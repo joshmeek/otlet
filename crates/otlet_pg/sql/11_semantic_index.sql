@@ -1,0 +1,671 @@
+CREATE FUNCTION otlet.semantic_native_table_name(
+  index_name text
+) RETURNS text
+LANGUAGE sql
+IMMUTABLE
+STRICT
+AS $$
+  SELECT CASE
+    WHEN ($1 || '_native') ~ '^[a-z][a-z0-9_]*$' AND length($1 || '_native') <= 63 THEN $1 || '_native'
+    ELSE 'semantic_' || substr(regexp_replace($1, '[^a-z0-9_]', '_', 'g'), 1, 44) || '_' || substr(md5($1), 1, 8)
+  END;
+$$;
+
+CREATE FUNCTION otlet.semantic_source_view_name(
+  index_name text
+) RETURNS text
+LANGUAGE sql
+IMMUTABLE
+STRICT
+AS $$
+  SELECT CASE
+    WHEN ($1 || '_source') ~ '^[a-z][a-z0-9_]*$' AND length($1 || '_source') <= 63 THEN $1 || '_source'
+    ELSE 'semantic_src_' || substr(regexp_replace($1, '[^a-z0-9_]', '_', 'g'), 1, 40) || '_' || substr(md5($1), 1, 8)
+  END;
+$$;
+
+CREATE FUNCTION otlet.create_semantic_source_view(
+  index_name text,
+  view_name text DEFAULT NULL
+) RETURNS regclass
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  index_row otlet.semantic_indexes%ROWTYPE;
+  resolved_view_name text := COALESCE(view_name, otlet.semantic_source_view_name(index_name));
+  source_columns text;
+  reserved_columns text[] := ARRAY[
+    'otlet_semantic_ready',
+    'otlet_subject_id',
+    'otlet_semantic_body',
+    'otlet_semantic_stale',
+    'otlet_semantic_source_hash',
+    'otlet_semantic_updated_at'
+  ];
+BEGIN
+  IF resolved_view_name !~ '^[a-z][a-z0-9_]*$' OR length(resolved_view_name) > 63 THEN
+    RAISE EXCEPTION 'otlet semantic source view name % must be a simple SQL identifier', resolved_view_name;
+  END IF;
+
+  SELECT *
+  INTO index_row
+  FROM otlet.semantic_indexes si
+  WHERE si.name = create_semantic_source_view.index_name;
+
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'otlet semantic index % does not exist', create_semantic_source_view.index_name;
+  END IF;
+
+  IF EXISTS (
+    SELECT 1
+    FROM pg_attribute
+    WHERE attrelid = index_row.source_table::regclass
+      AND attname = ANY(reserved_columns)
+      AND attnum > 0
+      AND NOT attisdropped
+  ) THEN
+    RAISE EXCEPTION 'source table % already has one of the reserved Otlet semantic view columns: %',
+      index_row.source_table,
+      array_to_string(reserved_columns, ', ');
+  END IF;
+
+  SELECT string_agg(format('src.%I', attname), ', ' ORDER BY attnum)
+  INTO source_columns
+  FROM pg_attribute
+  WHERE attrelid = index_row.source_table::regclass
+    AND attnum > 0
+    AND NOT attisdropped;
+
+  IF source_columns IS NULL THEN
+    RAISE EXCEPTION 'otlet semantic source table % has no visible columns', index_row.source_table;
+  END IF;
+
+  EXECUTE format(
+    $sql$
+      CREATE OR REPLACE VIEW otlet.%1$I AS
+      SELECT
+        %2$s,
+        sem.subject_id IS NOT NULL AS otlet_semantic_ready,
+        sem.subject_id AS otlet_subject_id,
+        sem.body AS otlet_semantic_body,
+        sem.stale AS otlet_semantic_stale,
+        sem.source_hash AS otlet_semantic_source_hash,
+        sem.updated_at AS otlet_semantic_updated_at
+      FROM %3$s AS src
+      LEFT JOIN otlet.%4$I AS sem
+        ON sem.subject_id = (src.%5$I)::text
+    $sql$,
+    resolved_view_name,
+    source_columns,
+    index_row.source_table,
+    otlet.semantic_native_table_name(index_row.name),
+    index_row.subject_column
+  );
+
+  RETURN format('otlet.%I', resolved_view_name)::regclass;
+END;
+$$;
+
+CREATE FUNCTION otlet.create_semantic_index(
+  index_name text,
+  table_name regclass,
+  subject_column text,
+  instruction text,
+  output_schema jsonb,
+  model_name text,
+  runtime_options jsonb DEFAULT '{}'::jsonb,
+  record_type text DEFAULT NULL
+) RETURNS otlet.semantic_indexes
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  source_table text;
+  saved otlet.semantic_indexes%ROWTYPE;
+  semantic_record_type text := COALESCE(record_type, index_name);
+  semantic_task_name text := index_name || '_task';
+  query text;
+BEGIN
+  IF semantic_task_name !~ '^[a-z0-9][a-z0-9_-]*$' THEN
+    RAISE EXCEPTION 'semantic index name % creates invalid task name %', index_name, semantic_task_name;
+  END IF;
+
+  IF NOT EXISTS (
+    SELECT 1
+    FROM pg_attribute
+    WHERE attrelid = table_name
+      AND attname = subject_column
+      AND attnum > 0
+      AND NOT attisdropped
+  ) THEN
+    RAISE EXCEPTION 'otlet subject column % does not exist on %', subject_column, table_name;
+  END IF;
+
+  SELECT format('%I.%I', n.nspname, c.relname)
+  INTO source_table
+  FROM pg_class c
+  JOIN pg_namespace n ON n.oid = c.relnamespace
+  WHERE c.oid = table_name;
+
+  query := format(
+    $query$
+      SELECT subject_id, input
+      FROM (
+        SELECT
+          (src.%1$I)::text AS subject_id,
+          jsonb_build_object(
+            '_otlet_mvcc', jsonb_build_object(
+              'table', %2$L,
+              'subject_id', (src.%1$I)::text,
+              'ctid', src.ctid::text,
+              'xmin', src.xmin::text
+            ),
+            'table', %2$L,
+            'row', to_jsonb(src)
+          ) AS input
+        FROM %3$s AS src
+      ) otlet_semantic_input
+      WHERE NOT EXISTS (
+        SELECT 1
+        FROM otlet.semantic_materializations sm
+        WHERE sm.task_name = %4$L
+          AND sm.source_table = %2$L
+          AND sm.subject_id = otlet_semantic_input.subject_id
+          AND sm.stale = false
+          AND sm.source_hash = md5(otlet_semantic_input.input::text)
+      )
+    $query$,
+    subject_column,
+    source_table,
+    table_name,
+    semantic_task_name
+  );
+
+  PERFORM otlet.create_task(
+    semantic_task_name,
+    query,
+    instruction,
+    output_schema,
+    model_name,
+    runtime_options
+  );
+
+  INSERT INTO otlet.semantic_indexes (
+    name,
+    task_name,
+    source_table,
+    subject_column,
+    record_type,
+    model_name,
+    updated_at
+  )
+  VALUES (
+    index_name,
+    semantic_task_name,
+    source_table,
+    subject_column,
+    semantic_record_type,
+    model_name,
+    now()
+  )
+  ON CONFLICT (name) DO UPDATE
+    SET task_name = EXCLUDED.task_name,
+        source_table = EXCLUDED.source_table,
+        subject_column = EXCLUDED.subject_column,
+        record_type = EXCLUDED.record_type,
+        model_name = EXCLUDED.model_name,
+        updated_at = now()
+  RETURNING * INTO saved;
+
+  PERFORM otlet.watch_semantic_stale(table_name, subject_column);
+  PERFORM otlet.create_semantic_foreign_table(
+    otlet.semantic_native_table_name(index_name),
+    index_name
+  );
+  PERFORM otlet.create_semantic_source_view(index_name);
+
+  RETURN saved;
+END;
+$$;
+
+CREATE FUNCTION otlet.drop_semantic_index(
+  index_name text
+) RETURNS boolean
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  index_row otlet.semantic_indexes%ROWTYPE;
+  native_table text;
+  stale_trigger_name text;
+BEGIN
+  SELECT *
+  INTO index_row
+  FROM otlet.semantic_indexes si
+  WHERE si.name = drop_semantic_index.index_name;
+
+  IF NOT FOUND THEN
+    RETURN false;
+  END IF;
+
+  EXECUTE format('DROP VIEW IF EXISTS otlet.%I', otlet.semantic_source_view_name(index_row.name));
+
+  FOR native_table IN
+    SELECT format('%I.%I', ns.nspname, c.relname)
+    FROM pg_foreign_table ft
+    JOIN pg_class c ON c.oid = ft.ftrelid
+    JOIN pg_namespace ns ON ns.oid = c.relnamespace
+    WHERE ft.ftoptions @> ARRAY['index_name=' || index_row.name]
+  LOOP
+    EXECUTE format('DROP FOREIGN TABLE IF EXISTS %s', native_table);
+  END LOOP;
+
+  DELETE FROM otlet.semantic_materializations sm
+  WHERE sm.task_name = index_row.task_name
+    AND sm.record_type = index_row.record_type;
+
+  DELETE FROM otlet.semantic_indexes si
+  WHERE si.name = index_row.name;
+
+  DELETE FROM otlet.tasks t
+  WHERE t.name = index_row.task_name
+    AND NOT EXISTS (
+      SELECT 1
+      FROM otlet.jobs j
+      WHERE j.task_name = t.name
+    );
+
+  IF NOT EXISTS (
+    SELECT 1
+    FROM otlet.semantic_indexes si
+    WHERE si.source_table = index_row.source_table
+      AND si.subject_column = index_row.subject_column
+  ) THEN
+    stale_trigger_name := 'otlet_stale_' || substr(
+      md5(index_row.source_table::regclass::text || ':' || index_row.subject_column),
+      1,
+      16
+    );
+    EXECUTE format('DROP TRIGGER IF EXISTS %I ON %s', stale_trigger_name, index_row.source_table);
+  END IF;
+
+  RETURN true;
+END;
+$$;
+
+CREATE FUNCTION otlet.refresh_semantic_index(
+  index_name text
+) RETURNS bigint
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  index_row otlet.semantic_indexes%ROWTYPE;
+  queued bigint;
+BEGIN
+  SELECT *
+  INTO index_row
+  FROM otlet.semantic_indexes
+  WHERE name = refresh_semantic_index.index_name;
+
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'otlet semantic index % does not exist', refresh_semantic_index.index_name;
+  END IF;
+
+  SELECT otlet.run_task(index_row.task_name) INTO queued;
+
+  UPDATE otlet.semantic_indexes
+  SET last_refresh_at = now(),
+      updated_at = now()
+  WHERE name = index_row.name;
+
+  RETURN queued;
+END;
+$$;
+
+CREATE FUNCTION otlet.materialize_semantic_index(
+  index_name text
+) RETURNS bigint
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  index_row otlet.semantic_indexes%ROWTYPE;
+  input_query text;
+  refreshed bigint;
+BEGIN
+  SELECT *
+  INTO index_row
+  FROM otlet.semantic_indexes
+  WHERE name = materialize_semantic_index.index_name;
+
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'otlet semantic index % does not exist', materialize_semantic_index.index_name;
+  END IF;
+
+  SELECT t.input_query
+  INTO input_query
+  FROM otlet.tasks t
+  WHERE t.name = index_row.task_name;
+
+  IF input_query IS NULL THEN
+    RAISE EXCEPTION 'otlet semantic index % task % does not exist', materialize_semantic_index.index_name, index_row.task_name;
+  END IF;
+
+  EXECUTE format(
+    $sql$
+      WITH current_inputs AS (
+        SELECT subject_id::text AS subject_id, input::jsonb AS input
+        FROM (%1$s) otlet_current_input
+      ),
+      latest_jobs AS (
+        SELECT DISTINCT ON (j.subject_id)
+          j.id,
+          j.subject_id,
+          j.task_name,
+          j.input
+        FROM otlet.jobs j
+        JOIN current_inputs ci
+          ON ci.subject_id = j.subject_id
+         AND md5(ci.input::text) = md5(j.input::text)
+        WHERE j.task_name = %2$L
+          AND j.status = 'complete'
+        ORDER BY j.subject_id, j.finished_at DESC NULLS LAST, j.id DESC
+      )
+      INSERT INTO otlet.semantic_materializations (
+        record_id,
+        record_type,
+        source_table,
+        subject_id,
+        task_name,
+        model_name,
+        body,
+        stale,
+        source_hash,
+        updated_at
+      )
+      SELECT
+        r.id,
+        r.record_type,
+        %3$L,
+        j.subject_id,
+        j.task_name,
+        t.model_name,
+        r.body,
+        false,
+        md5(j.input::text),
+        now()
+      FROM otlet.records r
+      JOIN otlet.actions a ON a.id = r.action_id
+      JOIN latest_jobs j ON j.id = a.job_id
+      JOIN otlet.tasks t ON t.name = j.task_name
+      WHERE r.record_type = %4$L
+      ON CONFLICT (record_id) DO UPDATE
+        SET record_type = EXCLUDED.record_type,
+            source_table = EXCLUDED.source_table,
+            subject_id = EXCLUDED.subject_id,
+            task_name = EXCLUDED.task_name,
+            model_name = EXCLUDED.model_name,
+            body = EXCLUDED.body,
+            stale = false,
+            source_hash = EXCLUDED.source_hash,
+            updated_at = now()
+    $sql$,
+    input_query,
+    index_row.task_name,
+    index_row.source_table,
+    index_row.record_type
+  );
+
+  GET DIAGNOSTICS refreshed = ROW_COUNT;
+  RETURN refreshed;
+END;
+$$;
+
+CREATE FUNCTION otlet.materialize_semantic_index_subject(
+  index_name text,
+  subject_id text
+) RETURNS bigint
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  index_row otlet.semantic_indexes%ROWTYPE;
+  input_query text;
+  refreshed bigint;
+BEGIN
+  SELECT *
+  INTO index_row
+  FROM otlet.semantic_indexes
+  WHERE name = materialize_semantic_index_subject.index_name;
+
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'otlet semantic index % does not exist', materialize_semantic_index_subject.index_name;
+  END IF;
+
+  SELECT t.input_query
+  INTO input_query
+  FROM otlet.tasks t
+  WHERE t.name = index_row.task_name;
+
+  IF input_query IS NULL THEN
+    RAISE EXCEPTION 'otlet semantic index % task % does not exist', materialize_semantic_index_subject.index_name, index_row.task_name;
+  END IF;
+
+  EXECUTE format(
+    $sql$
+      WITH current_inputs AS (
+        SELECT subject_id::text AS subject_id, input::jsonb AS input
+        FROM (%1$s) otlet_current_input
+        WHERE subject_id::text = %3$L
+      ),
+      latest_jobs AS (
+        SELECT DISTINCT ON (j.subject_id)
+          j.id,
+          j.subject_id,
+          j.task_name,
+          j.input
+        FROM otlet.jobs j
+        JOIN current_inputs ci
+          ON ci.subject_id = j.subject_id
+         AND md5(ci.input::text) = md5(j.input::text)
+        WHERE j.task_name = %2$L
+          AND j.subject_id = %3$L
+          AND j.status = 'complete'
+        ORDER BY j.subject_id, j.finished_at DESC NULLS LAST, j.id DESC
+      )
+      INSERT INTO otlet.semantic_materializations (
+        record_id,
+        record_type,
+        source_table,
+        subject_id,
+        task_name,
+        model_name,
+        body,
+        stale,
+        source_hash,
+        updated_at
+      )
+      SELECT
+        r.id,
+        r.record_type,
+        %4$L,
+        j.subject_id,
+        j.task_name,
+        t.model_name,
+        r.body,
+        false,
+        md5(j.input::text),
+        now()
+      FROM otlet.records r
+      JOIN otlet.actions a ON a.id = r.action_id
+      JOIN latest_jobs j ON j.id = a.job_id
+      JOIN otlet.tasks t ON t.name = j.task_name
+      WHERE r.record_type = %5$L
+      ON CONFLICT (record_id) DO UPDATE
+        SET record_type = EXCLUDED.record_type,
+            source_table = EXCLUDED.source_table,
+            subject_id = EXCLUDED.subject_id,
+            task_name = EXCLUDED.task_name,
+            model_name = EXCLUDED.model_name,
+            body = EXCLUDED.body,
+            stale = false,
+            source_hash = EXCLUDED.source_hash,
+            updated_at = now()
+    $sql$,
+    input_query,
+    index_row.task_name,
+    materialize_semantic_index_subject.subject_id,
+    index_row.source_table,
+    index_row.record_type
+  );
+
+  GET DIAGNOSTICS refreshed = ROW_COUNT;
+  RETURN refreshed;
+END;
+$$;
+
+CREATE FUNCTION otlet.semantic_index_current_rows(
+  index_name text,
+  fresh_only boolean DEFAULT true
+) RETURNS TABLE (
+  subject_id text,
+  body jsonb,
+  stale boolean,
+  source_hash text,
+  updated_at timestamptz
+)
+LANGUAGE plpgsql
+STABLE
+AS $$
+DECLARE
+  index_row otlet.semantic_indexes%ROWTYPE;
+BEGIN
+  SELECT *
+  INTO index_row
+  FROM otlet.semantic_indexes
+  WHERE name = semantic_index_current_rows.index_name;
+
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'otlet semantic index % does not exist', semantic_index_current_rows.index_name;
+  END IF;
+
+  RETURN QUERY EXECUTE format(
+    $sql$
+      WITH current_inputs AS (
+        SELECT
+          (src.%1$I)::text AS subject_id,
+          jsonb_build_object(
+            '_otlet_mvcc', jsonb_build_object(
+              'table', %2$L,
+              'subject_id', (src.%1$I)::text,
+              'ctid', src.ctid::text,
+              'xmin', src.xmin::text
+            ),
+            'table', %2$L,
+            'row', to_jsonb(src)
+          ) AS input
+        FROM %3$s AS src
+      ),
+      latest AS (
+        SELECT DISTINCT ON (sm.subject_id)
+          sm.subject_id,
+          sm.body,
+          sm.stale,
+          sm.source_hash,
+          sm.updated_at,
+          sm.id
+        FROM otlet.semantic_materializations sm
+        WHERE sm.task_name = %4$L
+          AND sm.record_type = %5$L
+        ORDER BY sm.subject_id, sm.updated_at DESC, sm.id DESC
+      )
+      SELECT
+        latest.subject_id,
+        latest.body,
+        latest.stale OR latest.source_hash IS DISTINCT FROM md5(ci.input::text) AS stale,
+        latest.source_hash,
+        latest.updated_at
+      FROM current_inputs ci
+      JOIN latest ON latest.subject_id = ci.subject_id
+      WHERE (
+        NOT %6$s
+        OR (latest.stale = false AND latest.source_hash = md5(ci.input::text))
+      )
+      ORDER BY latest.subject_id, latest.updated_at DESC
+    $sql$,
+    index_row.subject_column,
+    index_row.source_table,
+    index_row.source_table,
+    index_row.task_name,
+    index_row.record_type,
+    CASE WHEN COALESCE(semantic_index_current_rows.fresh_only, true) THEN 'true' ELSE 'false' END
+  );
+END;
+$$;
+
+CREATE FUNCTION otlet.semantic_index_lookup(
+  index_name text,
+  fresh_only boolean DEFAULT true
+) RETURNS TABLE (
+  subject_id text,
+  body jsonb,
+  stale boolean,
+  source_hash text,
+  updated_at timestamptz
+)
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  index_row otlet.semantic_indexes%ROWTYPE;
+BEGIN
+  SELECT *
+  INTO index_row
+  FROM otlet.semantic_indexes
+  WHERE name = semantic_index_lookup.index_name;
+
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'otlet semantic index % does not exist', semantic_index_lookup.index_name;
+  END IF;
+
+  EXECUTE format(
+    $sql$
+      WITH current_inputs AS (
+        SELECT
+          (src.%1$I)::text AS subject_id,
+          jsonb_build_object(
+            '_otlet_mvcc', jsonb_build_object(
+              'table', %2$L,
+              'subject_id', (src.%1$I)::text,
+              'ctid', src.ctid::text,
+              'xmin', src.xmin::text
+            ),
+            'table', %2$L,
+            'row', to_jsonb(src)
+          ) AS input
+        FROM %3$s AS src
+      )
+      UPDATE otlet.semantic_materializations sm
+      SET stale = true,
+          updated_at = now()
+      FROM current_inputs ci
+      WHERE sm.task_name = %4$L
+        AND sm.record_type = %5$L
+        AND sm.stale = false
+        AND ci.subject_id = sm.subject_id
+        AND md5(ci.input::text) IS DISTINCT FROM sm.source_hash
+    $sql$,
+    index_row.subject_column,
+    index_row.source_table,
+    index_row.source_table,
+    index_row.task_name,
+    index_row.record_type
+  );
+
+  UPDATE otlet.semantic_indexes
+  SET last_lookup_at = now()
+  WHERE name = index_row.name;
+
+  RETURN QUERY
+  SELECT *
+  FROM otlet.semantic_index_current_rows(
+    semantic_index_lookup.index_name,
+    semantic_index_lookup.fresh_only
+  );
+END;
+$$;

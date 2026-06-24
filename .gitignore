@@ -1,0 +1,71 @@
+# Local planning and private notes
+.local/
+
+# Secrets and local environment
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.crt
+
+# Rust
+/target/
+**/*.rs.bk
+
+# Postgres / pgrx local state
+.pgrx/
+pgdata/
+postgres-data/
+data/postgres/
+*.pid
+*.sock
+
+# Native build artifacts
+build/
+cmake-build-*/
+*.o
+*.a
+*.so
+*.dylib
+*.dll
+*.rlib
+
+# Local model artifacts
+models/*
+!models/.gitkeep
+!models/README.md
+*.gguf
+*.ggml
+*.safetensors
+*.onnx
+*.pt
+*.pth
+
+# Database dumps and scratch data
+*.dump
+*.backup
+*.sql.gz
+*.sqlite
+*.sqlite3
+*.db
+
+# Logs, coverage, and temp files
+*.log
+logs/
+coverage/
+htmlcov/
+lcov.info
+.coverage
+tmp/
+temp/
+.tmp/
+
+# OS and editor files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+*~

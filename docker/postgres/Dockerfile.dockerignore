@@ -1,0 +1,13 @@
+.git/
+.local/
+target/
+models/
+*.gguf
+*.ggml
+*.safetensors
+*.onnx
+*.pt
+*.pth
+logs/
+tmp/
+.DS_Store
