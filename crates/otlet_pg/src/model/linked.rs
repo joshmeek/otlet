@@ -526,17 +526,7 @@ fn linked_clear_context(context: *mut llama_cpp_sys_4::llama_context) {
 }
 
 fn linked_output_complete(output: &str) -> bool {
-    parse_model_json(output)
-        .ok()
-        .and_then(|(json, _)| {
-            let has_actions = json.get("actions").is_some()
-                || json
-                    .get("output")
-                    .and_then(|value| value.get("actions"))
-                    .is_some();
-            has_actions.then_some(())
-        })
-        .is_some()
+    parse_model_json(output).is_ok()
 }
 
 fn linked_cancel_requested(job_id: i64) -> Result<bool, ModelError> {

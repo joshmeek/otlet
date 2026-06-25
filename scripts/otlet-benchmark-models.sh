@@ -236,7 +236,7 @@ SELECT otlet.create_task(
     }
   }'::jsonb,
   :'model_name',
-  '{"temperature":0,"max_tokens":192,"reasoning":"off","inference_cache":true,"generation_trace":true,"generation_trace_max_tokens":12,"generation_trace_top_k":3}'::jsonb
+  '{"max_tokens":192,"reasoning":"off","inference_cache":true,"generation_trace":true,"generation_trace_max_tokens":12,"generation_trace_top_k":3}'::jsonb
 );
 SQL
   job_id="$(
@@ -364,7 +364,7 @@ SELECT otlet.create_semantic_index(
     }
   }'::jsonb,
   :'model_name',
-  '{"temperature":0,"max_tokens":192,"reasoning":"off","inference_cache":true,"generation_trace":true,"generation_trace_max_tokens":12,"generation_trace_top_k":3}'::jsonb,
+  '{"max_tokens":192,"reasoning":"off","inference_cache":true,"generation_trace":true,"generation_trace_max_tokens":12,"generation_trace_top_k":3}'::jsonb,
   :'record_type'
 );
 SQL
@@ -477,7 +477,7 @@ SELECT otlet.create_task(
   'Return exactly {"output":{"ok":true},"actions":[]}',
   '{"type":"object","required":["ok"],"additionalProperties":false,"properties":{"ok":{"type":"boolean"}}}'::jsonb,
   :'model_name',
-  '{"temperature":0,"max_tokens":64,"reasoning":"off","inference_cache":true,"generation_trace":true,"generation_trace_max_tokens":8,"generation_trace_top_k":3}'::jsonb
+  '{"max_tokens":64,"reasoning":"off","inference_cache":true,"generation_trace":true,"generation_trace_max_tokens":8,"generation_trace_top_k":3}'::jsonb
 );
 SQL
   for n in 1 2; do

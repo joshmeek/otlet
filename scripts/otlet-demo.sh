@@ -393,7 +393,7 @@ SELECT otlet.create_task(
     }
   }'::jsonb,
   :'model_name',
-  '{"temperature":0,"max_tokens":256,"reasoning":"off","inference_cache":true,"generation_trace":true,"generation_trace_max_tokens":16,"generation_trace_top_k":3}'::jsonb
+  '{"max_tokens":256,"reasoning":"off","inference_cache":true,"generation_trace":true,"generation_trace_max_tokens":16,"generation_trace_top_k":3}'::jsonb
 );
 
 SELECT otlet.run_task(:'task_name');
@@ -498,7 +498,7 @@ FROM otlet.create_semantic_join_index(
   }'::jsonb,
   :'model_name',
   :'record_type',
-  '{"temperature":0,"max_tokens":256,"reasoning":"off","inference_cache":true,"generation_trace":true,"generation_trace_max_tokens":16,"generation_trace_top_k":3}'::jsonb,
+  '{"max_tokens":256,"reasoning":"off","inference_cache":true,"generation_trace":true,"generation_trace_max_tokens":16,"generation_trace_top_k":3}'::jsonb,
   10
 );
 SQL

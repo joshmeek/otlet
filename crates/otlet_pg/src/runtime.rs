@@ -35,9 +35,6 @@ pub(crate) fn parse_runtime_options(value: &Value) -> Result<RuntimeOptions, Str
             key.as_str(),
             "reasoning"
                 | "max_tokens"
-                | "temperature"
-                | "connect_timeout_ms"
-                | "request_timeout_ms"
                 | "inference_cache"
                 | "max_worker_rss_bytes"
                 | "generation_trace"
@@ -66,41 +63,6 @@ pub(crate) fn parse_runtime_options(value: &Value) -> Result<RuntimeOptions, Str
             return Err("runtime_options.max_tokens must be between 1 and 4096".to_owned());
         }
         options.max_tokens = max_tokens;
-    }
-
-    if let Some(value) = object.get("temperature") {
-        let temperature = value
-            .as_f64()
-            .ok_or("runtime_options.temperature must be a number")?;
-        if temperature != 0.0 {
-            return Err(
-                "runtime_options.temperature is greedy-only for linked runtime; use 0".to_owned(),
-            );
-        }
-    }
-
-    if let Some(value) = object.get("connect_timeout_ms") {
-        let connect_timeout_ms = value
-            .as_u64()
-            .ok_or("runtime_options.connect_timeout_ms must be an integer")?;
-        if connect_timeout_ms != 1_000 {
-            return Err(
-                "runtime_options.connect_timeout_ms is not used by linked runtime; use default 1000"
-                    .to_owned(),
-            );
-        }
-    }
-
-    if let Some(value) = object.get("request_timeout_ms") {
-        let request_timeout_ms = value
-            .as_u64()
-            .ok_or("runtime_options.request_timeout_ms must be an integer")?;
-        if request_timeout_ms != 120_000 {
-            return Err(
-                "runtime_options.request_timeout_ms is not used by linked runtime; use default 120000"
-                    .to_owned(),
-            );
-        }
     }
 
     if let Some(value) = object.get("inference_cache") {
@@ -187,8 +149,7 @@ pub(crate) fn runtime_option_status(value: &Value) -> Value {
         "policy": "linked_runtime_rejects_unsupported_non_default_options_no_silent_ignore",
         "honored": honored,
         "defaulted": defaulted,
-        "accepted_noop_defaults": ["temperature=0", "connect_timeout_ms=1000", "request_timeout_ms=120000"],
-        "rejected_non_default": ["temperature", "connect_timeout_ms", "request_timeout_ms"],
+        "unsupported": ["temperature", "connect_timeout_ms", "request_timeout_ms"],
         "ignored": []
     })
 }

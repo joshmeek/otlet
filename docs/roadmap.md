@@ -12,7 +12,7 @@ Otlet has three public entry points today:
 | --- | --- |
 | `scripts/otlet-setup.sh` | build and start the local Postgres extension stack |
 | `scripts/otlet-demo.sh` | run the worked demo path with local inference |
-| `scripts/otlet-benchmark-models.sh` | compare GGUF models on Otlet workloads |
+| `scripts/otlet-benchmark-models.sh` | secondary model-fit proof, not the active roadmap track |
 
 The extension keeps source rows in user tables. Users choose rows with SQL, Otlet passes compact JSON to a resident local model, and Postgres stores derived outputs, actions, traces, and receipts under the `otlet` schema
 
@@ -20,26 +20,18 @@ The extension keeps source rows in user tables. Users choose rows with SQL, Otle
 
 | Order | Track | Outcome |
 | --- | --- | --- |
-| 1 | Benchmarks | Compare local models on Otlet tasks with latency, quality, memory, and crash evidence |
-| 2 | Planner work | Cost and explain semantic lookup, refresh, wait, fail-closed, and infer-now paths |
-| 3 | Actions | Let models propose typed database actions with receipts and approval |
-| 4 | Throughput | Improve queued materialization before pushing synchronous inference |
-| 5 | Model selection | Pick small or strong resident models from measured task history |
+| 1 | Planner work | Cost and explain semantic lookup, refresh, wait, fail-closed, and infer-now paths |
+| 2 | Throughput | Improve queued materialization before pushing synchronous inference |
+| 3 | Model selection | Pick small or strong resident models from measured task history |
+| 4 | Actions | Let models propose typed database actions with receipts and approval |
+| 5 | Packaging and security | Keep the open-source path small while tightening permissions and trace safety |
 | 6 | Core limits | Test Access Method and Postgres-fork paths where extension hooks fall short |
 
-## Benchmarking
+## Model-Fit Proof
 
-Otlet needs its own benchmark suite. Generic chat benchmarks miss the work this extension performs: row classification, entity resolution, structured extraction, semantic action proposals, stale-row refresh, schema-following, and trace-heavy debug runs
+Benchmarks are not the active track right now. Keep `scripts/otlet-benchmark-models.sh` as a secondary proof script for comparing GGUF models on the same Otlet workload when model choice or costing needs evidence
 
-`scripts/otlet-benchmark-models.sh` should compare multiple GGUF models against the same SQL workload. Each run should record model path, quantization, artifact size, runtime options, hardware, load time, warm latency, p50 and p95 job latency, tokens per second, memory use, JSON validity, schema failures, cache hits, trace overhead, stale refresh latency, infer-now latency, and crash status
-
-The public report should rank models by useful local work instead of raw token speed. A practical score can start with:
-
-```text
-task_quality * completed_jobs_per_second / resident_gb
-```
-
-The benchmark data should live in SQL rows first, then export to Markdown or CSV for README snippets and release notes
+The benchmark report should stay Otlet-specific: SQL input, resident worker inference, schema-validated JSON, receipts, semantic freshness, cache behavior, memory, and crash status. Generic chat scores do not decide the roadmap
 
 ## Planner And Executor
 
@@ -65,7 +57,7 @@ The resident inference cache should explain each hit and miss. Its key should in
 
 Otlet should choose models from measured database facts. Task type, row count, freshness, prior quality, prior latency, schema validity, cache probability, confidence policy, and trace mode should feed cost estimates
 
-A good first path is cheap-first execution: run the small model, accept high-confidence valid output, escalate low-confidence or invalid output, store both attempts in receipts, and feed results back into benchmarks and costing
+A good first path is cheap-first execution: run the small model, accept high-confidence valid output, escalate low-confidence or invalid output, store both attempts in receipts, and feed results back into costing
 
 A small local compiler model also fits Otlet. Train or fine-tune it on accepted actions, rejected actions, schema failures, human-approved merges, dry-run errors, and synthetic schema tasks. It should emit Otlet action ASTs with high JSON validity and conservative table or column references
 
@@ -87,7 +79,7 @@ Model-compiled SQL can come later through a constrained path. The model proposes
 
 ## Packaging And Security
 
-Open-source packaging should keep the first run small: one setup script, one demo script, one benchmark script, a small model path, Docker instructions, crash-log scanning, CPU-only defaults, resource warnings, extension versioning, and upgrade notes
+Open-source packaging should keep the first run small: one setup script, one demo script, a secondary model-fit script, a small model path, Docker instructions, crash-log scanning, CPU-only defaults, resource warnings, extension versioning, and upgrade notes
 
 Security work should cover schema permissions, model artifact path permissions, allowed write targets, action approval, prompt visibility, trace visibility, row-level security, superuser requirements, and extension install risk. Trace redaction needs special care because prompts and token traces can contain source values
 

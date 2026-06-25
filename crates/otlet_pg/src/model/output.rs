@@ -100,6 +100,14 @@ fn hash_text(text: &str) -> String {
 }
 
 fn model_actions(json: &Value) -> Result<Value, String> {
+    let Value::Object(object) = json else {
+        return Err("model JSON must be an object".to_owned());
+    };
+    if let Some(extra_key) = object.keys().find(|key| *key != "output" && *key != "actions") {
+        return Err(format!(
+            "model JSON unsupported top-level key: {extra_key}"
+        ));
+    }
     let actions = json
         .get("actions")
         .cloned()
@@ -110,43 +118,16 @@ fn model_actions(json: &Value) -> Result<Value, String> {
 
     let mut normalized = Vec::with_capacity(actions.len());
     for action in actions {
-        let Value::Object(mut object) = action else {
+        let Value::Object(object) = action else {
             return Err("model JSON actions must contain objects".to_owned());
         };
         if !object.contains_key("type") {
-            if let Some(alias) = object.remove("action") {
-                object.insert("type".to_owned(), alias);
-            }
+            return Err("model JSON actions must contain type".to_owned());
         }
         normalized.push(Value::Object(object));
     }
 
     Ok(Value::Array(normalized))
-}
-
-fn normalize_model_envelope(mut json: Value) -> Result<Value, String> {
-    if json.get("actions").is_some() {
-        return Ok(json);
-    }
-
-    let Some(output) = json.get_mut("output") else {
-        return Ok(json);
-    };
-    let Value::Object(output_object) = output else {
-        return Ok(json);
-    };
-    let Some(actions) = output_object.remove("actions") else {
-        return Ok(json);
-    };
-    if !actions.is_array() {
-        return Err("model JSON actions must be an array".to_owned());
-    }
-    let Value::Object(root) = &mut json else {
-        return Ok(json);
-    };
-    root.insert("actions".to_owned(), actions);
-
-    Ok(json)
 }
 
 fn parse_model_json(raw_output: &str) -> Result<(Value, String), String> {

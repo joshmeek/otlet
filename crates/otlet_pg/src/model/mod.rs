@@ -123,7 +123,7 @@ pub(crate) fn run_job(job: &Job) -> Result<ModelRun, ModelError> {
     let options = parse_runtime_options(&job.runtime_options).map_err(ModelError::new)?;
     validate_output_schema(&job.output_schema).map_err(ModelError::new)?;
     let prompt = format!(
-        "{}You are a Postgres-local data review worker.\nReturn one valid JSON object. No prose. No markdown.\nThe JSON object must have top-level \"output\" and \"actions\" keys.\n\"output\" must satisfy Output schema and use only values allowed by that schema.\n\"actions\" must be an array. Use [] when no action is needed.\nNever put actions inside \"output\".\nIf any issue is found, set output.needs_review to true and output.status to \"needs_review\" when allowed.\n\nInstruction:\n{}\n\nOutput schema:\n{}\n\nInput:\n{}",
+        "{}You are a Postgres-local JSON worker.\nReturn one valid JSON object. No prose. No markdown.\nThe JSON object must have top-level \"output\" and \"actions\" keys.\n\"output\" must satisfy Output schema and use only values allowed by that schema.\n\"actions\" must be an array. Use [] when no action is needed.\nNever put actions inside \"output\".\n\nInstruction:\n{}\n\nOutput schema:\n{}\n\nInput:\n{}",
         if options.reasoning == "off" {
             "/no_think "
         } else {
@@ -233,9 +233,6 @@ pub(crate) fn run_job(job: &Job) -> Result<ModelRun, ModelError> {
     let trace_summary = generation_trace_summary(&context, &metrics, &raw_output_hash);
 
     let (json, raw_json) = parse_model_json(raw_output.as_str()).map_err(|err| {
-        ModelError::with_context(err, raw_output.clone(), &context, trace_summary.clone())
-    })?;
-    let json = normalize_model_envelope(json).map_err(|err| {
         ModelError::with_context(err, raw_output.clone(), &context, trace_summary.clone())
     })?;
     let output = json.get("output").cloned().ok_or_else(|| {

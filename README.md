@@ -2,7 +2,7 @@
 
 Otlet is a Postgres extension that runs local LLM inference **inside Postgres**, next to the rows it reads and acts on
 
-My use case for building it came from an entity-resolution problem: when new data lands, Postgres should help decide whether a row is a new entity or a duplicate of something already in the database. Otlet runs through a resident Postgres worker, records receipts and source identity, and materializes results for later queries (not made for high throughput yet, it is CPU-based local inference). The [roadmap](docs/roadmap.md) tracks the path toward better benchmarks, planner integration, model selection, throughput work, richer trace visibility, etc.
+My use case for building it came from an entity-resolution problem: when new data lands, Postgres should help decide whether a row is a new entity or a duplicate of something already in the database. Otlet runs through a resident Postgres worker, records receipts and source identity, and materializes results for later queries (not made for high throughput yet, it is CPU-based local inference). The [roadmap](docs/roadmap.md) tracks the path toward planner integration, throughput work, model selection, action safety, and packaging
 
 Otlet uses a `pgrx` extension and a Postgres background worker loaded through `shared_preload_libraries` to keep local model work inside the database process. You can ask for model work from SQL, queue it from rows, refresh semantic state after source changes, and inspect the result without leaving Postgres
 
@@ -96,7 +96,7 @@ FROM otlet.create_task(
   'Use input.candidate_evidence before names. If evidence contains same remittance account or rebrand/acquisition, return exactly {"output":{"match":"same_entity","confidence":"high","reason":"shared remittance account and acquisition note"},"actions":[]}. If evidence contains no shared identifiers or different industry/city, return exactly {"output":{"match":"different_entity","confidence":"high","reason":"medical supplier has no shared identifiers"},"actions":[]}. Otherwise compare operational identifiers and use match same_entity, different_entity, or unclear. Do not add prose, markdown, labels, nested output, or action strings.',
   '{"type":"object","required":["match","confidence","reason"],"additionalProperties":false,"properties":{"match":{"enum":["same_entity","different_entity","unclear"]},"confidence":{"enum":["low","medium","high"]},"reason":{"type":"string"}}}'::jsonb,
   'linked_qwen_0_6b',
-  '{"temperature":0,"max_tokens":128,"reasoning":"off"}'::jsonb
+  '{"max_tokens":128,"reasoning":"off"}'::jsonb
 );
 ```
 

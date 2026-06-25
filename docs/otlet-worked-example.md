@@ -218,7 +218,6 @@ FROM otlet.create_task(
   }'::jsonb,
   'linked_qwen_0_6b',
   '{
-    "temperature": 0,
     "max_tokens": 256,
     "reasoning": "off",
     "inference_cache": true,
@@ -310,16 +309,10 @@ The worker uses normal database state as its coordination surface. Jobs are clai
 
 ```sql
 SELECT
-  r.status,
   r.subject_id,
   r.output ->> 'match' AS match,
   r.output ->> 'confidence' AS confidence,
-  r.output ->> 'reason' AS reason,
-  r.receipt_id,
-  r.prompt_tokens,
-  r.generated_tokens,
-  r.generate_ms,
-  r.tokens_per_second
+  r.output ->> 'reason' AS reason
 FROM otlet.runs r
 WHERE r.task_name = 'entity_resolution_demo'
 ORDER BY r.subject_id;
@@ -328,10 +321,10 @@ ORDER BY r.subject_id;
 Representative output:
 
 ```text
- status  |      subject_id       |      match       | confidence |                    reason                    | receipt_id | prompt_tokens | generated_tokens | generate_ms | tokens_per_second
----------+-----------------------+------------------+------------+----------------------------------------------+------------+---------------+------------------+-------------+-------------------
- complete | vendor-1001:vendor-42 | same_entity      | high       | shared remittance account and acquisition note |          1 |           516 |               39 |         646 | 60.34
- complete | vendor-1001:vendor-77 | different_entity | high       | medical supplier has no shared identifiers     |          2 |           516 |               39 |         646 | 60.34
+      subject_id       |      match       | confidence |                    reason
+-----------------------+------------------+------------+----------------------------------------------
+ vendor-1001:vendor-42 | same_entity      | high       | shared remittance account and acquisition note
+ vendor-1001:vendor-77 | different_entity | high       | medical supplier has no shared identifiers
 (2 rows)
 ```
 
@@ -446,20 +439,12 @@ The source rows remain source data. The Otlet record is a derived fact with prov
 ```sql
 SELECT
   receipt_id,
-  task_name,
   subject_id,
   status,
-  model_name,
-  runtime_name,
   prompt_tokens,
   generated_tokens,
-  generate_ms,
-  tokens_per_second,
   schema_validation_status,
-  stop_reason,
-  schema_force,
-  model_cache_hit,
-  inference_cache_hit
+  stop_reason
 FROM otlet.inference_receipt_trace_status
 WHERE task_name = 'entity_resolution_demo'
 ORDER BY subject_id;
@@ -468,10 +453,10 @@ ORDER BY subject_id;
 Representative output:
 
 ```text
- receipt_id |       task_name        |      subject_id       |  status  |    model_name    | runtime_name  | prompt_tokens | generated_tokens | generate_ms | tokens_per_second | schema_validation_status |  stop_reason  |              schema_force              | model_cache_hit | inference_cache_hit
-------------+------------------------+-----------------------+----------+------------------+---------------+---------------+------------------+-------------+-------------------+--------------------------+---------------+----------------------------------------+-----------------+---------------------
-          1 | entity_resolution_demo | vendor-1001:vendor-42 | complete | linked_qwen_0_6b | linked_inproc |           516 |               39 |         646 | 60.34             | passed                   | json_complete | post_generation_json_schema_validation | t               | f
-          2 | entity_resolution_demo | vendor-1001:vendor-77 | complete | linked_qwen_0_6b | linked_inproc |           516 |               39 |         646 | 60.34             | passed                   | json_complete | post_generation_json_schema_validation | t               | f
+ receipt_id |      subject_id       |  status  | prompt_tokens | generated_tokens | schema_validation_status |  stop_reason
+------------+-----------------------+----------+---------------+------------------+--------------------------+---------------
+          1 | vendor-1001:vendor-42 | complete |           516 |               39 | passed                   | json_complete
+          2 | vendor-1001:vendor-77 | complete |           516 |               39 | passed                   | json_complete
 (2 rows)
 ```
 
@@ -680,34 +665,19 @@ The direct task path gives you the smallest loop. The rest of Otlet uses the sam
 Use the catalog to see the durable state Otlet owns:
 
 ```sql
-SELECT table_name
+SELECT count(*) AS otlet_base_tables
 FROM information_schema.tables
 WHERE table_schema = 'otlet'
-  AND table_type = 'BASE TABLE'
-ORDER BY table_name;
+  AND table_type = 'BASE TABLE';
 ```
 
 Representative output:
 
 ```text
-        table_name
----------------------------
- actions
- inference_receipts
- jobs
- model_versions
- models
- outputs
- production_policy
- records
- runtime_slots
- runtimes
- semantic_indexes
- semantic_join_indexes
- semantic_materializations
- tasks
- worker_events
-(15 rows)
+ otlet_base_tables
+-------------------
+                15
+(1 row)
 ```
 
 The base tables split into a few jobs:
@@ -746,7 +716,7 @@ FROM otlet.create_task(
   'Return exactly this JSON object: {"output":{"status":"ok"},"actions":[]}',
   '{"type":"object","required":["status"],"additionalProperties":false,"properties":{"status":{"enum":["ok"]}}}'::jsonb,
   'linked_qwen_0_6b',
-  '{"temperature":0,"max_tokens":64,"reasoning":"off"}'::jsonb
+  '{"max_tokens":64,"reasoning":"off"}'::jsonb
 );
 ```
 
@@ -1046,7 +1016,7 @@ SELECT otlet.create_semantic_index(
     }
   }'::jsonb,
   'linked_qwen_0_6b',
-  '{"temperature":0,"max_tokens":256,"reasoning":"off","inference_cache":true,"generation_trace":true,"generation_trace_max_tokens":12,"generation_trace_top_k":3}'::jsonb,
+  '{"max_tokens":256,"reasoning":"off","inference_cache":true,"generation_trace":true,"generation_trace_max_tokens":12,"generation_trace_top_k":3}'::jsonb,
   'demo_semantic_fact'
 );
 
@@ -1332,7 +1302,7 @@ FROM otlet.create_semantic_join_index(
   '{"type":"object","required":["match","confidence","needs_review"],"additionalProperties":false,"properties":{"match":{"enum":["yes"]},"confidence":{"type":"number"},"needs_review":{"type":"boolean"}}}'::jsonb,
   'linked_qwen_0_6b',
   'learning_entity_pair',
-  '{"temperature":0,"max_tokens":160,"reasoning":"off"}'::jsonb,
+  '{"max_tokens":160,"reasoning":"off"}'::jsonb,
   10
 );
 
@@ -1547,12 +1517,13 @@ Otlet installs internal production policy, bounded queues, leases, sweeps, valid
 Check row-level security:
 
 ```sql
-SELECT relname, relrowsecurity
+SELECT
+  count(*) AS otlet_base_tables,
+  count(*) FILTER (WHERE relrowsecurity) AS rls_enabled_tables
 FROM pg_class c
 JOIN pg_namespace n ON n.oid = c.relnamespace
 WHERE n.nspname = 'otlet'
-  AND c.relkind = 'r'
-ORDER BY relname;
+  AND c.relkind = 'r';
 
 SELECT count(*) AS installed_policies
 FROM pg_policies
@@ -1562,24 +1533,10 @@ WHERE schemaname = 'otlet';
 Representative output:
 
 ```text
-          relname          | relrowsecurity
----------------------------+----------------
- actions                   | f
- inference_receipts        | f
- jobs                      | f
- model_versions            | f
- models                    | f
- outputs                   | f
- production_policy         | f
- records                   | f
- runtime_slots             | f
- runtimes                  | f
- semantic_indexes          | f
- semantic_join_indexes     | f
- semantic_materializations | f
- tasks                     | f
- worker_events             | f
-(15 rows)
+ otlet_base_tables | rls_enabled_tables
+-------------------+--------------------
+                15 |                  0
+(1 row)
 
  installed_policies
 --------------------
