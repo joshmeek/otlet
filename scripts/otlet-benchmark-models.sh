@@ -202,8 +202,28 @@ run_row_job() {
   psql_exec \
     -v task_name="$task" \
     -v model_name="$model_name" >/dev/null <<'SQL'
-SELECT otlet.register_task(
+SELECT otlet.create_task(
   :'task_name',
+  $$
+    SELECT
+      src.id AS subject_id,
+      jsonb_build_object(
+        '_otlet_mvcc', jsonb_build_object(
+          'table', 'public.otlet_model_benchmark_rows',
+          'subject_id', src.id,
+          'ctid', src.ctid::text,
+          'xmin', src.xmin::text,
+          'source_hash', md5(to_jsonb(src)::text)
+        ),
+        'table', 'public.otlet_model_benchmark_rows',
+        'row', jsonb_build_object(
+          'id', src.id,
+          'email', src.body ->> 'email',
+          'phone', src.body ->> 'phone'
+        )
+      ) AS input
+    FROM public.otlet_model_benchmark_rows src
+  $$,
   'Benchmark row quality. Return exactly this JSON object: {"output":{"status":"needs_review","needs_review":true,"issues":["benchmark"]},"actions":[{"type":"create_record","record_type":"benchmark_fact","subject_id":"bench-row","body":{"status":"needs_review","semantic":"benchmark row"}}]}',
   '{
     "type": "object",
@@ -221,21 +241,13 @@ SELECT otlet.register_task(
 SQL
   job_id="$(
     psql_exec -qAt -v task_name="$task" -v subject="$subject" <<'SQL'
+SELECT otlet.run_task_subject(:'task_name', :'subject') AS queued \gset
 SELECT id
-FROM otlet.infer_async(
-  :'task_name',
-  :'subject',
-  jsonb_build_object(
-    '_otlet_mvcc', jsonb_build_object(
-      'table', 'public.otlet_model_benchmark_rows',
-      'subject_id', :'subject',
-      'ctid', '(0,1)',
-      'xmin', '1',
-      'source_hash', :'subject'
-    ),
-    'row', jsonb_build_object('id', :'subject', 'email', 'billing@', 'phone', NULL)
-  )
-);
+FROM otlet.jobs
+WHERE task_name = :'task_name'
+  AND subject_id = :'subject'
+ORDER BY id DESC
+LIMIT 1;
 SQL
   )"
   status="$(wait_job_done "$job_id" "$task" 600 1)"
@@ -394,7 +406,7 @@ SET email = 'changed@example.test',
 WHERE id = 3;
 SQL
   stale_rows="$(psql_value "SELECT stale_rows FROM otlet.semantic_index_status WHERE name = '$index_name';")"
-  fail_closed="$(psql_value "SELECT count(*) FROM public.otlet_model_benchmark_vendor v WHERE v.id = 3 AND otlet.semantic_matches('$index_name', v.id::text, '{\"status\":\"needs_review\"}'::jsonb, 1, false);")"
+  fail_closed="$(psql_value "SELECT count(*) FROM public.otlet_model_benchmark_vendor v WHERE v.id = 3 AND otlet.semantic_matches('$index_name', v.id::text, '{\"status\":\"needs_review\"}'::jsonb);")"
   echo "${model_name}_stale_rows=$stale_rows"
   echo "${model_name}_stale_fail_closed_rows=$fail_closed"
   if [ "$stale_rows" != "0" ] && [ "$fail_closed" = "0" ]; then
@@ -441,8 +453,28 @@ LIMIT 1;
   psql_exec \
     -v task_name="$trace_task" \
     -v model_name="$model_name" >/dev/null <<'SQL'
-SELECT otlet.register_task(
+INSERT INTO public.otlet_model_benchmark_rows (id, body)
+VALUES ('cache-row', '{"id":"cache-row","source_hash":"same"}'::jsonb)
+ON CONFLICT (id) DO UPDATE SET body = EXCLUDED.body;
+
+SELECT otlet.create_task(
   :'task_name',
+  $$
+    SELECT
+      src.id AS subject_id,
+      jsonb_build_object(
+        '_otlet_mvcc', jsonb_build_object(
+          'table', 'public.otlet_model_benchmark_rows',
+          'subject_id', src.id,
+          'ctid', src.ctid::text,
+          'xmin', src.xmin::text,
+          'source_hash', md5(to_jsonb(src)::text)
+        ),
+        'table', 'public.otlet_model_benchmark_rows',
+        'row', src.body
+      ) AS input
+    FROM public.otlet_model_benchmark_rows src
+  $$,
   'Return exactly {"output":{"ok":true},"actions":[]}',
   '{"type":"object","required":["ok"],"additionalProperties":false,"properties":{"ok":{"type":"boolean"}}}'::jsonb,
   :'model_name',
@@ -452,7 +484,13 @@ SQL
   for n in 1 2; do
     job_id="$(
       psql_exec -qAt -v task_name="$trace_task" -v subject="cache-row" <<'SQL'
-SELECT id FROM otlet.infer_async(:'task_name', :'subject', '{"id":"cache-row","source_hash":"same"}'::jsonb);
+SELECT otlet.run_task_subject(:'task_name', :'subject') AS queued \gset
+SELECT id
+FROM otlet.jobs
+WHERE task_name = :'task_name'
+  AND subject_id = :'subject'
+ORDER BY id DESC
+LIMIT 1;
 SQL
     )"
     [ "$(wait_job_done "$job_id" "$trace_task" 600 1)" = "complete" ] || {

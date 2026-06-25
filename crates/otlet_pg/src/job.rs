@@ -102,7 +102,7 @@ WITH inserted AS (
     started_at,
     finished_at
   )
-  VALUES ($1, $2, $3, 'running', 1, now() + interval '5 minutes', now(), NULL)
+  VALUES ($1, $2, $3, 'running', 1, now() + (SELECT job_lease_interval FROM otlet.production_policy), now(), NULL)
   ON CONFLICT (task_name, subject_id)
   WHERE status IN ('queued', 'running', 'cancel_requested')
   DO NOTHING

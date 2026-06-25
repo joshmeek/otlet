@@ -1,5 +1,27 @@
 CREATE SCHEMA otlet;
 
+CREATE TABLE otlet.production_policy (
+  name text PRIMARY KEY DEFAULT 'default',
+  stale_policy text NOT NULL DEFAULT 'refresh_then_fail_closed',
+  max_queued_jobs_per_model integer NOT NULL DEFAULT 1000,
+  max_attempts integer NOT NULL DEFAULT 3,
+  job_lease_interval interval NOT NULL DEFAULT interval '5 minutes',
+  worker_event_retention interval NOT NULL DEFAULT interval '7 days',
+  trace_detail_retention interval NOT NULL DEFAULT interval '7 days',
+  CHECK (name = 'default'),
+  CHECK (stale_policy IN (
+    'lookup_only_fail_closed',
+    'refresh_then_fail_closed'
+  )),
+  CHECK (max_queued_jobs_per_model BETWEEN 1 AND 1000000),
+  CHECK (max_attempts BETWEEN 1 AND 20),
+  CHECK (job_lease_interval >= interval '1 second'),
+  CHECK (job_lease_interval <= interval '1 hour')
+);
+
+INSERT INTO otlet.production_policy (name)
+VALUES ('default');
+
 CREATE TABLE otlet.runtimes (
   name text PRIMARY KEY CHECK (name ~ '^[a-z0-9][a-z0-9_-]*$'),
   endpoint text NOT NULL DEFAULT 'linked',

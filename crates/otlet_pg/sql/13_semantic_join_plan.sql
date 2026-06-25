@@ -266,6 +266,7 @@ CREATE FUNCTION otlet.semantic_join_index_plan(
 ) RETURNS TABLE (
   selected_path text,
   reason text,
+  effective_stale_policy text,
   name text,
   task_name text,
   record_type text,
@@ -293,6 +294,7 @@ AS $$
         WHEN total_pairs = 0 THEN 'semantic_join_lookup'
         WHEN active_jobs > 0 THEN 'wait_for_refresh'
         WHEN refresh_pairs = 0 THEN 'semantic_join_lookup'
+        WHEN policy.stale_policy = 'lookup_only_fail_closed' THEN 'semantic_join_lookup'
         WHEN $2 THEN 'refresh_then_lookup'
         ELSE 'fresh_pair_inference'
       END AS selected_path,
@@ -300,15 +302,19 @@ AS $$
         WHEN total_pairs = 0 THEN 'empty candidate set'
         WHEN active_jobs > 0 THEN 'pair refresh already active'
         WHEN refresh_pairs = 0 THEN 'semantic join index fully fresh'
+        WHEN policy.stale_policy = 'lookup_only_fail_closed' THEN 'policy returns fresh pair lookup rows only'
         WHEN $2 THEN 'bounded pair refresh required'
         ELSE 'fresh pair inference required'
       END AS reason,
+      policy.stale_policy AS effective_stale_policy,
       stats.*
     FROM stats
+    CROSS JOIN otlet.production_policy policy
   )
   SELECT
     selected_path,
     reason,
+    effective_stale_policy,
     name,
     task_name,
     record_type,
@@ -324,73 +330,4 @@ AS $$
     active_jobs,
     completed_jobs
   FROM decision;
-$$;
-
-CREATE FUNCTION otlet.explain_semantic_join_index_plan(
-  index_name text,
-  allow_refresh boolean DEFAULT true
-) RETURNS TABLE (
-  step_order int,
-  node text,
-  detail jsonb
-)
-LANGUAGE sql
-AS $$
-  WITH plan AS (
-    SELECT *
-    FROM otlet.semantic_join_index_plan($1, $2)
-  )
-  SELECT *
-  FROM (
-    SELECT
-      1,
-      'SemanticJoinStats',
-      jsonb_build_object(
-        'index_name', name,
-        'total_pairs', total_pairs,
-        'ready_pairs', ready_pairs,
-        'stale_pairs', stale_pairs,
-        'missing_pairs', missing_pairs,
-        'refresh_pairs', refresh_pairs,
-        'freshness', freshness
-      )
-    FROM plan
-    UNION ALL
-    SELECT
-      2,
-      'SemanticJoinCost',
-      jsonb_build_object(
-        'lookup_ms', estimated_lookup_ms,
-        'refresh_then_lookup_ms', estimated_refresh_ms,
-        'fresh_inference_ms', estimated_fresh_inference_ms
-      )
-    FROM plan
-    UNION ALL
-    SELECT
-      3,
-      'SemanticJoinPathDecision',
-      jsonb_build_object(
-        'selected_path', selected_path,
-        'reason', reason,
-        'allow_refresh', $2
-      )
-    FROM plan
-    UNION ALL
-    SELECT
-      4,
-      'ExecutorBoundary',
-      jsonb_build_object(
-        'selected_node', 'Foreign Scan via otlet_semantic_fdw(join_index_name) over bounded semantic join materializations',
-        'access_kind', 'semantic_join_pair_access',
-        'candidate_policy', 'caller_supplied_query_capped_by_max_candidate_rows',
-        'freshness_policy', 'lookup_rechecks_current_candidate_input_hash_and_marks_mismatches_stale',
-        'stale_policy', 'lookup_wait_or_refresh_then_lookup_fail_closed',
-        'native_pushdown', 'subject_id equality and prepared subject params pushed through fdw_private with executor recheck',
-        'storage_policy', 'no_all_pairs_index_no_prompt_token_blob_cache',
-        'mutation_policy', 'no_user_table_mutation',
-        'worker_handoff', 'shared_memory_xact_commit_latch'
-      )
-    FROM plan
-  ) explained(step_order, node, detail)
-  ORDER BY step_order;
 $$;

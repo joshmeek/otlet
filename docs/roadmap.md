@@ -21,13 +21,11 @@ The extension keeps source rows in user tables. Users choose rows with SQL, Otle
 | Order | Track | Outcome |
 | --- | --- | --- |
 | 1 | Benchmarks | Compare local models on Otlet tasks with latency, quality, memory, and crash evidence |
-| 2 | Entity resolution | Ship a clear demo that resolves hard row pairs without all-pairs inference |
-| 3 | Production policy | Make stale rows, traces, caches, queues, and writes safe by default |
-| 4 | Planner work | Cost and explain semantic lookup, refresh, wait, fail-closed, and infer-now paths |
-| 5 | Actions | Let models propose typed database actions with receipts and approval |
-| 6 | Throughput | Improve queued materialization before pushing synchronous inference |
-| 7 | Model selection | Pick small or strong resident models from measured task history |
-| 8 | Core limits | Test Access Method and Postgres-fork paths where extension hooks fall short |
+| 2 | Planner work | Cost and explain semantic lookup, refresh, wait, fail-closed, and infer-now paths |
+| 3 | Actions | Let models propose typed database actions with receipts and approval |
+| 4 | Throughput | Improve queued materialization before pushing synchronous inference |
+| 5 | Model selection | Pick small or strong resident models from measured task history |
+| 6 | Core limits | Test Access Method and Postgres-fork paths where extension hooks fall short |
 
 ## Benchmarking
 
@@ -42,31 +40,6 @@ task_quality * completed_jobs_per_second / resident_gb
 ```
 
 The benchmark data should live in SQL rows first, then export to Markdown or CSV for README snippets and release notes
-
-## Entity Resolution
-
-Entity resolution should stay the first public demo. It shows why Otlet exists without asking readers to understand planner hooks first
-
-The demo should use ordinary user tables and candidate row IDs. SQL should produce candidate pairs, join by primary key, and pass selected fields to the model. Otlet should return `same_entity`, `different_entity`, or `unclear`, with confidence, receipts, and trace state available from SQL
-
-The example needs records that defeat simple string normalization: rebrands, shared addresses, old domains, acquisition notes, payment metadata, and near matches that should stay separate. SQL should generate candidates; the model should make the judgment call
-
-## Production Policy
-
-Otlet should make unsafe behavior hard to miss. Stale semantic state should refresh, wait, infer-now, or fail closed according to explicit policy. User-table writes should pass through typed actions and receipts. Trace and cache storage should stay bounded
-
-The policy surface should cover queue slots, prompt bytes, output tokens, trace depth, timeout behavior, retries, cancellation, cache bounds, receipt retention, trace retention, and materialization invalidation
-
-Operators should be able to answer these questions from SQL:
-
-| Question | SQL evidence |
-| --- | --- |
-| Is the model resident | runtime status and model slot metrics |
-| Is work backing up | queue depth, active jobs, slow tasks |
-| Are rows stale | stale counts, refresh coverage, source hashes |
-| Are outputs trusted | schema validation status and receipt hashes |
-| Are traces safe | trace policy, trace counts, retention state |
-| Are caches healthy | cache entries, bytes, hits, evictions, invalidation reasons |
 
 ## Planner And Executor
 
