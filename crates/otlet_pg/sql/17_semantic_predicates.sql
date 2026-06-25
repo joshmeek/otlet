@@ -101,64 +101,6 @@ AS $$
     AND semantic_matches_auto.allow_refresh IS NOT NULL;
 $$;
 
-CREATE FUNCTION otlet.semantic_matches_program(
-  program_name text,
-  subject_id text
-) RETURNS boolean
-LANGUAGE plpgsql
-STABLE
-STRICT
-COST 1000
-AS $$
-DECLARE
-  program_row otlet.semantic_programs%ROWTYPE;
-BEGIN
-  SELECT *
-  INTO program_row
-  FROM otlet.semantic_programs sp
-  WHERE sp.name = semantic_matches_program.program_name;
-
-  IF NOT FOUND THEN
-    RAISE EXCEPTION 'otlet semantic program % does not exist', semantic_matches_program.program_name;
-  END IF;
-
-  RETURN otlet.semantic_matches(
-    program_row.index_name,
-    semantic_matches_program.subject_id,
-    program_row.expected
-  );
-END;
-$$;
-
-CREATE FUNCTION otlet.semantic_join_matches_program(
-  program_name text,
-  subject_id text
-) RETURNS boolean
-LANGUAGE plpgsql
-STABLE
-STRICT
-COST 1000
-AS $$
-DECLARE
-  program_row otlet.semantic_join_programs%ROWTYPE;
-BEGIN
-  SELECT *
-  INTO program_row
-  FROM otlet.semantic_join_programs sp
-  WHERE sp.name = semantic_join_matches_program.program_name;
-
-  IF NOT FOUND THEN
-    RAISE EXCEPTION 'otlet semantic join program % does not exist', semantic_join_matches_program.program_name;
-  END IF;
-
-  RETURN otlet.semantic_join_matches(
-    program_row.index_name,
-    semantic_join_matches_program.subject_id,
-    program_row.expected
-  );
-END;
-$$;
-
 CREATE FUNCTION otlet.semantic_action_matches(
   index_name text,
   subject_id text,
@@ -251,43 +193,10 @@ BEGIN
 END;
 $$;
 
-CREATE FUNCTION otlet.semantic_action_matches_program(
-  program_name text,
-  subject_id text
-) RETURNS boolean
-LANGUAGE plpgsql
-STABLE
-STRICT
-COST 1000
-AS $$
-DECLARE
-  program_row otlet.semantic_action_programs%ROWTYPE;
-BEGIN
-  SELECT *
-  INTO program_row
-  FROM otlet.semantic_action_programs sp
-  WHERE sp.name = semantic_action_matches_program.program_name;
-
-  IF NOT FOUND THEN
-    RAISE EXCEPTION 'otlet semantic action program % does not exist', semantic_action_matches_program.program_name;
-  END IF;
-
-  RETURN otlet.semantic_action_matches(
-    program_row.index_name,
-    semantic_action_matches_program.subject_id,
-    program_row.action_type,
-    program_row.expected
-  );
-END;
-$$;
-
 ALTER FUNCTION otlet.semantic_join_matches(text, text, jsonb) VOLATILE PARALLEL RESTRICTED;
 ALTER FUNCTION otlet.semantic_join_matches_auto(text, text, jsonb, integer, integer, integer, boolean) VOLATILE PARALLEL RESTRICTED;
-ALTER FUNCTION otlet.semantic_join_matches_program(text, text) VOLATILE PARALLEL RESTRICTED;
 
 ALTER FUNCTION otlet.semantic_matches(text, text, jsonb) VOLATILE PARALLEL RESTRICTED;
 ALTER FUNCTION otlet.semantic_matches_auto(text, text, jsonb, integer, integer, integer, boolean) VOLATILE PARALLEL RESTRICTED;
-ALTER FUNCTION otlet.semantic_matches_program(text, text) VOLATILE PARALLEL RESTRICTED;
 
 ALTER FUNCTION otlet.semantic_action_matches(text, text, text, jsonb) VOLATILE PARALLEL RESTRICTED;
-ALTER FUNCTION otlet.semantic_action_matches_program(text, text) VOLATILE PARALLEL RESTRICTED;

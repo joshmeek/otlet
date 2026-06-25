@@ -10,8 +10,6 @@ use std::sync::{Mutex, OnceLock};
 struct SemanticFdwOptions {
     index_name: String,
     access_kind: SemanticAccessKind,
-    min_freshness: f64,
-    allow_refresh: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]

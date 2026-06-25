@@ -120,49 +120,50 @@ AS $$
     AND semantic_join_matches_auto.allow_refresh IS NOT NULL;
 $$;
 
-CREATE FUNCTION otlet.semantic_join_index_stats(
+CREATE FUNCTION otlet.semantic_join_index_plan(
   index_name text
 ) RETURNS TABLE (
+  selected_path text,
+  reason text,
+  effective_stale_policy text,
   name text,
   task_name text,
   record_type text,
-  model_name text,
-  max_candidate_rows integer,
   total_pairs bigint,
   ready_pairs bigint,
   stale_pairs bigint,
   missing_pairs bigint,
   refresh_pairs bigint,
-  active_jobs bigint,
-  completed_jobs bigint,
   freshness numeric,
-  avg_generate_ms numeric,
   estimated_lookup_ms numeric,
   estimated_refresh_ms numeric,
   estimated_fresh_inference_ms numeric,
-  last_refresh_at timestamptz,
-  last_lookup_at timestamptz,
-  last_materialized_at timestamptz
+  active_jobs bigint,
+  completed_jobs bigint
 )
 LANGUAGE plpgsql
 AS $$
 DECLARE
   index_row otlet.semantic_join_indexes%ROWTYPE;
-  total_count bigint;
-  ready_count bigint;
-  stale_count bigint;
-  missing_count bigint;
-  active_count bigint;
-  complete_count bigint;
-  generate_ms numeric;
+  v_total_pairs bigint := 0;
+  v_ready_pairs bigint := 0;
+  v_stale_pairs bigint := 0;
+  v_missing_pairs bigint := 0;
+  v_refresh_pairs bigint := 0;
+  v_active_jobs bigint := 0;
+  v_completed_jobs bigint := 0;
+  v_generate_ms numeric := 2500;
+  v_stale_policy text;
+  v_selected_path text;
+  v_reason text;
 BEGIN
   SELECT *
   INTO index_row
   FROM otlet.semantic_join_indexes sji
-  WHERE sji.name = semantic_join_index_stats.index_name;
+  WHERE sji.name = semantic_join_index_plan.index_name;
 
   IF NOT FOUND THEN
-    RAISE EXCEPTION 'otlet semantic join index % does not exist', semantic_join_index_stats.index_name;
+    RAISE EXCEPTION 'otlet semantic join index % does not exist', semantic_join_index_plan.index_name;
   END IF;
 
   EXECUTE format(
@@ -204,10 +205,10 @@ BEGIN
         LEFT JOIN latest l USING (subject_id)
       )
       SELECT
-        count(*)::bigint AS total_pairs,
-        count(*) FILTER (WHERE has_materialization AND stale = false AND source_fresh)::bigint AS ready_pairs,
-        count(*) FILTER (WHERE has_materialization AND NOT (stale = false AND source_fresh))::bigint AS stale_pairs,
-        count(*) FILTER (WHERE NOT has_materialization)::bigint AS missing_pairs
+        count(*)::bigint,
+        count(*) FILTER (WHERE has_materialization AND stale = false AND source_fresh)::bigint,
+        count(*) FILTER (WHERE has_materialization AND NOT (stale = false AND source_fresh))::bigint,
+        count(*) FILTER (WHERE NOT has_materialization)::bigint
       FROM classified
     $sql$,
     index_row.candidate_query,
@@ -215,17 +216,26 @@ BEGIN
     index_row.task_name,
     index_row.record_type
   )
-  INTO total_count, ready_count, stale_count, missing_count;
+  INTO v_total_pairs, v_ready_pairs, v_stale_pairs, v_missing_pairs;
+
+  v_total_pairs := COALESCE(v_total_pairs, 0);
+  v_ready_pairs := COALESCE(v_ready_pairs, 0);
+  v_stale_pairs := COALESCE(v_stale_pairs, 0);
+  v_missing_pairs := COALESCE(v_missing_pairs, 0);
+  v_refresh_pairs := v_stale_pairs + v_missing_pairs;
 
   SELECT
     count(*) FILTER (WHERE j.status IN ('queued', 'running', 'cancel_requested')),
     count(*) FILTER (WHERE j.status = 'complete')
-  INTO active_count, complete_count
+  INTO v_active_jobs, v_completed_jobs
   FROM otlet.jobs j
   WHERE j.task_name = index_row.task_name;
 
+  v_active_jobs := COALESCE(v_active_jobs, 0);
+  v_completed_jobs := COALESCE(v_completed_jobs, 0);
+
   SELECT COALESCE(NULLIF(rs.last_generate_ms, 0), 2500)::numeric
-  INTO generate_ms
+  INTO v_generate_ms
   FROM otlet.runtime_slots rs
   JOIN otlet.models m ON m.name = index_row.model_name
   WHERE rs.model_name = index_row.model_name
@@ -233,101 +243,53 @@ BEGIN
   ORDER BY rs.last_used_at DESC NULLS LAST
   LIMIT 1;
 
-  generate_ms := COALESCE(generate_ms, 2500);
+  v_generate_ms := COALESCE(v_generate_ms, 2500);
+
+  SELECT policy.stale_policy
+  INTO v_stale_policy
+  FROM otlet.production_policy policy
+  LIMIT 1;
+
+  v_stale_policy := COALESCE(v_stale_policy, 'lookup_only_fail_closed');
+
+  IF v_total_pairs = 0 THEN
+    v_selected_path := 'semantic_join_lookup';
+    v_reason := 'empty candidate set';
+  ELSIF v_active_jobs > 0 THEN
+    v_selected_path := 'wait_for_refresh';
+    v_reason := 'pair refresh already active';
+  ELSIF v_refresh_pairs = 0 THEN
+    v_selected_path := 'semantic_join_lookup';
+    v_reason := 'semantic join index fully fresh';
+  ELSIF v_stale_policy = 'lookup_only_fail_closed' THEN
+    v_selected_path := 'semantic_join_lookup';
+    v_reason := 'policy returns fresh pair lookup rows only';
+  ELSIF v_refresh_pairs < v_total_pairs THEN
+    v_selected_path := 'refresh_then_lookup';
+    v_reason := 'partial pair refresh cheaper than full fresh inference';
+  ELSE
+    v_selected_path := 'fresh_pair_inference';
+    v_reason := 'fresh pair inference has no reusable semantic coverage';
+  END IF;
 
   RETURN QUERY
   SELECT
+    v_selected_path,
+    v_reason,
+    v_stale_policy,
     index_row.name,
     index_row.task_name,
     index_row.record_type,
-    index_row.model_name,
-    index_row.max_candidate_rows,
-    COALESCE(total_count, 0),
-    COALESCE(ready_count, 0),
-    COALESCE(stale_count, 0),
-    COALESCE(missing_count, 0),
-    COALESCE(stale_count, 0) + COALESCE(missing_count, 0),
-    COALESCE(active_count, 0),
-    COALESCE(complete_count, 0),
-    CASE WHEN COALESCE(total_count, 0) = 0 THEN 1::numeric ELSE round(COALESCE(ready_count, 0)::numeric / total_count, 4) END,
-    generate_ms,
-    round(1 + (COALESCE(ready_count, 0)::numeric * 0.05), 2),
-    round(((COALESCE(stale_count, 0) + COALESCE(missing_count, 0))::numeric * generate_ms) + 1 + (COALESCE(total_count, 0)::numeric * 0.05), 2),
-    round(COALESCE(total_count, 0)::numeric * generate_ms, 2),
-    index_row.last_refresh_at,
-    index_row.last_lookup_at,
-    index_row.last_materialized_at;
+    v_total_pairs,
+    v_ready_pairs,
+    v_stale_pairs,
+    v_missing_pairs,
+    v_refresh_pairs,
+    CASE WHEN v_total_pairs = 0 THEN 1::numeric ELSE round(v_ready_pairs::numeric / v_total_pairs, 4) END,
+    round(1 + (v_ready_pairs::numeric * 0.05), 2),
+    round((v_refresh_pairs::numeric * v_generate_ms) + 1 + (v_total_pairs::numeric * 0.05), 2),
+    round(v_total_pairs::numeric * v_generate_ms, 2),
+    v_active_jobs,
+    v_completed_jobs;
 END;
-$$;
-
-CREATE FUNCTION otlet.semantic_join_index_plan(
-  index_name text,
-  allow_refresh boolean DEFAULT true
-) RETURNS TABLE (
-  selected_path text,
-  reason text,
-  effective_stale_policy text,
-  name text,
-  task_name text,
-  record_type text,
-  total_pairs bigint,
-  ready_pairs bigint,
-  stale_pairs bigint,
-  missing_pairs bigint,
-  refresh_pairs bigint,
-  freshness numeric,
-  estimated_lookup_ms numeric,
-  estimated_refresh_ms numeric,
-  estimated_fresh_inference_ms numeric,
-  active_jobs bigint,
-  completed_jobs bigint
-)
-LANGUAGE sql
-AS $$
-  WITH stats AS (
-    SELECT *
-    FROM otlet.semantic_join_index_stats($1)
-  ),
-  decision AS (
-    SELECT
-      CASE
-        WHEN total_pairs = 0 THEN 'semantic_join_lookup'
-        WHEN active_jobs > 0 THEN 'wait_for_refresh'
-        WHEN refresh_pairs = 0 THEN 'semantic_join_lookup'
-        WHEN policy.stale_policy = 'lookup_only_fail_closed' THEN 'semantic_join_lookup'
-        WHEN $2 THEN 'refresh_then_lookup'
-        ELSE 'fresh_pair_inference'
-      END AS selected_path,
-      CASE
-        WHEN total_pairs = 0 THEN 'empty candidate set'
-        WHEN active_jobs > 0 THEN 'pair refresh already active'
-        WHEN refresh_pairs = 0 THEN 'semantic join index fully fresh'
-        WHEN policy.stale_policy = 'lookup_only_fail_closed' THEN 'policy returns fresh pair lookup rows only'
-        WHEN $2 THEN 'bounded pair refresh required'
-        ELSE 'fresh pair inference required'
-      END AS reason,
-      policy.stale_policy AS effective_stale_policy,
-      stats.*
-    FROM stats
-    CROSS JOIN otlet.production_policy policy
-  )
-  SELECT
-    selected_path,
-    reason,
-    effective_stale_policy,
-    name,
-    task_name,
-    record_type,
-    total_pairs,
-    ready_pairs,
-    stale_pairs,
-    missing_pairs,
-    refresh_pairs,
-    freshness,
-    estimated_lookup_ms,
-    estimated_refresh_ms,
-    estimated_fresh_inference_ms,
-    active_jobs,
-    completed_jobs
-  FROM decision;
 $$;

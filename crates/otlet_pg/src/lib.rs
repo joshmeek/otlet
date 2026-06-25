@@ -71,14 +71,9 @@ pgrx::extension_sql_file!(
     requires = ["semantic_join_core"]
 );
 pgrx::extension_sql_file!(
-    "../sql/14_semantic_programs.sql",
-    name = "semantic_programs",
-    requires = ["semantic_join_plan"]
-);
-pgrx::extension_sql_file!(
     "../sql/17_semantic_predicates.sql",
     name = "semantic_predicates",
-    requires = ["semantic_programs"]
+    requires = ["semantic_join_plan"]
 );
 pgrx::extension_sql_file!(
     "../sql/18_semantic_status_plan.sql",

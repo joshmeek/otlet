@@ -85,13 +85,8 @@ fn load_effective_plan(
             return Ok(plan);
         }
 
-        if opts.allow_refresh {
-            plan.selected_path = "refresh_then_lookup".to_string();
-            plan.reason = "pushed subject rows stale or missing".to_string();
-        } else {
-            plan.selected_path = "fresh_inference_scan".to_string();
-            plan.reason = "pushed subject rows stale or missing and refresh disabled".to_string();
-        }
+        plan.selected_path = "refresh_then_lookup".to_string();
+        plan.reason = "pushed subject rows stale or missing".to_string();
     }
 
     apply_materialization_filter_plan(opts, pushdown, plan)

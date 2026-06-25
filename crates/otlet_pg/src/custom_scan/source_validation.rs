@@ -324,24 +324,24 @@ fn validate_semantic_join_index_source(
     auto_policy: bool,
 ) -> Option<SemanticPlannerStats> {
     let stats_query = format!(
-        "WITH stats AS ( \
-           SELECT * \
-           FROM otlet.semantic_join_index_stats({}) \
-         ), \
-         current_rows AS ( \
-           SELECT subject_id, body, stale \
-           FROM otlet.semantic_join_index_current_rows({}, false) \
-         ) \
-         SELECT \
-           COALESCE((SELECT total_pairs FROM stats), 0)::bigint AS source_rows, \
-           count(*) FILTER (WHERE stale = false AND body @> {}::jsonb)::bigint AS fresh_matches, \
-           count(*) FILTER (WHERE stale = false AND NOT (body @> {}::jsonb))::bigint AS fresh_non_matches, \
-           COALESCE((SELECT stale_pairs FROM stats), 0)::bigint AS stale_rows, \
-           COALESCE((SELECT missing_pairs FROM stats), 0)::bigint AS missing_rows, \
-           COALESCE((SELECT active_jobs FROM stats), 0)::bigint AS inflight_rows, \
-           0::bigint AS cache_reusable_rows, \
-           COALESCE((SELECT avg_generate_ms FROM stats), 2500)::float8 AS model_ms \
-         FROM current_rows",
+        "WITH plan AS ( \
+	           SELECT * \
+	           FROM otlet.semantic_join_index_plan({}) \
+	         ), \
+	         current_rows AS ( \
+	           SELECT subject_id, body, stale \
+	           FROM otlet.semantic_join_index_current_rows({}, false) \
+	         ) \
+	         SELECT \
+	           COALESCE((SELECT total_pairs FROM plan), 0)::bigint AS source_rows, \
+	           count(*) FILTER (WHERE stale = false AND body @> {}::jsonb)::bigint AS fresh_matches, \
+	           count(*) FILTER (WHERE stale = false AND NOT (body @> {}::jsonb))::bigint AS fresh_non_matches, \
+	           COALESCE((SELECT stale_pairs FROM plan), 0)::bigint AS stale_rows, \
+	           COALESCE((SELECT missing_pairs FROM plan), 0)::bigint AS missing_rows, \
+	           COALESCE((SELECT active_jobs FROM plan), 0)::bigint AS inflight_rows, \
+	           0::bigint AS cache_reusable_rows, \
+	           COALESCE((SELECT estimated_fresh_inference_ms / NULLIF(total_pairs, 0) FROM plan), 2500)::float8 AS model_ms \
+	         FROM current_rows",
         sql_literal(index_name),
         sql_literal(index_name),
         sql_literal(expected_json),

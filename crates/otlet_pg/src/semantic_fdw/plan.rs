@@ -37,8 +37,6 @@ unsafe fn semantic_options(relid: pg_sys::Oid) -> Result<SemanticFdwOptions, Str
 
         let mut index_name = None;
         let mut join_index_name = None;
-        let mut min_freshness: f64 = 1.0;
-        let mut allow_refresh = true;
         let options = (*table).options;
         let len = pg_sys::list_length(options);
 
@@ -54,29 +52,6 @@ unsafe fn semantic_options(relid: pg_sys::Oid) -> Result<SemanticFdwOptions, Str
             match name.as_ref() {
                 "index_name" => index_name = Some(value),
                 "join_index_name" => join_index_name = Some(value),
-                "min_freshness" => {
-                    min_freshness = value.parse::<f64>().map_err(|_| {
-                        format!(
-                            "otlet semantic FDW option min_freshness must be numeric between 0 and 1, got {value}"
-                        )
-                    })?;
-                    if !min_freshness.is_finite() || !(0.0..=1.0).contains(&min_freshness) {
-                        return Err(format!(
-                            "otlet semantic FDW option min_freshness must be numeric between 0 and 1, got {value}"
-                        ));
-                    }
-                }
-                "allow_refresh" => {
-                    allow_refresh = match value.as_str() {
-                        "true" => true,
-                        "false" => false,
-                        _ => {
-                            return Err(format!(
-                                "otlet semantic FDW option allow_refresh must be true or false, got {value}"
-                            ));
-                        }
-                    }
-                }
                 _ => return Err(format!("otlet semantic FDW unknown option {name}")),
             }
         }
@@ -99,8 +74,6 @@ unsafe fn semantic_options(relid: pg_sys::Oid) -> Result<SemanticFdwOptions, Str
         Ok(SemanticFdwOptions {
             index_name,
             access_kind,
-            min_freshness,
-            allow_refresh,
         })
     }
 }
@@ -113,10 +86,8 @@ fn load_plan(opts: &SemanticFdwOptions) -> Result<SemanticFdwPlan, String> {
              estimated_lookup_ms::float8 AS estimated_lookup_ms, \
              estimated_refresh_ms::float8 AS estimated_refresh_ms, \
              estimated_fresh_inference_ms::float8 AS estimated_fresh_inference_ms \
-             FROM otlet.semantic_index_plan({}, {}, {})",
-            sql_literal(&opts.index_name),
-            opts.min_freshness,
-            opts.allow_refresh
+             FROM otlet.semantic_index_plan({})",
+            sql_literal(&opts.index_name)
         ),
         SemanticAccessKind::JoinIndex => format!(
             "SELECT selected_path, reason, task_name, total_pairs AS total_rows, refresh_pairs AS refresh_rows, \
@@ -124,9 +95,8 @@ fn load_plan(opts: &SemanticFdwOptions) -> Result<SemanticFdwPlan, String> {
              estimated_lookup_ms::float8 AS estimated_lookup_ms, \
              estimated_refresh_ms::float8 AS estimated_refresh_ms, \
              estimated_fresh_inference_ms::float8 AS estimated_fresh_inference_ms \
-             FROM otlet.semantic_join_index_plan({}, {})",
-            sql_literal(&opts.index_name),
-            opts.allow_refresh
+             FROM otlet.semantic_join_index_plan({})",
+            sql_literal(&opts.index_name)
         ),
     };
 
@@ -270,7 +240,7 @@ fn lookup_rows_query(
     match opts.access_kind {
         SemanticAccessKind::RowIndex => format!(
             "SELECT latest.subject_id, latest.body::text AS body, latest.stale, latest.source_hash, latest.updated_at::text AS updated_at \
-             FROM otlet.semantic_index_lookup({}, true) latest \
+             FROM otlet.semantic_index_current_rows({}, true) latest \
              WHERE true{}{}{}{} \
              ORDER BY latest.subject_id",
             sql_literal(&opts.index_name),
@@ -281,7 +251,7 @@ fn lookup_rows_query(
         ),
         SemanticAccessKind::JoinIndex => format!(
             "SELECT latest.subject_id, latest.body::text AS body, latest.stale, latest.source_hash, latest.updated_at::text AS updated_at \
-             FROM otlet.semantic_join_index_lookup({}, true) latest \
+             FROM otlet.semantic_join_index_current_rows({}, true) latest \
              WHERE true{}{}{}{} \
              ORDER BY latest.subject_id",
             sql_literal(&opts.index_name),

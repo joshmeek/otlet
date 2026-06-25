@@ -11,101 +11,6 @@ AS $$
   END;
 $$;
 
-CREATE FUNCTION otlet.semantic_source_view_name(
-  index_name text
-) RETURNS text
-LANGUAGE sql
-IMMUTABLE
-STRICT
-AS $$
-  SELECT CASE
-    WHEN ($1 || '_source') ~ '^[a-z][a-z0-9_]*$' AND length($1 || '_source') <= 63 THEN $1 || '_source'
-    ELSE 'semantic_src_' || substr(regexp_replace($1, '[^a-z0-9_]', '_', 'g'), 1, 40) || '_' || substr(md5($1), 1, 8)
-  END;
-$$;
-
-CREATE FUNCTION otlet.create_semantic_source_view(
-  index_name text,
-  view_name text DEFAULT NULL
-) RETURNS regclass
-LANGUAGE plpgsql
-AS $$
-DECLARE
-  index_row otlet.semantic_indexes%ROWTYPE;
-  resolved_view_name text := COALESCE(view_name, otlet.semantic_source_view_name(index_name));
-  source_columns text;
-  reserved_columns text[] := ARRAY[
-    'otlet_semantic_ready',
-    'otlet_subject_id',
-    'otlet_semantic_body',
-    'otlet_semantic_stale',
-    'otlet_semantic_source_hash',
-    'otlet_semantic_updated_at'
-  ];
-BEGIN
-  IF resolved_view_name !~ '^[a-z][a-z0-9_]*$' OR length(resolved_view_name) > 63 THEN
-    RAISE EXCEPTION 'otlet semantic source view name % must be a simple SQL identifier', resolved_view_name;
-  END IF;
-
-  SELECT *
-  INTO index_row
-  FROM otlet.semantic_indexes si
-  WHERE si.name = create_semantic_source_view.index_name;
-
-  IF NOT FOUND THEN
-    RAISE EXCEPTION 'otlet semantic index % does not exist', create_semantic_source_view.index_name;
-  END IF;
-
-  IF EXISTS (
-    SELECT 1
-    FROM pg_attribute
-    WHERE attrelid = index_row.source_table::regclass
-      AND attname = ANY(reserved_columns)
-      AND attnum > 0
-      AND NOT attisdropped
-  ) THEN
-    RAISE EXCEPTION 'source table % already has one of the reserved Otlet semantic view columns: %',
-      index_row.source_table,
-      array_to_string(reserved_columns, ', ');
-  END IF;
-
-  SELECT string_agg(format('src.%I', attname), ', ' ORDER BY attnum)
-  INTO source_columns
-  FROM pg_attribute
-  WHERE attrelid = index_row.source_table::regclass
-    AND attnum > 0
-    AND NOT attisdropped;
-
-  IF source_columns IS NULL THEN
-    RAISE EXCEPTION 'otlet semantic source table % has no visible columns', index_row.source_table;
-  END IF;
-
-  EXECUTE format(
-    $sql$
-      CREATE OR REPLACE VIEW otlet.%1$I AS
-      SELECT
-        %2$s,
-        sem.subject_id IS NOT NULL AS otlet_semantic_ready,
-        sem.subject_id AS otlet_subject_id,
-        sem.body AS otlet_semantic_body,
-        sem.stale AS otlet_semantic_stale,
-        sem.source_hash AS otlet_semantic_source_hash,
-        sem.updated_at AS otlet_semantic_updated_at
-      FROM %3$s AS src
-      LEFT JOIN otlet.%4$I AS sem
-        ON sem.subject_id = (src.%5$I)::text
-    $sql$,
-    resolved_view_name,
-    source_columns,
-    index_row.source_table,
-    otlet.semantic_native_table_name(index_row.name),
-    index_row.subject_column
-  );
-
-  RETURN format('otlet.%I', resolved_view_name)::regclass;
-END;
-$$;
-
 CREATE FUNCTION otlet.create_semantic_index(
   index_name text,
   table_name regclass,
@@ -221,7 +126,6 @@ BEGIN
     otlet.semantic_native_table_name(index_name),
     index_name
   );
-  PERFORM otlet.create_semantic_source_view(index_name);
 
   RETURN saved;
 END;
@@ -245,8 +149,6 @@ BEGIN
   IF NOT FOUND THEN
     RETURN false;
   END IF;
-
-  EXECUTE format('DROP VIEW IF EXISTS otlet.%I', otlet.semantic_source_view_name(index_row.name));
 
   FOR native_table IN
     SELECT format('%I.%I', ns.nspname, c.relname)
@@ -595,77 +497,6 @@ BEGIN
     index_row.task_name,
     index_row.record_type,
     CASE WHEN COALESCE(semantic_index_current_rows.fresh_only, true) THEN 'true' ELSE 'false' END
-  );
-END;
-$$;
-
-CREATE FUNCTION otlet.semantic_index_lookup(
-  index_name text,
-  fresh_only boolean DEFAULT true
-) RETURNS TABLE (
-  subject_id text,
-  body jsonb,
-  stale boolean,
-  source_hash text,
-  updated_at timestamptz
-)
-LANGUAGE plpgsql
-AS $$
-DECLARE
-  index_row otlet.semantic_indexes%ROWTYPE;
-BEGIN
-  SELECT *
-  INTO index_row
-  FROM otlet.semantic_indexes
-  WHERE name = semantic_index_lookup.index_name;
-
-  IF NOT FOUND THEN
-    RAISE EXCEPTION 'otlet semantic index % does not exist', semantic_index_lookup.index_name;
-  END IF;
-
-  EXECUTE format(
-    $sql$
-      WITH current_inputs AS (
-        SELECT
-          (src.%1$I)::text AS subject_id,
-          jsonb_build_object(
-            '_otlet_mvcc', jsonb_build_object(
-              'table', %2$L,
-              'subject_id', (src.%1$I)::text,
-              'ctid', src.ctid::text,
-              'xmin', src.xmin::text
-            ),
-            'table', %2$L,
-            'row', to_jsonb(src)
-          ) AS input
-        FROM %3$s AS src
-      )
-      UPDATE otlet.semantic_materializations sm
-      SET stale = true,
-          updated_at = now()
-      FROM current_inputs ci
-      WHERE sm.task_name = %4$L
-        AND sm.record_type = %5$L
-        AND sm.stale = false
-        AND ci.subject_id = sm.subject_id
-        AND md5(ci.input::text) IS DISTINCT FROM sm.source_hash
-    $sql$,
-    index_row.subject_column,
-    index_row.source_table,
-    index_row.source_table,
-    index_row.task_name,
-    index_row.record_type
-  );
-
-  UPDATE otlet.semantic_indexes
-  SET last_lookup_at = now()
-  WHERE name = index_row.name;
-
-  RETURN QUERY
-  SELECT *
-  FROM otlet.semantic_index_current_rows(
-    semantic_index_lookup.index_name,
-    semantic_index_lookup.fresh_only
   );
 END;
 $$;

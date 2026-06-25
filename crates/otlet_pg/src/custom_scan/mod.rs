@@ -159,7 +159,6 @@ include!("child_plan.rs");
 include!("callbacks.rs");
 include!("explain.rs");
 include!("predicate_parse.rs");
-include!("programs.rs");
 include!("source_validation.rs");
 include!("semantic_state.rs");
 include!("counters.rs");

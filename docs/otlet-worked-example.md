@@ -702,15 +702,12 @@ Representative output:
  records
  runtime_slots
  runtimes
- semantic_action_programs
  semantic_indexes
  semantic_join_indexes
- semantic_join_programs
  semantic_materializations
- semantic_programs
  tasks
  worker_events
-(18 rows)
+(15 rows)
 ```
 
 The base tables split into a few jobs:
@@ -719,14 +716,14 @@ The base tables split into a few jobs:
 - `tasks` and `jobs` describe durable work
 - `outputs`, `actions`, `records`, `inference_receipts`, and `worker_events` describe what happened
 - `production_policy` defines queue admission, leases, invalid output handling, stale-result behavior, and cleanup windows
-- `semantic_indexes`, `semantic_materializations`, and semantic program tables make model-derived state queryable
-- `semantic_join_indexes` and `semantic_join_programs` do the same for pairwise candidate rows
+- `semantic_indexes` and `semantic_materializations` make model-derived state queryable
+- `semantic_join_indexes` do the same for pairwise candidate rows
 
 Use `otlet.runs` for application reads. Use trace and status views for debugging, proof, and learning
 
-## Plan Work Before Running It
+## Create A Retry Task
 
-`otlet.inference_scan_plan` tells you what a direct task would enqueue before you run it
+This task is reused below to show terminal failure evidence and safe requeueing
 
 ```sql
 DROP TABLE IF EXISTS public.learning_retry_source;
@@ -751,8 +748,6 @@ FROM otlet.create_task(
   'linked_qwen_0_6b',
   '{"temperature":0,"max_tokens":64,"reasoning":"off"}'::jsonb
 );
-
-SELECT * FROM otlet.inference_scan_plan('learning_retry_task');
 ```
 
 Representative output:
@@ -762,16 +757,7 @@ Representative output:
 ---------------------+-----------------+------------------
  learning_retry_task | t               | linked_qwen_0_6b
 (1 row)
-
-      task_name      |    model_name    | runtime_name  | input_rows | active_rows | queueable_rows | avg_generate_ms | estimated_model_ms |        model_residency_policy
----------------------+------------------+---------------+------------+-------------+----------------+-----------------+--------------------+--------------------------------------
- learning_retry_task | linked_qwen_0_6b | linked_inproc |          1 |           0 |              1 |             999 |                999 | resident_worker_loaded_model_context
-(1 row)
 ```
-
-`input_rows` counts task query results. `active_rows` counts rows already queued or running for the same task and subject. `queueable_rows` counts what Otlet can enqueue now after the per-model queue cap
-
-Semantic indexes use the same planning idea later. Direct tasks expose it first
 
 ## Cancel Queued Work
 
@@ -1039,7 +1025,7 @@ The trigger does not rerun the model. It marks the previous derived fact stale s
 
 ## Build A Semantic Index
 
-A semantic index wraps a source table with an Otlet task, materialized records, stale tracking, a source view, and a native FDW table
+A semantic index wraps a source table with an Otlet task, materialized records, stale tracking, and a native FDW table
 
 The creation shape is:
 
@@ -1148,9 +1134,9 @@ Representative output:
 
 `semantic_index_plan` is Otlet deciding whether it can reuse materialized state, should refresh, should wait, or should run fresh inference
 
-## Read Through FDW And The Source View
+## Read Through FDW
 
-`create_semantic_index` also creates a native foreign table and a source view
+`create_semantic_index` also creates a native foreign table
 
 The FDW table holds materialized semantic state:
 
@@ -1171,26 +1157,7 @@ Representative output:
 (3 rows)
 ```
 
-The source view joins source rows to their semantic state:
-
-```sql
-SELECT id, name, otlet_semantic_ready, otlet_semantic_stale, otlet_semantic_body
-FROM otlet.demo_semantic_vendor_idx_source
-ORDER BY id;
-```
-
-Representative output:
-
-```text
- id |     name      | otlet_semantic_ready | otlet_semantic_stale |                             otlet_semantic_body
-----+---------------+----------------------+----------------------+-----------------------------------------------------------------------------
-  1 | Demo Vendor 1 | t                    | f                    | {"status": "needs_review", "semantic": "indexed row", "needs_review": true}
-  2 | Demo Vendor 2 | t                    | f                    | {"status": "needs_review", "semantic": "indexed row", "needs_review": true}
-  3 | Demo Vendor 3 | t                    | f                    | {"status": "needs_review", "semantic": "indexed row", "needs_review": true}
-(3 rows)
-```
-
-Use the FDW table for semantic rows. Use the source view for source rows plus semantic columns
+Use the FDW table for semantic rows. Use `semantic_index_current_rows` when you want the same state without a foreign table
 
 ## Inspect The Native FDW Plan
 
@@ -1206,95 +1173,14 @@ WHERE subject_id = '2';
 Representative output excerpt:
 
 ```text
-Foreign Scan on otlet.demo_semantic_vendor_idx_native  (cost=0.00..1.05 rows=1 width=129) (actual rows=1.00 loops=1)
-  Output: subject_id, body, stale, source_hash, updated_at
-  Filter: (demo_semantic_vendor_idx_native.subject_id = '2'::text)
+Foreign Scan on otlet.demo_semantic_vendor_idx_native
   Otlet Node: Semantic Foreign Scan
-  Executor Boundary: Foreign Scan
-  Stale Result Policy: fail_closed_zero_subject_rows_until_worker_refresh_commits
-  Worker Handoff: shared_memory_xact_commit_latch
-  Access Kind: semantic_index
   Selected Path: semantic_lookup
-  Reason: pushed subject rows fresh
-  Task Name: demo_semantic_vendor_idx_task
-  Total Rows: 1
-  Refresh Rows: 0
   Freshness: 1.00
-  Actual Rows Loaded: 1
-  Actual Rows Emitted: 1
   Pushed Subject Id: 2
 ```
 
 The FDW runs inside Postgres as a native access path over Otlet-owned semantic materializations
-
-## Compile Semantic Programs
-
-Semantic programs turn a reusable predicate name into a stored expected JSON shape
-
-Compile the reusable output and action programs:
-
-```sql
-SELECT otlet.compile_semantic_program(
-  'demo_vendor_needs_review',
-  'demo_semantic_vendor_idx',
-  'needs_review',
-  '{"status":"needs_review"}'::jsonb
-);
-
-SELECT otlet.compile_semantic_action_program(
-  'demo_vendor_action_indexed',
-  'demo_semantic_vendor_idx',
-  'create_record',
-  'semantic indexed row',
-  '{"record_type":"demo_semantic_fact","body":{"semantic":"indexed row"}}'::jsonb
-);
-
-SELECT name, index_name, expected, program_hash
-FROM otlet.semantic_programs
-WHERE name = 'demo_vendor_needs_review';
-
-SELECT name, index_name, action_type, expected, program_hash
-FROM otlet.semantic_action_programs
-WHERE name = 'demo_vendor_action_indexed';
-```
-
-Representative output:
-
-```text
-           name           |        index_name        |          expected          |           program_hash
---------------------------+--------------------------+----------------------------+----------------------------------
- demo_vendor_needs_review | demo_semantic_vendor_idx | {"status": "needs_review"} | 5c201902979781d1fdf36416efbe4373
-(1 row)
-
-            name            |        index_name        |  action_type  |                                  expected                                  |           program_hash
-----------------------------+--------------------------+---------------+----------------------------------------------------------------------------+----------------------------------
- demo_vendor_action_indexed | demo_semantic_vendor_idx | create_record | {"body": {"semantic": "indexed row"}, "record_type": "demo_semantic_fact"} | 74179009d163da1fc16d8542741245a1
-(1 row)
-```
-
-Then predicates can use explicit JSON, a compiled output program, or a compiled action program:
-
-```sql
-SELECT v.id,
-       otlet.semantic_matches('demo_semantic_vendor_idx', v.id::text, '{"status":"needs_review"}'::jsonb) AS direct_match,
-       otlet.semantic_matches_program('demo_vendor_needs_review', v.id::text) AS program_match,
-       otlet.semantic_action_matches_program('demo_vendor_action_indexed', v.id::text) AS action_match
-FROM public.otlet_demo_semantic_vendor v
-ORDER BY v.id;
-```
-
-Representative output:
-
-```text
- id | direct_match | program_match | action_match
-----+--------------+---------------+--------------
-  1 | t            | t             | t
-  2 | t            | t             | t
-  3 | t            | t             | t
-(3 rows)
-```
-
-Otlet deduplicates programs by hash for each index. The same predicate cannot hide under a second name as unrelated logic
 
 ## Use CustomScan For Source-Row Predicates
 
@@ -1310,25 +1196,12 @@ WHERE otlet.semantic_matches('demo_semantic_vendor_idx', v.id::text, '{"status":
 Representative output excerpt:
 
 ```text
-Custom Scan (Otlet Semantic Source CustomScan) on public.otlet_demo_semantic_vendor v  (cost=1.00..4.14 rows=3 width=144) (actual rows=3.00 loops=1)
-  Output: id, name, email, phone, city, updated_at
+Custom Scan (Otlet Semantic Source CustomScan) on public.otlet_demo_semantic_vendor v
   Otlet Node: Semantic Source CustomScan
-  Semantic Predicate Owner: otlet_customscan_executor
   Child Semantic Filter: stripped_before_child_plan
   Semantic Index: demo_semantic_vendor_idx
-  Semantic Predicate Kind: materialization
-  Semantic Predicate: {"status":"needs_review"}
-  Refresh Policy: fail_closed_no_refresh
-  Worker Handoff: none_for_fail_closed_lookup
-  Planner Semantic Reason: all source rows resolved from fresh semantic state; fresh=3
-  Planner Source Rows: 3
   Planner Fresh Match Rows: 3
-  Planner Stale Rows: 0
-  Rows Seen: 3
-  Rows Returned: 3
   Semantic Cache Hits: 3
-  Semantic Cache Misses: 0
-  ->  Seq Scan on public.otlet_demo_semantic_vendor v
 ```
 
 The child scan reads the source table. Otlet strips the semantic predicate from the child plan and evaluates it against preloaded semantic state
@@ -1384,30 +1257,15 @@ WHERE otlet.semantic_matches_auto('demo_semantic_vendor_idx', v.id::text, '{"sta
 Representative output excerpt:
 
 ```text
-Custom Scan (Otlet Semantic Source CustomScan) on public.otlet_demo_semantic_vendor v  (cost=1.00..12.17 rows=3 width=8) (actual rows=3.00 loops=1)
+Custom Scan (Otlet Semantic Source CustomScan) on public.otlet_demo_semantic_vendor v
   Otlet Node: Semantic Source CustomScan
-  Semantic Predicate Owner: otlet_customscan_executor
   Semantic Index: demo_semantic_vendor_idx
   Refresh Policy: auto_lookup_wait_infer_refresh_fail_closed
-  Worker Handoff: auto_resident_worker_wait_infer_or_commit_latch
   Infer Now Timeout Ms: 15000
   Infer Now Max Rows: 1
-  Infer Now Admission Policy: bounded_shared_memory_infer_queue_4_slots
-  Infer Now Input Path: tuple_slot_mvcc_json_no_spi
-  Planner Semantic Reason: auto semantic policy: fresh=2 wait=0 infer=1 queue=0 fail_closed=0
   Planner Stale Rows: 1
-  Actual Lookup Rows: 2
   Actual Infer Resolved Rows: 1
-  Actual Infer Returned Rows: 1
-  Infer Now Batches: 1
   Infer Now Receipts: 1
-  Infer Now Outputs: 1
-  Infer Now Actions: 1
-  Infer Now Materializations: 1
-  Infer Now Trace Receipt Id: 14
-  Infer Now Trace Version: otlet_generation_trace_v1
-  Infer Now Detailed Trace Captured Tokens: 12
-  Infer Now Detailed Trace Top K: 3
 ```
 
 The executor refreshed the stale row with a bounded infer-now budget and a receipt
@@ -1415,7 +1273,11 @@ The executor refreshed the stale row with a bounded infer-now budget and a recei
 Inspect that receipt:
 
 ```sql
-SELECT receipt_id, task_name, subject_id, executor_origin, executor_node, semantic_index_name, stale_policy, status, prompt_tokens, generated_tokens
+SELECT executor_origin || '|' ||
+       semantic_index_name || '|' ||
+       status || '|' ||
+       (prompt_tokens > 0)::text || '|' ||
+       (generated_tokens >= 0)::text AS receipt_contract
 FROM otlet.inference_receipt_trace_status
 WHERE task_name = 'demo_semantic_vendor_idx_task'
   AND subject_id = '2'
@@ -1426,9 +1288,9 @@ LIMIT 1;
 Representative output:
 
 ```text
- receipt_id |           task_name           | subject_id |   executor_origin    |          executor_node           |   semantic_index_name    |            stale_policy             |  status  | prompt_tokens | generated_tokens
-------------+-------------------------------+------------+----------------------+----------------------------------+--------------------------+-------------------------------------+----------+---------------+------------------
-         14 | demo_semantic_vendor_idx_task | 2          | customscan_infer_now | Otlet Semantic Source CustomScan | demo_semantic_vendor_idx | fail_closed_no_silent_stale_results | complete |           362 |               62
+                    receipt_contract
+---------------------------------------------------------
+ customscan_infer_now|demo_semantic_vendor_idx|complete|t|t
 (1 row)
 ```
 
@@ -1533,13 +1395,13 @@ Now inspect the join index:
 
 ```sql
 SELECT name, task_name, total_pairs, ready_pairs, stale_pairs, missing_pairs, freshness
-FROM otlet.semantic_join_index_stats('learning_entity_pair_idx');
+FROM otlet.semantic_join_index_plan('learning_entity_pair_idx');
 
 SELECT selected_path, reason, effective_stale_policy
 FROM otlet.semantic_join_index_plan('learning_entity_pair_idx');
 
 SELECT subject_id, body, stale
-FROM otlet.semantic_join_index_lookup('learning_entity_pair_idx')
+FROM otlet.semantic_join_index_current_rows('learning_entity_pair_idx', true)
 ORDER BY subject_id;
 ```
 
@@ -1564,41 +1426,25 @@ Representative output:
 
 A semantic join index uses the same contract: jobs, outputs, actions, records, materializations, receipts
 
-## Query A Semantic Join Program
-
-Join programs compile reusable pair predicates
+## Query A Semantic Join Predicate
 
 ```sql
-SELECT name, index_name, expected, program_hash
-FROM otlet.compile_semantic_join_program(
-  'learning_join_same_company',
-  'learning_entity_pair_idx',
-  'match equals yes',
-  '{"match":"yes"}'::jsonb
-);
-
 SELECT subject_id,
-       otlet.semantic_join_matches('learning_entity_pair_idx', subject_id, '{"match":"yes"}'::jsonb) AS direct_match,
-       otlet.semantic_join_matches_program('learning_join_same_company', subject_id) AS program_match
-FROM otlet.semantic_join_index_lookup('learning_entity_pair_idx')
+       otlet.semantic_join_matches('learning_entity_pair_idx', subject_id, '{"match":"yes"}'::jsonb) AS direct_match
+FROM otlet.semantic_join_index_current_rows('learning_entity_pair_idx', true)
 ORDER BY subject_id;
 ```
 
 Representative output:
 
 ```text
-            name            |        index_name        |     expected     |           program_hash
-----------------------------+--------------------------+------------------+----------------------------------
- learning_join_same_company | learning_entity_pair_idx | {"match": "yes"} | b7ead8d08190dfa1eea552f190ed1cc0
-(1 row)
-
- subject_id | direct_match | program_match
-------------+--------------+---------------
- 1:2        | t            | t
+ subject_id | direct_match
+------------+--------------
+ 1:2        | t
 (1 row)
 ```
 
-Use this as the join version of `semantic_matches_program`
+Use explicit JSON predicates for row and join semantic filters
 
 ## Inspect Trace Visibility Across The System
 
@@ -1728,15 +1574,12 @@ Representative output:
  records                   | f
  runtime_slots             | f
  runtimes                  | f
- semantic_action_programs  | f
  semantic_indexes          | f
  semantic_join_indexes     | f
- semantic_join_programs    | f
  semantic_materializations | f
- semantic_programs         | f
  tasks                     | f
  worker_events             | f
-(18 rows)
+(15 rows)
 
  installed_policies
 --------------------

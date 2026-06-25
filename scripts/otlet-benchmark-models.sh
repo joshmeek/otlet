@@ -334,7 +334,6 @@ SQL
     -v model_name="$model_name" \
     -v record_type="$record_type" >/dev/null <<'SQL'
 SET client_min_messages TO warning;
-SELECT format('DROP VIEW IF EXISTS otlet.%I', otlet.semantic_source_view_name(:'index_name')) \gexec
 SELECT format('DROP FOREIGN TABLE IF EXISTS otlet.%I', otlet.semantic_native_table_name(:'index_name')) \gexec
 DROP TABLE IF EXISTS public.otlet_model_benchmark_vendor;
 CREATE TABLE public.otlet_model_benchmark_vendor (

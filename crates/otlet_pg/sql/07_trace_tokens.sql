@@ -121,62 +121,6 @@ SELECT
 FROM otlet.inference_receipt_token_trace t
 CROSS JOIN LATERAL jsonb_array_elements(t.top_alternatives) WITH ORDINALITY AS alt(value, ordinality);
 
-CREATE VIEW otlet.inference_trace_timeline AS
-SELECT
-  t.receipt_id,
-  t.job_id,
-  t.task_name,
-  t.subject_id,
-  t.status,
-  t.model_name,
-  t.runtime_name,
-  t.row_identity,
-  t.mvcc,
-  t.worker_handoff,
-  t.stale_policy,
-  t.stop_reason,
-  t.trace_contract,
-  t.storage_policy,
-  t.logprob_policy,
-  t.max_tokens,
-  t.top_k,
-  t.step,
-  t.token_id,
-  t.token_text,
-  t.token_text_readable,
-  string_agg(t.token_text_readable, '') OVER (
-    PARTITION BY t.receipt_id
-    ORDER BY t.step
-    ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
-  ) AS generated_text_readable_so_far,
-  t.chosen_logit,
-  t.chosen_probability,
-  t.chosen_logprob,
-  t.chosen_rank,
-  t.probability_status
-FROM otlet.inference_receipt_token_trace t;
-
-CREATE VIEW otlet.inference_trace_alternatives AS
-SELECT
-  a.receipt_id,
-  a.job_id,
-  a.task_name,
-  a.subject_id,
-  a.model_name,
-  a.runtime_name,
-  a.row_identity,
-  a.trace_contract,
-  a.step,
-  a.alternative_ordinality,
-  a.alternative_rank,
-  a.token_id,
-  a.token_text,
-  a.token_text_readable,
-  a.logit,
-  a.probability,
-  a.logprob
-FROM otlet.inference_receipt_token_alternative_trace a;
-
 CREATE VIEW otlet.inference_trace_summary AS
 SELECT
   s.receipt_id,
@@ -201,9 +145,6 @@ SELECT
   s.semantic_index_name,
   s.semantic_predicate_kind,
   s.semantic_action_type,
-  s.semantic_program_name,
-  s.semantic_program_hash,
-  s.semantic_program_predicate,
   s.row_identity,
   s.mvcc,
   s.worker_handoff,
@@ -225,50 +166,18 @@ SELECT
   pg_column_size(r.trace_summary)::bigint AS trace_summary_bytes,
   COALESCE((
     SELECT count(*)
-    FROM otlet.inference_trace_timeline t
+    FROM otlet.inference_receipt_token_trace t
     WHERE t.receipt_id = s.receipt_id
   ), 0)::bigint AS token_steps,
   COALESCE((
     SELECT count(*)
-    FROM otlet.inference_trace_alternatives a
+    FROM otlet.inference_receipt_token_alternative_trace a
     WHERE a.receipt_id = s.receipt_id
   ), 0)::bigint AS top_k_alternatives,
   COALESCE((
     SELECT string_agg(t.token_text_readable, '' ORDER BY t.step)
-    FROM otlet.inference_trace_timeline t
+    FROM otlet.inference_receipt_token_trace t
     WHERE t.receipt_id = s.receipt_id
-  ), '') AS chosen_text_readable,
-  COALESCE((
-    SELECT jsonb_agg(o.id ORDER BY o.id)
-    FROM otlet.outputs o
-    WHERE o.job_id = s.job_id
-  ), '[]'::jsonb) AS output_ids,
-  COALESCE((
-    SELECT jsonb_agg(a.id ORDER BY a.id)
-    FROM otlet.actions a
-    WHERE a.job_id = s.job_id
-  ), '[]'::jsonb) AS action_ids,
-  COALESCE((
-    SELECT jsonb_agg(sm.id ORDER BY sm.id)
-    FROM otlet.semantic_materializations sm
-    WHERE sm.task_name = s.task_name
-      AND sm.subject_id = s.subject_id
-  ), '[]'::jsonb) AS materialization_ids,
-  format(
-    'SELECT * FROM otlet.inference_trace_summary WHERE receipt_id = %s',
-    s.receipt_id
-  ) AS summary_sql,
-  format(
-    'SELECT * FROM otlet.inference_trace_timeline WHERE receipt_id = %s ORDER BY step',
-    s.receipt_id
-  ) AS timeline_sql,
-  format(
-    'SELECT * FROM otlet.inference_trace_alternatives WHERE receipt_id = %s ORDER BY step, alternative_rank',
-    s.receipt_id
-  ) AS alternatives_sql,
-  format(
-    'SELECT * FROM otlet.inference_trace_chain WHERE receipt_id = %s',
-    s.receipt_id
-  ) AS chain_sql
+  ), '') AS chosen_text_readable
 FROM otlet.inference_receipt_trace_status s
 JOIN otlet.inference_receipts r ON r.id = s.receipt_id;

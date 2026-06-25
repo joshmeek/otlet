@@ -520,7 +520,7 @@ echo "semantic_join_materialized=$materialized"
 
 join_status_contract="$(psql_value "
 SELECT selected_path || '|' || total_pairs || '|' || ready_pairs || '|' || stale_pairs || '|' || missing_pairs
-FROM otlet.semantic_join_index_plan('$join_index_name', true);
+FROM otlet.semantic_join_index_plan('$join_index_name');
 ")"
 echo "semantic_join_status_contract=$join_status_contract"
 [ "$join_status_contract" = "semantic_join_lookup|2|2|0|0" ] || {
@@ -590,9 +590,9 @@ echo "entity_resolution_stale_materializations=$direct_stale_materializations"
 
 join_stale_contract="$(psql_value "
 SELECT stale_pairs::text || '|' || ready_pairs::text
-FROM otlet.semantic_join_index_stats('$join_index_name');
+FROM otlet.semantic_join_index_plan('$join_index_name');
 SELECT count(*)::text
-FROM otlet.semantic_join_index_lookup('$join_index_name');
+FROM otlet.semantic_join_index_current_rows('$join_index_name', true);
 ")"
 join_stale_pairs="$(head -n 1 <<<"$join_stale_contract")"
 join_fresh_after_lookup="$(tail -n 1 <<<"$join_stale_contract")"

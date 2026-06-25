@@ -78,10 +78,6 @@ unsafe fn semantic_match_from_clause(
             index_name: parts.index_name,
             expected_json: parts.expected_json,
             action_type: parts.action_type,
-            program_name: parts.program_name,
-            program_hash: parts.program_hash,
-            program_predicate: parts.program_predicate,
-            program_compiler_mode: parts.program_compiler_mode,
             auto_policy: parts.auto_policy,
             allow_refresh: parts.allow_refresh,
             wait_ms: parts.wait_ms,
@@ -103,10 +99,6 @@ struct ParsedSemanticMatch {
     subject: SubjectVar,
     expected_json: String,
     action_type: Option<String>,
-    program_name: Option<String>,
-    program_hash: Option<String>,
-    program_predicate: Option<String>,
-    program_compiler_mode: Option<String>,
     auto_policy: bool,
     allow_refresh: bool,
     wait_ms: u32,
@@ -123,9 +115,6 @@ unsafe fn semantic_match_function_parts(
         let is_matches = is_otlet_function((*func).funcid, "semantic_matches");
         let is_auto = is_otlet_function((*func).funcid, "semantic_matches_auto");
         let is_action_matches = is_otlet_function((*func).funcid, "semantic_action_matches");
-        let is_action_program =
-            is_otlet_function((*func).funcid, "semantic_action_matches_program");
-        let is_program = is_otlet_function((*func).funcid, "semantic_matches_program");
         if is_action_matches {
             if pg_sys::list_length((*func).args) < 4 {
                 return None;
@@ -141,89 +130,6 @@ unsafe fn semantic_match_function_parts(
                 subject: subject_var(subject_arg, rti)?,
                 expected_json: jsonb_const_text(expected_arg)?,
                 action_type: Some(text_const_value(action_type_arg)?),
-                program_name: None,
-                program_hash: None,
-                program_predicate: None,
-                program_compiler_mode: None,
-                auto_policy: false,
-                allow_refresh: false,
-                wait_ms: 0,
-                infer_ms: 0,
-                infer_max_rows: 0,
-            });
-        }
-        if is_action_program {
-            if pg_sys::list_length((*func).args) < 2 {
-                return None;
-            }
-            let program_arg = pg_sys::list_nth((*func).args, 0) as *mut pg_sys::Expr;
-            let subject_arg = pg_sys::list_nth((*func).args, 1) as *mut pg_sys::Expr;
-            let program_name = text_const_value(program_arg)?;
-            let program = load_semantic_action_program(&program_name)?;
-            return Some(ParsedSemanticMatch {
-                index_kind: SemanticIndexKind::Row,
-                predicate_kind: SemanticPredicateKind::Action,
-                index_name: program.index_name,
-                subject: subject_var(subject_arg, rti)?,
-                expected_json: program.expected_json,
-                action_type: Some(program.action_type),
-                program_name: Some(program.name),
-                program_hash: Some(program.program_hash),
-                program_predicate: Some(program.predicate),
-                program_compiler_mode: Some(program.compiler_mode),
-                auto_policy: false,
-                allow_refresh: false,
-                wait_ms: 0,
-                infer_ms: 0,
-                infer_max_rows: 0,
-            });
-        }
-        let is_join_program = is_otlet_function((*func).funcid, "semantic_join_matches_program");
-        if is_program {
-            if pg_sys::list_length((*func).args) < 2 {
-                return None;
-            }
-            let program_arg = pg_sys::list_nth((*func).args, 0) as *mut pg_sys::Expr;
-            let subject_arg = pg_sys::list_nth((*func).args, 1) as *mut pg_sys::Expr;
-            let program_name = text_const_value(program_arg)?;
-            let program = load_semantic_program(&program_name)?;
-            return Some(ParsedSemanticMatch {
-                index_kind: SemanticIndexKind::Row,
-                predicate_kind: SemanticPredicateKind::Materialization,
-                index_name: program.index_name,
-                subject: subject_var(subject_arg, rti)?,
-                expected_json: program.expected_json,
-                action_type: None,
-                program_name: Some(program.name),
-                program_hash: Some(program.program_hash),
-                program_predicate: Some(program.predicate),
-                program_compiler_mode: Some(program.compiler_mode),
-                auto_policy: false,
-                allow_refresh: false,
-                wait_ms: 0,
-                infer_ms: 0,
-                infer_max_rows: 0,
-            });
-        }
-        if is_join_program {
-            if pg_sys::list_length((*func).args) < 2 {
-                return None;
-            }
-            let program_arg = pg_sys::list_nth((*func).args, 0) as *mut pg_sys::Expr;
-            let subject_arg = pg_sys::list_nth((*func).args, 1) as *mut pg_sys::Expr;
-            let program_name = text_const_value(program_arg)?;
-            let program = load_semantic_join_program(&program_name)?;
-            return Some(ParsedSemanticMatch {
-                index_kind: SemanticIndexKind::Join,
-                predicate_kind: SemanticPredicateKind::Materialization,
-                index_name: program.index_name,
-                subject: subject_var(subject_arg, rti)?,
-                expected_json: program.expected_json,
-                action_type: None,
-                program_name: Some(program.name),
-                program_hash: Some(program.program_hash),
-                program_predicate: Some(program.predicate),
-                program_compiler_mode: Some(program.compiler_mode),
                 auto_policy: false,
                 allow_refresh: false,
                 wait_ms: 0,
@@ -293,10 +199,6 @@ unsafe fn semantic_match_function_parts(
             subject: subject_var(subject_arg, rti)?,
             expected_json: jsonb_const_text(expected_arg)?,
             action_type: None,
-            program_name: None,
-            program_hash: None,
-            program_predicate: None,
-            program_compiler_mode: None,
             auto_policy: is_any_auto,
             allow_refresh,
             wait_ms,

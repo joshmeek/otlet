@@ -52,10 +52,7 @@ fn record_infer_now_executor_context(runtime: &RuntimeState, job_id: i64) -> Res
         "semantic_index_kind": runtime.index_kind.as_str(),
         "semantic_index_name": runtime.index_name.as_str(),
         "semantic_predicate_kind": runtime.predicate_kind.as_str(),
-        "semantic_action_type": runtime.action_type.as_deref(),
-        "semantic_program_name": runtime.program_name.as_deref(),
-        "semantic_program_hash": runtime.program_hash.as_deref(),
-        "semantic_program_predicate": runtime.program_predicate.as_deref()
+        "semantic_action_type": runtime.action_type.as_deref()
     });
     pgrx::Spi::connect_mut(|client| {
         let args = [job_id.into(), JsonB(context).into()];
