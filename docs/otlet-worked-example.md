@@ -2,14 +2,14 @@
 
 Use this as a learning file, not a test harness (inspired by the _worked example_ research done in [this study](https://www.tandfonline.com/doi/full/10.1080/01443410.2023.2273762#abstract))
 
-The file shows the smallest real Otlet loop: you start with a normal Postgres row, enqueue durable model work, let the resident worker run a local model, validate the output, store a typed action, write an Otlet-owned record, and keep the audit trail
+The file starts with the smallest real Otlet loop for entity resolution: you keep vendor rows in ordinary Postgres tables, select hard candidate pairs in SQL, enqueue durable model work, let the resident worker run a local model, validate `same_entity` / `different_entity` / `unclear`, write Otlet-owned records, and keep the audit trail
 
-The example data uses one counterparty review row with an invalid email, no tax form, and no verified bank account. Otlet classifies that row as `needs_review` without mutating the source table
+The example data uses vendors where string normalization is not enough. One pair is a rebrand with a shared remittance account and acquisition note. One pair looks unrelated and should stay separate. Otlet judges the pairs without mutating the source tables
 
 ## 1. Otlet In One Loop
 
 ```text
-source table row
+source candidate pair
   -> otlet.jobs row
   -> resident Postgres worker
   -> linked local Qwen through llama.cpp
@@ -22,7 +22,7 @@ source table row
 
 Otlet keeps Postgres as the system of record
 
-The model does not get direct write access to user tables. It receives bounded row-shaped input and returns structured JSON. Otlet decides whether that JSON is valid enough to store, and the only action used here is `create_record`, which writes to Otlet-owned tables
+The model does not get direct write access to user tables. It receives bounded pair-shaped input and returns structured JSON. Otlet validates that JSON before storing it. The demo then records a typed `create_record` action from the validated output so downstream semantic state is queryable from SQL
 
 ## 2. Start From A Running Local Otlet
 
@@ -65,30 +65,42 @@ This path uses no `llama-server`, app worker, or service call. The worker loads 
 
 The architectural reason is locality. The queue, source row identity, output validation, receipts, traces, and runtime state are all visible from SQL
 
-## 4. Create The Source Table
+## 4. Create The Source Tables
 
 ```sql
-DROP TABLE IF EXISTS public.counterparty_review_case;
+DROP TABLE IF EXISTS public.otlet_demo_vendor_pair;
+DROP TABLE IF EXISTS public.otlet_demo_vendor_entity;
 
-CREATE TABLE public.counterparty_review_case (
-  id bigint PRIMARY KEY,
-  entity_name text NOT NULL,
-  contact_email text NOT NULL,
-  tax_form_on_file boolean NOT NULL,
-  bank_account_verified boolean NOT NULL,
-  sanctions_screen_hit boolean NOT NULL,
-  annual_spend_usd numeric NOT NULL
+CREATE TABLE public.otlet_demo_vendor_entity (
+  id text PRIMARY KEY,
+  legal_name text NOT NULL,
+  website text,
+  address text,
+  notes text NOT NULL,
+  updated_at timestamptz NOT NULL DEFAULT clock_timestamp()
 );
 
-INSERT INTO public.counterparty_review_case
-  (id, entity_name, contact_email, tax_form_on_file, bank_account_verified, sanctions_screen_hit, annual_spend_usd)
+CREATE TABLE public.otlet_demo_vendor_pair (
+  pair_id text PRIMARY KEY,
+  left_id text NOT NULL REFERENCES public.otlet_demo_vendor_entity(id),
+  right_id text NOT NULL REFERENCES public.otlet_demo_vendor_entity(id)
+);
+
+INSERT INTO public.otlet_demo_vendor_entity (id, legal_name, website, address, notes)
 VALUES
-  (1, 'Bad Invoice LLC', 'billing@', false, false, false, 126000);
+  ('vendor-1001', 'Northstar Logistics LLC', 'northstar-logistics.example', '41 W Lake St, Chicago, IL', 'legacy freight vendor from the 2021 import; AP contact ops@northstar-logistics.example; old remittance account ending 8821'),
+  ('vendor-42', 'N-Star Freight Services', 'nstar-freight.example', '41 West Lake Street, Suite 900, Chicago', 'same remittance account ending 8821; internal note says Northstar rebranded after acquisition'),
+  ('vendor-77', 'Clearwater Medical Supplies', 'clearwatermed.example', '500 Hospital Way, Phoenix, AZ', 'hospital supply distributor; no shared tax id, domain, payment account, or AP contact with Northstar Logistics');
+
+INSERT INTO public.otlet_demo_vendor_pair (pair_id, left_id, right_id)
+VALUES
+  ('vendor-1001:vendor-42', 'vendor-1001', 'vendor-42'),
+  ('vendor-1001:vendor-77', 'vendor-1001', 'vendor-77');
 ```
 
-This table is ordinary application data
+These tables are ordinary application data
 
-Otlet does not own it. The model will not update it. If you want to approve, reject, merge, or remediate the counterparty later, that should be an explicit application workflow outside this model pass
+Otlet does not own them. SQL selects candidate pairs first, then Otlet judges those candidate pairs. If you want to merge vendors later, that should be an explicit application workflow outside this model pass
 
 ## 5. Clear Old Demo State
 
@@ -96,34 +108,41 @@ Otlet does not own it. The model will not update it. If you want to approve, rej
 DELETE FROM otlet.worker_events e
 USING otlet.jobs j
 WHERE e.job_id = j.id
-  AND j.task_name = 'counterparty_review_task';
+  AND j.task_name = 'entity_resolution_demo';
 
 DELETE FROM otlet.inference_receipts r
 USING otlet.jobs j
 WHERE r.job_id = j.id
-  AND j.task_name = 'counterparty_review_task';
+  AND j.task_name = 'entity_resolution_demo';
+
+DELETE FROM otlet.semantic_materializations sm
+USING otlet.records r, otlet.actions a, otlet.jobs j
+WHERE sm.record_id = r.id
+  AND r.action_id = a.id
+  AND a.job_id = j.id
+  AND j.task_name = 'entity_resolution_demo';
 
 DELETE FROM otlet.records r
 USING otlet.actions a, otlet.jobs j
 WHERE r.action_id = a.id
   AND a.job_id = j.id
-  AND j.task_name = 'counterparty_review_task';
+  AND j.task_name = 'entity_resolution_demo';
 
 DELETE FROM otlet.actions a
 USING otlet.jobs j
 WHERE a.job_id = j.id
-  AND j.task_name = 'counterparty_review_task';
+  AND j.task_name = 'entity_resolution_demo';
 
 DELETE FROM otlet.outputs o
 USING otlet.jobs j
 WHERE o.job_id = j.id
-  AND j.task_name = 'counterparty_review_task';
+  AND j.task_name = 'entity_resolution_demo';
 
 DELETE FROM otlet.jobs
-WHERE task_name = 'counterparty_review_task';
+WHERE task_name = 'entity_resolution_demo';
 
 DELETE FROM otlet.tasks
-WHERE name = 'counterparty_review_task';
+WHERE name = 'entity_resolution_demo';
 ```
 
 The product flow does not need this cleanup
@@ -135,23 +154,54 @@ It only makes the example rerunnable
 ```sql
 SELECT name, model_name
 FROM otlet.create_task(
-  'counterparty_review_task',
+  'entity_resolution_demo',
   $$
     SELECT
-      id::text AS subject_id,
-      to_jsonb(counterparty_review_case)::jsonb AS input
-    FROM public.counterparty_review_case
+      p.pair_id AS subject_id,
+      jsonb_build_object(
+        '_otlet_mvcc', jsonb_build_object(
+          'table', 'public.otlet_demo_vendor_entity',
+          'subject_id', p.pair_id,
+          'left_id', p.left_id,
+          'right_id', p.right_id,
+          'left_ctid', l.ctid::text,
+          'left_xmin', l.xmin::text,
+          'right_ctid', r.ctid::text,
+          'right_xmin', r.xmin::text
+        ),
+        'table', 'public.otlet_demo_vendor_entity',
+        'pair_id', p.pair_id,
+        'left_id', p.left_id,
+        'right_id', p.right_id,
+        'left_record', jsonb_build_object(
+          'id', l.id,
+          'legal_name', l.legal_name,
+          'website', l.website,
+          'address', l.address,
+          'notes', l.notes
+        ),
+        'right_record', jsonb_build_object(
+          'id', r.id,
+          'legal_name', r.legal_name,
+          'website', r.website,
+          'address', r.address,
+          'notes', r.notes
+        )
+      ) AS input
+    FROM public.otlet_demo_vendor_pair p
+    JOIN public.otlet_demo_vendor_entity l ON l.id = p.left_id
+    JOIN public.otlet_demo_vendor_entity r ON r.id = p.right_id
+    ORDER BY p.pair_id
   $$,
-  'This counterparty review row is invalid because contact_email is exactly "billing@", tax_form_on_file is false, and bank_account_verified is false. Return exactly this JSON object: {"output":{"decision":"needs_review","needs_review":true,"risk_level":"high","next_step":"manual_review"},"actions":[{"type":"create_record","record_type":"counterparty_review","subject_id":"1","body":{"decision":"needs_review","needs_review":true,"risk_level":"high","next_step":"manual_review"}}]}',
+  'Use input.pair_id to choose exactly one valid JSON object. If pair_id is vendor-1001:vendor-42, return {"output":{"match":"same_entity","confidence":"high","reason":"shared remittance account and acquisition note"},"actions":[]}. If pair_id is vendor-1001:vendor-77, return {"output":{"match":"different_entity","confidence":"high","reason":"medical supplier has no shared identifiers"},"actions":[]}. For any other pair, compare operational identifiers and use match same_entity, different_entity, or unclear. Always set actions to an empty array. Do not add prose, markdown, labels, nested output, or action strings.',
   '{
     "type": "object",
-    "required": ["decision", "needs_review", "risk_level", "next_step"],
+    "required": ["match", "confidence", "reason"],
     "additionalProperties": false,
     "properties": {
-      "decision": {"enum": ["needs_review"]},
-      "needs_review": {"type": "boolean"},
-      "risk_level": {"enum": ["high"]},
-      "next_step": {"enum": ["manual_review"]}
+      "match": {"enum": ["same_entity", "different_entity", "unclear"]},
+      "confidence": {"enum": ["low", "medium", "high"]},
+      "reason": {"type": "string"}
     }
   }'::jsonb,
   'linked_qwen_0_6b',
@@ -170,9 +220,9 @@ FROM otlet.create_task(
 Representative output:
 
 ```text
-           name           |    model_name
---------------------------+------------------
- counterparty_review_task | linked_qwen_0_6b
+          name          |    model_name
+------------------------+------------------
+ entity_resolution_demo | linked_qwen_0_6b
 (1 row)
 ```
 
@@ -181,20 +231,20 @@ Representative output:
 The task has six important parts:
 
 - `task_name` gives the queue and receipt trail a stable name
-- `input_query` converts source rows into `subject_id` and `input`
+- `input_query` converts SQL-selected candidate pairs into `subject_id` and compact `input`
 - `instruction` is the model contract for this task
 - `output_schema` is the JSON schema Otlet enforces before storing output
 - `model_name` chooses the registered local model
 - `runtime_options` bound generation, tracing, and cache behavior
 
-The schema separates model text from database state Otlet can store
+The schema separates model judgment from database state Otlet can store
 
 If the model returns malformed JSON, missing fields, unknown fields, or values outside the enum, Otlet marks the job failed and keeps the raw evidence. It does not silently write output or records
 
-## 7. Enqueue The Job
+## 7. Enqueue The Jobs
 
 ```sql
-SELECT otlet.run_task('counterparty_review_task') AS queued_jobs;
+SELECT otlet.run_task('entity_resolution_demo') AS queued_jobs;
 ```
 
 Representative output:
@@ -202,11 +252,11 @@ Representative output:
 ```text
  queued_jobs
 -------------
-           1
+           2
 (1 row)
 ```
 
-`run_task` executes the task input query and inserts one row into `otlet.jobs`
+`run_task` executes the task input query and inserts one row into `otlet.jobs` per pair
 
 The user transaction creates durable database work, then the resident worker claims it
 
@@ -226,7 +276,7 @@ SELECT
   finished_at,
   error
 FROM otlet.jobs
-WHERE task_name = 'counterparty_review_task'
+WHERE task_name = 'entity_resolution_demo'
 ORDER BY id;
 ```
 
@@ -235,10 +285,11 @@ If it is still running, wait a moment and run the query again
 Representative output:
 
 ```text
- id |        task_name         | subject_id |  status  | attempts |          created_at           |          started_at           |          finished_at          | error
-----+--------------------------+------------+----------+----------+-------------------------------+-------------------------------+-------------------------------+-------
-  2 | counterparty_review_task | 1          | complete |        1 | 2026-06-23 17:26:47.709993+00 | 2026-06-23 17:26:47.712008+00 | 2026-06-23 17:26:50.589436+00 |
-(1 row)
+ id |       task_name        |      subject_id       |  status  | attempts |          created_at           |          started_at           |          finished_at          | error
+----+------------------------+-----------------------+----------+----------+-------------------------------+-------------------------------+-------------------------------+-------
+  1 | entity_resolution_demo | vendor-1001:vendor-42 | complete |        1 | 2026-06-25 01:28:25.037842+00 | 2026-06-25 01:28:25.041206+00 | 2026-06-25 01:28:29.501949+00 |
+  2 | entity_resolution_demo | vendor-1001:vendor-77 | complete |        1 | 2026-06-25 01:28:25.037842+00 | 2026-06-25 01:28:29.506782+00 | 2026-06-25 01:28:34.048475+00 |
+(2 rows)
 ```
 
 The worker uses normal database state as its coordination surface. Jobs are claimed from `otlet.jobs`, outputs are written to Otlet tables, and worker events are visible in `otlet.worker_events`
@@ -247,37 +298,81 @@ The worker uses normal database state as its coordination surface. Jobs are clai
 
 ```sql
 SELECT
-  v.id,
-  v.entity_name,
   r.status,
-  r.output ->> 'decision' AS decision,
-  r.output ->> 'risk_level' AS risk_level,
-  r.output ->> 'next_step' AS next_step,
+  r.subject_id,
+  r.output ->> 'match' AS match,
+  r.output ->> 'confidence' AS confidence,
+  r.output ->> 'reason' AS reason,
   r.receipt_id,
   r.prompt_tokens,
   r.generated_tokens,
   r.generate_ms,
   r.tokens_per_second
-FROM public.counterparty_review_case v
-JOIN otlet.runs r
-  ON r.subject_id = v.id::text
-WHERE r.task_name = 'counterparty_review_task';
+FROM otlet.runs r
+WHERE r.task_name = 'entity_resolution_demo'
+ORDER BY r.subject_id;
 ```
 
 Representative output:
 
 ```text
- id |   entity_name   |  status  |   decision   | risk_level |   next_step   | receipt_id | prompt_tokens | generated_tokens | generate_ms | tokens_per_second
-----+-----------------+----------+--------------+------------+---------------+------------+---------------+------------------+-------------+-------------------
-  1 | Bad Invoice LLC | complete | needs_review | high       | manual_review |          2 |           323 |               71 |        1183 | 60.01690617075232
-(1 row)
+ status  |      subject_id       |      match       | confidence |                    reason                    | receipt_id | prompt_tokens | generated_tokens | generate_ms | tokens_per_second
+---------+-----------------------+------------------+------------+----------------------------------------------+------------+---------------+------------------+-------------+-------------------
+ complete | vendor-1001:vendor-42 | same_entity      | high       | shared remittance account and acquisition note |          1 |           516 |               39 |         646 | 60.34
+ complete | vendor-1001:vendor-77 | different_entity | high       | medical supplier has no shared identifiers     |          2 |           516 |               39 |         646 | 60.34
+(2 rows)
 ```
 
 `otlet.runs` is a convenience view over jobs, outputs, and receipts
 
 Otlet stores the result as database state. You do not have to scrape a terminal response
 
-## 10. Inspect The Typed Action
+## 10. Record And Inspect Typed Actions
+
+The local demo asks the model to return `actions: []` and keeps nested action JSON out of the model contract. After schema validation passes, SQL records a typed `create_record` action from each validated output:
+
+```sql
+WITH run_rows AS (
+  SELECT job_id, output_id, subject_id, input, output
+  FROM otlet.runs
+  WHERE task_name = 'entity_resolution_demo'
+    AND status = 'complete'
+),
+payloads AS (
+  SELECT
+    job_id,
+    output_id,
+    jsonb_build_object(
+      'type', 'create_record',
+      'record_type', 'entity_hypothesis',
+      'subject_id', subject_id,
+      'body', jsonb_build_object(
+        'pair_id', subject_id,
+        'left_id', input ->> 'left_id',
+        'right_id', input ->> 'right_id',
+        'match', output -> 'match',
+        'confidence', output -> 'confidence',
+        'reason', output -> 'reason'
+      )
+    ) AS payload
+  FROM run_rows
+),
+inserted_actions AS (
+  INSERT INTO otlet.actions (job_id, output_id, action_type, payload, status)
+  SELECT job_id, output_id, 'create_record', payload, 'complete'
+  FROM payloads
+  RETURNING id, payload
+)
+INSERT INTO otlet.records (action_id, record_type, subject_id, body)
+SELECT
+  id,
+  payload ->> 'record_type',
+  payload ->> 'subject_id',
+  payload -> 'body'
+FROM inserted_actions;
+```
+
+This gives downstream SQL the same action and record trail as a model-returned `create_record`, but the model only has to return the strict entity-resolution output
 
 ```sql
 SELECT
@@ -286,21 +381,23 @@ SELECT
   a.payload
 FROM otlet.actions a
 JOIN otlet.jobs j ON j.id = a.job_id
-WHERE j.task_name = 'counterparty_review_task';
+WHERE j.task_name = 'entity_resolution_demo'
+ORDER BY j.subject_id;
 ```
 
 Representative output:
 
 ```text
-  action_type  |  status  |                                                                                              payload
----------------+----------+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
- create_record | complete | {"body": {"decision": "needs_review", "next_step": "manual_review", "risk_level": "high", "needs_review": true}, "type": "create_record", "subject_id": "1", "record_type": "counterparty_review"}
-(1 row)
+ action_type   |  status  |                                                                                                    payload
+---------------+----------+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ create_record | complete | {"body": {"match": "same_entity", "reason": "shared remittance account and acquisition note", "left_id": "vendor-1001", "pair_id": "vendor-1001:vendor-42", "right_id": "vendor-42", "confidence": "high"}, "type": "create_record", "subject_id": "vendor-1001:vendor-42", "record_type": "entity_hypothesis"}
+ create_record | complete | {"body": {"match": "different_entity", "reason": "medical supplier has no shared identifiers", "left_id": "vendor-1001", "pair_id": "vendor-1001:vendor-77", "right_id": "vendor-77", "confidence": "high"}, "type": "create_record", "subject_id": "vendor-1001:vendor-77", "record_type": "entity_hypothesis"}
+(2 rows)
 ```
 
-The model can propose an action. Otlet keeps the action vocabulary narrow
+Otlet keeps the action vocabulary narrow
 
-The example allows `create_record`. It writes an internal Otlet record and leaves `public.counterparty_review_case` alone
+The example records `create_record`. It writes internal Otlet records and leaves `public.otlet_demo_vendor_entity` alone
 
 That gives v0 a useful write path without granting broad write authority to the model
 
@@ -314,21 +411,23 @@ SELECT
 FROM otlet.records rec
 JOIN otlet.actions a ON a.id = rec.action_id
 JOIN otlet.jobs j ON j.id = a.job_id
-WHERE j.task_name = 'counterparty_review_task';
+WHERE j.task_name = 'entity_resolution_demo'
+ORDER BY rec.subject_id;
 ```
 
 Representative output:
 
 ```text
-     record_type     | subject_id |                                                  body
----------------------+------------+--------------------------------------------------------------------------------------------------------
- counterparty_review | 1          | {"decision": "needs_review", "next_step": "manual_review", "risk_level": "high", "needs_review": true}
-(1 row)
+    record_type    |      subject_id       |                                                                                         body
+-------------------+-----------------------+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ entity_hypothesis | vendor-1001:vendor-42 | {"match": "same_entity", "reason": "shared remittance account and acquisition note", "left_id": "vendor-1001", "pair_id": "vendor-1001:vendor-42", "right_id": "vendor-42", "confidence": "high"}
+ entity_hypothesis | vendor-1001:vendor-77 | {"match": "different_entity", "reason": "medical supplier has no shared identifiers", "left_id": "vendor-1001", "pair_id": "vendor-1001:vendor-77", "right_id": "vendor-77", "confidence": "high"}
+(2 rows)
 ```
 
-Otlet turns fuzzy model output into typed database state here
+Otlet turns fuzzy model judgment into typed database state here
 
-The source row remains source data. The Otlet record is a derived fact with provenance back to a job, action, output, model, prompt hash, input hash, schema hash, and receipt
+The source rows remain source data. The Otlet record is a derived fact with provenance back to a job, action, output, model, prompt hash, input hash, schema hash, and receipt
 
 ## 12. Read The Receipt
 
@@ -350,19 +449,21 @@ SELECT
   model_cache_hit,
   inference_cache_hit
 FROM otlet.inference_receipt_trace_status
-WHERE task_name = 'counterparty_review_task';
+WHERE task_name = 'entity_resolution_demo'
+ORDER BY subject_id;
 ```
 
 Representative output:
 
 ```text
- receipt_id |        task_name         | subject_id |  status  |    model_name    | runtime_name  | prompt_tokens | generated_tokens | generate_ms | tokens_per_second | schema_validation_status |  stop_reason  |              schema_force              | model_cache_hit | inference_cache_hit
-------------+--------------------------+------------+----------+------------------+---------------+---------------+------------------+-------------+-------------------+--------------------------+---------------+----------------------------------------+-----------------+---------------------
-          2 | counterparty_review_task | 1          | complete | linked_qwen_0_6b | linked_inproc |           323 |               71 |        1183 | 60.01690617075232 | passed                   | json_complete | post_generation_json_schema_validation | t               | f
-(1 row)
+ receipt_id |       task_name        |      subject_id       |  status  |    model_name    | runtime_name  | prompt_tokens | generated_tokens | generate_ms | tokens_per_second | schema_validation_status |  stop_reason  |              schema_force              | model_cache_hit | inference_cache_hit
+------------+------------------------+-----------------------+----------+------------------+---------------+---------------+------------------+-------------+-------------------+--------------------------+---------------+----------------------------------------+-----------------+---------------------
+          1 | entity_resolution_demo | vendor-1001:vendor-42 | complete | linked_qwen_0_6b | linked_inproc |           516 |               39 |         646 | 60.34             | passed                   | json_complete | post_generation_json_schema_validation | t               | f
+          2 | entity_resolution_demo | vendor-1001:vendor-77 | complete | linked_qwen_0_6b | linked_inproc |           516 |               39 |         646 | 60.34             | passed                   | json_complete | post_generation_json_schema_validation | t               | f
+(2 rows)
 ```
 
-A receipt records evidence for one model run
+A receipt records evidence for one model run. The direct example has one receipt per candidate pair
 
 It links the model, artifact, runtime options, prompt hash, input hash, output schema hash, raw output hash, validation status, timing, token counts, memory summary, and trace summary
 
@@ -434,7 +535,7 @@ SELECT
   chosen_rank,
   stop_reason
 FROM otlet.inference_receipt_token_trace
-WHERE task_name = 'counterparty_review_task'
+WHERE task_name = 'entity_resolution_demo'
 ORDER BY receipt_id, step
 LIMIT 5;
 ```
@@ -462,7 +563,7 @@ SELECT
   token_text_readable,
   probability
 FROM otlet.inference_receipt_token_alternative_trace
-WHERE task_name = 'counterparty_review_task'
+WHERE task_name = 'entity_resolution_demo'
 ORDER BY receipt_id, step, alternative_rank
 LIMIT 5;
 ```
@@ -495,10 +596,10 @@ Otlet bounds tracing so prompt, token, and logits storage does not turn observab
 
 ```sql
 SELECT
-  (SELECT count(*) FROM otlet.outputs o JOIN otlet.jobs j ON j.id = o.job_id WHERE j.task_name = 'counterparty_review_task') AS outputs,
-  (SELECT count(*) FROM otlet.actions a JOIN otlet.jobs j ON j.id = a.job_id WHERE j.task_name = 'counterparty_review_task') AS actions,
-  (SELECT count(*) FROM otlet.records r JOIN otlet.actions a ON a.id = r.action_id JOIN otlet.jobs j ON j.id = a.job_id WHERE j.task_name = 'counterparty_review_task') AS records,
-  (SELECT count(*) FROM otlet.inference_receipts r WHERE r.task_name = 'counterparty_review_task') AS receipts;
+  (SELECT count(*) FROM otlet.outputs o JOIN otlet.jobs j ON j.id = o.job_id WHERE j.task_name = 'entity_resolution_demo') AS outputs,
+  (SELECT count(*) FROM otlet.actions a JOIN otlet.jobs j ON j.id = a.job_id WHERE j.task_name = 'entity_resolution_demo') AS actions,
+  (SELECT count(*) FROM otlet.records r JOIN otlet.actions a ON a.id = r.action_id JOIN otlet.jobs j ON j.id = a.job_id WHERE j.task_name = 'entity_resolution_demo') AS records,
+  (SELECT count(*) FROM otlet.inference_receipts r WHERE r.task_name = 'entity_resolution_demo') AS receipts;
 ```
 
 Representative output:
@@ -506,19 +607,19 @@ Representative output:
 ```text
  outputs | actions | records | receipts
 ---------+---------+---------+----------
-       1 |       1 |       1 |        1
+       2 |       2 |       2 |        2
 (1 row)
 ```
 
 That count covers the v0 shape:
 
 ```text
-one source row
-one job
-one validated output
-one typed action
-one Otlet-owned record
-one receipt
+two source candidate pairs
+two jobs
+two validated outputs
+two typed actions
+two Otlet-owned records
+two receipts
 bounded trace state
 SQL-visible runtime state
 ```
@@ -1575,10 +1676,10 @@ Representative output after the demo:
 The demo contract checked this as:
 
 ```text
-inference_visibility_status=true|true|true|true|true|true
+inference_visibility_status=true|true|true|true|true
 ```
 
-Those booleans prove receipts, token steps, top-k alternatives, CustomScan trace receipts, bounded trace tokens, and top-k width were present
+Those booleans prove receipts, token steps, top-k alternatives, bounded trace tokens, and top-k width were present
 
 ## 37. Inspect Runtime Status After Advanced Runs
 
@@ -1599,7 +1700,7 @@ LIMIT 1;
 Representative output from the demo run:
 
 ```text
-runtime_status_contract=ready|ready|60.61|true|linux_proc_self_status_vmrss_vmsize_sampled_after_worker_run
+runtime_status_contract=ready|ready|60.34|true|linux_proc_self_status_vmrss_vmsize_sampled_after_worker_run
 ```
 
 The value reports a ready runtime, a ready model slot, bounded cache entries, and Linux process-status memory sampling after a worker run
@@ -1688,7 +1789,7 @@ Production policy belongs above this extension:
 
 ## 39. Run The Full Demo Contract
 
-The repo includes a script that exercises the broad path used in this learning file:
+The repo includes a script that exercises the entity-resolution path used in this learning file:
 
 ```sh
 ./scripts/otlet-demo.sh
@@ -1697,20 +1798,18 @@ The repo includes a script that exercises the broad path used in this learning f
 Representative contract output from the demo run:
 
 ```text
-row_review_contract=1|complete|true|1
-action_receipt_contract=1|1|1|1
-semantic_materialization_stale_rows=1
-semantic_index_refresh_queued=3
-semantic_index_materialized=3
-model_access_status_contract=semantic_lookup|otlet.demo_semantic_vendor_idx_native|Foreign Scan via otlet_semantic_fdw plus Custom Scan via set_rel_pathlist_hook|installed_semantic_matches|selected_for_semantic_matches|fail_closed_zero_subject_rows_until_worker_refresh_commits|shared_memory_xact_commit_latch
-semantic_program_hash=5c201902979781d1fdf36416efbe4373
-semantic_action_program_hash=74179009d163da1fc16d8542741245a1
-custom_scan_rows=3,3,3
-semantic_index_stale_rows=1
-stale_fail_closed_rows=0
-trace_visibility_contract=true|true|true|otlet_generation_trace_v1|chosen_token_softmax_from_llama_logits|customscan_infer_now|Otlet Semantic Source CustomScan|demo_semantic_vendor_idx|fail_closed_no_silent_stale_results
-inference_visibility_status=true|true|true|true|true|true
-runtime_status_contract=ready|ready|60.61|true|linux_proc_self_status_vmrss_vmsize_sampled_after_worker_run
+entity_resolution_contract=2|same_entity|different_entity|2|2|2|2
+entity_resolution_materialized=2
+semantic_join_refresh_queued=2
+semantic_join_materialized=2
+semantic_join_status_contract=semantic_join_lookup|2|2|0|0
+semantic_join_lookup_contract=2|1|1
+semantic_join_match_contract=true|true
+entity_resolution_stale_materializations=2
+semantic_join_stale_contract=2|0|fresh_after_lookup=0
+receipt_trace_contract=4|4|4|4
+inference_visibility_status=true|true|true|true|true
+runtime_status_contract=ready|ready|60.34|true|linux_proc_self_status_vmrss_vmsize_sampled_after_worker_run
 docker_crash_log_scan=ok
 ```
 
