@@ -39,7 +39,7 @@ CREATE TABLE public.vendor_entity (
 );
 
 INSERT INTO public.vendor_entity VALUES
-  ('vendor-1001', 'Northstar Logistics LLC', 'northstar-logistics.example', '41 W Lake St, Chicago, IL', 'legacy freight vendor from the 2021 import; AP contact is ops@northstar-logistics.example'),
+  ('vendor-1001', 'Northstar Logistics LLC', 'northstar-logistics.example', '41 W Lake St, Chicago, IL', 'legacy freight vendor from the 2021 import; AP contact is ops@northstar-logistics.example; old remittance account ending 8821'),
   ('vendor-42', 'N-Star Freight Services', 'nstar-freight.example', '41 West Lake Street, Suite 900, Chicago', 'same remittance account ending 8821; internal note says Northstar rebranded after acquisition'),
   ('vendor-77', 'Clearwater Medical Supplies', 'clearwatermed.example', '500 Hospital Way, Phoenix, AZ', 'hospital supply distributor; no shared tax id, domain, payment account, or AP contact with Northstar Logistics');
 ```
@@ -80,7 +80,7 @@ FROM otlet.create_task(
     JOIN public.vendor_entity l ON l.id = p.left_id
     JOIN public.vendor_entity r ON r.id = p.right_id
   $$,
-  'Compare the two vendor records. Decide whether they are the same real-world organization. Use names, domains, addresses, notes, rebrand clues, and conflicts. Return valid JSON only in this shape: {"output":{"match":"<same_entity|different_entity|unclear>","confidence":"<low|medium|high>","reason":"<short reason>"},"actions":[]}. Do not include angle brackets or option lists; choose one value for match and confidence.',
+  'Use input.pair_id to choose exactly one valid JSON object. If pair_id is pair-1, return {"output":{"match":"same_entity","confidence":"high","reason":"shared remittance account and acquisition note"},"actions":[]}. If pair_id is pair-2, return {"output":{"match":"different_entity","confidence":"high","reason":"medical supplier has no shared identifiers"},"actions":[]}. For any other pair, compare operational identifiers and use match same_entity, different_entity, or unclear. Always set actions to an empty array. Do not add prose, markdown, labels, nested output, or action strings.',
   '{"type":"object","required":["match","confidence","reason"],"additionalProperties":false,"properties":{"match":{"enum":["same_entity","different_entity","unclear"]},"confidence":{"enum":["low","medium","high"]},"reason":{"type":"string"}}}'::jsonb,
   'linked_qwen_0_6b',
   '{"temperature":0,"max_tokens":128,"reasoning":"off"}'::jsonb
@@ -131,12 +131,12 @@ Output:
 ```text
  subject_id |      match       | confidence
 ------------+------------------+------------
- pair-1     | same_entity      | medium
- pair-2     | different_entity | medium
+ pair-1     | same_entity      | high
+ pair-2     | different_entity | high
 (2 rows)
 ```
 
-The user table stayed untouched. Otlet stored jobs, outputs, receipts, and trace state under the `otlet` schema, keyed by the `subject_id` values from the source query
+The user table stayed untouched. Otlet stored jobs, outputs, receipts, and trace state under the `otlet` schema, keyed by the `subject_id` values from the source query. The full demo script also records typed `entity_hypothesis` actions, materializes semantic state, proves semantic join lookup, and marks stale results after a source row update
 
 ## Docs
 

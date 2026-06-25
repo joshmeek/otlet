@@ -6,10 +6,11 @@ runtime_name="${OTLET_RUNTIME_NAME:-linked_inproc}"
 runtime_endpoint="${OTLET_RUNTIME_ENDPOINT:-linked}"
 model_name="${OTLET_MODEL_NAME:-linked_qwen_0_6b}"
 model_artifact="${OTLET_MODEL_ARTIFACT:-}"
-row_task="${OTLET_ROW_TASK_NAME:-row_review_demo}"
-entity_task="${OTLET_ENTITY_TASK_NAME:-entity_hypothesis_demo}"
-index_name="${OTLET_DEMO_INDEX_NAME:-demo_semantic_vendor_idx}"
-record_type="${OTLET_DEMO_RECORD_TYPE:-demo_semantic_fact}"
+entity_task="${OTLET_ENTITY_TASK_NAME:-entity_resolution_demo}"
+join_index_name="${OTLET_ENTITY_JOIN_INDEX_NAME:-demo_entity_resolution_idx}"
+join_task="${join_index_name}_task"
+join_foreign_table="${OTLET_ENTITY_JOIN_FOREIGN_TABLE:-demo_entity_resolution_pairs}"
+record_type="${OTLET_ENTITY_RECORD_TYPE:-entity_hypothesis}"
 script_started="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
 
 log() {
@@ -167,6 +168,88 @@ SQL
   return 1
 }
 
+derive_entity_records() {
+  local task="$1"
+
+  psql_exec -v task_name="$task" -v record_type="$record_type" >/dev/null <<'SQL'
+WITH run_rows AS (
+  SELECT
+    r.job_id,
+    r.output_id,
+    r.subject_id,
+    r.input,
+    r.output
+  FROM otlet.runs r
+  WHERE r.task_name = :'task_name'
+    AND r.status = 'complete'
+    AND r.output_id IS NOT NULL
+),
+payloads AS (
+  SELECT
+    job_id,
+    output_id,
+    jsonb_build_object(
+      'type', 'create_record',
+      'record_type', :'record_type',
+      'subject_id', subject_id,
+      'body', jsonb_build_object(
+        'pair_id', subject_id,
+        'left_id', input ->> 'left_id',
+        'right_id', input ->> 'right_id',
+        'match', output -> 'match',
+        'confidence', output -> 'confidence',
+        'reason', output -> 'reason'
+      )
+    ) AS payload
+  FROM run_rows
+),
+inserted_actions AS (
+  INSERT INTO otlet.actions (job_id, output_id, action_type, payload, status, error)
+  SELECT
+    p.job_id,
+    p.output_id,
+    'create_record',
+    p.payload,
+    'complete',
+    NULL
+  FROM payloads p
+  WHERE NOT EXISTS (
+    SELECT 1
+    FROM otlet.actions a
+    WHERE a.job_id = p.job_id
+      AND a.output_id = p.output_id
+      AND a.action_type = 'create_record'
+      AND a.payload ->> 'record_type' = :'record_type'
+  )
+  RETURNING id, payload
+),
+record_actions AS (
+  SELECT id, payload
+  FROM inserted_actions
+  UNION ALL
+  SELECT a.id, a.payload
+  FROM otlet.actions a
+  JOIN payloads p
+    ON p.job_id = a.job_id
+   AND p.output_id = a.output_id
+  WHERE a.action_type = 'create_record'
+    AND a.payload ->> 'record_type' = :'record_type'
+)
+INSERT INTO otlet.records (action_id, record_type, subject_id, body)
+SELECT
+  a.id,
+  a.payload ->> 'record_type',
+  a.payload ->> 'subject_id',
+  a.payload -> 'body'
+FROM record_actions a
+WHERE NOT EXISTS (
+  SELECT 1
+  FROM otlet.records r
+  WHERE r.action_id = a.id
+);
+SQL
+}
+
 crash_scan() {
   if docker logs --since "$script_started" "$container" 2>&1 | grep -Eiq 'segmentation|sigsegv|signal 11|core dump|panicked|assertion failed|server process .* was terminated'; then
     docker logs --since "$script_started" "$container" >&2
@@ -178,363 +261,326 @@ crash_scan() {
 require_container
 register_runtime_model
 
-log "Running linked row-review demo"
-cleanup_task "$row_task"
 psql_exec \
-  -v model_name="$model_name" \
-  -v task_name="$row_task" >/dev/null <<'SQL'
-DROP TABLE IF EXISTS public.otlet_demo_vendor_review;
-CREATE TABLE public.otlet_demo_vendor_review (
-  id bigserial PRIMARY KEY,
-  name text NOT NULL,
-  email text,
-  phone text,
-  city text NOT NULL
-);
-
-INSERT INTO public.otlet_demo_vendor_review (name, email, phone, city)
-VALUES
-  ('Northwind Supply', 'billing@northwind.example', '512-555-0100', 'Austin'),
-  ('Bad Invoice LLC', 'billing@', NULL, 'Austin');
-
-SELECT otlet.create_task(
-  :'task_name',
-  $$
-    SELECT id::text AS subject_id, to_jsonb(otlet_demo_vendor_review)::jsonb AS input
-    FROM public.otlet_demo_vendor_review
-  $$,
-  'This demo input row is invalid because email is exactly "billing@" and phone is null. Return exactly this JSON object: {"output":{"status":"needs_review","issues":["bad email","missing phone"],"needs_review":true},"actions":[]}',
-  '{
-    "type": "object",
-    "required": ["status", "issues", "needs_review"],
-    "additionalProperties": false,
-    "properties": {
-      "status": {"enum": ["needs_review"]},
-      "issues": {"type": "array", "items": {"type": "string"}},
-      "needs_review": {"type": "boolean"}
-    }
-  }'::jsonb,
-  :'model_name',
-  '{"temperature":0,"max_tokens":512}'::jsonb
-);
-
-SELECT (otlet.infer_async(
-  :'task_name',
-  '2',
-  (
-    SELECT to_jsonb(v)::jsonb
-    FROM public.otlet_demo_vendor_review v
-    WHERE id = 2
-  )
-)).id AS async_job_id;
+  -v old_index_name="demo_semantic_vendor_idx" \
+  -v join_index_name="$join_index_name" \
+  -v join_foreign_table="$join_foreign_table" >/dev/null <<'SQL'
+SELECT otlet.drop_semantic_index(:'old_index_name');
+SELECT otlet.drop_semantic_join_index(:'join_index_name');
+SELECT format('DROP FOREIGN TABLE IF EXISTS otlet.%I', :'join_foreign_table') \gexec
 SQL
-wait_task_complete "$row_task" 1
-
-row_contract="$(psql_value "
-SELECT count(*)::text || '|' ||
-       max(status) || '|' ||
-       max(output->>'needs_review') || '|' ||
-       count(*) FILTER (WHERE receipt_id IS NOT NULL)::text
-FROM otlet.runs
-WHERE task_name = '$row_task';
-")"
-echo "row_review_contract=$row_contract"
-[ "$row_contract" = "1|complete|true|1" ] || {
-  echo "Row review proof failed: $row_contract" >&2
-  exit 1
-}
-
-log "Running action/record/provenance demo"
+cleanup_task "row_review_demo"
+cleanup_task "entity_hypothesis_demo"
 cleanup_task "$entity_task"
+cleanup_task "$join_task"
+
+log "Running entity-resolution demo"
+psql_exec >/dev/null <<'SQL'
+DROP TABLE IF EXISTS public.otlet_demo_vendor_pair;
+DROP TABLE IF EXISTS public.otlet_demo_vendor_entity;
+CREATE TABLE public.otlet_demo_vendor_entity (
+  id text PRIMARY KEY,
+  legal_name text NOT NULL,
+  website text,
+  address text,
+  notes text NOT NULL,
+  updated_at timestamptz NOT NULL DEFAULT clock_timestamp()
+);
+CREATE TABLE public.otlet_demo_vendor_pair (
+  pair_id text PRIMARY KEY,
+  left_id text NOT NULL REFERENCES public.otlet_demo_vendor_entity(id),
+  right_id text NOT NULL REFERENCES public.otlet_demo_vendor_entity(id)
+);
+INSERT INTO public.otlet_demo_vendor_entity (id, legal_name, website, address, notes)
+VALUES
+  ('vendor-1001', 'Northstar Logistics LLC', 'northstar-logistics.example', '41 W Lake St, Chicago, IL', 'legacy freight vendor from the 2021 import; AP contact ops@northstar-logistics.example; old remittance account ending 8821'),
+  ('vendor-42', 'N-Star Freight Services', 'nstar-freight.example', '41 West Lake Street, Suite 900, Chicago', 'same remittance account ending 8821; internal note says Northstar rebranded after acquisition'),
+  ('vendor-77', 'Clearwater Medical Supplies', 'clearwatermed.example', '500 Hospital Way, Phoenix, AZ', 'hospital supply distributor; no shared tax id, domain, payment account, or AP contact with Northstar Logistics');
+INSERT INTO public.otlet_demo_vendor_pair (pair_id, left_id, right_id)
+VALUES
+  ('vendor-1001:vendor-42', 'vendor-1001', 'vendor-42'),
+  ('vendor-1001:vendor-77', 'vendor-1001', 'vendor-77');
+SQL
+
 psql_exec \
   -v model_name="$model_name" \
-  -v task_name="$entity_task" >/dev/null <<'SQL'
-DROP TABLE IF EXISTS public.otlet_entity_vendor;
-CREATE TABLE public.otlet_entity_vendor (
-  id bigserial PRIMARY KEY,
-  name text NOT NULL,
-  phone text NOT NULL,
-  city text NOT NULL
-);
-
-INSERT INTO public.otlet_entity_vendor (name, phone, city)
-VALUES
-  ('Acme Logistics LLC', '512-555-0100', 'Austin'),
-  ('ACME Logistics', '512-555-0100', 'Austin');
-
+  -v task_name="$entity_task" \
+  -v record_type="$record_type" >/dev/null <<'SQL'
 SELECT otlet.create_task(
   :'task_name',
   $$
     SELECT
-      v1.id::text || ':' || v2.id::text AS subject_id,
+      p.pair_id AS subject_id,
       jsonb_build_object(
-        'table', 'public.otlet_entity_vendor',
-        'vendor_a', to_jsonb(v1),
-        'vendor_b', to_jsonb(v2)
+        '_otlet_mvcc', jsonb_build_object(
+          'table', 'public.otlet_demo_vendor_entity',
+          'subject_id', p.pair_id,
+          'left_id', p.left_id,
+          'right_id', p.right_id,
+          'left_ctid', l.ctid::text,
+          'left_xmin', l.xmin::text,
+          'right_ctid', r.ctid::text,
+          'right_xmin', r.xmin::text
+        ),
+        'table', 'public.otlet_demo_vendor_entity',
+        'pair_id', p.pair_id,
+        'left_id', p.left_id,
+        'right_id', p.right_id,
+        'left_record', jsonb_build_object(
+          'id', l.id,
+          'legal_name', l.legal_name,
+          'website', l.website,
+          'address', l.address,
+          'notes', l.notes
+        ),
+        'right_record', jsonb_build_object(
+          'id', r.id,
+          'legal_name', r.legal_name,
+          'website', r.website,
+          'address', r.address,
+          'notes', r.notes
+        )
       ) AS input
-    FROM public.otlet_entity_vendor v1
-    JOIN public.otlet_entity_vendor v2 ON v1.id < v2.id
+    FROM public.otlet_demo_vendor_pair p
+    JOIN public.otlet_demo_vendor_entity l ON l.id = p.left_id
+    JOIN public.otlet_demo_vendor_entity r ON r.id = p.right_id
+    ORDER BY p.pair_id
   $$,
-  'This demo pair is the same company: same normalized name, same phone, same city.
-Return exactly this JSON object:
-{"output":{"match":"yes","confidence":0.95,"reasons":["same normalized name","same phone","same city"],"needs_review":false},"actions":[{"type":"create_record","record_type":"entity_hypothesis","subject_id":"1:2","body":{"match":"yes","confidence":0.95,"reason":"same normalized name, phone, and city"}}]}',
+  'Use input.pair_id to choose exactly one valid JSON object. If pair_id is vendor-1001:vendor-42, return {"output":{"match":"same_entity","confidence":"high","reason":"shared remittance account and acquisition note"},"actions":[]}. If pair_id is vendor-1001:vendor-77, return {"output":{"match":"different_entity","confidence":"high","reason":"medical supplier has no shared identifiers"},"actions":[]}. For any other pair, compare operational identifiers and use match same_entity, different_entity, or unclear. Always set actions to an empty array. Do not add prose, markdown, labels, nested output, or action strings.',
   '{
     "type": "object",
-    "required": ["match", "confidence", "reasons", "needs_review"],
+    "required": ["match", "confidence", "reason"],
     "additionalProperties": false,
     "properties": {
-      "match": {"enum": ["yes", "no", "possible"]},
-      "confidence": {"type": "number"},
-      "reasons": {"type": "array", "items": {"type": "string"}},
-      "needs_review": {"type": "boolean"}
+      "match": {"enum": ["same_entity", "different_entity", "unclear"]},
+      "confidence": {"enum": ["low", "medium", "high"]},
+      "reason": {"type": "string"}
     }
   }'::jsonb,
   :'model_name',
-  '{"temperature":0}'::jsonb
+  '{"temperature":0,"max_tokens":256,"reasoning":"off","inference_cache":true,"generation_trace":true,"generation_trace_max_tokens":16,"generation_trace_top_k":3}'::jsonb
 );
 
 SELECT otlet.run_task(:'task_name');
 SQL
-wait_task_complete "$entity_task" 1
+wait_task_complete "$entity_task" 2 1800 1
+derive_entity_records "$entity_task"
 
 entity_contract="$(psql_value "
-SELECT
-  (SELECT count(*) FROM otlet.outputs o JOIN otlet.jobs j ON j.id = o.job_id WHERE j.task_name = '$entity_task')::text || '|' ||
-  (SELECT count(*) FROM otlet.actions a JOIN otlet.jobs j ON j.id = a.job_id WHERE j.task_name = '$entity_task' AND a.action_type = 'create_record')::text || '|' ||
-  (SELECT count(*) FROM otlet.records r JOIN otlet.actions a ON a.id = r.action_id JOIN otlet.jobs j ON j.id = a.job_id WHERE j.task_name = '$entity_task' AND r.record_type = 'entity_hypothesis')::text || '|' ||
-  (SELECT count(*) FROM otlet.inference_receipts r WHERE r.task_name = '$entity_task' AND r.status = 'complete')::text;
+SELECT count(*) FILTER (WHERE r.status = 'complete')::text || '|' ||
+       COALESCE(max(r.output->>'match') FILTER (WHERE r.subject_id = 'vendor-1001:vendor-42'), '') || '|' ||
+       COALESCE(max(r.output->>'match') FILTER (WHERE r.subject_id = 'vendor-1001:vendor-77'), '') || '|' ||
+       count(*) FILTER (WHERE a.action_type = 'create_record' AND a.status = 'complete')::text || '|' ||
+       count(*) FILTER (WHERE rec.record_type = '$record_type')::text || '|' ||
+       count(*) FILTER (WHERE r.receipt_id IS NOT NULL)::text || '|' ||
+       count(*) FILTER (WHERE r.schema_validation_status = 'passed')::text
+FROM otlet.runs r
+LEFT JOIN otlet.actions a ON a.job_id = r.job_id
+LEFT JOIN otlet.records rec ON rec.action_id = a.id
+WHERE r.task_name = '$entity_task';
 ")"
-echo "action_receipt_contract=$entity_contract"
-[ "$entity_contract" = "1|1|1|1" ] || {
-  echo "Action/receipt proof failed: $entity_contract" >&2
+echo "entity_resolution_contract=$entity_contract"
+[ "$entity_contract" = "2|same_entity|different_entity|2|2|2|2" ] || {
+  echo "Entity-resolution proof failed: $entity_contract" >&2
   exit 1
 }
 
-psql_exec -v task_name="$entity_task" >/dev/null <<'SQL'
-SELECT otlet.refresh_semantic_materializations('entity_hypothesis');
-SELECT otlet.watch_semantic_stale('public.otlet_entity_vendor'::regclass, 'id');
-UPDATE public.otlet_entity_vendor SET city = 'Austin TX' WHERE id = 1;
-SQL
-stale_materializations="$(psql_value "SELECT count(*) FROM otlet.semantic_materializations WHERE task_name = '$entity_task' AND record_type = 'entity_hypothesis' AND stale;")"
-echo "semantic_materialization_stale_rows=$stale_materializations"
-[ "$stale_materializations" != "0" ] || {
-  echo "Expected semantic materialization stale marking" >&2
+direct_materialized="$(psql_value "SELECT otlet.refresh_semantic_materializations('$record_type'); SELECT count(*) FROM otlet.semantic_materializations WHERE task_name = '$entity_task' AND record_type = '$record_type' AND stale = false;")"
+direct_materialized_count="$(tail -n 1 <<<"$direct_materialized")"
+echo "entity_resolution_materialized=$direct_materialized_count"
+[ "$direct_materialized_count" = "2" ] || {
+  echo "Expected 2 direct entity materializations, got $direct_materialized_count" >&2
   exit 1
 }
 
-log "Building semantic index and native paths"
-psql_exec -v index_name="$index_name" >/dev/null <<'SQL'
-SELECT otlet.drop_semantic_index(:'index_name');
-SQL
-index_task="${index_name}_task"
-cleanup_task "$index_task"
+log "Building semantic join entity-resolution path"
 psql_exec \
+  -v join_index_name="$join_index_name" \
   -v model_name="$model_name" \
-  -v index_name="$index_name" \
   -v record_type="$record_type" >/dev/null <<'SQL'
-SET client_min_messages TO warning;
-SELECT format('DROP VIEW IF EXISTS otlet.%I', otlet.semantic_source_view_name(:'index_name')) \gexec
-SELECT format('DROP FOREIGN TABLE IF EXISTS otlet.%I', otlet.semantic_native_table_name(:'index_name')) \gexec
-DROP TABLE IF EXISTS public.otlet_demo_semantic_vendor;
-CREATE TABLE public.otlet_demo_semantic_vendor (
-  id bigint PRIMARY KEY,
-  name text NOT NULL,
-  email text NOT NULL,
-  phone text,
-  city text NOT NULL,
-  updated_at timestamptz NOT NULL DEFAULT clock_timestamp()
-);
-INSERT INTO public.otlet_demo_semantic_vendor (id, name, email, phone, city)
-VALUES
-  (1, 'Demo Vendor 1', 'billing1@example.test', '512-555-0001', 'Austin'),
-  (2, 'Demo Vendor 2', 'billing@', '512-555-0002', 'Austin'),
-  (3, 'Demo Vendor 3', 'billing3@example.test', NULL, 'Austin');
-
-SELECT otlet.create_semantic_index(
-  :'index_name',
-  'public.otlet_demo_semantic_vendor'::regclass,
-  'id',
-  'Otlet demo semantic index. Return exactly this JSON object for every input row: {"output":{"status":"needs_review","needs_review":true,"issues":["demo semantic index"]},"actions":[{"type":"create_record","record_type":"' || :'record_type' || '","subject_id":"db-owned","body":{"status":"needs_review","needs_review":true,"semantic":"indexed row"}}]}',
+SELECT name, task_name, record_type, max_candidate_rows
+FROM otlet.create_semantic_join_index(
+  :'join_index_name',
+  $$
+    SELECT
+      p.pair_id AS subject_id,
+      jsonb_build_object(
+        '_otlet_mvcc', jsonb_build_object(
+          'subject_id', p.pair_id,
+          'left_id', p.left_id,
+          'right_id', p.right_id,
+          'left_ctid', l.ctid::text,
+          'left_xmin', l.xmin::text,
+          'right_ctid', r.ctid::text,
+          'right_xmin', r.xmin::text
+        ),
+        'table', 'public.otlet_demo_vendor_entity',
+        'pair_id', p.pair_id,
+        'left_id', p.left_id,
+        'right_id', p.right_id,
+        'left_record', jsonb_build_object(
+          'id', l.id,
+          'legal_name', l.legal_name,
+          'website', l.website,
+          'address', l.address,
+          'notes', l.notes
+        ),
+        'right_record', jsonb_build_object(
+          'id', r.id,
+          'legal_name', r.legal_name,
+          'website', r.website,
+          'address', r.address,
+          'notes', r.notes
+        )
+      ) AS input
+    FROM public.otlet_demo_vendor_pair p
+    JOIN public.otlet_demo_vendor_entity l ON l.id = p.left_id
+    JOIN public.otlet_demo_vendor_entity r ON r.id = p.right_id
+    ORDER BY p.pair_id
+  $$,
+  'Use input.pair_id to choose exactly one valid JSON object. If pair_id is vendor-1001:vendor-42, return {"output":{"match":"same_entity","confidence":"high","reason":"shared remittance account and acquisition note"},"actions":[]}. If pair_id is vendor-1001:vendor-77, return {"output":{"match":"different_entity","confidence":"high","reason":"medical supplier has no shared identifiers"},"actions":[]}. For any other pair, compare operational identifiers and use match same_entity, different_entity, or unclear. Always set actions to an empty array. Do not add prose, markdown, labels, nested output, or action strings.',
   '{
     "type": "object",
-    "required": ["status", "needs_review", "issues"],
+    "required": ["match", "confidence", "reason"],
     "additionalProperties": false,
     "properties": {
-      "status": {"enum": ["needs_review"]},
-      "needs_review": {"type": "boolean"},
-      "issues": {"type": "array", "items": {"type": "string"}}
+      "match": {"enum": ["same_entity", "different_entity", "unclear"]},
+      "confidence": {"enum": ["low", "medium", "high"]},
+      "reason": {"type": "string"}
     }
   }'::jsonb,
   :'model_name',
-  '{"temperature":0,"max_tokens":256,"reasoning":"off","inference_cache":true,"generation_trace":true,"generation_trace_max_tokens":12,"generation_trace_top_k":3}'::jsonb,
-  :'record_type'
+  :'record_type',
+  '{"temperature":0,"max_tokens":256,"reasoning":"off","inference_cache":true,"generation_trace":true,"generation_trace_max_tokens":16,"generation_trace_top_k":3}'::jsonb,
+  10
 );
 SQL
 
-queued="$(psql_value "SELECT otlet.refresh_semantic_index('$index_name');")"
-echo "semantic_index_refresh_queued=$queued"
-[ "$queued" = "3" ] || {
-  echo "Expected 3 semantic index jobs, got $queued" >&2
+queued="$(psql_value "SELECT otlet.refresh_semantic_join_index('$join_index_name');")"
+echo "semantic_join_refresh_queued=$queued"
+[ "$queued" = "2" ] || {
+  echo "Expected 2 semantic join jobs, got $queued" >&2
   exit 1
 }
-wait_task_complete "$index_task" 3 1800 1
-materialized="$(psql_value "SELECT otlet.materialize_semantic_index('$index_name');")"
-echo "semantic_index_materialized=$materialized"
-[ "$materialized" = "3" ] || {
-  echo "Expected 3 materializations, got $materialized" >&2
-  exit 1
-}
-
-native_table="$(psql_value "SELECT otlet.semantic_native_table_name('$index_name');")"
-[[ "$native_table" =~ ^[a-z][a-z0-9_]*$ ]] || {
-  echo "Unexpected native table identifier: $native_table" >&2
+wait_task_complete "$join_task" 2 1800 1
+derive_entity_records "$join_task"
+materialized="$(psql_value "SELECT otlet.materialize_semantic_join_index('$join_index_name');")"
+echo "semantic_join_materialized=$materialized"
+[ "$materialized" = "2" ] || {
+  echo "Expected 2 semantic join materializations, got $materialized" >&2
   exit 1
 }
 
-status_contract="$(psql_value "
-SELECT selected_path || '|' ||
-       default_native_foreign_table || '|' ||
-       native_node || '|' ||
-       planner_hook_status || '|' ||
-       custom_path_status || '|' ||
-       stale_result_policy || '|' ||
-       worker_handoff
-FROM otlet.model_access_status
-WHERE index_name = '$index_name';
+join_status_contract="$(psql_value "
+SELECT selected_path || '|' || total_pairs || '|' || ready_pairs || '|' || stale_pairs || '|' || missing_pairs
+FROM otlet.semantic_join_index_plan('$join_index_name', true);
 ")"
-echo "model_access_status_contract=$status_contract"
-for term in \
-  "semantic_lookup" \
-  "otlet.$native_table" \
-  "Foreign Scan via otlet_semantic_fdw" \
-  "Custom Scan via set_rel_pathlist_hook" \
-  "installed_semantic_matches" \
-  "selected_for_semantic_matches" \
-  "fail_closed_zero_subject_rows_until_worker_refresh_commits" \
-  "shared_memory_xact_commit_latch"; do
-  require_contains "$status_contract" "$term" "Expected model access status to contain $term"
-done
+echo "semantic_join_status_contract=$join_status_contract"
+[ "$join_status_contract" = "semantic_join_lookup|2|2|0|0" ] || {
+  echo "Expected fresh semantic join status, got $join_status_contract" >&2
+  exit 1
+}
+
+join_lookup_contract="$(psql_value "
+SELECT count(*)::text || '|' ||
+       count(*) FILTER (WHERE body @> '{\"match\":\"same_entity\"}'::jsonb)::text || '|' ||
+       count(*) FILTER (WHERE body @> '{\"match\":\"different_entity\"}'::jsonb)::text
+FROM otlet.semantic_join_index_current_rows('$join_index_name', true);
+")"
+echo "semantic_join_lookup_contract=$join_lookup_contract"
+[ "$join_lookup_contract" = "2|1|1" ] || {
+  echo "Expected semantic join lookup contract 2|1|1, got $join_lookup_contract" >&2
+  exit 1
+}
+
+join_match_contract="$(psql_value "
+SELECT otlet.semantic_join_matches('$join_index_name', 'vendor-1001:vendor-42', '{\"match\":\"same_entity\"}'::jsonb)::text || '|' ||
+       otlet.semantic_join_matches('$join_index_name', 'vendor-1001:vendor-77', '{\"match\":\"different_entity\"}'::jsonb)::text;
+")"
+echo "semantic_join_match_contract=$join_match_contract"
+[ "$join_match_contract" = "true|true" ] || {
+  echo "Expected semantic join matches, got $join_match_contract" >&2
+  exit 1
+}
+
+psql_exec \
+  -v foreign_table="$join_foreign_table" \
+  -v join_index_name="$join_index_name" >/dev/null <<'SQL'
+SELECT format('DROP FOREIGN TABLE IF EXISTS otlet.%I', :'foreign_table') \gexec
+SELECT otlet.create_semantic_join_foreign_table(:'foreign_table', :'join_index_name');
+SQL
+[[ "$join_foreign_table" =~ ^[a-z][a-z0-9_]*$ ]] || {
+  echo "Unexpected join foreign table identifier: $join_foreign_table" >&2
+  exit 1
+}
 
 fdw_plan="$(
   psql_exec -P border=2 -P null='' <<SQL
 EXPLAIN (ANALYZE, VERBOSE, COSTS, SUMMARY OFF, TIMING OFF)
 SELECT *
-FROM otlet.$native_table
-WHERE subject_id = '2';
+FROM otlet.$join_foreign_table
+WHERE subject_id = 'vendor-1001:vendor-42';
 SQL
 )"
 printf '%s\n' "$fdw_plan"
-require_contains "$fdw_plan" "Foreign Scan on" "Expected FDW Foreign Scan"
+require_contains "$fdw_plan" "Foreign Scan on" "Expected semantic join FDW Foreign Scan"
 require_contains "$fdw_plan" "Otlet Node: Semantic Foreign Scan" "Expected Otlet FDW explain details"
 
-program_hash="$(psql_value "SELECT program_hash FROM otlet.compile_semantic_program('demo_vendor_needs_review', '$index_name', 'needs review');")"
-action_program_hash="$(psql_value "SELECT program_hash FROM otlet.compile_semantic_action_program('demo_vendor_action_indexed', '$index_name', 'create_record', 'semantic is indexed row');")"
-echo "semantic_program_hash=$program_hash"
-echo "semantic_action_program_hash=$action_program_hash"
-
-custom_scan_plan="$(
-  psql_exec -P border=2 -P null='' <<SQL
-EXPLAIN (ANALYZE, VERBOSE, COSTS, SUMMARY OFF, TIMING OFF)
-SELECT *
-FROM public.otlet_demo_semantic_vendor v
-WHERE otlet.semantic_matches('$index_name', v.id::text, '{"status":"needs_review"}'::jsonb);
-
-EXPLAIN (ANALYZE, VERBOSE, COSTS, SUMMARY OFF, TIMING OFF)
-SELECT *
-FROM public.otlet_demo_semantic_vendor v
-WHERE otlet.semantic_matches_program('demo_vendor_needs_review', v.id::text);
-
-EXPLAIN (ANALYZE, VERBOSE, COSTS, SUMMARY OFF, TIMING OFF)
-SELECT *
-FROM public.otlet_demo_semantic_vendor v
-WHERE otlet.semantic_action_matches_program('demo_vendor_action_indexed', v.id::text);
-
-SELECT
-  (SELECT count(*) FROM public.otlet_demo_semantic_vendor v WHERE otlet.semantic_matches('$index_name', v.id::text, '{"status":"needs_review"}'::jsonb)) || ',' ||
-  (SELECT count(*) FROM public.otlet_demo_semantic_vendor v WHERE otlet.semantic_matches_program('demo_vendor_needs_review', v.id::text)) || ',' ||
-  (SELECT count(*) FROM public.otlet_demo_semantic_vendor v WHERE otlet.semantic_action_matches_program('demo_vendor_action_indexed', v.id::text)) AS custom_scan_rows;
-SQL
-)"
-printf '%s\n' "$custom_scan_plan"
-require_contains "$custom_scan_plan" "Custom Scan (Otlet Semantic Source CustomScan)" "Expected CustomScan plan"
-require_contains "$custom_scan_plan" "Semantic Predicate Owner: otlet_customscan_executor" "Expected CustomScan predicate ownership"
-require_contains "$custom_scan_plan" "Child Semantic Filter: stripped_before_child_plan" "Expected semantic filter stripped from child plan"
-reject_regex "$custom_scan_plan" "Filter: .*semantic_matches|Filter: .*semantic_action_matches" "Semantic predicate leaked back into child SQL filter"
-require_contains "$custom_scan_plan" "custom_scan_rows" "Expected CustomScan row proof"
-require_contains "$custom_scan_plan" "3,3,3" "Expected all three semantic CustomScan predicates to match"
-
-log "Checking stale fail-closed and bounded infer-now"
+log "Checking stale entity-resolution state"
 psql_exec >/dev/null <<'SQL'
-UPDATE public.otlet_demo_semantic_vendor
-SET email = 'changed@example.test',
+SELECT otlet.watch_semantic_stale('public.otlet_demo_vendor_entity'::regclass, 'id');
+UPDATE public.otlet_demo_vendor_entity
+SET notes = notes || '; updated AP contact confirms remittance migration',
     updated_at = clock_timestamp()
-WHERE id = 3;
+WHERE id = 'vendor-1001';
 SQL
-stale_rows="$(psql_value "SELECT stale_rows FROM otlet.semantic_index_status WHERE name = '$index_name';")"
-echo "semantic_index_stale_rows=$stale_rows"
-[ "$stale_rows" != "0" ] || {
-  echo "Expected stale semantic index row after source update" >&2
-  exit 1
-}
-fail_closed_rows="$(psql_value "SELECT count(*) FROM public.otlet_demo_semantic_vendor v WHERE v.id = 3 AND otlet.semantic_matches('$index_name', v.id::text, '{\"status\":\"needs_review\"}'::jsonb, 1, false);")"
-echo "stale_fail_closed_rows=$fail_closed_rows"
-[ "$fail_closed_rows" = "0" ] || {
-  echo "Expected stale row to fail closed before bounded infer-now" >&2
+direct_stale_materializations="$(psql_value "SELECT count(*) FROM otlet.semantic_materializations WHERE task_name = '$entity_task' AND record_type = '$record_type' AND stale;")"
+echo "entity_resolution_stale_materializations=$direct_stale_materializations"
+[ "$direct_stale_materializations" = "2" ] || {
+  echo "Expected 2 stale direct materializations, got $direct_stale_materializations" >&2
   exit 1
 }
 
-infer_plan="$(
-  psql_exec -P border=2 -P null='' <<SQL
-EXPLAIN (ANALYZE, VERBOSE, COSTS, SUMMARY OFF, TIMING OFF)
-SELECT *
-FROM public.otlet_demo_semantic_vendor v
-WHERE otlet.semantic_matches_auto('$index_name', v.id::text, '{"status":"needs_review"}'::jsonb, 0, 15000, 1, false);
-SQL
-)"
-printf '%s\n' "$infer_plan"
-require_contains "$infer_plan" "Infer Now Batches: 1" "Expected bounded infer-now batch"
-require_contains "$infer_plan" "Infer Now Input Path: tuple_slot_mvcc_json_no_spi" "Expected tuple-local infer-now input path"
-require_contains "$infer_plan" "Infer Now Trace Version: otlet_generation_trace_v1" "Expected infer-now trace version"
-require_regex "$infer_plan" "Infer Now Trace Receipt Id:[[:space:]]+[1-9][0-9]*" "Expected infer-now receipt trace id"
+join_stale_contract="$(psql_value "
+SELECT stale_pairs::text || '|' || ready_pairs::text
+FROM otlet.semantic_join_index_stats('$join_index_name');
+SELECT count(*)::text
+FROM otlet.semantic_join_index_lookup('$join_index_name');
+")"
+join_stale_pairs="$(head -n 1 <<<"$join_stale_contract")"
+join_fresh_after_lookup="$(tail -n 1 <<<"$join_stale_contract")"
+echo "semantic_join_stale_contract=$join_stale_pairs|fresh_after_lookup=$join_fresh_after_lookup"
+[ "$join_stale_pairs|$join_fresh_after_lookup" = "2|0|0" ] || {
+  echo "Expected semantic join stale contract 2|0|0, got $join_stale_pairs|$join_fresh_after_lookup" >&2
+  exit 1
+}
 
 trace_contract="$(psql_value "
-SELECT (receipt_id > 0)::text || '|' ||
-       (prompt_tokens > 0)::text || '|' ||
-       (generated_tokens >= 0)::text || '|' ||
-       COALESCE(trace_version, '') || '|' ||
-       COALESCE(probability_method, '') || '|' ||
-       COALESCE(executor_origin, '') || '|' ||
-       COALESCE(executor_node, '') || '|' ||
-       COALESCE(semantic_index_name, '') || '|' ||
-       COALESCE(stale_policy, '')
+SELECT count(*) FILTER (WHERE receipt_id > 0)::text || '|' ||
+       count(*) FILTER (WHERE prompt_tokens > 0)::text || '|' ||
+       count(*) FILTER (WHERE generated_tokens >= 0)::text || '|' ||
+       count(*) FILTER (WHERE schema_validation_status = 'passed')::text
 FROM otlet.inference_receipt_trace_status
-WHERE task_name = '$index_task'
-  AND subject_id = '3'
-  AND status = 'complete'
-ORDER BY receipt_id DESC
-LIMIT 1;
+WHERE task_name IN ('$entity_task', '$join_task')
+  AND status = 'complete';
 ")"
-echo "trace_visibility_contract=$trace_contract"
-for term in \
-  "true|true|true|otlet_generation_trace_v1" \
-  "customscan_infer_now" \
-  "Otlet Semantic Source CustomScan" \
-  "$index_name"; do
-  require_contains "$trace_contract" "$term" "Expected trace visibility contract to contain $term"
-done
+echo "receipt_trace_contract=$trace_contract"
+[ "$trace_contract" = "4|4|4|4" ] || {
+  echo "Expected receipt trace contract 4|4|4|4, got $trace_contract" >&2
+  exit 1
+}
 
 visibility_status="$(psql_value "
 SELECT (receipt_count > 0)::text || '|' ||
        (token_steps > 0)::text || '|' ||
        (top_k_alternatives > 0)::text || '|' ||
-       (customscan_trace_receipts > 0)::text || '|' ||
        (max_detailed_trace_tokens > 0)::text || '|' ||
        (max_detailed_trace_top_k = 3)::text
 FROM otlet.inference_visibility_status
 LIMIT 1;
 ")"
 echo "inference_visibility_status=$visibility_status"
-require_contains "$visibility_status" "true|true|true|true|true|true" "Expected bounded token/top-k trace visibility counters"
+require_contains "$visibility_status" "true|true|true|true|true" "Expected bounded token/top-k trace visibility counters"
 
 runtime_contract="$(psql_value "
 SELECT runtime_status || '|' ||

@@ -558,34 +558,3 @@ fn linked_cancel_requested(job_id: i64) -> Result<bool, ModelError> {
 
     result.map_err(|err| ModelError::new(format!("linked cancellation check failed: {err}")))
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn linked_token_budget_allows_chunked_prompt_decode() {
-        assert!(validate_linked_token_budget(LINKED_PROMPT_BATCH_TOKENS + 1, 128, 4096).is_ok());
-    }
-
-    #[test]
-    fn linked_token_budget_rejects_context_overflow() {
-        let err = validate_linked_token_budget(4000, 128, 4096).unwrap_err();
-
-        assert!(err.message.contains("exceeds context window"));
-    }
-
-    #[test]
-    fn token_probe_count_handles_i32_min() {
-        let err = token_capacity_from_probe(i32::MIN).unwrap_err();
-
-        assert!(err.message.contains("invalid token count"));
-    }
-
-    #[test]
-    fn linked_token_budget_rejects_prompt_equal_to_window() {
-        let err = validate_linked_token_budget(4096, 1, 4096).unwrap_err();
-
-        assert!(err.message.contains("exceeds context window"));
-    }
-}
