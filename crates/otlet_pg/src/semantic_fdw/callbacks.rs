@@ -21,10 +21,7 @@ pub extern "C-unwind" fn otlet_semantic_fdw_handler(
         (*routine).EndForeignScan = Some(otlet_semantic_end_foreign_scan);
         (*routine).ExplainForeignScan = Some(otlet_semantic_explain_foreign_scan);
         (*routine).AnalyzeForeignTable = Some(otlet_semantic_analyze_foreign_table);
-        (*routine).IsForeignRelUpdatable = Some(otlet_semantic_is_foreign_rel_updatable);
-        (*routine).GetForeignRowMarkType = Some(otlet_semantic_get_foreign_row_mark_type);
         (*routine).ShutdownForeignScan = Some(otlet_semantic_shutdown_foreign_scan);
-        (*routine).IsForeignScanParallelSafe = Some(otlet_semantic_is_foreign_scan_parallel_safe);
         pg_sys::Datum::from(routine as usize)
     }
 }
@@ -321,30 +318,6 @@ fn take_explain_snapshot(
 
 fn fdw_explain_snapshots() -> &'static Mutex<HashMap<usize, SemanticFdwExplainSnapshot>> {
     FDW_EXPLAIN_SNAPSHOTS.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-#[pgrx::pg_guard]
-unsafe extern "C-unwind" fn otlet_semantic_is_foreign_rel_updatable(
-    _rel: pg_sys::Relation,
-) -> std::ffi::c_int {
-    0
-}
-
-#[pgrx::pg_guard]
-unsafe extern "C-unwind" fn otlet_semantic_get_foreign_row_mark_type(
-    _rte: *mut pg_sys::RangeTblEntry,
-    _strength: pg_sys::LockClauseStrength::Type,
-) -> pg_sys::RowMarkType::Type {
-    pg_sys::RowMarkType::ROW_MARK_COPY
-}
-
-#[pgrx::pg_guard]
-unsafe extern "C-unwind" fn otlet_semantic_is_foreign_scan_parallel_safe(
-    _root: *mut pg_sys::PlannerInfo,
-    _rel: *mut pg_sys::RelOptInfo,
-    _rte: *mut pg_sys::RangeTblEntry,
-) -> bool {
-    false
 }
 
 #[pgrx::pg_guard]

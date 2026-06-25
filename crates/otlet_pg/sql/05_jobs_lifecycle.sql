@@ -7,6 +7,7 @@ AS $$
     FROM otlet.jobs j
     JOIN otlet.tasks t ON t.name = j.task_name
     JOIN otlet.models m ON m.name = t.model_name
+    CROSS JOIN otlet.production_policy p
     LEFT JOIN (
       SELECT
         t.model_name,
@@ -30,6 +31,7 @@ AS $$
         OR (
           j.status = 'running'
           AND j.leased_until < now()
+          AND j.attempts < p.max_attempts
         )
         OR (
           j.status = 'cancel_requested'
@@ -51,12 +53,13 @@ AS $$
   UPDATE otlet.jobs j
   SET status = CASE WHEN j.status = 'cancel_requested' THEN 'cancel_requested' ELSE 'running' END,
       attempts = attempts + 1,
-      leased_until = now() + interval '5 minutes',
+      leased_until = now() + p.job_lease_interval,
       error = CASE WHEN j.status = 'cancel_requested' THEN j.error ELSE NULL END,
       raw_output = NULL,
       started_at = now(),
       finished_at = NULL
   FROM next_job
+  CROSS JOIN otlet.production_policy p
   WHERE j.id = next_job.id
   RETURNING j.*;
 $$;
@@ -465,7 +468,9 @@ CREATE FUNCTION otlet.fail_job(
   input_hash text DEFAULT NULL,
   output_schema_hash text DEFAULT NULL,
   raw_output_hash text DEFAULT NULL,
-  started_at timestamptz DEFAULT NULL
+  started_at timestamptz DEFAULT NULL,
+  schema_validation_status text DEFAULT NULL,
+  trace_summary jsonb DEFAULT '{}'::jsonb
 ) RETURNS SETOF otlet.jobs
 LANGUAGE plpgsql
 AS $$
@@ -528,6 +533,8 @@ BEGIN
     input_hash,
     output_schema_hash,
     raw_output_hash,
+    schema_validation_status,
+    trace_summary,
     started_at,
     status,
     error
@@ -546,6 +553,8 @@ BEGIN
     fail_job.input_hash,
     fail_job.output_schema_hash,
     COALESCE(fail_job.raw_output_hash, md5(COALESCE(fail_job.raw_output, ''))),
+    fail_job.schema_validation_status,
+    COALESCE(fail_job.trace_summary, '{}'::jsonb),
     COALESCE(fail_job.started_at, saved_job.started_at, now()),
     'failed',
     fail_job.error
@@ -554,7 +563,9 @@ BEGIN
     SET finished_at = now(),
         status = EXCLUDED.status,
         error = EXCLUDED.error,
-        raw_output_hash = EXCLUDED.raw_output_hash;
+        raw_output_hash = EXCLUDED.raw_output_hash,
+        schema_validation_status = EXCLUDED.schema_validation_status,
+        trace_summary = EXCLUDED.trace_summary;
 
   PERFORM otlet.mark_runtime_health(runtime_row.name, 'error', fail_job.error);
   PERFORM otlet.touch_runtime_slot(runtime_row.name, model_row.name, 'error', 0, fail_job.error);
@@ -572,5 +583,99 @@ BEGIN
   );
 
   RETURN NEXT saved_job;
+END;
+$$;
+
+CREATE FUNCTION otlet.sweep_expired_jobs() RETURNS bigint
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  job_row otlet.jobs%ROWTYPE;
+  task_row otlet.tasks%ROWTYPE;
+  model_row otlet.models%ROWTYPE;
+  runtime_row otlet.runtimes%ROWTYPE;
+  swept bigint := 0;
+BEGIN
+  FOR job_row IN
+    SELECT j.*
+    FROM otlet.jobs j
+    CROSS JOIN otlet.production_policy p
+    WHERE j.status = 'running'
+      AND j.leased_until < now()
+      AND j.attempts >= p.max_attempts
+    ORDER BY j.id
+    FOR UPDATE
+  LOOP
+    SELECT * INTO task_row FROM otlet.tasks WHERE name = job_row.task_name;
+    SELECT * INTO model_row FROM otlet.models WHERE name = task_row.model_name;
+    SELECT * INTO runtime_row FROM otlet.runtimes WHERE name = model_row.runtime_name;
+
+    UPDATE otlet.jobs
+    SET status = 'failed',
+        leased_until = NULL,
+        error = 'job lease expired after max attempts',
+        raw_output = COALESCE(job_row.raw_output, ''),
+        finished_at = now()
+    WHERE id = job_row.id
+    RETURNING * INTO job_row;
+
+    INSERT INTO otlet.inference_receipts (
+      job_id,
+      task_name,
+      subject_id,
+      model_name,
+      model_artifact_path,
+      model_artifact_hash,
+      runtime_name,
+      runtime_endpoint,
+      runtime_options,
+      raw_output_hash,
+      schema_validation_status,
+      trace_summary,
+      started_at,
+      status,
+      error
+    )
+    VALUES (
+      job_row.id,
+      job_row.task_name,
+      job_row.subject_id,
+      model_row.name,
+      model_row.artifact_path,
+      model_row.artifact_hash,
+      runtime_row.name,
+      runtime_row.endpoint,
+      task_row.runtime_options,
+      md5(COALESCE(job_row.raw_output, '')),
+      'not_run',
+      jsonb_build_object('schema_validation_status', 'not_run'),
+      COALESCE(job_row.started_at, job_row.created_at, now()),
+      'failed',
+      job_row.error
+    )
+    ON CONFLICT ON CONSTRAINT inference_receipts_job_id_key DO UPDATE
+      SET finished_at = now(),
+          status = EXCLUDED.status,
+          error = EXCLUDED.error,
+          raw_output_hash = EXCLUDED.raw_output_hash,
+          schema_validation_status = EXCLUDED.schema_validation_status,
+          trace_summary = EXCLUDED.trace_summary;
+
+    PERFORM otlet.mark_runtime_health(runtime_row.name, 'error', job_row.error);
+    PERFORM otlet.touch_runtime_slot(runtime_row.name, model_row.name, 'error', 0, job_row.error);
+    swept := swept + 1;
+  END LOOP;
+
+  IF swept > 0 THEN
+    PERFORM otlet.record_worker_event(
+      'expired_job_sweep',
+      NULL,
+      NULL,
+      'otlet expired running jobs failed after max attempts',
+      jsonb_build_object('failed_jobs', swept)
+    );
+  END IF;
+
+  RETURN swept;
 END;
 $$;

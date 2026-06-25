@@ -11,9 +11,7 @@ FOREIGN DATA WRAPPER otlet_semantic_fdw;
 CREATE FUNCTION otlet.create_semantic_foreign_table(
   table_name text,
   index_name text,
-  schema_name text DEFAULT 'otlet',
-  min_freshness numeric DEFAULT 1,
-  allow_refresh boolean DEFAULT true
+  schema_name text DEFAULT 'otlet'
 ) RETURNS regclass
 LANGUAGE plpgsql
 AS $$
@@ -45,15 +43,11 @@ BEGIN
       )
       SERVER otlet_semantic_server
       OPTIONS (
-        index_name %L,
-        min_freshness %L,
-        allow_refresh %L
+        index_name %L
       )
     $create$,
     fq_table,
-    index_name,
-    GREATEST(0, LEAST(COALESCE(min_freshness, 1), 1))::text,
-    CASE WHEN allow_refresh THEN 'true' ELSE 'false' END
+    index_name
   );
 
   RETURN fq_table::regclass;
@@ -63,8 +57,7 @@ $$;
 CREATE FUNCTION otlet.create_semantic_join_foreign_table(
   table_name text,
   index_name text,
-  schema_name text DEFAULT 'otlet',
-  allow_refresh boolean DEFAULT true
+  schema_name text DEFAULT 'otlet'
 ) RETURNS regclass
 LANGUAGE plpgsql
 AS $$
@@ -96,13 +89,11 @@ BEGIN
       )
       SERVER otlet_semantic_server
       OPTIONS (
-        join_index_name %L,
-        allow_refresh %L
+        join_index_name %L
       )
     $create$,
     fq_table,
-    index_name,
-    CASE WHEN allow_refresh THEN 'true' ELSE 'false' END
+    index_name
   );
 
   RETURN fq_table::regclass;

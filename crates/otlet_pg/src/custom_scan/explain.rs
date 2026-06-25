@@ -18,10 +18,6 @@ unsafe extern "C-unwind" fn explain_semantic_custom_scan(
                     predicate_kind: runtime.predicate_kind.as_str(),
                     expected_json: &runtime.expected_json,
                     action_type: runtime.action_type.as_deref(),
-                    program_name: runtime.program_name.as_deref(),
-                    program_compiler_mode: runtime.program_compiler_mode.as_deref(),
-                    program_hash: runtime.program_hash.as_deref(),
-                    program_predicate: runtime.program_predicate.as_deref(),
                 },
                 es,
             );
@@ -81,10 +77,6 @@ unsafe extern "C-unwind" fn explain_semantic_custom_scan(
                     predicate_kind: private.predicate_kind.as_str(),
                     expected_json: &private.expected_json,
                     action_type: private.action_type.as_deref(),
-                    program_name: private.program_name.as_deref(),
-                    program_compiler_mode: private.program_compiler_mode.as_deref(),
-                    program_hash: private.program_hash.as_deref(),
-                    program_predicate: private.program_predicate.as_deref(),
                 },
                 es,
             );
@@ -161,10 +153,6 @@ struct SemanticExplainMetadata<'a> {
     predicate_kind: &'static str,
     expected_json: &'a str,
     action_type: Option<&'a str>,
-    program_name: Option<&'a str>,
-    program_compiler_mode: Option<&'a str>,
-    program_hash: Option<&'a str>,
-    program_predicate: Option<&'a str>,
 }
 
 unsafe fn explain_semantic_metadata(
@@ -179,16 +167,6 @@ unsafe fn explain_semantic_metadata(
         explain_text("Semantic Predicate Kind", metadata.predicate_kind, es);
         explain_text("Semantic Predicate", metadata.expected_json, es);
         explain_optional_text("Semantic Action Type", metadata.action_type, es);
-        if let Some(program_name) = metadata.program_name {
-            explain_text("Semantic Program", program_name, es);
-            explain_text(
-                "Semantic Program Compiler Mode",
-                metadata.program_compiler_mode.unwrap_or("unknown"),
-                es,
-            );
-        }
-        explain_optional_text("Semantic Program Hash", metadata.program_hash, es);
-        explain_optional_text("Semantic Program Predicate", metadata.program_predicate, es);
     }
 }
 
@@ -383,7 +361,7 @@ unsafe fn explain_infer_now_trace(trace: &InferNowTraceExplain<'_>, es: *mut pg_
         explain_text(
             "Infer Now Trace Inspect SQL",
             &format!(
-                "SELECT * FROM otlet.inference_trace_chain WHERE receipt_id = {}",
+                "SELECT * FROM otlet.inference_trace_summary WHERE receipt_id = {}",
                 trace.receipt_id
             ),
             es,

@@ -1,5 +1,27 @@
 CREATE SCHEMA otlet;
 
+CREATE TABLE otlet.production_policy (
+  name text PRIMARY KEY DEFAULT 'default',
+  stale_policy text NOT NULL DEFAULT 'refresh_then_fail_closed',
+  max_queued_jobs_per_model integer NOT NULL DEFAULT 1000,
+  max_attempts integer NOT NULL DEFAULT 3,
+  job_lease_interval interval NOT NULL DEFAULT interval '5 minutes',
+  worker_event_retention interval NOT NULL DEFAULT interval '7 days',
+  trace_detail_retention interval NOT NULL DEFAULT interval '7 days',
+  CHECK (name = 'default'),
+  CHECK (stale_policy IN (
+    'lookup_only_fail_closed',
+    'refresh_then_fail_closed'
+  )),
+  CHECK (max_queued_jobs_per_model BETWEEN 1 AND 1000000),
+  CHECK (max_attempts BETWEEN 1 AND 20),
+  CHECK (job_lease_interval >= interval '1 second'),
+  CHECK (job_lease_interval <= interval '1 hour')
+);
+
+INSERT INTO otlet.production_policy (name)
+VALUES ('default');
+
 CREATE TABLE otlet.runtimes (
   name text PRIMARY KEY CHECK (name ~ '^[a-z0-9][a-z0-9_-]*$'),
   endpoint text NOT NULL DEFAULT 'linked',
@@ -210,41 +232,4 @@ CREATE TABLE otlet.semantic_join_indexes (
   last_refresh_at timestamptz,
   last_lookup_at timestamptz,
   last_materialized_at timestamptz
-);
-
-CREATE TABLE otlet.semantic_programs (
-  name text PRIMARY KEY CHECK (name ~ '^[a-z0-9][a-z0-9_-]*$'),
-  index_name text NOT NULL REFERENCES otlet.semantic_indexes(name) ON DELETE CASCADE,
-  predicate text NOT NULL,
-  expected jsonb NOT NULL CHECK (jsonb_typeof(expected) = 'object'),
-  compiler_version text NOT NULL DEFAULT 'otlet_semantic_program_v1',
-  program_hash text NOT NULL,
-  created_at timestamptz NOT NULL DEFAULT now(),
-  updated_at timestamptz NOT NULL DEFAULT now(),
-  UNIQUE (index_name, program_hash)
-);
-
-CREATE TABLE otlet.semantic_join_programs (
-  name text PRIMARY KEY CHECK (name ~ '^[a-z0-9][a-z0-9_-]*$'),
-  index_name text NOT NULL REFERENCES otlet.semantic_join_indexes(name) ON DELETE CASCADE,
-  predicate text NOT NULL,
-  expected jsonb NOT NULL CHECK (jsonb_typeof(expected) = 'object'),
-  compiler_version text NOT NULL DEFAULT 'otlet_semantic_join_program_v1',
-  program_hash text NOT NULL,
-  created_at timestamptz NOT NULL DEFAULT now(),
-  updated_at timestamptz NOT NULL DEFAULT now(),
-  UNIQUE (index_name, program_hash)
-);
-
-CREATE TABLE otlet.semantic_action_programs (
-  name text PRIMARY KEY CHECK (name ~ '^[a-z0-9][a-z0-9_-]*$'),
-  index_name text NOT NULL REFERENCES otlet.semantic_indexes(name) ON DELETE CASCADE,
-  action_type text NOT NULL,
-  predicate text NOT NULL,
-  expected jsonb NOT NULL CHECK (jsonb_typeof(expected) = 'object'),
-  compiler_version text NOT NULL DEFAULT 'otlet_semantic_action_program_v1',
-  program_hash text NOT NULL,
-  created_at timestamptz NOT NULL DEFAULT now(),
-  updated_at timestamptz NOT NULL DEFAULT now(),
-  UNIQUE (index_name, action_type, program_hash)
 );

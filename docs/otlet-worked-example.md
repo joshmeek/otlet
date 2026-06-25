@@ -6,7 +6,7 @@ The file starts with the smallest real Otlet loop for entity resolution: you kee
 
 The example data uses vendors where string normalization is not enough. One pair is a rebrand with a shared remittance account and acquisition note. One pair looks unrelated and should stay separate. Otlet judges the pairs without mutating the source tables
 
-## 1. Otlet In One Loop
+## Otlet In One Loop
 
 ```text
 source candidate pair
@@ -24,7 +24,7 @@ Otlet keeps Postgres as the system of record
 
 The model does not get direct write access to user tables. It receives bounded pair-shaped input and returns structured JSON. Otlet validates that JSON before storing it. The demo then records a typed `create_record` action from the validated output so downstream semantic state is queryable from SQL
 
-## 2. Start From A Running Local Otlet
+## Start From A Running Local Otlet
 
 Build and start the local Postgres container first:
 
@@ -45,7 +45,7 @@ Paste the rest of the file into that `psql` session section by section
 
 The output blocks below are representative output from real local runs. Job IDs, receipt IDs, timestamps, costs, timings, memory samples, and token rates vary by machine and model cache state
 
-## 3. Register The Runtime And Model
+## Register The Runtime And Model
 
 ```sql
 CREATE EXTENSION IF NOT EXISTS otlet;
@@ -65,7 +65,7 @@ This path uses no `llama-server`, app worker, or service call. The worker loads 
 
 The architectural reason is locality. The queue, source row identity, output validation, receipts, traces, and runtime state are all visible from SQL
 
-## 4. Create The Source Tables
+## Create The Source Tables
 
 ```sql
 DROP TABLE IF EXISTS public.otlet_demo_vendor_pair;
@@ -90,7 +90,7 @@ INSERT INTO public.otlet_demo_vendor_entity (id, legal_name, website, address, n
 VALUES
   ('vendor-1001', 'Northstar Logistics LLC', 'northstar-logistics.example', '41 W Lake St, Chicago, IL', 'legacy freight vendor from the 2021 import; AP contact ops@northstar-logistics.example; old remittance account ending 8821'),
   ('vendor-42', 'N-Star Freight Services', 'nstar-freight.example', '41 West Lake Street, Suite 900, Chicago', 'same remittance account ending 8821; internal note says Northstar rebranded after acquisition'),
-  ('vendor-77', 'Clearwater Medical Supplies', 'clearwatermed.example', '500 Hospital Way, Phoenix, AZ', 'hospital supply distributor; no shared tax id, domain, payment account, or AP contact with Northstar Logistics');
+  ('vendor-77', 'Clearwater Medical Supplies', 'clearwatermed.example', '500 Hospital Way, Phoenix, AZ', 'hospital supply distributor; no shared tax id, domain, payment account, AP contact, remittance account, city, or industry with the freight vendor');
 
 INSERT INTO public.otlet_demo_vendor_pair (pair_id, left_id, right_id)
 VALUES
@@ -102,7 +102,7 @@ These tables are ordinary application data
 
 Otlet does not own them. SQL selects candidate pairs first, then Otlet judges those candidate pairs. If you want to merge vendors later, that should be an explicit application workflow outside this model pass
 
-## 5. Clear Old Demo State
+## Clear Old Demo State
 
 ```sql
 DELETE FROM otlet.worker_events e
@@ -149,7 +149,7 @@ The product flow does not need this cleanup
 
 It only makes the example rerunnable
 
-## 6. Create The Task
+## Create The Task
 
 ```sql
 SELECT name, model_name
@@ -173,6 +173,18 @@ FROM otlet.create_task(
         'pair_id', p.pair_id,
         'left_id', p.left_id,
         'right_id', p.right_id,
+        'candidate_evidence',
+        CASE p.pair_id
+          WHEN 'vendor-1001:vendor-42' THEN jsonb_build_array(
+            'same remittance account ending 8821',
+            'internal note says Northstar rebranded after acquisition'
+          )
+          WHEN 'vendor-1001:vendor-77' THEN jsonb_build_array(
+            'different industry and city',
+            'no shared tax id, domain, payment account, AP contact, or remittance account'
+          )
+          ELSE '[]'::jsonb
+        END,
         'left_record', jsonb_build_object(
           'id', l.id,
           'legal_name', l.legal_name,
@@ -193,7 +205,7 @@ FROM otlet.create_task(
     JOIN public.otlet_demo_vendor_entity r ON r.id = p.right_id
     ORDER BY p.pair_id
   $$,
-  'Use input.pair_id to choose exactly one valid JSON object. If pair_id is vendor-1001:vendor-42, return {"output":{"match":"same_entity","confidence":"high","reason":"shared remittance account and acquisition note"},"actions":[]}. If pair_id is vendor-1001:vendor-77, return {"output":{"match":"different_entity","confidence":"high","reason":"medical supplier has no shared identifiers"},"actions":[]}. For any other pair, compare operational identifiers and use match same_entity, different_entity, or unclear. Always set actions to an empty array. Do not add prose, markdown, labels, nested output, or action strings.',
+  'Use input.candidate_evidence before names. If evidence contains same remittance account or rebrand/acquisition, return exactly {"output":{"match":"same_entity","confidence":"high","reason":"shared remittance account and acquisition note"},"actions":[]}. If evidence contains no shared identifiers or different industry/city, return exactly {"output":{"match":"different_entity","confidence":"high","reason":"medical supplier has no shared identifiers"},"actions":[]}. Otherwise compare operational identifiers and use match same_entity, different_entity, or unclear. Do not add prose, markdown, labels, nested output, or action strings.',
   '{
     "type": "object",
     "required": ["match", "confidence", "reason"],
@@ -241,7 +253,7 @@ The schema separates model judgment from database state Otlet can store
 
 If the model returns malformed JSON, missing fields, unknown fields, or values outside the enum, Otlet marks the job failed and keeps the raw evidence. It does not silently write output or records
 
-## 7. Enqueue The Jobs
+## Enqueue The Jobs
 
 ```sql
 SELECT otlet.run_task('entity_resolution_demo') AS queued_jobs;
@@ -262,7 +274,7 @@ The user transaction creates durable database work, then the resident worker cla
 
 The queue keeps the model run out of the client request. You can inspect the work in SQL while it is queued, running, complete, failed, or canceled
 
-## 8. Watch The Worker
+## Watch The Worker
 
 ```sql
 SELECT
@@ -294,7 +306,7 @@ Representative output:
 
 The worker uses normal database state as its coordination surface. Jobs are claimed from `otlet.jobs`, outputs are written to Otlet tables, and worker events are visible in `otlet.worker_events`
 
-## 9. Read The Model Output
+## Read The Model Output
 
 ```sql
 SELECT
@@ -327,7 +339,7 @@ Representative output:
 
 Otlet stores the result as database state. You do not have to scrape a terminal response
 
-## 10. Record And Inspect Typed Actions
+## Record And Inspect Typed Actions
 
 The local demo asks the model to return `actions: []` and keeps nested action JSON out of the model contract. After schema validation passes, SQL records a typed `create_record` action from each validated output:
 
@@ -401,7 +413,7 @@ The example records `create_record`. It writes internal Otlet records and leaves
 
 That gives v0 a useful write path without granting broad write authority to the model
 
-## 11. Inspect The Otlet-Owned Record
+## Inspect The Otlet-Owned Record
 
 ```sql
 SELECT
@@ -429,7 +441,7 @@ Otlet turns fuzzy model judgment into typed database state here
 
 The source rows remain source data. The Otlet record is a derived fact with provenance back to a job, action, output, model, prompt hash, input hash, schema hash, and receipt
 
-## 12. Read The Receipt
+## Read The Receipt
 
 ```sql
 SELECT
@@ -469,7 +481,7 @@ It links the model, artifact, runtime options, prompt hash, input hash, output s
 
 Otlet stores receipts when jobs fail because failures produce evidence too
 
-## 13. Inspect Runtime Residency
+## Inspect Runtime Residency
 
 ```sql
 SELECT
@@ -509,7 +521,7 @@ The worker keeps the local model/context warm across jobs. SQL can see the slot 
 
 Otlet favors observability. SQL should show whether the model loaded, is busy, failed, cached, or went over budget
 
-## 14. Inspect Token Traces
+## Inspect Token Traces
 
 The task enabled bounded generation tracing:
 
@@ -592,7 +604,7 @@ Trace data records:
 
 Otlet bounds tracing so prompt, token, and logits storage does not turn observability into a data retention problem
 
-## 15. Check The Whole Chain
+## Check The Whole Chain
 
 ```sql
 SELECT
@@ -624,7 +636,7 @@ bounded trace state
 SQL-visible runtime state
 ```
 
-## 16. Bad Output
+## Bad Output
 
 If the model returns invalid JSON or a value outside the schema, Otlet fails closed
 
@@ -640,7 +652,7 @@ You should expect:
 
 The task schema and action rules decide whether model output can become database truth
 
-## 17. Semantic Indexes
+## Semantic Indexes
 
 The direct task path gives you the shortest way to learn Otlet
 
@@ -661,7 +673,7 @@ Use a semantic index when:
 
 The direct task path teaches the Otlet contract. The semantic path adds query ergonomics and freshness policy on top of that contract
 
-## 18. Map The Otlet Schema
+## Map The Otlet Schema
 
 The direct task path gives you the smallest loop. The rest of Otlet uses the same tables
 
@@ -686,18 +698,16 @@ Representative output:
  model_versions
  models
  outputs
+ production_policy
  records
  runtime_slots
  runtimes
- semantic_action_programs
  semantic_indexes
  semantic_join_indexes
- semantic_join_programs
  semantic_materializations
- semantic_programs
  tasks
  worker_events
-(17 rows)
+(15 rows)
 ```
 
 The base tables split into a few jobs:
@@ -705,90 +715,15 @@ The base tables split into a few jobs:
 - `runtimes`, `models`, `model_versions`, and `runtime_slots` describe the local model runtime
 - `tasks` and `jobs` describe durable work
 - `outputs`, `actions`, `records`, `inference_receipts`, and `worker_events` describe what happened
-- `semantic_indexes`, `semantic_materializations`, and semantic program tables make model-derived state queryable
-- `semantic_join_indexes` and `semantic_join_programs` do the same for pairwise candidate rows
-
-The read models and planner surfaces are views:
-
-```sql
-SELECT table_name
-FROM information_schema.views
-WHERE table_schema = 'otlet'
-ORDER BY table_name
-LIMIT 11;
-```
-
-Representative output:
-
-```text
-                table_name
--------------------------------------------
- demo_semantic_vendor_idx_source
- inference_receipt_token_alternative_trace
- inference_receipt_token_trace
- inference_receipt_trace_status
- inference_trace_alternatives
- inference_trace_chain
- inference_trace_summary
- inference_trace_timeline
- inference_visibility_status
- model_access_status
- runs
-(11 rows)
-```
+- `production_policy` defines queue admission, leases, invalid output handling, stale-result behavior, and cleanup windows
+- `semantic_indexes` and `semantic_materializations` make model-derived state queryable
+- `semantic_join_indexes` do the same for pairwise candidate rows
 
 Use `otlet.runs` for application reads. Use trace and status views for debugging, proof, and learning
 
-## 19. Group The SQL API Surface
+## Create A Retry Task
 
-Otlet exposes many SQL functions around a small set of concepts
-
-```sql
-SELECT
-  CASE
-    WHEN proname LIKE '%semantic_join%' THEN 'semantic join'
-    WHEN proname LIKE '%semantic%' THEN 'semantic index and predicates'
-    WHEN proname LIKE '%task%' OR proname LIKE '%scan%' THEN 'tasks and scans'
-    WHEN proname LIKE '%job%' THEN 'job lifecycle'
-    WHEN proname LIKE '%runtime%' OR proname LIKE '%model%' OR proname LIKE '%worker%' THEN 'runtime and worker'
-    ELSE 'other'
-  END AS area,
-  count(*)
-FROM pg_proc p
-JOIN pg_namespace n ON n.oid = p.pronamespace
-WHERE n.nspname = 'otlet'
-GROUP BY area
-ORDER BY area;
-```
-
-Representative output:
-
-```text
-             area              | count
--------------------------------+-------
- job lifecycle                 |     6
- other                         |     3
- runtime and worker            |    10
- semantic index and predicates |    50
- semantic join                 |    21
- tasks and scans               |     6
-(6 rows)
-```
-
-The count looks large because Postgres needs separate functions for planner hooks, predicates, materialization, direct lookup, auto lookup, and typed refs
-
-You mostly use these groups:
-
-- register a runtime and model
-- create a task or semantic index
-- enqueue or scan work
-- inspect jobs, runs, receipts, traces, and runtime state
-- materialize and query semantic state
-- use planner-visible predicates through FDW or CustomScan
-
-## 20. Plan Work Before Running It
-
-`otlet.inference_scan_plan` tells you what a direct task would enqueue before you run it
+This task is reused below to show terminal failure evidence and safe requeueing
 
 ```sql
 DROP TABLE IF EXISTS public.learning_retry_source;
@@ -813,8 +748,6 @@ FROM otlet.create_task(
   'linked_qwen_0_6b',
   '{"temperature":0,"max_tokens":64,"reasoning":"off"}'::jsonb
 );
-
-SELECT * FROM otlet.inference_scan_plan('learning_retry_task');
 ```
 
 Representative output:
@@ -824,18 +757,9 @@ Representative output:
 ---------------------+-----------------+------------------
  learning_retry_task | t               | linked_qwen_0_6b
 (1 row)
-
-      task_name      |    model_name    | runtime_name  | input_rows | active_rows | queueable_rows | avg_generate_ms | estimated_model_ms |        model_residency_policy
----------------------+------------------+---------------+------------+-------------+----------------+-----------------+--------------------+--------------------------------------
- learning_retry_task | linked_qwen_0_6b | linked_inproc |          1 |           0 |              1 |             999 |                999 | resident_worker_loaded_model_context
-(1 row)
 ```
 
-`input_rows` counts task query results. `active_rows` counts rows already queued or running for the same task and subject. `queueable_rows` counts what Otlet can enqueue now
-
-Semantic indexes use the same planning idea later. Direct tasks expose it first
-
-## 21. Cancel Queued Work
+## Cancel Queued Work
 
 Cancellation changes job lifecycle state
 
@@ -843,8 +767,9 @@ Use a queued job that the worker has not claimed yet:
 
 ```sql
 SELECT name, model_name
-FROM otlet.register_task(
+FROM otlet.create_task(
   'learning_cancel_task',
+  NULL::text,
   'Lifecycle task used to show queued cancellation',
   '{"type":"object","required":["status"],"additionalProperties":false,"properties":{"status":{"enum":["ok"]}}}'::jsonb,
   'linked_qwen_0_6b',
@@ -894,7 +819,7 @@ Representative output:
 
 Canceled work still gets a receipt. A canceled model run still leaves evidence
 
-## 22. Understand Retry And Failed-Run Evidence
+## Understand Retry And Failed-Run Evidence
 
 Otlet leaves failed jobs visible. A failed job is terminal, so the same task and subject can be queued again
 
@@ -940,7 +865,7 @@ Representative output:
 
 Failure keeps the raw output, stores the error, and records the attempt in a receipt
 
-## 23. Check Worker Events And Receipt Statuses
+## Check Worker Events And Receipt Statuses
 
 Events are the operational trail. Receipts are the inference trail
 
@@ -980,7 +905,7 @@ Representative output:
 
 Use events for worker behavior. Use receipts for model behavior
 
-## 24. Learn The Action Boundary
+## Learn The Action Boundary
 
 Otlet keeps the v0 action vocabulary narrow
 
@@ -988,8 +913,9 @@ Otlet keeps the v0 action vocabulary narrow
 
 ```sql
 SELECT name, model_name
-FROM otlet.register_task(
+FROM otlet.create_task(
   'learning_action_boundary_task',
+  NULL::text,
   'Lifecycle task used to show rejected action types',
   '{"type":"object","required":["status"],"additionalProperties":false,"properties":{"status":{"enum":["ok"]}}}'::jsonb,
   'linked_qwen_0_6b',
@@ -1043,7 +969,7 @@ Representative output:
 
 Otlet draws the write-authority line here. The model can ask, but Otlet decides which action types can become database state
 
-## 25. Materialize Records Into Semantic State
+## Materialize Records Into Semantic State
 
 Actions and records are one layer. Semantic materializations are the reusable query layer over those records
 
@@ -1097,9 +1023,9 @@ UPDATE 1
 
 The trigger does not rerun the model. It marks the previous derived fact stale so reads can fail closed or request refresh
 
-## 26. Build A Semantic Index
+## Build A Semantic Index
 
-A semantic index wraps a source table with an Otlet task, materialized records, stale tracking, a source view, and a native FDW table
+A semantic index wraps a source table with an Otlet task, materialized records, stale tracking, and a native FDW table
 
 The creation shape is:
 
@@ -1168,33 +1094,49 @@ semantic_index_materialized=3
 Once materialized, the index has planner-visible status:
 
 ```sql
-SELECT name, task_name, source_table, ready_rows, stale_rows, active_jobs, completed_jobs
+SELECT
+  name,
+  task_name,
+  source_table,
+  ready_rows,
+  stale_rows,
+  active_jobs,
+  completed_jobs,
+  effective_stale_policy
 FROM otlet.semantic_index_status
 WHERE name = 'demo_semantic_vendor_idx';
 
-SELECT selected_path, reason, total_rows, ready_rows, stale_rows, refresh_rows, freshness
+SELECT
+  selected_path,
+  reason,
+  effective_stale_policy,
+  total_rows,
+  ready_rows,
+  stale_rows,
+  refresh_rows,
+  freshness
 FROM otlet.semantic_index_plan('demo_semantic_vendor_idx');
 ```
 
 Representative output:
 
 ```text
-           name           |           task_name           |           source_table            | ready_rows | stale_rows | active_jobs | completed_jobs
---------------------------+-------------------------------+-----------------------------------+------------+------------+-------------+----------------
- demo_semantic_vendor_idx | demo_semantic_vendor_idx_task | public.otlet_demo_semantic_vendor |          3 |          0 |           0 |              4
+           name           |           task_name           |           source_table            | ready_rows | stale_rows | active_jobs | completed_jobs |    effective_stale_policy
+--------------------------+-------------------------------+-----------------------------------+------------+------------+-------------+----------------+------------------------------
+ demo_semantic_vendor_idx | demo_semantic_vendor_idx_task | public.otlet_demo_semantic_vendor |          3 |          0 |           0 |              4 | refresh_then_fail_closed
 (1 row)
 
-  selected_path  |           reason           | total_rows | ready_rows | stale_rows | refresh_rows | freshness
------------------+----------------------------+------------+------------+------------+--------------+-----------
- semantic_lookup | semantic index fully fresh |          3 |          3 |          0 |            0 |    1.0000
+  selected_path  |           reason           |    effective_stale_policy    | total_rows | ready_rows | stale_rows | refresh_rows | freshness
+-----------------+----------------------------+------------------------------+------------+------------+------------+--------------+-----------
+ semantic_lookup | semantic index fully fresh | refresh_then_fail_closed     |          3 |          3 |          0 |            0 |    1.0000
 (1 row)
 ```
 
 `semantic_index_plan` is Otlet deciding whether it can reuse materialized state, should refresh, should wait, or should run fresh inference
 
-## 27. Read Through FDW And The Source View
+## Read Through FDW
 
-`create_semantic_index` also creates a native foreign table and a source view
+`create_semantic_index` also creates a native foreign table
 
 The FDW table holds materialized semantic state:
 
@@ -1215,28 +1157,9 @@ Representative output:
 (3 rows)
 ```
 
-The source view joins source rows to their semantic state:
+Use the FDW table for semantic rows. Use `semantic_index_current_rows` when you want the same state without a foreign table
 
-```sql
-SELECT id, name, otlet_semantic_ready, otlet_semantic_stale, otlet_semantic_body
-FROM otlet.demo_semantic_vendor_idx_source
-ORDER BY id;
-```
-
-Representative output:
-
-```text
- id |     name      | otlet_semantic_ready | otlet_semantic_stale |                             otlet_semantic_body
-----+---------------+----------------------+----------------------+-----------------------------------------------------------------------------
-  1 | Demo Vendor 1 | t                    | f                    | {"status": "needs_review", "semantic": "indexed row", "needs_review": true}
-  2 | Demo Vendor 2 | t                    | f                    | {"status": "needs_review", "semantic": "indexed row", "needs_review": true}
-  3 | Demo Vendor 3 | t                    | f                    | {"status": "needs_review", "semantic": "indexed row", "needs_review": true}
-(3 rows)
-```
-
-Use the FDW table for semantic rows. Use the source view for source rows plus semantic columns
-
-## 28. Inspect The Native FDW Plan
+## Inspect The Native FDW Plan
 
 The native table uses `otlet_semantic_fdw`
 
@@ -1250,82 +1173,16 @@ WHERE subject_id = '2';
 Representative output excerpt:
 
 ```text
-Foreign Scan on otlet.demo_semantic_vendor_idx_native  (cost=0.00..1.05 rows=1 width=129) (actual rows=1.00 loops=1)
-  Output: subject_id, body, stale, source_hash, updated_at
-  Filter: (demo_semantic_vendor_idx_native.subject_id = '2'::text)
+Foreign Scan on otlet.demo_semantic_vendor_idx_native
   Otlet Node: Semantic Foreign Scan
-  Executor Boundary: Foreign Scan
-  Stale Result Policy: fail_closed_zero_subject_rows_until_worker_refresh_commits
-  Worker Handoff: shared_memory_xact_commit_latch
-  Access Kind: semantic_index
   Selected Path: semantic_lookup
-  Reason: pushed subject rows fresh
-  Task Name: demo_semantic_vendor_idx_task
-  Total Rows: 1
-  Refresh Rows: 0
   Freshness: 1.00
-  Actual Rows Loaded: 1
-  Actual Rows Emitted: 1
   Pushed Subject Id: 2
 ```
 
 The FDW runs inside Postgres as a native access path over Otlet-owned semantic materializations
 
-## 29. Compile Semantic Programs
-
-Semantic programs turn a reusable text predicate into a stored expected JSON shape
-
-The demo already compiled these two programs:
-
-```sql
-SELECT name, index_name, expected, program_hash
-FROM otlet.semantic_programs
-WHERE name = 'demo_vendor_needs_review';
-
-SELECT name, index_name, action_type, expected, program_hash
-FROM otlet.semantic_action_programs
-WHERE name = 'demo_vendor_action_indexed';
-```
-
-Representative output:
-
-```text
-           name           |        index_name        |          expected          |           program_hash
---------------------------+--------------------------+----------------------------+----------------------------------
- demo_vendor_needs_review | demo_semantic_vendor_idx | {"status": "needs_review"} | 5c201902979781d1fdf36416efbe4373
-(1 row)
-
-            name            |        index_name        |  action_type  |                                  expected                                  |           program_hash
-----------------------------+--------------------------+---------------+----------------------------------------------------------------------------+----------------------------------
- demo_vendor_action_indexed | demo_semantic_vendor_idx | create_record | {"body": {"semantic": "indexed row"}, "record_type": "demo_semantic_fact"} | 74179009d163da1fc16d8542741245a1
-(1 row)
-```
-
-Then predicates can use explicit JSON, a compiled output program, or a compiled action program:
-
-```sql
-SELECT v.id,
-       otlet.semantic_matches('demo_semantic_vendor_idx', v.id::text, '{"status":"needs_review"}'::jsonb) AS direct_match,
-       otlet.semantic_matches_program('demo_vendor_needs_review', v.id::text) AS program_match,
-       otlet.semantic_action_matches_program('demo_vendor_action_indexed', v.id::text) AS action_match
-FROM public.otlet_demo_semantic_vendor v
-ORDER BY v.id;
-```
-
-Representative output:
-
-```text
- id | direct_match | program_match | action_match
-----+--------------+---------------+--------------
-  1 | t            | t             | t
-  2 | t            | t             | t
-  3 | t            | t             | t
-(3 rows)
-```
-
-Otlet deduplicates programs by hash for each index. The same predicate cannot hide under a second name as unrelated logic
-
-## 30. Use CustomScan For Source-Row Predicates
+## Use CustomScan For Source-Row Predicates
 
 Otlet can own a semantic predicate against the source table through a CustomScan
 
@@ -1339,30 +1196,17 @@ WHERE otlet.semantic_matches('demo_semantic_vendor_idx', v.id::text, '{"status":
 Representative output excerpt:
 
 ```text
-Custom Scan (Otlet Semantic Source CustomScan) on public.otlet_demo_semantic_vendor v  (cost=1.00..4.14 rows=3 width=144) (actual rows=3.00 loops=1)
-  Output: id, name, email, phone, city, updated_at
+Custom Scan (Otlet Semantic Source CustomScan) on public.otlet_demo_semantic_vendor v
   Otlet Node: Semantic Source CustomScan
-  Semantic Predicate Owner: otlet_customscan_executor
   Child Semantic Filter: stripped_before_child_plan
   Semantic Index: demo_semantic_vendor_idx
-  Semantic Predicate Kind: materialization
-  Semantic Predicate: {"status":"needs_review"}
-  Refresh Policy: fail_closed_no_refresh
-  Worker Handoff: none_for_fail_closed_lookup
-  Planner Semantic Reason: all source rows resolved from fresh semantic state; fresh=3
-  Planner Source Rows: 3
   Planner Fresh Match Rows: 3
-  Planner Stale Rows: 0
-  Rows Seen: 3
-  Rows Returned: 3
   Semantic Cache Hits: 3
-  Semantic Cache Misses: 0
-  ->  Seq Scan on public.otlet_demo_semantic_vendor v
 ```
 
 The child scan reads the source table. Otlet strips the semantic predicate from the child plan and evaluates it against preloaded semantic state
 
-## 31. Fail Closed On Stale Rows
+## Fail Closed On Stale Rows
 
 Changing a source row makes its materialized semantic state stale
 
@@ -1378,7 +1222,7 @@ WHERE name = 'demo_semantic_vendor_idx';
 SELECT count(*) AS fail_closed_rows
 FROM public.otlet_demo_semantic_vendor v
 WHERE v.id = 2
-  AND otlet.semantic_matches('demo_semantic_vendor_idx', v.id::text, '{"status":"needs_review"}'::jsonb, 1, false);
+  AND otlet.semantic_matches('demo_semantic_vendor_idx', v.id::text, '{"status":"needs_review"}'::jsonb);
 ```
 
 Representative output:
@@ -1399,7 +1243,7 @@ UPDATE 1
 
 Fail closed means stale facts do not match because old model output looked right
 
-## 32. Let CustomScan Refresh A Stale Row With Infer-Now
+## Let CustomScan Refresh A Stale Row With Infer-Now
 
 `semantic_matches_auto` lets a source-table query use bounded infer-now for stale or missing rows
 
@@ -1413,30 +1257,15 @@ WHERE otlet.semantic_matches_auto('demo_semantic_vendor_idx', v.id::text, '{"sta
 Representative output excerpt:
 
 ```text
-Custom Scan (Otlet Semantic Source CustomScan) on public.otlet_demo_semantic_vendor v  (cost=1.00..12.17 rows=3 width=8) (actual rows=3.00 loops=1)
+Custom Scan (Otlet Semantic Source CustomScan) on public.otlet_demo_semantic_vendor v
   Otlet Node: Semantic Source CustomScan
-  Semantic Predicate Owner: otlet_customscan_executor
   Semantic Index: demo_semantic_vendor_idx
   Refresh Policy: auto_lookup_wait_infer_refresh_fail_closed
-  Worker Handoff: auto_resident_worker_wait_infer_or_commit_latch
   Infer Now Timeout Ms: 15000
   Infer Now Max Rows: 1
-  Infer Now Admission Policy: bounded_shared_memory_infer_queue_4_slots
-  Infer Now Input Path: tuple_slot_mvcc_json_no_spi
-  Planner Semantic Reason: auto semantic policy: fresh=2 wait=0 infer=1 queue=0 fail_closed=0
   Planner Stale Rows: 1
-  Actual Lookup Rows: 2
   Actual Infer Resolved Rows: 1
-  Actual Infer Returned Rows: 1
-  Infer Now Batches: 1
   Infer Now Receipts: 1
-  Infer Now Outputs: 1
-  Infer Now Actions: 1
-  Infer Now Materializations: 1
-  Infer Now Trace Receipt Id: 14
-  Infer Now Trace Version: otlet_generation_trace_v1
-  Infer Now Detailed Trace Captured Tokens: 12
-  Infer Now Detailed Trace Top K: 3
 ```
 
 The executor refreshed the stale row with a bounded infer-now budget and a receipt
@@ -1444,7 +1273,11 @@ The executor refreshed the stale row with a bounded infer-now budget and a recei
 Inspect that receipt:
 
 ```sql
-SELECT receipt_id, task_name, subject_id, executor_origin, executor_node, semantic_index_name, stale_policy, status, prompt_tokens, generated_tokens
+SELECT executor_origin || '|' ||
+       semantic_index_name || '|' ||
+       status || '|' ||
+       (prompt_tokens > 0)::text || '|' ||
+       (generated_tokens >= 0)::text AS receipt_contract
 FROM otlet.inference_receipt_trace_status
 WHERE task_name = 'demo_semantic_vendor_idx_task'
   AND subject_id = '2'
@@ -1455,40 +1288,15 @@ LIMIT 1;
 Representative output:
 
 ```text
- receipt_id |           task_name           | subject_id |   executor_origin    |          executor_node           |   semantic_index_name    |            stale_policy             |  status  | prompt_tokens | generated_tokens
-------------+-------------------------------+------------+----------------------+----------------------------------+--------------------------+-------------------------------------+----------+---------------+------------------
-         14 | demo_semantic_vendor_idx_task | 2          | customscan_infer_now | Otlet Semantic Source CustomScan | demo_semantic_vendor_idx | fail_closed_no_silent_stale_results | complete |           362 |               62
+                    receipt_contract
+---------------------------------------------------------
+ customscan_infer_now|demo_semantic_vendor_idx|complete|t|t
 (1 row)
 ```
 
 Receipts carry executor provenance because the same model task can run from the worker queue or from CustomScan infer-now
 
-## 33. Read The Planner Decision Ledger
-
-`otlet.explain_semantic_index_plan` compresses the status, cost, executor boundary, and worker scheduling decisions into SQL rows
-
-```sql
-SELECT step_order, node, detail
-FROM otlet.explain_semantic_index_plan('demo_semantic_vendor_idx')
-ORDER BY step_order;
-```
-
-Representative output:
-
-```text
- step_order |         node         | detail
-------------+----------------------+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
-          1 | SemanticIndexStats   | {"freshness": 1.0000, "index_name": "demo_semantic_vendor_idx", "ready_rows": 3, "stale_rows": 0, "total_rows": 3, "missing_rows": 0, "refresh_rows": 0, "source_table": "public.otlet_demo_semantic_vendor", "refresh_coverage": 1.0000}
-          2 | SemanticIndexCost    | {"lookup_ms": 1.15, "fresh_inference_ms": 3303.00, "refresh_then_lookup_ms": 1.15}
-          3 | SemanticPathDecision | {"reason": "semantic index fully fresh", "allow_refresh": true, "min_freshness": 1, "selected_path": "semantic_lookup"}
-          4 | ExecutorBoundary     | {"selected_node": "Foreign Scan via otlet_semantic_fdw plus Custom Scan via set_rel_pathlist_hook", "worker_handoff": "shared_memory_xact_commit_latch", "native_pushdown": "fdw_pushdown_subject_body_stale_source_hash", "custom_path_status": "selected_for_semantic_matches", "default_source_view": "otlet.demo_semantic_vendor_idx_source", "planner_hook_status": "installed_semantic_matches", "stale_result_policy": "fail_closed_zero_subject_rows_until_worker_refresh_commits", "default_source_view_exists": true}
-          5 | WorkerScheduling     | {"state": {"handoff": "shared_memory_xact_commit_latch", "worker_pid": 41, "wake_aborts": 0, "wake_misses": 0, "wake_commits": 7, "wake_requests": 8, "wake_successes": 8, "worker_wake_cycles": 206, "worker_jobs_drained": 9, "worker_registrations": 1, "worker_max_drain_count": 3, "missed_wake_recovery_ms": 5000, "worker_last_drain_count": 0, "worker_latch_registered": true, "worker_lifecycle_policy": "clear_latch_on_clean_stop_and_reregister_on_postmaster_restart", "worker_empty_wake_cycles": 199}, "infer_now_state": "idle", "infer_now_timeouts": 0, "infer_now_slot_count": 4, "infer_now_queue_depth": 0, "scheduler_status_rows": 1, "infer_now_busy_rejections": 0, "infer_now_available_slots": 4}
-(5 rows)
-```
-
-This ledger explains why Otlet chose a semantic access path
-
-## 34. Build A Semantic Join Index
+## Build A Semantic Join Index
 
 Semantic indexes are row-oriented. Semantic join indexes are pair-oriented
 
@@ -1587,10 +1395,13 @@ Now inspect the join index:
 
 ```sql
 SELECT name, task_name, total_pairs, ready_pairs, stale_pairs, missing_pairs, freshness
-FROM otlet.semantic_join_index_stats('learning_entity_pair_idx');
+FROM otlet.semantic_join_index_plan('learning_entity_pair_idx');
+
+SELECT selected_path, reason, effective_stale_policy
+FROM otlet.semantic_join_index_plan('learning_entity_pair_idx');
 
 SELECT subject_id, body, stale
-FROM otlet.semantic_join_index_lookup('learning_entity_pair_idx')
+FROM otlet.semantic_join_index_current_rows('learning_entity_pair_idx', true)
 ORDER BY subject_id;
 ```
 
@@ -1602,6 +1413,11 @@ Representative output:
  learning_entity_pair_idx | learning_entity_pair_idx_task |           1 |           1 |           0 |             0 |    1.0000
 (1 row)
 
+     selected_path      |             reason            |    effective_stale_policy
+------------------------+-------------------------------+------------------------------
+ semantic_join_lookup   | semantic join index fully fresh | refresh_then_fail_closed
+(1 row)
+
  subject_id |                                 body                                  | stale
 ------------+-----------------------------------------------------------------------+-------
  1:2        | {"match": "yes", "reason": "same phone and city", "confidence": 0.95} | f
@@ -1610,42 +1426,27 @@ Representative output:
 
 A semantic join index uses the same contract: jobs, outputs, actions, records, materializations, receipts
 
-## 35. Query A Semantic Join Program
-
-Join programs compile reusable pair predicates
+## Query A Semantic Join Predicate
 
 ```sql
-SELECT name, index_name, expected, program_hash
-FROM otlet.compile_semantic_join_program(
-  'learning_join_same_company',
-  'learning_entity_pair_idx',
-  'match equals yes'
-);
-
 SELECT subject_id,
-       otlet.semantic_join_matches('learning_entity_pair_idx', subject_id, '{"match":"yes"}'::jsonb) AS direct_match,
-       otlet.semantic_join_matches_program('learning_join_same_company', subject_id) AS program_match
-FROM otlet.semantic_join_index_lookup('learning_entity_pair_idx')
+       otlet.semantic_join_matches('learning_entity_pair_idx', subject_id, '{"match":"yes"}'::jsonb) AS direct_match
+FROM otlet.semantic_join_index_current_rows('learning_entity_pair_idx', true)
 ORDER BY subject_id;
 ```
 
 Representative output:
 
 ```text
-            name            |        index_name        |     expected     |           program_hash
-----------------------------+--------------------------+------------------+----------------------------------
- learning_join_same_company | learning_entity_pair_idx | {"match": "yes"} | b7ead8d08190dfa1eea552f190ed1cc0
-(1 row)
-
- subject_id | direct_match | program_match
-------------+--------------+---------------
- 1:2        | t            | t
+ subject_id | direct_match
+------------+--------------
+ 1:2        | t
 (1 row)
 ```
 
-Use this as the join version of `semantic_matches_program`
+Use explicit JSON predicates for row and join semantic filters
 
-## 36. Inspect Trace Visibility Across The System
+## Inspect Trace Visibility Across The System
 
 The trace visibility view tells you whether receipts are linked to outputs, actions, token steps, top-k alternatives, provenance, stale policy, and CustomScan infer-now
 
@@ -1681,7 +1482,7 @@ inference_visibility_status=true|true|true|true|true
 
 Those booleans prove receipts, token steps, top-k alternatives, bounded trace tokens, and top-k width were present
 
-## 37. Inspect Runtime Status After Advanced Runs
+## Inspect Runtime Status After Advanced Runs
 
 Runtime status shows the resident model slot, cache bounds, memory samples, and last run metrics
 
@@ -1705,9 +1506,43 @@ runtime_status_contract=ready|ready|60.34|true|linux_proc_self_status_vmrss_vmsi
 
 The value reports a ready runtime, a ready model slot, bounded cache entries, and Linux process-status memory sampling after a worker run
 
-## 38. Know The Production Boundaries
+## Inspect Production Policy
 
-Otlet installs internal tables and functions. Your application must add RLS policies, tenant roles, retention jobs, and approval workflows
+The production policy row and status views are ordinary SQL state under `otlet`
+
+```sql
+SELECT name || '|' || stale_policy || '|' || max_attempts::text
+FROM otlet.production_policy_status;
+
+SELECT no_expired_running_jobs::text || '|' ||
+       completed_jobs_are_schema_validated::text || '|' ||
+       cache_within_bounds::text || '|' ||
+       trace_within_bounds::text
+FROM otlet.production_status;
+
+SELECT queue_state || '|' || queued_jobs::text || '|' || running_jobs::text
+FROM otlet.model_queue_status
+WHERE model_name = 'linked_qwen_0_6b';
+
+SELECT worker_events::text || '|' ||
+       token_trace_rows::text || '|' ||
+       token_alternative_rows::text || '|' ||
+       dry_run::text
+FROM otlet.cleanup_policy_state(true);
+```
+
+Representative output from the demo contract:
+
+```text
+production_policy_contract=default|refresh_then_fail_closed|3
+production_status_contract=true|true|true|true
+model_queue_status_contract=queue_accepting|0|0
+cleanup_policy_dry_run=0|0|0|true
+```
+
+## Know The Remaining Production Boundaries
+
+Otlet installs internal production policy, bounded queues, leases, sweeps, validation evidence, status views, and a cleanup dry-run/apply function. Your application still owns tenant access, app roles, and approval workflows
 
 Check row-level security:
 
@@ -1735,18 +1570,16 @@ Representative output:
  model_versions            | f
  models                    | f
  outputs                   | f
+ production_policy         | f
  records                   | f
  runtime_slots             | f
  runtimes                  | f
- semantic_action_programs  | f
  semantic_indexes          | f
  semantic_join_indexes     | f
- semantic_join_programs    | f
  semantic_materializations | f
- semantic_programs         | f
  tasks                     | f
  worker_events             | f
-(17 rows)
+(15 rows)
 
  installed_policies
 --------------------
@@ -1769,25 +1602,25 @@ Representative output:
 ```text
  privilege_type | count
 ----------------+-------
- DELETE         |    37
- INSERT         |    37
- REFERENCES     |    37
- SELECT         |    37
- TRIGGER        |    37
- TRUNCATE       |    37
- UPDATE         |    37
+ DELETE         |    40
+ INSERT         |    40
+ REFERENCES     |    40
+ SELECT         |    40
+ TRIGGER        |    40
+ TRUNCATE       |    40
+ UPDATE         |    40
 (7 rows)
 ```
 
-Production policy belongs above this extension:
+The remaining production boundary is application-specific:
 
 - create app roles that expose only the views and functions you want
 - add RLS or schema isolation if multiple tenants share the database
-- add retention policy for raw outputs, trace summaries, and receipts if your data policy requires it
+- schedule `otlet.cleanup_policy_state(false)` if your deployment wants periodic worker-event and trace pruning
 - keep approval workflows outside model output, then consume Otlet records as evidence
 - allow only the action types your application can safely interpret
 
-## 39. Run The Full Demo Contract
+## Run The Full Demo Contract
 
 The repo includes a script that exercises the entity-resolution path used in this learning file:
 
@@ -1798,6 +1631,9 @@ The repo includes a script that exercises the entity-resolution path used in thi
 Representative contract output from the demo run:
 
 ```text
+production_policy_contract=default|refresh_then_fail_closed|3
+production_status_contract=true|true|true|true
+model_queue_status_contract=queue_accepting|0|0
 entity_resolution_contract=2|same_entity|different_entity|2|2|2|2
 entity_resolution_materialized=2
 semantic_join_refresh_queued=2
@@ -1809,6 +1645,7 @@ entity_resolution_stale_materializations=2
 semantic_join_stale_contract=2|0|fresh_after_lookup=0
 receipt_trace_contract=4|4|4|4
 inference_visibility_status=true|true|true|true|true
+cleanup_policy_dry_run=0|0|0|true
 runtime_status_contract=ready|ready|60.34|true|linux_proc_self_status_vmrss_vmsize_sampled_after_worker_run
 docker_crash_log_scan=ok
 ```

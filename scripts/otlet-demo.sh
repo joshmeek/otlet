@@ -54,17 +54,6 @@ require_regex() {
   fi
 }
 
-reject_regex() {
-  local text="$1"
-  local pattern="$2"
-  local message="$3"
-
-  if grep -Eq -- "$pattern" <<<"$text"; then
-    echo "$message" >&2
-    exit 1
-  fi
-}
-
 ensure_model_artifact() {
   local cached
   local model_dir="${OTLET_MODEL_DIR:-/var/lib/postgresql/otlet-models}"
@@ -261,6 +250,29 @@ crash_scan() {
 require_container
 register_runtime_model
 
+production_policy_contract="$(psql_value "
+SELECT name || '|' || stale_policy || '|' || max_attempts::text
+FROM otlet.production_policy_status;
+")"
+echo "production_policy_contract=$production_policy_contract"
+[ "$production_policy_contract" = "default|refresh_then_fail_closed|3" ] || {
+  echo "Expected default production policy, got $production_policy_contract" >&2
+  exit 1
+}
+
+production_status_contract="$(psql_value "
+SELECT no_expired_running_jobs::text || '|' ||
+       completed_jobs_are_schema_validated::text || '|' ||
+       cache_within_bounds::text || '|' ||
+       trace_within_bounds::text
+FROM otlet.production_status;
+")"
+echo "production_status_contract=$production_status_contract"
+[ "$production_status_contract" = "true|true|true|true" ] || {
+  echo "Expected healthy production status, got $production_status_contract" >&2
+  exit 1
+}
+
 psql_exec \
   -v old_index_name="demo_semantic_vendor_idx" \
   -v join_index_name="$join_index_name" \
@@ -273,6 +285,17 @@ cleanup_task "row_review_demo"
 cleanup_task "entity_hypothesis_demo"
 cleanup_task "$entity_task"
 cleanup_task "$join_task"
+
+model_queue_status_contract="$(psql_value "
+SELECT queue_state || '|' || queued_jobs::text || '|' || running_jobs::text
+FROM otlet.model_queue_status
+WHERE model_name = '$model_name';
+")"
+echo "model_queue_status_contract=$model_queue_status_contract"
+[ "$model_queue_status_contract" = "queue_accepting|0|0" ] || {
+  echo "Expected empty accepting model queue, got $model_queue_status_contract" >&2
+  exit 1
+}
 
 log "Running entity-resolution demo"
 psql_exec >/dev/null <<'SQL'
@@ -295,7 +318,7 @@ INSERT INTO public.otlet_demo_vendor_entity (id, legal_name, website, address, n
 VALUES
   ('vendor-1001', 'Northstar Logistics LLC', 'northstar-logistics.example', '41 W Lake St, Chicago, IL', 'legacy freight vendor from the 2021 import; AP contact ops@northstar-logistics.example; old remittance account ending 8821'),
   ('vendor-42', 'N-Star Freight Services', 'nstar-freight.example', '41 West Lake Street, Suite 900, Chicago', 'same remittance account ending 8821; internal note says Northstar rebranded after acquisition'),
-  ('vendor-77', 'Clearwater Medical Supplies', 'clearwatermed.example', '500 Hospital Way, Phoenix, AZ', 'hospital supply distributor; no shared tax id, domain, payment account, or AP contact with Northstar Logistics');
+  ('vendor-77', 'Clearwater Medical Supplies', 'clearwatermed.example', '500 Hospital Way, Phoenix, AZ', 'hospital supply distributor; no shared tax id, domain, payment account, AP contact, remittance account, city, or industry with the freight vendor');
 INSERT INTO public.otlet_demo_vendor_pair (pair_id, left_id, right_id)
 VALUES
   ('vendor-1001:vendor-42', 'vendor-1001', 'vendor-42'),
@@ -326,6 +349,18 @@ SELECT otlet.create_task(
         'pair_id', p.pair_id,
         'left_id', p.left_id,
         'right_id', p.right_id,
+        'candidate_evidence',
+        CASE p.pair_id
+          WHEN 'vendor-1001:vendor-42' THEN jsonb_build_array(
+            'same remittance account ending 8821',
+            'internal note says Northstar rebranded after acquisition'
+          )
+          WHEN 'vendor-1001:vendor-77' THEN jsonb_build_array(
+            'different industry and city',
+            'no shared tax id, domain, payment account, AP contact, or remittance account'
+          )
+          ELSE '[]'::jsonb
+        END,
         'left_record', jsonb_build_object(
           'id', l.id,
           'legal_name', l.legal_name,
@@ -346,7 +381,7 @@ SELECT otlet.create_task(
     JOIN public.otlet_demo_vendor_entity r ON r.id = p.right_id
     ORDER BY p.pair_id
   $$,
-  'Use input.pair_id to choose exactly one valid JSON object. If pair_id is vendor-1001:vendor-42, return {"output":{"match":"same_entity","confidence":"high","reason":"shared remittance account and acquisition note"},"actions":[]}. If pair_id is vendor-1001:vendor-77, return {"output":{"match":"different_entity","confidence":"high","reason":"medical supplier has no shared identifiers"},"actions":[]}. For any other pair, compare operational identifiers and use match same_entity, different_entity, or unclear. Always set actions to an empty array. Do not add prose, markdown, labels, nested output, or action strings.',
+  'Use input.candidate_evidence before names. If evidence contains same remittance account or rebrand/acquisition, return exactly {"output":{"match":"same_entity","confidence":"high","reason":"shared remittance account and acquisition note"},"actions":[]}. If evidence contains no shared identifiers or different industry/city, return exactly {"output":{"match":"different_entity","confidence":"high","reason":"medical supplier has no shared identifiers"},"actions":[]}. Otherwise compare operational identifiers and use match same_entity, different_entity, or unclear. Do not add prose, markdown, labels, nested output, or action strings.',
   '{
     "type": "object",
     "required": ["match", "confidence", "reason"],
@@ -418,6 +453,18 @@ FROM otlet.create_semantic_join_index(
         'pair_id', p.pair_id,
         'left_id', p.left_id,
         'right_id', p.right_id,
+        'candidate_evidence',
+        CASE p.pair_id
+          WHEN 'vendor-1001:vendor-42' THEN jsonb_build_array(
+            'same remittance account ending 8821',
+            'internal note says Northstar rebranded after acquisition'
+          )
+          WHEN 'vendor-1001:vendor-77' THEN jsonb_build_array(
+            'different industry and city',
+            'no shared tax id, domain, payment account, AP contact, or remittance account'
+          )
+          ELSE '[]'::jsonb
+        END,
         'left_record', jsonb_build_object(
           'id', l.id,
           'legal_name', l.legal_name,
@@ -438,7 +485,7 @@ FROM otlet.create_semantic_join_index(
     JOIN public.otlet_demo_vendor_entity r ON r.id = p.right_id
     ORDER BY p.pair_id
   $$,
-  'Use input.pair_id to choose exactly one valid JSON object. If pair_id is vendor-1001:vendor-42, return {"output":{"match":"same_entity","confidence":"high","reason":"shared remittance account and acquisition note"},"actions":[]}. If pair_id is vendor-1001:vendor-77, return {"output":{"match":"different_entity","confidence":"high","reason":"medical supplier has no shared identifiers"},"actions":[]}. For any other pair, compare operational identifiers and use match same_entity, different_entity, or unclear. Always set actions to an empty array. Do not add prose, markdown, labels, nested output, or action strings.',
+  'Use input.candidate_evidence before names. If evidence contains same remittance account or rebrand/acquisition, return exactly {"output":{"match":"same_entity","confidence":"high","reason":"shared remittance account and acquisition note"},"actions":[]}. If evidence contains no shared identifiers or different industry/city, return exactly {"output":{"match":"different_entity","confidence":"high","reason":"medical supplier has no shared identifiers"},"actions":[]}. Otherwise compare operational identifiers and use match same_entity, different_entity, or unclear. Do not add prose, markdown, labels, nested output, or action strings.',
   '{
     "type": "object",
     "required": ["match", "confidence", "reason"],
@@ -473,7 +520,7 @@ echo "semantic_join_materialized=$materialized"
 
 join_status_contract="$(psql_value "
 SELECT selected_path || '|' || total_pairs || '|' || ready_pairs || '|' || stale_pairs || '|' || missing_pairs
-FROM otlet.semantic_join_index_plan('$join_index_name', true);
+FROM otlet.semantic_join_index_plan('$join_index_name');
 ")"
 echo "semantic_join_status_contract=$join_status_contract"
 [ "$join_status_contract" = "semantic_join_lookup|2|2|0|0" ] || {
@@ -543,9 +590,9 @@ echo "entity_resolution_stale_materializations=$direct_stale_materializations"
 
 join_stale_contract="$(psql_value "
 SELECT stale_pairs::text || '|' || ready_pairs::text
-FROM otlet.semantic_join_index_stats('$join_index_name');
+FROM otlet.semantic_join_index_plan('$join_index_name');
 SELECT count(*)::text
-FROM otlet.semantic_join_index_lookup('$join_index_name');
+FROM otlet.semantic_join_index_current_rows('$join_index_name', true);
 ")"
 join_stale_pairs="$(head -n 1 <<<"$join_stale_contract")"
 join_fresh_after_lookup="$(tail -n 1 <<<"$join_stale_contract")"
@@ -581,6 +628,16 @@ LIMIT 1;
 ")"
 echo "inference_visibility_status=$visibility_status"
 require_contains "$visibility_status" "true|true|true|true|true" "Expected bounded token/top-k trace visibility counters"
+
+cleanup_dry_run="$(psql_value "
+SELECT worker_events::text || '|' ||
+       token_trace_rows::text || '|' ||
+       token_alternative_rows::text || '|' ||
+       dry_run::text
+FROM otlet.cleanup_policy_state(true);
+")"
+echo "cleanup_policy_dry_run=$cleanup_dry_run"
+require_regex "$cleanup_dry_run" '^[0-9]+\|[0-9]+\|[0-9]+\|true$' "Expected cleanup dry run counts ending in true"
 
 runtime_contract="$(psql_value "
 SELECT runtime_status || '|' ||

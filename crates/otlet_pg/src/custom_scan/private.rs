@@ -4,10 +4,6 @@ struct CustomScanPrivate {
     index_name: String,
     expected_json: String,
     action_type: Option<String>,
-    program_name: Option<String>,
-    program_hash: Option<String>,
-    program_predicate: Option<String>,
-    program_compiler_mode: Option<String>,
     auto_policy: bool,
     allow_refresh: bool,
     wait_ms: u32,
@@ -26,10 +22,6 @@ unsafe fn custom_private_from_predicate(predicate: &SemanticMatchPredicate) -> *
             "index_name": &predicate.index_name,
             "expected_json": &predicate.expected_json,
             "action_type": &predicate.action_type,
-            "program_name": &predicate.program_name,
-            "program_hash": &predicate.program_hash,
-            "program_predicate": &predicate.program_predicate,
-            "program_compiler_mode": &predicate.program_compiler_mode,
             "auto_policy": predicate.auto_policy,
             "allow_refresh": predicate.allow_refresh,
             "wait_ms": predicate.wait_ms,
@@ -102,22 +94,6 @@ unsafe fn custom_private_from_list(private: *mut pg_sys::List) -> Option<CustomS
             expected_json: payload.get("expected_json")?.as_str()?.to_string(),
             action_type: payload
                 .get("action_type")
-                .and_then(Value::as_str)
-                .map(str::to_string),
-            program_name: payload
-                .get("program_name")
-                .and_then(Value::as_str)
-                .map(str::to_string),
-            program_hash: payload
-                .get("program_hash")
-                .and_then(Value::as_str)
-                .map(str::to_string),
-            program_predicate: payload
-                .get("program_predicate")
-                .and_then(Value::as_str)
-                .map(str::to_string),
-            program_compiler_mode: payload
-                .get("program_compiler_mode")
                 .and_then(Value::as_str)
                 .map(str::to_string),
             auto_policy: payload.get("auto_policy")?.as_bool()?,

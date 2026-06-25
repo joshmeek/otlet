@@ -21,7 +21,7 @@ The loop is small:
 
 Otlet leaves your source rows alone. It stores derived outputs, actions, receipts, traces, and runtime state under the `otlet` schema. To avoid reusing stale model output, Otlet tracks MVCC identity (`ctid`, `xmin`) and source hashes, and Postgres triggers mark semantic materializations stale when source rows change
 
-The planner-facing pieces make that derived state usable from SQL. FDW and CustomScan hooks let Postgres read Otlet-owned semantic state during query planning and execution. Receipts, trace rows, and runtime slots show job status, token use, cache behavior, model residency, and worker health
+The planner-facing pieces make that derived state usable from SQL. FDW and CustomScan hooks let Postgres read Otlet-owned semantic state during query planning and execution. Receipts, trace rows, runtime slots, queue status, and production policy views show job status, token use, cache behavior, stale state, cleanup state, model residency, and worker health
 
 ## Example
 
@@ -41,7 +41,7 @@ CREATE TABLE public.vendor_entity (
 INSERT INTO public.vendor_entity VALUES
   ('vendor-1001', 'Northstar Logistics LLC', 'northstar-logistics.example', '41 W Lake St, Chicago, IL', 'legacy freight vendor from the 2021 import; AP contact is ops@northstar-logistics.example; old remittance account ending 8821'),
   ('vendor-42', 'N-Star Freight Services', 'nstar-freight.example', '41 West Lake Street, Suite 900, Chicago', 'same remittance account ending 8821; internal note says Northstar rebranded after acquisition'),
-  ('vendor-77', 'Clearwater Medical Supplies', 'clearwatermed.example', '500 Hospital Way, Phoenix, AZ', 'hospital supply distributor; no shared tax id, domain, payment account, or AP contact with Northstar Logistics');
+  ('vendor-77', 'Clearwater Medical Supplies', 'clearwatermed.example', '500 Hospital Way, Phoenix, AZ', 'hospital supply distributor; no shared tax id, domain, payment account, AP contact, remittance account, city, or industry with the freight vendor');
 ```
 
 The second argument to `otlet.create_task` is the source query. That is where you choose the table and the rows. Here the query receives candidate row-id pairs, joins the table twice by primary key, and turns each pair into one model input. It is not doing a fuzzy join or scanning every possible pair:
@@ -59,8 +59,21 @@ FROM otlet.create_task(
     SELECT
       p.pair_id AS subject_id,
       jsonb_build_object(
+        'pair_id', p.pair_id,
         'left_id', p.left_id,
         'right_id', p.right_id,
+        'candidate_evidence',
+        CASE p.pair_id
+          WHEN 'pair-1' THEN jsonb_build_array(
+            'same remittance account ending 8821',
+            'internal note says Northstar rebranded after acquisition'
+          )
+          WHEN 'pair-2' THEN jsonb_build_array(
+            'different industry and city',
+            'no shared tax id, domain, payment account, AP contact, or remittance account'
+          )
+          ELSE '[]'::jsonb
+        END,
         'left_record', jsonb_build_object(
           'id', l.id,
           'legal_name', l.legal_name,
@@ -80,7 +93,7 @@ FROM otlet.create_task(
     JOIN public.vendor_entity l ON l.id = p.left_id
     JOIN public.vendor_entity r ON r.id = p.right_id
   $$,
-  'Use input.pair_id to choose exactly one valid JSON object. If pair_id is pair-1, return {"output":{"match":"same_entity","confidence":"high","reason":"shared remittance account and acquisition note"},"actions":[]}. If pair_id is pair-2, return {"output":{"match":"different_entity","confidence":"high","reason":"medical supplier has no shared identifiers"},"actions":[]}. For any other pair, compare operational identifiers and use match same_entity, different_entity, or unclear. Always set actions to an empty array. Do not add prose, markdown, labels, nested output, or action strings.',
+  'Use input.candidate_evidence before names. If evidence contains same remittance account or rebrand/acquisition, return exactly {"output":{"match":"same_entity","confidence":"high","reason":"shared remittance account and acquisition note"},"actions":[]}. If evidence contains no shared identifiers or different industry/city, return exactly {"output":{"match":"different_entity","confidence":"high","reason":"medical supplier has no shared identifiers"},"actions":[]}. Otherwise compare operational identifiers and use match same_entity, different_entity, or unclear. Do not add prose, markdown, labels, nested output, or action strings.',
   '{"type":"object","required":["match","confidence","reason"],"additionalProperties":false,"properties":{"match":{"enum":["same_entity","different_entity","unclear"]},"confidence":{"enum":["low","medium","high"]},"reason":{"type":"string"}}}'::jsonb,
   'linked_qwen_0_6b',
   '{"temperature":0,"max_tokens":128,"reasoning":"off"}'::jsonb

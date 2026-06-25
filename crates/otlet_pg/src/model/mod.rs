@@ -52,6 +52,8 @@ pub(crate) struct ModelError {
     pub(crate) input_hash: Option<String>,
     pub(crate) output_schema_hash: Option<String>,
     pub(crate) raw_output_hash: Option<String>,
+    pub(crate) schema_validation_status: Option<String>,
+    pub(crate) trace_summary: Option<Value>,
 }
 
 impl ModelError {
@@ -63,11 +65,33 @@ impl ModelError {
             input_hash: None,
             output_schema_hash: None,
             raw_output_hash: None,
+            schema_validation_status: None,
+            trace_summary: None,
         }
     }
 
-    fn with_context(message: String, raw_output: String, context: &RunContext) -> Self {
+    fn with_context(
+        message: String,
+        raw_output: String,
+        context: &RunContext,
+        trace_summary: Value,
+    ) -> Self {
         let raw_output_hash = hash_text(&raw_output);
+        let mut trace_summary = trace_summary;
+        if let Value::Object(object) = &mut trace_summary {
+            object.insert(
+                "schema_validation_status".to_owned(),
+                Value::String("failed".to_owned()),
+            );
+            object.insert(
+                "schema_force".to_owned(),
+                Value::String("post_generation_json_schema_validation_failed".to_owned()),
+            );
+            object.insert(
+                "stop_reason".to_owned(),
+                Value::String("schema_or_json_validation_failed".to_owned()),
+            );
+        }
         Self {
             message,
             raw_output: Some(raw_output),
@@ -75,6 +99,8 @@ impl ModelError {
             input_hash: Some(context.input_hash.clone()),
             output_schema_hash: Some(context.output_schema_hash.clone()),
             raw_output_hash: Some(raw_output_hash),
+            schema_validation_status: Some("failed".to_owned()),
+            trace_summary: Some(trace_summary),
         }
     }
 }
@@ -204,22 +230,28 @@ pub(crate) fn run_job(job: &Job) -> Result<ModelRun, ModelError> {
     };
     let cache_enabled = options.inference_cache && !options.generation_trace;
     let raw_output_hash = hash_text(&raw_output);
+    let trace_summary = generation_trace_summary(&context, &metrics, &raw_output_hash);
 
-    let (json, raw_json) = parse_model_json(raw_output.as_str())
-        .map_err(|err| ModelError::with_context(err, raw_output.clone(), &context))?;
-    let json = normalize_model_envelope(json)
-        .map_err(|err| ModelError::with_context(err, raw_output.clone(), &context))?;
+    let (json, raw_json) = parse_model_json(raw_output.as_str()).map_err(|err| {
+        ModelError::with_context(err, raw_output.clone(), &context, trace_summary.clone())
+    })?;
+    let json = normalize_model_envelope(json).map_err(|err| {
+        ModelError::with_context(err, raw_output.clone(), &context, trace_summary.clone())
+    })?;
     let output = json.get("output").cloned().ok_or_else(|| {
         ModelError::with_context(
             "model JSON missing output".to_owned(),
             raw_output.clone(),
             &context,
+            trace_summary.clone(),
         )
     })?;
-    let actions = model_actions(&json)
-        .map_err(|err| ModelError::with_context(err, raw_output.clone(), &context))?;
-    validate_output(&job.output_schema, &output)
-        .map_err(|err| ModelError::with_context(err, raw_output.clone(), &context))?;
+    let actions = model_actions(&json).map_err(|err| {
+        ModelError::with_context(err, raw_output.clone(), &context, trace_summary.clone())
+    })?;
+    validate_output(&job.output_schema, &output).map_err(|err| {
+        ModelError::with_context(err, raw_output.clone(), &context, trace_summary.clone())
+    })?;
 
     if cache_enabled && !metrics.inference_cache_hit {
         let stats = inference_cache_put(
@@ -232,8 +264,6 @@ pub(crate) fn run_job(job: &Job) -> Result<ModelRun, ModelError> {
         metrics.inference_cache_bytes = stats.bytes;
         metrics.inference_cache_evictions = stats.evictions;
     }
-    let trace_summary = generation_trace_summary(&context, &metrics, &raw_output_hash);
-
     Ok(ModelRun {
         output,
         raw_output: raw_json,

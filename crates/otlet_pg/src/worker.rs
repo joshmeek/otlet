@@ -32,6 +32,16 @@ pub extern "C-unwind" fn otlet_worker_main(_arg: pgrx::pg_sys::Datum) {
             process_infer_now_request(request);
         }
 
+        let sweep_result: pgrx::spi::Result<()> = BackgroundWorker::transaction(|| {
+            pgrx::Spi::connect_mut(|client| {
+                client.update("SELECT otlet.sweep_expired_jobs()", Some(1), &[])?;
+                Ok(())
+            })
+        });
+        if let Err(err) = sweep_result {
+            pgrx::warning!("otlet worker expired job sweep failed: {err}");
+        }
+
         let mut drained = 0;
         loop {
             let job = match BackgroundWorker::transaction(claim_job) {
@@ -225,9 +235,11 @@ fn process_job(job: Job) -> bool {
                         err.input_hash.as_deref().into(),
                         err.output_schema_hash.as_deref().into(),
                         err.raw_output_hash.as_deref().into(),
+                        err.schema_validation_status.as_deref().into(),
+                        JsonB(err.trace_summary.unwrap_or_else(|| serde_json::json!({}))).into(),
                     ];
                     client.update(
-                        "SELECT otlet.fail_job($1, $2, $3, $4, $5, $6, $7)",
+                        "SELECT otlet.fail_job($1, $2, $3, $4, $5, $6, $7, schema_validation_status => $8, trace_summary => $9)",
                         Some(1),
                         &args,
                     )?;

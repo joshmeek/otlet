@@ -71,24 +71,9 @@ pgrx::extension_sql_file!(
     requires = ["semantic_join_core"]
 );
 pgrx::extension_sql_file!(
-    "../sql/14_semantic_programs.sql",
-    name = "semantic_programs",
-    requires = ["semantic_join_plan"]
-);
-pgrx::extension_sql_file!(
-    "../sql/15_semantic_program_worker.sql",
-    name = "semantic_program_worker",
-    requires = ["semantic_programs"]
-);
-pgrx::extension_sql_file!(
-    "../sql/16_semantic_program_status.sql",
-    name = "semantic_program_status",
-    requires = ["semantic_program_worker"]
-);
-pgrx::extension_sql_file!(
     "../sql/17_semantic_predicates.sql",
     name = "semantic_predicates",
-    requires = ["semantic_program_status"]
+    requires = ["semantic_join_plan"]
 );
 pgrx::extension_sql_file!(
     "../sql/18_semantic_status_plan.sql",
@@ -99,6 +84,11 @@ pgrx::extension_sql_file!(
     "../sql/19_semantic_fdw.sql",
     name = "semantic_fdw",
     requires = ["semantic_status_plan"]
+);
+pgrx::extension_sql_file!(
+    "../sql/20_production_policy.sql",
+    name = "production_policy",
+    requires = ["semantic_fdw"]
 );
 
 #[allow(non_snake_case)]

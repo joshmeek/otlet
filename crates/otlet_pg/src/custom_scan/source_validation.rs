@@ -1,105 +1,3 @@
-unsafe fn semantic_action_ref_argument(
-    node: *mut pg_sys::Expr,
-    rti: pg_sys::Index,
-) -> Option<(String, SubjectVar, String)> {
-    unsafe {
-        let node = strip_relabel(node);
-        if node.is_null() || (*node).type_ != pg_sys::NodeTag::T_FuncExpr {
-            return None;
-        }
-        let func = node as *mut pg_sys::FuncExpr;
-        if !is_otlet_function((*func).funcid, "semantic_action")
-            || pg_sys::list_length((*func).args) != 3
-        {
-            return None;
-        }
-        let index_arg = pg_sys::list_nth((*func).args, 0) as *mut pg_sys::Expr;
-        let subject_arg = pg_sys::list_nth((*func).args, 1) as *mut pg_sys::Expr;
-        let action_arg = pg_sys::list_nth((*func).args, 2) as *mut pg_sys::Expr;
-        let action_type = text_const_value(action_arg)?;
-        if action_type.is_empty() {
-            return None;
-        }
-        Some((
-            text_const_value(index_arg)?,
-            subject_var(subject_arg, rti)?,
-            action_type,
-        ))
-    }
-}
-
-unsafe fn semantic_ref_argument(
-    node: *mut pg_sys::Expr,
-    rti: pg_sys::Index,
-) -> Option<(String, SubjectVar)> {
-    unsafe {
-        let node = strip_relabel(node);
-        if node.is_null() || (*node).type_ != pg_sys::NodeTag::T_FuncExpr {
-            return None;
-        }
-        let func = node as *mut pg_sys::FuncExpr;
-        if !is_otlet_function((*func).funcid, "semantic_subject")
-            || pg_sys::list_length((*func).args) != 2
-        {
-            return None;
-        }
-        let index_arg = pg_sys::list_nth((*func).args, 0) as *mut pg_sys::Expr;
-        let subject_arg = pg_sys::list_nth((*func).args, 1) as *mut pg_sys::Expr;
-        Some((text_const_value(index_arg)?, subject_var(subject_arg, rti)?))
-    }
-}
-
-unsafe fn semantic_join_ref_argument(
-    node: *mut pg_sys::Expr,
-    rti: pg_sys::Index,
-) -> Option<(String, SubjectVar)> {
-    unsafe {
-        let node = strip_relabel(node);
-        if node.is_null() || (*node).type_ != pg_sys::NodeTag::T_FuncExpr {
-            return None;
-        }
-        let func = node as *mut pg_sys::FuncExpr;
-        if !is_otlet_function((*func).funcid, "semantic_join_subject")
-            || pg_sys::list_length((*func).args) != 2
-        {
-            return None;
-        }
-        let index_arg = pg_sys::list_nth((*func).args, 0) as *mut pg_sys::Expr;
-        let subject_arg = pg_sys::list_nth((*func).args, 1) as *mut pg_sys::Expr;
-        Some((text_const_value(index_arg)?, subject_var(subject_arg, rti)?))
-    }
-}
-
-unsafe fn semantic_field_ref_argument(
-    node: *mut pg_sys::Expr,
-    rti: pg_sys::Index,
-) -> Option<(String, SubjectVar, String)> {
-    unsafe {
-        let node = strip_relabel(node);
-        if node.is_null() || (*node).type_ != pg_sys::NodeTag::T_FuncExpr {
-            return None;
-        }
-        let func = node as *mut pg_sys::FuncExpr;
-        if !is_otlet_function((*func).funcid, "semantic_field")
-            || pg_sys::list_length((*func).args) != 3
-        {
-            return None;
-        }
-        let index_arg = pg_sys::list_nth((*func).args, 0) as *mut pg_sys::Expr;
-        let subject_arg = pg_sys::list_nth((*func).args, 1) as *mut pg_sys::Expr;
-        let field_arg = pg_sys::list_nth((*func).args, 2) as *mut pg_sys::Expr;
-        let field_name = text_const_value(field_arg)?;
-        if field_name.is_empty() {
-            return None;
-        }
-        Some((
-            text_const_value(index_arg)?,
-            subject_var(subject_arg, rti)?,
-            field_name,
-        ))
-    }
-}
-
 unsafe fn is_otlet_function(funcid: pg_sys::Oid, expected_name: &str) -> bool {
     unsafe {
         let func_name = pg_sys::get_func_name(funcid);
@@ -426,24 +324,24 @@ fn validate_semantic_join_index_source(
     auto_policy: bool,
 ) -> Option<SemanticPlannerStats> {
     let stats_query = format!(
-        "WITH stats AS ( \
-           SELECT * \
-           FROM otlet.semantic_join_index_stats({}) \
-         ), \
-         current_rows AS ( \
-           SELECT subject_id, body, stale \
-           FROM otlet.semantic_join_index_current_rows({}, false) \
-         ) \
-         SELECT \
-           COALESCE((SELECT total_pairs FROM stats), 0)::bigint AS source_rows, \
-           count(*) FILTER (WHERE stale = false AND body @> {}::jsonb)::bigint AS fresh_matches, \
-           count(*) FILTER (WHERE stale = false AND NOT (body @> {}::jsonb))::bigint AS fresh_non_matches, \
-           COALESCE((SELECT stale_pairs FROM stats), 0)::bigint AS stale_rows, \
-           COALESCE((SELECT missing_pairs FROM stats), 0)::bigint AS missing_rows, \
-           COALESCE((SELECT active_jobs FROM stats), 0)::bigint AS inflight_rows, \
-           0::bigint AS cache_reusable_rows, \
-           COALESCE((SELECT avg_generate_ms FROM stats), 2500)::float8 AS model_ms \
-         FROM current_rows",
+        "WITH plan AS ( \
+	           SELECT * \
+	           FROM otlet.semantic_join_index_plan({}) \
+	         ), \
+	         current_rows AS ( \
+	           SELECT subject_id, body, stale \
+	           FROM otlet.semantic_join_index_current_rows({}, false) \
+	         ) \
+	         SELECT \
+	           COALESCE((SELECT total_pairs FROM plan), 0)::bigint AS source_rows, \
+	           count(*) FILTER (WHERE stale = false AND body @> {}::jsonb)::bigint AS fresh_matches, \
+	           count(*) FILTER (WHERE stale = false AND NOT (body @> {}::jsonb))::bigint AS fresh_non_matches, \
+	           COALESCE((SELECT stale_pairs FROM plan), 0)::bigint AS stale_rows, \
+	           COALESCE((SELECT missing_pairs FROM plan), 0)::bigint AS missing_rows, \
+	           COALESCE((SELECT active_jobs FROM plan), 0)::bigint AS inflight_rows, \
+	           0::bigint AS cache_reusable_rows, \
+	           COALESCE((SELECT estimated_fresh_inference_ms / NULLIF(total_pairs, 0) FROM plan), 2500)::float8 AS model_ms \
+	         FROM current_rows",
         sql_literal(index_name),
         sql_literal(index_name),
         sql_literal(expected_json),
