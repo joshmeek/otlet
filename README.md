@@ -2,13 +2,15 @@
 
 Otlet is a Postgres extension that runs local LLM inference **inside Postgres**, next to the rows it reads and acts on
 
-My use case for building it came from an entity-resolution problem: when new data lands, Postgres should help decide whether a row is a new entity or a duplicate of something already in the database. Otlet runs through a resident Postgres worker, can try a cheap local model before escalating hard rows to a stronger local model, records receipts and source identity, drains bounded queued work, stores typed action proposals, and materializes results for later queries. The [roadmap](docs/roadmap.md) tracks the path toward packaging, security, and deeper planner work
+I built Otlet for entity resolution: when new data lands, Postgres helps decide whether a row is a new entity or a duplicate. Otlet runs through a resident Postgres worker, tries a cheap local model before escalating hard rows to a stronger local model, records receipts and source identity, drains bounded queued work, stores typed action proposals, and materializes results for later queries. The [roadmap](docs/roadmap.md) tracks packaging, security, and planner work
 
 Otlet uses a `pgrx` extension and a Postgres background worker loaded through `shared_preload_libraries` to keep local model work inside the database process. You can ask for model work from SQL, queue it from rows, refresh semantic state after source changes, and inspect the result without leaving Postgres
 
 ## Quick Example
 
-SQL picks hard candidate pairs. Otlet passes compact row-pair JSON to a resident local model inside Postgres, validates the answer, escalates hard rows to a stronger local model, and stores typed action proposals without mutating source tables
+The demo task reads `public.otlet_demo_vendor_pair`, joins each side to `public.otlet_demo_vendor_entity`, and builds one compact JSON input per pair. Each input includes the two rows plus evidence such as shared remittance accounts, acquisition notes, missing identifiers, and conflicting name/address signals
+
+Otlet asks the resident worker for `same_entity`, `different_entity`, or `unclear`, with confidence and a reason. The task starts with Qwen3 0.6B and escalates hard rows to Qwen3 1.7B. The model can propose typed actions like `merge_candidate` or `new_entity`; source rows stay untouched
 
 ```sql
 SELECT otlet.run_task('entity_resolution_demo') AS queued_jobs;
@@ -37,7 +39,7 @@ Real output from `./scripts/otlet-demo.sh`:
  vendor-1001:vendor-77  | different_entity | high
 ```
 
-The interesting part is not string similarity. SQL selected pairs like:
+Some pairs need evidence beyond string similarity. SQL sends evidence like:
 
 ```text
 vendor-1001:vendor-42
@@ -93,9 +95,9 @@ Source rows stayed in `public.otlet_demo_vendor_entity`. Otlet stored jobs, acce
 
 Start with [the worked example](docs/otlet-worked-example.md)
 
-You run the local extension with SQL commands and real output. You start with the direct task path, then work through semantic indexes, automatic semantic materialization, stale rows, FDW, CustomScan, cancellation, retries, worker batches, traces, and production policy
+You run the extension with SQL commands and real output. The worked example starts with the direct task path, then covers semantic indexes, automatic semantic materialization, stale rows, FDW, CustomScan, cancellation, retries, worker batches, traces, and production policy
 
-Future work is tracked in [docs/roadmap.md](docs/roadmap.md)
+See [docs/roadmap.md](docs/roadmap.md) for future work
 
 ## License
 

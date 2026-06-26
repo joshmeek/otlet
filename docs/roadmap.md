@@ -1,6 +1,6 @@
 # Otlet roadmap
 
-Otlet should make local model work feel like database work: planned by Postgres, run beside source rows, checked against schemas, tied to row identity, visible through SQL, and recorded with receipts
+Otlet makes local model work feel like database work: Postgres plans it, runs it beside source rows, checks schemas, ties results to row identity, exposes state through SQL, and records receipts
 
 Use this roadmap to judge future changes. A feature belongs here when it improves model choice, row freshness, planner behavior, operator visibility, action safety, or production packaging
 
@@ -24,31 +24,31 @@ The extension keeps source rows in user tables. Users choose rows with SQL, Otle
 
 ## Planner And Executor
 
-The planner path now has one inspectable decision vocabulary for semantic lookup, queue refresh, wait, fail-closed, fresh inference, and bounded infer-now. SQL plan functions, semantic status views, FDW EXPLAIN, CustomScan EXPLAIN, receipts, and demo output should stay aligned on that vocabulary
+The planner path has one inspectable decision vocabulary for semantic lookup, queue refresh, wait, fail-closed, fresh inference, and bounded infer-now. Keep SQL plan functions, semantic status views, FDW EXPLAIN, CustomScan EXPLAIN, receipts, and demo output aligned on that vocabulary
 
-`EXPLAIN (ANALYZE, VERBOSE)` should keep showing selected model, resident state, source identity, source hash, stale policy, cache decision, worker handoff, token counts, schema validation, trace policy, receipt IDs, provenance links, estimated model time, and actual model time
+`EXPLAIN (ANALYZE, VERBOSE)` shows selected model, resident state, source identity, source hash, stale policy, cache decision, worker handoff, token counts, schema validation, trace policy, receipt IDs, provenance links, estimated model time, and model runtime
 
-Costing should use measured runtime history: load time, warm generation time, token counts, schema failures, cache hits, stale refresh rate, worker queue depth, model-selection attempts, and materialization coverage. Postgres should choose the cheap fresh lookup path when it can, and show the reason when it cannot
+Costing uses measured runtime history: load time, warm generation time, token counts, schema failures, cache hits, stale refresh rate, worker queue depth, model-selection attempts, and materialization coverage. Postgres chooses the cheap fresh lookup path when it can and shows the reason when it cannot
 
-The Access Method track should stay evidence-driven. We should try honest `CREATE ACCESS METHOD`, `IndexAmRoutine`, operator classes, `amcostestimate`, tuple/TID semantics, build, insert, vacuum, update, and bitmap/gettuple paths. If PostgreSQL extension APIs cannot represent semantic model access without lying, document the exact missing contract and keep the CustomScan path as the extension answer
+Keep the Access Method track evidence-driven. Test honest `CREATE ACCESS METHOD`, `IndexAmRoutine`, operator classes, `amcostestimate`, tuple/TID semantics, build, insert, vacuum, update, and bitmap/gettuple paths. If PostgreSQL extension APIs cannot represent semantic model access without lying, document the exact missing contract and keep the CustomScan path as the extension answer
 
 ## Explain And Trace
 
-Verbose EXPLAIN should make model work inspectable from Postgres. Users should see why Otlet reused a materialized result, refreshed a row, waited, failed closed, or ran infer-now
+Verbose EXPLAIN makes model work inspectable from Postgres. Users see why Otlet reused a materialized result, refreshed a row, waited, failed closed, or ran infer-now
 
-Token-level tracing should stay optional and bounded. Debug mode can show chosen token IDs, token text, probabilities or logprobs when llama.cpp exposes them, top-k alternatives, partial generated text, stop reason, schema validation, and trace storage policy
+Keep token-level tracing optional and bounded. Debug mode can show chosen token IDs, token text, probabilities or logprobs when llama.cpp exposes them, top-k alternatives, partial generated text, stop reason, schema validation, and trace storage policy
 
-Production defaults should keep tracing low-detail or off. The system should explain disabled tracing through SQL instead of storing unbounded token streams
+Production defaults keep tracing low-detail or off. SQL explains disabled tracing without storing unbounded token streams
 
 ## Packaging And Security
 
-Open-source packaging should keep the first run small: one setup script, one demo script, a small model path, Docker instructions, crash-log scanning, CPU-only defaults, resource warnings, extension versioning, and upgrade notes
+Open-source packaging keeps the first run small: one setup script, one demo script, a small model path, Docker instructions, crash-log scanning, CPU-only defaults, resource warnings, extension versioning, and upgrade notes
 
-Security work should cover schema permissions, model artifact path permissions, allowed write targets, action approval, prompt visibility, trace visibility, row-level security, superuser requirements, and extension install risk. Trace redaction needs special care because prompts and token traces can contain source values
+Security work covers schema permissions, model artifact path permissions, allowed write targets, action approval, prompt visibility, trace visibility, row-level security, superuser requirements, and extension install risk. Trace redaction needs special care because prompts and token traces can contain source values
 
-GPU support belongs on an acceleration track after the CPU path has solid evidence. A useful GPU release would report device policy, memory accounting, throughput per watt, crash behavior, and EXPLAIN-visible device state
+GPU support belongs on an acceleration track after the CPU path has solid evidence. A useful GPU release reports device policy, memory accounting, throughput per watt, crash behavior, and EXPLAIN-visible device state
 
-If extension APIs hit a hard ceiling, a small Postgres fork proof should show the missing planner or executor contract. The extension should remain the public path unless a fork proves a capability that PostgreSQL cannot expose through hooks
+If extension APIs hit a hard ceiling, a small Postgres fork proof must show the missing planner or executor contract. Keep the extension as the public path unless a fork proves a capability that PostgreSQL cannot expose through hooks
 
 ## Boundaries
 

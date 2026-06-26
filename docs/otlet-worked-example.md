@@ -1,10 +1,10 @@
 # Otlet Worked Example
 
-Use this as a learning file, not a test harness (inspired by the _worked example_ research done in [this study](https://www.tandfonline.com/doi/full/10.1080/01443410.2023.2273762#abstract))
+Use this as a learning file, not a test harness. The format follows _worked example_ research from [this study](https://www.tandfonline.com/doi/full/10.1080/01443410.2023.2273762#abstract)
 
-The file starts with the smallest real Otlet loop for entity resolution: you keep vendor rows in ordinary Postgres tables, select hard candidate pairs in SQL, enqueue durable model work, let the resident worker try a cheap local model and escalate hard rows to a stronger local model, validate `same_entity` / `different_entity` / `unclear`, record typed action proposals, and keep the audit trail
+You start with the smallest real Otlet loop for entity resolution: keep vendor rows in ordinary Postgres tables, select hard candidate pairs in SQL, enqueue durable model work, let the resident worker try a cheap local model and escalate hard rows to a stronger local model, validate `same_entity` / `different_entity` / `unclear`, record typed action proposals, and keep the audit trail
 
-The example data uses vendors where string normalization is not enough. One pair is a rebrand with a shared remittance account and acquisition note. One pair looks unrelated and should stay separate. Two pairs carry weak name/address/brand signals that should produce harder model work. Otlet judges the pairs without mutating the source tables
+The example data uses vendors where string normalization fails. One pair is a rebrand with a shared remittance account and acquisition note. One pair has no shared identifiers and belongs in a separate entity. Two pairs carry weak name/address/brand signals that force harder model work. Otlet judges the pairs without mutating source tables
 
 ## Otlet In One Loop
 
@@ -24,7 +24,7 @@ source candidate pair
 
 Otlet keeps Postgres as the system of record
 
-The model does not get direct write access to user tables. It receives bounded pair-shaped input and returns structured JSON. Otlet validates the output and the typed actions before storing them. Semantic refresh jobs then create Otlet-owned `create_record` actions, records, and materialized semantic rows from the validated output so downstream SQL can read fresh state without another manual step
+Source tables stay under application control. Otlet sends the model bounded pair-shaped input and accepts structured JSON. Otlet validates output and typed actions before storage. Semantic refresh jobs create Otlet-owned `create_record` actions, records, and materialized semantic rows from validated output so downstream SQL can read fresh state
 
 ## Start From A Running Local Otlet
 
@@ -34,7 +34,7 @@ Build and start the local Postgres container first:
 ./scripts/otlet-setup.sh
 ```
 
-Then open `psql` with both local Qwen artifact paths available as variables:
+Open `psql` with both local Qwen artifact paths available as variables:
 
 ```sh
 docker exec -it otlet-postgres sh -lc '
@@ -48,7 +48,7 @@ docker exec -it otlet-postgres sh -lc '
 
 Paste the rest of the file into that `psql` session section by section
 
-The output blocks below are representative output from real local runs. Job IDs, receipt IDs, timestamps, costs, timings, memory samples, and token rates vary by machine and model cache state
+Output blocks show representative output from real local runs. Job IDs, receipt IDs, timestamps, costs, timings, memory samples, and token rates vary by machine and model cache state
 
 ## Register The Runtime And Models
 
@@ -72,9 +72,9 @@ SELECT otlet.register_model(
 
 `linked_inproc` means the Otlet background worker inside Postgres owns inference
 
-This path uses no `llama-server`, app worker, or service call. The worker loads a local GGUF through linked llama.cpp and keeps the model resident across jobs
+The worker loads a local GGUF through linked llama.cpp and keeps the model resident across jobs
 
-The architectural reason is locality. The queue, source row identity, output validation, receipts, traces, and runtime state are all visible from SQL
+Postgres can query the queue, source row identity, output validation, receipts, traces, and runtime state
 
 ## Create The Source Tables
 
@@ -113,9 +113,9 @@ VALUES
   ('vendor-1001:vendor-314', 'vendor-1001', 'vendor-314');
 ```
 
-These tables are ordinary application data
+Your application owns these tables
 
-Otlet does not own them. SQL selects candidate pairs first, then Otlet judges those candidate pairs. If you want to merge vendors later, that should be an explicit application workflow outside this model pass
+SQL selects candidate pairs first, then Otlet judges those pairs. Merge vendors later through an explicit application workflow outside this model pass
 
 ## Clear Old Demo State
 
@@ -288,7 +288,7 @@ Representative output:
 
 `create_task` registers the model contract and input query
 
-The task has six important parts:
+The task has seven parts:
 
 - `task_name` gives the queue and receipt trail a stable name
 - `input_query` converts SQL-selected candidate pairs into `subject_id` and compact `input`
@@ -298,9 +298,9 @@ The task has six important parts:
 - `model_selection_policies` chooses the stronger registered local model for escalation
 - `runtime_options` bound generation, tracing, and cache behavior
 
-The schema separates model judgment from database state Otlet can store
+The schema separates model judgment from database state Otlet stores
 
-If the model returns malformed JSON, missing fields, unknown fields, or values outside the enum, Otlet marks the job failed and keeps the raw evidence. It does not silently write output or records
+If the model returns malformed JSON, missing fields, unknown fields, or values outside the enum, Otlet marks the job failed and keeps the raw evidence. Otlet stores no trusted output or records
 
 ## Enqueue The Jobs
 
@@ -319,9 +319,9 @@ Representative output:
 
 `run_task` executes the task input query and inserts one row into `otlet.jobs` per pair
 
-The user transaction creates durable database work, then the resident worker claims it
+The user transaction creates durable database work. The resident worker claims it
 
-The queue keeps the model run out of the client request. You can inspect the work in SQL while it is queued, running, complete, failed, or canceled
+The queue keeps model work out of the client request. SQL shows each job at any status: queued, running, complete, failed, or canceled
 
 ## Watch The Worker
 
@@ -355,7 +355,7 @@ Representative output:
 (4 rows)
 ```
 
-The worker uses normal database state as its coordination surface. Jobs are claimed from `otlet.jobs`, outputs are written to Otlet tables, and worker events are visible in `otlet.worker_events`
+The worker coordinates through normal database state. It claims jobs from `otlet.jobs`, writes outputs to Otlet tables, and records worker events in `otlet.worker_events`
 
 ## Read The Model Output
 
@@ -386,7 +386,7 @@ Representative output:
 
 Otlet stores the result as database state. You do not have to scrape a terminal response
 
-Direct entity-resolution tasks also ask the model for one typed action. Otlet stores only actions attached to an accepted, schema-valid output receipt
+Direct entity-resolution tasks ask the model for one typed action. Otlet stores actions only when they attach to an accepted, schema-valid output receipt
 
 ## Inspect Typed Actions
 
@@ -414,7 +414,7 @@ Representative output:
 (2 rows)
 ```
 
-`merge_candidate` is evidence for a later merge workflow. It requires approval and has no direct source-table apply path. `new_entity` says the right-side row should stay separate
+`merge_candidate` records evidence for a later merge workflow. It requires approval and has no source-table apply path. `new_entity` says the right-side row belongs in a separate entity
 
 Failed or rejected model attempts do not create trusted actions:
 
@@ -474,7 +474,7 @@ Representative output:
 (3 rows)
 ```
 
-Semantic refresh jobs below create typed `create_record` actions, `otlet.records` rows, and semantic materializations automatically after schema validation passes
+Semantic refresh jobs create typed `create_record` actions, `otlet.records` rows, and semantic materializations after schema validation passes
 
 ## Inspect Model Selection Attempts
 
@@ -556,7 +556,7 @@ Otlet exposes model residency here
 
 The worker keeps the local model/context warm across jobs. SQL can see the slot state, memory sample, context window, cache entries, cache bounds, and the last cache reason
 
-Otlet favors observability. SQL should show whether the model loaded, is busy, failed, cached, or went over budget
+SQL shows whether the model loaded, is busy, failed, cached, or went over budget
 
 ## Inspect Token Traces
 
@@ -570,7 +570,7 @@ The task enabled bounded generation tracing:
 }
 ```
 
-That stores a bounded trace summary on the receipt instead of storing an unbounded prompt or logits blob
+Otlet stores a bounded trace summary on the receipt instead of an unbounded prompt or logits blob
 
 Check the bounded token trace:
 
@@ -593,9 +593,9 @@ Trace data records:
 - Prompt tokens used by the row
 - Model tokens generated
 - Generation stop reason
-- Were probabilities available from llama.cpp logits
+- Probability availability from llama.cpp logits
 - Receipt, row identity, input hash, and schema hash attached to the trace
-- Did this run use the resident model cache or inference-output cache
+- Resident model cache and inference-output cache use
 
 Otlet bounds tracing so prompt, token, and logits storage does not turn observability into a data retention problem
 
@@ -634,23 +634,23 @@ SQL-visible runtime state
 
 If the model returns invalid JSON or a value outside the schema, Otlet fails closed
 
-You should expect:
+Check these rows:
 
 - `otlet.jobs.status = 'failed'`
 - `otlet.jobs.error` contains the validation or parse failure
-- raw model text is kept for inspection
-- no validated `otlet.outputs` row is stored
-- no trusted `otlet.actions` row is stored from a failed model attempt
-- no `otlet.records` row is created
+- `otlet.jobs.raw_output` keeps raw model text for inspection
+- `otlet.outputs` has no validated row
+- `otlet.actions` has no trusted row from a failed model attempt
+- `otlet.records` has no row
 - an error receipt preserves the model/runtime evidence when available
 
-The task schema and action rules decide whether model output can become database truth. If output is valid but a proposed action is not, Otlet keeps the rejected action as evidence and does not turn it into a record
+The task schema and action rules decide whether model output can become database truth. If output passes and a proposed action fails, Otlet keeps the rejected action as evidence and creates no record
 
 ## Semantic Indexes
 
 The direct task path gives you the shortest way to learn Otlet
 
-Semantic indexes are the next layer. They are for repeated lookup over source rows, stale-row tracking, refresh decisions, native FDW reads, and source-row CustomScan predicates
+Semantic indexes add repeated lookup over source rows, stale-row tracking, refresh decisions, native FDW reads, and source-row CustomScan predicates
 
 Use a direct task when:
 
@@ -662,10 +662,10 @@ Use a semantic index when:
 
 - you want model-derived state to be reusable in normal queries
 - source rows change and stale results must fail closed
-- lookup should skip rows whose source hash is already fresh
+- lookup can skip rows whose source hash is fresh
 - you want executor-visible semantic access through FDW or CustomScan paths
 
-The direct task path teaches the Otlet contract. The semantic path adds query ergonomics and freshness policy on top of that contract
+The direct task path teaches the Otlet contract. The semantic path adds query ergonomics and freshness policy
 
 ## Map The Otlet Schema
 
@@ -702,7 +702,7 @@ Use `otlet.runs` for application reads. Use trace and status views for debugging
 
 ## Create A Retry Task
 
-This task is reused below to show terminal failure evidence and safe requeueing
+The next examples reuse this task to show terminal failure evidence and safe requeueing
 
 ```sql
 DROP TABLE IF EXISTS public.learning_retry_source;
@@ -800,7 +800,7 @@ Canceled work still gets a receipt. A canceled model run still leaves evidence
 
 ## Understand Retry And Failed-Run Evidence
 
-Otlet leaves failed jobs visible. A failed job is terminal, so the same task and subject can be queued again
+Otlet leaves failed jobs visible. A failed job is terminal, so you can queue the same task and subject again
 
 The partial unique index only blocks duplicate active work:
 
@@ -810,9 +810,9 @@ ON otlet.jobs (task_name, subject_id)
 WHERE status IN ('queued', 'running', 'cancel_requested');
 ```
 
-This run created one synthetic failed job, then allowed `run_task` to enqueue a second job for the same subject
+This run creates one synthetic failed job, then lets `run_task` enqueue a second job for the same subject
 
-The real worker claimed the second job and rejected the output against the strict JSON contract:
+The worker claims the second job and rejects the output against the strict JSON contract:
 
 ```sql
 SELECT id, subject_id, status, attempts, error, raw_output IS NOT NULL AS has_raw_output
@@ -846,7 +846,7 @@ Failure keeps the raw output, stores the error, and records the attempt in a rec
 
 ## Check Worker Events And Receipt Statuses
 
-Events are the operational trail. Receipts are the inference trail
+Events show worker behavior. Receipts show model behavior
 
 ```sql
 SELECT event_type, count(*)
@@ -880,7 +880,7 @@ Representative output:
 (2 rows)
 ```
 
-Use events for worker behavior. Use receipts for model behavior
+Use events for worker behavior and receipts for model behavior
 
 ## Learn The Action Boundary
 
@@ -915,11 +915,11 @@ Representative output:
 (1 row)
 ```
 
-Otlet draws the write-authority line here. The model can ask, but Otlet decides which action types can become database state. Unsupported actions are stored as rejected evidence when they arrive with an accepted output. Approval, dry-run, and apply status are visible through `otlet.action_status`
+Otlet controls write authority here. The model can ask for an action, but Otlet decides which action types can become database state. Otlet stores unsupported actions as rejected evidence when they arrive with an accepted output. `otlet.action_status` shows approval, dry-run, and apply state
 
 ## Materialize Records Into Semantic State
 
-Actions and records are one layer. Semantic materializations are the reusable query layer over those records
+Actions and records form one layer. Semantic materializations make those records reusable from queries
 
 This sequence materializes an entity-pair record, watches source changes, and marks the record stale through an update trigger:
 
@@ -1068,7 +1068,7 @@ semantic_index_status_contract=demo_semantic_vendor_idx|3|0|0|refresh_then_fail_
 semantic_index_plan_contract=semantic_lookup|3|3|0|0|1.0000
 ```
 
-`semantic_index_plan` is Otlet deciding whether it can reuse materialized state, should refresh, should wait, or should run fresh inference
+`semantic_index_plan` shows whether Otlet can reuse materialized state, refresh, wait, or run fresh inference
 
 ## Read Through FDW
 
@@ -1361,7 +1361,7 @@ Use explicit JSON predicates for row and join semantic filters
 
 ## Inspect Trace Visibility Across The System
 
-The trace visibility view tells you whether receipts are linked to outputs, actions, token steps, top-k alternatives, provenance, stale policy, and CustomScan infer-now
+The trace visibility view reports links from receipts to outputs, actions, token steps, top-k alternatives, provenance, stale policy, and CustomScan infer-now
 
 ```sql
 SELECT 'inference_visibility_status=' ||
@@ -1421,7 +1421,7 @@ cleanup_policy_dry_run=0|0|0|true
 
 ## Know The Remaining Production Boundaries
 
-Otlet installs internal production policy, bounded queues, leases, sweeps, validation evidence, action approval state, status views, and cleanup dry-run/apply functions. Your application still owns tenant access, app roles, and who may approve or apply actions
+Otlet installs internal production policy, bounded queues, leases, sweeps, validation evidence, action approval state, status views, and cleanup dry-run/apply functions. Your application owns tenant access, app roles, and who may approve or apply actions
 
 Check row-level security:
 
@@ -1465,12 +1465,12 @@ Representative output:
 grant_contract=DELETE:34|INSERT:34|REFERENCES:34|SELECT:34|TRIGGER:34|TRUNCATE:34|UPDATE:34
 ```
 
-The remaining production boundary is application-specific:
+Your application owns these production boundaries:
 
 - create app roles that expose only the views and functions you want
 - add RLS or schema isolation if multiple tenants share the database
 - schedule `otlet.cleanup_policy_state(false)` if your deployment wants periodic worker-event and trace pruning
-- expose `otlet.approve_action`, `otlet.reject_action`, `otlet.dry_run_action`, and `otlet.apply_action` only to roles that should operate actions
+- expose `otlet.approve_action`, `otlet.reject_action`, `otlet.dry_run_action`, and `otlet.apply_action` only to roles that can operate actions
 - allow only the action types your application can safely interpret
 
 ## Run The Full Demo Contract
