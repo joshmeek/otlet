@@ -6,24 +6,23 @@ Use this roadmap to judge future changes. A feature belongs here when it improve
 
 ## Current Shape
 
-Otlet has three public entry points today:
+Otlet has two public entry points today:
 
 | Surface | Purpose |
 | --- | --- |
 | `scripts/otlet-setup.sh` | build and start the local Postgres extension stack |
 | `scripts/otlet-demo.sh` | run the worked demo path with local inference |
 
-The extension keeps source rows in user tables. Users choose rows with SQL, Otlet passes compact JSON to a resident local model, and Postgres stores derived outputs, actions, traces, and receipts under the `otlet` schema
+The extension keeps source rows in user tables. Users choose rows with SQL, Otlet passes compact JSON to a resident local model, drains bounded compatible queue batches, and Postgres stores derived outputs, actions, traces, receipts, and semantic materializations under the `otlet` schema
 
 ## Priorities
 
 | Order | Track | Outcome |
 | --- | --- | --- |
-| 1 | Throughput | Improve queued materialization before pushing synchronous inference |
-| 2 | Model selection | Pick small or strong resident models from measured task history |
-| 3 | Actions | Let models propose typed database actions with receipts and approval |
-| 4 | Packaging and security | Keep the open-source path small while tightening permissions and trace safety |
-| 5 | Core limits | Test Access Method and Postgres-fork paths where extension hooks fall short |
+| 1 | Model selection | Pick small or strong resident models from measured task history |
+| 2 | Actions | Let models propose typed database actions with receipts and approval |
+| 3 | Packaging and security | Keep the open-source path small while tightening permissions and trace safety |
+| 4 | Core limits | Test Access Method and Postgres-fork paths where extension hooks fall short |
 
 ## Planner And Executor
 
@@ -34,16 +33,6 @@ The planner path now has one inspectable decision vocabulary for semantic lookup
 Costing should use measured runtime history: load time, warm generation time, token counts, schema failures, cache hits, stale refresh rate, worker queue depth, and materialization coverage. Postgres should choose the cheap fresh lookup path when it can, and show the reason when it cannot
 
 The Access Method track should stay evidence-driven. We should try honest `CREATE ACCESS METHOD`, `IndexAmRoutine`, operator classes, `amcostestimate`, tuple/TID semantics, build, insert, vacuum, update, and bitmap/gettuple paths. If PostgreSQL extension APIs cannot represent semantic model access without lying, document the exact missing contract and keep the CustomScan path as the extension answer
-
-## Throughput
-
-The production throughput path starts with queued materialization. Users should generate candidate rows in SQL, enqueue bounded model work, keep a model resident in the Postgres worker, materialize semantic state under `otlet`, mark state stale from source changes, and let planner paths read fresh state
-
-Worker batching deserves a narrow test. Batch jobs when model, runtime options, output schema, prompt shape, and token budget match. Measure throughput gain, first-job latency, memory growth, failure isolation, and receipt ordering before keeping it
-
-A model warm pool can help once one resident slot works well. Useful slots include a small classifier, a stronger row-judgment model, a trace/debug model, and a schema/action compiler model. Planner choices should prefer a resident model when quality remains close, and escalate when confidence or policy calls for it
-
-The resident inference cache should explain each hit and miss. Its key should include model name, artifact hash, prompt hash, runtime options, output schema, task, subject ID, source hash, and MVCC identity where available. SQL should expose hit reason, miss reason, invalidation reason, size, evictions, and skipped-cache reason
 
 ## Model Selection
 

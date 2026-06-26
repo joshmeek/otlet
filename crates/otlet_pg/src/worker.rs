@@ -1,4 +1,4 @@
-use crate::job::{Job, claim_job, insert_infer_now_job};
+use crate::job::{Job, claim_jobs, insert_infer_now_job};
 use crate::model::run_job;
 use pgrx::JsonB;
 use pgrx::bgworkers::{BackgroundWorker, SignalWakeFlags};
@@ -44,16 +44,47 @@ pub extern "C-unwind" fn otlet_worker_main(_arg: pgrx::pg_sys::Datum) {
 
         let mut drained = 0;
         loop {
-            let job = match BackgroundWorker::transaction(claim_job) {
-                Ok(Some(job)) => job,
-                Ok(None) => break,
+            let jobs = match BackgroundWorker::transaction(claim_jobs) {
+                Ok(jobs) if jobs.is_empty() => break,
+                Ok(jobs) => jobs,
                 Err(err) => {
                     pgrx::warning!("otlet worker claim failed: {err}");
                     break;
                 }
             };
-            process_job(job);
-            drained += 1;
+
+            let batch = jobs.first().filter(|_| jobs.len() > 1).map(|job| {
+                (
+                    job.runtime_name.clone(),
+                    job.task_name.clone(),
+                    job.model_name.clone(),
+                    jobs.len() as i64,
+                )
+            });
+
+            let mut completed: i64 = 0;
+            let mut failed: i64 = 0;
+            for job in jobs {
+                if process_job(job) {
+                    completed += 1;
+                } else {
+                    failed += 1;
+                }
+            }
+
+            if let Some((runtime_name, task_name, model_name, job_count)) = batch {
+                record_worker_batch_finished(
+                    &runtime_name,
+                    &task_name,
+                    &model_name,
+                    job_count,
+                    completed,
+                    failed,
+                );
+                drained += job_count as u64;
+            } else {
+                drained += (completed + failed) as u64;
+            }
         }
         crate::wake::record_worker_drain(drained);
     }
@@ -207,6 +238,7 @@ fn process_job(job: Job) -> bool {
                             pgrx::warning!("otlet worker metric update failed: {err}");
                         }
                     }
+                    materialize_completed_semantic_job(&job);
                     pgrx::log!("otlet worker completed job {}", job.id);
                     true
                 }
@@ -256,6 +288,79 @@ fn process_job(job: Job) -> bool {
     }
 }
 
+fn record_worker_batch_finished(
+    runtime_name: &str,
+    task_name: &str,
+    model_name: &str,
+    job_count: i64,
+    completed: i64,
+    failed: i64,
+) {
+    let result: pgrx::spi::Result<()> = BackgroundWorker::transaction(|| {
+        pgrx::Spi::connect_mut(|client| {
+            let args = [
+                Option::<i64>::None.into(),
+                runtime_name.into(),
+                task_name.into(),
+                model_name.into(),
+                job_count.into(),
+                completed.into(),
+                failed.into(),
+            ];
+            client.update(
+                "SELECT otlet.record_worker_event('worker_batch_finished', $1, $2, 'worker_batch_finished', jsonb_build_object('task_name', $3, 'model_name', $4, 'job_count', $5, 'completed_jobs', $6, 'failed_jobs', $7))",
+                Some(1),
+                &args,
+            )?;
+            Ok(())
+        })
+    });
+    if let Err(err) = result {
+        pgrx::warning!("otlet worker batch event failed: {err}");
+    }
+}
+
+fn materialize_completed_semantic_job(job: &Job) {
+    let result: pgrx::spi::Result<()> = BackgroundWorker::transaction(|| {
+        pgrx::Spi::connect_mut(|client| {
+            let args = [job.id.into()];
+            client.update(
+                "SELECT otlet.materialize_completed_semantic_job($1)",
+                Some(1),
+                &args,
+            )?;
+            Ok(())
+        })
+    });
+    if let Err(err) = result {
+        record_semantic_materialization_failed(job, &err.to_string());
+    }
+}
+
+fn record_semantic_materialization_failed(job: &Job, error: &str) {
+    let result: pgrx::spi::Result<()> = BackgroundWorker::transaction(|| {
+        pgrx::Spi::connect_mut(|client| {
+            let args = [
+                job.id.into(),
+                job.runtime_name.as_str().into(),
+                job.task_name.as_str().into(),
+                job.subject_id.as_str().into(),
+                job.model_name.as_str().into(),
+                error.into(),
+            ];
+            client.update(
+                "SELECT otlet.record_worker_event('semantic_materialization_failed', $1, $2, 'otlet semantic materialization failed', jsonb_build_object('task_name', $3, 'subject_id', $4, 'model_name', $5, 'error', $6))",
+                Some(1),
+                &args,
+            )?;
+            Ok(())
+        })
+    });
+    if let Err(err) = result {
+        pgrx::warning!("otlet semantic materialization failure event failed: {err}");
+    }
+}
+
 fn materialize_infer_now_subject(task_name: &str, subject_id: &str) -> pgrx::spi::Result<i64> {
     BackgroundWorker::transaction(|| {
         pgrx::Spi::connect_mut(|client| {
@@ -275,7 +380,7 @@ fn materialize_infer_now_subject(task_name: &str, subject_id: &str) -> pgrx::spi
 fn otlet_schema_ready() -> pgrx::spi::Result<bool> {
     pgrx::Spi::connect(|client| {
         let rows = client.select(
-            "SELECT to_regprocedure('otlet.claim_job()') IS NOT NULL",
+            "SELECT to_regprocedure('otlet.claim_jobs()') IS NOT NULL AND to_regprocedure('otlet.materialize_completed_semantic_job(bigint)') IS NOT NULL",
             Some(1),
             &[],
         )?;

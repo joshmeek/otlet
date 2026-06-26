@@ -7,6 +7,7 @@ SELECT
   p.semantic_auto_wait_ms,
   p.semantic_auto_infer_ms,
   p.semantic_auto_max_rows,
+  p.worker_claim_batch_size,
   p.job_lease_interval,
   p.worker_event_retention,
   p.trace_detail_retention
@@ -36,6 +37,42 @@ GROUP BY
   m.name,
   m.max_active_jobs,
   p.max_queued_jobs_per_model;
+
+CREATE VIEW otlet.worker_throughput_status AS
+SELECT
+  m.runtime_name,
+  m.name AS model_name,
+  p.worker_claim_batch_size,
+  COALESCE(q.queued_jobs, 0) AS queued_jobs,
+  COALESCE(q.running_jobs, 0) AS running_jobs,
+  COALESCE(q.cancel_requested_jobs, 0) AS cancel_requested_jobs,
+  COALESCE(q.available_queue_slots, 0) AS available_queue_slots,
+  COALESCE((last_batch.detail ->> 'job_count')::bigint, 0) AS last_batch_jobs,
+  COALESCE((last_batch.detail ->> 'completed_jobs')::bigint, 0) AS last_batch_completed_jobs,
+  COALESCE((last_batch.detail ->> 'failed_jobs')::bigint, 0) AS last_batch_failed_jobs,
+  last_batch.created_at AS last_batch_at
+FROM otlet.models m
+CROSS JOIN otlet.production_policy p
+LEFT JOIN otlet.model_queue_status q ON q.model_name = m.name
+LEFT JOIN LATERAL (
+  SELECT e.detail, e.created_at
+  FROM otlet.worker_events e
+  WHERE e.event_type = 'worker_batch_finished'
+    AND e.runtime_name = m.runtime_name
+    AND e.detail ->> 'model_name' = m.name
+  ORDER BY e.created_at DESC, e.id DESC
+  LIMIT 1
+) last_batch ON true
+GROUP BY
+  m.runtime_name,
+  m.name,
+  p.worker_claim_batch_size,
+  q.queued_jobs,
+  q.running_jobs,
+  q.cancel_requested_jobs,
+  q.available_queue_slots,
+  last_batch.detail,
+  last_batch.created_at;
 
 CREATE VIEW otlet.production_status AS
 WITH queue AS (
@@ -89,6 +126,7 @@ SELECT
   p.semantic_auto_wait_ms,
   p.semantic_auto_infer_ms,
   p.semantic_auto_max_rows,
+  p.worker_claim_batch_size,
   p.job_lease_interval,
   q.queued_jobs,
   q.running_jobs,

@@ -157,88 +157,6 @@ SQL
   return 1
 }
 
-derive_entity_records() {
-  local task="$1"
-
-  psql_exec -v task_name="$task" -v record_type="$record_type" >/dev/null <<'SQL'
-WITH run_rows AS (
-  SELECT
-    r.job_id,
-    r.output_id,
-    r.subject_id,
-    r.input,
-    r.output
-  FROM otlet.runs r
-  WHERE r.task_name = :'task_name'
-    AND r.status = 'complete'
-    AND r.output_id IS NOT NULL
-),
-payloads AS (
-  SELECT
-    job_id,
-    output_id,
-    jsonb_build_object(
-      'type', 'create_record',
-      'record_type', :'record_type',
-      'subject_id', subject_id,
-      'body', jsonb_build_object(
-        'pair_id', subject_id,
-        'left_id', input ->> 'left_id',
-        'right_id', input ->> 'right_id',
-        'match', output -> 'match',
-        'confidence', output -> 'confidence',
-        'reason', output -> 'reason'
-      )
-    ) AS payload
-  FROM run_rows
-),
-inserted_actions AS (
-  INSERT INTO otlet.actions (job_id, output_id, action_type, payload, status, error)
-  SELECT
-    p.job_id,
-    p.output_id,
-    'create_record',
-    p.payload,
-    'complete',
-    NULL
-  FROM payloads p
-  WHERE NOT EXISTS (
-    SELECT 1
-    FROM otlet.actions a
-    WHERE a.job_id = p.job_id
-      AND a.output_id = p.output_id
-      AND a.action_type = 'create_record'
-      AND a.payload ->> 'record_type' = :'record_type'
-  )
-  RETURNING id, payload
-),
-record_actions AS (
-  SELECT id, payload
-  FROM inserted_actions
-  UNION ALL
-  SELECT a.id, a.payload
-  FROM otlet.actions a
-  JOIN payloads p
-    ON p.job_id = a.job_id
-   AND p.output_id = a.output_id
-  WHERE a.action_type = 'create_record'
-    AND a.payload ->> 'record_type' = :'record_type'
-)
-INSERT INTO otlet.records (action_id, record_type, subject_id, body)
-SELECT
-  a.id,
-  a.payload ->> 'record_type',
-  a.payload ->> 'subject_id',
-  a.payload -> 'body'
-FROM record_actions a
-WHERE NOT EXISTS (
-  SELECT 1
-  FROM otlet.records r
-  WHERE r.action_id = a.id
-);
-SQL
-}
-
 crash_scan() {
   if docker logs --since "$script_started" "$container" 2>&1 | grep -Eiq 'segmentation|sigsegv|signal 11|core dump|panicked|assertion failed|server process .* was terminated'; then
     docker logs --since "$script_started" "$container" >&2
@@ -251,11 +169,11 @@ require_container
 register_runtime_model
 
 production_policy_contract="$(psql_value "
-SELECT name || '|' || stale_policy || '|' || max_attempts::text
+SELECT name || '|' || stale_policy || '|' || max_attempts::text || '|' || worker_claim_batch_size::text
 FROM otlet.production_policy_status;
 ")"
 echo "production_policy_contract=$production_policy_contract"
-[ "$production_policy_contract" = "default|refresh_then_fail_closed|3" ] || {
+[ "$production_policy_contract" = "default|refresh_then_fail_closed|3|8" ] || {
   echo "Expected default production policy, got $production_policy_contract" >&2
   exit 1
 }
@@ -299,6 +217,7 @@ echo "model_queue_status_contract=$model_queue_status_contract"
 
 log "Running entity-resolution demo"
 psql_exec >/dev/null <<'SQL'
+DROP VIEW IF EXISTS public.otlet_demo_vendor_pair_input;
 DROP TABLE IF EXISTS public.otlet_demo_vendor_pair;
 DROP TABLE IF EXISTS public.otlet_demo_vendor_entity;
 CREATE TABLE public.otlet_demo_vendor_entity (
@@ -323,6 +242,54 @@ INSERT INTO public.otlet_demo_vendor_pair (pair_id, left_id, right_id)
 VALUES
   ('vendor-1001:vendor-42', 'vendor-1001', 'vendor-42'),
   ('vendor-1001:vendor-77', 'vendor-1001', 'vendor-77');
+CREATE VIEW public.otlet_demo_vendor_pair_input AS
+SELECT
+  p.pair_id AS subject_id,
+  jsonb_build_object(
+    '_otlet_mvcc', jsonb_build_object(
+      'table', 'public.otlet_demo_vendor_entity',
+      'subject_id', p.pair_id,
+      'left_id', p.left_id,
+      'right_id', p.right_id,
+      'left_ctid', l.ctid::text,
+      'left_xmin', l.xmin::text,
+      'right_ctid', r.ctid::text,
+      'right_xmin', r.xmin::text
+    ),
+    'table', 'public.otlet_demo_vendor_entity',
+    'pair_id', p.pair_id,
+    'left_id', p.left_id,
+    'right_id', p.right_id,
+    'candidate_evidence',
+    CASE p.pair_id
+      WHEN 'vendor-1001:vendor-42' THEN jsonb_build_array(
+        'same remittance account ending 8821',
+        'internal note says Northstar rebranded after acquisition'
+      )
+      WHEN 'vendor-1001:vendor-77' THEN jsonb_build_array(
+        'different industry and city',
+        'no shared tax id, domain, payment account, AP contact, or remittance account'
+      )
+      ELSE '[]'::jsonb
+    END,
+    'left_record', jsonb_build_object(
+      'id', l.id,
+      'legal_name', l.legal_name,
+      'website', l.website,
+      'address', l.address,
+      'notes', l.notes
+    ),
+    'right_record', jsonb_build_object(
+      'id', r.id,
+      'legal_name', r.legal_name,
+      'website', r.website,
+      'address', r.address,
+      'notes', r.notes
+    )
+  ) AS input
+FROM public.otlet_demo_vendor_pair p
+JOIN public.otlet_demo_vendor_entity l ON l.id = p.left_id
+JOIN public.otlet_demo_vendor_entity r ON r.id = p.right_id;
 SQL
 
 psql_exec \
@@ -332,54 +299,9 @@ psql_exec \
 SELECT otlet.create_task(
   :'task_name',
   $$
-    SELECT
-      p.pair_id AS subject_id,
-      jsonb_build_object(
-        '_otlet_mvcc', jsonb_build_object(
-          'table', 'public.otlet_demo_vendor_entity',
-          'subject_id', p.pair_id,
-          'left_id', p.left_id,
-          'right_id', p.right_id,
-          'left_ctid', l.ctid::text,
-          'left_xmin', l.xmin::text,
-          'right_ctid', r.ctid::text,
-          'right_xmin', r.xmin::text
-        ),
-        'table', 'public.otlet_demo_vendor_entity',
-        'pair_id', p.pair_id,
-        'left_id', p.left_id,
-        'right_id', p.right_id,
-        'candidate_evidence',
-        CASE p.pair_id
-          WHEN 'vendor-1001:vendor-42' THEN jsonb_build_array(
-            'same remittance account ending 8821',
-            'internal note says Northstar rebranded after acquisition'
-          )
-          WHEN 'vendor-1001:vendor-77' THEN jsonb_build_array(
-            'different industry and city',
-            'no shared tax id, domain, payment account, AP contact, or remittance account'
-          )
-          ELSE '[]'::jsonb
-        END,
-        'left_record', jsonb_build_object(
-          'id', l.id,
-          'legal_name', l.legal_name,
-          'website', l.website,
-          'address', l.address,
-          'notes', l.notes
-        ),
-        'right_record', jsonb_build_object(
-          'id', r.id,
-          'legal_name', r.legal_name,
-          'website', r.website,
-          'address', r.address,
-          'notes', r.notes
-        )
-      ) AS input
-    FROM public.otlet_demo_vendor_pair p
-    JOIN public.otlet_demo_vendor_entity l ON l.id = p.left_id
-    JOIN public.otlet_demo_vendor_entity r ON r.id = p.right_id
-    ORDER BY p.pair_id
+    SELECT subject_id, input
+    FROM public.otlet_demo_vendor_pair_input
+    ORDER BY subject_id
   $$,
   'Use input.candidate_evidence before names. If evidence contains same remittance account or rebrand/acquisition, return exactly {"output":{"match":"same_entity","confidence":"high","reason":"shared remittance account and acquisition note"},"actions":[]}. If evidence contains no shared identifiers or different industry/city, return exactly {"output":{"match":"different_entity","confidence":"high","reason":"medical supplier has no shared identifiers"},"actions":[]}. Otherwise compare operational identifiers and use match same_entity, different_entity, or unclear. Do not add prose, markdown, labels, nested output, or action strings.',
   '{
@@ -399,32 +321,19 @@ SELECT otlet.create_task(
 SELECT otlet.run_task(:'task_name');
 SQL
 wait_task_complete "$entity_task" 2 1800 1
-derive_entity_records "$entity_task"
 
 entity_contract="$(psql_value "
 SELECT count(*) FILTER (WHERE r.status = 'complete')::text || '|' ||
        COALESCE(max(r.output->>'match') FILTER (WHERE r.subject_id = 'vendor-1001:vendor-42'), '') || '|' ||
        COALESCE(max(r.output->>'match') FILTER (WHERE r.subject_id = 'vendor-1001:vendor-77'), '') || '|' ||
-       count(*) FILTER (WHERE a.action_type = 'create_record' AND a.status = 'complete')::text || '|' ||
-       count(*) FILTER (WHERE rec.record_type = '$record_type')::text || '|' ||
        count(*) FILTER (WHERE r.receipt_id IS NOT NULL)::text || '|' ||
        count(*) FILTER (WHERE r.schema_validation_status = 'passed')::text
 FROM otlet.runs r
-LEFT JOIN otlet.actions a ON a.job_id = r.job_id
-LEFT JOIN otlet.records rec ON rec.action_id = a.id
 WHERE r.task_name = '$entity_task';
 ")"
 echo "entity_resolution_contract=$entity_contract"
-[ "$entity_contract" = "2|same_entity|different_entity|2|2|2|2" ] || {
+[ "$entity_contract" = "2|same_entity|different_entity|2|2" ] || {
   echo "Entity-resolution proof failed: $entity_contract" >&2
-  exit 1
-}
-
-direct_materialized="$(psql_value "SELECT otlet.refresh_semantic_materializations('$record_type'); SELECT count(*) FROM otlet.semantic_materializations WHERE task_name = '$entity_task' AND record_type = '$record_type' AND stale = false;")"
-direct_materialized_count="$(tail -n 1 <<<"$direct_materialized")"
-echo "entity_resolution_materialized=$direct_materialized_count"
-[ "$direct_materialized_count" = "2" ] || {
-  echo "Expected 2 direct entity materializations, got $direct_materialized_count" >&2
   exit 1
 }
 
@@ -437,53 +346,9 @@ SELECT name, task_name, record_type, max_candidate_rows
 FROM otlet.create_semantic_join_index(
   :'join_index_name',
   $$
-    SELECT
-      p.pair_id AS subject_id,
-      jsonb_build_object(
-        '_otlet_mvcc', jsonb_build_object(
-          'subject_id', p.pair_id,
-          'left_id', p.left_id,
-          'right_id', p.right_id,
-          'left_ctid', l.ctid::text,
-          'left_xmin', l.xmin::text,
-          'right_ctid', r.ctid::text,
-          'right_xmin', r.xmin::text
-        ),
-        'table', 'public.otlet_demo_vendor_entity',
-        'pair_id', p.pair_id,
-        'left_id', p.left_id,
-        'right_id', p.right_id,
-        'candidate_evidence',
-        CASE p.pair_id
-          WHEN 'vendor-1001:vendor-42' THEN jsonb_build_array(
-            'same remittance account ending 8821',
-            'internal note says Northstar rebranded after acquisition'
-          )
-          WHEN 'vendor-1001:vendor-77' THEN jsonb_build_array(
-            'different industry and city',
-            'no shared tax id, domain, payment account, AP contact, or remittance account'
-          )
-          ELSE '[]'::jsonb
-        END,
-        'left_record', jsonb_build_object(
-          'id', l.id,
-          'legal_name', l.legal_name,
-          'website', l.website,
-          'address', l.address,
-          'notes', l.notes
-        ),
-        'right_record', jsonb_build_object(
-          'id', r.id,
-          'legal_name', r.legal_name,
-          'website', r.website,
-          'address', r.address,
-          'notes', r.notes
-        )
-      ) AS input
-    FROM public.otlet_demo_vendor_pair p
-    JOIN public.otlet_demo_vendor_entity l ON l.id = p.left_id
-    JOIN public.otlet_demo_vendor_entity r ON r.id = p.right_id
-    ORDER BY p.pair_id
+    SELECT subject_id, input
+    FROM public.otlet_demo_vendor_pair_input
+    ORDER BY subject_id
   $$,
   'Use input.candidate_evidence before names. If evidence contains same remittance account or rebrand/acquisition, return exactly {"output":{"match":"same_entity","confidence":"high","reason":"shared remittance account and acquisition note"},"actions":[]}. If evidence contains no shared identifiers or different industry/city, return exactly {"output":{"match":"different_entity","confidence":"high","reason":"medical supplier has no shared identifiers"},"actions":[]}. Otherwise compare operational identifiers and use match same_entity, different_entity, or unclear. Do not add prose, markdown, labels, nested output, or action strings.',
   '{
@@ -510,11 +375,48 @@ echo "semantic_join_refresh_queued=$queued"
   exit 1
 }
 wait_task_complete "$join_task" 2 1800 1
-derive_entity_records "$join_task"
-materialized="$(psql_value "SELECT otlet.materialize_semantic_join_index('$join_index_name');")"
-echo "semantic_join_materialized=$materialized"
+throughput_contracts="$(psql_value "
+SELECT count(*) FILTER (WHERE a.action_type = 'create_record' AND a.status = 'complete')::text || '|' ||
+       count(*) FILTER (WHERE r.record_type = '$record_type')::text
+FROM otlet.jobs j
+LEFT JOIN otlet.actions a ON a.job_id = j.id
+LEFT JOIN otlet.records r ON r.action_id = a.id
+WHERE j.task_name = '$join_task';
+
+SELECT count(*)
+FROM otlet.semantic_materializations
+WHERE task_name = '$join_task'
+  AND record_type = '$record_type'
+  AND stale = false;
+
+SELECT q.queue_state || '|' ||
+       w.queued_jobs::text || '|' ||
+       w.running_jobs::text || '|' ||
+       w.last_batch_jobs::text || '|' ||
+       w.last_batch_completed_jobs::text || '|' ||
+       w.last_batch_failed_jobs::text
+FROM otlet.worker_throughput_status w
+JOIN otlet.model_queue_status q ON q.model_name = w.model_name
+WHERE w.model_name = '$model_name';
+")"
+auto_records="$(sed -n '1p' <<<"$throughput_contracts")"
+materialized="$(sed -n '2p' <<<"$throughput_contracts")"
+throughput_status_contract="$(sed -n '3p' <<<"$throughput_contracts")"
+echo "semantic_join_auto_records=$auto_records"
+[ "$auto_records" = "2|2" ] || {
+  echo "Expected 2 auto actions and records, got $auto_records" >&2
+  exit 1
+}
+
+echo "semantic_join_auto_materialized=$materialized"
 [ "$materialized" = "2" ] || {
-  echo "Expected 2 semantic join materializations, got $materialized" >&2
+  echo "Expected 2 automatic semantic join materializations, got $materialized" >&2
+  exit 1
+}
+
+echo "throughput_status_contract=$throughput_status_contract"
+[ "$throughput_status_contract" = "queue_accepting|0|0|2|2|0" ] || {
+  echo "Expected throughput status contract queue_accepting|0|0|2|2|0, got $throughput_status_contract" >&2
   exit 1
 }
 
@@ -590,13 +492,6 @@ SET notes = notes || '; updated AP contact confirms remittance migration',
     updated_at = clock_timestamp()
 WHERE id = 'vendor-1001';
 SQL
-direct_stale_materializations="$(psql_value "SELECT count(*) FROM otlet.semantic_materializations WHERE task_name = '$entity_task' AND record_type = '$record_type' AND stale;")"
-echo "entity_resolution_stale_materializations=$direct_stale_materializations"
-[ "$direct_stale_materializations" = "2" ] || {
-  echo "Expected 2 stale direct materializations, got $direct_stale_materializations" >&2
-  exit 1
-}
-
 join_stale_contract="$(psql_value "
 SELECT stale_subjects::text || '|' || fresh_subjects::text
 FROM otlet.semantic_join_index_plan('$join_index_name');

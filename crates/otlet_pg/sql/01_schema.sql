@@ -8,6 +8,7 @@ CREATE TABLE otlet.production_policy (
   semantic_auto_wait_ms integer NOT NULL DEFAULT 10000,
   semantic_auto_infer_ms integer NOT NULL DEFAULT 15000,
   semantic_auto_max_rows integer NOT NULL DEFAULT 1,
+  worker_claim_batch_size integer NOT NULL DEFAULT 8,
   job_lease_interval interval NOT NULL DEFAULT interval '5 minutes',
   worker_event_retention interval NOT NULL DEFAULT interval '7 days',
   trace_detail_retention interval NOT NULL DEFAULT interval '7 days',
@@ -21,6 +22,7 @@ CREATE TABLE otlet.production_policy (
   CHECK (semantic_auto_wait_ms BETWEEN 0 AND 30000),
   CHECK (semantic_auto_infer_ms BETWEEN 0 AND 30000),
   CHECK (semantic_auto_max_rows BETWEEN 0 AND 10),
+  CHECK (worker_claim_batch_size BETWEEN 1 AND 128),
   CHECK (job_lease_interval >= interval '1 second'),
   CHECK (job_lease_interval <= interval '1 hour')
 );

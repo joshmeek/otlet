@@ -364,3 +364,101 @@ BEGIN
   RETURN refreshed;
 END;
 $$;
+
+CREATE FUNCTION otlet.materialize_completed_semantic_job(
+  job_id bigint
+) RETURNS bigint
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  job_row otlet.jobs%ROWTYPE;
+  output_row otlet.outputs%ROWTYPE;
+  index_row record;
+  saved_action_id bigint;
+  refreshed bigint := 0;
+  total_refreshed bigint := 0;
+BEGIN
+  SELECT *
+  INTO job_row
+  FROM otlet.jobs j
+  WHERE j.id = materialize_completed_semantic_job.job_id
+    AND j.status = 'complete';
+
+  IF NOT FOUND THEN
+    RETURN 0;
+  END IF;
+
+  SELECT *
+  INTO output_row
+  FROM otlet.outputs o
+  WHERE o.job_id = job_row.id
+  ORDER BY o.id DESC
+  LIMIT 1;
+
+  IF NOT FOUND THEN
+    RETURN 0;
+  END IF;
+
+  IF jsonb_typeof(output_row.output) IS DISTINCT FROM 'object' THEN
+    RAISE EXCEPTION 'otlet semantic job % output must be a JSON object to materialize', job_row.id;
+  END IF;
+
+  FOR index_row IN
+    SELECT 'row'::text AS index_kind, si.name, si.record_type
+    FROM otlet.semantic_indexes si
+    WHERE si.task_name = job_row.task_name
+    UNION ALL
+    SELECT 'join'::text AS index_kind, sji.name, sji.record_type
+    FROM otlet.semantic_join_indexes sji
+    WHERE sji.task_name = job_row.task_name
+  LOOP
+    SELECT a.id
+    INTO saved_action_id
+    FROM otlet.actions a
+    WHERE a.job_id = job_row.id
+      AND a.output_id = output_row.id
+      AND a.action_type = 'create_record'
+      AND a.payload ->> 'record_type' = index_row.record_type
+    ORDER BY a.id
+    LIMIT 1;
+
+    IF NOT FOUND THEN
+      INSERT INTO otlet.actions (job_id, output_id, action_type, payload, status, error)
+      VALUES (
+        job_row.id,
+        output_row.id,
+        'create_record',
+        jsonb_build_object(
+          'type', 'create_record',
+          'record_type', index_row.record_type,
+          'subject_id', job_row.subject_id,
+          'body', output_row.output
+        ),
+        'complete',
+        NULL
+      )
+      RETURNING id INTO saved_action_id;
+    END IF;
+
+    INSERT INTO otlet.records (action_id, record_type, subject_id, body)
+    SELECT saved_action_id, index_row.record_type, job_row.subject_id, output_row.output
+    WHERE NOT EXISTS (
+      SELECT 1
+      FROM otlet.records r
+      WHERE r.action_id = saved_action_id
+    );
+
+    IF index_row.index_kind = 'row' THEN
+      SELECT otlet.materialize_semantic_index_subject(index_row.name, job_row.subject_id)
+      INTO refreshed;
+    ELSE
+      SELECT otlet.materialize_semantic_join_index_subject(index_row.name, job_row.subject_id)
+      INTO refreshed;
+    END IF;
+
+    total_refreshed := total_refreshed + COALESCE(refreshed, 0);
+  END LOOP;
+
+  RETURN total_refreshed;
+END;
+$$;
