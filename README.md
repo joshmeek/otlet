@@ -41,9 +41,11 @@ CREATE TABLE public.vendor_entity (
 );
 
 INSERT INTO public.vendor_entity VALUES
-  ('vendor-1001', 'Northstar Logistics LLC', 'northstar-logistics.example', '41 W Lake St, Chicago, IL', 'legacy freight vendor from the 2021 import; AP contact is ops@northstar-logistics.example; old remittance account ending 8821'),
+  ('vendor-1001', 'Northstar Logistics LLC', 'northstar-logistics.example', '41 W Lake St, Chicago, IL', 'legacy freight vendor from the 2021 import; AP contact is ops@northstar-logistics.example'),
   ('vendor-42', 'N-Star Freight Services', 'nstar-freight.example', '41 West Lake Street, Suite 900, Chicago', 'same remittance account ending 8821; internal note says Northstar rebranded after acquisition'),
-  ('vendor-77', 'Clearwater Medical Supplies', 'clearwatermed.example', '500 Hospital Way, Phoenix, AZ', 'hospital supply distributor; no shared tax id, domain, payment account, AP contact, remittance account, city, or industry with the freight vendor');
+  ('vendor-77', 'Clearwater Medical Supplies', 'clearwatermed.example', '500 Hospital Way, Phoenix, AZ', 'hospital supply distributor; no shared tax id, domain, payment account, AP contact, remittance account, city, or industry with the freight vendor'),
+  ('vendor-313', 'North Star Medical Logistics', 'northstarmedlog.example', '41 West Lake Street, Chicago, IL', 'medical logistics broker; same building and similar name, but different domain, payment account, AP contact, and no acquisition note'),
+  ('vendor-314', 'Northstar Freight Canada Inc.', 'northstar-canada.example', '88 King St W, Toronto, ON', 'freight carrier with similar brand; different country, bank account, AP contact, and no shared remittance account in the ledger');
 ```
 
 The second argument to `otlet.create_task` is the source query. That is where you choose the table and the rows. Here the query receives candidate row-id pairs, joins the table twice by primary key, and turns each pair into one model input. It is not doing a fuzzy join or scanning every possible pair:
@@ -55,8 +57,10 @@ FROM otlet.create_task(
   $$
     WITH candidate_pairs(pair_id, left_id, right_id) AS (
       VALUES
-        ('pair-1', 'vendor-1001', 'vendor-42'),
-        ('pair-2', 'vendor-1001', 'vendor-77')
+        ('vendor-1001:vendor-42', 'vendor-1001', 'vendor-42'),
+        ('vendor-1001:vendor-77', 'vendor-1001', 'vendor-77'),
+        ('vendor-1001:vendor-313', 'vendor-1001', 'vendor-313'),
+        ('vendor-1001:vendor-314', 'vendor-1001', 'vendor-314')
     )
     SELECT
       p.pair_id AS subject_id,
@@ -66,13 +70,25 @@ FROM otlet.create_task(
         'right_id', p.right_id,
         'candidate_evidence',
         CASE p.pair_id
-          WHEN 'pair-1' THEN jsonb_build_array(
+          WHEN 'vendor-1001:vendor-42' THEN jsonb_build_array(
             'same remittance account ending 8821',
             'internal note says Northstar rebranded after acquisition'
           )
-          WHEN 'pair-2' THEN jsonb_build_array(
+          WHEN 'vendor-1001:vendor-77' THEN jsonb_build_array(
             'different industry and city',
             'no shared tax id, domain, payment account, AP contact, or remittance account'
+          )
+          WHEN 'vendor-1001:vendor-313' THEN jsonb_build_array(
+            'same office building and similar North Star name',
+            'medical logistics versus freight vendor',
+            'different domain, payment account, AP contact, and no acquisition note',
+            'weak signals conflict with important identifiers'
+          )
+          WHEN 'vendor-1001:vendor-314' THEN jsonb_build_array(
+            'similar Northstar freight brand',
+            'different country, bank account, AP contact, and no shared remittance account',
+            'no acquisition or rebrand note connecting the records',
+            'name similarity alone is not enough'
           )
           ELSE '[]'::jsonb
         END,
@@ -95,10 +111,10 @@ FROM otlet.create_task(
     JOIN public.vendor_entity l ON l.id = p.left_id
     JOIN public.vendor_entity r ON r.id = p.right_id
   $$,
-  'Use input.candidate_evidence before names. If evidence contains same remittance account or rebrand/acquisition, return exactly {"output":{"match":"same_entity","confidence":"high","reason":"shared remittance account and acquisition note"},"actions":[]}. If evidence contains no shared identifiers or different industry/city, return exactly {"output":{"match":"different_entity","confidence":"high","reason":"medical supplier has no shared identifiers"},"actions":[]}. Otherwise compare operational identifiers and use match same_entity, different_entity, or unclear. Do not add prose, markdown, labels, nested output, or action strings.',
-  '{"type":"object","required":["match","confidence","reason"],"additionalProperties":false,"properties":{"match":{"enum":["same_entity","different_entity","unclear"]},"confidence":{"enum":["low","medium","high"]},"reason":{"type":"string"}}}'::jsonb,
+  'Use input.candidate_evidence as authority before names or notes. Return same_entity with high confidence when evidence contains shared remittance, rebrand, or acquisition. Return different_entity with high confidence when evidence says no shared identifiers or different industry and city. Return unclear with medium confidence when evidence says weak signals conflict or name similarity alone is not enough. Do not add prose, markdown, labels, nested output, or action strings.',
+  '{"type":"object","required":["match","confidence","reason"],"additionalProperties":false,"properties":{"match":{"enum":["same_entity","different_entity","unclear"]},"confidence":{"enum":["low","medium","high"]},"reason":{"type":"string"}},"allOf":[{"if":{"properties":{"match":{"const":"same_entity"}},"required":["match"]},"then":{"properties":{"reason":{"pattern":"remittance|rebrand|acquisition"}}}},{"if":{"properties":{"match":{"const":"different_entity"}},"required":["match"]},"then":{"properties":{"reason":{"pattern":"no shared|different"}}}}]}'::jsonb,
   'linked_qwen_0_6b',
-  '{"max_tokens":128,"reasoning":"off"}'::jsonb
+  '{"max_tokens":256,"reasoning":"off"}'::jsonb
 );
 
 SELECT otlet.set_model_selection_policy(
@@ -130,7 +146,7 @@ Output:
 ```text
  queued_jobs
 -------------
-           2
+           4
 (1 row)
 ```
 
@@ -150,11 +166,13 @@ ORDER BY subject_id;
 Output:
 
 ```text
- subject_id |      match       | confidence
-------------+------------------+------------
- pair-1     | same_entity      | high
- pair-2     | different_entity | high
-(2 rows)
+      subject_id       |      match       | confidence
+-----------------------+------------------+------------
+ vendor-1001:vendor-313 | same_entity      | high
+ vendor-1001:vendor-314 | same_entity      | high
+ vendor-1001:vendor-42  | same_entity      | high
+ vendor-1001:vendor-77  | different_entity | high
+(4 rows)
 ```
 
 Inspect model attempts:
@@ -175,10 +193,13 @@ ORDER BY subject_id, attempt_index;
 Representative output:
 
 ```text
- subject_id | attempt_index | selection_role | selection_status |    model_name    |      match
-------------+---------------+----------------+------------------+------------------+------------------
- pair-1     |             1 | cheap          | accepted         | linked_qwen_0_6b | same_entity
- pair-2     |             1 | cheap          | accepted         | linked_qwen_0_6b | different_entity
+      subject_id       | attempt_index | selection_role | selection_status |    model_name    |      match
+-----------------------+---------------+----------------+------------------+------------------+------------------
+ vendor-1001:vendor-313 |             1 | cheap          | failed           | linked_qwen_0_6b |
+ vendor-1001:vendor-313 |             2 | strong         | accepted         | linked_qwen_1_7b | same_entity
+ vendor-1001:vendor-314 |             1 | cheap          | accepted         | linked_qwen_0_6b | same_entity
+ vendor-1001:vendor-42  |             1 | cheap          | accepted         | linked_qwen_0_6b | same_entity
+ vendor-1001:vendor-77  |             1 | cheap          | accepted         | linked_qwen_0_6b | different_entity
 ```
 
 The user table stayed untouched. Otlet stored jobs, accepted outputs, rejected or failed attempts, receipts, and trace state under the `otlet` schema, keyed by the `subject_id` values from the source query. The full demo script also proves cheap-first model selection with Qwen3 0.6B and Qwen3 1.7B, worker batch drain, typed `entity_hypothesis` actions, automatic semantic materialization, semantic join lookup, and stale results after a source row update
