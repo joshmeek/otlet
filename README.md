@@ -8,133 +8,93 @@ Otlet uses a `pgrx` extension and a Postgres background worker loaded through `s
 
 ## Quick Example
 
-The demo task reads `public.otlet_demo_vendor_pair`, joins each side to `public.otlet_demo_vendor_entity`, and builds one compact JSON input per pair. Each input includes the two rows plus evidence such as shared remittance accounts, acquisition notes, missing identifiers, and conflicting name/address signals
-
-Otlet asks the resident worker for `same_entity`, `different_entity`, or `unclear`, with confidence and a reason. The task starts with Qwen3 0.6B and escalates hard rows to Qwen3 1.7B. The model can propose typed actions like `merge_candidate` or `new_entity`; source rows stay untouched
-
-The task input looks like this:
+The demo registers two local GGUF models with the resident Postgres worker. The model paths come from `./scripts/otlet-setup.sh`; the full worked example shows the copy/paste setup. Output below comes from a local demo run and is trimmed for width
 
 ```sql
-SELECT
-  subject_id,
-  input #>> '{left_record,legal_name}' AS left_name,
-  input #>> '{right_record,legal_name}' AS right_name,
-  input #>> '{candidate_evidence,0}' AS first_evidence
-FROM public.otlet_demo_vendor_pair_input
-ORDER BY subject_id
+SELECT name, endpoint FROM otlet.register_runtime('linked_inproc', 'linked');
+SELECT name, runtime_name FROM otlet.register_model('linked_qwen_0_6b', '<Qwen3-0.6B-Q8_0.gguf>', 'linked_inproc');
+SELECT name, runtime_name FROM otlet.register_model('linked_qwen_1_7b', '<Qwen3-1.7B-Q8_0.gguf>', 'linked_inproc');
+```
+
+```text
+ linked_inproc | linked
+ linked_qwen_0_6b | linked_inproc
+ linked_qwen_1_7b | linked_inproc
+```
+
+The task reads candidate vendor pairs, joins the source rows, and builds compact row-pair JSON for the model:
+
+```sql
+SELECT p.pair_id, r.legal_name AS right_name, r.notes AS evidence
+FROM public.otlet_demo_vendor_pair p
+JOIN public.otlet_demo_vendor_entity r ON r.id = p.right_id
+ORDER BY p.pair_id
 LIMIT 3;
 ```
 
 ```text
-       subject_id       |        left_name        |          right_name           |                  first_evidence
-------------------------+-------------------------+-------------------------------+--------------------------------------------------
- vendor-1001:vendor-313 | Northstar Logistics LLC | North Star Medical Logistics  | same office building and similar North Star name
- vendor-1001:vendor-314 | Northstar Logistics LLC | Northstar Freight Canada Inc. | similar Northstar freight brand
- vendor-1001:vendor-42  | Northstar Logistics LLC | N-Star Freight Services       | same remittance account ending 8821
+ vendor-1001:vendor-313 | North Star Medical Logistics  | same building, different domain/payment/AP contact
+ vendor-1001:vendor-314 | Northstar Freight Canada Inc. | similar brand, different country/bank/contact
+ vendor-1001:vendor-42  | N-Star Freight Services       | same remittance account, rebrand note
 ```
+
+Then SQL queues model work and reads validated answers:
 
 ```sql
 SELECT otlet.run_task('entity_resolution_demo') AS queued_jobs;
-
-SELECT
-  subject_id,
-  output->>'match' AS match,
-  output->>'confidence' AS confidence
-FROM otlet.runs
-WHERE task_name = 'entity_resolution_demo'
-ORDER BY subject_id;
+SELECT subject_id, output->>'match' AS match, output->>'confidence' AS confidence
+FROM otlet.runs WHERE task_name = 'entity_resolution_demo' ORDER BY subject_id;
 ```
-
-Real output from `./scripts/otlet-demo.sh`:
 
 ```text
  queued_jobs
 -------------
            4
 
-       subject_id       |      match       | confidence
-------------------------+------------------+------------
  vendor-1001:vendor-313 | different_entity | high
  vendor-1001:vendor-314 | different_entity | high
  vendor-1001:vendor-42  | same_entity      | high
  vendor-1001:vendor-77  | different_entity | high
 ```
 
-Some pairs need evidence beyond string similarity. SQL sends evidence like:
-
-```text
-vendor-1001:vendor-42
-  same remittance account ending 8821
-  internal note says Northstar rebranded after acquisition
-
-vendor-1001:vendor-77
-  different industry and city
-  no shared tax id, domain, payment account, AP contact, or remittance account
-
-vendor-1001:vendor-313
-  same office building and similar North Star name
-  medical logistics versus freight vendor
-  different domain, payment account, AP contact, and no acquisition note
-```
-
-Otlet keeps the trail in SQL:
+Otlet keeps the model-selection and action trail in Postgres:
 
 ```sql
-SELECT
-  subject_id,
-  selection_role,
-  selection_status,
-  model_name,
-  output->>'match' AS match
-FROM otlet.model_selection_attempts
-WHERE task_name = 'entity_resolution_demo'
+SELECT subject_id, selection_role, selection_status, model_name, output->>'match' AS match
+FROM otlet.model_selection_attempts WHERE task_name = 'entity_resolution_demo'
 ORDER BY subject_id, attempt_index;
 
 SELECT action_type, status, approval_status, count(*) AS actions
-FROM otlet.action_status
-WHERE task_name = 'entity_resolution_demo'
-GROUP BY action_type, status, approval_status
-ORDER BY action_type;
+FROM otlet.action_status WHERE task_name = 'entity_resolution_demo'
+GROUP BY action_type, status, approval_status ORDER BY action_type;
 ```
 
 ```text
-       subject_id       | selection_role | selection_status |    model_name    |      match
-------------------------+----------------+------------------+------------------+------------------
- vendor-1001:vendor-313 | cheap          | failed           | linked_qwen_0_6b |
- vendor-1001:vendor-313 | strong         | accepted         | linked_qwen_1_7b | different_entity
- vendor-1001:vendor-42  | cheap          | accepted         | linked_qwen_0_6b | same_entity
+ vendor-1001:vendor-313 | cheap  | failed   | linked_qwen_0_6b |
+ vendor-1001:vendor-313 | strong | accepted | linked_qwen_1_7b | different_entity
+ vendor-1001:vendor-42  | cheap  | accepted | linked_qwen_0_6b | same_entity
 
-   action_type   |  status  | approval_status | actions
------------------+----------+-----------------+---------
- merge_candidate | proposed | required        |       1
- new_entity      | proposed | not_required    |       3
+ merge_candidate | approved | approved     | 1
+ new_entity      | proposed | not_required | 2
+ new_entity      | rejected | rejected     | 1
 ```
 
-Postgres can inspect each model attempt, schema result, token count, bounded trace, and output hash:
+Receipts expose schema validation, token counts, bounded traces, and output hashes:
 
 ```sql
-SELECT
-  subject_id,
-  selection_role,
-  status,
-  schema_validation_status AS schema,
-  prompt_tokens,
-  generated_tokens,
-  detailed_trace_captured_tokens AS traced_tokens,
-  left(receipt_raw_output_hash, 8) AS output_hash
+SELECT subject_id, selection_role, status, schema_validation_status AS schema,
+       prompt_tokens, generated_tokens, detailed_trace_captured_tokens AS traced,
+       left(receipt_raw_output_hash, 8) AS output_hash
 FROM otlet.inference_receipt_trace_status
 WHERE task_name = 'entity_resolution_demo'
-ORDER BY subject_id, attempt_index
-LIMIT 4;
+ORDER BY subject_id, attempt_index LIMIT 4;
 ```
 
 ```text
-       subject_id       | selection_role |  status  | schema | prompt_tokens | generated_tokens | traced_tokens | output_hash
-------------------------+----------------+----------+--------+---------------+------------------+---------------+-------------
- vendor-1001:vendor-313 | cheap          | failed   | failed |           801 |              139 |            16 | 8e564078
- vendor-1001:vendor-313 | strong         | complete | passed |           801 |               66 |            16 | 66f14495
- vendor-1001:vendor-314 | cheap          | failed   | failed |           806 |              192 |            16 | 908d9787
- vendor-1001:vendor-314 | strong         | complete | passed |           806 |               66 |            16 | 096a78cd
+ vendor-1001:vendor-313 | cheap  | failed   | failed | 801 |  43 | 16 | 0ea12091
+ vendor-1001:vendor-313 | strong | complete | passed | 801 |  66 | 16 | 66f14495
+ vendor-1001:vendor-314 | cheap  | failed   | failed | 806 | 192 | 16 | 908d9787
+ vendor-1001:vendor-314 | strong | complete | passed | 806 |  54 | 16 | 837b8e2f
 ```
 
 Source rows stayed in `public.otlet_demo_vendor_entity`. Otlet stored jobs, accepted outputs, failed attempts, receipts, trace state, and typed actions under `otlet`
