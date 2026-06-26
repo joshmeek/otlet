@@ -434,6 +434,112 @@ BEGIN
 END;
 $$;
 
+CREATE FUNCTION otlet.action_validation_error(action jsonb) RETURNS text
+LANGUAGE plpgsql
+STABLE
+AS $$
+DECLARE
+  v_action_type text := COALESCE(action ->> 'type', '');
+BEGIN
+  IF jsonb_typeof(action) IS DISTINCT FROM 'object' THEN
+    RETURN 'action must be an object';
+  END IF;
+
+  IF v_action_type = '' THEN
+    RETURN 'action missing type';
+  END IF;
+
+  IF NOT EXISTS (
+    SELECT 1
+    FROM otlet.action_type_schemas s
+    WHERE s.action_type = v_action_type
+  ) THEN
+    RETURN 'unsupported action type';
+  END IF;
+
+  IF v_action_type = 'create_record' THEN
+    IF NULLIF(action ->> 'record_type', '') IS NULL THEN
+      RETURN 'create_record missing record_type';
+    END IF;
+    IF jsonb_typeof(action -> 'body') IS DISTINCT FROM 'object' THEN
+      RETURN 'create_record body must be an object';
+    END IF;
+    RETURN NULL;
+  END IF;
+
+  IF v_action_type = 'merge_candidate' THEN
+    IF NULLIF(action ->> 'left_id', '') IS NULL THEN
+      RETURN 'merge_candidate missing left_id';
+    END IF;
+    IF NULLIF(action ->> 'right_id', '') IS NULL THEN
+      RETURN 'merge_candidate missing right_id';
+    END IF;
+    IF jsonb_typeof(action -> 'confidence') = 'number' THEN
+      IF (action ->> 'confidence')::numeric < 0 OR (action ->> 'confidence')::numeric > 1 THEN
+        RETURN 'merge_candidate numeric confidence must be between 0 and 1';
+      END IF;
+    ELSIF action ->> 'confidence' NOT IN ('low', 'medium', 'high') THEN
+      RETURN 'merge_candidate confidence must be low, medium, high, or a number between 0 and 1';
+    END IF;
+    IF NULLIF(action ->> 'reason', '') IS NULL THEN
+      RETURN 'merge_candidate missing reason';
+    END IF;
+    IF COALESCE(jsonb_typeof(action -> 'evidence'), '') NOT IN ('array', 'string') THEN
+      RETURN 'merge_candidate evidence must be an array or string';
+    END IF;
+    RETURN NULL;
+  END IF;
+
+  IF v_action_type = 'new_entity' THEN
+    IF NULLIF(action ->> 'entity_id', '') IS NULL THEN
+      RETURN 'new_entity missing entity_id';
+    END IF;
+    IF NULLIF(action ->> 'reason', '') IS NULL THEN
+      RETURN 'new_entity missing reason';
+    END IF;
+    IF COALESCE(jsonb_typeof(action -> 'evidence'), '') NOT IN ('array', 'string') THEN
+      RETURN 'new_entity evidence must be an array or string';
+    END IF;
+    RETURN NULL;
+  END IF;
+
+  IF v_action_type = 'review_flag' THEN
+    IF NULLIF(action ->> 'reason', '') IS NULL THEN
+      RETURN 'review_flag missing reason';
+    END IF;
+    IF action ->> 'severity' NOT IN ('low', 'medium', 'high') THEN
+      RETURN 'review_flag severity must be low, medium, or high';
+    END IF;
+    RETURN NULL;
+  END IF;
+
+  IF v_action_type = 'note' THEN
+    IF NULLIF(action ->> 'subject_id', '') IS NULL THEN
+      RETURN 'note missing subject_id';
+    END IF;
+    IF jsonb_typeof(action -> 'body') IS DISTINCT FROM 'object' THEN
+      RETURN 'note body must be an object';
+    END IF;
+    RETURN NULL;
+  END IF;
+
+  IF v_action_type = 'follow_up_job' THEN
+    IF NULLIF(action ->> 'task_name', '') IS NULL THEN
+      RETURN 'follow_up_job missing task_name';
+    END IF;
+    IF NULLIF(action ->> 'subject_id', '') IS NULL THEN
+      RETURN 'follow_up_job missing subject_id';
+    END IF;
+    IF NULLIF(action ->> 'reason', '') IS NULL THEN
+      RETURN 'follow_up_job missing reason';
+    END IF;
+    RETURN NULL;
+  END IF;
+
+  RETURN 'unsupported action type';
+END;
+$$;
+
 CREATE FUNCTION otlet.complete_job(
   job_id bigint,
   output jsonb,
@@ -460,9 +566,17 @@ DECLARE
   model_row otlet.models%ROWTYPE;
   runtime_row otlet.runtimes%ROWTYPE;
   action jsonb;
+  action_payload jsonb;
   saved_action_id bigint;
   action_error text;
-  action_type text;
+  action_type_name text;
+  action_status text;
+  action_approval_status text;
+  action_subject_id text;
+  action_requires_approval boolean;
+  action_creates_record boolean;
+  action_record_type text;
+  action_record_body jsonb;
 BEGIN
   SELECT * INTO job_row
   FROM otlet.jobs
@@ -531,6 +645,10 @@ BEGIN
     RETURN;
   END IF;
 
+  IF jsonb_typeof(COALESCE(complete_job.actions, '[]'::jsonb)) IS DISTINCT FROM 'array' THEN
+    RAISE EXCEPTION 'otlet complete_job actions must be an array';
+  END IF;
+
   PERFORM otlet.mark_runtime_health(runtime_row.name, 'ready', NULL);
   PERFORM otlet.touch_runtime_slot(runtime_row.name, model_row.name, 'ready', 0, NULL);
   PERFORM otlet.record_worker_event(
@@ -548,42 +666,218 @@ BEGIN
   );
 
   FOR action IN SELECT value FROM jsonb_array_elements(COALESCE(complete_job.actions, '[]'::jsonb)) LOOP
-    action_type := COALESCE(action ->> 'type', '');
-    action_error := NULL;
-
-    IF action_type = 'create_record' THEN
-      IF action ->> 'record_type' IS NULL THEN
-        action_error := 'create_record missing record_type';
-      ELSIF jsonb_typeof(action -> 'body') IS DISTINCT FROM 'object' THEN
-        action_error := 'create_record body must be an object';
-      END IF;
-    ELSE
-      action_error := 'unsupported action type';
+    action_payload := CASE
+      WHEN jsonb_typeof(action) = 'object' THEN action
+      ELSE jsonb_build_object('invalid_action', action)
+    END;
+    action_type_name := COALESCE(NULLIF(action ->> 'type', ''), 'invalid');
+    action_error := otlet.action_validation_error(action);
+    action_requires_approval := false;
+    action_creates_record := false;
+    IF action_error IS NULL THEN
+      SELECT s.requires_approval, s.creates_record
+      INTO action_requires_approval, action_creates_record
+      FROM otlet.action_type_schemas s
+      WHERE s.action_type = action_type_name;
     END IF;
+    action_subject_id := COALESCE(
+      NULLIF(action_payload ->> 'subject_id', ''),
+      NULLIF(action_payload ->> 'entity_id', ''),
+      NULLIF(action_payload ->> 'right_id', ''),
+      job_row.subject_id
+    );
+    action_status := CASE
+      WHEN action_error IS NOT NULL THEN 'rejected'
+      WHEN action_creates_record AND NOT action_requires_approval THEN 'complete'
+      ELSE 'proposed'
+    END;
+    action_approval_status := CASE
+      WHEN action_error IS NOT NULL THEN 'not_required'
+      WHEN action_requires_approval THEN 'required'
+      ELSE 'not_required'
+    END;
 
-    INSERT INTO otlet.actions (job_id, output_id, action_type, payload, status, error)
+    INSERT INTO otlet.actions (
+      job_id,
+      output_id,
+      receipt_id,
+      action_type,
+      payload,
+      status,
+      approval_status,
+      subject_id,
+      source_table,
+      source_hash,
+      error
+    )
     VALUES (
       complete_job.job_id,
       saved_output.id,
-      action_type,
-      action,
-      CASE WHEN action_error IS NULL THEN 'complete' ELSE 'rejected' END,
+      saved_receipt.id,
+      action_type_name,
+      action_payload,
+      action_status,
+      action_approval_status,
+      action_subject_id,
+      complete_job.trace_summary #>> '{mvcc,table}',
+      complete_job.trace_summary #>> '{mvcc,source_hash}',
       action_error
     )
     RETURNING id INTO saved_action_id;
 
-    IF action_error IS NULL THEN
+    IF action_creates_record THEN
+      action_record_type := CASE
+        WHEN action_type_name = 'note' THEN COALESCE(NULLIF(action_payload ->> 'record_type', ''), 'note')
+        ELSE action_payload ->> 'record_type'
+      END;
+      action_record_body := action_payload -> 'body';
+
       INSERT INTO otlet.records (action_id, record_type, subject_id, body)
       VALUES (
         saved_action_id,
-        action ->> 'record_type',
-        action ->> 'subject_id',
-        action -> 'body'
+        action_record_type,
+        action_subject_id,
+        action_record_body
       );
     END IF;
   END LOOP;
 
   RETURN NEXT saved_output;
+END;
+$$;
+
+CREATE FUNCTION otlet.approve_action(action_id bigint) RETURNS SETOF otlet.actions
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  action_row otlet.actions%ROWTYPE;
+BEGIN
+  UPDATE otlet.actions
+  SET status = 'approved',
+      approval_status = 'approved',
+      approved_at = now(),
+      error = NULL
+  WHERE id = approve_action.action_id
+    AND status = 'proposed'
+    AND approval_status = 'required'
+  RETURNING * INTO action_row;
+
+  IF FOUND THEN
+    RETURN NEXT action_row;
+  END IF;
+END;
+$$;
+
+CREATE FUNCTION otlet.reject_action(
+  action_id bigint,
+  reason text DEFAULT 'rejected'
+) RETURNS SETOF otlet.actions
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  action_row otlet.actions%ROWTYPE;
+BEGIN
+  UPDATE otlet.actions
+  SET status = 'rejected',
+      approval_status = 'rejected',
+      error = reject_action.reason
+  WHERE id = reject_action.action_id
+    AND status <> 'applied'
+  RETURNING * INTO action_row;
+
+  IF FOUND THEN
+    RETURN NEXT action_row;
+  END IF;
+END;
+$$;
+
+CREATE FUNCTION otlet.dry_run_action(action_id bigint) RETURNS SETOF otlet.actions
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  action_row otlet.actions%ROWTYPE;
+  validation_error text;
+BEGIN
+  SELECT *
+  INTO action_row
+  FROM otlet.actions
+  WHERE id = dry_run_action.action_id
+  FOR UPDATE;
+
+  IF NOT FOUND THEN
+    RETURN;
+  END IF;
+
+  validation_error := otlet.action_validation_error(action_row.payload);
+  IF action_row.status = 'rejected' THEN
+    validation_error := COALESCE(action_row.error, validation_error, 'rejected action cannot be dry-run');
+  END IF;
+
+  UPDATE otlet.actions
+  SET dry_run_status = CASE WHEN validation_error IS NULL THEN 'passed' ELSE 'failed' END,
+      error = COALESCE(validation_error, error)
+  WHERE id = action_row.id
+  RETURNING * INTO action_row;
+
+  RETURN NEXT action_row;
+END;
+$$;
+
+CREATE FUNCTION otlet.apply_action(action_id bigint) RETURNS SETOF otlet.actions
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  action_row otlet.actions%ROWTYPE;
+  validation_error text;
+  next_status text;
+  next_apply_status text;
+  next_error text;
+  next_applied_at timestamptz;
+BEGIN
+  SELECT *
+  INTO action_row
+  FROM otlet.actions
+  WHERE id = apply_action.action_id
+  FOR UPDATE;
+
+  IF NOT FOUND THEN
+    RETURN;
+  END IF;
+
+  validation_error := otlet.action_validation_error(action_row.payload);
+  next_status := action_row.status;
+  next_apply_status := action_row.apply_status;
+  next_error := action_row.error;
+  next_applied_at := action_row.applied_at;
+
+  IF validation_error IS NOT NULL THEN
+    next_apply_status := 'failed';
+    next_error := validation_error;
+  ELSIF action_row.status = 'rejected' THEN
+    next_apply_status := 'failed';
+    next_error := COALESCE(action_row.error, 'rejected action cannot be applied');
+  ELSIF action_row.approval_status = 'required' THEN
+    next_apply_status := 'failed';
+    next_error := 'action requires approval';
+  ELSIF action_row.action_type IN ('create_record', 'note') THEN
+    next_status := 'applied';
+    next_apply_status := 'applied';
+    next_applied_at := now();
+    next_error := NULL;
+  ELSE
+    next_apply_status := 'not_applicable';
+    next_error := 'action type has no apply path';
+  END IF;
+
+  UPDATE otlet.actions
+  SET status = next_status,
+      apply_status = next_apply_status,
+      applied_at = next_applied_at,
+      error = next_error
+  WHERE id = action_row.id
+  RETURNING * INTO action_row;
+
+  RETURN NEXT action_row;
 END;
 $$;
 

@@ -196,15 +196,48 @@ CREATE TABLE otlet.outputs (
 CREATE UNIQUE INDEX outputs_one_per_job_idx
 ON otlet.outputs (job_id);
 
+CREATE TABLE otlet.action_type_schemas (
+  action_type text PRIMARY KEY,
+  requires_approval boolean NOT NULL DEFAULT false,
+  creates_record boolean NOT NULL DEFAULT false,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+
+INSERT INTO otlet.action_type_schemas (
+  action_type,
+  requires_approval,
+  creates_record
+)
+VALUES
+  ('create_record', false, true),
+  ('merge_candidate', true, false),
+  ('new_entity', false, false),
+  ('review_flag', false, false),
+  ('note', false, true),
+  ('follow_up_job', false, false);
+
 CREATE TABLE otlet.actions (
   id bigserial PRIMARY KEY,
   job_id bigint NOT NULL REFERENCES otlet.jobs(id),
   output_id bigint REFERENCES otlet.outputs(id),
+  receipt_id bigint REFERENCES otlet.inference_receipts(id),
   action_type text NOT NULL,
-  payload jsonb NOT NULL,
+  payload jsonb NOT NULL CHECK (jsonb_typeof(payload) = 'object'),
   status text NOT NULL DEFAULT 'proposed',
+  approval_status text NOT NULL DEFAULT 'not_required',
+  dry_run_status text NOT NULL DEFAULT 'not_run',
+  apply_status text NOT NULL DEFAULT 'not_applicable',
+  source_table text,
+  subject_id text,
+  source_hash text,
   error text,
-  created_at timestamptz NOT NULL DEFAULT now()
+  created_at timestamptz NOT NULL DEFAULT now(),
+  approved_at timestamptz,
+  applied_at timestamptz,
+  CHECK (status IN ('proposed', 'complete', 'rejected', 'approved', 'applied')),
+  CHECK (approval_status IN ('not_required', 'required', 'approved', 'rejected')),
+  CHECK (dry_run_status IN ('not_run', 'passed', 'failed')),
+  CHECK (apply_status IN ('not_applicable', 'applied', 'failed'))
 );
 
 CREATE TABLE otlet.records (
