@@ -71,6 +71,15 @@ CREATE TABLE otlet.tasks (
   created_at timestamptz NOT NULL DEFAULT now()
 );
 
+CREATE TABLE otlet.model_selection_policies (
+  task_name text PRIMARY KEY REFERENCES otlet.tasks(name) ON DELETE CASCADE,
+  cheap_model_name text NOT NULL REFERENCES otlet.models(name),
+  strong_model_name text NOT NULL REFERENCES otlet.models(name),
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  CHECK (cheap_model_name <> strong_model_name)
+);
+
 CREATE TABLE otlet.runtime_slots (
   runtime_name text NOT NULL REFERENCES otlet.runtimes(name),
   model_name text NOT NULL REFERENCES otlet.models(name),
@@ -130,7 +139,11 @@ WHERE status IN ('queued', 'running', 'cancel_requested');
 
 CREATE TABLE otlet.inference_receipts (
   id bigserial PRIMARY KEY,
-  job_id bigint NOT NULL UNIQUE REFERENCES otlet.jobs(id),
+  job_id bigint NOT NULL REFERENCES otlet.jobs(id),
+  attempt_index int NOT NULL,
+  selection_role text NOT NULL DEFAULT 'direct',
+  selection_status text NOT NULL DEFAULT 'accepted',
+  selection_reason text,
   task_name text NOT NULL,
   subject_id text NOT NULL,
   model_name text NOT NULL,
@@ -143,6 +156,7 @@ CREATE TABLE otlet.inference_receipts (
   input_hash text,
   output_schema_hash text,
   raw_output_hash text,
+  raw_output text,
   prompt_tokens bigint,
   generated_tokens bigint,
   generate_ms bigint,
@@ -153,7 +167,11 @@ CREATE TABLE otlet.inference_receipts (
   started_at timestamptz NOT NULL,
   finished_at timestamptz NOT NULL DEFAULT now(),
   status text NOT NULL,
-  error text
+  error text,
+  UNIQUE (job_id, attempt_index),
+  CHECK (attempt_index > 0),
+  CHECK (selection_role IN ('direct', 'cheap', 'strong')),
+  CHECK (selection_status IN ('accepted', 'rejected', 'failed'))
 );
 
 CREATE TABLE otlet.worker_events (
@@ -169,10 +187,14 @@ CREATE TABLE otlet.worker_events (
 CREATE TABLE otlet.outputs (
   id bigserial PRIMARY KEY,
   job_id bigint NOT NULL REFERENCES otlet.jobs(id),
+  receipt_id bigint NOT NULL UNIQUE REFERENCES otlet.inference_receipts(id),
   output jsonb NOT NULL,
   raw_output text NOT NULL,
   created_at timestamptz NOT NULL DEFAULT now()
 );
+
+CREATE UNIQUE INDEX outputs_one_per_job_idx
+ON otlet.outputs (job_id);
 
 CREATE TABLE otlet.actions (
   id bigserial PRIMARY KEY,

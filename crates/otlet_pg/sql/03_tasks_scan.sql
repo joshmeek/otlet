@@ -21,6 +21,42 @@ AS $$
   RETURNING *;
 $$;
 
+CREATE FUNCTION otlet.set_model_selection_policy(
+  task_name text,
+  cheap_model_name text,
+  strong_model_name text
+) RETURNS otlet.model_selection_policies
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  saved otlet.model_selection_policies%ROWTYPE;
+BEGIN
+  UPDATE otlet.tasks t
+  SET model_name = set_model_selection_policy.cheap_model_name
+  WHERE t.name = set_model_selection_policy.task_name;
+
+  INSERT INTO otlet.model_selection_policies (
+    task_name,
+    cheap_model_name,
+    strong_model_name,
+    updated_at
+  )
+  VALUES (
+    set_model_selection_policy.task_name,
+    set_model_selection_policy.cheap_model_name,
+    set_model_selection_policy.strong_model_name,
+    now()
+  )
+  ON CONFLICT ON CONSTRAINT model_selection_policies_pkey DO UPDATE
+    SET cheap_model_name = EXCLUDED.cheap_model_name,
+        strong_model_name = EXCLUDED.strong_model_name,
+        updated_at = now()
+  RETURNING * INTO saved;
+
+  RETURN saved;
+END;
+$$;
+
 CREATE FUNCTION otlet.available_model_queue_slots(model_name text)
 RETURNS integer
 LANGUAGE sql

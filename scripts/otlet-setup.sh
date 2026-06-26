@@ -8,8 +8,10 @@ port="${OTLET_PG_PORT:-55432}"
 password="${POSTGRES_PASSWORD:-postgres}"
 pgrx_features="${OTLET_PGRX_FEATURES:-pg18}"
 model_dir="${OTLET_MODEL_DIR:-/var/lib/postgresql/otlet-models}"
-model_file="${OTLET_MODEL_FILE:-Qwen3-0.6B-Q8_0.gguf}"
-model_url="${OTLET_MODEL_URL:-https://huggingface.co/Qwen/Qwen3-0.6B-GGUF/resolve/main/Qwen3-0.6B-Q8_0.gguf}"
+cheap_model_file="${OTLET_CHEAP_MODEL_FILE:-Qwen3-0.6B-Q8_0.gguf}"
+cheap_model_url="${OTLET_CHEAP_MODEL_URL:-https://huggingface.co/Qwen/Qwen3-0.6B-GGUF/resolve/main/Qwen3-0.6B-Q8_0.gguf}"
+strong_model_file="${OTLET_STRONG_MODEL_FILE:-Qwen3-1.7B-Q8_0.gguf}"
+strong_model_url="${OTLET_STRONG_MODEL_URL:-https://huggingface.co/Qwen/Qwen3-1.7B-GGUF/resolve/main/Qwen3-1.7B-Q8_0.gguf}"
 
 log() {
   printf '[%s] %s\n' "$(date '+%H:%M:%S')" "$*"
@@ -54,11 +56,14 @@ psql_exec() {
 }
 
 ensure_qwen_model() {
+  local repo_cache="$1"
+  local model_file="$2"
+  local model_url="$3"
   local cached
 
   cached="$(
     docker exec "$container" sh -lc \
-      "find /var/lib/postgresql/.cache/huggingface/hub/models--Qwen--Qwen3-0.6B-GGUF/snapshots '$model_dir' -name '$model_file' -print -quit 2>/dev/null"
+      "find /var/lib/postgresql/.cache/huggingface/hub/$repo_cache/snapshots '$model_dir' -name '$model_file' -print -quit 2>/dev/null"
   )"
   if [ -n "$cached" ]; then
     printf '%s\n' "$cached"
@@ -128,9 +133,11 @@ docker restart "$container" >/dev/null
 wait_ready
 wait_worker
 
-model_artifact="$(ensure_qwen_model)"
+cheap_model_artifact="$(ensure_qwen_model "models--Qwen--Qwen3-0.6B-GGUF" "$cheap_model_file" "$cheap_model_url")"
+strong_model_artifact="$(ensure_qwen_model "models--Qwen--Qwen3-1.7B-GGUF" "$strong_model_file" "$strong_model_url")"
 worker_count="$(docker exec "$container" psql -U postgres -d postgres -qAt -c "select count(*) from pg_stat_activity where backend_type = 'otlet worker';")"
 
 printf 'postgres_url=postgres://postgres:%s@127.0.0.1:%s/postgres\n' "$password" "$port"
 printf 'worker_count=%s\n' "$worker_count"
-printf 'model_artifact=%s\n' "$model_artifact"
+printf 'cheap_model_artifact=%s\n' "$cheap_model_artifact"
+printf 'strong_model_artifact=%s\n' "$strong_model_artifact"

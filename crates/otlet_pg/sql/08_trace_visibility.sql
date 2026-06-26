@@ -22,24 +22,24 @@ WITH per_receipt AS (
     COALESCE((
       SELECT count(*)
       FROM otlet.inference_receipt_token_trace t
-      WHERE t.job_id = s.job_id
+      WHERE t.receipt_id = s.receipt_id
     ), 0)::bigint AS token_steps,
     COALESCE((
       SELECT count(*)
       FROM otlet.inference_receipt_token_trace t
-      WHERE t.job_id = s.job_id
+      WHERE t.receipt_id = s.receipt_id
         AND t.chosen_logprob IS NOT NULL
         AND t.chosen_probability IS NOT NULL
     ), 0)::bigint AS token_logprob_steps,
     COALESCE((
       SELECT count(*)
       FROM otlet.inference_receipt_token_alternative_trace a
-      WHERE a.job_id = s.job_id
+      WHERE a.receipt_id = s.receipt_id
     ), 0)::bigint AS top_k_alternatives,
     COALESCE((
       SELECT count(*)
       FROM otlet.inference_receipt_token_alternative_trace a
-      WHERE a.job_id = s.job_id
+      WHERE a.receipt_id = s.receipt_id
         AND a.logprob IS NOT NULL
         AND a.probability IS NOT NULL
     ), 0)::bigint AS top_k_logprob_alternatives,

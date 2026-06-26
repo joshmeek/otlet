@@ -54,6 +54,7 @@ pub(crate) struct ModelError {
     pub(crate) raw_output_hash: Option<String>,
     pub(crate) schema_validation_status: Option<String>,
     pub(crate) trace_summary: Option<Value>,
+    pub(crate) metrics: Option<ModelMetrics>,
 }
 
 impl ModelError {
@@ -67,6 +68,7 @@ impl ModelError {
             raw_output_hash: None,
             schema_validation_status: None,
             trace_summary: None,
+            metrics: None,
         }
     }
 
@@ -101,7 +103,13 @@ impl ModelError {
             raw_output_hash: Some(raw_output_hash),
             schema_validation_status: Some("failed".to_owned()),
             trace_summary: Some(trace_summary),
+            metrics: None,
         }
+    }
+
+    fn with_metrics(mut self, metrics: ModelMetrics) -> Self {
+        self.metrics = Some(metrics);
+        self
     }
 }
 
@@ -232,23 +240,51 @@ pub(crate) fn run_job(job: &Job) -> Result<ModelRun, ModelError> {
     let raw_output_hash = hash_text(&raw_output);
     let trace_summary = generation_trace_summary(&context, &metrics, &raw_output_hash);
 
-    let (json, raw_json) = parse_model_json(raw_output.as_str()).map_err(|err| {
-        ModelError::with_context(err, raw_output.clone(), &context, trace_summary.clone())
-    })?;
-    let output = json.get("output").cloned().ok_or_else(|| {
-        ModelError::with_context(
-            "model JSON missing output".to_owned(),
+    let (json, raw_json) = match parse_model_json(raw_output.as_str()) {
+        Ok(parsed) => parsed,
+        Err(err) => {
+            return Err(ModelError::with_context(
+                err,
+                raw_output.clone(),
+                &context,
+                trace_summary.clone(),
+            )
+            .with_metrics(metrics));
+        }
+    };
+    let output = match json.get("output").cloned() {
+        Some(output) => output,
+        None => {
+            return Err(ModelError::with_context(
+                "model JSON missing output".to_owned(),
+                raw_output.clone(),
+                &context,
+                trace_summary.clone(),
+            )
+            .with_metrics(metrics));
+        }
+    };
+    let actions = match model_actions(&json) {
+        Ok(actions) => actions,
+        Err(err) => {
+            return Err(ModelError::with_context(
+                err,
+                raw_output.clone(),
+                &context,
+                trace_summary.clone(),
+            )
+            .with_metrics(metrics));
+        }
+    };
+    if let Err(err) = validate_output(&job.output_schema, &output) {
+        return Err(ModelError::with_context(
+            err,
             raw_output.clone(),
             &context,
             trace_summary.clone(),
         )
-    })?;
-    let actions = model_actions(&json).map_err(|err| {
-        ModelError::with_context(err, raw_output.clone(), &context, trace_summary.clone())
-    })?;
-    validate_output(&job.output_schema, &output).map_err(|err| {
-        ModelError::with_context(err, raw_output.clone(), &context, trace_summary.clone())
-    })?;
+        .with_metrics(metrics));
+    }
 
     if cache_enabled && !metrics.inference_cache_hit {
         let stats = inference_cache_put(

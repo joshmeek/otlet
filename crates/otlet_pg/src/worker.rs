@@ -1,5 +1,7 @@
-use crate::job::{Job, claim_jobs, insert_infer_now_job};
-use crate::model::run_job;
+use crate::job::{
+    Job, ModelSelectionPolicy, claim_jobs, insert_infer_now_job, model_selection_policy,
+};
+use crate::model::{ModelError, ModelMetrics, ModelRun, run_job};
 use pgrx::JsonB;
 use pgrx::bgworkers::{BackgroundWorker, SignalWakeFlags};
 use std::time::Duration;
@@ -170,121 +172,311 @@ fn process_job(job: Job) -> bool {
         pgrx::warning!("otlet worker start event failed: {err}");
     }
 
-    match run_job(&job) {
-        Ok(run) => {
-            let metrics = run.metrics;
-            let result: pgrx::spi::Result<bool> = BackgroundWorker::transaction(|| {
-                pgrx::Spi::connect_mut(|client| {
-                    let args = [
-                        job.id.into(),
-                        JsonB(run.output).into(),
-                        run.raw_output.as_str().into(),
-                        JsonB(run.actions).into(),
-                        run.prompt_hash.as_str().into(),
-                        run.input_hash.as_str().into(),
-                        run.output_schema_hash.as_str().into(),
-                        run.raw_output_hash.as_str().into(),
-                        JsonB(run.trace_summary).into(),
-                    ];
-                    let rows = client.select(
-                        "SELECT EXISTS(SELECT 1 FROM otlet.complete_job($1, $2, $3, $4, $5, $6, $7, $8, trace_summary => $9)) AS completed",
-                        Some(1),
-                        &args,
-                    )?;
-                    Ok(rows.first().get::<bool>(1)?.unwrap_or(false))
-                })
-            });
-
-            match result {
-                Ok(true) => {
-                    if let Some(metrics) = metrics {
-                        let metric_result: pgrx::spi::Result<()> = BackgroundWorker::transaction(
-                            || {
-                                pgrx::Spi::connect_mut(|client| {
-                                    let args = [
-                                        job.runtime_name.as_str().into(),
-                                        job.model_name.as_str().into(),
-                                        metrics.artifact_path.as_str().into(),
-                                        metrics.load_ms.into(),
-                                        metrics.ctx_ms.into(),
-                                        metrics.prompt_tokens.into(),
-                                        metrics.generated_tokens.into(),
-                                        metrics.generate_ms.into(),
-                                        metrics.cache_hit.into(),
-                                        metrics.inference_cache_hit.into(),
-                                        metrics.inference_cache_entries.into(),
-                                        metrics.inference_cache_bytes.into(),
-                                        metrics.inference_cache_evictions.into(),
-                                        metrics.inference_cache_invalidation_reason.as_str().into(),
-                                        metrics.model_memory_bytes.into(),
-                                        metrics.model_parameters.into(),
-                                        metrics.context_window_tokens.into(),
-                                        metrics.model_device_policy.as_str().into(),
-                                        metrics.memory_accounting_policy.as_str().into(),
-                                        metrics.worker_process_rss_bytes.into(),
-                                        metrics.worker_process_virtual_bytes.into(),
-                                        metrics.worker_memory_sample_policy.as_str().into(),
-                                    ];
-                                    client.update(
-                                        "SELECT otlet.record_runtime_slot_metrics($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22)",
-                                        Some(1),
-                                        &args,
-                                    )?;
-                                    Ok(())
-                                })
-                            },
-                        );
-                        if let Err(err) = metric_result {
-                            pgrx::warning!("otlet worker metric update failed: {err}");
-                        }
-                    }
-                    materialize_completed_semantic_job(&job);
-                    pgrx::log!("otlet worker completed job {}", job.id);
-                    true
-                }
-                Ok(false) => {
-                    pgrx::warning!(
-                        "otlet worker complete produced no output row for job {}",
-                        job.id
-                    );
-                    false
-                }
-                Err(err) => {
-                    pgrx::warning!("otlet worker complete failed: {err}");
-                    false
-                }
-            }
-        }
+    match BackgroundWorker::transaction(|| model_selection_policy(&job.task_name)) {
+        Ok(Some(policy)) => process_selected_job(job, policy),
+        Ok(None) => process_direct_job(job),
         Err(err) => {
-            let canceled = err.message == "canceled";
-            let _: pgrx::spi::Result<()> = BackgroundWorker::transaction(|| {
-                pgrx::Spi::connect_mut(|client| {
-                    let args = [
-                        job.id.into(),
-                        err.message.as_str().into(),
-                        err.raw_output.as_deref().into(),
-                        err.prompt_hash.as_deref().into(),
-                        err.input_hash.as_deref().into(),
-                        err.output_schema_hash.as_deref().into(),
-                        err.raw_output_hash.as_deref().into(),
-                        err.schema_validation_status.as_deref().into(),
-                        JsonB(err.trace_summary.unwrap_or_else(|| serde_json::json!({}))).into(),
-                    ];
-                    client.update(
-                        "SELECT otlet.fail_job($1, $2, $3, $4, $5, $6, $7, schema_validation_status => $8, trace_summary => $9)",
-                        Some(1),
-                        &args,
-                    )?;
-                    Ok(())
-                })
-            });
-            if canceled {
-                pgrx::log!("otlet worker canceled job {}", job.id);
-            } else {
-                pgrx::warning!("otlet worker failed job {}: {}", job.id, err.message);
+            pgrx::warning!("otlet model selection policy lookup failed: {err}");
+            fail_attempt(
+                &job,
+                ModelError {
+                    message: format!("model selection policy lookup failed: {err}"),
+                    raw_output: None,
+                    prompt_hash: None,
+                    input_hash: None,
+                    output_schema_hash: None,
+                    raw_output_hash: None,
+                    schema_validation_status: None,
+                    trace_summary: None,
+                    metrics: None,
+                },
+                "direct",
+                "policy_lookup_failed",
+            )
+        }
+    }
+}
+
+fn process_direct_job(job: Job) -> bool {
+    match run_job(&job) {
+        Ok(run) => accept_attempt(&job, run, "direct", "accepted_by_direct_task"),
+        Err(err) => fail_attempt(&job, err, "direct", "direct_attempt_failed"),
+    }
+}
+
+fn process_selected_job(job: Job, policy: ModelSelectionPolicy) -> bool {
+    let cheap_job = job.with_model(&policy.cheap);
+    match run_job(&cheap_job) {
+        Ok(run) => {
+            let (accepted, reason) = accepted_by_policy(&run.output);
+            if accepted {
+                return accept_attempt(&cheap_job, run, "cheap", &reason);
             }
+            record_metrics_from_run(&cheap_job, &run);
+            if !record_rejected_attempt(&cheap_job, run, "cheap", &reason) {
+                return false;
+            }
+            run_strong_attempt(
+                job.with_model(&policy.strong),
+                "escalated_after_cheap_rejection",
+            )
+        }
+        Err(err) if err.message == "canceled" => fail_attempt(&cheap_job, err, "cheap", "canceled"),
+        Err(err) if err.raw_output.is_some() => {
+            record_metrics_from_error(&cheap_job, &err);
+            if !record_failed_model_attempt(&cheap_job, &err, "cheap", "schema_validation_failed") {
+                return false;
+            }
+            run_strong_attempt(
+                job.with_model(&policy.strong),
+                "escalated_after_cheap_schema_failure",
+            )
+        }
+        Err(err) => fail_attempt(&cheap_job, err, "cheap", "cheap_runtime_failed"),
+    }
+}
+
+fn run_strong_attempt(job: Job, reason: &str) -> bool {
+    match run_job(&job) {
+        Ok(run) => accept_attempt(&job, run, "strong", reason),
+        Err(err) => fail_attempt(&job, err, "strong", "strong_attempt_failed"),
+    }
+}
+
+fn accepted_by_policy(output: &serde_json::Value) -> (bool, String) {
+    let confidence = output.get("confidence").and_then(serde_json::Value::as_str);
+    let Some(confidence) = confidence else {
+        return (false, "missing_confidence_field".to_owned());
+    };
+    if confidence != "high" {
+        return (false, "confidence_below_policy".to_owned());
+    }
+
+    let uncertainty = output.get("match").and_then(serde_json::Value::as_str);
+    let Some(uncertainty) = uncertainty else {
+        return (false, "missing_uncertainty_field".to_owned());
+    };
+    if uncertainty == "unclear" {
+        return (false, "uncertain_output".to_owned());
+    }
+
+    (true, "accepted_by_policy".to_owned())
+}
+
+fn accept_attempt(job: &Job, run: ModelRun, selection_role: &str, selection_reason: &str) -> bool {
+    record_metrics_from_run(job, &run);
+    let result: pgrx::spi::Result<bool> = BackgroundWorker::transaction(|| {
+        pgrx::Spi::connect_mut(|client| {
+            let args = [
+                job.id.into(),
+                JsonB(run.output).into(),
+                run.raw_output.as_str().into(),
+                JsonB(run.actions).into(),
+                run.prompt_hash.as_str().into(),
+                run.input_hash.as_str().into(),
+                run.output_schema_hash.as_str().into(),
+                run.raw_output_hash.as_str().into(),
+                JsonB(run.trace_summary).into(),
+                job.model_name.as_str().into(),
+                selection_role.into(),
+                selection_reason.into(),
+            ];
+            let rows = client.select(
+                "SELECT EXISTS(SELECT 1 FROM otlet.complete_job($1, $2, $3, $4, $5, $6, $7, $8, trace_summary => $9, model_name => $10, selection_role => $11, selection_reason => $12)) AS completed",
+                Some(1),
+                &args,
+            )?;
+            Ok(rows.first().get::<bool>(1)?.unwrap_or(false))
+        })
+    });
+
+    match result {
+        Ok(true) => {
+            materialize_completed_semantic_job(job);
+            pgrx::log!("otlet worker completed job {}", job.id);
+            true
+        }
+        Ok(false) => {
+            pgrx::warning!(
+                "otlet worker complete produced no output row for job {}",
+                job.id
+            );
             false
         }
+        Err(err) => {
+            pgrx::warning!("otlet worker complete failed: {err}");
+            false
+        }
+    }
+}
+
+fn record_rejected_attempt(
+    job: &Job,
+    run: ModelRun,
+    selection_role: &str,
+    selection_reason: &str,
+) -> bool {
+    let result: pgrx::spi::Result<()> = BackgroundWorker::transaction(|| {
+        pgrx::Spi::connect_mut(|client| {
+            let args = [
+                job.id.into(),
+                job.model_name.as_str().into(),
+                run.raw_output.as_str().into(),
+                run.prompt_hash.as_str().into(),
+                run.input_hash.as_str().into(),
+                run.output_schema_hash.as_str().into(),
+                run.raw_output_hash.as_str().into(),
+                JsonB(run.trace_summary).into(),
+                selection_role.into(),
+                selection_reason.into(),
+            ];
+            client.update(
+                "SELECT otlet.record_model_attempt($1, $2, raw_output => $3, prompt_hash => $4, input_hash => $5, output_schema_hash => $6, raw_output_hash => $7, trace_summary => $8, selection_role => $9, selection_status => 'rejected', selection_reason => $10)",
+                Some(1),
+                &args,
+            )?;
+            Ok(())
+        })
+    });
+    if let Err(err) = result {
+        pgrx::warning!("otlet worker rejected-attempt receipt failed: {err}");
+        return false;
+    }
+    true
+}
+
+fn record_failed_model_attempt(
+    job: &Job,
+    err: &ModelError,
+    selection_role: &str,
+    selection_reason: &str,
+) -> bool {
+    let result: pgrx::spi::Result<()> = BackgroundWorker::transaction(|| {
+        pgrx::Spi::connect_mut(|client| {
+            let trace_summary = err
+                .trace_summary
+                .clone()
+                .unwrap_or_else(|| serde_json::json!({}));
+            let args = [
+                job.id.into(),
+                job.model_name.as_str().into(),
+                err.raw_output.as_deref().into(),
+                err.prompt_hash.as_deref().into(),
+                err.input_hash.as_deref().into(),
+                err.output_schema_hash.as_deref().into(),
+                err.raw_output_hash.as_deref().into(),
+                JsonB(trace_summary).into(),
+                err.schema_validation_status.as_deref().into(),
+                selection_role.into(),
+                selection_reason.into(),
+                err.message.as_str().into(),
+            ];
+            client.update(
+                "SELECT otlet.record_model_attempt($1, $2, raw_output => $3, prompt_hash => $4, input_hash => $5, output_schema_hash => $6, raw_output_hash => $7, trace_summary => $8, schema_validation_status => $9, selection_role => $10, selection_status => 'failed', selection_reason => $11, error => $12)",
+                Some(1),
+                &args,
+            )?;
+            Ok(())
+        })
+    });
+    if let Err(receipt_err) = result {
+        pgrx::warning!("otlet worker failed-attempt receipt failed: {receipt_err}");
+        return false;
+    }
+    true
+}
+
+fn fail_attempt(job: &Job, err: ModelError, selection_role: &str, selection_reason: &str) -> bool {
+    record_metrics_from_error(job, &err);
+    let canceled = err.message == "canceled";
+    let result: pgrx::spi::Result<()> = BackgroundWorker::transaction(|| {
+        pgrx::Spi::connect_mut(|client| {
+            let trace_summary = err
+                .trace_summary
+                .clone()
+                .unwrap_or_else(|| serde_json::json!({}));
+            let args = [
+                job.id.into(),
+                err.message.as_str().into(),
+                err.raw_output.as_deref().into(),
+                err.prompt_hash.as_deref().into(),
+                err.input_hash.as_deref().into(),
+                err.output_schema_hash.as_deref().into(),
+                err.raw_output_hash.as_deref().into(),
+                err.schema_validation_status.as_deref().into(),
+                JsonB(trace_summary).into(),
+                job.model_name.as_str().into(),
+                selection_role.into(),
+                selection_reason.into(),
+            ];
+            client.update(
+                "SELECT otlet.fail_job($1, $2, $3, $4, $5, $6, $7, schema_validation_status => $8, trace_summary => $9, model_name => $10, selection_role => $11, selection_reason => $12)",
+                Some(1),
+                &args,
+            )?;
+            Ok(())
+        })
+    });
+    if let Err(fail_err) = result {
+        pgrx::warning!("otlet worker fail_job call failed: {fail_err}");
+    }
+    if canceled {
+        pgrx::log!("otlet worker canceled job {}", job.id);
+    } else {
+        pgrx::warning!("otlet worker failed job {}: {}", job.id, err.message);
+    }
+    false
+}
+
+fn record_metrics_from_run(job: &Job, run: &ModelRun) {
+    if let Some(metrics) = run.metrics.as_ref() {
+        record_metrics(job, metrics);
+    }
+}
+
+fn record_metrics_from_error(job: &Job, err: &ModelError) {
+    if let Some(metrics) = err.metrics.as_ref() {
+        record_metrics(job, metrics);
+    }
+}
+
+fn record_metrics(job: &Job, metrics: &ModelMetrics) {
+    let metric_result: pgrx::spi::Result<()> = BackgroundWorker::transaction(|| {
+        pgrx::Spi::connect_mut(|client| {
+            let args = [
+                job.runtime_name.as_str().into(),
+                job.model_name.as_str().into(),
+                metrics.artifact_path.as_str().into(),
+                metrics.load_ms.into(),
+                metrics.ctx_ms.into(),
+                metrics.prompt_tokens.into(),
+                metrics.generated_tokens.into(),
+                metrics.generate_ms.into(),
+                metrics.cache_hit.into(),
+                metrics.inference_cache_hit.into(),
+                metrics.inference_cache_entries.into(),
+                metrics.inference_cache_bytes.into(),
+                metrics.inference_cache_evictions.into(),
+                metrics.inference_cache_invalidation_reason.as_str().into(),
+                metrics.model_memory_bytes.into(),
+                metrics.model_parameters.into(),
+                metrics.context_window_tokens.into(),
+                metrics.model_device_policy.as_str().into(),
+                metrics.memory_accounting_policy.as_str().into(),
+                metrics.worker_process_rss_bytes.into(),
+                metrics.worker_process_virtual_bytes.into(),
+                metrics.worker_memory_sample_policy.as_str().into(),
+            ];
+            client.update(
+                "SELECT otlet.record_runtime_slot_metrics($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22)",
+                Some(1),
+                &args,
+            )?;
+            Ok(())
+        })
+    });
+    if let Err(err) = metric_result {
+        pgrx::warning!("otlet worker metric update failed: {err}");
     }
 }
 

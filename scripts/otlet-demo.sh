@@ -4,8 +4,10 @@ set -euo pipefail
 container="${OTLET_PG_CONTAINER:-otlet-postgres}"
 runtime_name="${OTLET_RUNTIME_NAME:-linked_inproc}"
 runtime_endpoint="${OTLET_RUNTIME_ENDPOINT:-linked}"
-model_name="${OTLET_MODEL_NAME:-linked_qwen_0_6b}"
-model_artifact="${OTLET_MODEL_ARTIFACT:-}"
+cheap_model_name="${OTLET_CHEAP_MODEL_NAME:-linked_qwen_0_6b}"
+strong_model_name="${OTLET_STRONG_MODEL_NAME:-linked_qwen_1_7b}"
+cheap_model_artifact="${OTLET_CHEAP_MODEL_ARTIFACT:-}"
+strong_model_artifact="${OTLET_STRONG_MODEL_ARTIFACT:-}"
 entity_task="${OTLET_ENTITY_TASK_NAME:-entity_resolution_demo}"
 join_index_name="${OTLET_ENTITY_JOIN_INDEX_NAME:-demo_entity_resolution_idx}"
 join_task="${join_index_name}_task"
@@ -54,40 +56,55 @@ require_regex() {
   fi
 }
 
-ensure_model_artifact() {
+ensure_model_artifacts() {
   local cached
   local model_dir="${OTLET_MODEL_DIR:-/var/lib/postgresql/otlet-models}"
-  local model_file="${OTLET_MODEL_FILE:-Qwen3-0.6B-Q8_0.gguf}"
-  local model_url="${OTLET_MODEL_URL:-https://huggingface.co/Qwen/Qwen3-0.6B-GGUF/resolve/main/Qwen3-0.6B-Q8_0.gguf}"
+  local cheap_model_file="${OTLET_CHEAP_MODEL_FILE:-Qwen3-0.6B-Q8_0.gguf}"
+  local cheap_model_url="${OTLET_CHEAP_MODEL_URL:-https://huggingface.co/Qwen/Qwen3-0.6B-GGUF/resolve/main/Qwen3-0.6B-Q8_0.gguf}"
+  local strong_model_file="${OTLET_STRONG_MODEL_FILE:-Qwen3-1.7B-Q8_0.gguf}"
+  local strong_model_url="${OTLET_STRONG_MODEL_URL:-https://huggingface.co/Qwen/Qwen3-1.7B-GGUF/resolve/main/Qwen3-1.7B-Q8_0.gguf}"
 
-  if [ -n "$model_artifact" ]; then
-    return
+  if [ -z "$cheap_model_artifact" ]; then
+    cached="$(
+      docker exec "$container" sh -lc \
+        "find /var/lib/postgresql/.cache/huggingface/hub/models--Qwen--Qwen3-0.6B-GGUF/snapshots '$model_dir' -name '$cheap_model_file' -print -quit 2>/dev/null"
+    )"
+    if [ -n "$cached" ]; then
+      cheap_model_artifact="$cached"
+    else
+      docker exec "$container" sh -lc "mkdir -p '$model_dir' && curl -fL --retry 3 '$cheap_model_url' -o '$model_dir/$cheap_model_file'"
+      cheap_model_artifact="$model_dir/$cheap_model_file"
+    fi
   fi
 
-  cached="$(
-    docker exec "$container" sh -lc \
-      "find /var/lib/postgresql/.cache/huggingface/hub/models--Qwen--Qwen3-0.6B-GGUF/snapshots '$model_dir' -name '$model_file' -print -quit 2>/dev/null"
-  )"
-  if [ -n "$cached" ]; then
-    model_artifact="$cached"
-    return
+  if [ -z "$strong_model_artifact" ]; then
+    cached="$(
+      docker exec "$container" sh -lc \
+        "find /var/lib/postgresql/.cache/huggingface/hub/models--Qwen--Qwen3-1.7B-GGUF/snapshots '$model_dir' -name '$strong_model_file' -print -quit 2>/dev/null"
+    )"
+    if [ -n "$cached" ]; then
+      strong_model_artifact="$cached"
+    else
+      docker exec "$container" sh -lc "mkdir -p '$model_dir' && curl -fL --retry 3 '$strong_model_url' -o '$model_dir/$strong_model_file'"
+      strong_model_artifact="$model_dir/$strong_model_file"
+    fi
   fi
-
-  docker exec "$container" sh -lc "mkdir -p '$model_dir' && curl -fL --retry 3 '$model_url' -o '$model_dir/$model_file'"
-  model_artifact="$model_dir/$model_file"
 }
 
-register_runtime_model() {
-  ensure_model_artifact
+register_runtime_models() {
+  ensure_model_artifacts
   psql_exec \
     -v runtime_name="$runtime_name" \
     -v runtime_endpoint="$runtime_endpoint" \
-    -v model_name="$model_name" \
-    -v model_artifact="$model_artifact" >/dev/null <<'SQL'
+    -v cheap_model_name="$cheap_model_name" \
+    -v cheap_model_artifact="$cheap_model_artifact" \
+    -v strong_model_name="$strong_model_name" \
+    -v strong_model_artifact="$strong_model_artifact" >/dev/null <<'SQL'
 SET client_min_messages TO warning;
 CREATE EXTENSION IF NOT EXISTS otlet;
 SELECT otlet.register_runtime(:'runtime_name', :'runtime_endpoint');
-SELECT otlet.register_model(:'model_name', :'model_artifact', :'runtime_name');
+SELECT otlet.register_model(:'cheap_model_name', :'cheap_model_artifact', :'runtime_name');
+SELECT otlet.register_model(:'strong_model_name', :'strong_model_artifact', :'runtime_name');
 SQL
 }
 
@@ -98,10 +115,6 @@ cleanup_task() {
 DELETE FROM otlet.worker_events e
 USING otlet.jobs j
 WHERE e.job_id = j.id
-  AND j.task_name = :'task_name';
-DELETE FROM otlet.inference_receipts r
-USING otlet.jobs j
-WHERE r.job_id = j.id
   AND j.task_name = :'task_name';
 DELETE FROM otlet.semantic_materializations sm
 USING otlet.records r, otlet.actions a, otlet.jobs j
@@ -121,6 +134,10 @@ WHERE a.job_id = j.id
 DELETE FROM otlet.outputs o
 USING otlet.jobs j
 WHERE o.job_id = j.id
+  AND j.task_name = :'task_name';
+DELETE FROM otlet.inference_receipts r
+USING otlet.jobs j
+WHERE r.job_id = j.id
   AND j.task_name = :'task_name';
 DELETE FROM otlet.jobs WHERE task_name = :'task_name';
 DELETE FROM otlet.tasks WHERE name = :'task_name';
@@ -166,7 +183,7 @@ crash_scan() {
 }
 
 require_container
-register_runtime_model
+register_runtime_models
 
 production_policy_contract="$(psql_value "
 SELECT name || '|' || stale_policy || '|' || max_attempts::text || '|' || worker_claim_batch_size::text
@@ -207,7 +224,7 @@ cleanup_task "$join_task"
 model_queue_status_contract="$(psql_value "
 SELECT queue_state || '|' || queued_jobs::text || '|' || running_jobs::text
 FROM otlet.model_queue_status
-WHERE model_name = '$model_name';
+WHERE model_name = '$cheap_model_name';
 ")"
 echo "model_queue_status_contract=$model_queue_status_contract"
 [ "$model_queue_status_contract" = "queue_accepting|0|0" ] || {
@@ -235,13 +252,17 @@ CREATE TABLE public.otlet_demo_vendor_pair (
 );
 INSERT INTO public.otlet_demo_vendor_entity (id, legal_name, website, address, notes)
 VALUES
-  ('vendor-1001', 'Northstar Logistics LLC', 'northstar-logistics.example', '41 W Lake St, Chicago, IL', 'legacy freight vendor from the 2021 import; AP contact ops@northstar-logistics.example; old remittance account ending 8821'),
+  ('vendor-1001', 'Northstar Logistics LLC', 'northstar-logistics.example', '41 W Lake St, Chicago, IL', 'legacy freight vendor from the 2021 import; AP contact ops@northstar-logistics.example'),
   ('vendor-42', 'N-Star Freight Services', 'nstar-freight.example', '41 West Lake Street, Suite 900, Chicago', 'same remittance account ending 8821; internal note says Northstar rebranded after acquisition'),
-  ('vendor-77', 'Clearwater Medical Supplies', 'clearwatermed.example', '500 Hospital Way, Phoenix, AZ', 'hospital supply distributor; no shared tax id, domain, payment account, AP contact, remittance account, city, or industry with the freight vendor');
+  ('vendor-77', 'Clearwater Medical Supplies', 'clearwatermed.example', '500 Hospital Way, Phoenix, AZ', 'hospital supply distributor; no shared tax id, domain, payment account, AP contact, remittance account, city, or industry with the freight vendor'),
+  ('vendor-313', 'North Star Medical Logistics', 'northstarmedlog.example', '41 West Lake Street, Chicago, IL', 'medical logistics broker; same building and similar name, but different domain, payment account, AP contact, and no acquisition note'),
+  ('vendor-314', 'Northstar Freight Canada Inc.', 'northstar-canada.example', '88 King St W, Toronto, ON', 'freight carrier with similar brand; different country, bank account, AP contact, and no shared remittance account in the ledger');
 INSERT INTO public.otlet_demo_vendor_pair (pair_id, left_id, right_id)
 VALUES
   ('vendor-1001:vendor-42', 'vendor-1001', 'vendor-42'),
-  ('vendor-1001:vendor-77', 'vendor-1001', 'vendor-77');
+  ('vendor-1001:vendor-77', 'vendor-1001', 'vendor-77'),
+  ('vendor-1001:vendor-313', 'vendor-1001', 'vendor-313'),
+  ('vendor-1001:vendor-314', 'vendor-1001', 'vendor-314');
 CREATE VIEW public.otlet_demo_vendor_pair_input AS
 SELECT
   p.pair_id AS subject_id,
@@ -270,6 +291,18 @@ SELECT
         'different industry and city',
         'no shared tax id, domain, payment account, AP contact, or remittance account'
       )
+      WHEN 'vendor-1001:vendor-313' THEN jsonb_build_array(
+        'same office building and similar North Star name',
+        'medical logistics versus freight vendor',
+        'different domain, payment account, AP contact, and no acquisition note',
+        'weak signals conflict with important identifiers'
+      )
+      WHEN 'vendor-1001:vendor-314' THEN jsonb_build_array(
+        'similar Northstar freight brand',
+        'different country, bank account, AP contact, and no shared remittance account',
+        'no acquisition or rebrand note connecting the records',
+        'name similarity alone is not enough'
+      )
       ELSE '[]'::jsonb
     END,
     'left_record', jsonb_build_object(
@@ -293,7 +326,8 @@ JOIN public.otlet_demo_vendor_entity r ON r.id = p.right_id;
 SQL
 
 psql_exec \
-  -v model_name="$model_name" \
+  -v cheap_model_name="$cheap_model_name" \
+  -v strong_model_name="$strong_model_name" \
   -v task_name="$entity_task" \
   -v record_type="$record_type" >/dev/null <<'SQL'
 SELECT otlet.create_task(
@@ -303,7 +337,7 @@ SELECT otlet.create_task(
     FROM public.otlet_demo_vendor_pair_input
     ORDER BY subject_id
   $$,
-  'Use input.candidate_evidence before names. If evidence contains same remittance account or rebrand/acquisition, return exactly {"output":{"match":"same_entity","confidence":"high","reason":"shared remittance account and acquisition note"},"actions":[]}. If evidence contains no shared identifiers or different industry/city, return exactly {"output":{"match":"different_entity","confidence":"high","reason":"medical supplier has no shared identifiers"},"actions":[]}. Otherwise compare operational identifiers and use match same_entity, different_entity, or unclear. Do not add prose, markdown, labels, nested output, or action strings.',
+  'Use input.candidate_evidence as authority before names or notes. Shared means candidate_evidence says the identifier is shared by both records. Return only {"output":{"match":"same_entity|different_entity|unclear","confidence":"low|medium|high","reason":"short reason"},"actions":[]}. Return same_entity with high confidence when evidence contains shared remittance, rebrand, or acquisition. Return different_entity with high confidence when evidence says no shared identifiers or different industry and city. The word no means absence; a reason saying no shared identifiers must use match different_entity, not same_entity. Return unclear with medium confidence when evidence says weak signals conflict or name similarity alone is not enough. A same_entity reason must name the shared identifier that candidate_evidence says both records share. Do not add prose, markdown, labels, nested output, or action strings.',
   '{
     "type": "object",
     "required": ["match", "confidence", "reason"],
@@ -312,15 +346,26 @@ SELECT otlet.create_task(
       "match": {"enum": ["same_entity", "different_entity", "unclear"]},
       "confidence": {"enum": ["low", "medium", "high"]},
       "reason": {"type": "string"}
-    }
+    },
+    "allOf": [
+      {
+        "if": {"properties": {"match": {"const": "same_entity"}}, "required": ["match"]},
+        "then": {"properties": {"reason": {"pattern": "remittance|rebrand|acquisition"}}}
+      },
+      {
+        "if": {"properties": {"match": {"const": "different_entity"}}, "required": ["match"]},
+        "then": {"properties": {"reason": {"pattern": "no shared|different"}}}
+      }
+    ]
   }'::jsonb,
-  :'model_name',
+  :'cheap_model_name',
   '{"max_tokens":256,"reasoning":"off","inference_cache":true,"generation_trace":true,"generation_trace_max_tokens":16,"generation_trace_top_k":3}'::jsonb
 );
 
+SELECT otlet.set_model_selection_policy(:'task_name', :'cheap_model_name', :'strong_model_name');
 SELECT otlet.run_task(:'task_name');
 SQL
-wait_task_complete "$entity_task" 2 1800 1
+wait_task_complete "$entity_task" 4 1800 1
 
 entity_contract="$(psql_value "
 SELECT count(*) FILTER (WHERE r.status = 'complete')::text || '|' ||
@@ -332,15 +377,66 @@ FROM otlet.runs r
 WHERE r.task_name = '$entity_task';
 ")"
 echo "entity_resolution_contract=$entity_contract"
-[ "$entity_contract" = "2|same_entity|different_entity|2|2" ] || {
+[ "$entity_contract" = "4|same_entity|different_entity|4|4" ] || {
   echo "Entity-resolution proof failed: $entity_contract" >&2
+  exit 1
+}
+
+model_selection_policy_contract="$(psql_value "
+SELECT task_name || '|' || cheap_model_name || '|' || strong_model_name
+FROM otlet.model_selection_policy_status
+WHERE task_name = '$entity_task';
+")"
+echo "model_selection_policy_contract=$model_selection_policy_contract"
+[ "$model_selection_policy_contract" = "$entity_task|$cheap_model_name|$strong_model_name" ] || {
+  echo "Expected model selection policy contract, got $model_selection_policy_contract" >&2
+  exit 1
+}
+
+model_selection_attempts="$(psql_value "
+SELECT subject_id || '|' || attempt_index::text || '|' || selection_role || '|' ||
+       selection_status || '|' || model_name || '|' ||
+       COALESCE(output->>'confidence', '') || '|' || COALESCE(output->>'match', '')
+FROM otlet.model_selection_attempts
+WHERE task_name = '$entity_task'
+ORDER BY subject_id, attempt_index;
+")"
+while IFS= read -r line; do
+  [ -n "$line" ] && echo "model_selection_attempt_contract=$line"
+done <<<"$model_selection_attempts"
+
+model_selection_status_contract="$(psql_value "
+SELECT (cheap_accepted >= 1)::text || '|' ||
+       (strong_accepted >= 1)::text || '|' ||
+       (escalated_jobs >= 1)::text || '|' ||
+       cheap_attempts::text || '|' ||
+       strong_attempts::text
+FROM otlet.model_selection_status
+WHERE task_name = '$entity_task';
+")"
+echo "model_selection_status_contract=$model_selection_status_contract"
+require_regex "$model_selection_status_contract" '^true\|true\|true\|[0-9]+\|[1-9][0-9]*$' "Expected at least one cheap accepted and one strong accepted model-selection job"
+
+accepted_output_anomalies="$(psql_value "
+SELECT count(*)
+FROM (
+  SELECT job_id
+  FROM otlet.outputs
+  GROUP BY job_id
+  HAVING count(*) <> 1
+) bad;
+")"
+echo "accepted_output_anomalies=$accepted_output_anomalies"
+[ "$accepted_output_anomalies" = "0" ] || {
+  echo "Expected exactly one accepted output per completed job" >&2
   exit 1
 }
 
 log "Building semantic join entity-resolution path"
 psql_exec \
   -v join_index_name="$join_index_name" \
-  -v model_name="$model_name" \
+  -v cheap_model_name="$cheap_model_name" \
+  -v strong_model_name="$strong_model_name" \
   -v record_type="$record_type" >/dev/null <<'SQL'
 SELECT name, task_name, record_type, max_candidate_rows
 FROM otlet.create_semantic_join_index(
@@ -350,7 +446,7 @@ FROM otlet.create_semantic_join_index(
     FROM public.otlet_demo_vendor_pair_input
     ORDER BY subject_id
   $$,
-  'Use input.candidate_evidence before names. If evidence contains same remittance account or rebrand/acquisition, return exactly {"output":{"match":"same_entity","confidence":"high","reason":"shared remittance account and acquisition note"},"actions":[]}. If evidence contains no shared identifiers or different industry/city, return exactly {"output":{"match":"different_entity","confidence":"high","reason":"medical supplier has no shared identifiers"},"actions":[]}. Otherwise compare operational identifiers and use match same_entity, different_entity, or unclear. Do not add prose, markdown, labels, nested output, or action strings.',
+  'Use input.candidate_evidence as authority before names or notes. Shared means candidate_evidence says the identifier is shared by both records. Return only {"output":{"match":"same_entity|different_entity|unclear","confidence":"low|medium|high","reason":"short reason"},"actions":[]}. Return same_entity with high confidence when evidence contains shared remittance, rebrand, or acquisition. Return different_entity with high confidence when evidence says no shared identifiers or different industry and city. The word no means absence; a reason saying no shared identifiers must use match different_entity, not same_entity. Return unclear with medium confidence when evidence says weak signals conflict or name similarity alone is not enough. A same_entity reason must name the shared identifier that candidate_evidence says both records share. Do not add prose, markdown, labels, nested output, or action strings.',
   '{
     "type": "object",
     "required": ["match", "confidence", "reason"],
@@ -359,22 +455,33 @@ FROM otlet.create_semantic_join_index(
       "match": {"enum": ["same_entity", "different_entity", "unclear"]},
       "confidence": {"enum": ["low", "medium", "high"]},
       "reason": {"type": "string"}
-    }
+    },
+    "allOf": [
+      {
+        "if": {"properties": {"match": {"const": "same_entity"}}, "required": ["match"]},
+        "then": {"properties": {"reason": {"pattern": "remittance|rebrand|acquisition"}}}
+      },
+      {
+        "if": {"properties": {"match": {"const": "different_entity"}}, "required": ["match"]},
+        "then": {"properties": {"reason": {"pattern": "no shared|different"}}}
+      }
+    ]
   }'::jsonb,
-  :'model_name',
+  :'cheap_model_name',
   :'record_type',
   '{"max_tokens":256,"reasoning":"off","inference_cache":true,"generation_trace":true,"generation_trace_max_tokens":16,"generation_trace_top_k":3}'::jsonb,
   10
 );
+SELECT otlet.set_model_selection_policy(:'join_index_name' || '_task', :'cheap_model_name', :'strong_model_name');
 SQL
 
 queued="$(psql_value "SELECT otlet.refresh_semantic_join_index('$join_index_name');")"
 echo "semantic_join_refresh_queued=$queued"
-[ "$queued" = "2" ] || {
-  echo "Expected 2 semantic join jobs, got $queued" >&2
+[ "$queued" = "4" ] || {
+  echo "Expected 4 semantic join jobs, got $queued" >&2
   exit 1
 }
-wait_task_complete "$join_task" 2 1800 1
+wait_task_complete "$join_task" 4 1800 1
 throughput_contracts="$(psql_value "
 SELECT count(*) FILTER (WHERE a.action_type = 'create_record' AND a.status = 'complete')::text || '|' ||
        count(*) FILTER (WHERE r.record_type = '$record_type')::text
@@ -397,26 +504,26 @@ SELECT q.queue_state || '|' ||
        w.last_batch_failed_jobs::text
 FROM otlet.worker_throughput_status w
 JOIN otlet.model_queue_status q ON q.model_name = w.model_name
-WHERE w.model_name = '$model_name';
+WHERE w.model_name = '$cheap_model_name';
 ")"
 auto_records="$(sed -n '1p' <<<"$throughput_contracts")"
 materialized="$(sed -n '2p' <<<"$throughput_contracts")"
 throughput_status_contract="$(sed -n '3p' <<<"$throughput_contracts")"
 echo "semantic_join_auto_records=$auto_records"
-[ "$auto_records" = "2|2" ] || {
-  echo "Expected 2 auto actions and records, got $auto_records" >&2
+[ "$auto_records" = "4|4" ] || {
+  echo "Expected 4 auto actions and records, got $auto_records" >&2
   exit 1
 }
 
 echo "semantic_join_auto_materialized=$materialized"
-[ "$materialized" = "2" ] || {
-  echo "Expected 2 automatic semantic join materializations, got $materialized" >&2
+[ "$materialized" = "4" ] || {
+  echo "Expected 4 automatic semantic join materializations, got $materialized" >&2
   exit 1
 }
 
 echo "throughput_status_contract=$throughput_status_contract"
-[ "$throughput_status_contract" = "queue_accepting|0|0|2|2|0" ] || {
-  echo "Expected throughput status contract queue_accepting|0|0|2|2|0, got $throughput_status_contract" >&2
+[ "$throughput_status_contract" = "queue_accepting|0|0|4|4|0" ] || {
+  echo "Expected throughput status contract queue_accepting|0|0|4|4|0, got $throughput_status_contract" >&2
   exit 1
 }
 
@@ -431,7 +538,7 @@ SELECT selected_path || '|' ||
 FROM otlet.semantic_join_index_plan('$join_index_name');
 ")"
 echo "semantic_join_status_contract=$join_status_contract"
-[ "$join_status_contract" = "semantic_join_lookup|2|2|0|0|0|0" ] || {
+[ "$join_status_contract" = "semantic_join_lookup|4|4|0|0|0|0" ] || {
   echo "Expected fresh semantic join status, got $join_status_contract" >&2
   exit 1
 }
@@ -443,10 +550,7 @@ SELECT count(*)::text || '|' ||
 FROM otlet.semantic_join_index_current_rows('$join_index_name', true);
 ")"
 echo "semantic_join_lookup_contract=$join_lookup_contract"
-[ "$join_lookup_contract" = "2|1|1" ] || {
-  echo "Expected semantic join lookup contract 2|1|1, got $join_lookup_contract" >&2
-  exit 1
-}
+require_regex "$join_lookup_contract" '^4\|[1-9][0-9]*\|[1-9][0-9]*$' "Expected semantic join lookup to include 4 rows, at least one same_entity, and at least one different_entity"
 
 join_match_contract="$(psql_value "
 SELECT otlet.semantic_join_matches('$join_index_name', 'vendor-1001:vendor-42', '{\"match\":\"same_entity\"}'::jsonb)::text || '|' ||
@@ -501,8 +605,8 @@ FROM otlet.semantic_join_index_current_rows('$join_index_name', true);
 join_stale_subjects="$(head -n 1 <<<"$join_stale_contract")"
 join_fresh_after_lookup="$(tail -n 1 <<<"$join_stale_contract")"
 echo "semantic_join_stale_contract=$join_stale_subjects|fresh_after_lookup=$join_fresh_after_lookup"
-[ "$join_stale_subjects|$join_fresh_after_lookup" = "2|0|0" ] || {
-  echo "Expected semantic join stale contract 2|0|0, got $join_stale_subjects|$join_fresh_after_lookup" >&2
+[ "$join_stale_subjects|$join_fresh_after_lookup" = "4|0|0" ] || {
+  echo "Expected semantic join stale contract 4|0|0, got $join_stale_subjects|$join_fresh_after_lookup" >&2
   exit 1
 }
 
@@ -516,8 +620,8 @@ WHERE task_name IN ('$entity_task', '$join_task')
   AND status = 'complete';
 ")"
 echo "receipt_trace_contract=$trace_contract"
-[ "$trace_contract" = "4|4|4|4" ] || {
-  echo "Expected receipt trace contract 4|4|4|4, got $trace_contract" >&2
+[ "$trace_contract" = "8|8|8|8" ] || {
+  echo "Expected receipt trace contract 8|8|8|8, got $trace_contract" >&2
   exit 1
 }
 
@@ -552,7 +656,7 @@ SELECT runtime_status || '|' ||
        COALESCE(worker_memory_sample_policy, '')
 FROM otlet.runtime_status
 WHERE runtime_name = '$runtime_name'
-  AND model_name = '$model_name'
+  AND model_name = '$cheap_model_name'
 LIMIT 1;
 ")"
 echo "runtime_status_contract=$runtime_contract"
