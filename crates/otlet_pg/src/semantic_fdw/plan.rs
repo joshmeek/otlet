@@ -79,26 +79,22 @@ unsafe fn semantic_options(relid: pg_sys::Oid) -> Result<SemanticFdwOptions, Str
 }
 
 fn load_plan(opts: &SemanticFdwOptions) -> Result<SemanticFdwPlan, String> {
-    let query = match opts.access_kind {
-        SemanticAccessKind::RowIndex => format!(
-            "SELECT selected_path, reason, task_name, total_rows, refresh_rows, \
-             freshness::float8 AS freshness, \
-             estimated_lookup_ms::float8 AS estimated_lookup_ms, \
-             estimated_refresh_ms::float8 AS estimated_refresh_ms, \
-             estimated_fresh_inference_ms::float8 AS estimated_fresh_inference_ms \
-             FROM otlet.semantic_index_plan({})",
-            sql_literal(&opts.index_name)
-        ),
-        SemanticAccessKind::JoinIndex => format!(
-            "SELECT selected_path, reason, task_name, total_pairs AS total_rows, refresh_pairs AS refresh_rows, \
-             freshness::float8 AS freshness, \
-             estimated_lookup_ms::float8 AS estimated_lookup_ms, \
-             estimated_refresh_ms::float8 AS estimated_refresh_ms, \
-             estimated_fresh_inference_ms::float8 AS estimated_fresh_inference_ms \
-             FROM otlet.semantic_join_index_plan({})",
-            sql_literal(&opts.index_name)
-        ),
+    let plan_function = match opts.access_kind {
+        SemanticAccessKind::RowIndex => "otlet.semantic_index_plan",
+        SemanticAccessKind::JoinIndex => "otlet.semantic_join_index_plan",
     };
+    let query = format!(
+        "SELECT selected_path, reason, task_name, record_type, model_name, runtime_name, source_relation, \
+         total_subjects, fresh_subjects, stale_subjects, missing_subjects, inflight_subjects, \
+         lookup_subjects, wait_subjects, queue_subjects, infer_now_subjects, fail_closed_subjects, \
+         freshness::float8 AS freshness, model_ms::float8 AS model_ms, model_cost_source, \
+         cache_hit_ms::float8 AS cache_hit_ms, lookup_ms::float8 AS lookup_ms, \
+         queue_ms::float8 AS queue_ms, infer_now_ms::float8 AS infer_now_ms, \
+         path_cost::float8 AS path_cost, worker_queue_depth, available_queue_slots \
+         FROM {}({})",
+        plan_function,
+        sql_literal(&opts.index_name)
+    );
 
     pgrx::Spi::connect(|client| {
         let table = client
@@ -118,30 +114,102 @@ fn load_plan(opts: &SemanticFdwOptions) -> Result<SemanticFdwPlan, String> {
                 .get_by_name::<String, _>("task_name")
                 .map_err(to_string)?
                 .unwrap_or_default(),
-            total_rows: row
-                .get_by_name::<i64, _>("total_rows")
+            record_type: row
+                .get_by_name::<String, _>("record_type")
                 .map_err(to_string)?
                 .unwrap_or_default(),
-            refresh_rows: row
-                .get_by_name::<i64, _>("refresh_rows")
+            model_name: row
+                .get_by_name::<String, _>("model_name")
+                .map_err(to_string)?
+                .unwrap_or_default(),
+            runtime_name: row
+                .get_by_name::<String, _>("runtime_name")
+                .map_err(to_string)?
+                .unwrap_or_default(),
+            source_relation: row
+                .get_by_name::<String, _>("source_relation")
+                .map_err(to_string)?
+                .unwrap_or_default(),
+            total_subjects: row
+                .get_by_name::<i64, _>("total_subjects")
+                .map_err(to_string)?
+                .unwrap_or_default(),
+            fresh_subjects: row
+                .get_by_name::<i64, _>("fresh_subjects")
+                .map_err(to_string)?
+                .unwrap_or_default(),
+            stale_subjects: row
+                .get_by_name::<i64, _>("stale_subjects")
+                .map_err(to_string)?
+                .unwrap_or_default(),
+            missing_subjects: row
+                .get_by_name::<i64, _>("missing_subjects")
+                .map_err(to_string)?
+                .unwrap_or_default(),
+            inflight_subjects: row
+                .get_by_name::<i64, _>("inflight_subjects")
+                .map_err(to_string)?
+                .unwrap_or_default(),
+            lookup_subjects: row
+                .get_by_name::<i64, _>("lookup_subjects")
+                .map_err(to_string)?
+                .unwrap_or_default(),
+            wait_subjects: row
+                .get_by_name::<i64, _>("wait_subjects")
+                .map_err(to_string)?
+                .unwrap_or_default(),
+            queue_subjects: row
+                .get_by_name::<i64, _>("queue_subjects")
+                .map_err(to_string)?
+                .unwrap_or_default(),
+            infer_now_subjects: row
+                .get_by_name::<i64, _>("infer_now_subjects")
+                .map_err(to_string)?
+                .unwrap_or_default(),
+            fail_closed_subjects: row
+                .get_by_name::<i64, _>("fail_closed_subjects")
                 .map_err(to_string)?
                 .unwrap_or_default(),
             freshness: row
                 .get_by_name::<f64, _>("freshness")
                 .map_err(to_string)?
                 .unwrap_or(1.0),
-            estimated_lookup_ms: row
-                .get_by_name::<f64, _>("estimated_lookup_ms")
+            model_ms: row
+                .get_by_name::<f64, _>("model_ms")
+                .map_err(to_string)?
+                .unwrap_or(2500.0),
+            model_cost_source: row
+                .get_by_name::<String, _>("model_cost_source")
+                .map_err(to_string)?
+                .unwrap_or_else(|| "static_fallback".to_string()),
+            cache_hit_ms: row
+                .get_by_name::<f64, _>("cache_hit_ms")
+                .map_err(to_string)?
+                .unwrap_or(0.05),
+            lookup_ms: row
+                .get_by_name::<f64, _>("lookup_ms")
                 .map_err(to_string)?
                 .unwrap_or(1.0),
-            estimated_refresh_ms: row
-                .get_by_name::<f64, _>("estimated_refresh_ms")
+            queue_ms: row
+                .get_by_name::<f64, _>("queue_ms")
                 .map_err(to_string)?
                 .unwrap_or(1.0),
-            estimated_fresh_inference_ms: row
-                .get_by_name::<f64, _>("estimated_fresh_inference_ms")
+            infer_now_ms: row
+                .get_by_name::<f64, _>("infer_now_ms")
+                .map_err(to_string)?
+                .unwrap_or(0.0),
+            path_cost: row
+                .get_by_name::<f64, _>("path_cost")
                 .map_err(to_string)?
                 .unwrap_or(1.0),
+            worker_queue_depth: row
+                .get_by_name::<i64, _>("worker_queue_depth")
+                .map_err(to_string)?
+                .unwrap_or_default(),
+            available_queue_slots: row
+                .get_by_name::<i64, _>("available_queue_slots")
+                .map_err(to_string)?
+                .unwrap_or_default(),
         })
     })
 }
@@ -154,7 +222,7 @@ fn load_scan_state(
     pgrx::Spi::connect_mut(|client| {
         let plan = load_effective_plan(&opts, &pushdown)?;
         let queued_jobs = match plan.selected_path.as_str() {
-            "refresh_then_lookup" => scalar_i64(
+            "queue_refresh" => scalar_i64(
                 client,
                 &format!(
                     "SELECT {}({})::bigint",
@@ -227,7 +295,10 @@ fn load_scan_state(
 }
 
 fn is_lookup_path(path: &str) -> bool {
-    matches!(path, "semantic_lookup" | "semantic_join_lookup")
+    matches!(
+        path,
+        "semantic_lookup" | "semantic_join_lookup" | "lookup_fail_closed"
+    )
 }
 
 fn lookup_rows_query(

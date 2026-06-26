@@ -248,6 +248,7 @@ fn validate_semantic_index_source(
             .map_err(to_string)?;
         let row = stats_table.first();
         let mut stats = SemanticPlannerStats {
+            selected_path: "semantic_lookup".to_string(),
             reason: String::new(),
             source_rows: row
                 .get_by_name::<i64, _>("source_rows")
@@ -324,7 +325,7 @@ fn validate_semantic_join_index_source(
     auto_policy: bool,
 ) -> Option<SemanticPlannerStats> {
     let stats_query = format!(
-        "WITH plan AS ( \
+            "WITH plan AS ( \
 	           SELECT * \
 	           FROM otlet.semantic_join_index_plan({}) \
 	         ), \
@@ -333,14 +334,14 @@ fn validate_semantic_join_index_source(
 	           FROM otlet.semantic_join_index_current_rows({}, false) \
 	         ) \
 	         SELECT \
-	           COALESCE((SELECT total_pairs FROM plan), 0)::bigint AS source_rows, \
+	           COALESCE((SELECT total_subjects FROM plan), 0)::bigint AS source_rows, \
 	           count(*) FILTER (WHERE stale = false AND body @> {}::jsonb)::bigint AS fresh_matches, \
 	           count(*) FILTER (WHERE stale = false AND NOT (body @> {}::jsonb))::bigint AS fresh_non_matches, \
-	           COALESCE((SELECT stale_pairs FROM plan), 0)::bigint AS stale_rows, \
-	           COALESCE((SELECT missing_pairs FROM plan), 0)::bigint AS missing_rows, \
-	           COALESCE((SELECT active_jobs FROM plan), 0)::bigint AS inflight_rows, \
+	           COALESCE((SELECT stale_subjects FROM plan), 0)::bigint AS stale_rows, \
+	           COALESCE((SELECT missing_subjects FROM plan), 0)::bigint AS missing_rows, \
+	           COALESCE((SELECT inflight_subjects FROM plan), 0)::bigint AS inflight_rows, \
 	           0::bigint AS cache_reusable_rows, \
-	           COALESCE((SELECT estimated_fresh_inference_ms / NULLIF(total_pairs, 0) FROM plan), 2500)::float8 AS model_ms \
+	           COALESCE((SELECT model_ms FROM plan), 2500)::float8 AS model_ms \
 	         FROM current_rows",
         sql_literal(index_name),
         sql_literal(index_name),
@@ -356,6 +357,7 @@ fn validate_semantic_join_index_source(
         }
         let row = table.first();
         let mut stats = SemanticPlannerStats {
+            selected_path: "semantic_join_lookup".to_string(),
             reason: String::new(),
             source_rows: row
                 .get_by_name::<i64, _>("source_rows")
@@ -412,6 +414,9 @@ fn validate_semantic_join_index_source(
             infer_max_rows,
             auto_policy,
         );
+        if stats.selected_path == "semantic_lookup" {
+            stats.selected_path = "semantic_join_lookup".to_string();
+        }
         stats.reason = format!("semantic join candidate row-source: {}", stats.reason);
         Ok::<Option<SemanticPlannerStats>, String>(Some(stats))
     }) {

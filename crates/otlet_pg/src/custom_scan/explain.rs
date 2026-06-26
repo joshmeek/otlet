@@ -73,7 +73,7 @@ unsafe extern "C-unwind" fn explain_semantic_custom_scan(
             explain_semantic_metadata(
                 SemanticExplainMetadata {
                     index_name: &private.index_name,
-                    index_kind: None,
+                    index_kind: Some(private.index_kind.as_str()),
                     predicate_kind: private.predicate_kind.as_str(),
                     expected_json: &private.expected_json,
                     action_type: private.action_type.as_deref(),
@@ -203,6 +203,7 @@ unsafe fn explain_semantic_policy(
 
 unsafe fn explain_planner_stats(stats: &SemanticPlannerStats, es: *mut pg_sys::ExplainState) {
     unsafe {
+        explain_text("Planner Selected Path", &stats.selected_path, es);
         explain_text("Planner Semantic Reason", &stats.reason, es);
         explain_counter("Planner Source Rows", stats.source_rows, es);
         explain_counter("Planner Fresh Match Rows", stats.fresh_matches, es);

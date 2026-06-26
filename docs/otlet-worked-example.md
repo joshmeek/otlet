@@ -1067,11 +1067,11 @@ Once materialized, the index has planner-visible status:
 SELECT
   name,
   task_name,
-  source_table,
-  ready_rows,
-  stale_rows,
-  active_jobs,
-  completed_jobs,
+  source_relation,
+  fresh_subjects,
+  stale_subjects,
+  inflight_subjects,
+  queue_subjects,
   effective_stale_policy
 FROM otlet.semantic_index_status
 WHERE name = 'demo_semantic_vendor_idx';
@@ -1080,25 +1080,28 @@ SELECT
   selected_path,
   reason,
   effective_stale_policy,
-  total_rows,
-  ready_rows,
-  stale_rows,
-  refresh_rows,
-  freshness
+  total_subjects,
+  fresh_subjects,
+  stale_subjects,
+  missing_subjects,
+  queue_subjects,
+  freshness,
+  model_cost_source,
+  path_cost
 FROM otlet.semantic_index_plan('demo_semantic_vendor_idx');
 ```
 
 Representative output:
 
 ```text
-           name           |           task_name           |           source_table            | ready_rows | stale_rows | active_jobs | completed_jobs |    effective_stale_policy
---------------------------+-------------------------------+-----------------------------------+------------+------------+-------------+----------------+------------------------------
- demo_semantic_vendor_idx | demo_semantic_vendor_idx_task | public.otlet_demo_semantic_vendor |          3 |          0 |           0 |              4 | refresh_then_fail_closed
+           name           |           task_name           |          source_relation          | fresh_subjects | stale_subjects | inflight_subjects | queue_subjects |    effective_stale_policy
+--------------------------+-------------------------------+-----------------------------------+----------------+----------------+-------------------+----------------+------------------------------
+ demo_semantic_vendor_idx | demo_semantic_vendor_idx_task | public.otlet_demo_semantic_vendor |              3 |              0 |                 0 |              0 | refresh_then_fail_closed
 (1 row)
 
-  selected_path  |           reason           |    effective_stale_policy    | total_rows | ready_rows | stale_rows | refresh_rows | freshness
------------------+----------------------------+------------------------------+------------+------------+------------+--------------+-----------
- semantic_lookup | semantic index fully fresh | refresh_then_fail_closed     |          3 |          3 |          0 |            0 |    1.0000
+  selected_path  |           reason           |    effective_stale_policy    | total_subjects | fresh_subjects | stale_subjects | missing_subjects | queue_subjects | freshness | model_cost_source | path_cost
+-----------------+----------------------------+------------------------------+----------------+----------------+----------------+------------------+----------------+-----------+-------------------+-----------
+ semantic_lookup | semantic index fully fresh | refresh_then_fail_closed     |              3 |              3 |              0 |                0 |              0 |    1.0000 | task_receipt      |      1.15
 (1 row)
 ```
 
@@ -1146,6 +1149,8 @@ Representative output excerpt:
 Foreign Scan on otlet.demo_semantic_vendor_idx_native
   Otlet Node: Semantic Foreign Scan
   Selected Path: semantic_lookup
+  Queue Subjects: 0
+  Path Cost: 1.05
   Freshness: 1.00
   Pushed Subject Id: 2
 ```
@@ -1170,6 +1175,7 @@ Custom Scan (Otlet Semantic Source CustomScan) on public.otlet_demo_semantic_ven
   Otlet Node: Semantic Source CustomScan
   Child Semantic Filter: stripped_before_child_plan
   Semantic Index: demo_semantic_vendor_idx
+  Planner Selected Path: semantic_lookup
   Planner Fresh Match Rows: 3
   Semantic Cache Hits: 3
 ```
@@ -1185,7 +1191,7 @@ UPDATE public.otlet_demo_semantic_vendor
 SET email = 'learning-stale@example.test', updated_at = clock_timestamp()
 WHERE id = 2;
 
-SELECT name, ready_rows, stale_rows, active_jobs
+SELECT name, fresh_subjects, stale_subjects, inflight_subjects
 FROM otlet.semantic_index_status
 WHERE name = 'demo_semantic_vendor_idx';
 
@@ -1200,9 +1206,9 @@ Representative output:
 ```text
 UPDATE 1
 
-           name           | ready_rows | stale_rows | active_jobs
---------------------------+------------+------------+-------------
- demo_semantic_vendor_idx |          2 |          1 |           0
+           name           | fresh_subjects | stale_subjects | inflight_subjects
+--------------------------+----------------+----------------+-------------------
+ demo_semantic_vendor_idx |              2 |              1 |                 0
 (1 row)
 
  fail_closed_rows
@@ -1233,6 +1239,7 @@ Custom Scan (Otlet Semantic Source CustomScan) on public.otlet_demo_semantic_ven
   Refresh Policy: auto_lookup_wait_infer_refresh_fail_closed
   Infer Now Timeout Ms: 15000
   Infer Now Max Rows: 1
+  Planner Selected Path: bounded_infer_now
   Planner Stale Rows: 1
   Actual Infer Resolved Rows: 1
   Infer Now Receipts: 1
@@ -1364,7 +1371,7 @@ DO
 Now inspect the join index:
 
 ```sql
-SELECT name, task_name, total_pairs, ready_pairs, stale_pairs, missing_pairs, freshness
+SELECT name, task_name, total_subjects, fresh_subjects, stale_subjects, missing_subjects, freshness
 FROM otlet.semantic_join_index_plan('learning_entity_pair_idx');
 
 SELECT selected_path, reason, effective_stale_policy
@@ -1378,9 +1385,9 @@ ORDER BY subject_id;
 Representative output:
 
 ```text
-           name           |           task_name           | total_pairs | ready_pairs | stale_pairs | missing_pairs | freshness
---------------------------+-------------------------------+-------------+-------------+-------------+---------------+-----------
- learning_entity_pair_idx | learning_entity_pair_idx_task |           1 |           1 |           0 |             0 |    1.0000
+           name           |           task_name           | total_subjects | fresh_subjects | stale_subjects | missing_subjects | freshness
+--------------------------+-------------------------------+----------------+----------------+----------------+------------------+-----------
+ learning_entity_pair_idx | learning_entity_pair_idx_task |              1 |              1 |              0 |                0 |    1.0000
 (1 row)
 
      selected_path      |             reason            |    effective_stale_policy

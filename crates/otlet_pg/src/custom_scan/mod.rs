@@ -31,9 +31,9 @@ macro_rules! explain_scan_counters {
             source.fresh_non_matches,
             $es,
         );
-        explain_counter("Stale Rows", source.stale_rows, $es);
-        explain_counter("Missing Rows", source.missing_rows, $es);
-        explain_counter("In Flight Refresh Rows", source.inflight_rows, $es);
+        explain_counter("Actual Stale Subjects", source.stale_rows, $es);
+        explain_counter("Actual Missing Subjects", source.missing_rows, $es);
+        explain_counter("Actual In Flight Subjects", source.inflight_rows, $es);
         explain_counter("Queued Refreshes", source.queued_refreshes, $es);
         explain_counter("Waited Refreshes", source.waited_refreshes, $es);
         explain_counter("Wait Elapsed Ms", source.wait_elapsed_ms, $es);

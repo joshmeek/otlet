@@ -30,6 +30,7 @@ unsafe fn custom_private_from_predicate(predicate: &SemanticMatchPredicate) -> *
             "subject_attno": predicate.subject_attno,
             "subject_typid": predicate.subject_typid.to_u32(),
             "planner_stats": {
+                "selected_path": &predicate.planner_stats.selected_path,
                 "reason": &predicate.planner_stats.reason,
                 "source_rows": predicate.planner_stats.source_rows,
                 "fresh_matches": predicate.planner_stats.fresh_matches,
@@ -104,6 +105,7 @@ unsafe fn custom_private_from_list(private: *mut pg_sys::List) -> Option<CustomS
             subject_attno: payload.get("subject_attno")?.as_i64()?.try_into().ok()?,
             subject_typid: pg_sys::Oid::from(payload.get("subject_typid")?.as_u64()? as u32),
             planner_stats: SemanticPlannerStats {
+                selected_path: stats.get("selected_path")?.as_str()?.to_string(),
                 reason: stats.get("reason")?.as_str()?.to_string(),
                 source_rows: stats.get("source_rows")?.as_u64()?,
                 fresh_matches: stats.get("fresh_matches")?.as_u64()?,

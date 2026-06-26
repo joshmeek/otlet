@@ -36,7 +36,7 @@ unsafe extern "C-unwind" fn otlet_semantic_get_foreign_rel_size(
         let rows = semantic_options(foreigntableid)
             .ok()
             .and_then(|opts| load_plan(&opts).ok())
-            .map(|plan| plan.total_rows.max(1) as f64)
+            .map(|plan| plan.total_subjects.max(1) as f64)
             .unwrap_or(1000.0);
         (*baserel).rows = rows;
     }
@@ -56,15 +56,11 @@ unsafe extern "C-unwind" fn otlet_semantic_get_foreign_paths(
             .and_then(|opts| load_effective_plan(&opts, &pushdown).ok())
             .map(|plan| {
                 let mut rows = if pushdown.has_filters() {
-                    plan.total_rows.max(0) as f64
+                    plan.total_subjects.max(0) as f64
                 } else {
-                    plan.total_rows.max(1) as f64
+                    plan.total_subjects.max(1) as f64
                 };
-                let mut cost = match plan.selected_path.as_str() {
-                    "semantic_lookup" => plan.estimated_lookup_ms,
-                    "refresh_then_lookup" => plan.estimated_refresh_ms,
-                    _ => plan.estimated_fresh_inference_ms,
-                };
+                let mut cost = plan.path_cost;
                 if let Some(subjects) = pushdown.subjects() {
                     let pushed_rows = (subjects.len() as f64).min(rows).max(0.0);
                     if rows > 0.0 {
@@ -107,19 +103,15 @@ unsafe extern "C-unwind" fn otlet_semantic_get_foreign_paths(
             let param_pushdown =
                 semantic_pushdown_from_restrictinfos(param_restrictinfo, (*baserel).relid);
             let (param_rows, param_cost) = semantic_options(foreigntableid)
-                .ok()
-                .and_then(|opts| load_effective_plan(&opts, &param_pushdown).ok())
-                .map(|plan| {
-                    let mut rows = 1.0;
-                    let mut cost = match plan.selected_path.as_str() {
-                        "semantic_lookup" => plan.estimated_lookup_ms,
-                        "refresh_then_lookup" => plan.estimated_refresh_ms,
-                        _ => plan.estimated_fresh_inference_ms,
-                    };
-                    let base_rows = plan.total_rows.max(1) as f64;
-                    if param_pushdown.has_concrete_materialization_filters() {
-                        rows = (plan.total_rows.max(0) as f64).min(1.0);
-                    }
+            .ok()
+            .and_then(|opts| load_effective_plan(&opts, &param_pushdown).ok())
+            .map(|plan| {
+                let mut rows = 1.0;
+                let mut cost = plan.path_cost;
+                let base_rows = plan.total_subjects.max(1) as f64;
+                if param_pushdown.has_concrete_materialization_filters() {
+                    rows = (plan.total_subjects.max(0) as f64).min(1.0);
+                }
                     if base_rows > 0.0 {
                         cost *= rows.max(1.0) / base_rows;
                     }

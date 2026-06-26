@@ -20,12 +20,11 @@ The extension keeps source rows in user tables. Users choose rows with SQL, Otle
 
 | Order | Track | Outcome |
 | --- | --- | --- |
-| 1 | Planner work | Cost and explain semantic lookup, refresh, wait, fail-closed, and infer-now paths |
-| 2 | Throughput | Improve queued materialization before pushing synchronous inference |
-| 3 | Model selection | Pick small or strong resident models from measured task history |
-| 4 | Actions | Let models propose typed database actions with receipts and approval |
-| 5 | Packaging and security | Keep the open-source path small while tightening permissions and trace safety |
-| 6 | Core limits | Test Access Method and Postgres-fork paths where extension hooks fall short |
+| 1 | Throughput | Improve queued materialization before pushing synchronous inference |
+| 2 | Model selection | Pick small or strong resident models from measured task history |
+| 3 | Actions | Let models propose typed database actions with receipts and approval |
+| 4 | Packaging and security | Keep the open-source path small while tightening permissions and trace safety |
+| 5 | Core limits | Test Access Method and Postgres-fork paths where extension hooks fall short |
 
 ## Model-Fit Proof
 
@@ -35,9 +34,9 @@ The benchmark report should stay Otlet-specific: SQL input, resident worker infe
 
 ## Planner And Executor
 
-The planner path should keep moving from lookup helper toward semantic access over source tuples. The CustomScan node should start with a Postgres-built child plan, preserve ordinary quals, read source tuple identity, look up semantic state, then choose lookup, refresh, wait, fail closed, or bounded infer-now
+The planner path now has one inspectable decision vocabulary for semantic lookup, queue refresh, wait, fail-closed, fresh inference, and bounded infer-now. SQL plan functions, semantic status views, FDW EXPLAIN, CustomScan EXPLAIN, receipts, and demo output should stay aligned on that vocabulary
 
-`EXPLAIN (ANALYZE, VERBOSE)` should show selected model, resident state, source identity, source hash, stale policy, cache decision, worker handoff, token counts, schema validation, trace policy, receipt IDs, provenance links, estimated model time, and actual model time
+`EXPLAIN (ANALYZE, VERBOSE)` should keep showing selected model, resident state, source identity, source hash, stale policy, cache decision, worker handoff, token counts, schema validation, trace policy, receipt IDs, provenance links, estimated model time, and actual model time
 
 Costing should use measured runtime history: load time, warm generation time, token counts, schema failures, cache hits, stale refresh rate, worker queue depth, and materialization coverage. Postgres should choose the cheap fresh lookup path when it can, and show the reason when it cannot
 

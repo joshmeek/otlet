@@ -135,6 +135,7 @@ struct RuntimeState {
     wait_ms: u32,
     infer_ms: u32,
     infer_max_rows: u32,
+    planner_selected_path: String,
     source_table: String,
     task_name: String,
     record_type: String,
@@ -309,6 +310,7 @@ struct SemanticMatchPredicate {
 
 #[derive(Clone)]
 struct SemanticPlannerStats {
+    selected_path: String,
     reason: String,
     source_rows: u64,
     fresh_matches: u64,

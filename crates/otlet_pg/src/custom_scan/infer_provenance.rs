@@ -49,6 +49,14 @@ fn record_infer_now_executor_context(runtime: &RuntimeState, job_id: i64) -> Res
         "executor_origin": "customscan_infer_now",
         "executor_node": "Otlet Semantic Source CustomScan",
         "executor_boundary": "CustomScan owned Postgres-planned source child scan",
+        "planner_selected_path": runtime.planner_selected_path.as_str(),
+        "source_tuple_provider": source_tuple_provider(runtime),
+        "refresh_policy": refresh_policy_from_parts(
+            runtime.auto_policy,
+            runtime.allow_refresh,
+            runtime.wait_ms,
+            runtime.infer_ms
+        ),
         "semantic_index_kind": runtime.index_kind.as_str(),
         "semantic_index_name": runtime.index_name.as_str(),
         "semantic_predicate_kind": runtime.predicate_kind.as_str(),

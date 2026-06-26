@@ -404,7 +404,7 @@ SET email = 'changed@example.test',
     updated_at = clock_timestamp()
 WHERE id = 3;
 SQL
-  stale_rows="$(psql_value "SELECT stale_rows FROM otlet.semantic_index_status WHERE name = '$index_name';")"
+  stale_rows="$(psql_value "SELECT stale_subjects FROM otlet.semantic_index_status WHERE name = '$index_name';")"
   fail_closed="$(psql_value "SELECT count(*) FROM public.otlet_model_benchmark_vendor v WHERE v.id = 3 AND otlet.semantic_matches('$index_name', v.id::text, '{\"status\":\"needs_review\"}'::jsonb);")"
   echo "${model_name}_stale_rows=$stale_rows"
   echo "${model_name}_stale_fail_closed_rows=$fail_closed"

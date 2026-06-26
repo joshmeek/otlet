@@ -519,11 +519,17 @@ echo "semantic_join_materialized=$materialized"
 }
 
 join_status_contract="$(psql_value "
-SELECT selected_path || '|' || total_pairs || '|' || ready_pairs || '|' || stale_pairs || '|' || missing_pairs
+SELECT selected_path || '|' ||
+       total_subjects::text || '|' ||
+       fresh_subjects::text || '|' ||
+       stale_subjects::text || '|' ||
+       missing_subjects::text || '|' ||
+       queue_subjects::text || '|' ||
+       fail_closed_subjects::text
 FROM otlet.semantic_join_index_plan('$join_index_name');
 ")"
 echo "semantic_join_status_contract=$join_status_contract"
-[ "$join_status_contract" = "semantic_join_lookup|2|2|0|0" ] || {
+[ "$join_status_contract" = "semantic_join_lookup|2|2|0|0|0|0" ] || {
   echo "Expected fresh semantic join status, got $join_status_contract" >&2
   exit 1
 }
@@ -572,6 +578,9 @@ SQL
 printf '%s\n' "$fdw_plan"
 require_contains "$fdw_plan" "Foreign Scan on" "Expected semantic join FDW Foreign Scan"
 require_contains "$fdw_plan" "Otlet Node: Semantic Foreign Scan" "Expected Otlet FDW explain details"
+require_contains "$fdw_plan" "Selected Path: semantic_join_lookup" "Expected FDW selected path"
+require_contains "$fdw_plan" "Queue Subjects: 0" "Expected FDW queue subject count"
+require_contains "$fdw_plan" "Path Cost:" "Expected FDW path cost"
 
 log "Checking stale entity-resolution state"
 psql_exec >/dev/null <<'SQL'
@@ -589,16 +598,16 @@ echo "entity_resolution_stale_materializations=$direct_stale_materializations"
 }
 
 join_stale_contract="$(psql_value "
-SELECT stale_pairs::text || '|' || ready_pairs::text
+SELECT stale_subjects::text || '|' || fresh_subjects::text
 FROM otlet.semantic_join_index_plan('$join_index_name');
 SELECT count(*)::text
 FROM otlet.semantic_join_index_current_rows('$join_index_name', true);
 ")"
-join_stale_pairs="$(head -n 1 <<<"$join_stale_contract")"
+join_stale_subjects="$(head -n 1 <<<"$join_stale_contract")"
 join_fresh_after_lookup="$(tail -n 1 <<<"$join_stale_contract")"
-echo "semantic_join_stale_contract=$join_stale_pairs|fresh_after_lookup=$join_fresh_after_lookup"
-[ "$join_stale_pairs|$join_fresh_after_lookup" = "2|0|0" ] || {
-  echo "Expected semantic join stale contract 2|0|0, got $join_stale_pairs|$join_fresh_after_lookup" >&2
+echo "semantic_join_stale_contract=$join_stale_subjects|fresh_after_lookup=$join_fresh_after_lookup"
+[ "$join_stale_subjects|$join_fresh_after_lookup" = "2|0|0" ] || {
+  echo "Expected semantic join stale contract 2|0|0, got $join_stale_subjects|$join_fresh_after_lookup" >&2
   exit 1
 }
 
