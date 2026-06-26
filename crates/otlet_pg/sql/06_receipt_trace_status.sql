@@ -1,3 +1,31 @@
+CREATE VIEW otlet.model_selection_attempts AS
+SELECT
+  r.job_id,
+  r.task_name,
+  r.subject_id,
+  r.attempt_index,
+  r.selection_role,
+  r.selection_status,
+  r.selection_reason,
+  (o.id IS NOT NULL) AS accepted,
+  r.model_name,
+  r.runtime_name,
+  r.schema_validation_status,
+  r.status,
+  r.error,
+  o.output,
+  r.raw_output,
+  r.raw_output_hash,
+  r.prompt_tokens,
+  r.generated_tokens,
+  r.generate_ms,
+  r.tokens_per_second,
+  r.id AS receipt_id,
+  o.id AS output_id,
+  r.finished_at
+FROM otlet.inference_receipts r
+LEFT JOIN otlet.outputs o ON o.receipt_id = r.id;
+
 CREATE VIEW otlet.runs AS
 SELECT
   j.id AS job_id,
@@ -10,28 +38,70 @@ SELECT
   j.started_at,
   j.finished_at,
   j.cancel_requested_at,
-  o.id AS output_id,
-  o.output,
-  COALESCE(o.raw_output, j.raw_output) AS raw_output,
-  r.id AS receipt_id,
-  r.model_name,
-  r.runtime_name,
-  r.prompt_hash,
-  r.input_hash,
-  r.output_schema_hash,
-  r.raw_output_hash,
-  r.prompt_tokens,
-  r.generated_tokens,
-  r.generate_ms,
-  r.tokens_per_second,
-  r.schema_validation_status,
-  r.trace_summary,
+  accepted.output_id,
+  accepted.output,
+  COALESCE(accepted.output_raw_output, accepted.raw_output, j.raw_output) AS raw_output,
+  accepted.receipt_id,
+  accepted.receipt_id AS accepted_receipt_id,
+  accepted.model_name,
+  accepted.model_name AS accepted_model_name,
+  accepted.runtime_name,
+  accepted.prompt_hash,
+  accepted.input_hash,
+  accepted.output_schema_hash,
+  accepted.raw_output_hash,
+  accepted.prompt_tokens,
+  accepted.generated_tokens,
+  accepted.generate_ms,
+  accepted.tokens_per_second,
+  accepted.schema_validation_status,
+  accepted.trace_summary,
+  accepted.selection_role AS model_selection_role,
+  accepted.selection_status AS model_selection_status,
+  accepted.selection_reason AS model_selection_reason,
+  COALESCE(attempts.model_attempt_count, 0)::bigint AS model_attempt_count,
+  COALESCE(attempts.escalated, false) AS escalated,
   j.created_at AS job_created_at,
-  o.created_at AS output_created_at,
-  r.finished_at AS receipt_finished_at
+  accepted.output_created_at,
+  accepted.finished_at AS receipt_finished_at
 FROM otlet.jobs j
-LEFT JOIN otlet.outputs o ON o.job_id = j.id
-LEFT JOIN otlet.inference_receipts r ON r.job_id = j.id;
+LEFT JOIN LATERAL (
+  SELECT
+    ar.id AS receipt_id,
+    ar.model_name,
+    ar.runtime_name,
+    ar.prompt_hash,
+    ar.input_hash,
+    ar.output_schema_hash,
+    ar.raw_output_hash,
+    ar.raw_output,
+    ar.prompt_tokens,
+    ar.generated_tokens,
+    ar.generate_ms,
+    ar.tokens_per_second,
+    ar.schema_validation_status,
+    ar.trace_summary,
+    ar.selection_role,
+    ar.selection_status,
+    ar.selection_reason,
+    ar.finished_at,
+    o.id AS output_id,
+    o.output,
+    o.raw_output AS output_raw_output,
+    o.created_at AS output_created_at
+  FROM otlet.outputs o
+  JOIN otlet.inference_receipts ar ON ar.id = o.receipt_id
+  WHERE o.job_id = j.id
+  ORDER BY ar.attempt_index DESC, ar.id DESC
+  LIMIT 1
+) accepted ON true
+LEFT JOIN LATERAL (
+  SELECT
+    count(*)::bigint AS model_attempt_count,
+    bool_or(ar.selection_role = 'strong') AS escalated
+  FROM otlet.inference_receipts ar
+  WHERE ar.job_id = j.id
+) attempts ON true;
 
 CREATE VIEW otlet.inference_receipt_trace_status AS
 SELECT
@@ -39,6 +109,11 @@ SELECT
   r.job_id,
   r.task_name,
   r.subject_id,
+  r.attempt_index,
+  r.selection_role,
+  r.selection_status,
+  r.selection_reason,
+  (o.id IS NOT NULL) AS accepted,
   r.status,
   r.model_name,
   r.runtime_name,
@@ -134,4 +209,5 @@ SELECT
   END AS inference_cache_evictions,
   r.trace_summary ->> 'inference_cache_invalidation_reason' AS inference_cache_reason,
   r.finished_at AS receipt_finished_at
-FROM otlet.inference_receipts r;
+FROM otlet.inference_receipts r
+LEFT JOIN otlet.outputs o ON o.receipt_id = r.id;

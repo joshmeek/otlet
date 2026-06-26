@@ -2,7 +2,7 @@
 
 Otlet is a Postgres extension that runs local LLM inference **inside Postgres**, next to the rows it reads and acts on
 
-My use case for building it came from an entity-resolution problem: when new data lands, Postgres should help decide whether a row is a new entity or a duplicate of something already in the database. Otlet runs through a resident Postgres worker, records receipts and source identity, drains bounded queued work, and materializes results for later queries. The [roadmap](docs/roadmap.md) tracks the path toward model selection, action safety, packaging, and deeper planner work
+My use case for building it came from an entity-resolution problem: when new data lands, Postgres should help decide whether a row is a new entity or a duplicate of something already in the database. Otlet runs through a resident Postgres worker, can try a cheap local model before escalating hard rows to a stronger local model, records receipts and source identity, drains bounded queued work, and materializes results for later queries. The [roadmap](docs/roadmap.md) tracks the path toward action safety, packaging, and deeper planner work
 
 Otlet uses a `pgrx` extension and a Postgres background worker loaded through `shared_preload_libraries` to keep local model work inside the database process. You can ask for model work from SQL, queue it from rows, refresh semantic state after source changes, and inspect the result without leaving Postgres
 
@@ -16,9 +16,10 @@ The loop is small:
 2. The query returns a stable `subject_id` and compact `input jsonb`
 3. Otlet stores one job per subject in `otlet.jobs`
 4. The worker claims jobs with `FOR UPDATE SKIP LOCKED`
-5. The worker drains compatible queued jobs against a warm local GGUF model
+5. The worker drains compatible queued jobs against warm local GGUF models
 6. Otlet validates the JSON output before storing it
-7. Semantic refresh jobs create Otlet-owned records and fresh materialized state automatically
+7. Low-confidence, unclear, or schema-failed cheap attempts can escalate to a stronger resident model
+8. Semantic refresh jobs create Otlet-owned records and fresh materialized state automatically
 
 Otlet leaves your source rows alone. It stores derived outputs, actions, receipts, traces, and runtime state under the `otlet` schema. To avoid reusing stale model output, Otlet tracks MVCC identity (`ctid`, `xmin`) and source hashes, and Postgres triggers mark semantic materializations stale when source rows change
 
@@ -99,6 +100,12 @@ FROM otlet.create_task(
   'linked_qwen_0_6b',
   '{"max_tokens":128,"reasoning":"off"}'::jsonb
 );
+
+SELECT otlet.set_model_selection_policy(
+  'entity_resolution_example',
+  'linked_qwen_0_6b',
+  'linked_qwen_1_7b'
+);
 ```
 
 For a large batch, replace the small `VALUES` list with a real candidate-pairs table and keep the same joins
@@ -150,7 +157,31 @@ Output:
 (2 rows)
 ```
 
-The user table stayed untouched. Otlet stored jobs, outputs, receipts, and trace state under the `otlet` schema, keyed by the `subject_id` values from the source query. The full demo script also proves worker batch drain, typed `entity_hypothesis` actions, automatic semantic materialization, semantic join lookup, and stale results after a source row update
+Inspect model attempts:
+
+```sql
+SELECT
+  subject_id,
+  attempt_index,
+  selection_role,
+  selection_status,
+  model_name,
+  output->>'match' AS match
+FROM otlet.model_selection_attempts
+WHERE task_name = 'entity_resolution_example'
+ORDER BY subject_id, attempt_index;
+```
+
+Representative output:
+
+```text
+ subject_id | attempt_index | selection_role | selection_status |    model_name    |      match
+------------+---------------+----------------+------------------+------------------+------------------
+ pair-1     |             1 | cheap          | accepted         | linked_qwen_0_6b | same_entity
+ pair-2     |             1 | cheap          | accepted         | linked_qwen_0_6b | different_entity
+```
+
+The user table stayed untouched. Otlet stored jobs, accepted outputs, rejected or failed attempts, receipts, and trace state under the `otlet` schema, keyed by the `subject_id` values from the source query. The full demo script also proves cheap-first model selection with Qwen3 0.6B and Qwen3 1.7B, worker batch drain, typed `entity_hypothesis` actions, automatic semantic materialization, semantic join lookup, and stale results after a source row update
 
 ## Docs
 

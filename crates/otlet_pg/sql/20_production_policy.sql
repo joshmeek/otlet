@@ -74,6 +74,38 @@ GROUP BY
   last_batch.detail,
   last_batch.created_at;
 
+CREATE VIEW otlet.model_selection_policy_status AS
+SELECT
+  p.task_name,
+  p.cheap_model_name,
+  p.strong_model_name,
+  cheap_q.queue_state AS cheap_queue_state,
+  cheap_q.queued_jobs AS cheap_queued_jobs,
+  cheap_q.running_jobs AS cheap_running_jobs,
+  p.created_at,
+  p.updated_at
+FROM otlet.model_selection_policies p
+LEFT JOIN otlet.model_queue_status cheap_q ON cheap_q.model_name = p.cheap_model_name;
+
+CREATE VIEW otlet.model_selection_status AS
+SELECT
+  p.task_name,
+  count(DISTINCT j.id)::bigint AS total_jobs,
+  count(DISTINCT j.id) FILTER (WHERE j.status = 'complete')::bigint AS complete_jobs,
+  count(DISTINCT j.id) FILTER (WHERE j.status = 'failed')::bigint AS failed_jobs,
+  count(r.id) FILTER (WHERE r.selection_role = 'cheap')::bigint AS cheap_attempts,
+  count(r.id) FILTER (WHERE r.selection_role = 'cheap' AND r.selection_status = 'accepted')::bigint AS cheap_accepted,
+  count(r.id) FILTER (WHERE r.selection_role = 'cheap' AND r.selection_status = 'rejected')::bigint AS cheap_rejected,
+  count(r.id) FILTER (WHERE r.selection_role = 'cheap' AND r.schema_validation_status = 'failed')::bigint AS cheap_schema_failed,
+  count(r.id) FILTER (WHERE r.selection_role = 'strong')::bigint AS strong_attempts,
+  count(r.id) FILTER (WHERE r.selection_role = 'strong' AND r.selection_status = 'accepted')::bigint AS strong_accepted,
+  count(r.id) FILTER (WHERE r.selection_role = 'strong' AND r.selection_status = 'failed')::bigint AS strong_failed,
+  count(DISTINCT r.job_id) FILTER (WHERE r.selection_role = 'strong')::bigint AS escalated_jobs
+FROM otlet.model_selection_policies p
+LEFT JOIN otlet.jobs j ON j.task_name = p.task_name
+LEFT JOIN otlet.inference_receipts r ON r.job_id = j.id
+GROUP BY p.task_name;
+
 CREATE VIEW otlet.production_status AS
 WITH queue AS (
   SELECT

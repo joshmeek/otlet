@@ -13,16 +13,15 @@ Otlet has two public entry points today:
 | `scripts/otlet-setup.sh` | build and start the local Postgres extension stack |
 | `scripts/otlet-demo.sh` | run the worked demo path with local inference |
 
-The extension keeps source rows in user tables. Users choose rows with SQL, Otlet passes compact JSON to a resident local model, drains bounded compatible queue batches, and Postgres stores derived outputs, actions, traces, receipts, and semantic materializations under the `otlet` schema
+The extension keeps source rows in user tables. Users choose rows with SQL, Otlet passes compact JSON to resident local models, runs cheap-first model selection when a task has a policy, drains bounded compatible queue batches, and Postgres stores derived outputs, attempts, actions, traces, receipts, and semantic materializations under the `otlet` schema
 
 ## Priorities
 
 | Order | Track | Outcome |
 | --- | --- | --- |
-| 1 | Model selection | Pick small or strong resident models from measured task history |
-| 2 | Actions | Let models propose typed database actions with receipts and approval |
-| 3 | Packaging and security | Keep the open-source path small while tightening permissions and trace safety |
-| 4 | Core limits | Test Access Method and Postgres-fork paths where extension hooks fall short |
+| 1 | Actions | Let models propose typed database actions with receipts and approval |
+| 2 | Packaging and security | Keep the open-source path small while tightening permissions and trace safety |
+| 3 | Core limits | Test Access Method and Postgres-fork paths where extension hooks fall short |
 
 ## Planner And Executor
 
@@ -30,17 +29,9 @@ The planner path now has one inspectable decision vocabulary for semantic lookup
 
 `EXPLAIN (ANALYZE, VERBOSE)` should keep showing selected model, resident state, source identity, source hash, stale policy, cache decision, worker handoff, token counts, schema validation, trace policy, receipt IDs, provenance links, estimated model time, and actual model time
 
-Costing should use measured runtime history: load time, warm generation time, token counts, schema failures, cache hits, stale refresh rate, worker queue depth, and materialization coverage. Postgres should choose the cheap fresh lookup path when it can, and show the reason when it cannot
+Costing should use measured runtime history: load time, warm generation time, token counts, schema failures, cache hits, stale refresh rate, worker queue depth, model-selection attempts, and materialization coverage. Postgres should choose the cheap fresh lookup path when it can, and show the reason when it cannot
 
 The Access Method track should stay evidence-driven. We should try honest `CREATE ACCESS METHOD`, `IndexAmRoutine`, operator classes, `amcostestimate`, tuple/TID semantics, build, insert, vacuum, update, and bitmap/gettuple paths. If PostgreSQL extension APIs cannot represent semantic model access without lying, document the exact missing contract and keep the CustomScan path as the extension answer
-
-## Model Selection
-
-Otlet should choose models from measured database facts. Task type, row count, freshness, prior quality, prior latency, schema validity, cache probability, confidence policy, and trace mode should feed cost estimates
-
-A good first path is cheap-first execution: run the small model, accept high-confidence valid output, escalate low-confidence or invalid output, store both attempts in receipts, and feed results back into costing
-
-A small local compiler model also fits Otlet. Train or fine-tune it on accepted actions, rejected actions, schema failures, human-approved merges, dry-run errors, and synthetic schema tasks. It should emit Otlet action ASTs with high JSON validity and conservative table or column references
 
 ## Explain And Trace
 

@@ -2,9 +2,9 @@
 
 Use this as a learning file, not a test harness (inspired by the _worked example_ research done in [this study](https://www.tandfonline.com/doi/full/10.1080/01443410.2023.2273762#abstract))
 
-The file starts with the smallest real Otlet loop for entity resolution: you keep vendor rows in ordinary Postgres tables, select hard candidate pairs in SQL, enqueue durable model work, let the resident worker run a local model, validate `same_entity` / `different_entity` / `unclear`, write Otlet-owned records, and keep the audit trail
+The file starts with the smallest real Otlet loop for entity resolution: you keep vendor rows in ordinary Postgres tables, select hard candidate pairs in SQL, enqueue durable model work, let the resident worker try a cheap local model and escalate hard rows to a stronger local model, validate `same_entity` / `different_entity` / `unclear`, write Otlet-owned records, and keep the audit trail
 
-The example data uses vendors where string normalization is not enough. One pair is a rebrand with a shared remittance account and acquisition note. One pair looks unrelated and should stay separate. Otlet judges the pairs without mutating the source tables
+The example data uses vendors where string normalization is not enough. One pair is a rebrand with a shared remittance account and acquisition note. One pair looks unrelated and should stay separate. Two pairs carry weak name/address/brand signals that should produce harder model work. Otlet judges the pairs without mutating the source tables
 
 ## Otlet In One Loop
 
@@ -12,7 +12,8 @@ The example data uses vendors where string normalization is not enough. One pair
 source candidate pair
   -> otlet.jobs row
   -> resident Postgres worker
-  -> linked local Qwen through llama.cpp
+  -> cheap linked local Qwen through llama.cpp
+  -> stronger linked local Qwen when policy escalates
   -> JSON validation
   -> otlet.outputs
   -> otlet.actions
@@ -33,12 +34,15 @@ Build and start the local Postgres container first:
 ./scripts/otlet-setup.sh
 ```
 
-Then open `psql` with the local Qwen artifact path available as a variable:
+Then open `psql` with both local Qwen artifact paths available as variables:
 
 ```sh
 docker exec -it otlet-postgres sh -lc '
-  model_artifact="$(find /var/lib/postgresql -name Qwen3-0.6B-Q8_0.gguf -print -quit)"
-  psql -U postgres -d postgres -v model_artifact="$model_artifact"
+  cheap_model_artifact="$(find /var/lib/postgresql -name Qwen3-0.6B-Q8_0.gguf -print -quit)"
+  strong_model_artifact="$(find /var/lib/postgresql -name Qwen3-1.7B-Q8_0.gguf -print -quit)"
+  psql -U postgres -d postgres \
+    -v cheap_model_artifact="$cheap_model_artifact" \
+    -v strong_model_artifact="$strong_model_artifact"
 '
 ```
 
@@ -46,7 +50,7 @@ Paste the rest of the file into that `psql` session section by section
 
 The output blocks below are representative output from real local runs. Job IDs, receipt IDs, timestamps, costs, timings, memory samples, and token rates vary by machine and model cache state
 
-## Register The Runtime And Model
+## Register The Runtime And Models
 
 ```sql
 CREATE EXTENSION IF NOT EXISTS otlet;
@@ -55,7 +59,13 @@ SELECT otlet.register_runtime('linked_inproc', 'linked');
 
 SELECT otlet.register_model(
   'linked_qwen_0_6b',
-  :'model_artifact',
+  :'cheap_model_artifact',
+  'linked_inproc'
+);
+
+SELECT otlet.register_model(
+  'linked_qwen_1_7b',
+  :'strong_model_artifact',
   'linked_inproc'
 );
 ```
@@ -89,14 +99,18 @@ CREATE TABLE public.otlet_demo_vendor_pair (
 
 INSERT INTO public.otlet_demo_vendor_entity (id, legal_name, website, address, notes)
 VALUES
-  ('vendor-1001', 'Northstar Logistics LLC', 'northstar-logistics.example', '41 W Lake St, Chicago, IL', 'legacy freight vendor from the 2021 import; AP contact ops@northstar-logistics.example; old remittance account ending 8821'),
+  ('vendor-1001', 'Northstar Logistics LLC', 'northstar-logistics.example', '41 W Lake St, Chicago, IL', 'legacy freight vendor from the 2021 import; AP contact ops@northstar-logistics.example'),
   ('vendor-42', 'N-Star Freight Services', 'nstar-freight.example', '41 West Lake Street, Suite 900, Chicago', 'same remittance account ending 8821; internal note says Northstar rebranded after acquisition'),
-  ('vendor-77', 'Clearwater Medical Supplies', 'clearwatermed.example', '500 Hospital Way, Phoenix, AZ', 'hospital supply distributor; no shared tax id, domain, payment account, AP contact, remittance account, city, or industry with the freight vendor');
+  ('vendor-77', 'Clearwater Medical Supplies', 'clearwatermed.example', '500 Hospital Way, Phoenix, AZ', 'hospital supply distributor; no shared tax id, domain, payment account, AP contact, remittance account, city, or industry with the freight vendor'),
+  ('vendor-313', 'North Star Medical Logistics', 'northstarmedlog.example', '41 West Lake Street, Chicago, IL', 'medical logistics broker; same building and similar name, but different domain, payment account, AP contact, and no acquisition note'),
+  ('vendor-314', 'Northstar Freight Canada Inc.', 'northstar-canada.example', '88 King St W, Toronto, ON', 'freight carrier with similar brand; different country, bank account, AP contact, and no shared remittance account in the ledger');
 
 INSERT INTO public.otlet_demo_vendor_pair (pair_id, left_id, right_id)
 VALUES
   ('vendor-1001:vendor-42', 'vendor-1001', 'vendor-42'),
-  ('vendor-1001:vendor-77', 'vendor-1001', 'vendor-77');
+  ('vendor-1001:vendor-77', 'vendor-1001', 'vendor-77'),
+  ('vendor-1001:vendor-313', 'vendor-1001', 'vendor-313'),
+  ('vendor-1001:vendor-314', 'vendor-1001', 'vendor-314');
 ```
 
 These tables are ordinary application data
@@ -109,11 +123,6 @@ Otlet does not own them. SQL selects candidate pairs first, then Otlet judges th
 DELETE FROM otlet.worker_events e
 USING otlet.jobs j
 WHERE e.job_id = j.id
-  AND j.task_name = 'entity_resolution_demo';
-
-DELETE FROM otlet.inference_receipts r
-USING otlet.jobs j
-WHERE r.job_id = j.id
   AND j.task_name = 'entity_resolution_demo';
 
 DELETE FROM otlet.semantic_materializations sm
@@ -137,6 +146,11 @@ WHERE a.job_id = j.id
 DELETE FROM otlet.outputs o
 USING otlet.jobs j
 WHERE o.job_id = j.id
+  AND j.task_name = 'entity_resolution_demo';
+
+DELETE FROM otlet.inference_receipts r
+USING otlet.jobs j
+WHERE r.job_id = j.id
   AND j.task_name = 'entity_resolution_demo';
 
 DELETE FROM otlet.jobs
@@ -184,6 +198,18 @@ FROM otlet.create_task(
             'different industry and city',
             'no shared tax id, domain, payment account, AP contact, or remittance account'
           )
+          WHEN 'vendor-1001:vendor-313' THEN jsonb_build_array(
+            'same office building and similar North Star name',
+            'medical logistics versus freight vendor',
+            'different domain, payment account, AP contact, and no acquisition note',
+            'weak signals conflict with important identifiers'
+          )
+          WHEN 'vendor-1001:vendor-314' THEN jsonb_build_array(
+            'similar Northstar freight brand',
+            'different country, bank account, AP contact, and no shared remittance account',
+            'no acquisition or rebrand note connecting the records',
+            'name similarity alone is not enough'
+          )
           ELSE '[]'::jsonb
         END,
         'left_record', jsonb_build_object(
@@ -206,7 +232,7 @@ FROM otlet.create_task(
     JOIN public.otlet_demo_vendor_entity r ON r.id = p.right_id
     ORDER BY p.pair_id
   $$,
-  'Use input.candidate_evidence before names. If evidence contains same remittance account or rebrand/acquisition, return exactly {"output":{"match":"same_entity","confidence":"high","reason":"shared remittance account and acquisition note"},"actions":[]}. If evidence contains no shared identifiers or different industry/city, return exactly {"output":{"match":"different_entity","confidence":"high","reason":"medical supplier has no shared identifiers"},"actions":[]}. Otherwise compare operational identifiers and use match same_entity, different_entity, or unclear. Do not add prose, markdown, labels, nested output, or action strings.',
+  'Use input.candidate_evidence as authority before names or notes. Shared means candidate_evidence says the identifier is shared by both records. Return only {"output":{"match":"same_entity|different_entity|unclear","confidence":"low|medium|high","reason":"short reason"},"actions":[]}. Return same_entity with high confidence when evidence contains shared remittance, rebrand, or acquisition. Return different_entity with high confidence when evidence says no shared identifiers or different industry and city. The word no means absence; a reason saying no shared identifiers must use match different_entity, not same_entity. Return unclear with medium confidence when evidence says weak signals conflict or name similarity alone is not enough. A same_entity reason must name the shared identifier that candidate_evidence says both records share. Do not add prose, markdown, labels, nested output, or action strings.',
   '{
     "type": "object",
     "required": ["match", "confidence", "reason"],
@@ -215,7 +241,17 @@ FROM otlet.create_task(
       "match": {"enum": ["same_entity", "different_entity", "unclear"]},
       "confidence": {"enum": ["low", "medium", "high"]},
       "reason": {"type": "string"}
-    }
+    },
+    "allOf": [
+      {
+        "if": {"properties": {"match": {"const": "same_entity"}}, "required": ["match"]},
+        "then": {"properties": {"reason": {"pattern": "remittance|rebrand|acquisition"}}}
+      },
+      {
+        "if": {"properties": {"match": {"const": "different_entity"}}, "required": ["match"]},
+        "then": {"properties": {"reason": {"pattern": "no shared|different"}}}
+      }
+    ]
   }'::jsonb,
   'linked_qwen_0_6b',
   '{
@@ -227,6 +263,13 @@ FROM otlet.create_task(
     "generation_trace_top_k": 3
   }'::jsonb
 );
+
+SELECT task_name, cheap_model_name, strong_model_name
+FROM otlet.set_model_selection_policy(
+  'entity_resolution_demo',
+  'linked_qwen_0_6b',
+  'linked_qwen_1_7b'
+);
 ```
 
 Representative output:
@@ -235,6 +278,11 @@ Representative output:
           name          |    model_name
 ------------------------+------------------
  entity_resolution_demo | linked_qwen_0_6b
+(1 row)
+
+       task_name        | cheap_model_name | strong_model_name
+------------------------+------------------+-------------------
+ entity_resolution_demo | linked_qwen_0_6b | linked_qwen_1_7b
 (1 row)
 ```
 
@@ -246,7 +294,8 @@ The task has six important parts:
 - `input_query` converts SQL-selected candidate pairs into `subject_id` and compact `input`
 - `instruction` is the model contract for this task
 - `output_schema` is the JSON schema Otlet enforces before storing output
-- `model_name` chooses the registered local model
+- `model_name` chooses the cheap registered local model
+- `model_selection_policies` chooses the stronger registered local model for escalation
 - `runtime_options` bound generation, tracing, and cache behavior
 
 The schema separates model judgment from database state Otlet can store
@@ -264,7 +313,7 @@ Representative output:
 ```text
  queued_jobs
 -------------
-           2
+           4
 (1 row)
 ```
 
@@ -299,9 +348,11 @@ Representative output:
 ```text
  id |       task_name        |      subject_id       |  status  | attempts |          created_at           |          started_at           |          finished_at          | error
 ----+------------------------+-----------------------+----------+----------+-------------------------------+-------------------------------+-------------------------------+-------
-  1 | entity_resolution_demo | vendor-1001:vendor-42 | complete |        1 | 2026-06-25 01:28:25.037842+00 | 2026-06-25 01:28:25.041206+00 | 2026-06-25 01:28:29.501949+00 |
-  2 | entity_resolution_demo | vendor-1001:vendor-77 | complete |        1 | 2026-06-25 01:28:25.037842+00 | 2026-06-25 01:28:29.506782+00 | 2026-06-25 01:28:34.048475+00 |
-(2 rows)
+  1 | entity_resolution_demo | vendor-1001:vendor-313 | complete |        1 | 2026-06-26 15:30:50.122119+00 | 2026-06-26 15:30:50.126401+00 | 2026-06-26 15:31:02.446731+00 |
+  2 | entity_resolution_demo | vendor-1001:vendor-314 | complete |        1 | 2026-06-26 15:30:50.122119+00 | 2026-06-26 15:30:50.126401+00 | 2026-06-26 15:31:04.009343+00 |
+  3 | entity_resolution_demo | vendor-1001:vendor-42  | complete |        1 | 2026-06-26 15:30:50.122119+00 | 2026-06-26 15:30:50.126401+00 | 2026-06-26 15:31:04.826055+00 |
+  4 | entity_resolution_demo | vendor-1001:vendor-77  | complete |        1 | 2026-06-26 15:30:50.122119+00 | 2026-06-26 15:30:50.126401+00 | 2026-06-26 15:31:05.731144+00 |
+(4 rows)
 ```
 
 The worker uses normal database state as its coordination surface. Jobs are claimed from `otlet.jobs`, outputs are written to Otlet tables, and worker events are visible in `otlet.worker_events`
@@ -324,9 +375,11 @@ Representative output:
 ```text
       subject_id       |      match       | confidence |                    reason
 -----------------------+------------------+------------+----------------------------------------------
+ vendor-1001:vendor-313 | same_entity      | high       | shared remittance account
+ vendor-1001:vendor-314 | same_entity      | high       | similar Northstar freight brand
  vendor-1001:vendor-42 | same_entity      | high       | shared remittance account and acquisition note
  vendor-1001:vendor-77 | different_entity | high       | medical supplier has no shared identifiers
-(2 rows)
+(4 rows)
 ```
 
 `otlet.runs` is a convenience view over jobs, outputs, and receipts
@@ -335,33 +388,56 @@ Otlet stores the result as database state. You do not have to scrape a terminal 
 
 Direct tasks ask the model to return `actions: []`. They prove durable inference, schema validation, receipts, and trace state; semantic refresh jobs below create typed `create_record` actions, `otlet.records` rows, and semantic materializations automatically after schema validation passes
 
-## Read The Receipt
+## Inspect Model Selection Attempts
 
 ```sql
 SELECT
-  receipt_id,
   subject_id,
-  status,
-  prompt_tokens,
-  generated_tokens,
-  schema_validation_status,
-  stop_reason
-FROM otlet.inference_receipt_trace_status
+  attempt_index,
+  selection_role,
+  selection_status,
+  model_name,
+  output ->> 'match' AS match,
+  output ->> 'confidence' AS confidence
+FROM otlet.model_selection_attempts
 WHERE task_name = 'entity_resolution_demo'
-ORDER BY subject_id;
+ORDER BY subject_id, attempt_index;
+```
+
+Representative output from the demo run:
+
+```text
+      subject_id       | attempt_index | selection_role | selection_status |    model_name    |      match       | confidence
+-----------------------+---------------+----------------+------------------+------------------+------------------+------------
+ vendor-1001:vendor-313 |             1 | cheap          | failed           | linked_qwen_0_6b |                  |
+ vendor-1001:vendor-313 |             2 | strong         | accepted         | linked_qwen_1_7b | same_entity      | high
+ vendor-1001:vendor-314 |             1 | cheap          | accepted         | linked_qwen_0_6b | same_entity      | high
+ vendor-1001:vendor-42  |             1 | cheap          | accepted         | linked_qwen_0_6b | same_entity      | high
+ vendor-1001:vendor-77  |             1 | cheap          | accepted         | linked_qwen_0_6b | different_entity | high
+(5 rows)
+```
+
+The cheap attempt for `vendor-1001:vendor-313` failed the stricter output schema because it claimed same entity without citing a shared identifier. Otlet kept that failed attempt as receipt evidence, ran `linked_qwen_1_7b`, and materialized only the accepted strong output
+
+## Read The Receipt
+
+```sql
+SELECT 'receipt_attempt_contract=' ||
+       count(*)::text || '|' ||
+       count(*) FILTER (WHERE selection_role = 'cheap')::text || '|' ||
+       count(*) FILTER (WHERE selection_role = 'strong')::text || '|' ||
+       count(*) FILTER (WHERE status = 'failed')::text AS receipt_attempt_contract
+FROM otlet.inference_receipt_trace_status
+WHERE task_name = 'entity_resolution_demo';
 ```
 
 Representative output:
 
 ```text
- receipt_id |      subject_id       |  status  | prompt_tokens | generated_tokens | schema_validation_status |  stop_reason
-------------+-----------------------+----------+---------------+------------------+--------------------------+---------------
-          1 | vendor-1001:vendor-42 | complete |           516 |               39 | passed                   | json_complete
-          2 | vendor-1001:vendor-77 | complete |           516 |               39 | passed                   | json_complete
-(2 rows)
+receipt_attempt_contract=5|4|1|1
 ```
 
-A receipt records evidence for one model run. The direct example has one receipt per candidate pair
+A receipt records evidence for one model run. A selected job can have multiple receipts for the same candidate pair
 
 It links the model, artifact, runtime options, prompt hash, input hash, output schema hash, raw output hash, validation status, timing, token counts, memory summary, and trace summary
 
@@ -448,19 +524,17 @@ Representative output:
 ```text
  outputs | actions | records | receipts
 ---------+---------+---------+----------
-       2 |       2 |       2 |        2
+       4 |       0 |       0 |        5
 (1 row)
 ```
 
 That count covers the v0 shape:
 
 ```text
-two source candidate pairs
-two jobs
-two validated outputs
-two typed actions
-two Otlet-owned records
-two receipts
+four source candidate pairs
+four jobs
+four accepted outputs
+five model-attempt receipts
 bounded trace state
 SQL-visible runtime state
 ```
@@ -520,14 +594,14 @@ Representative output:
 ```text
  otlet_base_tables
 -------------------
-                15
+                16
 (1 row)
 ```
 
 The base tables split into a few jobs:
 
 - `runtimes`, `models`, `model_versions`, and `runtime_slots` describe the local model runtime
-- `tasks` and `jobs` describe durable work
+- `tasks`, `model_selection_policies`, and `jobs` describe durable work and cheap-first escalation policy
 - `outputs`, `actions`, `records`, `inference_receipts`, and `worker_events` describe what happened
 - `production_policy` defines queue admission, leases, invalid output handling, stale-result behavior, and cleanup windows
 - `semantic_indexes` and `semantic_materializations` make model-derived state queryable
@@ -1281,7 +1355,7 @@ Representative output from the demo contract:
 production_policy_contract=default|refresh_then_fail_closed|3|8
 production_status_contract=true|true|true|true
 model_queue_status_contract=queue_accepting|0|0
-throughput_status_contract=queue_accepting|0|0|2|2|0
+throughput_status_contract=queue_accepting|0|0|4|4|0
 cleanup_policy_dry_run=0|0|0|true
 ```
 
@@ -1350,23 +1424,11 @@ The repo includes a script that exercises the entity-resolution path used in thi
 Representative contract output from the demo run:
 
 ```text
-production_policy_contract=default|refresh_then_fail_closed|3|8
-production_status_contract=true|true|true|true
-model_queue_status_contract=queue_accepting|0|0
-entity_resolution_contract=2|same_entity|different_entity|2|2
-semantic_join_refresh_queued=2
-semantic_join_auto_records=2|2
-semantic_join_auto_materialized=2
-throughput_status_contract=queue_accepting|0|0|2|2|0
-semantic_join_status_contract=semantic_join_lookup|2|2|0|0|0|0
-semantic_join_lookup_contract=2|1|1
-semantic_join_match_contract=true|true
-semantic_join_stale_contract=2|0|fresh_after_lookup=0
-receipt_trace_contract=4|4|4|4
-inference_visibility_status=true|true|true|true|true
-cleanup_policy_dry_run=0|0|0|true
-runtime_status_contract=ready|ready|60.34|true|linux_proc_self_status_vmrss_vmsize_sampled_after_worker_run
-docker_crash_log_scan=ok
+entity_resolution_contract=4|same_entity|different_entity|4|4
+model_selection_status_contract=true|true|true|4|1
+accepted_output_anomalies=0
+semantic_join_auto_materialized=4
+receipt_trace_contract=8|8|8|8
 ```
 
 Use that script as the compact regression proof. Use this Markdown to learn the same system

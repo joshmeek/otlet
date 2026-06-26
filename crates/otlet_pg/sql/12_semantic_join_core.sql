@@ -221,7 +221,7 @@ BEGIN
         %4$L,
         j.subject_id,
         j.task_name,
-        t.model_name,
+        ar.model_name,
         r.body,
         false,
         md5(j.input::text),
@@ -229,7 +229,8 @@ BEGIN
       FROM otlet.records r
       JOIN otlet.actions a ON a.id = r.action_id
       JOIN latest_jobs j ON j.id = a.job_id
-      JOIN otlet.tasks t ON t.name = j.task_name
+      JOIN otlet.outputs o ON o.id = a.output_id
+      JOIN otlet.inference_receipts ar ON ar.id = o.receipt_id
       WHERE r.record_type = %5$L
       ON CONFLICT (record_id) DO UPDATE
         SET record_type = EXCLUDED.record_type,
@@ -323,7 +324,7 @@ BEGIN
         %5$L,
         j.subject_id,
         j.task_name,
-        t.model_name,
+        ar.model_name,
         r.body,
         false,
         md5(j.input::text),
@@ -331,7 +332,8 @@ BEGIN
       FROM otlet.records r
       JOIN otlet.actions a ON a.id = r.action_id
       JOIN latest_jobs j ON j.id = a.job_id
-      JOIN otlet.tasks t ON t.name = j.task_name
+      JOIN otlet.outputs o ON o.id = a.output_id
+      JOIN otlet.inference_receipts ar ON ar.id = o.receipt_id
       WHERE r.record_type = %6$L
       ON CONFLICT (record_id) DO UPDATE
         SET record_type = EXCLUDED.record_type,

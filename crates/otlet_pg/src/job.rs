@@ -1,6 +1,7 @@
 use pgrx::JsonB;
 use serde_json::Value;
 
+#[derive(Clone)]
 pub(crate) struct Job {
     pub(crate) id: i64,
     pub(crate) task_name: String,
@@ -14,6 +15,32 @@ pub(crate) struct Job {
     pub(crate) runtime_name: String,
     pub(crate) runtime_endpoint: String,
     pub(crate) runtime_options: Value,
+}
+
+pub(crate) struct JobModel {
+    pub(crate) name: String,
+    pub(crate) artifact_path: String,
+    pub(crate) artifact_hash: Option<String>,
+    pub(crate) runtime_name: String,
+    pub(crate) runtime_endpoint: String,
+}
+
+pub(crate) struct ModelSelectionPolicy {
+    pub(crate) cheap: JobModel,
+    pub(crate) strong: JobModel,
+}
+
+impl Job {
+    pub(crate) fn with_model(&self, model: &JobModel) -> Self {
+        Self {
+            artifact_path: model.artifact_path.clone(),
+            artifact_hash: model.artifact_hash.clone(),
+            model_name: model.name.clone(),
+            runtime_name: model.runtime_name.clone(),
+            runtime_endpoint: model.runtime_endpoint.clone(),
+            ..self.clone()
+        }
+    }
 }
 
 macro_rules! required_col {
@@ -131,5 +158,58 @@ JOIN otlet.runtimes r ON r.name = m.runtime_name
 
         let row = rows.first();
         Ok(Some(job_from_row!(row)))
+    })
+}
+
+pub(crate) fn model_selection_policy(
+    task_name: &str,
+) -> pgrx::spi::Result<Option<ModelSelectionPolicy>> {
+    pgrx::Spi::connect(|client| {
+        let args = [task_name.into()];
+        let rows = client.select(
+            r#"
+SELECT
+  cheap.name,
+  cheap.artifact_path,
+  cheap.artifact_hash,
+  cheap.runtime_name,
+  cheap_runtime.endpoint,
+  strong.name,
+  strong.artifact_path,
+  strong.artifact_hash,
+  strong.runtime_name,
+  strong_runtime.endpoint
+FROM otlet.model_selection_policies p
+JOIN otlet.models cheap ON cheap.name = p.cheap_model_name
+JOIN otlet.runtimes cheap_runtime ON cheap_runtime.name = cheap.runtime_name
+JOIN otlet.models strong ON strong.name = p.strong_model_name
+JOIN otlet.runtimes strong_runtime ON strong_runtime.name = strong.runtime_name
+WHERE p.task_name = $1
+"#,
+            Some(1),
+            &args,
+        )?;
+
+        if rows.is_empty() {
+            return Ok(None);
+        }
+
+        let row = rows.first();
+        Ok(Some(ModelSelectionPolicy {
+            cheap: JobModel {
+                name: required_col!(row, String, 1),
+                artifact_path: required_col!(row, String, 2),
+                artifact_hash: row.get::<String>(3)?,
+                runtime_name: required_col!(row, String, 4),
+                runtime_endpoint: required_col!(row, String, 5),
+            },
+            strong: JobModel {
+                name: required_col!(row, String, 6),
+                artifact_path: required_col!(row, String, 7),
+                artifact_hash: row.get::<String>(8)?,
+                runtime_name: required_col!(row, String, 9),
+                runtime_endpoint: required_col!(row, String, 10),
+            },
+        }))
     })
 }
