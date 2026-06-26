@@ -12,6 +12,27 @@ The demo task reads `public.otlet_demo_vendor_pair`, joins each side to `public.
 
 Otlet asks the resident worker for `same_entity`, `different_entity`, or `unclear`, with confidence and a reason. The task starts with Qwen3 0.6B and escalates hard rows to Qwen3 1.7B. The model can propose typed actions like `merge_candidate` or `new_entity`; source rows stay untouched
 
+The task input looks like this:
+
+```sql
+SELECT
+  subject_id,
+  input #>> '{left_record,legal_name}' AS left_name,
+  input #>> '{right_record,legal_name}' AS right_name,
+  input #>> '{candidate_evidence,0}' AS first_evidence
+FROM public.otlet_demo_vendor_pair_input
+ORDER BY subject_id
+LIMIT 3;
+```
+
+```text
+       subject_id       |        left_name        |          right_name           |                  first_evidence
+------------------------+-------------------------+-------------------------------+--------------------------------------------------
+ vendor-1001:vendor-313 | Northstar Logistics LLC | North Star Medical Logistics  | same office building and similar North Star name
+ vendor-1001:vendor-314 | Northstar Logistics LLC | Northstar Freight Canada Inc. | similar Northstar freight brand
+ vendor-1001:vendor-42  | Northstar Logistics LLC | N-Star Freight Services       | same remittance account ending 8821
+```
+
 ```sql
 SELECT otlet.run_task('entity_resolution_demo') AS queued_jobs;
 
@@ -87,6 +108,33 @@ ORDER BY action_type;
 -----------------+----------+-----------------+---------
  merge_candidate | proposed | required        |       1
  new_entity      | proposed | not_required    |       3
+```
+
+Postgres can inspect each model attempt, schema result, token count, bounded trace, and output hash:
+
+```sql
+SELECT
+  subject_id,
+  selection_role,
+  status,
+  schema_validation_status AS schema,
+  prompt_tokens,
+  generated_tokens,
+  detailed_trace_captured_tokens AS traced_tokens,
+  left(receipt_raw_output_hash, 8) AS output_hash
+FROM otlet.inference_receipt_trace_status
+WHERE task_name = 'entity_resolution_demo'
+ORDER BY subject_id, attempt_index
+LIMIT 4;
+```
+
+```text
+       subject_id       | selection_role |  status  | schema | prompt_tokens | generated_tokens | traced_tokens | output_hash
+------------------------+----------------+----------+--------+---------------+------------------+---------------+-------------
+ vendor-1001:vendor-313 | cheap          | failed   | failed |           801 |              139 |            16 | 8e564078
+ vendor-1001:vendor-313 | strong         | complete | passed |           801 |               66 |            16 | 66f14495
+ vendor-1001:vendor-314 | cheap          | failed   | failed |           806 |              192 |            16 | 908d9787
+ vendor-1001:vendor-314 | strong         | complete | passed |           806 |               66 |            16 | 096a78cd
 ```
 
 Source rows stayed in `public.otlet_demo_vendor_entity`. Otlet stored jobs, accepted outputs, failed attempts, receipts, trace state, and typed actions under `otlet`
