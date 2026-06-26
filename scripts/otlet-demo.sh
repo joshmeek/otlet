@@ -627,13 +627,14 @@ echo "receipt_trace_contract=$trace_contract"
 }
 
 visibility_status="$(psql_value "
-SELECT (receipt_count > 0)::text || '|' ||
-       (token_steps > 0)::text || '|' ||
-       (top_k_alternatives > 0)::text || '|' ||
-       (max_detailed_trace_tokens > 0)::text || '|' ||
-       (max_detailed_trace_top_k = 3)::text
-FROM otlet.inference_visibility_status
-LIMIT 1;
+SELECT (count(*) > 0)::text || '|' ||
+       (COALESCE(sum(detailed_trace_captured_tokens), 0) > 0)::text || '|' ||
+       (COALESCE(sum(detailed_trace_captured_tokens * detailed_trace_top_k), 0) > 0)::text || '|' ||
+       (COALESCE(max(detailed_trace_max_tokens), 0) > 0)::text || '|' ||
+       (COALESCE(max(detailed_trace_top_k), 0) = 3)::text
+FROM otlet.inference_receipt_trace_status
+WHERE task_name IN ('$entity_task', '$join_task')
+  AND status = 'complete';
 ")"
 echo "inference_visibility_status=$visibility_status"
 require_contains "$visibility_status" "true|true|true|true|true" "Expected bounded token/top-k trace visibility counters"
