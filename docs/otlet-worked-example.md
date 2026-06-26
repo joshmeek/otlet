@@ -17,12 +17,13 @@ source candidate pair
   -> otlet.outputs
   -> otlet.actions
   -> otlet.records
+  -> otlet.semantic_materializations
   -> otlet.inference_receipts
 ```
 
 Otlet keeps Postgres as the system of record
 
-The model does not get direct write access to user tables. It receives bounded pair-shaped input and returns structured JSON. Otlet validates that JSON before storing it. The demo then records a typed `create_record` action from the validated output so downstream semantic state is queryable from SQL
+The model does not get direct write access to user tables. It receives bounded pair-shaped input and returns structured JSON. Otlet validates that JSON before storing it. Semantic refresh jobs then create Otlet-owned `create_record` actions, records, and materialized semantic rows from the validated output so downstream SQL can read fresh state without another manual step
 
 ## Start From A Running Local Otlet
 
@@ -332,107 +333,7 @@ Representative output:
 
 Otlet stores the result as database state. You do not have to scrape a terminal response
 
-## Record And Inspect Typed Actions
-
-The local demo asks the model to return `actions: []` and keeps nested action JSON out of the model contract. After schema validation passes, SQL records a typed `create_record` action from each validated output:
-
-```sql
-WITH run_rows AS (
-  SELECT job_id, output_id, subject_id, input, output
-  FROM otlet.runs
-  WHERE task_name = 'entity_resolution_demo'
-    AND status = 'complete'
-),
-payloads AS (
-  SELECT
-    job_id,
-    output_id,
-    jsonb_build_object(
-      'type', 'create_record',
-      'record_type', 'entity_hypothesis',
-      'subject_id', subject_id,
-      'body', jsonb_build_object(
-        'pair_id', subject_id,
-        'left_id', input ->> 'left_id',
-        'right_id', input ->> 'right_id',
-        'match', output -> 'match',
-        'confidence', output -> 'confidence',
-        'reason', output -> 'reason'
-      )
-    ) AS payload
-  FROM run_rows
-),
-inserted_actions AS (
-  INSERT INTO otlet.actions (job_id, output_id, action_type, payload, status)
-  SELECT job_id, output_id, 'create_record', payload, 'complete'
-  FROM payloads
-  RETURNING id, payload
-)
-INSERT INTO otlet.records (action_id, record_type, subject_id, body)
-SELECT
-  id,
-  payload ->> 'record_type',
-  payload ->> 'subject_id',
-  payload -> 'body'
-FROM inserted_actions;
-```
-
-This gives downstream SQL the same action and record trail as a model-returned `create_record`, but the model only has to return the strict entity-resolution output
-
-```sql
-SELECT
-  a.action_type,
-  a.status,
-  a.payload
-FROM otlet.actions a
-JOIN otlet.jobs j ON j.id = a.job_id
-WHERE j.task_name = 'entity_resolution_demo'
-ORDER BY j.subject_id;
-```
-
-Representative output:
-
-```text
- action_type   |  status  |                                                                                                    payload
----------------+----------+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
- create_record | complete | {"body": {"match": "same_entity", "reason": "shared remittance account and acquisition note", "left_id": "vendor-1001", "pair_id": "vendor-1001:vendor-42", "right_id": "vendor-42", "confidence": "high"}, "type": "create_record", "subject_id": "vendor-1001:vendor-42", "record_type": "entity_hypothesis"}
- create_record | complete | {"body": {"match": "different_entity", "reason": "medical supplier has no shared identifiers", "left_id": "vendor-1001", "pair_id": "vendor-1001:vendor-77", "right_id": "vendor-77", "confidence": "high"}, "type": "create_record", "subject_id": "vendor-1001:vendor-77", "record_type": "entity_hypothesis"}
-(2 rows)
-```
-
-Otlet keeps the action vocabulary narrow
-
-The example records `create_record`. It writes internal Otlet records and leaves `public.otlet_demo_vendor_entity` alone
-
-That gives v0 a useful write path without granting broad write authority to the model
-
-## Inspect The Otlet-Owned Record
-
-```sql
-SELECT
-  rec.record_type,
-  rec.subject_id,
-  rec.body
-FROM otlet.records rec
-JOIN otlet.actions a ON a.id = rec.action_id
-JOIN otlet.jobs j ON j.id = a.job_id
-WHERE j.task_name = 'entity_resolution_demo'
-ORDER BY rec.subject_id;
-```
-
-Representative output:
-
-```text
-    record_type    |      subject_id       |                                                                                         body
--------------------+-----------------------+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
- entity_hypothesis | vendor-1001:vendor-42 | {"match": "same_entity", "reason": "shared remittance account and acquisition note", "left_id": "vendor-1001", "pair_id": "vendor-1001:vendor-42", "right_id": "vendor-42", "confidence": "high"}
- entity_hypothesis | vendor-1001:vendor-77 | {"match": "different_entity", "reason": "medical supplier has no shared identifiers", "left_id": "vendor-1001", "pair_id": "vendor-1001:vendor-77", "right_id": "vendor-77", "confidence": "high"}
-(2 rows)
-```
-
-Otlet turns fuzzy model judgment into typed database state here
-
-The source rows remain source data. The Otlet record is a derived fact with provenance back to a job, action, output, model, prompt hash, input hash, schema hash, and receipt
+Direct tasks ask the model to return `actions: []`. They prove durable inference, schema validation, receipts, and trace state; semantic refresh jobs below create typed `create_record` actions, `otlet.records` rows, and semantic materializations automatically after schema validation passes
 
 ## Read The Receipt
 
@@ -1250,7 +1151,7 @@ FROM otlet.create_semantic_join_index(
     FROM public.learning_entity a
     JOIN public.learning_entity b ON a.id < b.id
   $$,
-  'The two input entities are the same company. Return exactly this JSON object: {"output":{"match":"yes","confidence":0.95,"needs_review":false},"actions":[{"type":"create_record","record_type":"learning_entity_pair","subject_id":"1:2","body":{"match":"yes","confidence":0.95,"reason":"same phone and city"}}]}',
+  'The two input entities are the same company. Return exactly this JSON object: {"output":{"match":"yes","confidence":0.95,"needs_review":false},"actions":[]}',
   '{"type":"object","required":["match","confidence","needs_review"],"additionalProperties":false,"properties":{"match":{"enum":["yes"]},"confidence":{"type":"number"},"needs_review":{"type":"boolean"}}}'::jsonb,
   'linked_qwen_0_6b',
   'learning_entity_pair',
@@ -1260,38 +1161,17 @@ FROM otlet.create_semantic_join_index(
 
 SELECT 'semantic_join_refresh_queued=' ||
        otlet.refresh_semantic_join_index('learning_entity_pair_idx')::text;
+```
 
-DO $$
-DECLARE
-  active_jobs bigint;
-  complete_jobs bigint;
-  failed_jobs bigint;
-BEGIN
-  FOR i IN 1..180 LOOP
-    SELECT
-      count(*) FILTER (WHERE status IN ('queued','running','cancel_requested')),
-      count(*) FILTER (WHERE status = 'complete'),
-      count(*) FILTER (WHERE status IN ('failed','canceled'))
-    INTO active_jobs, complete_jobs, failed_jobs
-    FROM otlet.jobs
-    WHERE task_name = 'learning_entity_pair_idx_task';
+Wait for the worker the same way the semantic index section does, or run `./scripts/otlet-demo.sh` for the compact proof. Then inspect the automatic materialization:
 
-    IF failed_jobs > 0 THEN
-      RAISE EXCEPTION 'semantic join refresh failed';
-    END IF;
-
-    IF complete_jobs >= 1 AND active_jobs = 0 THEN
-      RETURN;
-    END IF;
-
-    PERFORM pg_sleep(1);
-  END LOOP;
-
-  RAISE EXCEPTION 'timed out waiting for semantic join refresh';
-END $$;
-
-SELECT 'semantic_join_materialized=' ||
-       otlet.materialize_semantic_join_index('learning_entity_pair_idx')::text;
+```sql
+SELECT 'semantic_join_auto_materialized=' ||
+       count(*)::text AS semantic_join_auto_materialized
+FROM otlet.semantic_materializations
+WHERE task_name = 'learning_entity_pair_idx_task'
+  AND record_type = 'learning_entity_pair'
+  AND stale = false;
 ```
 
 Representative output:
@@ -1299,7 +1179,7 @@ Representative output:
 ```text
 semantic_join_create_contract=learning_entity_pair_idx|learning_entity_pair_idx_task|learning_entity_pair|10
 semantic_join_refresh_queued=1
-semantic_join_materialized=1
+semantic_join_auto_materialized=1
 ```
 
 Now inspect the join index:
@@ -1393,35 +1273,15 @@ The value reports a ready runtime, a ready model slot, bounded cache entries, an
 
 ## Inspect Production Policy
 
-The production policy row and status views are ordinary SQL state under `otlet`
-
-```sql
-SELECT name || '|' || stale_policy || '|' || max_attempts::text
-FROM otlet.production_policy_status;
-
-SELECT no_expired_running_jobs::text || '|' ||
-       completed_jobs_are_schema_validated::text || '|' ||
-       cache_within_bounds::text || '|' ||
-       trace_within_bounds::text
-FROM otlet.production_status;
-
-SELECT queue_state || '|' || queued_jobs::text || '|' || running_jobs::text
-FROM otlet.model_queue_status
-WHERE model_name = 'linked_qwen_0_6b';
-
-SELECT worker_events::text || '|' ||
-       token_trace_rows::text || '|' ||
-       token_alternative_rows::text || '|' ||
-       dry_run::text
-FROM otlet.cleanup_policy_state(true);
-```
+The production policy row and status views are ordinary SQL state under `otlet`: `production_policy_status`, `production_status`, `model_queue_status`, `worker_throughput_status`, and `cleanup_policy_state(true)`
 
 Representative output from the demo contract:
 
 ```text
-production_policy_contract=default|refresh_then_fail_closed|3
+production_policy_contract=default|refresh_then_fail_closed|3|8
 production_status_contract=true|true|true|true
 model_queue_status_contract=queue_accepting|0|0
+throughput_status_contract=queue_accepting|0|0|2|2|0
 cleanup_policy_dry_run=0|0|0|true
 ```
 
@@ -1490,17 +1350,17 @@ The repo includes a script that exercises the entity-resolution path used in thi
 Representative contract output from the demo run:
 
 ```text
-production_policy_contract=default|refresh_then_fail_closed|3
+production_policy_contract=default|refresh_then_fail_closed|3|8
 production_status_contract=true|true|true|true
 model_queue_status_contract=queue_accepting|0|0
-entity_resolution_contract=2|same_entity|different_entity|2|2|2|2
-entity_resolution_materialized=2
+entity_resolution_contract=2|same_entity|different_entity|2|2
 semantic_join_refresh_queued=2
-semantic_join_materialized=2
-semantic_join_status_contract=semantic_join_lookup|2|2|0|0
+semantic_join_auto_records=2|2
+semantic_join_auto_materialized=2
+throughput_status_contract=queue_accepting|0|0|2|2|0
+semantic_join_status_contract=semantic_join_lookup|2|2|0|0|0|0
 semantic_join_lookup_contract=2|1|1
 semantic_join_match_contract=true|true
-entity_resolution_stale_materializations=2
 semantic_join_stale_contract=2|0|fresh_after_lookup=0
 receipt_trace_contract=4|4|4|4
 inference_visibility_status=true|true|true|true|true

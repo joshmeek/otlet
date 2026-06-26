@@ -1,28 +1,41 @@
 -- Atomic queue claim for the resident worker; returns zero rows when no work exists
-CREATE FUNCTION otlet.claim_job() RETURNS SETOF otlet.jobs
+CREATE FUNCTION otlet.claim_jobs() RETURNS SETOF otlet.jobs
 LANGUAGE sql
 AS $$
-  WITH next_job AS (
-    SELECT j.id
+  WITH policy AS (
+    SELECT
+      worker_claim_batch_size AS batch_size,
+      max_attempts,
+      job_lease_interval
+    FROM otlet.production_policy
+  ),
+  active_model AS (
+    SELECT
+      t.model_name,
+      count(*) FILTER (
+        WHERE j.status = 'running'
+          AND (j.leased_until IS NULL OR j.leased_until >= now())
+      ) AS running_jobs,
+      count(*) FILTER (
+        WHERE j.status = 'cancel_requested'
+          AND j.leased_until >= now()
+      ) AS cancel_requested_jobs
+    FROM otlet.jobs j
+    JOIN otlet.tasks t ON t.name = j.task_name
+    GROUP BY t.model_name
+  ),
+  first_job AS (
+    SELECT
+      j.id,
+      j.task_name,
+      m.name AS model_name,
+      m.runtime_name,
+      m.artifact_path
     FROM otlet.jobs j
     JOIN otlet.tasks t ON t.name = j.task_name
     JOIN otlet.models m ON m.name = t.model_name
-    CROSS JOIN otlet.production_policy p
-    LEFT JOIN (
-      SELECT
-        t.model_name,
-        count(*) FILTER (
-          WHERE j.status = 'running'
-            AND (j.leased_until IS NULL OR j.leased_until >= now())
-        ) AS running_jobs,
-        count(*) FILTER (
-          WHERE j.status = 'cancel_requested'
-            AND j.leased_until >= now()
-        ) AS cancel_requested_jobs
-      FROM otlet.jobs j
-      JOIN otlet.tasks t ON t.name = j.task_name
-      GROUP BY t.model_name
-    ) active_model ON active_model.model_name = m.name
+    CROSS JOIN policy p
+    LEFT JOIN active_model ON active_model.model_name = m.name
     LEFT JOIN otlet.runtime_slots s
       ON s.runtime_name = m.runtime_name
      AND s.model_name = m.name
@@ -49,19 +62,53 @@ AS $$
       j.id
     FOR UPDATE OF j SKIP LOCKED
     LIMIT 1
+  ),
+  claimable AS (
+    SELECT j.id
+    FROM otlet.jobs j
+    JOIN otlet.tasks t ON t.name = j.task_name
+    JOIN otlet.models m ON m.name = t.model_name
+    JOIN first_job f
+      ON f.task_name = j.task_name
+     AND f.model_name = m.name
+     AND f.runtime_name = m.runtime_name
+     AND f.artifact_path IS NOT DISTINCT FROM m.artifact_path
+    CROSS JOIN policy p
+    WHERE (
+        j.status = 'queued'
+        OR (
+          j.status = 'running'
+          AND j.leased_until < now()
+          AND j.attempts < p.max_attempts
+        )
+        OR (
+          j.status = 'cancel_requested'
+          AND (j.leased_until IS NULL OR j.leased_until < now())
+        )
+      )
+    ORDER BY
+      CASE WHEN j.id = f.id THEN 0 ELSE 1 END,
+      CASE WHEN j.status IN ('running', 'cancel_requested') AND (j.leased_until IS NULL OR j.leased_until < now()) THEN 0 ELSE 1 END,
+      j.created_at,
+      j.id
+    FOR UPDATE OF j SKIP LOCKED
+    LIMIT (SELECT batch_size FROM policy)
+  ),
+  updated AS (
+    UPDATE otlet.jobs j
+    SET status = CASE WHEN j.status = 'cancel_requested' THEN 'cancel_requested' ELSE 'running' END,
+        attempts = attempts + 1,
+        leased_until = now() + p.job_lease_interval,
+        error = CASE WHEN j.status = 'cancel_requested' THEN j.error ELSE NULL END,
+        raw_output = NULL,
+        started_at = now(),
+        finished_at = NULL
+    FROM claimable
+    CROSS JOIN policy p
+    WHERE j.id = claimable.id
+    RETURNING j.*
   )
-  UPDATE otlet.jobs j
-  SET status = CASE WHEN j.status = 'cancel_requested' THEN 'cancel_requested' ELSE 'running' END,
-      attempts = attempts + 1,
-      leased_until = now() + p.job_lease_interval,
-      error = CASE WHEN j.status = 'cancel_requested' THEN j.error ELSE NULL END,
-      raw_output = NULL,
-      started_at = now(),
-      finished_at = NULL
-  FROM next_job
-  CROSS JOIN otlet.production_policy p
-  WHERE j.id = next_job.id
-  RETURNING j.*;
+  SELECT * FROM updated ORDER BY created_at, id;
 $$;
 
 CREATE FUNCTION otlet.mark_job_started(job_id bigint) RETURNS void

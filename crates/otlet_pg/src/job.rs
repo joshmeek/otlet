@@ -43,7 +43,7 @@ macro_rules! job_from_row {
     };
 }
 
-pub(crate) fn claim_job() -> pgrx::spi::Result<Option<Job>> {
+pub(crate) fn claim_jobs() -> pgrx::spi::Result<Vec<Job>> {
     pgrx::Spi::connect_mut(|client| {
         let rows = client.update(
             r#"
@@ -60,21 +60,16 @@ SELECT
   r.name,
   r.endpoint,
   t.runtime_options
-FROM otlet.claim_job() j
+FROM otlet.claim_jobs() j
 JOIN otlet.tasks t ON t.name = j.task_name
 JOIN otlet.models m ON m.name = t.model_name
 JOIN otlet.runtimes r ON r.name = m.runtime_name
 "#,
-            Some(1),
+            None,
             &[],
         )?;
 
-        if rows.is_empty() {
-            return Ok(None);
-        }
-
-        let row = rows.first();
-        Ok(Some(job_from_row!(row)))
+        rows.into_iter().map(|row| Ok(job_from_row!(row))).collect()
     })
 }
 

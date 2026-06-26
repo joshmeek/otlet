@@ -2,7 +2,7 @@
 
 Otlet is a Postgres extension that runs local LLM inference **inside Postgres**, next to the rows it reads and acts on
 
-My use case for building it came from an entity-resolution problem: when new data lands, Postgres should help decide whether a row is a new entity or a duplicate of something already in the database. Otlet runs through a resident Postgres worker, records receipts and source identity, and materializes results for later queries (not made for high throughput yet, it is CPU-based local inference). The [roadmap](docs/roadmap.md) tracks the path toward planner integration, throughput work, model selection, action safety, and packaging
+My use case for building it came from an entity-resolution problem: when new data lands, Postgres should help decide whether a row is a new entity or a duplicate of something already in the database. Otlet runs through a resident Postgres worker, records receipts and source identity, drains bounded queued work, and materializes results for later queries. The [roadmap](docs/roadmap.md) tracks the path toward model selection, action safety, packaging, and deeper planner work
 
 Otlet uses a `pgrx` extension and a Postgres background worker loaded through `shared_preload_libraries` to keep local model work inside the database process. You can ask for model work from SQL, queue it from rows, refresh semantic state after source changes, and inspect the result without leaving Postgres
 
@@ -16,8 +16,9 @@ The loop is small:
 2. The query returns a stable `subject_id` and compact `input jsonb`
 3. Otlet stores one job per subject in `otlet.jobs`
 4. The worker claims jobs with `FOR UPDATE SKIP LOCKED`
-5. The worker runs linked llama.cpp against a warm local GGUF model
+5. The worker drains compatible queued jobs against a warm local GGUF model
 6. Otlet validates the JSON output before storing it
+7. Semantic refresh jobs create Otlet-owned records and fresh materialized state automatically
 
 Otlet leaves your source rows alone. It stores derived outputs, actions, receipts, traces, and runtime state under the `otlet` schema. To avoid reusing stale model output, Otlet tracks MVCC identity (`ctid`, `xmin`) and source hashes, and Postgres triggers mark semantic materializations stale when source rows change
 
@@ -149,13 +150,13 @@ Output:
 (2 rows)
 ```
 
-The user table stayed untouched. Otlet stored jobs, outputs, receipts, and trace state under the `otlet` schema, keyed by the `subject_id` values from the source query. The full demo script also records typed `entity_hypothesis` actions, materializes semantic state, proves semantic join lookup, and marks stale results after a source row update
+The user table stayed untouched. Otlet stored jobs, outputs, receipts, and trace state under the `otlet` schema, keyed by the `subject_id` values from the source query. The full demo script also proves worker batch drain, typed `entity_hypothesis` actions, automatic semantic materialization, semantic join lookup, and stale results after a source row update
 
 ## Docs
 
 Start with [the worked example](docs/otlet-worked-example.md)
 
-You run the local extension with SQL commands and real output. You start with the direct task path, then work through semantic indexes, stale rows, FDW, CustomScan, cancellation, retries, batches, traces, and production policy
+You run the local extension with SQL commands and real output. You start with the direct task path, then work through semantic indexes, automatic semantic materialization, stale rows, FDW, CustomScan, cancellation, retries, worker batches, traces, and production policy
 
 Future work is tracked in [docs/roadmap.md](docs/roadmap.md)
 
