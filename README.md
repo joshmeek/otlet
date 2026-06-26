@@ -10,16 +10,23 @@ Otlet uses a `pgrx` extension and a Postgres background worker loaded through `s
 
 The demo registers two local GGUF models with the resident Postgres worker. The model paths come from `./scripts/otlet-setup.sh`; the full worked example shows the copy/paste setup. Output below comes from a local demo run and is trimmed for width
 
+The LLM runs inside Postgres: the `otlet worker` background worker loads linked llama.cpp, tries `linked_qwen_0_6b` first, and escalates hard rows to `linked_qwen_1_7b`
+
+`linked_inproc` is the runtime row name. `linked` selects Otlet's current backend: in-process llama.cpp inside the Postgres worker
+
 ```sql
-SELECT name, endpoint FROM otlet.register_runtime('linked_inproc', 'linked');
-SELECT name, runtime_name FROM otlet.register_model('linked_qwen_0_6b', '<Qwen3-0.6B-Q8_0.gguf>', 'linked_inproc');
-SELECT name, runtime_name FROM otlet.register_model('linked_qwen_1_7b', '<Qwen3-1.7B-Q8_0.gguf>', 'linked_inproc');
+SELECT 'runtime' AS kind, name, 'Postgres worker + linked llama.cpp' AS runs_in
+FROM otlet.register_runtime('linked_inproc', 'linked');
+SELECT 'model' AS kind, name, runtime_name AS runs_in FROM otlet.register_model('linked_qwen_0_6b', '<Qwen3-0.6B-Q8_0.gguf>', 'linked_inproc');
+SELECT 'model' AS kind, name, runtime_name AS runs_in FROM otlet.register_model('linked_qwen_1_7b', '<Qwen3-1.7B-Q8_0.gguf>', 'linked_inproc');
 ```
 
 ```text
- linked_inproc | linked
- linked_qwen_0_6b | linked_inproc
- linked_qwen_1_7b | linked_inproc
+ kind    | name             | runs_in
+---------+------------------+------------------------------------
+ runtime | linked_inproc    | Postgres worker + linked llama.cpp
+ model   | linked_qwen_0_6b | linked_inproc
+ model   | linked_qwen_1_7b | linked_inproc
 ```
 
 The task reads candidate vendor pairs, joins the source rows, and builds compact row-pair JSON for the model:
@@ -33,6 +40,8 @@ LIMIT 3;
 ```
 
 ```text
+ pair_id                | right_name                    | evidence
+------------------------+-------------------------------+-------------------------------------------------
  vendor-1001:vendor-313 | North Star Medical Logistics  | same building, different domain/payment/AP contact
  vendor-1001:vendor-314 | Northstar Freight Canada Inc. | similar brand, different country/bank/contact
  vendor-1001:vendor-42  | N-Star Freight Services       | same remittance account, rebrand note
@@ -51,6 +60,8 @@ FROM otlet.runs WHERE task_name = 'entity_resolution_demo' ORDER BY subject_id;
 -------------
            4
 
+ subject_id             | match            | confidence
+------------------------+------------------+-----------
  vendor-1001:vendor-313 | different_entity | high
  vendor-1001:vendor-314 | different_entity | high
  vendor-1001:vendor-42  | same_entity      | high
@@ -58,6 +69,8 @@ FROM otlet.runs WHERE task_name = 'entity_resolution_demo' ORDER BY subject_id;
 ```
 
 Otlet keeps the model-selection and action trail in Postgres:
+
+`cheap` and `strong` are selection roles for the two registered models
 
 ```sql
 SELECT subject_id, selection_role, selection_status, model_name, output->>'match' AS match
@@ -70,10 +83,14 @@ GROUP BY action_type, status, approval_status ORDER BY action_type;
 ```
 
 ```text
+ subject_id             | role   | status   | model            | match
+------------------------+--------+----------+------------------+------------------
  vendor-1001:vendor-313 | cheap  | failed   | linked_qwen_0_6b |
  vendor-1001:vendor-313 | strong | accepted | linked_qwen_1_7b | different_entity
  vendor-1001:vendor-42  | cheap  | accepted | linked_qwen_0_6b | same_entity
 
+ action_type     | status   | approval     | actions
+-----------------+----------+--------------+--------
  merge_candidate | approved | approved     | 1
  new_entity      | proposed | not_required | 2
  new_entity      | rejected | rejected     | 1
@@ -91,6 +108,8 @@ ORDER BY subject_id, attempt_index LIMIT 4;
 ```
 
 ```text
+ subject_id             | role   | status   | schema | prompt | output | traced | hash
+------------------------+--------+----------+--------+--------+--------+--------+---------
  vendor-1001:vendor-313 | cheap  | failed   | failed | 801 |  43 | 16 | 0ea12091
  vendor-1001:vendor-313 | strong | complete | passed | 801 |  66 | 16 | 66f14495
  vendor-1001:vendor-314 | cheap  | failed   | failed | 806 | 192 | 16 | 908d9787
