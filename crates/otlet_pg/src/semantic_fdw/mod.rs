@@ -1,5 +1,5 @@
 use pgrx::prelude::*;
-use pgrx::{Array, FromDatum, JsonB, pg_sys};
+use pgrx::{FromDatum, JsonB, pg_sys};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::ffi::{CStr, CString};
@@ -65,34 +65,12 @@ struct SubjectScopeStats {
 #[derive(Clone)]
 struct SemanticPushdown {
     subjects: SubjectPushdown,
-    subject_outer: Option<OuterVarRef>,
-    subject_param_filters: Vec<SubjectParamFilter>,
-    body_contains: Vec<String>,
-    body_contains_params: Vec<RuntimeParamRef>,
-    body_field_equals: Vec<(String, String)>,
-    body_field_equals_params: Vec<(String, RuntimeParamRef)>,
-    stale: Option<bool>,
-    stale_param: Option<RuntimeParamRef>,
-    source_hash: Option<String>,
-    source_hash_param: Option<RuntimeParamRef>,
-    empty_result_reason: Option<String>,
 }
 
 impl SemanticPushdown {
     fn none() -> Self {
         Self {
             subjects: SubjectPushdown::None,
-            subject_outer: None,
-            subject_param_filters: Vec::new(),
-            body_contains: Vec::new(),
-            body_contains_params: Vec::new(),
-            body_field_equals: Vec::new(),
-            body_field_equals_params: Vec::new(),
-            stale: None,
-            stale_param: None,
-            source_hash: None,
-            source_hash_param: None,
-            empty_result_reason: None,
         }
     }
 
@@ -102,32 +80,6 @@ impl SemanticPushdown {
 
     fn has_filters(&self) -> bool {
         self.subjects().is_some()
-            || self.subject_outer.is_some()
-            || !self.subject_param_filters.is_empty()
-            || !self.body_contains.is_empty()
-            || !self.body_contains_params.is_empty()
-            || !self.body_field_equals.is_empty()
-            || !self.body_field_equals_params.is_empty()
-            || self.stale.is_some()
-            || self.stale_param.is_some()
-            || self.source_hash.is_some()
-            || self.source_hash_param.is_some()
-            || self.empty_result_reason.is_some()
-    }
-
-    fn has_runtime_filters(&self) -> bool {
-        self.subject_outer.is_some()
-            || !self.subject_param_filters.is_empty()
-            || !self.body_contains_params.is_empty()
-            || !self.body_field_equals_params.is_empty()
-            || self.stale_param.is_some()
-            || self.source_hash_param.is_some()
-    }
-
-    fn has_concrete_materialization_filters(&self) -> bool {
-        !self.body_contains.is_empty()
-            || !self.body_field_equals.is_empty()
-            || self.source_hash.is_some()
     }
 }
 
@@ -146,54 +98,6 @@ impl SubjectPushdown {
     }
 }
 
-#[derive(Clone)]
-enum SubjectParamFilter {
-    TextEq(RuntimeParamRef),
-    TextEqOutput(RuntimeParamRef, pg_sys::Oid),
-    TextArrayAny(RuntimeParamRef),
-}
-
-#[derive(Clone, Copy)]
-enum RuntimeParamRef {
-    Extern(i32),
-    Exec(i32),
-}
-
-enum SubjectClauseFilter {
-    Values(Vec<String>),
-    Param(SubjectParamFilter),
-    Outer(OuterVarRef),
-}
-
-#[derive(Clone, Copy)]
-struct OuterVarRef {
-    attno: i16,
-    typid: pg_sys::Oid,
-}
-
-enum BodyPushdownFilter {
-    Contains(String),
-    ContainsParam(RuntimeParamRef),
-    FieldEquals(String, String),
-    FieldEqualsParam(String, RuntimeParamRef),
-}
-
-enum SourceHashFilter {
-    Value(String),
-    Param(RuntimeParamRef),
-}
-
-enum StaleFilter {
-    Value(bool),
-    Param(RuntimeParamRef),
-}
-
-enum RuntimeParam<T> {
-    Value(T),
-    Null,
-    Unresolved,
-}
-
 struct SemanticFdwState {
     rows: Vec<SemanticFdwRow>,
     next: usize,
@@ -201,12 +105,9 @@ struct SemanticFdwState {
     rows_emitted: i64,
     queued_jobs: i64,
     rescans: i64,
-    fdw_expr_states: *mut pg_sys::List,
-    outer_expr_typid: pg_sys::Oid,
     opts: SemanticFdwOptions,
     plan: SemanticFdwPlan,
     pushdown: SemanticPushdown,
-    base_pushdown: SemanticPushdown,
 }
 
 #[derive(Clone)]
@@ -247,5 +148,4 @@ include!("plan.rs");
 include!("cost.rs");
 include!("private.rs");
 include!("quals.rs");
-include!("runtime_params.rs");
 include!("pg.rs");

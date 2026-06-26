@@ -110,11 +110,9 @@ unsafe fn rel_has_lateral_ref(rel: *mut pg_sys::RelOptInfo) -> bool {
 
 fn validate_semantic_index_source(
     index_name: &str,
-    predicate_kind: SemanticPredicateKind,
     relid: pg_sys::Oid,
     subject_attno: i16,
     expected_json: &str,
-    action_type: Option<&str>,
     allow_refresh: bool,
     wait_ms: u32,
     infer_ms: u32,
@@ -166,15 +164,7 @@ fn validate_semantic_index_source(
         }
 
         let source_rows_sql = source_rows_sql(&source_table, &subject_column);
-        let matches_expected_sql = row_predicate_match_sql(
-            predicate_kind,
-            "sm.body",
-            "sm.record_id",
-            "sm.subject_id",
-            "si.task_name",
-            expected_json,
-            action_type,
-        )?;
+        let matches_expected_sql = row_predicate_match_sql("sm.body", expected_json);
         let stats_query = format!(
             "WITH latest AS ( \
                SELECT DISTINCT ON (sm.subject_id) \

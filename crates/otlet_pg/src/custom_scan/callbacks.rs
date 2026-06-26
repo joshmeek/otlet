@@ -50,12 +50,11 @@ unsafe extern "C-unwind" fn begin_semantic_custom_scan(
         }
         let loaded_state = load_semantic_states(
             private.index_kind,
-            private.predicate_kind,
             &private.index_name,
             &private.expected_json,
-            private.action_type.as_deref(),
         )
         .unwrap_or_else(|err| pgrx::error!("{err}"));
+        let policy = semantic_policy_for_selected_path(&private.selected_path);
         (*state).source_table = pg_cstr(&loaded_state.source_table);
         (*state).task_name = pg_cstr(&loaded_state.task_name);
         (*state).record_type = pg_cstr(&loaded_state.record_type);
@@ -70,16 +69,14 @@ unsafe extern "C-unwind" fn begin_semantic_custom_scan(
             subject_state_count(&loaded_state.subjects, SubjectSemanticState::InFlight);
         (*state).runtime = Box::into_raw(Box::new(RuntimeState {
             index_kind: private.index_kind,
-            predicate_kind: private.predicate_kind,
             index_name: private.index_name,
             expected_json: private.expected_json,
-            action_type: private.action_type,
-            auto_policy: private.auto_policy,
-            allow_refresh: private.allow_refresh,
-            wait_ms: private.wait_ms,
-            infer_ms: private.infer_ms,
-            infer_max_rows: private.infer_max_rows,
-            planner_selected_path: private.planner_stats.selected_path.clone(),
+            auto_policy: policy.auto_policy,
+            allow_refresh: policy.allow_refresh,
+            wait_ms: policy.wait_ms,
+            infer_ms: policy.infer_ms,
+            infer_max_rows: policy.infer_max_rows,
+            planner_selected_path: private.selected_path,
             source_table: loaded_state.source_table,
             task_name: loaded_state.task_name,
             record_type: loaded_state.record_type,
@@ -96,8 +93,6 @@ unsafe extern "C-unwind" fn begin_semantic_custom_scan(
             rows_seen: 0,
             rows_returned: 0,
             lookup_rows: 0,
-            wait_resolved_rows: 0,
-            wait_returned_rows: 0,
             infer_resolved_rows: 0,
             infer_returned_rows: 0,
             fail_closed_rows: 0,
@@ -107,58 +102,25 @@ unsafe extern "C-unwind" fn begin_semantic_custom_scan(
             missing_rows: 0,
             inflight_rows: 0,
             queued_refreshes: 0,
-            waited_refreshes: 0,
-            wait_elapsed_ms: 0,
             infer_now_batches: 0,
             infer_now_ms: 0,
-            infer_now_request_wait_ms: 0,
-            infer_now_start_latency_ms: 0,
-            infer_now_worker_run_ms: 0,
             infer_now_timeouts: 0,
-            infer_now_abort_requests: 0,
-            infer_now_cancel_job_id: 0,
             infer_now_failures: 0,
             infer_now_last_error: String::new(),
-            infer_prefetch_submissions: 0,
-            infer_prefetch_source_rows: 0,
-            infer_buffered_rows: 0,
-            infer_slot_inputs: 0,
-            infer_spi_inputs: 0,
             infer_receipts: 0,
             infer_failed_receipts: 0,
             infer_failed_receipt_id: 0,
-            infer_outputs: 0,
-            infer_actions: 0,
-            infer_materializations: 0,
             infer_trace_receipt_id: 0,
             infer_trace_prompt_tokens: 0,
             infer_trace_generated_tokens: 0,
             infer_trace_generate_ms: 0,
             infer_trace_version: String::new(),
-            infer_trace_tokens_per_second: String::new(),
             infer_trace_probability_status: String::new(),
-            infer_trace_probability_method: String::new(),
             infer_trace_schema_force: String::new(),
-            infer_trace_worker_rss_bytes: 0,
-            infer_trace_worker_virtual_bytes: 0,
-            infer_trace_worker_memory_policy: String::new(),
-            infer_trace_model_cache_hits: 0,
-            infer_trace_model_cache_misses: 0,
-            infer_trace_inference_cache_hits: 0,
-            infer_trace_inference_cache_misses: 0,
-            infer_trace_inference_cache_entries: 0,
-            infer_trace_inference_cache_bytes: 0,
-            infer_trace_inference_cache_evictions: 0,
-            infer_trace_inference_cache_reason: String::new(),
             infer_trace_detailed_status: String::new(),
             infer_trace_detailed_captured_tokens: 0,
-            infer_trace_detailed_skipped_tokens: 0,
             infer_trace_detailed_top_k: 0,
             child_plan_rows: 0,
-            direct_scan_rows: 0,
-            subject_state_refreshes: 0,
-            semantic_cache_hits: 0,
-            semantic_cache_misses: 0,
             queued_refresh_subjects: HashSet::new(),
             pending_output_rows: VecDeque::new(),
         }));
@@ -217,18 +179,15 @@ unsafe extern "C-unwind" fn semantic_custom_scan_access(
                 SubjectSemanticState::FreshMatch => {
                     runtime.fresh_matches += 1;
                     runtime.lookup_rows += 1;
-                    runtime.semantic_cache_hits += 1;
                     runtime.rows_returned += 1;
                     return slot;
                 }
                 SubjectSemanticState::FreshNonMatch => {
                     runtime.fresh_non_matches += 1;
                     runtime.lookup_rows += 1;
-                    runtime.semantic_cache_hits += 1;
                 }
                 SubjectSemanticState::Stale => {
                     runtime.stale_rows += 1;
-                    runtime.semantic_cache_misses += 1;
                     if let Some(slot) =
                         resolve_stale_or_missing_subject(node, runtime, &subject_id, slot)
                     {
@@ -237,7 +196,6 @@ unsafe extern "C-unwind" fn semantic_custom_scan_access(
                 }
                 SubjectSemanticState::Missing => {
                     runtime.missing_rows += 1;
-                    runtime.semantic_cache_misses += 1;
                     if let Some(slot) =
                         resolve_stale_or_missing_subject(node, runtime, &subject_id, slot)
                     {
@@ -246,7 +204,6 @@ unsafe extern "C-unwind" fn semantic_custom_scan_access(
                 }
                 SubjectSemanticState::InFlight => {
                     runtime.inflight_rows += 1;
-                    runtime.semantic_cache_misses += 1;
                     if let Some(slot) =
                         resolve_inflight_subject(runtime, &subject_id, slot)
                     {
@@ -279,15 +236,10 @@ unsafe fn resolve_stale_or_missing_subject(
             SemanticResolution::Unresolved
         }) {
             SemanticResolution::Match => {
-                runtime.wait_resolved_rows += 1;
-                runtime.wait_returned_rows += 1;
                 runtime.rows_returned += 1;
                 return Some(slot);
             }
-            SemanticResolution::NonMatch => {
-                runtime.wait_resolved_rows += 1;
-                return None;
-            }
+            SemanticResolution::NonMatch => return None,
             SemanticResolution::Unresolved => {}
         }
 
@@ -321,15 +273,10 @@ fn resolve_inflight_subject(
         SemanticResolution::Unresolved
     }) {
         SemanticResolution::Match => {
-            runtime.wait_resolved_rows += 1;
-            runtime.wait_returned_rows += 1;
             runtime.rows_returned += 1;
             Some(slot)
         }
-        SemanticResolution::NonMatch => {
-            runtime.wait_resolved_rows += 1;
-            None
-        }
+        SemanticResolution::NonMatch => None,
         SemanticResolution::Unresolved => {
             runtime.fail_closed_rows += 1;
             None
@@ -423,8 +370,6 @@ unsafe extern "C-unwind" fn rescan_semantic_custom_scan(node: *mut pg_sys::Custo
             runtime.rows_seen = 0;
             runtime.rows_returned = 0;
             runtime.lookup_rows = 0;
-            runtime.wait_resolved_rows = 0;
-            runtime.wait_returned_rows = 0;
             runtime.infer_resolved_rows = 0;
             runtime.infer_returned_rows = 0;
             runtime.fail_closed_rows = 0;
@@ -434,58 +379,25 @@ unsafe extern "C-unwind" fn rescan_semantic_custom_scan(node: *mut pg_sys::Custo
             runtime.missing_rows = 0;
             runtime.inflight_rows = 0;
             runtime.queued_refreshes = 0;
-            runtime.waited_refreshes = 0;
-            runtime.wait_elapsed_ms = 0;
             runtime.infer_now_batches = 0;
             runtime.infer_now_ms = 0;
-            runtime.infer_now_request_wait_ms = 0;
-            runtime.infer_now_start_latency_ms = 0;
-            runtime.infer_now_worker_run_ms = 0;
             runtime.infer_now_timeouts = 0;
-            runtime.infer_now_abort_requests = 0;
-            runtime.infer_now_cancel_job_id = 0;
             runtime.infer_now_failures = 0;
             runtime.infer_now_last_error.clear();
-            runtime.infer_prefetch_submissions = 0;
-            runtime.infer_prefetch_source_rows = 0;
-            runtime.infer_buffered_rows = 0;
-            runtime.infer_slot_inputs = 0;
-            runtime.infer_spi_inputs = 0;
             runtime.infer_receipts = 0;
             runtime.infer_failed_receipts = 0;
             runtime.infer_failed_receipt_id = 0;
-            runtime.infer_outputs = 0;
-            runtime.infer_actions = 0;
-            runtime.infer_materializations = 0;
             runtime.infer_trace_receipt_id = 0;
             runtime.infer_trace_prompt_tokens = 0;
             runtime.infer_trace_generated_tokens = 0;
             runtime.infer_trace_generate_ms = 0;
             runtime.infer_trace_version.clear();
-            runtime.infer_trace_tokens_per_second.clear();
             runtime.infer_trace_probability_status.clear();
-            runtime.infer_trace_probability_method.clear();
             runtime.infer_trace_schema_force.clear();
-            runtime.infer_trace_worker_rss_bytes = 0;
-            runtime.infer_trace_worker_virtual_bytes = 0;
-            runtime.infer_trace_worker_memory_policy.clear();
-            runtime.infer_trace_model_cache_hits = 0;
-            runtime.infer_trace_model_cache_misses = 0;
-            runtime.infer_trace_inference_cache_hits = 0;
-            runtime.infer_trace_inference_cache_misses = 0;
-            runtime.infer_trace_inference_cache_entries = 0;
-            runtime.infer_trace_inference_cache_bytes = 0;
-            runtime.infer_trace_inference_cache_evictions = 0;
-            runtime.infer_trace_inference_cache_reason.clear();
             runtime.infer_trace_detailed_status.clear();
             runtime.infer_trace_detailed_captured_tokens = 0;
-            runtime.infer_trace_detailed_skipped_tokens = 0;
             runtime.infer_trace_detailed_top_k = 0;
             runtime.child_plan_rows = 0;
-            runtime.direct_scan_rows = 0;
-            runtime.subject_state_refreshes = 0;
-            runtime.semantic_cache_hits = 0;
-            runtime.semantic_cache_misses = 0;
             runtime.queued_refresh_subjects.clear();
             runtime.pending_output_rows.clear();
             if !runtime.child_plan.is_null() {

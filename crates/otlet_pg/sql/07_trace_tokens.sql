@@ -143,8 +143,6 @@ SELECT
   s.executor_boundary,
   s.semantic_index_kind,
   s.semantic_index_name,
-  s.semantic_predicate_kind,
-  s.semantic_action_type,
   s.row_identity,
   s.mvcc,
   s.worker_handoff,

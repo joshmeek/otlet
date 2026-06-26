@@ -12,7 +12,6 @@ Otlet has three public entry points today:
 | --- | --- |
 | `scripts/otlet-setup.sh` | build and start the local Postgres extension stack |
 | `scripts/otlet-demo.sh` | run the worked demo path with local inference |
-| `scripts/otlet-benchmark-models.sh` | secondary model-fit proof, not the active roadmap track |
 
 The extension keeps source rows in user tables. Users choose rows with SQL, Otlet passes compact JSON to a resident local model, and Postgres stores derived outputs, actions, traces, and receipts under the `otlet` schema
 
@@ -25,12 +24,6 @@ The extension keeps source rows in user tables. Users choose rows with SQL, Otle
 | 3 | Actions | Let models propose typed database actions with receipts and approval |
 | 4 | Packaging and security | Keep the open-source path small while tightening permissions and trace safety |
 | 5 | Core limits | Test Access Method and Postgres-fork paths where extension hooks fall short |
-
-## Model-Fit Proof
-
-Benchmarks are not the active track right now. Keep `scripts/otlet-benchmark-models.sh` as a secondary proof script for comparing GGUF models on the same Otlet workload when model choice or costing needs evidence
-
-The benchmark report should stay Otlet-specific: SQL input, resident worker inference, schema-validated JSON, receipts, semantic freshness, cache behavior, memory, and crash status. Generic chat scores do not decide the roadmap
 
 ## Planner And Executor
 
@@ -78,7 +71,7 @@ Model-compiled SQL can come later through a constrained path. The model proposes
 
 ## Packaging And Security
 
-Open-source packaging should keep the first run small: one setup script, one demo script, a secondary model-fit script, a small model path, Docker instructions, crash-log scanning, CPU-only defaults, resource warnings, extension versioning, and upgrade notes
+Open-source packaging should keep the first run small: one setup script, one demo script, a small model path, Docker instructions, crash-log scanning, CPU-only defaults, resource warnings, extension versioning, and upgrade notes
 
 Security work should cover schema permissions, model artifact path permissions, allowed write targets, action approval, prompt visibility, trace visibility, row-level security, superuser requirements, and extension install risk. Trace redaction needs special care because prompts and token traces can contain source values
 

@@ -46,43 +46,10 @@ fn source_rows_sql(source_table: &str, subject_column: &str) -> String {
 }
 
 fn row_predicate_match_sql(
-    predicate_kind: SemanticPredicateKind,
     body_expr: &str,
-    record_expr: &str,
-    subject_expr: &str,
-    task_expr: &str,
     expected_json: &str,
-    action_type: Option<&str>,
-) -> Result<String, String> {
-    match predicate_kind {
-        SemanticPredicateKind::Materialization => Ok(format!(
-            "{body_expr} @> {}::jsonb",
-            sql_literal(expected_json)
-        )),
-        SemanticPredicateKind::Action => {
-            let action_type = action_type.ok_or_else(|| {
-                "otlet semantic action predicate requires an action type".to_string()
-            })?;
-            Ok(format!(
-                "EXISTS ( \
-                   SELECT 1 \
-                   FROM otlet.records action_record \
-                   JOIN otlet.actions action_row \
-                     ON action_row.id = action_record.action_id \
-                   JOIN otlet.jobs action_job \
-                     ON action_job.id = action_row.job_id \
-                   WHERE action_record.id = {record_expr} \
-                     AND action_job.task_name = {task_expr} \
-                     AND action_job.subject_id = {subject_expr} \
-                     AND action_row.action_type = {} \
-                     AND action_row.status = 'complete' \
-                     AND action_row.payload @> {}::jsonb \
-                 )",
-                sql_literal(action_type),
-                sql_literal(expected_json)
-            ))
-        }
-    }
+) -> String {
+    format!("{body_expr} @> {}::jsonb", sql_literal(expected_json))
 }
 
 fn to_string<E: std::fmt::Display>(err: E) -> String {

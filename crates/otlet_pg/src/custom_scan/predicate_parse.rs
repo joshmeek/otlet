@@ -22,11 +22,9 @@ unsafe fn find_semantic_match_predicate(
                     }
                     validate_semantic_index_source(
                         &predicate.index_name,
-                        predicate.predicate_kind,
                         relid,
                         predicate.subject_attno,
                         &predicate.expected_json,
-                        predicate.action_type.as_deref(),
                         predicate.allow_refresh,
                         predicate.wait_ms,
                         predicate.infer_ms,
@@ -74,10 +72,8 @@ unsafe fn semantic_match_from_clause(
         };
         Some(SemanticMatchPredicate {
             index_kind: parts.index_kind,
-            predicate_kind: parts.predicate_kind,
             index_name: parts.index_name,
             expected_json: parts.expected_json,
-            action_type: parts.action_type,
             auto_policy: parts.auto_policy,
             allow_refresh: parts.allow_refresh,
             wait_ms: parts.wait_ms,
@@ -94,11 +90,17 @@ unsafe fn semantic_match_from_clause(
 
 struct ParsedSemanticMatch {
     index_kind: SemanticIndexKind,
-    predicate_kind: SemanticPredicateKind,
     index_name: String,
     subject: SubjectVar,
     expected_json: String,
-    action_type: Option<String>,
+    auto_policy: bool,
+    allow_refresh: bool,
+    wait_ms: u32,
+    infer_ms: u32,
+    infer_max_rows: u32,
+}
+
+struct SemanticAutoPolicy {
     auto_policy: bool,
     allow_refresh: bool,
     wait_ms: u32,
@@ -114,29 +116,6 @@ unsafe fn semantic_match_function_parts(
         let func = clause as *mut pg_sys::FuncExpr;
         let is_matches = is_otlet_function((*func).funcid, "semantic_matches");
         let is_auto = is_otlet_function((*func).funcid, "semantic_matches_auto");
-        let is_action_matches = is_otlet_function((*func).funcid, "semantic_action_matches");
-        if is_action_matches {
-            if pg_sys::list_length((*func).args) < 4 {
-                return None;
-            }
-            let index_arg = pg_sys::list_nth((*func).args, 0) as *mut pg_sys::Expr;
-            let subject_arg = pg_sys::list_nth((*func).args, 1) as *mut pg_sys::Expr;
-            let action_type_arg = pg_sys::list_nth((*func).args, 2) as *mut pg_sys::Expr;
-            let expected_arg = pg_sys::list_nth((*func).args, 3) as *mut pg_sys::Expr;
-            return Some(ParsedSemanticMatch {
-                index_kind: SemanticIndexKind::Row,
-                predicate_kind: SemanticPredicateKind::Action,
-                index_name: text_const_value(index_arg)?,
-                subject: subject_var(subject_arg, rti)?,
-                expected_json: jsonb_const_text(expected_arg)?,
-                action_type: Some(text_const_value(action_type_arg)?),
-                auto_policy: false,
-                allow_refresh: false,
-                wait_ms: 0,
-                infer_ms: 0,
-                infer_max_rows: 0,
-            });
-        }
         let is_join_matches = is_otlet_function((*func).funcid, "semantic_join_matches");
         let is_join_auto = is_otlet_function((*func).funcid, "semantic_join_matches_auto");
         let is_join = is_join_matches || is_join_auto;
@@ -148,62 +127,83 @@ unsafe fn semantic_match_function_parts(
         let index_arg = pg_sys::list_nth((*func).args, 0) as *mut pg_sys::Expr;
         let subject_arg = pg_sys::list_nth((*func).args, 1) as *mut pg_sys::Expr;
         let expected_arg = pg_sys::list_nth((*func).args, 2) as *mut pg_sys::Expr;
-        let allow_refresh = if is_any_auto {
-            if pg_sys::list_length((*func).args) >= 7 {
-                let allow_refresh_arg = pg_sys::list_nth((*func).args, 6) as *mut pg_sys::Expr;
-                bool_const_value(allow_refresh_arg)?
-            } else {
-                true
-            }
-        } else {
-            false
-        };
-        let wait_ms = if is_any_auto {
-            if pg_sys::list_length((*func).args) >= 4 {
-                let wait_arg = pg_sys::list_nth((*func).args, 3) as *mut pg_sys::Expr;
-                int_const_value(wait_arg)?.clamp(0, 30_000) as u32
-            } else {
-                10_000
-            }
-        } else {
-            0
-        };
-        let infer_ms = if is_any_auto {
-            if pg_sys::list_length((*func).args) >= 5 {
-                let infer_arg = pg_sys::list_nth((*func).args, 4) as *mut pg_sys::Expr;
-                int_const_value(infer_arg)?.clamp(0, 30_000) as u32
-            } else {
-                wait_ms
-            }
-        } else {
-            0
-        };
-        let infer_max_rows = if is_any_auto {
-            if pg_sys::list_length((*func).args) >= 6 {
-                let max_rows_arg = pg_sys::list_nth((*func).args, 5) as *mut pg_sys::Expr;
-                int_const_value(max_rows_arg)?.clamp(0, 10) as u32
-            } else {
-                1
-            }
-        } else {
-            0
-        };
+        let policy = semantic_auto_policy(is_any_auto);
         Some(ParsedSemanticMatch {
             index_kind: if is_join {
                 SemanticIndexKind::Join
             } else {
                 SemanticIndexKind::Row
             },
-            predicate_kind: SemanticPredicateKind::Materialization,
             index_name: text_const_value(index_arg)?,
             subject: subject_var(subject_arg, rti)?,
             expected_json: jsonb_const_text(expected_arg)?,
-            action_type: None,
             auto_policy: is_any_auto,
-            allow_refresh,
-            wait_ms,
-            infer_ms,
-            infer_max_rows,
+            allow_refresh: policy.allow_refresh,
+            wait_ms: policy.wait_ms,
+            infer_ms: policy.infer_ms,
+            infer_max_rows: policy.infer_max_rows,
         })
     }
+}
+
+fn semantic_auto_policy(enabled: bool) -> SemanticAutoPolicy {
+    if !enabled {
+        return SemanticAutoPolicy {
+            auto_policy: false,
+            allow_refresh: false,
+            wait_ms: 0,
+            infer_ms: 0,
+            infer_max_rows: 0,
+        };
+    }
+
+    pgrx::Spi::connect(|client| {
+        let table = client
+            .select(
+                "SELECT \
+                   stale_policy = 'refresh_then_fail_closed' AS allow_refresh, \
+                   semantic_auto_wait_ms, \
+                   semantic_auto_infer_ms, \
+                   semantic_auto_max_rows \
+                 FROM otlet.production_policy \
+                 LIMIT 1",
+                Some(1),
+                &[],
+            )
+            .ok()?;
+        let row = table.first();
+        Some(SemanticAutoPolicy {
+            auto_policy: true,
+            allow_refresh: row
+                .get_by_name::<bool, _>("allow_refresh")
+                .ok()
+                .flatten()
+                .unwrap_or(true),
+            wait_ms: row
+                .get_by_name::<i32, _>("semantic_auto_wait_ms")
+                .ok()
+                .flatten()
+                .unwrap_or(10_000)
+                .clamp(0, 30_000) as u32,
+            infer_ms: row
+                .get_by_name::<i32, _>("semantic_auto_infer_ms")
+                .ok()
+                .flatten()
+                .unwrap_or(15_000)
+                .clamp(0, 30_000) as u32,
+            infer_max_rows: row
+                .get_by_name::<i32, _>("semantic_auto_max_rows")
+                .ok()
+                .flatten()
+                .unwrap_or(1)
+                .clamp(0, 10) as u32,
+        })
+    })
+    .unwrap_or(SemanticAutoPolicy {
+        auto_policy: true,
+        allow_refresh: true,
+        wait_ms: 10_000,
+        infer_ms: 15_000,
+        infer_max_rows: 1,
+    })
 }

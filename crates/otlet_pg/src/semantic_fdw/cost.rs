@@ -3,19 +3,6 @@ fn load_effective_plan(
     pushdown: &SemanticPushdown,
 ) -> Result<SemanticFdwPlan, String> {
     let mut plan = load_plan(opts)?;
-    if let Some(reason) = &pushdown.empty_result_reason {
-        plan.selected_path = "semantic_lookup".to_string();
-        plan.reason = reason.clone();
-        clear_subject_counts(&mut plan);
-        return Ok(plan);
-    }
-    if pushdown.stale == Some(true) {
-        plan.selected_path = "lookup_fail_closed".to_string();
-        plan.reason = "pushed stale=true returns no rows under fail-closed policy".to_string();
-        clear_subject_counts(&mut plan);
-        return Ok(plan);
-    }
-
     if opts.access_kind == SemanticAccessKind::RowIndex
         && let Some(pushed_subject_ids) = pushdown.subjects()
     {
@@ -24,7 +11,7 @@ fn load_effective_plan(
             plan.selected_path = "semantic_lookup".to_string();
             plan.reason = "pushed subject filter empty".to_string();
             clear_subject_counts(&mut plan);
-            return apply_materialization_filter_plan(opts, pushdown, plan);
+            return Ok(plan);
         }
 
         let stats = subject_scope_stats(opts, &subjects)?;
@@ -48,14 +35,14 @@ fn load_effective_plan(
             plan.selected_path = "semantic_lookup".to_string();
             plan.reason = "pushed subject rows absent from source".to_string();
             finish_path_cost(&mut plan);
-            return apply_materialization_filter_plan(opts, pushdown, plan);
+            return Ok(plan);
         }
 
         if unresolved_subjects == 0 {
             plan.selected_path = "semantic_lookup".to_string();
             plan.reason = "pushed subject rows fresh".to_string();
             finish_path_cost(&mut plan);
-            return apply_materialization_filter_plan(opts, pushdown, plan);
+            return Ok(plan);
         }
 
         if plan.selected_path == "wait_for_refresh" {
@@ -76,25 +63,6 @@ fn load_effective_plan(
         finish_path_cost(&mut plan);
     }
 
-    apply_materialization_filter_plan(opts, pushdown, plan)
-}
-
-fn apply_materialization_filter_plan(
-    opts: &SemanticFdwOptions,
-    pushdown: &SemanticPushdown,
-    mut plan: SemanticFdwPlan,
-) -> Result<SemanticFdwPlan, String> {
-    if !pushdown.has_concrete_materialization_filters() || !is_lookup_path(&plan.selected_path) {
-        return Ok(plan);
-    }
-
-    let rows = matching_materialization_rows(opts, pushdown)?;
-    plan.total_subjects = rows;
-    plan.fresh_subjects = rows.min(plan.fresh_subjects);
-    plan.lookup_subjects = rows;
-    plan.lookup_ms = scoped_lookup_ms(rows);
-    finish_path_cost(&mut plan);
-    plan.reason = format!("{}; semantic materialization filter pushed", plan.reason);
     Ok(plan)
 }
 
@@ -149,36 +117,6 @@ fn subject_scope_stats(
             fresh_rows: fresh_rows.min(source_rows),
         })
     })
-}
-
-fn matching_materialization_rows(
-    opts: &SemanticFdwOptions,
-    pushdown: &SemanticPushdown,
-) -> Result<i64, String> {
-    let subject_filter = sql_subject_filter("latest.subject_id", &pushdown.subjects);
-    let body_filter = sql_body_filter("latest.body", pushdown);
-    let source_hash_filter = sql_source_hash_filter("latest.source_hash", pushdown);
-    let query = match opts.access_kind {
-        SemanticAccessKind::RowIndex => format!(
-            "SELECT count(*)::bigint \
-             FROM otlet.semantic_index_current_rows({}, true) latest \
-             WHERE true{}{}{}",
-            sql_literal(&opts.index_name),
-            subject_filter,
-            body_filter,
-            source_hash_filter
-        ),
-        SemanticAccessKind::JoinIndex => format!(
-            "SELECT count(*)::bigint \
-             FROM otlet.semantic_join_index_current_rows({}, true) latest \
-             WHERE true{}{}{}",
-            sql_literal(&opts.index_name),
-            subject_filter,
-            body_filter,
-            source_hash_filter
-        ),
-    };
-    pgrx::Spi::connect(|client| scalar_select_i64(client, &query))
 }
 
 fn scoped_lookup_ms(rows: i64) -> f64 {

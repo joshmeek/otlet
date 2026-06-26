@@ -57,8 +57,6 @@ SELECT
   r.trace_summary ->> 'refresh_policy' AS refresh_policy,
   r.trace_summary ->> 'semantic_index_kind' AS semantic_index_kind,
   r.trace_summary ->> 'semantic_index_name' AS semantic_index_name,
-  r.trace_summary ->> 'semantic_predicate_kind' AS semantic_predicate_kind,
-  r.trace_summary ->> 'semantic_action_type' AS semantic_action_type,
   r.trace_summary -> 'probability_summary' ->> 'status' AS probability_status,
   r.trace_summary -> 'probability_summary' ->> 'method' AS probability_method,
   r.trace_summary -> 'detailed_trace' ->> 'status' AS detailed_trace_status,

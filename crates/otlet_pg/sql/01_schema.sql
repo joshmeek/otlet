@@ -5,6 +5,9 @@ CREATE TABLE otlet.production_policy (
   stale_policy text NOT NULL DEFAULT 'refresh_then_fail_closed',
   max_queued_jobs_per_model integer NOT NULL DEFAULT 1000,
   max_attempts integer NOT NULL DEFAULT 3,
+  semantic_auto_wait_ms integer NOT NULL DEFAULT 10000,
+  semantic_auto_infer_ms integer NOT NULL DEFAULT 15000,
+  semantic_auto_max_rows integer NOT NULL DEFAULT 1,
   job_lease_interval interval NOT NULL DEFAULT interval '5 minutes',
   worker_event_retention interval NOT NULL DEFAULT interval '7 days',
   trace_detail_retention interval NOT NULL DEFAULT interval '7 days',
@@ -15,6 +18,9 @@ CREATE TABLE otlet.production_policy (
   )),
   CHECK (max_queued_jobs_per_model BETWEEN 1 AND 1000000),
   CHECK (max_attempts BETWEEN 1 AND 20),
+  CHECK (semantic_auto_wait_ms BETWEEN 0 AND 30000),
+  CHECK (semantic_auto_infer_ms BETWEEN 0 AND 30000),
+  CHECK (semantic_auto_max_rows BETWEEN 0 AND 10),
   CHECK (job_lease_interval >= interval '1 second'),
   CHECK (job_lease_interval <= interval '1 hour')
 );
