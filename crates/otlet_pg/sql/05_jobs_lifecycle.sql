@@ -567,8 +567,13 @@ BEGIN
         schema_validation_status = EXCLUDED.schema_validation_status,
         trace_summary = EXCLUDED.trace_summary;
 
-  PERFORM otlet.mark_runtime_health(runtime_row.name, 'error', fail_job.error);
-  PERFORM otlet.touch_runtime_slot(runtime_row.name, model_row.name, 'error', 0, fail_job.error);
+  IF fail_job.schema_validation_status = 'failed' THEN
+    PERFORM otlet.mark_runtime_health(runtime_row.name, 'ready', NULL);
+    PERFORM otlet.touch_runtime_slot(runtime_row.name, model_row.name, 'ready', 0, NULL);
+  ELSE
+    PERFORM otlet.mark_runtime_health(runtime_row.name, 'error', fail_job.error);
+    PERFORM otlet.touch_runtime_slot(runtime_row.name, model_row.name, 'error', 0, fail_job.error);
+  END IF;
   PERFORM otlet.record_worker_event(
     'job_failed',
     saved_job.id,

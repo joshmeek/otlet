@@ -30,25 +30,32 @@ unsafe extern "C-unwind" fn otlet_semantic_explain_foreign_scan(
             explain_text("Selected Path", &snapshot.plan.selected_path, es);
             explain_text("Reason", &snapshot.plan.reason, es);
             explain_text("Task Name", &snapshot.plan.task_name, es);
-            explain_integer("Total Rows", snapshot.plan.total_rows, es);
-            explain_integer("Refresh Rows", snapshot.plan.refresh_rows, es);
+            explain_text("Record Type", &snapshot.plan.record_type, es);
+            explain_text("Model Name", &snapshot.plan.model_name, es);
+            explain_text("Runtime Name", &snapshot.plan.runtime_name, es);
+            explain_text("Source Relation", &snapshot.plan.source_relation, es);
+            explain_integer("Total Subjects", snapshot.plan.total_subjects, es);
+            explain_integer("Fresh Subjects", snapshot.plan.fresh_subjects, es);
+            explain_integer("Stale Subjects", snapshot.plan.stale_subjects, es);
+            explain_integer("Missing Subjects", snapshot.plan.missing_subjects, es);
+            explain_integer("In Flight Subjects", snapshot.plan.inflight_subjects, es);
+            explain_integer("Lookup Subjects", snapshot.plan.lookup_subjects, es);
+            explain_integer("Wait Subjects", snapshot.plan.wait_subjects, es);
+            explain_integer("Queue Subjects", snapshot.plan.queue_subjects, es);
+            explain_integer("Infer Now Subjects", snapshot.plan.infer_now_subjects, es);
+            explain_integer("Fail Closed Subjects", snapshot.plan.fail_closed_subjects, es);
             explain_float("Freshness", snapshot.plan.freshness, "", es);
-            explain_float(
-                "Estimated Lookup",
-                snapshot.plan.estimated_lookup_ms,
-                "ms",
-                es,
-            );
-            explain_float(
-                "Estimated Refresh",
-                snapshot.plan.estimated_refresh_ms,
-                "ms",
-                es,
-            );
-            explain_float(
-                "Estimated Fresh Inference",
-                snapshot.plan.estimated_fresh_inference_ms,
-                "ms",
+            explain_float("Model Cost", snapshot.plan.model_ms, "ms", es);
+            explain_text("Model Cost Source", &snapshot.plan.model_cost_source, es);
+            explain_float("Cache Hit Cost", snapshot.plan.cache_hit_ms, "ms", es);
+            explain_float("Estimated Lookup", snapshot.plan.lookup_ms, "ms", es);
+            explain_float("Estimated Queue", snapshot.plan.queue_ms, "ms", es);
+            explain_float("Estimated Infer Now", snapshot.plan.infer_now_ms, "ms", es);
+            explain_float("Path Cost", snapshot.plan.path_cost, "", es);
+            explain_integer("Worker Queue Depth", snapshot.plan.worker_queue_depth, es);
+            explain_integer(
+                "Available Queue Slots",
+                snapshot.plan.available_queue_slots,
                 es,
             );
             if (*es).analyze {
@@ -62,101 +69,6 @@ unsafe extern "C-unwind" fn otlet_semantic_explain_foreign_scan(
                 Some([]) => explain_text("Pushed Subject Filter", "empty", es),
                 Some(subject_ids) => explain_text("Pushed Subject Ids", &subject_ids.join(","), es),
                 None => {}
-            }
-            if !snapshot.pushdown.subject_param_filters.is_empty() {
-                explain_text(
-                    "Pushed Subject Params",
-                    &snapshot
-                        .pushdown
-                        .subject_param_filters
-                        .iter()
-                        .map(subject_param_filter_label)
-                        .collect::<Vec<_>>()
-                        .join(","),
-                    es,
-                );
-            }
-            if let Some(outer_ref) = snapshot.pushdown.subject_outer {
-                explain_text(
-                    "Pushed Subject Outer Var",
-                    &outer_var_ref_label(outer_ref),
-                    es,
-                );
-            }
-            if !snapshot.pushdown.body_contains.is_empty() {
-                explain_text(
-                    "Pushed Body Contains",
-                    &snapshot.pushdown.body_contains.join(" AND "),
-                    es,
-                );
-            }
-            if !snapshot.pushdown.body_contains_params.is_empty() {
-                explain_text(
-                    "Pushed Body Contains Params",
-                    &snapshot
-                        .pushdown
-                        .body_contains_params
-                        .iter()
-                        .map(|param_ref| format!("body @> {}", param_ref_label(*param_ref)))
-                        .collect::<Vec<_>>()
-                        .join(" AND "),
-                    es,
-                );
-            }
-            if !snapshot.pushdown.body_field_equals.is_empty() {
-                explain_text(
-                    "Pushed Body Field Equals",
-                    &snapshot
-                        .pushdown
-                        .body_field_equals
-                        .iter()
-                        .map(|(field, value)| format!("{field}={value}"))
-                        .collect::<Vec<_>>()
-                        .join(" AND "),
-                    es,
-                );
-            }
-            if !snapshot.pushdown.body_field_equals_params.is_empty() {
-                explain_text(
-                    "Pushed Body Field Equals Params",
-                    &snapshot
-                        .pushdown
-                        .body_field_equals_params
-                        .iter()
-                        .map(|(field, param_ref)| {
-                            format!("{field}={}", param_ref_label(*param_ref))
-                        })
-                        .collect::<Vec<_>>()
-                        .join(" AND "),
-                    es,
-                );
-            }
-            if let Some(stale) = snapshot.pushdown.stale {
-                explain_text(
-                    "Pushed Stale Filter",
-                    if stale { "stale=true" } else { "stale=false" },
-                    es,
-                );
-            }
-            if let Some(param_ref) = snapshot.pushdown.stale_param {
-                explain_text(
-                    "Pushed Stale Param",
-                    &format!("stale = {}", param_ref_label(param_ref)),
-                    es,
-                );
-            }
-            if let Some(source_hash) = &snapshot.pushdown.source_hash {
-                explain_text("Pushed Source Hash", source_hash, es);
-            }
-            if let Some(param_ref) = snapshot.pushdown.source_hash_param {
-                explain_text(
-                    "Pushed Source Hash Param",
-                    &format!("source_hash = {}", param_ref_label(param_ref)),
-                    es,
-                );
-            }
-            if let Some(reason) = &snapshot.pushdown.empty_result_reason {
-                explain_text("Empty Result Reason", reason, es);
             }
         }
     }

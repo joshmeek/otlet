@@ -5,17 +5,14 @@ fn refresh_runtime_subject_state(
     let state = with_latest_snapshot(|| {
         semantic_subject_state(
             runtime.index_kind,
-            runtime.predicate_kind,
             &runtime.index_name,
             &runtime.expected_json,
-            runtime.action_type.as_deref(),
             subject_id,
         )
     })?;
     runtime
         .semantic_states
         .insert(subject_id.to_string(), state);
-    runtime.subject_state_refreshes = runtime.subject_state_refreshes.saturating_add(1);
     Ok(state)
 }
 
@@ -282,20 +279,12 @@ unsafe fn pg_output_text(
 
 fn semantic_subject_state(
     index_kind: SemanticIndexKind,
-    predicate_kind: SemanticPredicateKind,
     index_name: &str,
     expected_json: &str,
-    action_type: Option<&str>,
     subject_id: &str,
 ) -> Result<SubjectSemanticState, String> {
     match index_kind {
-        SemanticIndexKind::Row => semantic_row_subject_state(
-            predicate_kind,
-            index_name,
-            expected_json,
-            action_type,
-            subject_id,
-        ),
+        SemanticIndexKind::Row => semantic_row_subject_state(index_name, expected_json, subject_id),
         SemanticIndexKind::Join => {
             semantic_join_subject_state(index_name, expected_json, subject_id)
         }
@@ -303,21 +292,11 @@ fn semantic_subject_state(
 }
 
 fn semantic_row_subject_state(
-    predicate_kind: SemanticPredicateKind,
     index_name: &str,
     expected_json: &str,
-    action_type: Option<&str>,
     subject_id: &str,
 ) -> Result<SubjectSemanticState, String> {
-    let matches_expected_sql = row_predicate_match_sql(
-        predicate_kind,
-        "sm.body",
-        "sm.record_id",
-        "sm.subject_id",
-        "si.task_name",
-        expected_json,
-        action_type,
-    )?;
+    let matches_expected_sql = row_predicate_match_sql("sm.body", expected_json);
     let query = format!(
         "WITH latest AS ( \
            SELECT DISTINCT ON (sm.subject_id) \

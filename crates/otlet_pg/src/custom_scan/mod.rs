@@ -12,8 +12,6 @@ macro_rules! explain_scan_counters {
         explain_counter("Rows Seen", source.rows_seen, $es);
         explain_counter("Rows Returned", source.rows_returned, $es);
         explain_counter("Actual Lookup Rows", source.lookup_rows, $es);
-        explain_counter("Actual Wait Resolved Rows", source.wait_resolved_rows, $es);
-        explain_counter("Actual Wait Returned Rows", source.wait_returned_rows, $es);
         explain_counter(
             "Actual Infer Resolved Rows",
             source.infer_resolved_rows,
@@ -25,61 +23,22 @@ macro_rules! explain_scan_counters {
             $es,
         );
         explain_counter("Actual Fail Closed Rows", source.fail_closed_rows, $es);
-        explain_counter("Fresh Materialized Matches", source.fresh_matches, $es);
         explain_counter(
-            "Fresh Materialized Non Matches",
-            source.fresh_non_matches,
+            "Actual Fresh Subjects",
+            source
+                .fresh_matches
+                .saturating_add(source.fresh_non_matches),
             $es,
         );
-        explain_counter("Stale Rows", source.stale_rows, $es);
-        explain_counter("Missing Rows", source.missing_rows, $es);
-        explain_counter("In Flight Refresh Rows", source.inflight_rows, $es);
+        explain_counter("Actual Stale Subjects", source.stale_rows, $es);
+        explain_counter("Actual Missing Subjects", source.missing_rows, $es);
+        explain_counter("Actual In Flight Subjects", source.inflight_rows, $es);
         explain_counter("Queued Refreshes", source.queued_refreshes, $es);
-        explain_counter("Waited Refreshes", source.waited_refreshes, $es);
-        explain_counter("Wait Elapsed Ms", source.wait_elapsed_ms, $es);
         explain_counter("Infer Now Batches", source.infer_now_batches, $es);
         explain_counter("Infer Now Elapsed Ms", source.infer_now_ms, $es);
-        explain_counter(
-            "Infer Now Request Wait Ms",
-            source.infer_now_request_wait_ms,
-            $es,
-        );
-        explain_counter(
-            "Infer Now Start Latency Ms",
-            source.infer_now_start_latency_ms,
-            $es,
-        );
-        explain_counter(
-            "Infer Now Worker Run Ms",
-            source.infer_now_worker_run_ms,
-            $es,
-        );
         explain_counter("Infer Now Timeouts", source.infer_now_timeouts, $es);
-        explain_counter(
-            "Infer Now Abort Requests",
-            source.infer_now_abort_requests,
-            $es,
-        );
-        explain_counter(
-            "Infer Now Cancel Job Id",
-            source.infer_now_cancel_job_id as u64,
-            $es,
-        );
         explain_counter("Infer Now Failures", source.infer_now_failures, $es);
         explain_optional_text("Infer Now Last Error", $last_error, $es);
-        explain_counter(
-            "Infer Now Prefetch Submissions",
-            source.infer_prefetch_submissions,
-            $es,
-        );
-        explain_counter(
-            "Infer Now Prefetch Source Rows",
-            source.infer_prefetch_source_rows,
-            $es,
-        );
-        explain_counter("Infer Now Buffered Rows", source.infer_buffered_rows, $es);
-        explain_counter("Infer Now Slot Inputs", source.infer_slot_inputs, $es);
-        explain_counter("Infer Now SPI Inputs", source.infer_spi_inputs, $es);
         explain_counter("Infer Now Receipts", source.infer_receipts, $es);
         explain_counter(
             "Infer Now Failed Receipts",
@@ -91,22 +50,7 @@ macro_rules! explain_scan_counters {
             source.infer_failed_receipt_id,
             $es,
         );
-        explain_counter("Infer Now Outputs", source.infer_outputs, $es);
-        explain_counter("Infer Now Actions", source.infer_actions, $es);
-        explain_counter(
-            "Infer Now Materializations",
-            source.infer_materializations,
-            $es,
-        );
         explain_counter("Child Plan Source Rows", source.child_plan_rows, $es);
-        explain_counter("Direct Scan Source Rows", source.direct_scan_rows, $es);
-        explain_counter(
-            "Subject Local State Refreshes",
-            source.subject_state_refreshes,
-            $es,
-        );
-        explain_counter("Semantic Cache Hits", source.semantic_cache_hits, $es);
-        explain_counter("Semantic Cache Misses", source.semantic_cache_misses, $es);
         explain_counter("Estimated Model Cost Ms", $estimated_model_cost_ms, $es);
         explain_counter("Actual Model Cost Ms", source.infer_now_ms, $es);
     }};

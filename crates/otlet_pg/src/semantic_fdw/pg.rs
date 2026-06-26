@@ -8,32 +8,6 @@ unsafe fn strip_relabel(node: *mut pg_sys::Expr) -> *mut pg_sys::Expr {
     }
 }
 
-unsafe fn is_jsonb_contains_operator(opno: pg_sys::Oid) -> bool {
-    unsafe {
-        let opname = pg_sys::get_opname(opno);
-        if opname.is_null() || CStr::from_ptr(opname).to_bytes() != b"@>" {
-            return false;
-        }
-        let mut left = pg_sys::InvalidOid;
-        let mut right = pg_sys::InvalidOid;
-        pg_sys::op_input_types(opno, &mut left, &mut right);
-        left == pg_sys::JSONBOID && right == pg_sys::JSONBOID
-    }
-}
-
-unsafe fn is_jsonb_text_extract_operator(opno: pg_sys::Oid) -> bool {
-    unsafe {
-        let opname = pg_sys::get_opname(opno);
-        if opname.is_null() || CStr::from_ptr(opname).to_bytes() != b"->>" {
-            return false;
-        }
-        let mut left = pg_sys::InvalidOid;
-        let mut right = pg_sys::InvalidOid;
-        pg_sys::op_input_types(opno, &mut left, &mut right);
-        left == pg_sys::JSONBOID && right == pg_sys::TEXTOID
-    }
-}
-
 unsafe fn is_text_equality_operator(opno: pg_sys::Oid) -> bool {
     unsafe {
         let opname = pg_sys::get_opname(opno);
@@ -44,19 +18,6 @@ unsafe fn is_text_equality_operator(opno: pg_sys::Oid) -> bool {
         let mut right = pg_sys::InvalidOid;
         pg_sys::op_input_types(opno, &mut left, &mut right);
         left == pg_sys::TEXTOID && right == pg_sys::TEXTOID
-    }
-}
-
-unsafe fn is_bool_equality_operator(opno: pg_sys::Oid) -> bool {
-    unsafe {
-        let opname = pg_sys::get_opname(opno);
-        if opname.is_null() || CStr::from_ptr(opname).to_bytes() != b"=" {
-            return false;
-        }
-        let mut left = pg_sys::InvalidOid;
-        let mut right = pg_sys::InvalidOid;
-        pg_sys::op_input_types(opno, &mut left, &mut right);
-        left == pg_sys::BOOLOID && right == pg_sys::BOOLOID
     }
 }
 
@@ -96,37 +57,6 @@ fn sql_subject_filter(column: &str, subjects: &SubjectPushdown) -> String {
             sql_text_array(subject_ids)
         ),
     }
-}
-
-fn sql_body_filter(column: &str, pushdown: &SemanticPushdown) -> String {
-    let mut filter = pushdown
-        .body_contains
-        .iter()
-        .map(|filter| format!(" AND {column} @> {}::jsonb", sql_literal(filter)))
-        .collect::<String>();
-    for (field, value) in &pushdown.body_field_equals {
-        filter.push_str(&format!(
-            " AND {column} ->> {} = {}",
-            sql_literal(field),
-            sql_literal(value)
-        ));
-    }
-    filter
-}
-
-fn sql_stale_filter(stale: Option<bool>) -> &'static str {
-    match stale {
-        Some(true) => " AND false",
-        _ => "",
-    }
-}
-
-fn sql_source_hash_filter(column: &str, pushdown: &SemanticPushdown) -> String {
-    pushdown
-        .source_hash
-        .as_ref()
-        .map(|source_hash| format!(" AND {column} = {}", sql_literal(source_hash)))
-        .unwrap_or_default()
 }
 
 fn sql_text_array(subject_ids: &[String]) -> String {

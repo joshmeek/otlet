@@ -6,35 +6,40 @@ CREATE FUNCTION otlet.semantic_index_plan(
   effective_stale_policy text,
   name text,
   task_name text,
-  source_table text,
-  total_rows bigint,
-  ready_rows bigint,
-  stale_rows bigint,
-  refresh_rows bigint,
-  missing_rows bigint,
+  record_type text,
+  model_name text,
+  runtime_name text,
+  source_relation text,
+  total_subjects bigint,
+  fresh_subjects bigint,
+  stale_subjects bigint,
+  missing_subjects bigint,
+  inflight_subjects bigint,
+  lookup_subjects bigint,
+  wait_subjects bigint,
+  queue_subjects bigint,
+  infer_now_subjects bigint,
+  fail_closed_subjects bigint,
   freshness numeric,
-  refresh_coverage numeric,
-  estimated_lookup_ms numeric,
-  estimated_refresh_ms numeric,
-  estimated_fresh_inference_ms numeric,
-  active_jobs bigint,
-  completed_jobs bigint
+  model_ms numeric,
+  model_cost_source text,
+  cache_hit_ms numeric,
+  lookup_ms numeric,
+  queue_ms numeric,
+  infer_now_ms numeric,
+  path_cost numeric,
+  worker_queue_depth bigint,
+  available_queue_slots bigint,
+  checked_at timestamptz
 )
 LANGUAGE plpgsql
 AS $$
 DECLARE
   index_row otlet.semantic_indexes%ROWTYPE;
-  v_total_rows bigint := 0;
-  v_ready_rows bigint := 0;
-  v_stale_rows bigint := 0;
-  v_refresh_rows bigint := 0;
-  v_active_jobs bigint := 0;
-  v_completed_jobs bigint := 0;
-  v_materialized_at timestamptz;
-  v_generate_ms numeric := 2500;
-  v_stale_policy text;
-  v_selected_path text;
-  v_reason text;
+  v_total_subjects bigint := 0;
+  v_fresh_subjects bigint := 0;
+  v_stale_subjects bigint := 0;
+  v_missing_subjects bigint := 0;
 BEGIN
   SELECT *
   INTO index_row
@@ -78,7 +83,6 @@ BEGIN
         SELECT
           ci.subject_id,
           l.subject_id IS NOT NULL AS has_materialization,
-          l.updated_at,
           (
             l.subject_id IS NOT NULL
             AND l.stale = false
@@ -98,8 +102,7 @@ BEGIN
         count(*)::bigint,
         count(*) FILTER (WHERE is_fresh)::bigint,
         count(*) FILTER (WHERE is_stale)::bigint,
-        count(*) FILTER (WHERE NOT is_fresh)::bigint,
-        max(updated_at)
+        count(*) FILTER (WHERE NOT has_materialization)::bigint
       FROM classified
     $sql$,
     index_row.subject_column,
@@ -108,81 +111,28 @@ BEGIN
     index_row.task_name,
     index_row.record_type
   )
-  INTO v_total_rows, v_ready_rows, v_stale_rows, v_refresh_rows, v_materialized_at;
-
-  v_total_rows := COALESCE(v_total_rows, 0);
-  v_ready_rows := COALESCE(v_ready_rows, 0);
-  v_stale_rows := COALESCE(v_stale_rows, 0);
-  v_refresh_rows := COALESCE(v_refresh_rows, 0);
-
-  SELECT
-    count(*) FILTER (WHERE j.status IN ('queued', 'running', 'cancel_requested')),
-    count(*) FILTER (WHERE j.status = 'complete')
-  INTO v_active_jobs, v_completed_jobs
-  FROM otlet.jobs j
-  WHERE j.task_name = index_row.task_name;
-
-  v_active_jobs := COALESCE(v_active_jobs, 0);
-  v_completed_jobs := COALESCE(v_completed_jobs, 0);
-
-  SELECT COALESCE(NULLIF(rs.last_generate_ms, 0), 2500)::numeric
-  INTO v_generate_ms
-  FROM otlet.runtime_slots rs
-  JOIN otlet.models m ON m.name = index_row.model_name
-  WHERE rs.model_name = index_row.model_name
-    AND rs.runtime_name = m.runtime_name
-  ORDER BY rs.last_used_at DESC NULLS LAST
-  LIMIT 1;
-
-  v_generate_ms := COALESCE(v_generate_ms, 2500);
-
-  SELECT policy.stale_policy
-  INTO v_stale_policy
-  FROM otlet.production_policy policy
-  LIMIT 1;
-
-  v_stale_policy := COALESCE(v_stale_policy, 'lookup_only_fail_closed');
-
-  IF v_total_rows = 0 THEN
-    v_selected_path := 'semantic_lookup';
-    v_reason := 'empty source';
-  ELSIF v_active_jobs > 0 THEN
-    v_selected_path := 'wait_for_refresh';
-    v_reason := 'refresh already active';
-  ELSIF v_refresh_rows = 0 THEN
-    v_selected_path := 'semantic_lookup';
-    v_reason := 'semantic index fully fresh';
-  ELSIF v_stale_policy = 'lookup_only_fail_closed' THEN
-    v_selected_path := 'semantic_lookup';
-    v_reason := 'policy returns fresh lookup rows only';
-  ELSIF v_refresh_rows < v_total_rows THEN
-    v_selected_path := 'refresh_then_lookup';
-    v_reason := 'partial refresh cheaper than full fresh inference';
-  ELSE
-    v_selected_path := 'fresh_inference_scan';
-    v_reason := 'fresh inference has no reusable semantic coverage';
-  END IF;
+  INTO v_total_subjects, v_fresh_subjects, v_stale_subjects, v_missing_subjects;
 
   RETURN QUERY
-  SELECT
-    v_selected_path,
-    v_reason,
-    v_stale_policy,
+  SELECT *
+  FROM otlet.semantic_plan_from_counts(
     index_row.name,
     index_row.task_name,
+    index_row.record_type,
+    index_row.model_name,
     index_row.source_table,
-    v_total_rows,
-    v_ready_rows,
-    v_stale_rows,
-    v_refresh_rows,
-    GREATEST(v_total_rows - v_ready_rows, 0),
-    CASE WHEN v_total_rows = 0 THEN 1::numeric ELSE round(v_ready_rows::numeric / v_total_rows, 4) END,
-    CASE WHEN v_total_rows = 0 THEN 1::numeric ELSE round(GREATEST(v_total_rows - v_refresh_rows, 0)::numeric / v_total_rows, 4) END,
-    round(1 + (v_ready_rows::numeric * 0.05), 2),
-    round((v_refresh_rows::numeric * v_generate_ms) + 1 + (v_total_rows::numeric * 0.05), 2),
-    round(v_total_rows::numeric * v_generate_ms, 2),
-    v_active_jobs,
-    v_completed_jobs;
+    'semantic_lookup',
+    'empty source',
+    'semantic index fully fresh',
+    'policy returns fresh lookup rows only',
+    'partial refresh queued before lookup',
+    'fresh_inference_scan',
+    'fresh inference has no reusable semantic coverage',
+    v_total_subjects,
+    v_fresh_subjects,
+    v_stale_subjects,
+    v_missing_subjects
+  );
 END;
 $$;
 
@@ -190,22 +140,38 @@ CREATE OR REPLACE VIEW otlet.semantic_index_status AS
 SELECT
   plan.name,
   plan.task_name,
-  plan.source_table,
+  plan.source_relation,
   si.subject_column,
   si.record_type,
   si.model_name,
+  plan.runtime_name,
   si.last_refresh_at,
   si.last_lookup_at,
-  plan.ready_rows,
-  plan.stale_rows,
-  plan.active_jobs,
-  plan.completed_jobs,
+  plan.total_subjects,
+  plan.fresh_subjects,
+  plan.stale_subjects,
+  plan.missing_subjects,
+  plan.inflight_subjects,
+  plan.lookup_subjects,
+  plan.wait_subjects,
+  plan.queue_subjects,
+  plan.infer_now_subjects,
+  plan.fail_closed_subjects,
+  plan.selected_path,
+  plan.reason,
+  plan.freshness,
+  plan.model_ms,
+  plan.model_cost_source,
+  plan.path_cost,
+  plan.worker_queue_depth,
+  plan.available_queue_slots,
   (
     SELECT max(sm.updated_at)
     FROM otlet.semantic_materializations sm
     WHERE sm.task_name = si.task_name
       AND sm.record_type = si.record_type
   ) AS last_materialized_at,
-  plan.effective_stale_policy
+  plan.effective_stale_policy,
+  plan.checked_at
 FROM otlet.semantic_indexes si
 JOIN LATERAL otlet.semantic_index_plan(si.name) plan ON true;

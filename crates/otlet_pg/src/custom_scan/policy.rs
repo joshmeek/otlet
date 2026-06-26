@@ -50,6 +50,14 @@ fn infer_now_input_path(infer_ms: u32) -> &'static str {
     }
 }
 
+fn semantic_policy_for_selected_path(selected_path: &str) -> SemanticAutoPolicy {
+    match selected_path {
+        "bounded_infer_now" | "wait_for_refresh" | "queue_refresh" | "fresh_inference_scan"
+        | "fresh_pair_inference" => semantic_auto_policy(true),
+        _ => semantic_auto_policy(false),
+    }
+}
+
 fn source_tuple_provider(runtime: &RuntimeState) -> &'static str {
     if !runtime.child_plan.is_null() && is_semantic_join_runtime(runtime) {
         "child_subquery_join_execprocnode"
@@ -79,8 +87,6 @@ unsafe fn source_tuple_provider_from_state(
     unsafe {
         if !state.is_null() && (*state).child_plan_rows > 0 {
             "child_plan_execprocnode"
-        } else if !state.is_null() && (*state).direct_scan_rows > 0 {
-            "unexpected_table_beginscan_fallback"
         } else {
             "not_started"
         }

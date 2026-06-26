@@ -122,9 +122,7 @@ pub(crate) struct InferNowRequest {
 #[derive(Clone, Copy)]
 pub(crate) struct InferNowSnapshot {
     pub(crate) timeouts: u64,
-    pub(crate) abort_requests: u64,
     pub(crate) last_job_id: i64,
-    pub(crate) last_cancel_job_id: i64,
 }
 
 pub(crate) struct InferNowQueueSnapshot {
@@ -141,9 +139,6 @@ pub(crate) struct SubmittedInferNow {
 
 pub(crate) struct CompletedInferNow {
     pub(crate) job_id: i64,
-    pub(crate) elapsed_ms: u64,
-    pub(crate) start_latency_ms: u64,
-    pub(crate) worker_run_ms: u64,
 }
 
 pub(crate) fn init_shared_memory() {
@@ -208,9 +203,7 @@ pub(crate) fn snapshot() -> InferNowSnapshot {
     let state = INFER_NOW_STATE.share();
     InferNowSnapshot {
         timeouts: state.timeouts,
-        abort_requests: state.abort_requests,
         last_job_id: state.last_job_id,
-        last_cancel_job_id: state.last_cancel_job_id,
     }
 }
 
@@ -483,9 +476,6 @@ fn wait_for_request(request_id: u64, timeout_ms: u32) -> Result<Option<Completed
                         let elapsed = elapsed_ms(start);
                         let completed = CompletedInferNow {
                             job_id: state.slots[slot_index].last_job_id,
-                            elapsed_ms: elapsed,
-                            start_latency_ms: state.slots[slot_index].last_start_latency_ms,
-                            worker_run_ms: state.slots[slot_index].last_worker_run_ms,
                         };
                         {
                             let slot = &mut state.slots[slot_index];

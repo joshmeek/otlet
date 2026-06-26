@@ -1,51 +1,21 @@
 struct CustomScanPrivate {
     index_kind: SemanticIndexKind,
-    predicate_kind: SemanticPredicateKind,
     index_name: String,
     expected_json: String,
-    action_type: Option<String>,
-    auto_policy: bool,
-    allow_refresh: bool,
-    wait_ms: u32,
-    infer_ms: u32,
-    infer_max_rows: u32,
     subject_attno: i16,
     subject_typid: pg_sys::Oid,
-    planner_stats: SemanticPlannerStats,
+    selected_path: String,
 }
 
 unsafe fn custom_private_from_predicate(predicate: &SemanticMatchPredicate) -> *mut pg_sys::List {
     unsafe {
         let payload = json!({
             "index_kind": predicate.index_kind.as_str(),
-            "predicate_kind": predicate.predicate_kind.as_str(),
             "index_name": &predicate.index_name,
             "expected_json": &predicate.expected_json,
-            "action_type": &predicate.action_type,
-            "auto_policy": predicate.auto_policy,
-            "allow_refresh": predicate.allow_refresh,
-            "wait_ms": predicate.wait_ms,
-            "infer_ms": predicate.infer_ms,
-            "infer_max_rows": predicate.infer_max_rows,
             "subject_attno": predicate.subject_attno,
             "subject_typid": predicate.subject_typid.to_u32(),
-            "planner_stats": {
-                "reason": &predicate.planner_stats.reason,
-                "source_rows": predicate.planner_stats.source_rows,
-                "fresh_matches": predicate.planner_stats.fresh_matches,
-                "fresh_non_matches": predicate.planner_stats.fresh_non_matches,
-                "stale_rows": predicate.planner_stats.stale_rows,
-                "missing_rows": predicate.planner_stats.missing_rows,
-                "inflight_rows": predicate.planner_stats.inflight_rows,
-                "cache_reusable_rows": predicate.planner_stats.cache_reusable_rows,
-                "lookup_decision_rows": predicate.planner_stats.lookup_decision_rows,
-                "wait_decision_rows": predicate.planner_stats.wait_decision_rows,
-                "infer_decision_rows": predicate.planner_stats.infer_decision_rows,
-                "queue_decision_rows": predicate.planner_stats.queue_decision_rows,
-                "fail_closed_decision_rows": predicate.planner_stats.fail_closed_decision_rows,
-                "model_ms": predicate.planner_stats.model_ms,
-                "path_cost": predicate.planner_stats.path_cost
-            }
+            "selected_path": &predicate.planner_stats.selected_path
         });
         let mut list = ptr::null_mut();
         list = append_string_node(list, CUSTOM_PRIVATE_MARKER);
@@ -77,7 +47,6 @@ unsafe fn custom_private_from_list(private: *mut pg_sys::List) -> Option<CustomS
         }
         let payload_text = string_node_value(pg_sys::list_nth(private, 1) as *mut pg_sys::String)?;
         let payload: Value = serde_json::from_str(&payload_text).ok()?;
-        let stats = payload.get("planner_stats")?;
 
         Some(CustomScanPrivate {
             index_kind: payload
@@ -85,41 +54,11 @@ unsafe fn custom_private_from_list(private: *mut pg_sys::List) -> Option<CustomS
                 .and_then(Value::as_str)
                 .and_then(SemanticIndexKind::from_str)
                 .unwrap_or(SemanticIndexKind::Row),
-            predicate_kind: payload
-                .get("predicate_kind")
-                .and_then(Value::as_str)
-                .and_then(SemanticPredicateKind::from_str)
-                .unwrap_or(SemanticPredicateKind::Materialization),
             index_name: payload.get("index_name")?.as_str()?.to_string(),
             expected_json: payload.get("expected_json")?.as_str()?.to_string(),
-            action_type: payload
-                .get("action_type")
-                .and_then(Value::as_str)
-                .map(str::to_string),
-            auto_policy: payload.get("auto_policy")?.as_bool()?,
-            allow_refresh: payload.get("allow_refresh")?.as_bool()?,
-            wait_ms: payload.get("wait_ms")?.as_u64()?.try_into().ok()?,
-            infer_ms: payload.get("infer_ms")?.as_u64()?.try_into().ok()?,
-            infer_max_rows: payload.get("infer_max_rows")?.as_u64()?.try_into().ok()?,
             subject_attno: payload.get("subject_attno")?.as_i64()?.try_into().ok()?,
             subject_typid: pg_sys::Oid::from(payload.get("subject_typid")?.as_u64()? as u32),
-            planner_stats: SemanticPlannerStats {
-                reason: stats.get("reason")?.as_str()?.to_string(),
-                source_rows: stats.get("source_rows")?.as_u64()?,
-                fresh_matches: stats.get("fresh_matches")?.as_u64()?,
-                fresh_non_matches: stats.get("fresh_non_matches")?.as_u64()?,
-                stale_rows: stats.get("stale_rows")?.as_u64()?,
-                missing_rows: stats.get("missing_rows")?.as_u64()?,
-                inflight_rows: stats.get("inflight_rows")?.as_u64()?,
-                cache_reusable_rows: stats.get("cache_reusable_rows")?.as_u64()?,
-                lookup_decision_rows: stats.get("lookup_decision_rows")?.as_u64()?,
-                wait_decision_rows: stats.get("wait_decision_rows")?.as_u64()?,
-                infer_decision_rows: stats.get("infer_decision_rows")?.as_u64()?,
-                queue_decision_rows: stats.get("queue_decision_rows")?.as_u64()?,
-                fail_closed_decision_rows: stats.get("fail_closed_decision_rows")?.as_u64()?,
-                model_ms: stats.get("model_ms")?.as_f64()?,
-                path_cost: stats.get("path_cost")?.as_f64()?,
-            },
+            selected_path: payload.get("selected_path")?.as_str()?.to_string(),
         })
     }
 }
@@ -215,34 +154,6 @@ unsafe fn jsonb_const_text(node: *mut pg_sys::Expr) -> Option<String> {
             (*value).consttype,
         )?;
         serde_json::to_string(&jsonb.0).ok()
-    }
-}
-
-unsafe fn bool_const_value(node: *mut pg_sys::Expr) -> Option<bool> {
-    unsafe {
-        let node = strip_relabel(node);
-        if node.is_null() || (*node).type_ != pg_sys::NodeTag::T_Const {
-            return None;
-        }
-        let value = node as *mut pg_sys::Const;
-        if (*value).constisnull || (*value).consttype != pg_sys::BOOLOID {
-            return None;
-        }
-        <bool as FromDatum>::from_polymorphic_datum((*value).constvalue, false, (*value).consttype)
-    }
-}
-
-unsafe fn int_const_value(node: *mut pg_sys::Expr) -> Option<i32> {
-    unsafe {
-        let node = strip_relabel(node);
-        if node.is_null() || (*node).type_ != pg_sys::NodeTag::T_Const {
-            return None;
-        }
-        let value = node as *mut pg_sys::Const;
-        if (*value).constisnull || (*value).consttype != pg_sys::INT4OID {
-            return None;
-        }
-        <i32 as FromDatum>::from_polymorphic_datum((*value).constvalue, false, (*value).consttype)
     }
 }
 

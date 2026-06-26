@@ -1,9 +1,7 @@
 fn load_semantic_states(
     index_kind: SemanticIndexKind,
-    predicate_kind: SemanticPredicateKind,
     index_name: &str,
     expected_json: &str,
-    action_type: Option<&str>,
 ) -> Result<LoadedSemanticState, String> {
     if index_kind == SemanticIndexKind::Join {
         return load_semantic_join_states(index_name, expected_json);
@@ -40,15 +38,7 @@ fn load_semantic_states(
             .map_err(to_string)?
             .ok_or_else(|| format!("otlet semantic index {index_name} has no record type"))?;
         let source_rows_sql = source_rows_sql(&source_table, &subject_column);
-        let matches_expected_sql = row_predicate_match_sql(
-            predicate_kind,
-            "sm.body",
-            "sm.record_id",
-            "sm.subject_id",
-            &sql_literal(&task_name),
-            expected_json,
-            action_type,
-        )?;
+        let matches_expected_sql = row_predicate_match_sql("sm.body", expected_json);
         let query = format!(
             "WITH latest_materializations AS ( \
            SELECT DISTINCT ON (sm.subject_id) \

@@ -51,17 +51,9 @@ fn wait_for_refresh_if_allowed(
             }
             with_latest_snapshot(|| materialize_semantic_subject(runtime, subject_id))?;
             let state = refresh_runtime_subject_state(runtime, subject_id)?;
-            let elapsed = wait_elapsed_ms(start);
-            runtime.wait_elapsed_ms = runtime.wait_elapsed_ms.saturating_add(elapsed);
             match state {
-                SubjectSemanticState::FreshMatch => {
-                    runtime.waited_refreshes += 1;
-                    return Ok(SemanticResolution::Match);
-                }
-                SubjectSemanticState::FreshNonMatch => {
-                    runtime.waited_refreshes += 1;
-                    return Ok(SemanticResolution::NonMatch);
-                }
+                SubjectSemanticState::FreshMatch => return Ok(SemanticResolution::Match),
+                SubjectSemanticState::FreshNonMatch => return Ok(SemanticResolution::NonMatch),
                 _ => return Ok(SemanticResolution::Unresolved),
             }
         } else {
@@ -69,9 +61,6 @@ fn wait_for_refresh_if_allowed(
         }
         let now = unsafe { pg_sys::GetCurrentTimestamp() };
         if unsafe { pg_sys::TimestampDifferenceExceeds(start, now, max_wait_ms) } {
-            runtime.wait_elapsed_ms = runtime
-                .wait_elapsed_ms
-                .saturating_add(wait_elapsed_ms(start));
             return Ok(SemanticResolution::Unresolved);
         }
         unsafe {
@@ -100,7 +89,6 @@ unsafe fn prefetch_infer_now_batch(
     }
 
     let mut prefetched_source_rows = 1usize;
-    runtime.infer_prefetch_source_rows = runtime.infer_prefetch_source_rows.saturating_add(1);
     loop {
         if prefetched_infer_count(&rows) >= remaining_infer_capacity(runtime) {
             break;
@@ -112,7 +100,6 @@ unsafe fn prefetch_infer_now_batch(
             break;
         };
         prefetched_source_rows = prefetched_source_rows.saturating_add(1);
-        runtime.infer_prefetch_source_rows = runtime.infer_prefetch_source_rows.saturating_add(1);
         runtime.rows_seen = runtime.rows_seen.saturating_add(1);
         let mut isnull = false;
         let value = unsafe {
@@ -133,13 +120,11 @@ unsafe fn prefetch_infer_now_batch(
             SubjectSemanticState::FreshMatch => {
                 runtime.fresh_matches = runtime.fresh_matches.saturating_add(1);
                 runtime.lookup_rows = runtime.lookup_rows.saturating_add(1);
-                runtime.semantic_cache_hits = runtime.semantic_cache_hits.saturating_add(1);
                 rows.push(PrefetchedRow::Ready(unsafe { copy_slot_buffer(slot)? }));
             }
             SubjectSemanticState::FreshNonMatch => {
                 runtime.fresh_non_matches = runtime.fresh_non_matches.saturating_add(1);
                 runtime.lookup_rows = runtime.lookup_rows.saturating_add(1);
-                runtime.semantic_cache_hits = runtime.semantic_cache_hits.saturating_add(1);
             }
             SubjectSemanticState::Stale | SubjectSemanticState::Missing => {
                 if runtime
@@ -153,7 +138,6 @@ unsafe fn prefetch_infer_now_batch(
                 } else {
                     runtime.missing_rows = runtime.missing_rows.saturating_add(1);
                 }
-                runtime.semantic_cache_misses = runtime.semantic_cache_misses.saturating_add(1);
                 if prefetched_infer_count(&rows) < remaining_infer_capacity(runtime)
                     && submit_prefetched_infer_row(runtime, &subject_id, slot, &mut rows)?
                 {
@@ -163,7 +147,6 @@ unsafe fn prefetch_infer_now_batch(
             }
             SubjectSemanticState::InFlight => {
                 runtime.inflight_rows = runtime.inflight_rows.saturating_add(1);
-                runtime.semantic_cache_misses = runtime.semantic_cache_misses.saturating_add(1);
                 runtime.fail_closed_rows = runtime.fail_closed_rows.saturating_add(1);
             }
         }
@@ -202,10 +185,8 @@ fn submit_prefetched_infer_row(
     else {
         return Ok(false);
     };
-    runtime.infer_slot_inputs = runtime.infer_slot_inputs.saturating_add(1);
     let buffered_slot = unsafe { copy_slot_buffer(slot)? };
     crate::infer_now::signal_infer_now_worker();
-    runtime.infer_prefetch_submissions = runtime.infer_prefetch_submissions.saturating_add(1);
     rows.push(PrefetchedRow::Infer(PendingInferNowRow {
         subject_id: subject_id.to_string(),
         slot: buffered_slot,
@@ -220,7 +201,6 @@ fn resolve_prefetched_rows(runtime: &mut RuntimeState, rows: Vec<PrefetchedRow>)
     for row in rows {
         match row {
             PrefetchedRow::Ready(tuple) => {
-                runtime.infer_buffered_rows = runtime.infer_buffered_rows.saturating_add(1);
                 runtime.pending_output_rows.push_back(tuple);
             }
             PrefetchedRow::Infer(pending) => {
@@ -229,7 +209,6 @@ fn resolve_prefetched_rows(runtime: &mut RuntimeState, rows: Vec<PrefetchedRow>)
                     Ok(SemanticResolution::Match) => {
                         runtime.infer_resolved_rows = runtime.infer_resolved_rows.saturating_add(1);
                         runtime.infer_returned_rows = runtime.infer_returned_rows.saturating_add(1);
-                        runtime.infer_buffered_rows = runtime.infer_buffered_rows.saturating_add(1);
                         runtime.pending_output_rows.push_back(pending.slot);
                     }
                     Ok(SemanticResolution::NonMatch) => {
@@ -267,7 +246,6 @@ fn wait_for_prefetched_infer_row(
 ) -> Result<SemanticResolution, String> {
     match crate::infer_now::wait_for_submitted_infer_now(&pending.submitted, runtime.infer_ms) {
         Ok(Some(completed)) => {
-            record_infer_now_completion_timing(runtime, &completed);
             finish_infer_now_success(
                 runtime,
                 &pending.subject_id,
@@ -307,12 +285,6 @@ fn record_infer_now_timeout_deltas(
         runtime.infer_now_timeouts = runtime
             .infer_now_timeouts
             .saturating_add(after.timeouts.saturating_sub(before.timeouts));
-    }
-    if after.abort_requests > before.abort_requests {
-        runtime.infer_now_abort_requests = runtime
-            .infer_now_abort_requests
-            .saturating_add(after.abort_requests.saturating_sub(before.abort_requests));
-        runtime.infer_now_cancel_job_id = after.last_cancel_job_id;
     }
 }
 
@@ -372,7 +344,6 @@ fn infer_now_if_allowed(
     let input = semantic_slot_input(runtime, subject_id, slot)
         .map_err(|err| format!("tuple-slot infer-now input failed; SPI fallback disabled: {err}"))?
         .ok_or_else(|| "tuple-slot infer-now input missing; SPI fallback disabled".to_string())?;
-    runtime.infer_slot_inputs += 1;
     let start = unsafe { pg_sys::GetCurrentTimestamp() };
     let infer_state_before = crate::infer_now::snapshot();
     let request = crate::infer_now::submit_infer_now(&runtime.task_name, subject_id, &input);
@@ -409,23 +380,7 @@ fn infer_now_if_allowed(
             }
         };
 
-    record_infer_now_completion_timing(runtime, &completed);
     finish_infer_now_success(runtime, subject_id, completed.job_id, start)
-}
-
-fn record_infer_now_completion_timing(
-    runtime: &mut RuntimeState,
-    completed: &crate::infer_now::CompletedInferNow,
-) {
-    runtime.infer_now_start_latency_ms = runtime
-        .infer_now_start_latency_ms
-        .saturating_add(completed.start_latency_ms);
-    runtime.infer_now_request_wait_ms = runtime
-        .infer_now_request_wait_ms
-        .saturating_add(completed.elapsed_ms);
-    runtime.infer_now_worker_run_ms = runtime
-        .infer_now_worker_run_ms
-        .saturating_add(completed.worker_run_ms);
 }
 
 fn finish_infer_now_success(
@@ -443,11 +398,6 @@ fn finish_infer_now_success(
     with_latest_snapshot(|| materialize_semantic_subject(runtime, subject_id))?;
     let provenance = with_latest_snapshot(|| infer_now_provenance_counts(job_id))?;
     runtime.infer_receipts = runtime.infer_receipts.saturating_add(provenance.receipts);
-    runtime.infer_outputs = runtime.infer_outputs.saturating_add(provenance.outputs);
-    runtime.infer_actions = runtime.infer_actions.saturating_add(provenance.actions);
-    runtime.infer_materializations = runtime
-        .infer_materializations
-        .saturating_add(provenance.materializations);
     runtime.infer_trace_receipt_id = provenance.receipt_id;
     runtime.infer_trace_prompt_tokens = runtime
         .infer_trace_prompt_tokens
@@ -459,34 +409,10 @@ fn finish_infer_now_success(
         .infer_trace_generate_ms
         .saturating_add(provenance.generate_ms);
     runtime.infer_trace_version = provenance.trace_version;
-    runtime.infer_trace_tokens_per_second = provenance.tokens_per_second;
     runtime.infer_trace_probability_status = provenance.probability_status;
-    runtime.infer_trace_probability_method = provenance.probability_method;
     runtime.infer_trace_schema_force = provenance.schema_force;
-    runtime.infer_trace_worker_rss_bytes = provenance.worker_rss_bytes;
-    runtime.infer_trace_worker_virtual_bytes = provenance.worker_virtual_bytes;
-    runtime.infer_trace_worker_memory_policy = provenance.worker_memory_policy;
-    if provenance.model_cache_hit {
-        runtime.infer_trace_model_cache_hits =
-            runtime.infer_trace_model_cache_hits.saturating_add(1);
-    } else {
-        runtime.infer_trace_model_cache_misses =
-            runtime.infer_trace_model_cache_misses.saturating_add(1);
-    }
-    if provenance.inference_cache_hit {
-        runtime.infer_trace_inference_cache_hits =
-            runtime.infer_trace_inference_cache_hits.saturating_add(1);
-    } else {
-        runtime.infer_trace_inference_cache_misses =
-            runtime.infer_trace_inference_cache_misses.saturating_add(1);
-    }
-    runtime.infer_trace_inference_cache_entries = provenance.inference_cache_entries;
-    runtime.infer_trace_inference_cache_bytes = provenance.inference_cache_bytes;
-    runtime.infer_trace_inference_cache_evictions = provenance.inference_cache_evictions;
-    runtime.infer_trace_inference_cache_reason = provenance.inference_cache_reason;
     runtime.infer_trace_detailed_status = provenance.detailed_trace_status;
     runtime.infer_trace_detailed_captured_tokens = provenance.detailed_trace_captured_tokens;
-    runtime.infer_trace_detailed_skipped_tokens = provenance.detailed_trace_skipped_tokens;
     runtime.infer_trace_detailed_top_k = provenance.detailed_trace_top_k;
     let state = refresh_runtime_subject_state(runtime, subject_id)?;
     runtime.infer_now_ms = runtime.infer_now_ms.saturating_add(wait_elapsed_ms(start));

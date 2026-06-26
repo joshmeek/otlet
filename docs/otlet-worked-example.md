@@ -469,24 +469,12 @@ Otlet stores receipts when jobs fail because failures produce evidence too
 ## Inspect Runtime Residency
 
 ```sql
-SELECT
-  runtime_name,
-  endpoint,
-  runtime_status,
-  model_name,
-  slot_state,
-  model_residency_policy,
-  active_jobs,
-  model_memory_bytes,
-  model_parameters,
-  context_window_tokens,
-  worker_process_rss_bytes,
-  worker_process_virtual_bytes,
-  inference_cache_entries,
-  inference_cache_max_entries,
-  inference_cache_bytes,
-  inference_cache_max_bytes,
-  inference_cache_last_reason
+SELECT 'runtime_residency_contract=' ||
+       runtime_status || '|' ||
+       slot_state || '|' ||
+       model_residency_policy || '|' ||
+       (context_window_tokens > 0)::text || '|' ||
+       (inference_cache_entries <= inference_cache_max_entries)::text AS runtime_residency_contract
 FROM otlet.runtime_status
 WHERE runtime_name = 'linked_inproc';
 ```
@@ -494,10 +482,7 @@ WHERE runtime_name = 'linked_inproc';
 Representative output:
 
 ```text
- runtime_name  | endpoint | runtime_status |    model_name    | slot_state |        model_residency_policy        | active_jobs | model_memory_bytes | model_parameters | context_window_tokens | worker_process_rss_bytes | worker_process_virtual_bytes | inference_cache_entries | inference_cache_max_entries | inference_cache_bytes | inference_cache_max_bytes |  inference_cache_last_reason
----------------+----------+----------------+------------------+------------+--------------------------------------+-------------+--------------------+------------------+-----------------------+--------------------------+------------------------------+-------------------------+-----------------------------+-----------------------+---------------------------+-------------------------------
- linked_inproc | linked   | ready          | linked_qwen_0_6b | ready      | resident_worker_loaded_model_context |           0 |          633495552 |        596049920 |                  4096 |               1229848576 |                   1823137792 |                       0 |                         128 |                     0 |                   1048576 | disabled_for_generation_trace
-(1 row)
+runtime_residency_contract=ready|ready|resident_worker_loaded_model_context|true|true
 ```
 
 Otlet exposes model residency here
@@ -520,62 +505,20 @@ The task enabled bounded generation tracing:
 
 That stores a bounded trace summary on the receipt instead of storing an unbounded prompt or logits blob
 
-Look at the token steps:
+Check the bounded token trace:
 
 ```sql
-SELECT
-  receipt_id,
-  step,
-  token_id,
-  token_text_readable,
-  chosen_probability,
-  chosen_rank,
-  stop_reason
-FROM otlet.inference_receipt_token_trace
-WHERE task_name = 'entity_resolution_demo'
-ORDER BY receipt_id, step
-LIMIT 5;
+SELECT 'token_trace_contract=' ||
+       (SELECT count(*)::text FROM otlet.inference_receipt_token_trace WHERE task_name = 'entity_resolution_demo') || '|' ||
+       (SELECT count(*)::text FROM otlet.inference_receipt_token_alternative_trace WHERE task_name = 'entity_resolution_demo') || '|' ||
+       (SELECT (max(step) <= 16)::text FROM otlet.inference_receipt_token_trace WHERE task_name = 'entity_resolution_demo') || '|' ||
+       (SELECT (max(alternative_rank) <= 3)::text FROM otlet.inference_receipt_token_alternative_trace WHERE task_name = 'entity_resolution_demo') AS token_trace_contract;
 ```
 
 Representative output:
 
 ```text
- receipt_id | step | token_id | token_text_readable | chosen_probability | chosen_rank |  stop_reason
-------------+------+----------+---------------------+--------------------+-------------+---------------
-          2 |    1 |     4710 |  \n\n               |           0.630815 |           1 | json_complete
-          2 |    2 |     5097 | Output              |           0.383669 |           1 | json_complete
-          2 |    3 |      510 | :\n                 |           0.714491 |           1 | json_complete
-          2 |    4 |     4913 | {"                  |           0.925151 |           1 | json_complete
-          2 |    5 |     3006 | output              |           0.999448 |           1 | json_complete
-(5 rows)
-```
-
-Look at the top alternatives captured for each traced token:
-
-```sql
-SELECT
-  receipt_id,
-  step,
-  alternative_rank,
-  token_text_readable,
-  probability
-FROM otlet.inference_receipt_token_alternative_trace
-WHERE task_name = 'entity_resolution_demo'
-ORDER BY receipt_id, step, alternative_rank
-LIMIT 5;
-```
-
-Representative output:
-
-```text
- receipt_id | step | alternative_rank | token_text_readable | probability
-------------+------+------------------+---------------------+-------------
-          2 |    1 |                1 |  \n\n               |    0.630815
-          2 |    1 |                2 | }\n\n\n             |    0.068029
-          2 |    1 |                3 |  \n                 |     0.03416
-          2 |    2 |                1 | Output              |    0.383669
-          2 |    2 |                2 | The                 |    0.072367
-(5 rows)
+token_trace_contract=32|96|true|true
 ```
 
 Trace data records:
@@ -1064,42 +1007,30 @@ semantic_index_materialized=3
 Once materialized, the index has planner-visible status:
 
 ```sql
-SELECT
-  name,
-  task_name,
-  source_table,
-  ready_rows,
-  stale_rows,
-  active_jobs,
-  completed_jobs,
-  effective_stale_policy
+SELECT 'semantic_index_status_contract=' ||
+       name || '|' ||
+       fresh_subjects::text || '|' ||
+       stale_subjects::text || '|' ||
+       inflight_subjects::text || '|' ||
+       effective_stale_policy AS semantic_index_status_contract
 FROM otlet.semantic_index_status
 WHERE name = 'demo_semantic_vendor_idx';
 
-SELECT
-  selected_path,
-  reason,
-  effective_stale_policy,
-  total_rows,
-  ready_rows,
-  stale_rows,
-  refresh_rows,
-  freshness
+SELECT 'semantic_index_plan_contract=' ||
+       selected_path || '|' ||
+       total_subjects::text || '|' ||
+       fresh_subjects::text || '|' ||
+       stale_subjects::text || '|' ||
+       missing_subjects::text || '|' ||
+       freshness::text AS semantic_index_plan_contract
 FROM otlet.semantic_index_plan('demo_semantic_vendor_idx');
 ```
 
 Representative output:
 
 ```text
-           name           |           task_name           |           source_table            | ready_rows | stale_rows | active_jobs | completed_jobs |    effective_stale_policy
---------------------------+-------------------------------+-----------------------------------+------------+------------+-------------+----------------+------------------------------
- demo_semantic_vendor_idx | demo_semantic_vendor_idx_task | public.otlet_demo_semantic_vendor |          3 |          0 |           0 |              4 | refresh_then_fail_closed
-(1 row)
-
-  selected_path  |           reason           |    effective_stale_policy    | total_rows | ready_rows | stale_rows | refresh_rows | freshness
------------------+----------------------------+------------------------------+------------+------------+------------+--------------+-----------
- semantic_lookup | semantic index fully fresh | refresh_then_fail_closed     |          3 |          3 |          0 |            0 |    1.0000
-(1 row)
+semantic_index_status_contract=demo_semantic_vendor_idx|3|0|0|refresh_then_fail_closed
+semantic_index_plan_contract=semantic_lookup|3|3|0|0|1.0000
 ```
 
 `semantic_index_plan` is Otlet deciding whether it can reuse materialized state, should refresh, should wait, or should run fresh inference
@@ -1111,20 +1042,17 @@ Representative output:
 The FDW table holds materialized semantic state:
 
 ```sql
-SELECT subject_id, body, stale
-FROM otlet.demo_semantic_vendor_idx_native
-ORDER BY subject_id;
+SELECT 'semantic_fdw_rows_contract=' ||
+       count(*)::text || '|' ||
+       count(*) FILTER (WHERE body @> '{"status":"needs_review"}'::jsonb)::text || '|' ||
+       count(*) FILTER (WHERE stale)::text AS semantic_fdw_rows_contract
+FROM otlet.demo_semantic_vendor_idx_native;
 ```
 
 Representative output:
 
 ```text
- subject_id |                                    body                                     | stale
-------------+-----------------------------------------------------------------------------+-------
- 1          | {"status": "needs_review", "semantic": "indexed row", "needs_review": true} | f
- 2          | {"status": "needs_review", "semantic": "indexed row", "needs_review": true} | f
- 3          | {"status": "needs_review", "semantic": "indexed row", "needs_review": true} | f
-(3 rows)
+semantic_fdw_rows_contract=3|3|0
 ```
 
 Use the FDW table for semantic rows. Use `semantic_index_current_rows` when you want the same state without a foreign table
@@ -1146,6 +1074,8 @@ Representative output excerpt:
 Foreign Scan on otlet.demo_semantic_vendor_idx_native
   Otlet Node: Semantic Foreign Scan
   Selected Path: semantic_lookup
+  Queue Subjects: 0
+  Path Cost: 1.05
   Freshness: 1.00
   Pushed Subject Id: 2
 ```
@@ -1170,8 +1100,9 @@ Custom Scan (Otlet Semantic Source CustomScan) on public.otlet_demo_semantic_ven
   Otlet Node: Semantic Source CustomScan
   Child Semantic Filter: stripped_before_child_plan
   Semantic Index: demo_semantic_vendor_idx
-  Planner Fresh Match Rows: 3
-  Semantic Cache Hits: 3
+  Planner Selected Path: semantic_lookup
+  Planner Fresh Rows: 3
+  Actual Fresh Subjects: 3
 ```
 
 The child scan reads the source table. Otlet strips the semantic predicate from the child plan and evaluates it against preloaded semantic state
@@ -1185,7 +1116,10 @@ UPDATE public.otlet_demo_semantic_vendor
 SET email = 'learning-stale@example.test', updated_at = clock_timestamp()
 WHERE id = 2;
 
-SELECT name, ready_rows, stale_rows, active_jobs
+SELECT 'semantic_stale_status_contract=' ||
+       fresh_subjects::text || '|' ||
+       stale_subjects::text || '|' ||
+       inflight_subjects::text AS semantic_stale_status_contract
 FROM otlet.semantic_index_status
 WHERE name = 'demo_semantic_vendor_idx';
 
@@ -1200,10 +1134,7 @@ Representative output:
 ```text
 UPDATE 1
 
-           name           | ready_rows | stale_rows | active_jobs
---------------------------+------------+------------+-------------
- demo_semantic_vendor_idx |          2 |          1 |           0
-(1 row)
+semantic_stale_status_contract=2|1|0
 
  fail_closed_rows
 ------------------
@@ -1215,13 +1146,29 @@ Fail closed means stale facts do not match because old model output looked right
 
 ## Let CustomScan Refresh A Stale Row With Infer-Now
 
-`semantic_matches_auto` lets a source-table query use bounded infer-now for stale or missing rows
+`semantic_matches_auto` lets a source-table query use policy-owned bounded infer-now for stale or missing rows
+
+The wait, infer, and max-row budget comes from `otlet.production_policy_status`:
+
+```sql
+SELECT 'semantic_auto_policy_contract=' ||
+       semantic_auto_wait_ms::text || '|' ||
+       semantic_auto_infer_ms::text || '|' ||
+       semantic_auto_max_rows::text AS semantic_auto_policy_contract
+FROM otlet.production_policy_status;
+```
+
+Representative output:
+
+```text
+semantic_auto_policy_contract=10000|15000|1
+```
 
 ```sql
 EXPLAIN (ANALYZE, VERBOSE, COSTS, SUMMARY OFF, TIMING OFF)
 SELECT id
 FROM public.otlet_demo_semantic_vendor v
-WHERE otlet.semantic_matches_auto('demo_semantic_vendor_idx', v.id::text, '{"status":"needs_review"}'::jsonb, 0, 15000, 1, false);
+WHERE otlet.semantic_matches_auto('demo_semantic_vendor_idx', v.id::text, '{"status":"needs_review"}'::jsonb);
 ```
 
 Representative output excerpt:
@@ -1233,6 +1180,7 @@ Custom Scan (Otlet Semantic Source CustomScan) on public.otlet_demo_semantic_ven
   Refresh Policy: auto_lookup_wait_infer_refresh_fail_closed
   Infer Now Timeout Ms: 15000
   Infer Now Max Rows: 1
+  Planner Selected Path: bounded_infer_now
   Planner Stale Rows: 1
   Actual Infer Resolved Rows: 1
   Infer Now Receipts: 1
@@ -1288,7 +1236,11 @@ INSERT INTO public.learning_entity VALUES
   (1, 'Acme Logistics LLC', '512-555-0100', 'Austin'),
   (2, 'ACME Logistics', '512-555-0100', 'Austin');
 
-SELECT name, task_name, record_type, max_candidate_rows
+SELECT 'semantic_join_create_contract=' ||
+       name || '|' ||
+       task_name || '|' ||
+       record_type || '|' ||
+       max_candidate_rows::text
 FROM otlet.create_semantic_join_index(
   'learning_entity_pair_idx',
   $$
@@ -1306,7 +1258,8 @@ FROM otlet.create_semantic_join_index(
   10
 );
 
-SELECT otlet.refresh_semantic_join_index('learning_entity_pair_idx') AS queued_pairs;
+SELECT 'semantic_join_refresh_queued=' ||
+       otlet.refresh_semantic_join_index('learning_entity_pair_idx')::text;
 
 DO $$
 DECLARE
@@ -1337,61 +1290,41 @@ BEGIN
   RAISE EXCEPTION 'timed out waiting for semantic join refresh';
 END $$;
 
-SELECT otlet.materialize_semantic_join_index('learning_entity_pair_idx') AS materialized_pairs;
+SELECT 'semantic_join_materialized=' ||
+       otlet.materialize_semantic_join_index('learning_entity_pair_idx')::text;
 ```
 
 Representative output:
 
 ```text
-           name           |           task_name           |     record_type      | max_candidate_rows
---------------------------+-------------------------------+----------------------+--------------------
- learning_entity_pair_idx | learning_entity_pair_idx_task | learning_entity_pair |                 10
-(1 row)
-
- queued_pairs
---------------
-            1
-(1 row)
-
-DO
-
- materialized_pairs
---------------------
-                  1
-(1 row)
+semantic_join_create_contract=learning_entity_pair_idx|learning_entity_pair_idx_task|learning_entity_pair|10
+semantic_join_refresh_queued=1
+semantic_join_materialized=1
 ```
 
 Now inspect the join index:
 
 ```sql
-SELECT name, task_name, total_pairs, ready_pairs, stale_pairs, missing_pairs, freshness
+SELECT 'semantic_join_status_contract=' ||
+       selected_path || '|' ||
+       total_subjects::text || '|' ||
+       fresh_subjects::text || '|' ||
+       stale_subjects::text || '|' ||
+       missing_subjects::text AS semantic_join_status_contract
 FROM otlet.semantic_join_index_plan('learning_entity_pair_idx');
 
-SELECT selected_path, reason, effective_stale_policy
-FROM otlet.semantic_join_index_plan('learning_entity_pair_idx');
-
-SELECT subject_id, body, stale
-FROM otlet.semantic_join_index_current_rows('learning_entity_pair_idx', true)
-ORDER BY subject_id;
+SELECT 'semantic_join_lookup_contract=' ||
+       count(*)::text || '|' ||
+       count(*) FILTER (WHERE body @> '{"match":"yes"}'::jsonb)::text || '|' ||
+       count(*) FILTER (WHERE stale)::text AS semantic_join_lookup_contract
+FROM otlet.semantic_join_index_current_rows('learning_entity_pair_idx', true);
 ```
 
 Representative output:
 
 ```text
-           name           |           task_name           | total_pairs | ready_pairs | stale_pairs | missing_pairs | freshness
---------------------------+-------------------------------+-------------+-------------+-------------+---------------+-----------
- learning_entity_pair_idx | learning_entity_pair_idx_task |           1 |           1 |           0 |             0 |    1.0000
-(1 row)
-
-     selected_path      |             reason            |    effective_stale_policy
-------------------------+-------------------------------+------------------------------
- semantic_join_lookup   | semantic join index fully fresh | refresh_then_fail_closed
-(1 row)
-
- subject_id |                                 body                                  | stale
-------------+-----------------------------------------------------------------------+-------
- 1:2        | {"match": "yes", "reason": "same phone and city", "confidence": 0.95} | f
-(1 row)
+semantic_join_status_contract=semantic_join_lookup|1|1|0|0
+semantic_join_lookup_contract=1|1|0
 ```
 
 A semantic join index uses the same contract: jobs, outputs, actions, records, materializations, receipts
@@ -1399,19 +1332,15 @@ A semantic join index uses the same contract: jobs, outputs, actions, records, m
 ## Query A Semantic Join Predicate
 
 ```sql
-SELECT subject_id,
-       otlet.semantic_join_matches('learning_entity_pair_idx', subject_id, '{"match":"yes"}'::jsonb) AS direct_match
-FROM otlet.semantic_join_index_current_rows('learning_entity_pair_idx', true)
-ORDER BY subject_id;
+SELECT 'semantic_join_match_contract=' ||
+       bool_and(otlet.semantic_join_matches('learning_entity_pair_idx', subject_id, '{"match":"yes"}'::jsonb))::text AS semantic_join_match_contract
+FROM otlet.semantic_join_index_current_rows('learning_entity_pair_idx', true);
 ```
 
 Representative output:
 
 ```text
- subject_id | direct_match
-------------+--------------
- 1:2        | t
-(1 row)
+semantic_join_match_contract=true
 ```
 
 Use explicit JSON predicates for row and join semantic filters
@@ -1421,30 +1350,16 @@ Use explicit JSON predicates for row and join semantic filters
 The trace visibility view tells you whether receipts are linked to outputs, actions, token steps, top-k alternatives, provenance, stale policy, and CustomScan infer-now
 
 ```sql
-SELECT
-  receipt_count,
-  detailed_trace_receipts,
-  token_steps,
-  top_k_alternatives,
-  output_linked_receipts,
-  action_linked_receipts,
-  provenance_linked_receipts,
-  customscan_trace_receipts,
-  max_detailed_trace_tokens,
-  max_detailed_trace_top_k
+SELECT 'inference_visibility_status=' ||
+       (receipt_count > 0)::text || '|' ||
+       (token_steps > 0)::text || '|' ||
+       (top_k_alternatives > 0)::text || '|' ||
+       (max_detailed_trace_tokens <= 16)::text || '|' ||
+       (max_detailed_trace_top_k <= 3)::text AS inference_visibility_contract
 FROM otlet.inference_visibility_status;
 ```
 
-Representative output after the demo:
-
-```text
- receipt_count | detailed_trace_receipts | token_steps | top_k_alternatives | output_linked_receipts | action_linked_receipts | provenance_linked_receipts | customscan_trace_receipts | max_detailed_trace_tokens | max_detailed_trace_top_k
----------------+-------------------------+-------------+--------------------+------------------------+------------------------+----------------------------+---------------------------+---------------------------+--------------------------
-            12 |                       5 |          64 |                192 |                      9 |                      8 |                          1 |                         1 |                        16 |                        3
-(1 row)
-```
-
-The demo contract checked this as:
+Representative output:
 
 ```text
 inference_visibility_status=true|true|true|true|true
@@ -1517,15 +1432,15 @@ Otlet installs internal production policy, bounded queues, leases, sweeps, valid
 Check row-level security:
 
 ```sql
-SELECT
-  count(*) AS otlet_base_tables,
-  count(*) FILTER (WHERE relrowsecurity) AS rls_enabled_tables
+SELECT 'rls_contract=' ||
+       count(*)::text || '|' ||
+       (count(*) FILTER (WHERE relrowsecurity))::text
 FROM pg_class c
 JOIN pg_namespace n ON n.oid = c.relnamespace
 WHERE n.nspname = 'otlet'
   AND c.relkind = 'r';
 
-SELECT count(*) AS installed_policies
+SELECT 'installed_policies=' || count(*)::text
 FROM pg_policies
 WHERE schemaname = 'otlet';
 ```
@@ -1533,40 +1448,27 @@ WHERE schemaname = 'otlet';
 Representative output:
 
 ```text
- otlet_base_tables | rls_enabled_tables
--------------------+--------------------
-                15 |                  0
-(1 row)
-
- installed_policies
---------------------
-                  0
-(1 row)
+rls_contract=15|0
+installed_policies=0
 ```
 
 Check default grants visible through `information_schema`:
 
 ```sql
-SELECT privilege_type, count(*)
-FROM information_schema.role_table_grants
-WHERE table_schema = 'otlet'
-GROUP BY privilege_type
-ORDER BY privilege_type;
+SELECT 'grant_contract=' ||
+       string_agg(privilege_type || ':' || n::text, '|' ORDER BY privilege_type)
+FROM (
+  SELECT privilege_type, count(*) AS n
+  FROM information_schema.role_table_grants
+  WHERE table_schema = 'otlet'
+  GROUP BY privilege_type
+) grants;
 ```
 
 Representative output:
 
 ```text
- privilege_type | count
-----------------+-------
- DELETE         |    40
- INSERT         |    40
- REFERENCES     |    40
- SELECT         |    40
- TRIGGER        |    40
- TRUNCATE       |    40
- UPDATE         |    40
-(7 rows)
+grant_contract=DELETE:40|INSERT:40|REFERENCES:40|SELECT:40|TRIGGER:40|TRUNCATE:40|UPDATE:40
 ```
 
 The remaining production boundary is application-specific:
