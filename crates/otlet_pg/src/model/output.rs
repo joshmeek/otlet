@@ -111,16 +111,30 @@ fn model_actions(json: &Value) -> Result<Value, String> {
     let actions = json
         .get("actions")
         .cloned()
-        .unwrap_or_else(|| Value::Array(Vec::new()));
+        .ok_or_else(|| "model JSON missing actions".to_owned())?;
     let Value::Array(actions) = actions else {
         return Err("model JSON actions must be an array".to_owned());
     };
 
     let mut normalized = Vec::with_capacity(actions.len());
     for action in actions {
-        let Value::Object(object) = action else {
-            return Err("model JSON actions must contain objects".to_owned());
+        let mut object = match action {
+            Value::Object(object) => object,
+            Value::String(text) => {
+                let parsed = serde_json::from_str::<Value>(&text)
+                    .map_err(|_| "model JSON action string must contain JSON object".to_owned())?;
+                let Value::Object(object) = parsed else {
+                    return Err("model JSON action string must contain JSON object".to_owned());
+                };
+                object
+            }
+            _ => return Err("model JSON actions must contain objects".to_owned()),
         };
+        if !object.contains_key("type") {
+            if let Some(action_type) = object.remove("action_type") {
+                object.insert("type".to_owned(), action_type);
+            }
+        }
         if !object.contains_key("type") {
             return Err("model JSON actions must contain type".to_owned());
         }
@@ -131,7 +145,8 @@ fn model_actions(json: &Value) -> Result<Value, String> {
 }
 
 fn parse_model_json(raw_output: &str) -> Result<(Value, String), String> {
-    let mut parsed = None;
+    let mut output_object: Option<(Value, String)> = None;
+    let mut actions_object: Option<(Value, String)> = None;
 
     // Scan model chatter until it can emit clean JSON only
     for (index, _) in raw_output.char_indices().filter(|(_, ch)| *ch == '{') {
@@ -139,11 +154,33 @@ fn parse_model_json(raw_output: &str) -> Result<(Value, String), String> {
         let mut values = serde_json::Deserializer::from_str(rest).into_iter::<Value>();
 
         if let Some(Ok(value)) = values.next() {
-            if value.get("output").is_some() {
-                parsed = Some((value, rest[..values.byte_offset()].to_owned()));
+            let raw_json = rest[..values.byte_offset()].to_owned();
+            if value.get("output").is_some() && value.get("actions").is_some() {
+                return Ok((value, raw_json));
+            }
+            if value.get("output").is_some() && output_object.is_none() {
+                output_object = Some((value.clone(), raw_json.clone()));
+            }
+            if value.get("actions").is_some() && actions_object.is_none() {
+                actions_object = Some((value, raw_json));
+            }
+            if let (Some((output, output_raw)), Some((actions, actions_raw))) =
+                (&output_object, &actions_object)
+            {
+                let mut output_value = output["output"].clone();
+                if let Value::Object(object) = &mut output_value {
+                    object.remove("actions");
+                }
+                return Ok((
+                    json!({
+                        "output": output_value,
+                        "actions": actions["actions"].clone(),
+                    }),
+                    format!("{output_raw}\n{actions_raw}"),
+                ));
             }
         }
     }
 
-    parsed.ok_or_else(|| format!("invalid model JSON: {}", trim_error(raw_output)))
+    Err(format!("invalid model JSON: {}", trim_error(raw_output)))
 }

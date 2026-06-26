@@ -19,9 +19,8 @@ The extension keeps source rows in user tables. Users choose rows with SQL, Otle
 
 | Order | Track | Outcome |
 | --- | --- | --- |
-| 1 | Actions | Let models propose typed database actions with receipts and approval |
-| 2 | Packaging and security | Keep the open-source path small while tightening permissions and trace safety |
-| 3 | Core limits | Test Access Method and Postgres-fork paths where extension hooks fall short |
+| 1 | Packaging and security | Keep the open-source path small while tightening permissions and trace safety |
+| 2 | Core limits | Test Access Method and Postgres-fork paths where extension hooks fall short |
 
 ## Planner And Executor
 
@@ -40,14 +39,6 @@ Verbose EXPLAIN should make model work inspectable from Postgres. Users should s
 Token-level tracing should stay optional and bounded. Debug mode can show chosen token IDs, token text, probabilities or logprobs when llama.cpp exposes them, top-k alternatives, partial generated text, stop reason, schema validation, and trace storage policy
 
 Production defaults should keep tracing low-detail or off. The system should explain disabled tracing through SQL instead of storing unbounded token streams
-
-## Actions
-
-Otlet should start with typed actions before model-written SQL. Useful action types include record creation, review flags, merge proposals, refresh requests, follow-up jobs, notes, and update proposals
-
-Each action should carry JSON Schema validation, source row IDs, source hashes, receipt ID, model hash, prompt hash, dry-run result, approval status, applied timestamp, and rollback or provenance hints. Risky actions should wait for human approval through SQL or an external UI
-
-Model-compiled SQL can come later through a constrained path. The model proposes intent or an AST, Otlet validates allowed schemas, tables, columns, functions, and write targets, runs `EXPLAIN`, stores a dry-run receipt, then applies the action after policy or human approval
 
 ## Packaging And Security
 

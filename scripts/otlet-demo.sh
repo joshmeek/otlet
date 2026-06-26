@@ -14,6 +14,7 @@ join_task="${join_index_name}_task"
 join_foreign_table="${OTLET_ENTITY_JOIN_FOREIGN_TABLE:-demo_entity_resolution_pairs}"
 record_type="${OTLET_ENTITY_RECORD_TYPE:-entity_hypothesis}"
 script_started="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+entity_instruction='Return only JSON. The top-level object must have output and actions. actions must be an array with one object. Use input.candidate_evidence only. Check negative evidence first. Negative example: evidence says different industry and city plus no shared tax id, so match is different_entity and action type is new_entity. Positive example: evidence says same remittance account, so match is same_entity and action type is merge_candidate. Conflict example: evidence says weak signals conflict, so match is unclear and action type is review_flag. If evidence says no shared, different industry, different city, different country, different domain, different payment account, or different AP contact, return output match different_entity confidence high reason no shared identifiers and a new_entity action with type, entity_id, reason, and evidence. If evidence says weak signals conflict, return output match unclear confidence medium reason weak signals conflict and a review_flag action with type, left_id, right_id, severity, and reason. If evidence says same remittance account, rebrand, or acquisition without negation, return output match same_entity confidence high reason shared remittance or rebrand and a merge_candidate action with type, left_id, right_id, confidence, reason, and evidence. The word no means absence. Use actual input.left_id, input.right_id, and input.candidate_evidence values. Use input.right_id as new_entity.entity_id. Do not explain.'
 
 log() {
   printf '[%s] %s\n' "$(date '+%H:%M:%S')" "$*"
@@ -325,11 +326,18 @@ JOIN public.otlet_demo_vendor_entity l ON l.id = p.left_id
 JOIN public.otlet_demo_vendor_entity r ON r.id = p.right_id;
 SQL
 
+source_rows_before="$(psql_value "
+SELECT count(*)::text || '|' ||
+       md5(string_agg(to_jsonb(v)::text, ',' ORDER BY v.id))
+FROM public.otlet_demo_vendor_entity v;
+")"
+
 psql_exec \
   -v cheap_model_name="$cheap_model_name" \
   -v strong_model_name="$strong_model_name" \
   -v task_name="$entity_task" \
-  -v record_type="$record_type" >/dev/null <<'SQL'
+  -v record_type="$record_type" \
+  -v entity_instruction="$entity_instruction" >/dev/null <<'SQL'
 SELECT otlet.create_task(
   :'task_name',
   $$
@@ -337,7 +345,7 @@ SELECT otlet.create_task(
     FROM public.otlet_demo_vendor_pair_input
     ORDER BY subject_id
   $$,
-  'Use input.candidate_evidence as authority before names or notes. Shared means candidate_evidence says the identifier is shared by both records. Return only {"output":{"match":"same_entity|different_entity|unclear","confidence":"low|medium|high","reason":"short reason"},"actions":[]}. Return same_entity with high confidence when evidence contains shared remittance, rebrand, or acquisition. Return different_entity with high confidence when evidence says no shared identifiers or different industry and city. The word no means absence; a reason saying no shared identifiers must use match different_entity, not same_entity. Return unclear with medium confidence when evidence says weak signals conflict or name similarity alone is not enough. A same_entity reason must name the shared identifier that candidate_evidence says both records share. Do not add prose, markdown, labels, nested output, or action strings.',
+  :'entity_instruction',
   '{
     "type": "object",
     "required": ["match", "confidence", "reason"],
@@ -359,7 +367,7 @@ SELECT otlet.create_task(
     ]
   }'::jsonb,
   :'cheap_model_name',
-  '{"max_tokens":256,"reasoning":"off","inference_cache":true,"generation_trace":true,"generation_trace_max_tokens":16,"generation_trace_top_k":3}'::jsonb
+  '{"max_tokens":384,"reasoning":"off","inference_cache":true,"generation_trace":true,"generation_trace_max_tokens":16,"generation_trace_top_k":3}'::jsonb
 );
 
 SELECT otlet.set_model_selection_policy(:'task_name', :'cheap_model_name', :'strong_model_name');
@@ -406,7 +414,7 @@ while IFS= read -r line; do
 done <<<"$model_selection_attempts"
 
 model_selection_status_contract="$(psql_value "
-SELECT (cheap_accepted >= 1)::text || '|' ||
+SELECT (cheap_attempts >= 1)::text || '|' ||
        (strong_accepted >= 1)::text || '|' ||
        (escalated_jobs >= 1)::text || '|' ||
        cheap_attempts::text || '|' ||
@@ -415,7 +423,7 @@ FROM otlet.model_selection_status
 WHERE task_name = '$entity_task';
 ")"
 echo "model_selection_status_contract=$model_selection_status_contract"
-require_regex "$model_selection_status_contract" '^true\|true\|true\|[0-9]+\|[1-9][0-9]*$' "Expected at least one cheap accepted and one strong accepted model-selection job"
+require_regex "$model_selection_status_contract" '^true\|true\|true\|[1-9][0-9]*\|[1-9][0-9]*$' "Expected cheap attempts, strong acceptance, and escalation"
 
 accepted_output_anomalies="$(psql_value "
 SELECT count(*)
@@ -432,12 +440,120 @@ echo "accepted_output_anomalies=$accepted_output_anomalies"
   exit 1
 }
 
+action_contract="$(psql_value "
+WITH schema_check AS (
+  SELECT string_agg(action_type, '|' ORDER BY action_type) AS value
+  FROM otlet.action_type_schemas
+  WHERE action_type IN ('follow_up_job', 'merge_candidate', 'new_entity', 'note', 'review_flag')
+), type_check AS (
+  SELECT COALESCE(string_agg(DISTINCT action_type, '|' ORDER BY action_type), '') AS value
+  FROM otlet.action_status
+  WHERE task_name = '$entity_task'
+    AND trusted_output
+), status_check AS (
+  SELECT count(*)::text || '|' ||
+         count(*) FILTER (WHERE trusted_output)::text || '|' ||
+         count(*) FILTER (WHERE receipt_id IS NOT NULL AND output_id IS NOT NULL)::text || '|' ||
+         count(*) FILTER (WHERE status = 'rejected')::text AS value
+  FROM otlet.action_status
+  WHERE task_name = '$entity_task'
+), failed_check AS (
+  SELECT count(*)::text AS value
+  FROM otlet.action_status a
+  JOIN otlet.inference_receipts r ON r.id = a.receipt_id
+  WHERE a.task_name = '$entity_task'
+    AND r.selection_status <> 'accepted'
+)
+SELECT concat_ws(E'\n',
+  'action_schema_contract=' || schema_check.value,
+  'action_type_contract=' || type_check.value,
+  'action_status_contract=' || status_check.value,
+  'failed_attempt_action_contract=' || failed_check.value
+)
+FROM schema_check, type_check, status_check, failed_check;
+")"
+printf '%s\n' "$action_contract"
+require_contains "$action_contract" "action_schema_contract=follow_up_job|merge_candidate|new_entity|note|review_flag" "Expected built-in action schemas"
+require_contains "$action_contract" "action_type_contract=merge_candidate|new_entity" "Expected entity-resolution merge_candidate and new_entity actions"
+require_contains "$action_contract" "action_status_contract=4|4|4|0" "Expected four trusted valid entity actions"
+require_contains "$action_contract" "failed_attempt_action_contract=0" "Expected failed/rejected attempts to create no actions"
+
+merge_action_id="$(psql_value "
+SELECT min(action_id)
+FROM otlet.action_status
+WHERE task_name = '$entity_task'
+  AND action_type = 'merge_candidate';
+")"
+new_entity_action_id="$(psql_value "
+SELECT min(action_id)
+FROM otlet.action_status
+WHERE task_name = '$entity_task'
+  AND action_type = 'new_entity';
+")"
+[ -n "$merge_action_id" ] && [ -n "$new_entity_action_id" ] || {
+  echo "Expected merge_candidate and new_entity action ids" >&2
+  exit 1
+}
+
+action_approve_contract="$(psql_value "
+SELECT status || '|' || approval_status
+FROM otlet.approve_action($merge_action_id);
+")"
+echo "action_approve_contract=$action_approve_contract"
+[ "$action_approve_contract" = "approved|approved" ] || {
+  echo "Expected merge_candidate approval, got $action_approve_contract" >&2
+  exit 1
+}
+
+action_dry_run_contract="$(psql_value "
+SELECT status || '|' || approval_status || '|' || dry_run_status
+FROM otlet.dry_run_action($merge_action_id);
+")"
+echo "action_dry_run_contract=$action_dry_run_contract"
+[ "$action_dry_run_contract" = "approved|approved|passed" ] || {
+  echo "Expected approved action dry-run pass, got $action_dry_run_contract" >&2
+  exit 1
+}
+
+action_apply_contract="$(psql_value "
+SELECT status || '|' || approval_status || '|' || apply_status
+FROM otlet.apply_action($merge_action_id);
+")"
+echo "action_apply_contract=$action_apply_contract"
+[ "$action_apply_contract" = "approved|approved|not_applicable" ] || {
+  echo "Expected merge_candidate apply to stay not_applicable, got $action_apply_contract" >&2
+  exit 1
+}
+
+action_reject_contract="$(psql_value "
+SELECT status || '|' || approval_status
+FROM otlet.reject_action($new_entity_action_id, 'demo rejection');
+")"
+echo "action_reject_contract=$action_reject_contract"
+[ "$action_reject_contract" = "rejected|rejected" ] || {
+  echo "Expected new_entity rejection, got $action_reject_contract" >&2
+  exit 1
+}
+
+source_rows_after="$(psql_value "
+SELECT count(*)::text || '|' ||
+       md5(string_agg(to_jsonb(v)::text, ',' ORDER BY v.id))
+FROM public.otlet_demo_vendor_entity v;
+")"
+source_write_contract="$source_rows_before|$source_rows_after"
+echo "source_write_contract=$source_write_contract"
+[ "$source_rows_before" = "$source_rows_after" ] || {
+  echo "Expected action approval/apply to leave source rows unchanged" >&2
+  exit 1
+}
+
 log "Building semantic join entity-resolution path"
 psql_exec \
   -v join_index_name="$join_index_name" \
   -v cheap_model_name="$cheap_model_name" \
   -v strong_model_name="$strong_model_name" \
-  -v record_type="$record_type" >/dev/null <<'SQL'
+  -v record_type="$record_type" \
+  -v entity_instruction="$entity_instruction" >/dev/null <<'SQL'
 SELECT name, task_name, record_type, max_candidate_rows
 FROM otlet.create_semantic_join_index(
   :'join_index_name',
@@ -446,7 +562,7 @@ FROM otlet.create_semantic_join_index(
     FROM public.otlet_demo_vendor_pair_input
     ORDER BY subject_id
   $$,
-  'Use input.candidate_evidence as authority before names or notes. Shared means candidate_evidence says the identifier is shared by both records. Return only {"output":{"match":"same_entity|different_entity|unclear","confidence":"low|medium|high","reason":"short reason"},"actions":[]}. Return same_entity with high confidence when evidence contains shared remittance, rebrand, or acquisition. Return different_entity with high confidence when evidence says no shared identifiers or different industry and city. The word no means absence; a reason saying no shared identifiers must use match different_entity, not same_entity. Return unclear with medium confidence when evidence says weak signals conflict or name similarity alone is not enough. A same_entity reason must name the shared identifier that candidate_evidence says both records share. Do not add prose, markdown, labels, nested output, or action strings.',
+  :'entity_instruction',
   '{
     "type": "object",
     "required": ["match", "confidence", "reason"],
@@ -469,7 +585,7 @@ FROM otlet.create_semantic_join_index(
   }'::jsonb,
   :'cheap_model_name',
   :'record_type',
-  '{"max_tokens":256,"reasoning":"off","inference_cache":true,"generation_trace":true,"generation_trace_max_tokens":16,"generation_trace_top_k":3}'::jsonb,
+  '{"max_tokens":384,"reasoning":"off","inference_cache":true,"generation_trace":true,"generation_trace_max_tokens":16,"generation_trace_top_k":3}'::jsonb,
   10
 );
 SELECT otlet.set_model_selection_policy(:'join_index_name' || '_task', :'cheap_model_name', :'strong_model_name');

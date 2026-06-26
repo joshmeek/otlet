@@ -2,7 +2,7 @@
 
 Use this as a learning file, not a test harness (inspired by the _worked example_ research done in [this study](https://www.tandfonline.com/doi/full/10.1080/01443410.2023.2273762#abstract))
 
-The file starts with the smallest real Otlet loop for entity resolution: you keep vendor rows in ordinary Postgres tables, select hard candidate pairs in SQL, enqueue durable model work, let the resident worker try a cheap local model and escalate hard rows to a stronger local model, validate `same_entity` / `different_entity` / `unclear`, write Otlet-owned records, and keep the audit trail
+The file starts with the smallest real Otlet loop for entity resolution: you keep vendor rows in ordinary Postgres tables, select hard candidate pairs in SQL, enqueue durable model work, let the resident worker try a cheap local model and escalate hard rows to a stronger local model, validate `same_entity` / `different_entity` / `unclear`, record typed action proposals, and keep the audit trail
 
 The example data uses vendors where string normalization is not enough. One pair is a rebrand with a shared remittance account and acquisition note. One pair looks unrelated and should stay separate. Two pairs carry weak name/address/brand signals that should produce harder model work. Otlet judges the pairs without mutating the source tables
 
@@ -14,7 +14,7 @@ source candidate pair
   -> resident Postgres worker
   -> cheap linked local Qwen through llama.cpp
   -> stronger linked local Qwen when policy escalates
-  -> JSON validation
+  -> JSON and action validation
   -> otlet.outputs
   -> otlet.actions
   -> otlet.records
@@ -24,7 +24,7 @@ source candidate pair
 
 Otlet keeps Postgres as the system of record
 
-The model does not get direct write access to user tables. It receives bounded pair-shaped input and returns structured JSON. Otlet validates that JSON before storing it. Semantic refresh jobs then create Otlet-owned `create_record` actions, records, and materialized semantic rows from the validated output so downstream SQL can read fresh state without another manual step
+The model does not get direct write access to user tables. It receives bounded pair-shaped input and returns structured JSON. Otlet validates the output and the typed actions before storing them. Semantic refresh jobs then create Otlet-owned `create_record` actions, records, and materialized semantic rows from the validated output so downstream SQL can read fresh state without another manual step
 
 ## Start From A Running Local Otlet
 
@@ -232,7 +232,7 @@ FROM otlet.create_task(
     JOIN public.otlet_demo_vendor_entity r ON r.id = p.right_id
     ORDER BY p.pair_id
   $$,
-  'Use input.candidate_evidence as authority before names or notes. Shared means candidate_evidence says the identifier is shared by both records. Return only {"output":{"match":"same_entity|different_entity|unclear","confidence":"low|medium|high","reason":"short reason"},"actions":[]}. Return same_entity with high confidence when evidence contains shared remittance, rebrand, or acquisition. Return different_entity with high confidence when evidence says no shared identifiers or different industry and city. The word no means absence; a reason saying no shared identifiers must use match different_entity, not same_entity. Return unclear with medium confidence when evidence says weak signals conflict or name similarity alone is not enough. A same_entity reason must name the shared identifier that candidate_evidence says both records share. Do not add prose, markdown, labels, nested output, or action strings.',
+  'Return only JSON. The top-level object must have output and actions. actions must be an array with one object. Use input.candidate_evidence only. Check negative evidence first. Negative example: evidence says different industry and city plus no shared tax id, so match is different_entity and action type is new_entity. Positive example: evidence says same remittance account, so match is same_entity and action type is merge_candidate. Conflict example: evidence says weak signals conflict, so match is unclear and action type is review_flag. If evidence says no shared, different industry, different city, different country, different domain, different payment account, or different AP contact, return output match different_entity confidence high reason no shared identifiers and a new_entity action with type, entity_id, reason, and evidence. If evidence says weak signals conflict, return output match unclear confidence medium reason weak signals conflict and a review_flag action with type, left_id, right_id, severity, and reason. If evidence says same remittance account, rebrand, or acquisition without negation, return output match same_entity confidence high reason shared remittance or rebrand and a merge_candidate action with type, left_id, right_id, confidence, reason, and evidence. The word no means absence. Use actual input.left_id, input.right_id, and input.candidate_evidence values. Use input.right_id as new_entity.entity_id. Do not explain.',
   '{
     "type": "object",
     "required": ["match", "confidence", "reason"],
@@ -255,7 +255,7 @@ FROM otlet.create_task(
   }'::jsonb,
   'linked_qwen_0_6b',
   '{
-    "max_tokens": 256,
+    "max_tokens": 384,
     "reasoning": "off",
     "inference_cache": true,
     "generation_trace": true,
@@ -375,10 +375,10 @@ Representative output:
 ```text
       subject_id       |      match       | confidence |                    reason
 -----------------------+------------------+------------+----------------------------------------------
- vendor-1001:vendor-313 | same_entity      | high       | shared remittance account
- vendor-1001:vendor-314 | same_entity      | high       | similar Northstar freight brand
- vendor-1001:vendor-42 | same_entity      | high       | shared remittance account and acquisition note
- vendor-1001:vendor-77 | different_entity | high       | medical supplier has no shared identifiers
+ vendor-1001:vendor-313 | different_entity | high       | no shared identifiers
+ vendor-1001:vendor-314 | different_entity | high       | no shared identifiers
+ vendor-1001:vendor-42  | same_entity      | high       | shared remittance or rebrand
+ vendor-1001:vendor-77  | different_entity | high       | no shared identifiers
 (4 rows)
 ```
 
@@ -386,7 +386,95 @@ Representative output:
 
 Otlet stores the result as database state. You do not have to scrape a terminal response
 
-Direct tasks ask the model to return `actions: []`. They prove durable inference, schema validation, receipts, and trace state; semantic refresh jobs below create typed `create_record` actions, `otlet.records` rows, and semantic materializations automatically after schema validation passes
+Direct entity-resolution tasks also ask the model for one typed action. Otlet stores only actions attached to an accepted, schema-valid output receipt
+
+## Inspect Typed Actions
+
+```sql
+SELECT
+  action_type,
+  status,
+  approval_status,
+  dry_run_status,
+  apply_status,
+  count(*) AS actions
+FROM otlet.action_status
+WHERE task_name = 'entity_resolution_demo'
+GROUP BY action_type, status, approval_status, dry_run_status, apply_status
+ORDER BY action_type;
+```
+
+Representative output:
+
+```text
+   action_type   |  status  | approval_status | dry_run_status |  apply_status  | actions
+-----------------+----------+-----------------+----------------+----------------+---------
+ merge_candidate | proposed | required        | not_run        | not_applicable |       1
+ new_entity      | proposed | not_required    | not_run        | not_applicable |       3
+(2 rows)
+```
+
+`merge_candidate` is evidence for a later merge workflow. It requires approval and has no direct source-table apply path. `new_entity` says the right-side row should stay separate
+
+Failed or rejected model attempts do not create trusted actions:
+
+```sql
+SELECT count(*) AS failed_attempt_actions
+FROM otlet.action_status a
+JOIN otlet.inference_receipts r ON r.id = a.receipt_id
+WHERE a.task_name = 'entity_resolution_demo'
+  AND r.selection_status <> 'accepted';
+```
+
+Representative output:
+
+```text
+ failed_attempt_actions
+------------------------
+                      0
+(1 row)
+```
+
+Approve, dry-run, and apply one merge proposal:
+
+```sql
+WITH target AS (
+  SELECT min(action_id) AS action_id
+  FROM otlet.action_status
+  WHERE task_name = 'entity_resolution_demo'
+    AND action_type = 'merge_candidate'
+), approved AS (
+  SELECT 'approve' AS step, a.*
+  FROM target t, LATERAL otlet.approve_action(t.action_id) a
+), dry_run AS (
+  SELECT 'dry_run' AS step, a.*
+  FROM approved p, LATERAL otlet.dry_run_action(p.id) a
+), applied AS (
+  SELECT 'apply' AS step, a.*
+  FROM dry_run d, LATERAL otlet.apply_action(d.id) a
+)
+SELECT step, status, approval_status, dry_run_status, apply_status
+FROM approved
+UNION ALL
+SELECT step, status, approval_status, dry_run_status, apply_status
+FROM dry_run
+UNION ALL
+SELECT step, status, approval_status, dry_run_status, apply_status
+FROM applied;
+```
+
+Representative output:
+
+```text
+  step   |  status  | approval_status | dry_run_status |  apply_status
+---------+----------+-----------------+----------------+----------------
+ approve | approved | approved        | not_run        | not_applicable
+ dry_run | approved | approved        | passed         | not_applicable
+ apply   | approved | approved        | passed         | not_applicable
+(3 rows)
+```
+
+Semantic refresh jobs below create typed `create_record` actions, `otlet.records` rows, and semantic materializations automatically after schema validation passes
 
 ## Inspect Model Selection Attempts
 
@@ -410,14 +498,16 @@ Representative output from the demo run:
       subject_id       | attempt_index | selection_role | selection_status |    model_name    |      match       | confidence
 -----------------------+---------------+----------------+------------------+------------------+------------------+------------
  vendor-1001:vendor-313 |             1 | cheap          | failed           | linked_qwen_0_6b |                  |
- vendor-1001:vendor-313 |             2 | strong         | accepted         | linked_qwen_1_7b | same_entity      | high
- vendor-1001:vendor-314 |             1 | cheap          | accepted         | linked_qwen_0_6b | same_entity      | high
+ vendor-1001:vendor-313 |             2 | strong         | accepted         | linked_qwen_1_7b | different_entity | high
+ vendor-1001:vendor-314 |             1 | cheap          | failed           | linked_qwen_0_6b |                  |
+ vendor-1001:vendor-314 |             2 | strong         | accepted         | linked_qwen_1_7b | different_entity | high
  vendor-1001:vendor-42  |             1 | cheap          | accepted         | linked_qwen_0_6b | same_entity      | high
- vendor-1001:vendor-77  |             1 | cheap          | accepted         | linked_qwen_0_6b | different_entity | high
-(5 rows)
+ vendor-1001:vendor-77  |             1 | cheap          | failed           | linked_qwen_0_6b |                  |
+ vendor-1001:vendor-77  |             2 | strong         | accepted         | linked_qwen_1_7b | different_entity | high
+(7 rows)
 ```
 
-The cheap attempt for `vendor-1001:vendor-313` failed the stricter output schema because it claimed same entity without citing a shared identifier. Otlet kept that failed attempt as receipt evidence, ran `linked_qwen_1_7b`, and materialized only the accepted strong output
+The cheap model handles the obvious positive pair. Harder negative pairs fail the stricter output/action envelope, stay visible as failed receipts, and escalate to `linked_qwen_1_7b`. Otlet materializes only the accepted output for each job
 
 ## Read The Receipt
 
@@ -434,7 +524,7 @@ WHERE task_name = 'entity_resolution_demo';
 Representative output:
 
 ```text
-receipt_attempt_contract=5|4|1|1
+receipt_attempt_contract=7|4|3|3
 ```
 
 A receipt records evidence for one model run. A selected job can have multiple receipts for the same candidate pair
@@ -495,7 +585,7 @@ SELECT 'token_trace_contract=' ||
 Representative output:
 
 ```text
-token_trace_contract=32|96|true|true
+token_trace_contract=112|336|true|true
 ```
 
 Trace data records:
@@ -524,17 +614,18 @@ Representative output:
 ```text
  outputs | actions | records | receipts
 ---------+---------+---------+----------
-       4 |       0 |       0 |        5
+       4 |       4 |       0 |        7
 (1 row)
 ```
 
-That count covers the v0 shape:
+That count covers the direct task shape:
 
 ```text
 four source candidate pairs
 four jobs
 four accepted outputs
-five model-attempt receipts
+four typed action proposals
+seven model-attempt receipts
 bounded trace state
 SQL-visible runtime state
 ```
@@ -549,11 +640,11 @@ You should expect:
 - `otlet.jobs.error` contains the validation or parse failure
 - raw model text is kept for inspection
 - no validated `otlet.outputs` row is stored
-- no `otlet.actions` row is executed
+- no trusted `otlet.actions` row is stored from a failed model attempt
 - no `otlet.records` row is created
 - an error receipt preserves the model/runtime evidence when available
 
-The task schema and action rules decide whether model output can become database truth
+The task schema and action rules decide whether model output can become database truth. If output is valid but a proposed action is not, Otlet keeps the rejected action as evidence and does not turn it into a record
 
 ## Semantic Indexes
 
@@ -594,7 +685,7 @@ Representative output:
 ```text
  otlet_base_tables
 -------------------
-                16
+                17
 (1 row)
 ```
 
@@ -602,7 +693,7 @@ The base tables split into a few jobs:
 
 - `runtimes`, `models`, `model_versions`, and `runtime_slots` describe the local model runtime
 - `tasks`, `model_selection_policies`, and `jobs` describe durable work and cheap-first escalation policy
-- `outputs`, `actions`, `records`, `inference_receipts`, and `worker_events` describe what happened
+- `outputs`, `action_type_schemas`, `actions`, `records`, `inference_receipts`, and `worker_events` describe what happened
 - `production_policy` defines queue admission, leases, invalid output handling, stale-result behavior, and cleanup windows
 - `semantic_indexes` and `semantic_materializations` make model-derived state queryable
 - `semantic_join_indexes` do the same for pairwise candidate rows
@@ -775,87 +866,56 @@ ORDER BY task_name, status;
 Representative output:
 
 ```text
-  event_type   | count
+ event_type   | count
 ---------------+-------
  job_canceled  |     1
- job_completed |     1
  job_failed    |     2
  job_started   |     1
-(4 rows)
-
-           task_name           |  status  | count
--------------------------------+----------+-------
- learning_action_boundary_task | complete |     1
- learning_cancel_task          | canceled |     1
- learning_retry_task           | failed   |     2
 (3 rows)
+
+      task_name       |  status  | count
+----------------------+----------+-------
+ learning_cancel_task | canceled |     1
+ learning_retry_task  | failed   |     2
+(2 rows)
 ```
 
 Use events for worker behavior. Use receipts for model behavior
 
 ## Learn The Action Boundary
 
-Otlet keeps the v0 action vocabulary narrow
-
-`create_record` can create an Otlet-owned record. Otlet captures unsupported action types as rejected actions and does not mutate user tables:
+Otlet keeps the action vocabulary fixed and typed. The built-in action catalog says which actions need approval and which ones can create Otlet-owned records:
 
 ```sql
-SELECT name, model_name
-FROM otlet.create_task(
-  'learning_action_boundary_task',
-  NULL::text,
-  'Lifecycle task used to show rejected action types',
-  '{"type":"object","required":["status"],"additionalProperties":false,"properties":{"status":{"enum":["ok"]}}}'::jsonb,
-  'linked_qwen_0_6b',
-  '{}'::jsonb
-);
+SELECT action_type, requires_approval, creates_record
+FROM otlet.action_type_schemas
+ORDER BY action_type;
 
-INSERT INTO otlet.jobs (task_name, subject_id, input, status, attempts, started_at)
-VALUES ('learning_action_boundary_task', 'action-1', '{"kind":"manual running job"}'::jsonb, 'running', 1, now())
-RETURNING id, task_name, subject_id, status, attempts;
-
-SELECT job_id, output
-FROM otlet.complete_job(
-  (SELECT id FROM otlet.jobs WHERE task_name = 'learning_action_boundary_task' AND subject_id = 'action-1'),
-  '{"status":"ok"}'::jsonb,
-  '{"output":{"status":"ok"},"actions":[{"type":"update_source_table","table":"public.anything"}]}',
-  '[{"type":"update_source_table","table":"public.anything"}]'::jsonb
-);
-
-SELECT a.action_type, a.status, a.error, count(r.id) AS records_created
-FROM otlet.actions a
-LEFT JOIN otlet.records r ON r.action_id = a.id
-JOIN otlet.jobs j ON j.id = a.job_id
-WHERE j.task_name = 'learning_action_boundary_task'
-GROUP BY a.action_type, a.status, a.error
-ORDER BY a.action_type;
+SELECT otlet.action_validation_error(
+  '{"type":"update_source_table","table":"public.anything"}'::jsonb
+) AS rejected_action_error;
 ```
 
 Representative output:
 
 ```text
-             name              |    model_name
--------------------------------+------------------
- learning_action_boundary_task | linked_qwen_0_6b
-(1 row)
+   action_type   | requires_approval | creates_record
+-----------------+-------------------+----------------
+ create_record   | f                 | t
+ follow_up_job   | f                 | f
+ merge_candidate | t                 | f
+ new_entity      | f                 | f
+ note            | f                 | t
+ review_flag     | f                 | f
+(6 rows)
 
- id |           task_name           | subject_id | status  | attempts
-----+-------------------------------+------------+---------+----------
- 10 | learning_action_boundary_task | action-1   | running |        1
-(1 row)
-
- job_id |      output
---------+------------------
-     10 | {"status": "ok"}
-(1 row)
-
-     action_type     |  status  |          error          | records_created
----------------------+----------+-------------------------+-----------------
- update_source_table | rejected | unsupported action type |               0
+ rejected_action_error
+-----------------------
+ unsupported action type
 (1 row)
 ```
 
-Otlet draws the write-authority line here. The model can ask, but Otlet decides which action types can become database state
+Otlet draws the write-authority line here. The model can ask, but Otlet decides which action types can become database state. Unsupported actions are stored as rejected evidence when they arrive with an accepted output. Approval, dry-run, and apply status are visible through `otlet.action_status`
 
 ## Materialize Records Into Semantic State
 
@@ -1361,7 +1421,7 @@ cleanup_policy_dry_run=0|0|0|true
 
 ## Know The Remaining Production Boundaries
 
-Otlet installs internal production policy, bounded queues, leases, sweeps, validation evidence, status views, and a cleanup dry-run/apply function. Your application still owns tenant access, app roles, and approval workflows
+Otlet installs internal production policy, bounded queues, leases, sweeps, validation evidence, action approval state, status views, and cleanup dry-run/apply functions. Your application still owns tenant access, app roles, and who may approve or apply actions
 
 Check row-level security:
 
@@ -1402,7 +1462,7 @@ FROM (
 Representative output:
 
 ```text
-grant_contract=DELETE:40|INSERT:40|REFERENCES:40|SELECT:40|TRIGGER:40|TRUNCATE:40|UPDATE:40
+grant_contract=DELETE:34|INSERT:34|REFERENCES:34|SELECT:34|TRIGGER:34|TRUNCATE:34|UPDATE:34
 ```
 
 The remaining production boundary is application-specific:
@@ -1410,7 +1470,7 @@ The remaining production boundary is application-specific:
 - create app roles that expose only the views and functions you want
 - add RLS or schema isolation if multiple tenants share the database
 - schedule `otlet.cleanup_policy_state(false)` if your deployment wants periodic worker-event and trace pruning
-- keep approval workflows outside model output, then consume Otlet records as evidence
+- expose `otlet.approve_action`, `otlet.reject_action`, `otlet.dry_run_action`, and `otlet.apply_action` only to roles that should operate actions
 - allow only the action types your application can safely interpret
 
 ## Run The Full Demo Contract
@@ -1425,8 +1485,13 @@ Representative contract output from the demo run:
 
 ```text
 entity_resolution_contract=4|same_entity|different_entity|4|4
-model_selection_status_contract=true|true|true|4|1
+model_selection_status_contract=true|true|true|4|3
 accepted_output_anomalies=0
+action_type_contract=merge_candidate|new_entity
+action_approve_contract=approved|approved
+action_dry_run_contract=approved|approved|passed
+action_apply_contract=approved|approved|not_applicable
+source_write_contract=5|...|5|...
 semantic_join_auto_materialized=4
 receipt_trace_contract=8|8|8|8
 ```

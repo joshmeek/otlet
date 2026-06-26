@@ -103,6 +103,33 @@ LEFT JOIN LATERAL (
   WHERE ar.job_id = j.id
 ) attempts ON true;
 
+CREATE VIEW otlet.action_status AS
+SELECT
+  a.id AS action_id,
+  a.job_id,
+  j.task_name,
+  j.subject_id AS job_subject_id,
+  a.subject_id,
+  a.action_type,
+  a.status,
+  a.approval_status,
+  a.dry_run_status,
+  a.apply_status,
+  a.source_table,
+  a.source_hash,
+  a.error,
+  a.payload,
+  a.output_id,
+  a.receipt_id,
+  (o.id IS NOT NULL AND r.selection_status = 'accepted') AS trusted_output,
+  a.created_at,
+  a.approved_at,
+  a.applied_at
+FROM otlet.actions a
+JOIN otlet.jobs j ON j.id = a.job_id
+LEFT JOIN otlet.outputs o ON o.id = a.output_id
+LEFT JOIN otlet.inference_receipts r ON r.id = a.receipt_id;
+
 CREATE VIEW otlet.inference_receipt_trace_status AS
 SELECT
   r.id AS receipt_id,

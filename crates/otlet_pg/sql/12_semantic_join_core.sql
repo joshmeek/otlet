@@ -406,11 +406,11 @@ BEGIN
   END IF;
 
   FOR index_row IN
-    SELECT 'row'::text AS index_kind, si.name, si.record_type
+    SELECT 'row'::text AS index_kind, si.name, si.record_type, si.source_table
     FROM otlet.semantic_indexes si
     WHERE si.task_name = job_row.task_name
     UNION ALL
-    SELECT 'join'::text AS index_kind, sji.name, sji.record_type
+    SELECT 'join'::text AS index_kind, sji.name, sji.record_type, NULL::text AS source_table
     FROM otlet.semantic_join_indexes sji
     WHERE sji.task_name = job_row.task_name
   LOOP
@@ -425,10 +425,21 @@ BEGIN
     LIMIT 1;
 
     IF NOT FOUND THEN
-      INSERT INTO otlet.actions (job_id, output_id, action_type, payload, status, error)
+      INSERT INTO otlet.actions (
+        job_id,
+        output_id,
+        receipt_id,
+        action_type,
+        payload,
+        status,
+        subject_id,
+        source_table,
+        source_hash
+      )
       VALUES (
         job_row.id,
         output_row.id,
+        output_row.receipt_id,
         'create_record',
         jsonb_build_object(
           'type', 'create_record',
@@ -437,7 +448,9 @@ BEGIN
           'body', output_row.output
         ),
         'complete',
-        NULL
+        job_row.subject_id,
+        index_row.source_table,
+        md5(job_row.input::text)
       )
       RETURNING id INTO saved_action_id;
     END IF;
