@@ -8,7 +8,7 @@ Otlet uses a `pgrx` extension and a Postgres background worker loaded through `s
 
 ## Quick Example
 
-After setup creates the default worker runtime, the demo registers two local GGUF models. The model paths come from `./scripts/otlet-setup.sh`; the [worked example](docs/otlet-worked-example.md) shows the full copy/paste setup. Output below comes from a local demo run and is trimmed for width
+After setup creates the default worker runtime, the demo registers two local GGUF models. The model paths come from `./scripts/otlet-setup.sh`; the [worked example](docs/otlet-worked-example.md) shows the full copy/paste setup. I trimmed the local demo output below for width
 
 The LLM runs inside Postgres: the `otlet worker` background worker loads linked llama.cpp, tries `linked_qwen_0_6b` first, and escalates hard rows to `linked_qwen_1_7b`
 
