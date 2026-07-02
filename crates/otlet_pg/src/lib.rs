@@ -90,6 +90,11 @@ pgrx::extension_sql_file!(
     name = "production_policy",
     requires = ["semantic_fdw"]
 );
+pgrx::extension_sql_file!(
+    "../sql/21_watches.sql",
+    name = "watches",
+    requires = ["production_policy"]
+);
 
 #[allow(non_snake_case)]
 #[pgrx::pg_guard]

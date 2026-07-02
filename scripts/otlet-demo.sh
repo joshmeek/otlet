@@ -14,6 +14,10 @@ join_index_name="${OTLET_ENTITY_JOIN_INDEX_NAME:-demo_entity_resolution_idx}"
 join_task="${join_index_name}_task"
 join_foreign_table="${OTLET_ENTITY_JOIN_FOREIGN_TABLE:-demo_entity_resolution_pairs}"
 record_type="${OTLET_ENTITY_RECORD_TYPE:-entity_hypothesis}"
+row_triage_watch="${OTLET_ROW_TRIAGE_WATCH_NAME:-row_triage_demo}"
+row_triage_task="${row_triage_watch}_task"
+row_triage_policy_watch="${OTLET_ROW_TRIAGE_POLICY_WATCH_NAME:-row_triage_policy_demo}"
+row_triage_policy_task="${row_triage_policy_watch}_task"
 script_started="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
 entity_instruction='Never output different_entity when conflicting_stable_identifiers = 0. Never output same_entity when shared_stable_identifiers = 0. weak_matching_signals, missing_or_unknown_identifiers, and row_quality_warnings only explain unclear. Action type must be exactly merge_candidate, new_entity, or review_flag; never same_entity, different_entity, or unclear. same_entity uses merge_candidate body left_id, right_id, confidence, reason. different_entity uses new_entity body entity_id, reason, and entity_id must equal input.action_ids.right_id. unclear uses review_flag body left_id, right_id, severity, reason. Use input.action_ids.left_id and input.action_ids.right_id. Do not include an evidence field in actions. Keep output.reason and action body reason under 18 words. Quote every key and string. No markdown.'
 
@@ -217,7 +221,12 @@ echo "production_status_contract=$production_status_contract"
 psql_exec \
   -v old_index_name="demo_semantic_vendor_idx" \
   -v join_index_name="$join_index_name" \
-  -v join_foreign_table="$join_foreign_table" >/dev/null <<'SQL'
+  -v join_foreign_table="$join_foreign_table" \
+  -v row_triage_watch="$row_triage_watch" \
+  -v row_triage_policy_watch="$row_triage_policy_watch" >/dev/null <<'SQL'
+SELECT otlet.drop_watch(:'row_triage_watch');
+SELECT otlet.drop_watch(:'row_triage_policy_watch');
+SELECT otlet.drop_watch(:'join_index_name');
 SELECT otlet.drop_semantic_index(:'old_index_name');
 SELECT otlet.drop_semantic_join_index(:'join_index_name');
 SELECT format('DROP FOREIGN TABLE IF EXISTS otlet.%I', :'join_foreign_table') \gexec
@@ -226,6 +235,8 @@ cleanup_task "row_review_demo"
 cleanup_task "entity_hypothesis_demo"
 cleanup_task "row_triage_demo"
 cleanup_task "row_triage_policy_demo"
+cleanup_task "$row_triage_task"
+cleanup_task "$row_triage_policy_task"
 cleanup_task "$entity_task"
 cleanup_task "$join_task"
 
@@ -285,8 +296,10 @@ direct_ask_receipt_contract="$(sed -n 's/^direct_ask_receipt_contract=//p' <<<"$
 require_regex "$direct_ask_contract" '^review_payment\|[1-9][0-9]*\|[1-9][0-9]*$' "Expected direct ask to return review_payment with job and receipt ids"
 require_regex "$direct_ask_receipt_contract" "^$strong_model_name\\|complete\\|passed\\|[1-9][0-9]*$" "Expected direct ask receipt evidence"
 
-log "Running non-ER row triage task"
-psql_exec -v model_name="$strong_model_name" >/dev/null <<'SQL'
+log "Running non-ER row triage watch"
+psql_exec \
+  -v model_name="$strong_model_name" \
+  -v row_triage_watch="$row_triage_watch" >/dev/null <<'SQL'
 DROP TABLE IF EXISTS public.otlet_demo_triage_signal;
 CREATE TABLE public.otlet_demo_triage_signal (
   id text PRIMARY KEY,
@@ -294,28 +307,11 @@ CREATE TABLE public.otlet_demo_triage_signal (
   approvals integer NOT NULL,
   evidence text NOT NULL
 );
-INSERT INTO public.otlet_demo_triage_signal
-VALUES (
-  'triage-1',
-  2,
-  0,
-  'Wire instructions changed after invoice approval and the requester used urgent payment language'
-);
 
-SELECT otlet.create_task(
-  'row_triage_demo',
-  $$
-    SELECT
-      id AS subject_id,
-      jsonb_build_object(
-        'case_id', id,
-        'signals', jsonb_build_object('blockers', blockers, 'approvals', approvals),
-        'evidence', evidence
-      ) AS input
-    FROM public.otlet_demo_triage_signal
-    ORDER BY id
-  $$,
-  'Classify one operational row. If input.signals.blockers is greater than 0, output decision flag with confidence high and exactly one review_flag action. The review_flag body must have severity high and a short reason. If blockers = 0 and approvals > 0, output decision pass with confidence high and no actions. Otherwise output decision unclear with confidence medium and one review_flag action. Return JSON only.',
+SELECT otlet.create_watch(
+  :'row_triage_watch',
+  'row',
+  'Classify one operational row. Use input.row.blockers and input.row.approvals. If blockers is greater than 0, output decision flag with confidence high and exactly one review_flag action. The review_flag body must have severity high and a short reason. If blockers = 0 and approvals > 0, output decision pass with confidence high and no actions. Otherwise output decision unclear with confidence medium and one review_flag action. Return JSON only.',
   '{
     "type": "object",
     "required": ["decision", "confidence", "reason"],
@@ -327,23 +323,38 @@ SELECT otlet.create_task(
     }
   }'::jsonb,
   :'model_name',
+  'public.otlet_demo_triage_signal'::regclass,
+  'id',
+  NULL,
+  'demo_triage_fact',
   '{"max_tokens":160,"reasoning":"off","inference_cache":true}'::jsonb,
-  '{"evidence_fields":["signals"]}'::jsonb,
+  '{}'::jsonb,
+  '{"on_change":"mark_stale_and_enqueue"}'::jsonb,
+  ARRAY['review_flag'],
+  'refresh_then_fail_closed',
+  '{}'::jsonb,
   '{"answer_field":"decision","abstain_values":["unclear"],"confidence_field":"confidence","accepted_confidence":["high"]}'::jsonb
 );
-SELECT otlet.run_task('row_triage_demo');
+
+INSERT INTO public.otlet_demo_triage_signal
+VALUES (
+  'triage-1',
+  2,
+  0,
+  'Wire instructions changed after invoice approval and the requester used urgent payment language'
+);
 SQL
-wait_task_complete "row_triage_demo" 1 900 1
+wait_task_complete "$row_triage_task" 1 900 1
 
 row_triage_contract="$(psql_value "
-SELECT count(*) FILTER (WHERE r.status = 'complete')::text || '|' ||
+SELECT count(DISTINCT r.job_id) FILTER (WHERE r.status = 'complete')::text || '|' ||
        COALESCE(max(r.output->>'decision'), '') || '|' ||
        COALESCE(max(r.output->>'confidence'), '') || '|' ||
-       count(a.action_id)::text || '|' ||
+       count(a.action_id) FILTER (WHERE a.action_type = 'review_flag')::text || '|' ||
        count(a.action_id) FILTER (WHERE a.action_type = 'review_flag' AND a.error IS NULL)::text
 FROM otlet.runs r
 LEFT JOIN otlet.action_status a ON a.job_id = r.job_id
-WHERE r.task_name = 'row_triage_demo';
+WHERE r.task_name = '$row_triage_task';
 ")"
 echo "row_triage_contract=$row_triage_contract"
 [ "$row_triage_contract" = "1|flag|high|1|1" ] || {
@@ -351,36 +362,94 @@ echo "row_triage_contract=$row_triage_contract"
   exit 1
 }
 
+row_watch_status_contract="$(psql_value "
+SELECT watch_name || '|' || kind || '|' ||
+       total_subjects::text || '|' ||
+       fresh_subjects::text || '|' ||
+       stale_subjects::text || '|' ||
+       missing_subjects::text || '|' ||
+       queued_jobs::text || '|' ||
+       complete_jobs::text
+FROM otlet.watch_status
+WHERE watch_name = '$row_triage_watch';
+")"
+echo "row_watch_status_contract=$row_watch_status_contract"
+[ "$row_watch_status_contract" = "$row_triage_watch|row|1|1|0|0|0|1" ] || {
+  echo "Expected row watch status to show one fresh completed row, got $row_watch_status_contract" >&2
+  exit 1
+}
+
+queue_suppression_output="$(psql_value "
+BEGIN;
+UPDATE otlet.production_policy
+SET max_queued_jobs_per_model = 1
+WHERE name = 'default';
+
+DROP TABLE IF EXISTS public.otlet_demo_queue_flood;
+CREATE TABLE public.otlet_demo_queue_flood (
+  id text PRIMARY KEY,
+  note text NOT NULL
+);
+
+SELECT otlet.create_watch(
+  'row_queue_flood_demo',
+  'row',
+  'Return JSON only: {\"output\":{\"status\":\"ok\"},\"actions\":[]}',
+  '{\"type\":\"object\",\"required\":[\"status\"],\"additionalProperties\":false,\"properties\":{\"status\":{\"enum\":[\"ok\"]}}}'::jsonb,
+  '$strong_model_name',
+  'public.otlet_demo_queue_flood'::regclass,
+  'id',
+  NULL,
+  'demo_queue_flood_fact',
+  '{\"max_tokens\":64,\"reasoning\":\"off\"}'::jsonb,
+  '{}'::jsonb,
+  '{\"on_change\":\"mark_stale_and_enqueue\"}'::jsonb
+);
+
+INSERT INTO public.otlet_demo_queue_flood
+VALUES
+  ('flood-1', 'first flood row'),
+  ('flood-2', 'second flood row'),
+  ('flood-3', 'third flood row');
+
+SELECT (
+    SELECT count(*)
+    FROM otlet.jobs
+    WHERE task_name = 'row_queue_flood_demo_task'
+      AND status = 'queued'
+  )::text || '|' ||
+  (
+    SELECT (queue_admission_suppressed_events >= 2)::text || '|' ||
+           (queue_admission_last_suppressed_at IS NOT NULL)::text
+    FROM otlet.model_queue_status
+    WHERE model_name = '$strong_model_name'
+  );
+ROLLBACK;
+")"
+queue_suppression_contract="$(tail -n 1 <<<"$queue_suppression_output")"
+echo "queue_suppression_contract=$queue_suppression_contract"
+[ "$queue_suppression_contract" = "1|true|true" ] || {
+  echo "Expected queue suppression contract 1|true|true, got $queue_suppression_contract" >&2
+  exit 1
+}
+
 log "Running non-ER triage selection policy"
 psql_exec \
   -v cheap_policy_model="$strong_model_name" \
-  -v strong_policy_model="$strong_alias_model_name" >/dev/null <<'SQL'
-INSERT INTO public.otlet_demo_triage_signal
-VALUES (
-  'triage-unclear',
-  0,
-  0,
-  'No decisive blocker and no approval evidence; send to human review'
-)
-ON CONFLICT (id) DO UPDATE
-  SET blockers = EXCLUDED.blockers,
-      approvals = EXCLUDED.approvals,
-      evidence = EXCLUDED.evidence;
+  -v strong_policy_model="$strong_alias_model_name" \
+  -v row_triage_policy_watch="$row_triage_policy_watch" >/dev/null <<'SQL'
+DROP TABLE IF EXISTS public.otlet_demo_triage_policy_signal;
+CREATE TABLE public.otlet_demo_triage_policy_signal (
+  id text PRIMARY KEY,
+  blockers integer NOT NULL,
+  approvals integer NOT NULL,
+  evidence text NOT NULL
+);
 
-SELECT otlet.create_task(
-  'row_triage_policy_demo',
-  $$
-    SELECT
-      id AS subject_id,
-      jsonb_build_object(
-        'case_id', id,
-        'signals', jsonb_build_object('blockers', blockers, 'approvals', approvals),
-        'evidence', evidence
-      ) AS input
-    FROM public.otlet_demo_triage_signal
-    WHERE id = 'triage-unclear'
-  $$,
-  'Classify one operational row. If blockers > 0, output decision flag with confidence high and one review_flag action. If blockers = 0 and approvals > 0, output decision pass with confidence high and no actions. Otherwise output decision unclear with confidence medium and one review_flag action with severity medium. Return JSON only.',
+SELECT otlet.create_watch(
+  :'row_triage_policy_watch',
+  'row',
+  'Classify one operational row. Use input.row.blockers and input.row.approvals. If blockers > 0, output decision flag with confidence high and one review_flag action. If blockers = 0 and approvals > 0, output decision pass with confidence high and no actions. Otherwise output decision unclear with confidence medium and one review_flag action with severity medium and a short reason. Return JSON only.',
   '{
     "type": "object",
     "required": ["decision", "confidence", "reason"],
@@ -392,31 +461,44 @@ SELECT otlet.create_task(
     }
   }'::jsonb,
   :'cheap_policy_model',
+  'public.otlet_demo_triage_policy_signal'::regclass,
+  'id',
+  NULL,
+  'demo_triage_policy_fact',
   '{"max_tokens":160,"reasoning":"off","inference_cache":true}'::jsonb,
-  '{"evidence_fields":["signals"]}'::jsonb,
+  jsonb_build_object(
+    'cheap_model_name', :'cheap_policy_model',
+    'strong_model_name', :'strong_policy_model',
+    'accept_field_checks', '{"answer_field":"decision","abstain_values":["unclear"],"confidence_field":"confidence","accepted_confidence":["high","medium"]}'::jsonb
+  ),
+  '{"on_change":"mark_stale_and_enqueue"}'::jsonb,
+  ARRAY['review_flag'],
+  'refresh_then_fail_closed',
+  '{}'::jsonb,
   '{"answer_field":"decision","abstain_values":["unclear"],"confidence_field":"confidence","accepted_confidence":["high","medium"]}'::jsonb
 );
-SELECT otlet.set_model_selection_policy(
-  'row_triage_policy_demo',
-  :'cheap_policy_model',
-  :'strong_policy_model',
-  '{"answer_field":"decision","abstain_values":["unclear"],"confidence_field":"confidence","accepted_confidence":["high","medium"]}'::jsonb
+
+INSERT INTO public.otlet_demo_triage_policy_signal
+VALUES (
+  'triage-unclear',
+  0,
+  0,
+  'No decisive blocker and no approval evidence; send to human review'
 );
-SELECT otlet.run_task('row_triage_policy_demo');
 SQL
-wait_task_complete "row_triage_policy_demo" 1 900 1
+wait_task_complete "$row_triage_policy_task" 1 900 1
 
 row_triage_policy_contract="$(psql_value "
 WITH attempts AS (
   SELECT selection_role, selection_status, selection_reason
   FROM otlet.model_selection_attempts
-  WHERE task_name = 'row_triage_policy_demo'
+  WHERE task_name = '$row_triage_policy_task'
 )
 SELECT
   (SELECT count(*) FROM attempts WHERE selection_role = 'cheap' AND selection_status = 'rejected' AND selection_reason = 'abstained_output')::text || '|' ||
   (SELECT count(*) FROM attempts WHERE selection_role = 'strong' AND selection_status = 'accepted')::text || '|' ||
-  COALESCE((SELECT output->>'decision' FROM otlet.runs WHERE task_name = 'row_triage_policy_demo'), '') || '|' ||
-  (SELECT count(*) FROM otlet.action_status WHERE task_name = 'row_triage_policy_demo' AND action_type = 'review_flag')::text;
+  COALESCE((SELECT output->>'decision' FROM otlet.runs WHERE task_name = '$row_triage_policy_task'), '') || '|' ||
+  (SELECT count(*) FROM otlet.action_status WHERE task_name = '$row_triage_policy_task' AND action_type = 'review_flag')::text;
 ")"
 echo "row_triage_policy_contract=$row_triage_policy_contract"
 [ "$row_triage_policy_contract" = "1|1|unclear|1" ] || {
@@ -753,7 +835,7 @@ echo "source_write_contract=$source_write_contract"
   exit 1
 }
 
-log "Building semantic join entity-resolution path"
+log "Building entity-resolution pair watch"
 psql_exec \
   -v join_index_name="$join_index_name" \
   -v cheap_model_name="$cheap_model_name" \
@@ -761,15 +843,11 @@ psql_exec \
   -v record_type="$record_type" \
   -v entity_instruction="$entity_instruction" >/dev/null <<'SQL'
 SELECT name, task_name, record_type, max_candidate_rows
-FROM otlet.create_semantic_join_index(
-  :'join_index_name',
-  $$
-    SELECT subject_id, input
-    FROM public.otlet_demo_vendor_pair_input
-    ORDER BY subject_id
-  $$,
-  :'entity_instruction',
-  '{
+FROM otlet.create_watch(
+  watch_name => :'join_index_name',
+  kind => 'pair',
+  instruction => :'entity_instruction',
+  output_schema => '{
     "type": "object",
     "required": ["match", "confidence", "reason"],
     "additionalProperties": false,
@@ -779,12 +857,24 @@ FROM otlet.create_semantic_join_index(
       "reason": {"type": "string", "maxLength": 240}
     }
   }'::jsonb,
-  :'cheap_model_name',
-  :'record_type',
-  '{"max_tokens":256,"reasoning":"off","inference_cache":true,"generation_trace":true,"generation_trace_max_tokens":16,"generation_trace_top_k":3}'::jsonb,
-  10
+  model_name => :'cheap_model_name',
+  candidate_query => $$
+    SELECT subject_id, input
+    FROM public.otlet_demo_vendor_pair_input
+    ORDER BY subject_id
+  $$,
+  record_type => :'record_type',
+  runtime_options => '{"max_tokens":256,"reasoning":"off","inference_cache":true,"generation_trace":true,"generation_trace_max_tokens":16,"generation_trace_top_k":3}'::jsonb,
+  selection_policy => jsonb_build_object(
+    'cheap_model_name', :'cheap_model_name',
+    'strong_model_name', :'strong_model_name'
+  ),
+  trigger_policy => '{"on_change":"mark_stale"}'::jsonb,
+  action_types => ARRAY['merge_candidate', 'new_entity', 'review_flag'],
+  input_shaping => '{"evidence_fields":["candidate_evidence"],"action_id_fields":{"left_id":"left_id","right_id":"right_id"}}'::jsonb,
+  decision_contract => '{"preset":"entity_resolution_evidence_v1"}'::jsonb,
+  max_candidate_rows => 10
 );
-SELECT otlet.set_model_selection_policy(:'join_index_name' || '_task', :'cheap_model_name', :'strong_model_name');
 SQL
 
 queued="$(psql_value "SELECT otlet.refresh_semantic_join_index('$join_index_name');")"
@@ -852,6 +942,24 @@ FROM otlet.semantic_join_index_plan('$join_index_name');
 echo "semantic_join_status_contract=$join_status_contract"
 [ "$join_status_contract" = "semantic_join_lookup|4|4|0|0|0|0" ] || {
   echo "Expected fresh semantic join status, got $join_status_contract" >&2
+  exit 1
+}
+
+pair_watch_status_contract="$(psql_value "
+SELECT watch_name || '|' || kind || '|' ||
+       total_subjects::text || '|' ||
+       fresh_subjects::text || '|' ||
+       stale_subjects::text || '|' ||
+       missing_subjects::text || '|' ||
+       queued_jobs::text || '|' ||
+       complete_jobs::text || '|' ||
+       (proposed_actions >= 4)::text
+FROM otlet.watch_status
+WHERE watch_name = '$join_index_name';
+")"
+echo "pair_watch_status_contract=$pair_watch_status_contract"
+[ "$pair_watch_status_contract" = "$join_index_name|pair|4|4|0|0|0|4|true" ] || {
+  echo "Expected pair watch status to show four fresh completed subjects, got $pair_watch_status_contract" >&2
   exit 1
 }
 

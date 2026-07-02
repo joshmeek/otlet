@@ -345,3 +345,35 @@ CREATE TABLE otlet.semantic_join_indexes (
   last_lookup_at timestamptz,
   last_materialized_at timestamptz
 );
+
+CREATE TABLE otlet.watches (
+  name text PRIMARY KEY CHECK (name ~ '^[a-z0-9][a-z0-9_-]*$'),
+  kind text NOT NULL CHECK (kind IN ('row', 'pair')),
+  task_name text NOT NULL UNIQUE REFERENCES otlet.tasks(name) ON DELETE CASCADE,
+  semantic_index_name text UNIQUE REFERENCES otlet.semantic_indexes(name) ON DELETE SET NULL,
+  semantic_join_index_name text UNIQUE REFERENCES otlet.semantic_join_indexes(name) ON DELETE SET NULL,
+  source_table text,
+  subject_column text,
+  candidate_query text,
+  output_schema jsonb NOT NULL CHECK (jsonb_typeof(output_schema) = 'object'),
+  action_types text[] NOT NULL DEFAULT '{}'::text[],
+  stale_policy text NOT NULL DEFAULT 'refresh_then_fail_closed' CHECK (stale_policy IN (
+    'lookup_only_fail_closed',
+    'refresh_then_fail_closed'
+  )),
+  selection_policy jsonb NOT NULL DEFAULT '{}'::jsonb CHECK (jsonb_typeof(selection_policy) = 'object'),
+  trigger_policy jsonb NOT NULL DEFAULT '{"on_change":"mark_stale"}'::jsonb CHECK (jsonb_typeof(trigger_policy) = 'object'),
+  input_shaping jsonb NOT NULL DEFAULT '{}'::jsonb CHECK (jsonb_typeof(input_shaping) = 'object'),
+  decision_contract jsonb NOT NULL DEFAULT '{}'::jsonb CHECK (jsonb_typeof(decision_contract) = 'object'),
+  model_name text NOT NULL REFERENCES otlet.models(name),
+  record_type text NOT NULL,
+  runtime_options jsonb NOT NULL DEFAULT '{}'::jsonb CHECK (jsonb_typeof(runtime_options) = 'object'),
+  max_candidate_rows integer NOT NULL DEFAULT 1000 CHECK (max_candidate_rows BETWEEN 1 AND 100000),
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  CHECK (
+    (kind = 'row' AND semantic_index_name IS NOT NULL AND semantic_join_index_name IS NULL AND source_table IS NOT NULL AND subject_column IS NOT NULL AND candidate_query IS NULL)
+    OR
+    (kind = 'pair' AND semantic_index_name IS NULL AND semantic_join_index_name IS NOT NULL AND source_table IS NULL AND subject_column IS NULL AND candidate_query IS NOT NULL)
+  )
+);

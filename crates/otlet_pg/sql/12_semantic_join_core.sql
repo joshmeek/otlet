@@ -6,7 +6,9 @@ CREATE FUNCTION otlet.create_semantic_join_index(
   model_name text,
   record_type text DEFAULT NULL,
   runtime_options jsonb DEFAULT '{}'::jsonb,
-  max_candidate_rows integer DEFAULT 1000
+  max_candidate_rows integer DEFAULT 1000,
+  input_shaping jsonb DEFAULT '{}'::jsonb,
+  decision_contract jsonb DEFAULT '{}'::jsonb
 ) RETURNS otlet.semantic_join_indexes
 LANGUAGE plpgsql
 AS $$
@@ -61,7 +63,9 @@ BEGIN
     instruction,
     output_schema,
     model_name,
-    runtime_options
+    runtime_options,
+    input_shaping,
+    decision_contract
   );
 
   INSERT INTO otlet.semantic_join_indexes (

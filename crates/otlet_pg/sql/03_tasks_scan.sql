@@ -225,6 +225,8 @@ DECLARE
   model_name text;
   queue_slots integer;
   queued bigint;
+  has_pending boolean := false;
+  has_overflow boolean := false;
 BEGIN
   SELECT input_query, tasks.model_name
   INTO query, model_name
@@ -239,8 +241,28 @@ BEGIN
     RAISE EXCEPTION 'otlet task % has no input_query', task_name;
   END IF;
 
+  PERFORM pg_advisory_xact_lock(hashtext('otlet_queue:' || model_name));
   SELECT otlet.available_model_queue_slots(model_name) INTO queue_slots;
   IF queue_slots <= 0 THEN
+    EXECUTE format(
+      'SELECT EXISTS (SELECT 1 FROM (%s) otlet_input LIMIT 1)',
+      query
+    )
+    INTO has_pending;
+
+    IF has_pending THEN
+      INSERT INTO otlet.worker_events (event_type, message, detail)
+      VALUES (
+        'queue_admission_suppressed',
+        'otlet queue admission suppressed by model queue cap',
+        jsonb_build_object(
+          'task_name', run_task.task_name,
+          'model_name', model_name,
+          'reason', 'queue_cap'
+        )
+      );
+    END IF;
+
     RETURN 0;
   END IF;
 
@@ -261,6 +283,40 @@ BEGIN
     queue_slots
   );
   GET DIAGNOSTICS queued = ROW_COUNT;
+
+  IF queued >= queue_slots THEN
+    EXECUTE format(
+      'SELECT EXISTS (
+         SELECT 1
+         FROM (
+           SELECT subject_id::text AS subject_id, input::jsonb AS input
+           FROM (%s) otlet_input
+           ORDER BY subject_id
+           OFFSET %s
+           LIMIT 1
+         ) otlet_overflow_input
+       )',
+      query,
+      queue_slots
+    )
+    INTO has_overflow;
+
+    IF has_overflow THEN
+      INSERT INTO otlet.worker_events (event_type, message, detail)
+      VALUES (
+        'queue_admission_suppressed',
+        'otlet queue admission suppressed by model queue cap',
+        jsonb_build_object(
+          'task_name', run_task.task_name,
+          'model_name', model_name,
+          'reason', 'queue_cap',
+          'queued_jobs', queued,
+          'queue_slots', queue_slots
+        )
+      );
+    END IF;
+  END IF;
+
   IF queued > 0 THEN
     PERFORM otlet.wake_worker();
   END IF;
@@ -280,6 +336,7 @@ DECLARE
   model_name text;
   queue_slots integer;
   queued bigint;
+  has_pending boolean := false;
 BEGIN
   SELECT input_query, tasks.model_name
   INTO query, model_name
@@ -294,8 +351,35 @@ BEGIN
     RAISE EXCEPTION 'otlet task % has no input_query', run_task_subject.task_name;
   END IF;
 
+  PERFORM pg_advisory_xact_lock(hashtext('otlet_queue:' || model_name));
   SELECT otlet.available_model_queue_slots(model_name) INTO queue_slots;
   IF queue_slots <= 0 THEN
+    EXECUTE format(
+      'SELECT EXISTS (
+         SELECT 1
+         FROM (%s) otlet_input
+         WHERE subject_id::text = %L
+         LIMIT 1
+       )',
+      query,
+      run_task_subject.subject_id
+    )
+    INTO has_pending;
+
+    IF has_pending THEN
+      INSERT INTO otlet.worker_events (event_type, message, detail)
+      VALUES (
+        'queue_admission_suppressed',
+        'otlet queue admission suppressed by model queue cap',
+        jsonb_build_object(
+          'task_name', run_task_subject.task_name,
+          'subject_id', run_task_subject.subject_id,
+          'model_name', model_name,
+          'reason', 'queue_cap'
+        )
+      );
+    END IF;
+
     RETURN 0;
   END IF;
 

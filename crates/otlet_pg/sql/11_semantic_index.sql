@@ -19,7 +19,9 @@ CREATE FUNCTION otlet.create_semantic_index(
   output_schema jsonb,
   model_name text,
   runtime_options jsonb DEFAULT '{}'::jsonb,
-  record_type text DEFAULT NULL
+  record_type text DEFAULT NULL,
+  input_shaping jsonb DEFAULT '{}'::jsonb,
+  decision_contract jsonb DEFAULT '{}'::jsonb
 ) RETURNS otlet.semantic_indexes
 LANGUAGE plpgsql
 AS $$
@@ -91,7 +93,9 @@ BEGIN
     instruction,
     output_schema,
     model_name,
-    runtime_options
+    runtime_options,
+    input_shaping,
+    decision_contract
   );
 
   INSERT INTO otlet.semantic_indexes (

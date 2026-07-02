@@ -28,16 +28,28 @@ SELECT
   CASE
     WHEN otlet.available_model_queue_slots(m.name) <= 0 THEN 'queue_full'
     ELSE 'queue_accepting'
-  END AS queue_state
+  END AS queue_state,
+  COALESCE(suppressed.suppressed_events, 0)::bigint AS queue_admission_suppressed_events,
+  suppressed.last_suppressed_at AS queue_admission_last_suppressed_at
 FROM otlet.models m
 CROSS JOIN otlet.production_policy p
 LEFT JOIN otlet.tasks t ON t.model_name = m.name
 LEFT JOIN otlet.jobs j ON j.task_name = t.name
+LEFT JOIN LATERAL (
+  SELECT
+    count(*)::bigint AS suppressed_events,
+    max(e.created_at) AS last_suppressed_at
+  FROM otlet.worker_events e
+  WHERE e.event_type = 'queue_admission_suppressed'
+    AND e.detail ->> 'model_name' = m.name
+) suppressed ON true
 GROUP BY
   m.runtime_name,
   m.name,
   m.max_active_jobs,
-  p.max_queued_jobs_per_model;
+  p.max_queued_jobs_per_model,
+  suppressed.suppressed_events,
+  suppressed.last_suppressed_at;
 
 CREATE VIEW otlet.worker_throughput_status AS
 SELECT
