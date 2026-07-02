@@ -12,8 +12,8 @@ The example data uses vendors where string normalization fails. One pair is a re
 source candidate pair
   -> otlet.jobs row
   -> resident Postgres worker
-  -> cheap linked local Qwen through llama.cpp
-  -> stronger linked local Qwen when policy escalates
+  -> cheap local Qwen3 1.7B through llama.cpp
+  -> stronger local Qwen3.5 4B when policy escalates
   -> JSON and action validation
   -> otlet.outputs
   -> otlet.actions
@@ -25,6 +25,8 @@ source candidate pair
 Otlet keeps Postgres as the system of record
 
 Source tables stay under application control. Otlet sends the model bounded pair-shaped input and accepts structured JSON. Otlet validates output and typed actions before storage. Semantic refresh jobs create Otlet-owned `create_record` actions, records, and materialized semantic rows from validated output so downstream SQL can read fresh state
+
+For one-off row questions, use `otlet.ask(...)`. It inlines the prompt, row JSON, output schema, and model name, then returns trusted output with `job_id` and `receipt_id`. Otlet writes the internal task, job, receipt, trace, and output rows. Named tasks below are for repeatable watches, queues, semantic refresh, and model selection
 
 ## Start From A Running Local Otlet
 
@@ -38,8 +40,8 @@ Open `psql` with both local Qwen artifact paths available as variables:
 
 ```sh
 docker exec -it otlet-postgres sh -lc '
-  cheap_model_artifact="$(find /var/lib/postgresql -name Qwen3-0.6B-Q8_0.gguf -print -quit)"
-  strong_model_artifact="$(find /var/lib/postgresql -name Qwen3-1.7B-Q8_0.gguf -print -quit)"
+  cheap_model_artifact="$(find /var/lib/postgresql -name Qwen3-1.7B-Q8_0.gguf -print -quit)"
+  strong_model_artifact="$(find /var/lib/postgresql -name Qwen3.5-4B-Q4_K_M.gguf -print -quit)"
   psql -U postgres -d postgres \
     -v cheap_model_artifact="$cheap_model_artifact" \
     -v strong_model_artifact="$strong_model_artifact"
@@ -58,13 +60,13 @@ CREATE EXTENSION IF NOT EXISTS otlet;
 SELECT otlet.register_runtime('linked_inproc', 'linked');
 
 SELECT otlet.register_model(
-  'linked_qwen_0_6b',
+  'qwen3_1_7b',
   :'cheap_model_artifact',
   'linked_inproc'
 );
 
 SELECT otlet.register_model(
-  'linked_qwen_1_7b',
+  'qwen35_4b',
   :'strong_model_artifact',
   'linked_inproc'
 );
@@ -72,7 +74,7 @@ SELECT otlet.register_model(
 
 `linked_inproc` means the Otlet background worker inside Postgres owns inference
 
-The worker loads a local GGUF through linked llama.cpp and keeps the model resident across jobs
+The worker loads a local GGUF through in-process llama.cpp and keeps the model resident across jobs
 
 Postgres can query the queue, source row identity, output validation, receipts, traces, and runtime state
 
@@ -99,11 +101,11 @@ CREATE TABLE public.otlet_demo_vendor_pair (
 
 INSERT INTO public.otlet_demo_vendor_entity (id, legal_name, website, address, notes)
 VALUES
-  ('vendor-1001', 'Northstar Logistics LLC', 'northstar-logistics.example', '41 W Lake St, Chicago, IL', 'legacy freight vendor from the 2021 import; AP contact ops@northstar-logistics.example'),
-  ('vendor-42', 'N-Star Freight Services', 'nstar-freight.example', '41 West Lake Street, Suite 900, Chicago', 'same remittance account ending 8821; internal note says Northstar rebranded after acquisition'),
+  ('vendor-1001', 'Northstar Logistics LLC', 'northstar-logistics.example', '41 W Lake St, Chicago, IL', 'legacy freight vendor from the 2021 import; tax id 36-9918821; remittance account ending 8821; AP contact ops@northstar-logistics.example'),
+  ('vendor-42', 'N-Star Freight Services', 'nstar-freight.example', '41 West Lake Street, Suite 900, Chicago', 'same remittance account ending 8821 and same tax id 36-9918821; internal note says Northstar rebranded after acquisition'),
   ('vendor-77', 'Clearwater Medical Supplies', 'clearwatermed.example', '500 Hospital Way, Phoenix, AZ', 'hospital supply distributor; no shared tax id, domain, payment account, AP contact, remittance account, city, or industry with the freight vendor'),
-  ('vendor-313', 'North Star Medical Logistics', 'northstarmedlog.example', '41 West Lake Street, Chicago, IL', 'medical logistics broker; same building and similar name, but different domain, payment account, AP contact, and no acquisition note'),
-  ('vendor-314', 'Northstar Freight Canada Inc.', 'northstar-canada.example', '88 King St W, Toronto, ON', 'freight carrier with similar brand; different country, bank account, AP contact, and no shared remittance account in the ledger');
+  ('vendor-313', 'North Star Medical Logistics', 'northstarmedlog.example', '41 West Lake Street, Chicago, IL', 'medical logistics broker; same building and similar name, but verified separate legal entity; different tax id 92-4403130; different remittance account ending 1199; different domain, payment account, AP contact, and no acquisition note'),
+  ('vendor-314', 'Northstar Freight Canada Inc.', 'northstar-canada.example', '88 King St W, Toronto, ON', 'Canadian freight carrier with similar brand; different country, tax id CA-771314, bank account ending 4410, AP contact, and no shared remittance account or acquisition note in the ledger');
 
 INSERT INTO public.otlet_demo_vendor_pair (pair_id, left_id, right_id)
 VALUES
@@ -184,55 +186,78 @@ FROM otlet.create_task(
           'right_ctid', r.ctid::text,
           'right_xmin', r.xmin::text
         ),
-        'table', 'public.otlet_demo_vendor_entity',
-        'pair_id', p.pair_id,
-        'left_id', p.left_id,
-        'right_id', p.right_id,
-        'candidate_evidence',
-        CASE p.pair_id
-          WHEN 'vendor-1001:vendor-42' THEN jsonb_build_array(
-            'same remittance account ending 8821',
-            'internal note says Northstar rebranded after acquisition'
-          )
-          WHEN 'vendor-1001:vendor-77' THEN jsonb_build_array(
-            'different industry and city',
-            'no shared tax id, domain, payment account, AP contact, or remittance account'
-          )
-          WHEN 'vendor-1001:vendor-313' THEN jsonb_build_array(
-            'same office building and similar North Star name',
-            'medical logistics versus freight vendor',
-            'different domain, payment account, AP contact, and no acquisition note',
-            'weak signals conflict with important identifiers'
-          )
-          WHEN 'vendor-1001:vendor-314' THEN jsonb_build_array(
-            'similar Northstar freight brand',
-            'different country, bank account, AP contact, and no shared remittance account',
-            'no acquisition or rebrand note connecting the records',
-            'name similarity alone is not enough'
-          )
-          ELSE '[]'::jsonb
-        END,
-        'left_record', jsonb_build_object(
-          'id', l.id,
-          'legal_name', l.legal_name,
-          'website', l.website,
-          'address', l.address,
-          'notes', l.notes
+        'candidate_evidence', evidence.candidate_evidence,
+        'evidence_counts', jsonb_build_object(
+          'shared_stable_identifiers', jsonb_array_length(evidence.candidate_evidence -> 'shared_stable_identifiers'),
+          'conflicting_stable_identifiers', jsonb_array_length(evidence.candidate_evidence -> 'conflicting_stable_identifiers'),
+          'weak_matching_signals', jsonb_array_length(evidence.candidate_evidence -> 'weak_matching_signals'),
+          'missing_or_unknown_identifiers', jsonb_array_length(evidence.candidate_evidence -> 'missing_or_unknown_identifiers'),
+          'row_quality_warnings', jsonb_array_length(evidence.candidate_evidence -> 'row_quality_warnings')
         ),
-        'right_record', jsonb_build_object(
-          'id', r.id,
-          'legal_name', r.legal_name,
-          'website', r.website,
-          'address', r.address,
-          'notes', r.notes
-        )
+        'action_ids', jsonb_build_object('left_id', p.left_id, 'right_id', p.right_id)
       ) AS input
     FROM public.otlet_demo_vendor_pair p
     JOIN public.otlet_demo_vendor_entity l ON l.id = p.left_id
     JOIN public.otlet_demo_vendor_entity r ON r.id = p.right_id
+    CROSS JOIN LATERAL (
+      SELECT CASE p.pair_id
+        WHEN 'vendor-1001:vendor-42' THEN jsonb_build_object(
+          'shared_stable_identifiers', jsonb_build_array(
+            'same remittance account ending 8821',
+            'same tax id 36-9918821',
+            'Northstar rebrand after acquisition'
+          ),
+          'conflicting_stable_identifiers', '[]'::jsonb,
+          'weak_matching_signals', jsonb_build_array('similar address'),
+          'missing_or_unknown_identifiers', '[]'::jsonb,
+          'row_quality_warnings', '[]'::jsonb
+        )
+        WHEN 'vendor-1001:vendor-77' THEN jsonb_build_object(
+          'shared_stable_identifiers', '[]'::jsonb,
+          'conflicting_stable_identifiers', jsonb_build_array(
+            'different industry and city',
+            'no shared tax id, domain, payment account, AP contact, or remittance account'
+          ),
+          'weak_matching_signals', '[]'::jsonb,
+          'missing_or_unknown_identifiers', '[]'::jsonb,
+          'row_quality_warnings', '[]'::jsonb
+        )
+        WHEN 'vendor-1001:vendor-313' THEN jsonb_build_object(
+          'shared_stable_identifiers', '[]'::jsonb,
+          'conflicting_stable_identifiers', jsonb_build_array(
+            'medical logistics versus freight vendor',
+            'different tax id 92-4403130',
+            'different remittance account ending 1199',
+            'different domain, payment account, AP contact, and no acquisition note'
+          ),
+          'weak_matching_signals', jsonb_build_array('same office building', 'similar North Star name'),
+          'missing_or_unknown_identifiers', '[]'::jsonb,
+          'row_quality_warnings', '[]'::jsonb
+        )
+        WHEN 'vendor-1001:vendor-314' THEN jsonb_build_object(
+          'shared_stable_identifiers', '[]'::jsonb,
+          'conflicting_stable_identifiers', jsonb_build_array(
+            'different country and Canadian legal entity',
+            'different tax id CA-771314',
+            'different bank account ending 4410, AP contact, and no shared remittance account',
+            'no acquisition or rebrand note connecting the records'
+          ),
+          'weak_matching_signals', jsonb_build_array('similar Northstar freight brand'),
+          'missing_or_unknown_identifiers', '[]'::jsonb,
+          'row_quality_warnings', '[]'::jsonb
+        )
+        ELSE jsonb_build_object(
+          'shared_stable_identifiers', '[]'::jsonb,
+          'conflicting_stable_identifiers', '[]'::jsonb,
+          'weak_matching_signals', '[]'::jsonb,
+          'missing_or_unknown_identifiers', jsonb_build_array('no decisive identity evidence'),
+          'row_quality_warnings', '[]'::jsonb
+        )
+      END AS candidate_evidence
+    ) evidence
     ORDER BY p.pair_id
   $$,
-  'Return only JSON. The top-level object must have output and actions. actions must be an array with one object. Use input.candidate_evidence only. Check negative evidence first. Negative example: evidence says different industry and city plus no shared tax id, so match is different_entity and action type is new_entity. Positive example: evidence says same remittance account, so match is same_entity and action type is merge_candidate. Conflict example: evidence says weak signals conflict, so match is unclear and action type is review_flag. If evidence says no shared, different industry, different city, different country, different domain, different payment account, or different AP contact, return output match different_entity confidence high reason no shared identifiers and a new_entity action with type, entity_id, reason, and evidence. If evidence says weak signals conflict, return output match unclear confidence medium reason weak signals conflict and a review_flag action with type, left_id, right_id, severity, and reason. If evidence says same remittance account, rebrand, or acquisition without negation, return output match same_entity confidence high reason shared remittance or rebrand and a merge_candidate action with type, left_id, right_id, confidence, reason, and evidence. The word no means absence. Use actual input.left_id, input.right_id, and input.candidate_evidence values. Use input.right_id as new_entity.entity_id. Do not explain.',
+  'Return one JSON object only. Top-level keys must be output and actions. Never use ellipses or placeholder values. Use input.evidence_counts for the decision and input.candidate_evidence only for the short reason. input.action_ids are row IDs for action bodies, not identity evidence. confidence must be low, medium, or high, never unclear. Rule 1: if conflicting_stable_identifiers > 0, output different_entity with confidence high. Rule 2: else if shared_stable_identifiers > 0, output same_entity with confidence high. Rule 3: else output unclear with confidence medium. Never output different_entity when conflicting_stable_identifiers = 0. Never output same_entity when shared_stable_identifiers = 0. weak_matching_signals, missing_or_unknown_identifiers, and row_quality_warnings only explain unclear. Action type must be exactly merge_candidate, new_entity, or review_flag; never same_entity, different_entity, or unclear. same_entity uses merge_candidate body left_id, right_id, confidence, reason. different_entity uses new_entity body entity_id, reason, and entity_id must equal input.action_ids.right_id. unclear uses review_flag body left_id, right_id, severity, reason. Use input.action_ids.left_id and input.action_ids.right_id. Do not include an evidence field in actions. Keep output.reason and action body reason under 18 words. Quote every key and string. No markdown.',
   '{
     "type": "object",
     "required": ["match", "confidence", "reason"],
@@ -240,22 +265,12 @@ FROM otlet.create_task(
     "properties": {
       "match": {"enum": ["same_entity", "different_entity", "unclear"]},
       "confidence": {"enum": ["low", "medium", "high"]},
-      "reason": {"type": "string"}
-    },
-    "allOf": [
-      {
-        "if": {"properties": {"match": {"const": "same_entity"}}, "required": ["match"]},
-        "then": {"properties": {"reason": {"pattern": "remittance|rebrand|acquisition"}}}
-      },
-      {
-        "if": {"properties": {"match": {"const": "different_entity"}}, "required": ["match"]},
-        "then": {"properties": {"reason": {"pattern": "no shared|different"}}}
-      }
-    ]
+      "reason": {"type": "string", "maxLength": 240}
+    }
   }'::jsonb,
-  'linked_qwen_0_6b',
+  'qwen3_1_7b',
   '{
-    "max_tokens": 384,
+    "max_tokens": 256,
     "reasoning": "off",
     "inference_cache": true,
     "generation_trace": true,
@@ -267,8 +282,8 @@ FROM otlet.create_task(
 SELECT task_name, cheap_model_name, strong_model_name
 FROM otlet.set_model_selection_policy(
   'entity_resolution_demo',
-  'linked_qwen_0_6b',
-  'linked_qwen_1_7b'
+  'qwen3_1_7b',
+  'qwen35_4b'
 );
 ```
 
@@ -277,12 +292,12 @@ Representative output:
 ```text
           name          |    model_name
 ------------------------+------------------
- entity_resolution_demo | linked_qwen_0_6b
+ entity_resolution_demo | qwen3_1_7b
 (1 row)
 
        task_name        | cheap_model_name | strong_model_name
 ------------------------+------------------+-------------------
- entity_resolution_demo | linked_qwen_0_6b | linked_qwen_1_7b
+ entity_resolution_demo | qwen3_1_7b | qwen35_4b
 (1 row)
 ```
 
@@ -497,17 +512,18 @@ Representative output from the demo run:
 ```text
       subject_id       | attempt_index | selection_role | selection_status |    model_name    |      match       | confidence
 -----------------------+---------------+----------------+------------------+------------------+------------------+------------
- vendor-1001:vendor-313 |             1 | cheap          | failed           | linked_qwen_0_6b |                  |
- vendor-1001:vendor-313 |             2 | strong         | accepted         | linked_qwen_1_7b | different_entity | high
- vendor-1001:vendor-314 |             1 | cheap          | failed           | linked_qwen_0_6b |                  |
- vendor-1001:vendor-314 |             2 | strong         | accepted         | linked_qwen_1_7b | different_entity | high
- vendor-1001:vendor-42  |             1 | cheap          | accepted         | linked_qwen_0_6b | same_entity      | high
- vendor-1001:vendor-77  |             1 | cheap          | failed           | linked_qwen_0_6b |                  |
- vendor-1001:vendor-77  |             2 | strong         | accepted         | linked_qwen_1_7b | different_entity | high
-(7 rows)
+ vendor-1001:vendor-313 |             1 | cheap          | failed           | qwen3_1_7b |                  |
+ vendor-1001:vendor-313 |             2 | strong         | accepted         | qwen35_4b        | different_entity | high
+ vendor-1001:vendor-314 |             1 | cheap          | failed           | qwen3_1_7b |                  |
+ vendor-1001:vendor-314 |             2 | strong         | accepted         | qwen35_4b        | different_entity | high
+ vendor-1001:vendor-42  |             1 | cheap          | failed           | qwen3_1_7b |                  |
+ vendor-1001:vendor-42  |             2 | strong         | accepted         | qwen35_4b        | same_entity      | high
+ vendor-1001:vendor-77  |             1 | cheap          | failed           | qwen3_1_7b |                  |
+ vendor-1001:vendor-77  |             2 | strong         | accepted         | qwen35_4b        | different_entity | high
+(8 rows)
 ```
 
-The cheap model handles the obvious positive pair. Harder negative pairs fail the stricter output/action envelope, stay visible as failed receipts, and escalate to `linked_qwen_1_7b`. Otlet materializes only the accepted output for each job
+The cheap model fails the stricter output/action envelope in this run. Failed attempts stay visible as receipts, every row escalates to `qwen35_4b`, and Otlet materializes only the accepted output for each job
 
 ## Read The Receipt
 
@@ -524,7 +540,7 @@ WHERE task_name = 'entity_resolution_demo';
 Representative output:
 
 ```text
-receipt_attempt_contract=7|4|3|3
+receipt_attempt_contract=8|4|4|4
 ```
 
 A receipt records evidence for one model run. A selected job can have multiple receipts for the same candidate pair
@@ -724,7 +740,7 @@ FROM otlet.create_task(
   $$,
   'Return exactly this JSON object: {"output":{"status":"ok"},"actions":[]}',
   '{"type":"object","required":["status"],"additionalProperties":false,"properties":{"status":{"enum":["ok"]}}}'::jsonb,
-  'linked_qwen_0_6b',
+  'qwen3_1_7b',
   '{"max_tokens":64,"reasoning":"off"}'::jsonb
 );
 ```
@@ -734,7 +750,7 @@ Representative output:
 ```text
         name         | has_input_query |    model_name
 ---------------------+-----------------+------------------
- learning_retry_task | t               | linked_qwen_0_6b
+ learning_retry_task | t               | qwen3_1_7b
 (1 row)
 ```
 
@@ -751,7 +767,7 @@ FROM otlet.create_task(
   NULL::text,
   'Lifecycle task used to show queued cancellation',
   '{"type":"object","required":["status"],"additionalProperties":false,"properties":{"status":{"enum":["ok"]}}}'::jsonb,
-  'linked_qwen_0_6b',
+  'qwen3_1_7b',
   '{}'::jsonb
 );
 
@@ -777,7 +793,7 @@ Representative output:
 ```text
          name         |    model_name
 ----------------------+------------------
- learning_cancel_task | linked_qwen_0_6b
+ learning_cancel_task | qwen3_1_7b
 (1 row)
 
  id |      task_name       | subject_id | status | attempts
@@ -993,7 +1009,7 @@ SELECT otlet.create_semantic_index(
       "issues": {"type": "array", "items": {"type": "string"}}
     }
   }'::jsonb,
-  'linked_qwen_0_6b',
+  'qwen3_1_7b',
   '{"max_tokens":256,"reasoning":"off","inference_cache":true,"generation_trace":true,"generation_trace_max_tokens":12,"generation_trace_top_k":3}'::jsonb,
   'demo_semantic_fact'
 );
@@ -1287,7 +1303,7 @@ FROM otlet.create_semantic_join_index(
   $$,
   'The two input entities are the same company. Return exactly this JSON object: {"output":{"match":"yes","confidence":0.95,"needs_review":false},"actions":[]}',
   '{"type":"object","required":["match","confidence","needs_review"],"additionalProperties":false,"properties":{"match":{"enum":["yes"]},"confidence":{"type":"number"},"needs_review":{"type":"boolean"}}}'::jsonb,
-  'linked_qwen_0_6b',
+  'qwen3_1_7b',
   'learning_entity_pair',
   '{"max_tokens":160,"reasoning":"off"}'::jsonb,
   10
@@ -1393,7 +1409,7 @@ SELECT runtime_status || '|' ||
        COALESCE(worker_memory_sample_policy, '') AS runtime_contract
 FROM otlet.runtime_status
 WHERE runtime_name = 'linked_inproc'
-  AND model_name = 'linked_qwen_0_6b'
+  AND model_name = 'qwen3_1_7b'
 LIMIT 1;
 ```
 
@@ -1484,13 +1500,10 @@ The repo includes a script that exercises the entity-resolution path used in thi
 Representative contract output from the demo run:
 
 ```text
+direct_ask_contract=review_payment|2|2
 entity_resolution_contract=4|same_entity|different_entity|4|4
 model_selection_status_contract=true|true|true|4|3
-accepted_output_anomalies=0
 action_type_contract=merge_candidate|new_entity
-action_approve_contract=approved|approved
-action_dry_run_contract=approved|approved|passed
-action_apply_contract=approved|approved|not_applicable
 source_write_contract=5|...|5|...
 semantic_join_auto_materialized=4
 receipt_trace_contract=8|8|8|8
