@@ -120,9 +120,14 @@ fn validate_semantic_index_source(
     auto_policy: bool,
 ) -> Option<SemanticPlannerStats> {
     let metadata_query = format!(
-        "SELECT source_table, subject_column, model_name \
-         FROM otlet.semantic_indexes \
-         WHERE name = {} AND source_table::regclass = {}::oid \
+        "SELECT \
+           si.source_table, \
+           si.subject_column, \
+           si.model_name, \
+           otlet.task_contract_hash(t.instruction, t.output_schema, t.model_name, t.runtime_options, t.input_shaping, t.decision_contract) AS contract_hash \
+         FROM otlet.semantic_indexes si \
+         JOIN otlet.tasks t ON t.name = si.task_name \
+         WHERE si.name = {} AND si.source_table::regclass = {}::oid \
          LIMIT 1",
         sql_literal(index_name),
         relid.to_u32()
@@ -157,6 +162,12 @@ fn validate_semantic_index_source(
         else {
             return Ok::<Option<SemanticPlannerStats>, String>(None);
         };
+        let Some(contract_hash) = row
+            .get_by_name::<String, _>("contract_hash")
+            .map_err(to_string)?
+        else {
+            return Ok::<Option<SemanticPlannerStats>, String>(None);
+        };
         let subject_column_cstr = CString::new(subject_column.as_str()).map_err(to_string)?;
         let indexed_attno = unsafe { pg_sys::get_attnum(relid, subject_column_cstr.as_ptr()) };
         if indexed_attno != subject_attno {
@@ -168,7 +179,7 @@ fn validate_semantic_index_source(
         let stats_query = format!(
             "WITH latest AS ( \
                SELECT DISTINCT ON (sm.subject_id) \
-                 sm.subject_id, sm.stale, sm.source_hash, {} AS matches_expected, sm.updated_at, sm.id \
+                 sm.subject_id, sm.stale, sm.source_hash, sm.content_hash, sm.contract_hash, {} AS matches_expected, sm.updated_at, sm.id \
                FROM otlet.semantic_materializations sm \
                JOIN otlet.semantic_indexes si \
                  ON si.task_name = sm.task_name \
@@ -200,9 +211,9 @@ fn validate_semantic_index_source(
              classified AS ( \
                SELECT \
                  CASE \
-                   WHEN a.subject_id IS NOT NULL AND (l.subject_id IS NULL OR l.stale OR l.source_hash IS DISTINCT FROM src.source_hash) THEN 'in_flight' \
+                   WHEN a.subject_id IS NOT NULL AND (l.subject_id IS NULL OR l.content_hash IS DISTINCT FROM src.content_hash OR l.contract_hash IS DISTINCT FROM {}) THEN 'in_flight' \
                    WHEN l.subject_id IS NULL THEN 'missing' \
-                   WHEN l.stale OR l.source_hash IS DISTINCT FROM src.source_hash THEN 'stale' \
+                   WHEN l.content_hash IS DISTINCT FROM src.content_hash OR l.contract_hash IS DISTINCT FROM {} THEN 'stale' \
                    WHEN l.matches_expected THEN 'fresh_match' \
                    ELSE 'fresh_non_match' \
                  END AS state, \
@@ -210,7 +221,8 @@ fn validate_semantic_index_source(
                    a.subject_id IS NULL \
                    AND l.subject_id IS NOT NULL \
                    AND l.stale \
-                   AND l.source_hash IS NOT DISTINCT FROM src.source_hash \
+                   AND l.content_hash IS NOT DISTINCT FROM src.content_hash \
+                   AND l.contract_hash IS NOT DISTINCT FROM {} \
                  ) AS cache_reusable \
                FROM source_rows src \
                LEFT JOIN latest l USING (subject_id) \
@@ -231,7 +243,10 @@ fn validate_semantic_index_source(
             sql_literal(index_name),
             source_rows_sql,
             sql_literal(&model_name),
-            sql_literal(&model_name)
+            sql_literal(&model_name),
+            sql_literal(&contract_hash),
+            sql_literal(&contract_hash),
+            sql_literal(&contract_hash)
         );
         let stats_table = client
             .select(stats_query.as_str(), Some(1), &[])

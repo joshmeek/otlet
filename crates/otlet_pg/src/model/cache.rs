@@ -1,7 +1,7 @@
 fn inference_cache_key(job: &Job, context: &RunContext) -> String {
     hash_text(
         format!(
-            "task={}|subject={}|model={}|runtime={}|model_fingerprint={}|prompt={}|input={}|schema={}|options={}|mvcc={}",
+            "task={}|subject={}|model={}|runtime={}|model_fingerprint={}|prompt={}|input={}|schema={}|options={}|content={}",
             job.task_name,
             job.subject_id,
             job.model_name,
@@ -11,7 +11,7 @@ fn inference_cache_key(job: &Job, context: &RunContext) -> String {
             context.input_hash,
             context.output_schema_hash,
             context.runtime_options_hash,
-            input_mvcc_version(&job.input)
+            input_content_hash(&job.input)
         )
         .as_str(),
     )
@@ -68,12 +68,13 @@ fn model_fingerprint(job: &Job) -> String {
     }
 }
 
-fn input_mvcc_version(input: &Value) -> String {
-    input
-        .get("_otlet_mvcc")
-        .or_else(|| input.get("otlet_mvcc"))
-        .map(hash_json)
-        .unwrap_or_else(|| "none".to_owned())
+fn input_content_hash(input: &Value) -> String {
+    let mut content = input.clone();
+    if let Value::Object(object) = &mut content {
+        object.remove("_otlet_mvcc");
+        object.remove("otlet_mvcc");
+    }
+    hash_json(&content)
 }
 
 fn input_mvcc_row_identity(input: &Value, subject_id: &str) -> String {

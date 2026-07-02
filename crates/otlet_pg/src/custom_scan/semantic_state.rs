@@ -8,9 +8,15 @@ fn load_semantic_states(
     }
     pgrx::Spi::connect(|client| {
         let metadata_query = format!(
-            "SELECT source_table, subject_column, task_name, record_type \
-             FROM otlet.semantic_indexes \
-             WHERE name = {} \
+            "SELECT \
+               si.source_table, \
+               si.subject_column, \
+               si.task_name, \
+               si.record_type, \
+               otlet.task_contract_hash(t.instruction, t.output_schema, t.model_name, t.runtime_options, t.input_shaping, t.decision_contract) AS contract_hash \
+             FROM otlet.semantic_indexes si \
+             JOIN otlet.tasks t ON t.name = si.task_name \
+             WHERE si.name = {} \
              LIMIT 1",
             sql_literal(index_name)
         );
@@ -37,6 +43,10 @@ fn load_semantic_states(
             .get_by_name::<String, _>("record_type")
             .map_err(to_string)?
             .ok_or_else(|| format!("otlet semantic index {index_name} has no record type"))?;
+        let contract_hash = row
+            .get_by_name::<String, _>("contract_hash")
+            .map_err(to_string)?
+            .ok_or_else(|| format!("otlet semantic index {index_name} has no contract hash"))?;
         let source_rows_sql = source_rows_sql(&source_table, &subject_column);
         let matches_expected_sql = row_predicate_match_sql("sm.body", expected_json);
         let query = format!(
@@ -45,6 +55,8 @@ fn load_semantic_states(
              sm.subject_id, \
              sm.stale, \
              sm.source_hash, \
+             sm.content_hash, \
+             sm.contract_hash, \
              {} AS matches_expected, \
              sm.updated_at, \
              sm.id \
@@ -66,9 +78,9 @@ fn load_semantic_states(
            SELECT \
              src.subject_id, \
              CASE \
-               WHEN a.subject_id IS NOT NULL AND (l.subject_id IS NULL OR l.stale OR l.source_hash IS DISTINCT FROM src.source_hash) THEN 'in_flight' \
+               WHEN a.subject_id IS NOT NULL AND (l.subject_id IS NULL OR l.content_hash IS DISTINCT FROM src.content_hash OR l.contract_hash IS DISTINCT FROM {}) THEN 'in_flight' \
                WHEN l.subject_id IS NULL THEN 'missing' \
-               WHEN l.stale OR l.source_hash IS DISTINCT FROM src.source_hash THEN 'stale' \
+               WHEN l.content_hash IS DISTINCT FROM src.content_hash OR l.contract_hash IS DISTINCT FROM {} THEN 'stale' \
                WHEN l.matches_expected THEN 'fresh_match' \
                ELSE 'fresh_non_match' \
              END AS semantic_state \
@@ -83,7 +95,9 @@ fn load_semantic_states(
             sql_literal(&task_name),
             sql_literal(&record_type),
             sql_literal(&task_name),
-            source_rows_sql
+            source_rows_sql,
+            sql_literal(&contract_hash),
+            sql_literal(&contract_hash)
         );
         let table = client
             .select(query.as_str(), None, &[])

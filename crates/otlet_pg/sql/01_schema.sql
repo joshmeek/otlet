@@ -69,6 +69,37 @@ CREATE TABLE otlet.decision_rule_presets (
   created_at timestamptz NOT NULL DEFAULT now()
 );
 
+CREATE FUNCTION otlet.semantic_content_hash(
+  input jsonb
+) RETURNS text
+LANGUAGE sql
+IMMUTABLE
+STRICT
+AS $$
+  SELECT md5((COALESCE($1, 'null'::jsonb) - '_otlet_mvcc' - 'otlet_mvcc')::text);
+$$;
+
+CREATE FUNCTION otlet.task_contract_hash(
+  instruction text,
+  output_schema jsonb,
+  model_name text,
+  runtime_options jsonb DEFAULT '{}'::jsonb,
+  input_shaping jsonb DEFAULT '{}'::jsonb,
+  decision_contract jsonb DEFAULT '{}'::jsonb
+) RETURNS text
+LANGUAGE sql
+IMMUTABLE
+AS $$
+  SELECT md5(jsonb_build_object(
+    'instruction', COALESCE($1, ''),
+    'output_schema', COALESCE($2, '{}'::jsonb),
+    'model_name', COALESCE($3, ''),
+    'runtime_options', COALESCE($4, '{}'::jsonb),
+    'input_shaping', COALESCE($5, '{}'::jsonb),
+    'decision_contract', COALESCE($6, '{}'::jsonb)
+  )::text);
+$$;
+
 INSERT INTO otlet.decision_rule_presets (name, decision_contract)
 VALUES (
   'entity_resolution_evidence_v1',
@@ -309,6 +340,21 @@ CREATE TABLE otlet.semantic_materializations (
   body jsonb NOT NULL,
   stale boolean NOT NULL DEFAULT false,
   source_hash text,
+  content_hash text,
+  contract_hash text,
+  stale_reason text CHECK (stale_reason IN (
+    'source_update',
+    'source_delete',
+    'contract_changed',
+    'schema_drift',
+    'manual',
+    'content_revalidation_pending'
+  )),
+  freshness_basis text CHECK (freshness_basis IN (
+    'content_hash_match',
+    'mvcc_match',
+    'revalidated_after_benign_update'
+  )),
   created_at timestamptz NOT NULL DEFAULT now(),
   updated_at timestamptz NOT NULL DEFAULT now()
 );

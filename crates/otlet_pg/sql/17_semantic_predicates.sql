@@ -11,13 +11,22 @@ COST 1000
 AS $$
 DECLARE
   index_row record;
-  current_source_hash text;
+  current_content_hash text;
 BEGIN
   SELECT
     si.source_table,
-    si.subject_column
+    si.subject_column,
+    otlet.task_contract_hash(
+      t.instruction,
+      t.output_schema,
+      t.model_name,
+      t.runtime_options,
+      t.input_shaping,
+      t.decision_contract
+    ) AS contract_hash
   INTO index_row
   FROM otlet.semantic_indexes si
+  JOIN otlet.tasks t ON t.name = si.task_name
   WHERE si.name = semantic_matches.index_name;
 
   IF NOT FOUND THEN
@@ -26,7 +35,7 @@ BEGIN
 
   EXECUTE format(
     $sql$
-      SELECT md5(jsonb_build_object(
+      SELECT otlet.semantic_content_hash(jsonb_build_object(
         '_otlet_mvcc', jsonb_build_object(
           'table', %L,
           'subject_id', (src.%I)::text,
@@ -35,7 +44,7 @@ BEGIN
         ),
         'table', %L,
         'row', to_jsonb(src)
-      )::text)
+      ))
       FROM %s AS src
       WHERE (src.%I)::text = $1
       LIMIT 1
@@ -46,10 +55,10 @@ BEGIN
     index_row.source_table,
     index_row.subject_column
   )
-  INTO current_source_hash
+  INTO current_content_hash
   USING semantic_matches.subject_id;
 
-  IF current_source_hash IS NULL THEN
+  IF current_content_hash IS NULL THEN
     RETURN false;
   END IF;
 
@@ -59,6 +68,8 @@ BEGIN
       SELECT DISTINCT ON (sm.subject_id)
         sm.subject_id,
         sm.body,
+        sm.content_hash,
+        sm.contract_hash,
         sm.updated_at,
         sm.id
       FROM otlet.semantic_materializations sm
@@ -67,8 +78,8 @@ BEGIN
        AND si.record_type = sm.record_type
       WHERE si.name = semantic_matches.index_name
         AND sm.subject_id = semantic_matches.subject_id
-        AND sm.stale = false
-        AND sm.source_hash = current_source_hash
+        AND sm.content_hash = current_content_hash
+        AND sm.contract_hash = index_row.contract_hash
       ORDER BY sm.subject_id, sm.updated_at DESC, sm.id DESC
     ) latest
     WHERE latest.body @> semantic_matches.expected

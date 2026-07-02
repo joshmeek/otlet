@@ -1005,7 +1005,13 @@ require_contains "$fdw_plan" "Selected Path: semantic_join_lookup" "Expected FDW
 require_contains "$fdw_plan" "Queue Subjects: 0" "Expected FDW queue subject count"
 require_contains "$fdw_plan" "Path Cost:" "Expected FDW path cost"
 
-log "Checking stale entity-resolution state"
+log "Checking benign entity-resolution source update"
+join_receipts_before_update="$(psql_value "
+SELECT count(*)::text
+FROM otlet.inference_receipts ar
+JOIN otlet.jobs j ON j.id = ar.job_id
+WHERE j.task_name = '$join_task';
+")"
 psql_exec >/dev/null <<'SQL'
 SELECT otlet.watch_semantic_stale('public.otlet_demo_vendor_entity'::regclass, 'id');
 UPDATE public.otlet_demo_vendor_entity
@@ -1018,12 +1024,52 @@ SELECT stale_subjects::text || '|' || fresh_subjects::text
 FROM otlet.semantic_join_index_plan('$join_index_name');
 SELECT count(*)::text
 FROM otlet.semantic_join_index_current_rows('$join_index_name', true);
+SELECT count(*)::text
+FROM otlet.inference_receipts ar
+JOIN otlet.jobs j ON j.id = ar.job_id
+WHERE j.task_name = '$join_task';
 ")"
 join_stale_subjects="$(head -n 1 <<<"$join_stale_contract")"
-join_fresh_after_lookup="$(tail -n 1 <<<"$join_stale_contract")"
-echo "semantic_join_stale_contract=$join_stale_subjects|fresh_after_lookup=$join_fresh_after_lookup"
-[ "$join_stale_subjects|$join_fresh_after_lookup" = "4|0|0" ] || {
-  echo "Expected semantic join stale contract 4|0|0, got $join_stale_subjects|$join_fresh_after_lookup" >&2
+join_fresh_after_lookup="$(sed -n '2p' <<<"$join_stale_contract")"
+join_receipts_after_update="$(tail -n 1 <<<"$join_stale_contract")"
+echo "semantic_join_stale_contract=$join_stale_subjects|fresh_after_lookup=$join_fresh_after_lookup|receipts=$join_receipts_before_update|$join_receipts_after_update"
+if [ "$join_stale_subjects|$join_fresh_after_lookup" != "0|4|4" ] || [ "$join_receipts_before_update" != "$join_receipts_after_update" ]; then
+  echo "Expected semantic join benign-update contract 0|4|4 with unchanged receipts, got $join_stale_subjects|$join_fresh_after_lookup|$join_receipts_before_update|$join_receipts_after_update" >&2
+  exit 1
+fi
+
+log "Checking contract-change freshness invalidation"
+psql_exec >/dev/null <<SQL
+WITH current_task AS (
+  SELECT *
+  FROM otlet.tasks
+  WHERE name = '$join_task'
+)
+SELECT (otlet.create_task(
+    name,
+    input_query,
+    instruction || ' Contract drift demo.',
+    output_schema,
+    model_name,
+    runtime_options,
+    input_shaping,
+    decision_contract
+  )).name
+FROM current_task;
+SQL
+contract_change_contract="$(psql_value "
+SELECT count(*) FILTER (WHERE sm.stale_reason = 'contract_changed')::text || '|' ||
+       count(*) FILTER (WHERE sm.stale)::text
+FROM otlet.semantic_materializations sm
+WHERE sm.task_name = '$join_task';
+SELECT count(*)::text
+FROM otlet.semantic_join_index_current_rows('$join_index_name', true);
+")"
+contract_change_counts="$(head -n 1 <<<"$contract_change_contract")"
+contract_change_fresh="$(tail -n 1 <<<"$contract_change_contract")"
+echo "contract_change_contract=$contract_change_counts|fresh_after_contract_change=$contract_change_fresh"
+[ "$contract_change_counts|$contract_change_fresh" = "4|4|0" ] || {
+  echo "Expected contract-change freshness invalidation 4|4|0, got $contract_change_counts|$contract_change_fresh" >&2
   exit 1
 }
 

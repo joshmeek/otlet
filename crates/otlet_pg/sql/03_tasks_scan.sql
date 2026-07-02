@@ -73,6 +73,21 @@ BEGIN
     )
   RETURNING * INTO saved_task;
 
+  UPDATE otlet.semantic_materializations sm
+  SET stale = true,
+      stale_reason = 'contract_changed',
+      updated_at = now()
+  WHERE sm.task_name = saved_task.name
+    AND sm.contract_hash IS NOT NULL
+    AND sm.contract_hash IS DISTINCT FROM otlet.task_contract_hash(
+      saved_task.instruction,
+      saved_task.output_schema,
+      saved_task.model_name,
+      saved_task.runtime_options,
+      saved_task.input_shaping,
+      saved_task.decision_contract
+    );
+
   RETURN saved_task;
 END;
 $$;

@@ -26,7 +26,11 @@ BEGIN
   END IF;
 
   subject_id := row_input ->> TG_ARGV[0];
-  PERFORM otlet.mark_semantic_stale(format('%I.%I', TG_TABLE_SCHEMA, TG_TABLE_NAME), subject_id);
+  PERFORM otlet.mark_semantic_stale(
+    format('%I.%I', TG_TABLE_SCHEMA, TG_TABLE_NAME),
+    subject_id,
+    CASE WHEN TG_OP = 'DELETE' THEN 'source_delete' ELSE 'source_update' END
+  );
 
   IF TG_OP <> 'DELETE'
      AND COALESCE(watch_row.trigger_policy ->> 'on_change', 'mark_stale') = 'mark_stale_and_enqueue'

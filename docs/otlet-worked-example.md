@@ -491,6 +491,8 @@ Representative output:
 
 Semantic refresh jobs create typed `create_record` actions, `otlet.records` rows, and semantic materializations after schema validation passes
 
+Semantic materializations keep two row identities. `source_hash` is MVCC-coupled provenance for the exact row version that produced a job. `content_hash` is the model-input identity used for freshness, excluding Otlet's MVCC envelope so benign row churn can revalidate without rerunning the model
+
 ## Inspect Model Selection Attempts
 
 ```sql

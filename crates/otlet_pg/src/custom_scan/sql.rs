@@ -40,7 +40,17 @@ fn source_rows_sql(source_table: &str, subject_column: &str) -> String {
                   ), \
                   'table', {source_table_literal}, \
                   'row', to_jsonb(src) \
-                )::text) AS source_hash \
+                )::text) AS source_hash, \
+                otlet.semantic_content_hash(jsonb_build_object( \
+                  '_otlet_mvcc', jsonb_build_object( \
+                    'table', {source_table_literal}, \
+                    'subject_id', (src.{subject_identifier})::text, \
+                    'ctid', src.ctid::text, \
+                    'xmin', src.xmin::text \
+                  ), \
+                  'table', {source_table_literal}, \
+                  'row', to_jsonb(src) \
+                )) AS content_hash \
          FROM {source_table} AS src"
     )
 }

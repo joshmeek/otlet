@@ -30,6 +30,7 @@ DECLARE
   saved otlet.semantic_indexes%ROWTYPE;
   semantic_record_type text := COALESCE(record_type, index_name);
   semantic_task_name text := index_name || '_task';
+  current_contract_hash text := otlet.task_contract_hash(instruction, output_schema, model_name, runtime_options, input_shaping, decision_contract);
   query text;
 BEGIN
   IF semantic_task_name !~ '^[a-z0-9][a-z0-9_-]*$' THEN
@@ -78,13 +79,15 @@ BEGIN
           AND sm.source_table = %2$L
           AND sm.subject_id = otlet_semantic_input.subject_id
           AND sm.stale = false
-          AND sm.source_hash = md5(otlet_semantic_input.input::text)
+          AND sm.content_hash = otlet.semantic_content_hash(otlet_semantic_input.input)
+          AND sm.contract_hash = %5$L
       )
     $query$,
     subject_column,
     source_table,
     table_name,
-    semantic_task_name
+    semantic_task_name,
+    current_contract_hash
   );
 
   PERFORM otlet.create_task(
@@ -284,6 +287,10 @@ BEGIN
         body,
         stale,
         source_hash,
+        content_hash,
+        contract_hash,
+        stale_reason,
+        freshness_basis,
         updated_at
       )
       SELECT
@@ -296,10 +303,15 @@ BEGIN
         r.body,
         false,
         md5(j.input::text),
+        otlet.semantic_content_hash(j.input),
+        otlet.task_contract_hash(t.instruction, t.output_schema, t.model_name, t.runtime_options, t.input_shaping, t.decision_contract),
+        NULL,
+        'content_hash_match',
         now()
       FROM otlet.records r
       JOIN otlet.actions a ON a.id = r.action_id
       JOIN latest_jobs j ON j.id = a.job_id
+      JOIN otlet.tasks t ON t.name = j.task_name
       JOIN otlet.outputs o ON o.id = a.output_id
       JOIN otlet.inference_receipts ar ON ar.id = o.receipt_id
       WHERE r.record_type = %4$L
@@ -312,6 +324,10 @@ BEGIN
             body = EXCLUDED.body,
             stale = false,
             source_hash = EXCLUDED.source_hash,
+            content_hash = EXCLUDED.content_hash,
+            contract_hash = EXCLUDED.contract_hash,
+            stale_reason = NULL,
+            freshness_basis = EXCLUDED.freshness_basis,
             updated_at = now()
     $sql$,
     input_query,
@@ -386,6 +402,10 @@ BEGIN
         body,
         stale,
         source_hash,
+        content_hash,
+        contract_hash,
+        stale_reason,
+        freshness_basis,
         updated_at
       )
       SELECT
@@ -398,10 +418,15 @@ BEGIN
         r.body,
         false,
         md5(j.input::text),
+        otlet.semantic_content_hash(j.input),
+        otlet.task_contract_hash(t.instruction, t.output_schema, t.model_name, t.runtime_options, t.input_shaping, t.decision_contract),
+        NULL,
+        'content_hash_match',
         now()
       FROM otlet.records r
       JOIN otlet.actions a ON a.id = r.action_id
       JOIN latest_jobs j ON j.id = a.job_id
+      JOIN otlet.tasks t ON t.name = j.task_name
       JOIN otlet.outputs o ON o.id = a.output_id
       JOIN otlet.inference_receipts ar ON ar.id = o.receipt_id
       WHERE r.record_type = %5$L
@@ -414,6 +439,10 @@ BEGIN
             body = EXCLUDED.body,
             stale = false,
             source_hash = EXCLUDED.source_hash,
+            content_hash = EXCLUDED.content_hash,
+            contract_hash = EXCLUDED.contract_hash,
+            stale_reason = NULL,
+            freshness_basis = EXCLUDED.freshness_basis,
             updated_at = now()
     $sql$,
     input_query,
@@ -443,6 +472,7 @@ STABLE
 AS $$
 DECLARE
   index_row otlet.semantic_indexes%ROWTYPE;
+  current_contract_hash text;
 BEGIN
   SELECT *
   INTO index_row
@@ -452,6 +482,18 @@ BEGIN
   IF NOT FOUND THEN
     RAISE EXCEPTION 'otlet semantic index % does not exist', semantic_index_current_rows.index_name;
   END IF;
+
+  SELECT otlet.task_contract_hash(
+    t.instruction,
+    t.output_schema,
+    t.model_name,
+    t.runtime_options,
+    t.input_shaping,
+    t.decision_contract
+  )
+  INTO current_contract_hash
+  FROM otlet.tasks t
+  WHERE t.name = index_row.task_name;
 
   RETURN QUERY EXECUTE format(
     $sql$
@@ -476,24 +518,39 @@ BEGIN
           sm.body,
           sm.stale,
           sm.source_hash,
+          sm.content_hash,
+          sm.contract_hash,
           sm.updated_at,
           sm.id
-        FROM otlet.semantic_materializations sm
+        FROM current_inputs ci
+        JOIN otlet.semantic_materializations sm
+          ON sm.subject_id = ci.subject_id
         WHERE sm.task_name = %4$L
           AND sm.record_type = %5$L
-        ORDER BY sm.subject_id, sm.updated_at DESC, sm.id DESC
+        ORDER BY
+          sm.subject_id,
+          (
+            sm.content_hash IS NOT DISTINCT FROM otlet.semantic_content_hash(ci.input)
+            AND sm.contract_hash IS NOT DISTINCT FROM %6$L
+          ) DESC,
+          sm.updated_at DESC,
+          sm.id DESC
       )
       SELECT
         latest.subject_id,
         latest.body,
-        latest.stale OR latest.source_hash IS DISTINCT FROM md5(ci.input::text) AS stale,
+        latest.content_hash IS DISTINCT FROM otlet.semantic_content_hash(ci.input)
+          OR latest.contract_hash IS DISTINCT FROM %6$L AS stale,
         latest.source_hash,
         latest.updated_at
       FROM current_inputs ci
       JOIN latest ON latest.subject_id = ci.subject_id
       WHERE (
-        NOT %6$s
-        OR (latest.stale = false AND latest.source_hash = md5(ci.input::text))
+        NOT %7$s
+        OR (
+          latest.content_hash IS NOT DISTINCT FROM otlet.semantic_content_hash(ci.input)
+          AND latest.contract_hash IS NOT DISTINCT FROM %6$L
+        )
       )
       ORDER BY latest.subject_id, latest.updated_at DESC
     $sql$,
@@ -502,6 +559,7 @@ BEGIN
     index_row.source_table,
     index_row.task_name,
     index_row.record_type,
+    current_contract_hash,
     CASE WHEN COALESCE(semantic_index_current_rows.fresh_only, true) THEN 'true' ELSE 'false' END
   );
 END;

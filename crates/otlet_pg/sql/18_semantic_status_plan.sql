@@ -40,6 +40,7 @@ DECLARE
   v_fresh_subjects bigint := 0;
   v_stale_subjects bigint := 0;
   v_missing_subjects bigint := 0;
+  current_contract_hash text;
 BEGIN
   SELECT *
   INTO index_row
@@ -49,6 +50,18 @@ BEGIN
   IF NOT FOUND THEN
     RAISE EXCEPTION 'otlet semantic index % does not exist', semantic_index_plan.index_name;
   END IF;
+
+  SELECT otlet.task_contract_hash(
+    t.instruction,
+    t.output_schema,
+    t.model_name,
+    t.runtime_options,
+    t.input_shaping,
+    t.decision_contract
+  )
+  INTO current_contract_hash
+  FROM otlet.tasks t
+  WHERE t.name = index_row.task_name;
 
   EXECUTE format(
     $sql$
@@ -72,12 +85,23 @@ BEGIN
           sm.subject_id,
           sm.stale,
           sm.source_hash,
+          sm.content_hash,
+          sm.contract_hash,
           sm.updated_at,
           sm.id
-        FROM otlet.semantic_materializations sm
+        FROM current_inputs ci
+        JOIN otlet.semantic_materializations sm
+          ON sm.subject_id = ci.subject_id
         WHERE sm.task_name = %4$L
           AND sm.record_type = %5$L
-        ORDER BY sm.subject_id, sm.updated_at DESC, sm.id DESC
+        ORDER BY
+          sm.subject_id,
+          (
+            sm.content_hash IS NOT DISTINCT FROM otlet.semantic_content_hash(ci.input)
+            AND sm.contract_hash IS NOT DISTINCT FROM %6$L
+          ) DESC,
+          sm.updated_at DESC,
+          sm.id DESC
       ),
       classified AS (
         SELECT
@@ -85,14 +109,14 @@ BEGIN
           l.subject_id IS NOT NULL AS has_materialization,
           (
             l.subject_id IS NOT NULL
-            AND l.stale = false
-            AND l.source_hash = md5(ci.input::text)
+            AND l.content_hash IS NOT DISTINCT FROM otlet.semantic_content_hash(ci.input)
+            AND l.contract_hash IS NOT DISTINCT FROM %6$L
           ) AS is_fresh,
           (
             l.subject_id IS NOT NULL
             AND NOT (
-              l.stale = false
-              AND l.source_hash = md5(ci.input::text)
+              l.content_hash IS NOT DISTINCT FROM otlet.semantic_content_hash(ci.input)
+              AND l.contract_hash IS NOT DISTINCT FROM %6$L
             )
           ) AS is_stale
         FROM current_inputs ci
@@ -109,7 +133,8 @@ BEGIN
     index_row.source_table,
     index_row.source_table,
     index_row.task_name,
-    index_row.record_type
+    index_row.record_type,
+    current_contract_hash
   )
   INTO v_total_subjects, v_fresh_subjects, v_stale_subjects, v_missing_subjects;
 

@@ -16,6 +16,10 @@ BEGIN
     body,
     stale,
     source_hash,
+    content_hash,
+    contract_hash,
+    stale_reason,
+    freshness_basis,
     updated_at
   )
   SELECT
@@ -28,6 +32,10 @@ BEGIN
     r.body,
     false,
     md5(j.input::text),
+    otlet.semantic_content_hash(j.input),
+    otlet.task_contract_hash(t.instruction, t.output_schema, t.model_name, t.runtime_options, t.input_shaping, t.decision_contract),
+    NULL,
+    'content_hash_match',
     now()
   FROM otlet.records r
   JOIN otlet.actions a ON a.id = r.action_id
@@ -44,6 +52,10 @@ BEGIN
         body = EXCLUDED.body,
         stale = false,
         source_hash = EXCLUDED.source_hash,
+        content_hash = EXCLUDED.content_hash,
+        contract_hash = EXCLUDED.contract_hash,
+        stale_reason = NULL,
+        freshness_basis = EXCLUDED.freshness_basis,
         updated_at = now();
 
   GET DIAGNOSTICS refreshed = ROW_COUNT;
@@ -53,7 +65,8 @@ $$;
 
 CREATE FUNCTION otlet.mark_semantic_stale(
   source_table text DEFAULT NULL,
-  subject_id text DEFAULT NULL
+  subject_id text DEFAULT NULL,
+  stale_reason text DEFAULT 'manual'
 ) RETURNS bigint
 LANGUAGE plpgsql
 AS $$
@@ -62,6 +75,7 @@ DECLARE
 BEGIN
   UPDATE otlet.semantic_materializations sm
   SET stale = true,
+      stale_reason = COALESCE(mark_semantic_stale.stale_reason, 'manual'),
       updated_at = now()
   WHERE (mark_semantic_stale.source_table IS NULL OR sm.source_table = mark_semantic_stale.source_table)
     AND (
@@ -89,7 +103,11 @@ BEGIN
   END IF;
 
   subject_id := row_input ->> TG_ARGV[0];
-  PERFORM otlet.mark_semantic_stale(format('%I.%I', TG_TABLE_SCHEMA, TG_TABLE_NAME), subject_id);
+  PERFORM otlet.mark_semantic_stale(
+    format('%I.%I', TG_TABLE_SCHEMA, TG_TABLE_NAME),
+    subject_id,
+    CASE WHEN TG_OP = 'DELETE' THEN 'source_delete' ELSE 'source_update' END
+  );
 
   IF TG_OP = 'DELETE' THEN
     RETURN OLD;

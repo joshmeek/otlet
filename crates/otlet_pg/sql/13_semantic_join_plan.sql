@@ -14,6 +14,7 @@ AS $$
 DECLARE
   index_row otlet.semantic_join_indexes%ROWTYPE;
   fresh_sql text := CASE WHEN COALESCE(fresh_only, true) THEN 'true' ELSE 'false' END;
+  current_contract_hash text;
 BEGIN
   SELECT *
   INTO index_row
@@ -23,6 +24,18 @@ BEGIN
   IF NOT FOUND THEN
     RAISE EXCEPTION 'otlet semantic join index % does not exist', semantic_join_index_current_rows.index_name;
   END IF;
+
+  SELECT otlet.task_contract_hash(
+    t.instruction,
+    t.output_schema,
+    t.model_name,
+    t.runtime_options,
+    t.input_shaping,
+    t.decision_contract
+  )
+  INTO current_contract_hash
+  FROM otlet.tasks t
+  WHERE t.name = index_row.task_name;
 
   RETURN QUERY EXECUTE format(
     $sql$
@@ -41,6 +54,8 @@ BEGIN
           sm.body,
           sm.stale,
           sm.source_hash,
+          sm.content_hash,
+          sm.contract_hash,
           sm.updated_at,
           sm.id
         FROM current_inputs ci
@@ -50,21 +65,28 @@ BEGIN
           AND sm.record_type = %4$L
         ORDER BY
           sm.subject_id,
-          (sm.stale = false AND sm.source_hash = md5(ci.input::text)) DESC,
+          (
+            sm.content_hash IS NOT DISTINCT FROM otlet.semantic_content_hash(ci.input)
+            AND sm.contract_hash IS NOT DISTINCT FROM %5$L
+          ) DESC,
           sm.updated_at DESC,
           sm.id DESC
       )
       SELECT
         latest.subject_id,
         latest.body,
-        latest.stale OR latest.source_hash IS DISTINCT FROM md5(ci.input::text) AS stale,
+        latest.content_hash IS DISTINCT FROM otlet.semantic_content_hash(ci.input)
+          OR latest.contract_hash IS DISTINCT FROM %5$L AS stale,
         latest.source_hash,
         latest.updated_at
       FROM current_inputs ci
       JOIN latest ON latest.subject_id = ci.subject_id
       WHERE (
-        NOT %5$s
-        OR (latest.stale = false AND latest.source_hash = md5(ci.input::text))
+        NOT %6$s
+        OR (
+          latest.content_hash IS NOT DISTINCT FROM otlet.semantic_content_hash(ci.input)
+          AND latest.contract_hash IS NOT DISTINCT FROM %5$L
+        )
       )
       ORDER BY latest.subject_id
     $sql$,
@@ -72,6 +94,7 @@ BEGIN
     index_row.max_candidate_rows,
     index_row.task_name,
     index_row.record_type,
+    current_contract_hash,
     fresh_sql
   );
 END;
@@ -362,6 +385,7 @@ DECLARE
   v_fresh_subjects bigint := 0;
   v_stale_subjects bigint := 0;
   v_missing_subjects bigint := 0;
+  current_contract_hash text;
 BEGIN
   SELECT *
   INTO index_row
@@ -371,6 +395,18 @@ BEGIN
   IF NOT FOUND THEN
     RAISE EXCEPTION 'otlet semantic join index % does not exist', semantic_join_index_plan.index_name;
   END IF;
+
+  SELECT otlet.task_contract_hash(
+    t.instruction,
+    t.output_schema,
+    t.model_name,
+    t.runtime_options,
+    t.input_shaping,
+    t.decision_contract
+  )
+  INTO current_contract_hash
+  FROM otlet.tasks t
+  WHERE t.name = index_row.task_name;
 
   EXECUTE format(
     $sql$
@@ -388,6 +424,8 @@ BEGIN
           sm.subject_id,
           sm.stale,
           sm.source_hash,
+          sm.content_hash,
+          sm.contract_hash,
           sm.updated_at,
           sm.id
         FROM current_inputs ci
@@ -397,7 +435,10 @@ BEGIN
           AND sm.record_type = %4$L
         ORDER BY
           sm.subject_id,
-          (sm.stale = false AND sm.source_hash = md5(ci.input::text)) DESC,
+          (
+            sm.content_hash IS NOT DISTINCT FROM otlet.semantic_content_hash(ci.input)
+            AND sm.contract_hash IS NOT DISTINCT FROM %5$L
+          ) DESC,
           sm.updated_at DESC,
           sm.id DESC
       ),
@@ -405,22 +446,23 @@ BEGIN
         SELECT
           ci.subject_id,
           l.subject_id IS NOT NULL AS has_materialization,
-          COALESCE(l.stale, true) AS stale,
-          l.source_hash = md5(ci.input::text) AS source_fresh
+          l.content_hash IS NOT DISTINCT FROM otlet.semantic_content_hash(ci.input)
+            AND l.contract_hash IS NOT DISTINCT FROM %5$L AS source_fresh
         FROM current_inputs ci
         LEFT JOIN latest l USING (subject_id)
       )
       SELECT
         count(*)::bigint,
-        count(*) FILTER (WHERE has_materialization AND stale = false AND source_fresh)::bigint,
-        count(*) FILTER (WHERE has_materialization AND NOT (stale = false AND source_fresh))::bigint,
+        count(*) FILTER (WHERE has_materialization AND source_fresh)::bigint,
+        count(*) FILTER (WHERE has_materialization AND NOT source_fresh)::bigint,
         count(*) FILTER (WHERE NOT has_materialization)::bigint
       FROM classified
     $sql$,
     index_row.candidate_query,
     index_row.max_candidate_rows,
     index_row.task_name,
-    index_row.record_type
+    index_row.record_type,
+    current_contract_hash
   )
   INTO v_total_subjects, v_fresh_subjects, v_stale_subjects, v_missing_subjects;
 

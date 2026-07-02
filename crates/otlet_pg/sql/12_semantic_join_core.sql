@@ -17,6 +17,7 @@ DECLARE
   semantic_record_type text := COALESCE(record_type, index_name);
   semantic_task_name text := index_name || '_task';
   bounded_rows integer := GREATEST(1, LEAST(COALESCE(max_candidate_rows, 1000), 100000));
+  current_contract_hash text := otlet.task_contract_hash(instruction, output_schema, model_name, runtime_options, input_shaping, decision_contract);
   wrapped_query text;
 BEGIN
   IF index_name !~ '^[a-z0-9][a-z0-9_-]*$' THEN
@@ -48,13 +49,15 @@ BEGIN
           AND sm.record_type = %4$L
           AND sm.subject_id = otlet_join_input.subject_id
           AND sm.stale = false
-          AND sm.source_hash = md5(otlet_join_input.input::text)
+          AND sm.content_hash = otlet.semantic_content_hash(otlet_join_input.input)
+          AND sm.contract_hash = %5$L
       )
     $query$,
     candidate_query,
     bounded_rows,
     semantic_task_name,
-    semantic_record_type
+    semantic_record_type,
+    current_contract_hash
   );
 
   PERFORM otlet.create_task(
@@ -217,6 +220,10 @@ BEGIN
         body,
         stale,
         source_hash,
+        content_hash,
+        contract_hash,
+        stale_reason,
+        freshness_basis,
         updated_at
       )
       SELECT
@@ -229,10 +236,15 @@ BEGIN
         r.body,
         false,
         md5(j.input::text),
+        otlet.semantic_content_hash(j.input),
+        otlet.task_contract_hash(t.instruction, t.output_schema, t.model_name, t.runtime_options, t.input_shaping, t.decision_contract),
+        NULL,
+        'content_hash_match',
         now()
       FROM otlet.records r
       JOIN otlet.actions a ON a.id = r.action_id
       JOIN latest_jobs j ON j.id = a.job_id
+      JOIN otlet.tasks t ON t.name = j.task_name
       JOIN otlet.outputs o ON o.id = a.output_id
       JOIN otlet.inference_receipts ar ON ar.id = o.receipt_id
       WHERE r.record_type = %5$L
@@ -245,6 +257,10 @@ BEGIN
             body = EXCLUDED.body,
             stale = false,
             source_hash = EXCLUDED.source_hash,
+            content_hash = EXCLUDED.content_hash,
+            contract_hash = EXCLUDED.contract_hash,
+            stale_reason = NULL,
+            freshness_basis = EXCLUDED.freshness_basis,
             updated_at = now()
     $sql$,
     index_row.candidate_query,
@@ -320,6 +336,10 @@ BEGIN
         body,
         stale,
         source_hash,
+        content_hash,
+        contract_hash,
+        stale_reason,
+        freshness_basis,
         updated_at
       )
       SELECT
@@ -332,10 +352,15 @@ BEGIN
         r.body,
         false,
         md5(j.input::text),
+        otlet.semantic_content_hash(j.input),
+        otlet.task_contract_hash(t.instruction, t.output_schema, t.model_name, t.runtime_options, t.input_shaping, t.decision_contract),
+        NULL,
+        'content_hash_match',
         now()
       FROM otlet.records r
       JOIN otlet.actions a ON a.id = r.action_id
       JOIN latest_jobs j ON j.id = a.job_id
+      JOIN otlet.tasks t ON t.name = j.task_name
       JOIN otlet.outputs o ON o.id = a.output_id
       JOIN otlet.inference_receipts ar ON ar.id = o.receipt_id
       WHERE r.record_type = %6$L
@@ -348,6 +373,10 @@ BEGIN
             body = EXCLUDED.body,
             stale = false,
             source_hash = EXCLUDED.source_hash,
+            content_hash = EXCLUDED.content_hash,
+            contract_hash = EXCLUDED.contract_hash,
+            stale_reason = NULL,
+            freshness_basis = EXCLUDED.freshness_basis,
             updated_at = now()
     $sql$,
     index_row.candidate_query,
