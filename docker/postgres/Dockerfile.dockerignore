@@ -1,7 +1,11 @@
 .git/
 .local/
 target/
+__pycache__/
+*.py[cod]
 models/
+benchmarks/runs/
+benchmarks/report/latest/
 *.gguf
 *.ggml
 *.safetensors

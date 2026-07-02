@@ -10,7 +10,8 @@ SELECT
   p.worker_claim_batch_size,
   p.job_lease_interval,
   p.worker_event_retention,
-  p.trace_detail_retention
+  p.trace_detail_retention,
+  p.eval_label_retention
 FROM otlet.production_policy p;
 
 CREATE VIEW otlet.model_queue_status AS
@@ -203,6 +204,7 @@ CREATE FUNCTION otlet.cleanup_policy_state(
   worker_events bigint,
   token_trace_rows bigint,
   token_alternative_rows bigint,
+  eval_labels bigint,
   dry_run boolean
 )
 LANGUAGE plpgsql
@@ -210,12 +212,14 @@ AS $$
 DECLARE
   worker_retention interval;
   trace_retention interval;
+  eval_retention interval;
   worker_count bigint := 0;
   token_count bigint := 0;
   alternative_count bigint := 0;
+  eval_count bigint := 0;
 BEGIN
-  SELECT worker_event_retention, trace_detail_retention
-  INTO worker_retention, trace_retention
+  SELECT worker_event_retention, trace_detail_retention, eval_label_retention
+  INTO worker_retention, trace_retention, eval_retention
   FROM otlet.production_policy;
 
   SELECT count(*)
@@ -252,6 +256,11 @@ BEGIN
   INTO token_count, alternative_count
   FROM candidates c;
 
+  SELECT count(*)
+  INTO eval_count
+  FROM otlet.eval_labels l
+  WHERE l.created_at < now() - eval_retention;
+
   IF NOT cleanup_policy_state.requested_dry_run THEN
     DELETE FROM otlet.worker_events e
     WHERE e.created_at < now() - worker_retention
@@ -282,8 +291,11 @@ BEGIN
     WHERE r.finished_at < now() - trace_retention
       AND jsonb_typeof(r.trace_summary #> '{detailed_trace,steps}') = 'array'
       AND jsonb_array_length(r.trace_summary #> '{detailed_trace,steps}') > 0;
+
+    DELETE FROM otlet.eval_labels l
+    WHERE l.created_at < now() - eval_retention;
   END IF;
 
-  RETURN QUERY SELECT worker_count, token_count, alternative_count, cleanup_policy_state.requested_dry_run;
+  RETURN QUERY SELECT worker_count, token_count, alternative_count, eval_count, cleanup_policy_state.requested_dry_run;
 END;
 $$;

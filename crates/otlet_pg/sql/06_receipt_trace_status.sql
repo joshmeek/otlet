@@ -130,6 +130,64 @@ JOIN otlet.jobs j ON j.id = a.job_id
 LEFT JOIN otlet.outputs o ON o.id = a.output_id
 LEFT JOIN otlet.inference_receipts r ON r.id = a.receipt_id;
 
+CREATE VIEW otlet.eval_label_status AS
+SELECT
+  l.id AS label_id,
+  l.action_id,
+  l.output_id,
+  l.receipt_id,
+  l.source_table,
+  l.subject_id,
+  l.source_hash,
+  l.expected_match,
+  l.expected_confidence,
+  l.expected_action_type,
+  l.label_source,
+  l.reason,
+  a.action_type AS observed_action_type,
+  a.status AS action_status,
+  a.approval_status,
+  o.output ->> 'match' AS observed_match,
+  o.output ->> 'confidence' AS observed_confidence,
+  r.model_name,
+  r.selection_role,
+  r.selection_status,
+  l.created_at
+FROM otlet.eval_labels l
+LEFT JOIN otlet.actions a ON a.id = l.action_id
+LEFT JOIN otlet.outputs o ON o.id = l.output_id
+LEFT JOIN otlet.inference_receipts r ON r.id = l.receipt_id;
+
+CREATE VIEW otlet.output_reliability_status AS
+SELECT
+  count(*)::bigint AS receipt_count,
+  count(*) FILTER (WHERE status = 'complete' AND schema_validation_status = 'passed')::bigint AS schema_passed_receipts,
+  count(*) FILTER (WHERE schema_validation_status = 'failed')::bigint AS schema_failed_receipts,
+  count(*) FILTER (WHERE error LIKE 'invalid model JSON:%')::bigint AS json_parse_failed_receipts,
+  count(*) FILTER (WHERE selection_role = 'cheap' AND selection_status = 'rejected')::bigint AS cheap_rejected_receipts,
+  count(*) FILTER (WHERE selection_role = 'strong' AND selection_status = 'accepted')::bigint AS strong_accepted_receipts,
+  count(*) FILTER (WHERE trace_summary ->> 'decode_constraint' IS NOT NULL)::bigint AS decode_constraint_receipts,
+  count(DISTINCT job_id) FILTER (WHERE selection_role = 'strong')::bigint AS escalated_jobs,
+  (
+    SELECT count(*)::bigint
+    FROM otlet.actions a
+    WHERE a.status = 'rejected'
+  ) AS rejected_actions,
+  (
+    SELECT count(*)::bigint
+    FROM otlet.actions a
+    WHERE a.error = 'unsupported action type'
+  ) AS unknown_action_rejections,
+  (
+    SELECT count(*)::bigint
+    FROM otlet.outputs o
+  ) AS trusted_outputs,
+  (
+    SELECT count(*)::bigint
+    FROM otlet.eval_labels l
+  ) AS eval_labels
+FROM otlet.inference_receipts;
+
 CREATE VIEW otlet.inference_receipt_trace_status AS
 SELECT
   r.id AS receipt_id,
@@ -191,6 +249,9 @@ SELECT
   r.trace_summary ->> 'stale_policy' AS stale_policy,
   r.trace_summary ->> 'stop_reason' AS stop_reason,
   r.trace_summary ->> 'schema_force' AS schema_force,
+  r.trace_summary ->> 'decode_constraint' AS decode_constraint,
+  COALESCE(r.trace_summary ->> 'grammar_supported', 'false')::boolean AS grammar_supported,
+  r.trace_summary ->> 'decode_constraint_reason' AS decode_constraint_reason,
   r.trace_summary ->> 'output_schema_hash' AS trace_output_schema_hash,
   r.output_schema_hash AS receipt_output_schema_hash,
   r.trace_summary ->> 'raw_output_hash' AS trace_raw_output_hash,

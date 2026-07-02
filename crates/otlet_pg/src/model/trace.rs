@@ -8,7 +8,7 @@ fn generation_trace_summary(
     } else {
         None
     };
-    json!({
+    let mut summary = json!({
         "trace_version": "otlet_generation_trace_v1",
         "prompt_hash": context.prompt_hash,
         "input_hash": context.input_hash,
@@ -49,7 +49,22 @@ fn generation_trace_summary(
         "prompt_decode_cancellation_boundary": LINKED_PROMPT_DECODE_CANCELLATION_BOUNDARY,
         "probability_summary": metrics.probability_summary,
         "detailed_trace": metrics.detailed_trace
-    })
+    });
+    if let Value::Object(object) = &mut summary {
+        object.insert(
+            "decode_constraint".to_owned(),
+            Value::String(context.decode_constraint.clone()),
+        );
+        object.insert(
+            "grammar_supported".to_owned(),
+            Value::Bool(context.grammar_supported),
+        );
+        object.insert(
+            "decode_constraint_reason".to_owned(),
+            Value::String(context.decode_constraint_reason.clone()),
+        );
+    }
+    summary
 }
 
 #[derive(Default)]

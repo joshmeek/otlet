@@ -96,6 +96,15 @@ pub extern "C-unwind" fn otlet_worker_main(_arg: pgrx::pg_sys::Datum) {
 }
 
 fn process_infer_now_request(request: crate::infer_now::InferNowRequest) {
+    if let Err(err) = ensure_inline_task(&request) {
+        crate::infer_now::finish_request(
+            request.id,
+            0,
+            Some(&format!("infer-now inline task setup failed: {err}")),
+        );
+        return;
+    }
+
     let job = match BackgroundWorker::transaction(|| {
         insert_infer_now_job(&request.task_name, &request.subject_id, &request.input)
     }) {
@@ -138,6 +147,46 @@ fn process_infer_now_request(request: crate::infer_now::InferNowRequest) {
     }
 
     crate::infer_now::finish_request(request.id, job_id, None);
+}
+
+fn ensure_inline_task(request: &crate::infer_now::InferNowRequest) -> pgrx::spi::Result<()> {
+    let Some(inline_task) = request.inline_task.as_ref() else {
+        return Ok(());
+    };
+    let model_name = inline_task
+        .get("model_name")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    let instruction = inline_task
+        .get("instruction")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    let output_schema = inline_task
+        .get("output_schema")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({"type":"object"}));
+    let runtime_options = inline_task
+        .get("runtime_options")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
+
+    BackgroundWorker::transaction(|| {
+        pgrx::Spi::connect_mut(|client| {
+            let args = [
+                request.task_name.as_str().into(),
+                instruction.into(),
+                JsonB(output_schema).into(),
+                model_name.into(),
+                JsonB(runtime_options).into(),
+            ];
+            client.update(
+                "SELECT otlet.create_task($1, NULL::text, $2, $3, $4, $5)",
+                Some(5),
+                &args,
+            )?;
+            Ok(())
+        })
+    })
 }
 
 fn infer_now_job_error(job_id: i64) -> String {

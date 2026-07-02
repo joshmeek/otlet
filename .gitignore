@@ -50,6 +50,10 @@ models/*
 *.sqlite3
 *.db
 
+# Generated benchmark artifacts
+benchmarks/runs/
+benchmarks/report/
+
 # Logs, coverage, and temp files
 *.log
 logs/
@@ -57,6 +61,8 @@ coverage/
 htmlcov/
 lcov.info
 .coverage
+__pycache__/
+*.py[cod]
 tmp/
 temp/
 .tmp/

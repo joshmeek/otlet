@@ -12,6 +12,7 @@ CREATE TABLE otlet.production_policy (
   job_lease_interval interval NOT NULL DEFAULT interval '5 minutes',
   worker_event_retention interval NOT NULL DEFAULT interval '7 days',
   trace_detail_retention interval NOT NULL DEFAULT interval '7 days',
+  eval_label_retention interval NOT NULL DEFAULT interval '90 days',
   CHECK (name = 'default'),
   CHECK (stale_policy IN (
     'lookup_only_fail_closed',
@@ -24,7 +25,8 @@ CREATE TABLE otlet.production_policy (
   CHECK (semantic_auto_max_rows BETWEEN 0 AND 10),
   CHECK (worker_claim_batch_size BETWEEN 1 AND 128),
   CHECK (job_lease_interval >= interval '1 second'),
-  CHECK (job_lease_interval <= interval '1 hour')
+  CHECK (job_lease_interval <= interval '1 hour'),
+  CHECK (eval_label_retention >= interval '1 day')
 );
 
 INSERT INTO otlet.production_policy (name)
@@ -248,6 +250,31 @@ CREATE TABLE otlet.records (
   body jsonb NOT NULL,
   created_at timestamptz NOT NULL DEFAULT now()
 );
+
+CREATE TABLE otlet.eval_labels (
+  id bigserial PRIMARY KEY,
+  action_id bigint REFERENCES otlet.actions(id),
+  output_id bigint REFERENCES otlet.outputs(id),
+  receipt_id bigint REFERENCES otlet.inference_receipts(id),
+  source_table text,
+  subject_id text NOT NULL,
+  source_hash text,
+  expected_match text NOT NULL,
+  expected_confidence text NOT NULL,
+  expected_action_type text NOT NULL,
+  label_source text NOT NULL,
+  reason text,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  CHECK (expected_match IN ('same_entity', 'different_entity', 'unclear')),
+  CHECK (expected_confidence IN ('high', 'medium', 'low')),
+  CHECK (label_source IN ('approved_action', 'rejected_action', 'manual_correction'))
+);
+
+CREATE INDEX eval_labels_subject_idx
+ON otlet.eval_labels (source_table, subject_id, source_hash);
+
+CREATE INDEX eval_labels_receipt_idx
+ON otlet.eval_labels (receipt_id, action_id);
 
 CREATE TABLE otlet.semantic_materializations (
   id bigserial PRIMARY KEY,
