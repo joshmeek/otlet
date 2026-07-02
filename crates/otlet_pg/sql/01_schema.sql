@@ -69,6 +69,33 @@ CREATE TABLE otlet.decision_rule_presets (
   created_at timestamptz NOT NULL DEFAULT now()
 );
 
+CREATE FUNCTION otlet.semantic_canonical_jsonb(
+  input jsonb
+) RETURNS jsonb
+LANGUAGE sql
+IMMUTABLE
+STRICT
+AS $$
+  SELECT CASE jsonb_typeof($1)
+    WHEN 'object' THEN COALESCE(
+      (
+        SELECT jsonb_object_agg(key, otlet.semantic_canonical_jsonb(value) ORDER BY key)
+        FROM jsonb_each($1)
+      ),
+      '{}'::jsonb
+    )
+    WHEN 'array' THEN COALESCE(
+      (
+        SELECT jsonb_agg(otlet.semantic_canonical_jsonb(value) ORDER BY ordinality)
+        FROM jsonb_array_elements($1) WITH ORDINALITY AS items(value, ordinality)
+      ),
+      '[]'::jsonb
+    )
+    WHEN 'number' THEN to_jsonb(trim_scale(($1 #>> '{}')::numeric))
+    ELSE $1
+  END;
+$$;
+
 CREATE FUNCTION otlet.semantic_content_hash(
   input jsonb
 ) RETURNS text
@@ -76,7 +103,7 @@ LANGUAGE sql
 IMMUTABLE
 STRICT
 AS $$
-  SELECT md5((COALESCE($1, 'null'::jsonb) - '_otlet_mvcc' - 'otlet_mvcc')::text);
+  SELECT md5(otlet.semantic_canonical_jsonb($1 - '_otlet_mvcc' - 'otlet_mvcc')::text);
 $$;
 
 CREATE FUNCTION otlet.task_contract_hash(
