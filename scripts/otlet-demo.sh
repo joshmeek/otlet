@@ -376,6 +376,74 @@ echo "row_watch_status_contract=$row_watch_status_contract"
   exit 1
 }
 
+log "Checking visible row update freshness"
+row_receipts_before_visible_update="$(psql_value "
+SELECT count(*)::text
+FROM otlet.inference_receipts ar
+JOIN otlet.jobs j ON j.id = ar.job_id
+WHERE j.task_name = '$row_triage_task';
+")"
+psql_exec >/dev/null <<'SQL'
+UPDATE public.otlet_demo_triage_signal
+SET blockers = 0,
+    approvals = 1,
+    evidence = 'Updated review cleared the blocker and recorded manager approval'
+WHERE id = 'triage-1';
+SQL
+row_visible_stale_contract="$(psql_value "
+SELECT count(*)::text
+FROM otlet.semantic_index_current_rows('$row_triage_watch', true);
+SELECT (count(*) FILTER (WHERE stale AND stale_reason = 'source_update') >= 1)::text
+FROM otlet.semantic_materializations
+WHERE task_name = '$row_triage_task'
+  AND subject_id = 'triage-1';
+")"
+row_visible_fresh_before="$(head -n 1 <<<"$row_visible_stale_contract")"
+row_visible_source_update="$(tail -n 1 <<<"$row_visible_stale_contract")"
+echo "row_visible_update_stale_contract=$row_visible_fresh_before|$row_visible_source_update"
+[ "$row_visible_fresh_before|$row_visible_source_update" = "0|true" ] || {
+  echo "Expected visible row update to fail closed with source_update reason, got $row_visible_fresh_before|$row_visible_source_update" >&2
+  exit 1
+}
+wait_task_complete "$row_triage_task" 2 900 1
+row_visible_refresh_contract="$(psql_value "
+SELECT count(*)::text
+FROM otlet.inference_receipts ar
+JOIN otlet.jobs j ON j.id = ar.job_id
+WHERE j.task_name = '$row_triage_task';
+SELECT count(*)::text
+FROM otlet.semantic_index_current_rows('$row_triage_watch', true);
+")"
+row_receipts_after_visible_update="$(head -n 1 <<<"$row_visible_refresh_contract")"
+row_visible_fresh_after="$(tail -n 1 <<<"$row_visible_refresh_contract")"
+row_visible_receipt_delta=$((row_receipts_after_visible_update - row_receipts_before_visible_update))
+echo "row_visible_update_refresh_contract=$row_visible_receipt_delta|$row_visible_fresh_after"
+[ "$row_visible_receipt_delta|$row_visible_fresh_after" = "1|1" ] || {
+  echo "Expected visible row update to produce exactly one receipt and one fresh row, got $row_visible_receipt_delta|$row_visible_fresh_after" >&2
+  exit 1
+}
+
+log "Checking row delete freshness"
+psql_exec >/dev/null <<'SQL'
+DELETE FROM public.otlet_demo_triage_signal
+WHERE id = 'triage-1';
+SQL
+row_delete_contract="$(psql_value "
+SELECT count(*)::text
+FROM otlet.semantic_index_current_rows('$row_triage_watch', true);
+SELECT (count(*) FILTER (WHERE stale AND stale_reason = 'source_delete') >= 1)::text
+FROM otlet.semantic_materializations
+WHERE task_name = '$row_triage_task'
+  AND subject_id = 'triage-1';
+")"
+row_delete_fresh="$(head -n 1 <<<"$row_delete_contract")"
+row_delete_reason="$(tail -n 1 <<<"$row_delete_contract")"
+echo "row_delete_contract=$row_delete_fresh|$row_delete_reason"
+[ "$row_delete_fresh|$row_delete_reason" = "0|true" ] || {
+  echo "Expected row delete to fail closed with source_delete reason, got $row_delete_fresh|$row_delete_reason" >&2
+  exit 1
+}
+
 queue_suppression_output="$(psql_value "
 BEGIN;
 UPDATE otlet.production_policy
