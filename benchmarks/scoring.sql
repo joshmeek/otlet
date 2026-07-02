@@ -25,10 +25,7 @@ WITH scored AS (
     substring(COALESCE(r.raw_output, '') from '"confidence"[[:space:]]*:[[:space:]]*"(low|medium|high)"') AS raw_confidence,
     g.expected_action_type,
     a.action_type AS actual_action_type,
-    COALESCE(
-      substring(COALESCE(r.raw_output, '') from '"type"[[:space:]]*:[[:space:]]*"(merge_candidate|new_entity|review_flag)"'),
-      substring(COALESCE(r.raw_output, '') from '"action_type"[[:space:]]*:[[:space:]]*"(merge_candidate|new_entity|review_flag)"')
-    ) AS raw_action_type,
+    substring(COALESCE(r.raw_output, '') from '"type"[[:space:]]*:[[:space:]]*"(merge_candidate|new_entity|review_flag)"') AS raw_action_type,
     (
       r.status = 'complete'
       AND r.output_id IS NOT NULL
@@ -47,11 +44,13 @@ WITH scored AS (
       AND COALESCE(a.status, '') <> 'rejected'
       AND COALESCE(a.trusted_output, false)
     ) AS action_correct,
-    COALESCE(a.action_type = g.expected_action_type AND COALESCE(a.trusted_output, false), false)
-      OR COALESCE(
-        substring(COALESCE(r.raw_output, '') from '"type"[[:space:]]*:[[:space:]]*"(merge_candidate|new_entity|review_flag)"'),
-        substring(COALESCE(r.raw_output, '') from '"action_type"[[:space:]]*:[[:space:]]*"(merge_candidate|new_entity|review_flag)"')
-      ) = g.expected_action_type
+    COALESCE(
+      a.action_type = g.expected_action_type
+      AND COALESCE(a.status, '') <> 'rejected'
+      AND COALESCE(a.trusted_output, false),
+      false
+    )
+      OR substring(COALESCE(r.raw_output, '') from '"type"[[:space:]]*:[[:space:]]*"(merge_candidate|new_entity|review_flag)"') = g.expected_action_type
       AS diagnostic_action_correct,
     (
       COALESCE(r.output ->> 'match', '') = 'same_entity'
@@ -82,8 +81,10 @@ WITH scored AS (
     FROM otlet.action_status ast
     WHERE ast.job_id = r.job_id
       AND ast.trusted_output
+      AND ast.status <> 'rejected'
       AND ast.action_type IN ('merge_candidate', 'new_entity', 'review_flag')
     ORDER BY
+      (ast.status <> 'rejected') DESC,
       (ast.action_type = g.expected_action_type) DESC,
       ast.action_id
     LIMIT 1
@@ -285,6 +286,30 @@ final_metrics AS (
   FROM quality q
   CROSS JOIN receipt_metrics rm
   CROSS JOIN runtime_metrics rt
+),
+fit_metrics AS (
+  SELECT
+    final_metrics.*,
+    CASE WHEN artifact_gb > 0 THEN LEAST(1.0, 2.0 / artifact_gb) ELSE 0.0 END AS artifact_fit,
+    CASE WHEN resident_gb > 0 THEN LEAST(1.0, 2.5 / resident_gb) ELSE 0.0 END AS resident_fit,
+    CASE WHEN p95_generate_ms > 0 THEN LEAST(1.0, 20000.0 / p95_generate_ms) ELSE 0.0 END AS latency_fit,
+    CASE
+      WHEN NULLIF(:'active_params_b', '')::numeric > 0
+        THEN LEAST(1.0, 3.0 / NULLIF(:'active_params_b', '')::numeric)
+      ELSE 0.0
+    END AS active_param_fit,
+    quality_score AS trusted_quality,
+    (
+      0.40 * CASE WHEN artifact_gb > 0 THEN LEAST(1.0, 2.0 / artifact_gb) ELSE 0.0 END
+      + 0.30 * CASE WHEN resident_gb > 0 THEN LEAST(1.0, 2.5 / resident_gb) ELSE 0.0 END
+      + 0.20 * CASE WHEN p95_generate_ms > 0 THEN LEAST(1.0, 20000.0 / p95_generate_ms) ELSE 0.0 END
+      + 0.10 * CASE
+        WHEN NULLIF(:'active_params_b', '')::numeric > 0
+          THEN LEAST(1.0, 3.0 / NULLIF(:'active_params_b', '')::numeric)
+        ELSE 0.0
+      END
+    )::numeric AS resource_fit
+  FROM final_metrics
 )
 INSERT INTO otlet_bench_source.model_summary (
   run_id,
@@ -332,6 +357,10 @@ INSERT INTO otlet_bench_source.model_summary (
   diagnostic_confidence_accuracy,
   diagnostic_quality_score,
   quality_score,
+  trusted_quality,
+  resource_fit,
+  overall_fit,
+  diagnostic_fit,
   verdict,
   cleanup_policy
 )
@@ -387,25 +416,54 @@ SELECT
   diagnostic_confidence_accuracy,
   diagnostic_quality_score,
   quality_score,
+  trusted_quality,
+  resource_fit,
+  trusted_quality * (0.75 + 0.25 * resource_fit),
+  diagnostic_quality_score * (0.75 + 0.25 * resource_fit),
   CASE
     WHEN :'run_status' <> 'complete' THEN 'not_supported'
-    WHEN (:'worker_crash_count')::bigint > 0 THEN 'too_unreliable'
-    WHEN NOT (:'source_unchanged')::boolean THEN 'too_unreliable'
-    WHEN (:'stale_leak_count')::bigint > 0 THEN 'too_unreliable'
-    WHEN schema_valid_rate < 0.95 THEN 'too_unreliable'
-    WHEN contract_score < 0.95 THEN 'too_unreliable'
-    WHEN confidence_score < 0.95 THEN 'too_unreliable'
-    WHEN abstention_false_merge_rate > 0 THEN 'too_unreliable'
-    WHEN hallucinated_trusted_action_rate > 0.01 THEN 'too_unreliable'
-    WHEN entity_accuracy < 0.80 THEN 'too_unreliable'
-    WHEN semantic_materialization_score < 0.95 THEN 'too_unreliable'
-    WHEN quality_score >= 0.90 THEN 'default_candidate'
-    WHEN entity_resolution_score >= 0.80 THEN 'hard_case_candidate'
-    WHEN row_watch_score >= 0.80 THEN 'row_watch_candidate'
-    ELSE 'partial_candidate'
+    WHEN (:'worker_crash_count')::bigint > 0 THEN 'unsafe_rejected'
+    WHEN NOT (:'source_unchanged')::boolean THEN 'unsafe_rejected'
+    WHEN (:'stale_leak_count')::bigint > 0 THEN 'unsafe_rejected'
+    WHEN schema_valid_rate >= 0.95
+      AND contract_score >= 0.95
+      AND confidence_score >= 0.95
+      AND abstention_false_merge_rate = 0
+      AND hallucinated_trusted_action_rate <= 0.01
+      AND entity_accuracy >= 0.80
+      AND semantic_materialization_score >= 0.95
+      AND quality_score >= 0.90
+      THEN 'default_candidate'
+    WHEN schema_valid_rate >= 0.95
+      AND contract_score >= 0.95
+      AND confidence_score >= 0.95
+      AND abstention_false_merge_rate = 0
+      AND hallucinated_trusted_action_rate <= 0.01
+      AND entity_accuracy >= 0.80
+      AND semantic_materialization_score >= 0.95
+      THEN 'eligible_candidate'
+    WHEN schema_valid_rate >= 0.50
+      AND confidence_score >= 0.50
+      AND abstention_false_merge_rate = 0
+      AND hallucinated_trusted_action_rate <= 0.01
+      THEN 'triage_candidate'
+    WHEN row_watch_score >= 0.70
+      AND semantic_materialization_score >= 0.50
+      THEN 'row_watch_candidate'
+    WHEN entity_resolution_score >= 0.50
+      AND schema_valid_rate >= 0.50
+      AND abstention_false_merge_rate = 0
+      THEN 'hard_case_candidate'
+    WHEN schema_valid_rate >= 0.25
+      OR semantic_materialization_score >= 0.25
+      OR row_watch_score >= 0.25
+      THEN 'partial_candidate'
+    WHEN diagnostic_quality_score >= 0.20 THEN 'diagnostic_only'
+    WHEN schema_valid_rate > 0 THEN 'contract_blocked'
+    ELSE 'unusable'
   END,
   :'cleanup_policy'
-FROM final_metrics;
+FROM fit_metrics;
 
 SELECT
   model_key,
@@ -417,7 +475,9 @@ SELECT
   round(diagnostic_confidence_accuracy, 3) AS diagnostic_confidence_accuracy,
   round(row_watch_score, 3) AS row_watch_score,
   round(diagnostic_quality_score, 3) AS diagnostic_quality_score,
-  round(quality_score, 3) AS quality_score,
+  round(trusted_quality, 3) AS trusted_quality,
+  round(resource_fit, 3) AS resource_fit,
+  round(overall_fit, 3) AS overall_fit,
   verdict
 FROM otlet_bench_source.model_summary
 WHERE run_id = :'run_id'

@@ -52,7 +52,7 @@ models/*
 
 # Generated benchmark artifacts
 benchmarks/runs/
-benchmarks/report/latest/
+benchmarks/report/
 
 # Logs, coverage, and temp files
 *.log

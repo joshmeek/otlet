@@ -1,107 +1,108 @@
 # Otlet Benchmarks
 
-## Overall Score
+## Overall Fit
 
-Read this ranking first. `overall_score` is `candidate_fit`: trusted Otlet work times resource fit. A zero means the model ran but produced no trusted state
+Read this ranking first. `overall_fit` is trusted Otlet quality with a soft resource adjustment. Resource fit still matters, but it does not veto a slightly larger model that does the work well
 
-| rank | model | overall_score | trusted_gate | diagnostic_fit | resource_fit | first_blocker |
-| ---: | --- | ---: | ---: | ---: | ---: | --- |
-| 1 | qwen3_4b | 0.068 | 0.776 | 0.068 | 0.085 | confidence < 0.95 |
-| 2 | linked_qwen_1_7b | 0.028 | 0.182 | 0.055 | 0.156 | confidence < 0.95 |
-| 3 | linked_qwen_0_6b | 0.000439 | 0.001 | 0.141 | 0.614 | confidence < 0.95 |
-| 4 | gemma3_270m | 0.000 | 0.000 | 0.094 | 0.787 | confidence < 0.95 |
-| 5 | granite4_1b | 0.000 | 0.000 | 0.077 | 0.642 | confidence < 0.95 |
-| 6 | lfm25_12b_instruct | 0.000 | 0.000 | 0.150 | 0.671 | confidence < 0.95 |
-| 7 | lfm25_230m | 0.000 | 0.000 | 0.104 | 0.859 | confidence < 0.95 |
-| 8 | lfm25_350m | 0.000 | 0.000 | 0.100 | 0.836 | confidence < 0.95 |
-| 9 | minicpm4_05b | 0.000 | 0.000 | 0.091 | 0.762 | confidence < 0.95 |
+| rank | model | role | overall_fit | trusted_quality | diagnostic_fit | resource_fit | first_blocker |
+| ---: | --- | --- | ---: | ---: | ---: | ---: | --- |
+| 1 | qwen35_4b | default_candidate | 0.948 | 0.999 | 0.949 | 0.799 |  |
+| 2 | gemma4_e2b | triage_candidate | 0.745 | 0.791 | 0.866 | 0.768 | confidence < 0.95 |
+| 3 | gemma4_e4b | triage_candidate | 0.675 | 0.756 | 0.796 | 0.568 | confidence < 0.95 |
+| 4 | phi4_mini | row_watch_candidate | 0.668 | 0.700 | 0.777 | 0.822 | confidence < 0.95 |
+| 5 | ministral3_3b | row_watch_candidate | 0.597 | 0.608 | 0.821 | 0.927 | confidence < 0.95 |
+
+![Overall Otlet fit](overall.svg)
 
 ## Latest Result
 
-Run `b1782789097,b1782813851`: this is a merged current scored report. It covers 9 selected model rows through the benchmark harness. The runner writes generated report artifacts under ignored `benchmarks/report/latest`
+Run `b1782932034`: this is a current scored run. It ranks 5 current scored models through the benchmark harness
 
-Benchmark confidence: `merged_provisional`. Next proof: Run the same selected model set in one OTLET_BENCH_RUNS=3 publish run
+Benchmark confidence: `provisional_single_run`. Next proof: Rerun with OTLET_BENCH_RUNS=3
 
-`qwen3_4b` has same-run repeat proof with 3 runs; repeated models rank by their worst candidate-fit repeat. The other 8 scored models are single-run broad comparison rows
+All scored models are currently single-run rows; rerun key candidates with `OTLET_BENCH_RUNS=3` before treating stability as proven
 
-A model that completes a current-format run gets an overall score. The harness marks load failures, timeouts, manifest blocks, and missing summaries as out of running instead of assigning a fake zero
+A model that completes a current-format run gets an overall fit score and a role. The harness marks load failures, timeouts, manifest blocks, and missing summaries as out of running instead of assigning a fake zero
 
-The TSVs store `overall_score` as `candidate_fit`: trusted Otlet work multiplied by resource fit for artifact size, resident RSS, p95 latency, and active params. Fast invalid output gets an overall score of zero because it creates no trusted Otlet state. `production_score` stays zero until a model passes every production gate
+Score fields are 0.000-1.000. `trusted_quality` is the accepted-output score before resource adjustment. `resource_fit` is a soft footprint and latency score, not a veto. `overall_fit` is trusted quality times the soft resource adjustment. `diagnostic_fit` reads partial signal from rejected or invalid attempts, but it never becomes trusted Otlet state
 
-Current coverage is 112.0 direct gold cases per model run. The current fixture target is 112 deterministic pair cases per model plus row-watch and semantic checks
+A model can show `overall_fit=0.000` when it produced no trusted schema-valid output. The run still keeps failure examples, diagnostic fit, and first blockers
 
-The runner skipped semantic and row-watch phases for 8 scored models because direct schema-valid rate was below 0.50
+The public ranking keeps the newest scored row per current family/size lane. Superseded rows, unscored candidates, and models with no useful Otlet signal stay out of the README ranking
+
+Current coverage is 112 direct gold cases per model run. The current fixture target is 112 deterministic pair cases per model plus row-watch and semantic checks
+
+## Columns And Roles
+
+| name | meaning |
+| --- | --- |
+| overall_fit | trusted_quality with a soft resource adjustment; higher is better |
+| trusted_quality | schema-valid accepted output quality before resource adjustment |
+| diagnostic_fit | partial signal from rejected or invalid attempts; never trusted state |
+| resource_fit | soft score for artifact size, resident RSS, latency, and active params |
+| first_blocker | first production gate that kept a model from default readiness |
+| default_candidate | passed the current production gate in this run |
+| triage_candidate | useful trusted output, but not default-ready |
+| row_watch_candidate | useful for watch-style row judgment, but not default-ready |
+| workload_candidate | production-readiness label for a useful non-default model |
 
 ## Workload Picks
 
 | workload | model | metric | gate | caveat |
 | --- | --- | --- | --- | --- |
-| default Otlet model |  |  |  | none passed production gates |
-| hard entity resolution | qwen3_4b | 0.874 | fail | not a default model unless gate passes |
-| row watching | qwen3_4b | 0.522 | fail | not a default model unless gate passes |
-| <=2.0 GB artifact | linked_qwen_1_7b | 0.028 | fail | small-fit pick, still gate-aware |
-| correct jobs/sec/GB | qwen3_4b | 0.008 | fail | compare timing after one same-run sweep |
+| default Otlet model | qwen35_4b | 0.948 | pass | production gate passed |
+| hard entity resolution | qwen35_4b | 1.000 | pass | production gate passed |
+| row watching | ministral3_3b | 0.991 | fail | not a default model unless gate passes |
+| <=2.0 GB artifact |  |  |  | no current overall-fit row |
+| correct jobs/sec/GB | gemma4_e2b | 0.012 | fail | compare timing after one same-run sweep |
 
 ## Production Readiness
 
-The default-model gate keeps failed models out of production rank. Failed models keep diagnostic evidence, but their production score is zero
+The default-model gate keeps non-passing models out of production rank. Useful partial models keep role labels and diagnostic evidence, but their production score is zero
 
-| rank | model | readiness | production_score | candidate_fit | gate | first_blocker |
+| rank | model | readiness | production_score | overall_fit | gate | first_blocker |
 | ---: | --- | --- | ---: | ---: | --- | --- |
-| 1 | qwen3_4b | research_only | 0.000 | 0.068 | fail | confidence < 0.95 |
-| 2 | linked_qwen_1_7b | contract_blocked | 0.000 | 0.028 | fail | confidence < 0.95 |
-| 3 | linked_qwen_0_6b | contract_blocked | 0.000 | 0.000439 | fail | confidence < 0.95 |
-| 4 | lfm25_12b_instruct | contract_blocked | 0.000 | 0.000 | fail | confidence < 0.95 |
-| 5 | lfm25_230m | contract_blocked | 0.000 | 0.000 | fail | confidence < 0.95 |
-| 6 | gemma3_270m | contract_blocked | 0.000 | 0.000 | fail | confidence < 0.95 |
-| 7 | granite4_1b | contract_blocked | 0.000 | 0.000 | fail | confidence < 0.95 |
-| 8 | lfm25_350m | contract_blocked | 0.000 | 0.000 | fail | confidence < 0.95 |
-| 9 | minicpm4_05b | contract_blocked | 0.000 | 0.000 | fail | confidence < 0.95 |
+| 1 | qwen35_4b | default_ready | 0.948 | 0.948 | pass |  |
+| 2 | gemma4_e2b | workload_candidate | 0.000 | 0.745 | fail | confidence < 0.95 |
+| 3 | gemma4_e4b | workload_candidate | 0.000 | 0.675 | fail | confidence < 0.95 |
+| 4 | phi4_mini | workload_candidate | 0.000 | 0.668 | fail | confidence < 0.95 |
+| 5 | ministral3_3b | workload_candidate | 0.000 | 0.597 | fail | confidence < 0.95 |
 
 ## First Failure Modes
 
 | model | top_failure | count | passed_cases |
 | --- | --- | ---: | ---: |
-| qwen3_4b | false_merge | 63 | 260 |
-| linked_qwen_1_7b | invalid_json | 85 | 20 |
-| linked_qwen_0_6b | invalid_json | 73 | 0 |
-| lfm25_12b_instruct | schema_invalid | 57 | 0 |
-| lfm25_230m | invalid_json | 112 | 0 |
+| qwen35_4b | passed | 0 | 112 |
+| gemma4_e2b | schema_missing | 17 | 94 |
+| gemma4_e4b | schema_missing | 22 | 87 |
+| phi4_mini | wrong_match | 37 | 72 |
+| ministral3_3b | invalid_json | 37 | 62 |
 
-## Overall Score Ranking
+## Overall Fit Ranking
 
-| rank | model | runs | readiness | overall_score | trusted_gate | schema | p95_ms | rss_gb | artifact_gb |
+| rank | model | runs | readiness | overall_fit | trusted_quality | schema | p95_ms | rss_gb | artifact_gb |
 | ---: | --- | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| 1 | qwen3_4b | 3 | research_only | 0.068 | 0.776 | 0.979 | 11527 | 3.357 | 2.497 |
-| 2 | linked_qwen_1_7b | 1 | contract_blocked | 0.028 | 0.182 | 0.241 | 11998 | 2.518 | 1.834 |
-| 3 | linked_qwen_0_6b | 1 | contract_blocked | 0.000439 | 0.001 | 0.080 | 8202 | 1.298 | 0.639 |
-| 4 | gemma3_270m | 1 | contract_blocked | 0.000 | 0.000 | 0.000 | 7823 | 0.560 | 0.292 |
-| 5 | granite4_1b | 1 | contract_blocked | 0.000 | 0.000 | 0.000 | 5 | 1.206 | 0.901 |
-| 6 | lfm25_12b_instruct | 1 | contract_blocked | 0.000 | 0.000 | 0.000 | 2117 | 1.011 | 0.731 |
-| 7 | lfm25_230m | 1 | contract_blocked | 0.000 | 0.000 | 0.000 | 2593 | 0.485 | 0.247 |
-| 8 | lfm25_350m | 1 | contract_blocked | 0.000 | 0.000 | 0.000 | 33 | 0.631 | 0.379 |
-| 9 | minicpm4_05b | 1 | contract_blocked | 0.000 | 0.000 | 0.000 | 4215 | 0.718 | 0.463 |
+| 1 | qwen35_4b | 1 | default_ready | 0.948 | 0.999 | 1.000 | 9000 | 3.227 | 2.741 |
+| 2 | gemma4_e2b | 1 | workload_candidate | 0.745 | 0.791 | 0.848 | 3197 | 3.568 | 3.107 |
+| 3 | gemma4_e4b | 1 | workload_candidate | 0.675 | 0.756 | 0.777 | 10432 | 5.665 | 4.977 |
+| 4 | phi4_mini | 1 | workload_candidate | 0.668 | 0.700 | 1.000 | 9174 | 3.379 | 2.492 |
+| 5 | ministral3_3b | 1 | workload_candidate | 0.597 | 0.608 | 0.670 | 6666 | 2.946 | 2.147 |
 
 ## Out Of Running
 
-No selected models were out of running
+No ranked models were out of running
 
 ## Drilldown Charts
 
-The headline chart ranks overall score. The charts below explain whether that score is quality-limited, memory-limited, latency-limited, or parameter-limited. Treat latency and throughput as useful only after checking `trusted_gate`; instant invalid output is not useful work
+The headline chart ranks overall fit. The charts below explain whether that fit is quality-limited, memory-limited, latency-limited, or parameter-limited. Treat latency and throughput as useful only after checking `trusted_quality`; instant invalid output is not useful work
 
-Running the benchmark writes local SVG charts under ignored `benchmarks/report/latest`: overall score, resident memory versus score, active parameters versus score, p95 latency, and trusted throughput per resident GB
+![Resident memory versus overall fit](pareto.svg)
 
-## Report Files
+![Active params versus overall fit](params.svg)
 
-- Full report: `report/latest/otlet-model-benchmark.md`
-- Overall score chart: `report/latest/overall.svg`
-- Score audit TSV: `report/latest/score_audit.tsv`
-- Gate scorecard TSV: `report/latest/scorecard.tsv`
-- Model summary TSV: `report/latest/model_summary.tsv`
-- Case result TSV: `report/latest/case_results.tsv`
-- Cleanup proof: `report/latest/cleanup.tsv`
-- Planner proof: `report/latest/explain.txt`
+![Generation latency](latency.svg)
+
+![Correct jobs per resident GB](efficiency.svg)
 
 ## Benchmark Scope
 
@@ -128,38 +129,44 @@ Start from the normal Otlet proof path:
 ./scripts/otlet-demo.sh
 ```
 
-Run one model and write a local report:
+Use the default model for normal harness iteration. The default set is intentionally small and evidence-based; today it is `qwen35_4b`:
+
+```sh
+OTLET_BENCH_LIMIT_MODELS=qwen35_4b OTLET_BENCH_RUNS=1 OTLET_BENCH_PUBLISH_REPORT=1 ./benchmarks/run.sh
+```
+
+Run a single named model when debugging a candidate:
 
 ```sh
 OTLET_BENCH_LIMIT_MODELS=ministral3_3b OTLET_BENCH_RUNS=1 OTLET_BENCH_PUBLISH_REPORT=1 ./benchmarks/run.sh
 ```
 
-Run a subset and write a local report:
+Run the current scored comparison set only after a meaningful prompt/schema/scoring/runtime change:
 
 ```sh
-OTLET_BENCH_LIMIT_MODELS=ministral3_3b,glm_edge_4b,smollm3_3b OTLET_BENCH_RUNS=1 OTLET_BENCH_PUBLISH_REPORT=1 ./benchmarks/run.sh
+OTLET_BENCH_LIMIT_MODELS=qwen35_4b,gemma4_e2b,gemma4_e4b,phi4_mini,ministral3_3b OTLET_BENCH_RUNS=1 OTLET_BENCH_PUBLISH_REPORT=1 ./benchmarks/run.sh
 ```
 
-Run the small-model set around the 2 GB artifact target and refresh the report:
+Run the default-included set when the harness has materially improved and you want the shortest publishable check:
 
 ```sh
-models="$(awk -F '\t' 'NR > 1 && $6 == "core" && $10 <= 2.0 {print $1}' benchmarks/models.tsv | paste -sd, -)"
-OTLET_BENCH_LIMIT_MODELS="$models" OTLET_BENCH_RUNS=1 OTLET_BENCH_MAX_ARTIFACT_GB=2.0 OTLET_BENCH_PUBLISH_REPORT=1 ./benchmarks/run.sh
+models="$(awk -F '\t' 'NR > 1 && $9 == "true" {print $1}' benchmarks/models.tsv | paste -sd, -)"
+OTLET_BENCH_LIMIT_MODELS="$models" OTLET_BENCH_RUNS=1 OTLET_BENCH_PUBLISH_REPORT=1 ./benchmarks/run.sh
 ```
 
 The benchmark default timeout is two hours per task phase because the current fixture loads 112 row-pair cases per model and larger local models can cross one hour before semantic refresh starts
 
-Run every core model in the manifest and write a local report:
+Run manual candidates only when you have a reason to spend the time. Rows marked `candidate`, `diagnostic`, `historical`, or `heavy` are never part of the default run:
 
 ```sh
-models="$(awk -F '\t' 'NR > 1 && $6 == "core" {print $1}' benchmarks/models.tsv | paste -sd, -)"
+models="$(awk -F '\t' 'NR > 1 && ($6 == "candidate" || $6 == "diagnostic") {print $1}' benchmarks/models.tsv | paste -sd, -)"
 OTLET_BENCH_LIMIT_MODELS="$models" OTLET_BENCH_RUNS=1 OTLET_BENCH_MAX_ARTIFACT_GB=6 OTLET_BENCH_PUBLISH_REPORT=1 ./benchmarks/run.sh
 ```
 
-Run the Qwen smoke without writing a local report:
+Run a one-model Qwen smoke without writing a local report:
 
 ```sh
-OTLET_BENCH_LIMIT_MODELS=linked_qwen_0_6b,linked_qwen_1_7b OTLET_BENCH_RUNS=1 ./benchmarks/run.sh
+OTLET_BENCH_LIMIT_MODELS=qwen35_4b OTLET_BENCH_RUNS=1 ./benchmarks/run.sh
 ```
 
 Refresh model manifest metadata:
@@ -168,8 +175,6 @@ Refresh model manifest metadata:
 python3 benchmarks/refresh-metadata.py
 ```
 
-`OTLET_BENCH_PUBLISH_REPORT=1` updates local generated Markdown, SVG, TSV, cleanup, and EXPLAIN files under ignored `benchmarks/report/latest/`
+`OTLET_BENCH_PUBLISH_REPORT=1` updates this README and committed chart SVGs. Raw run and debug files stay ignored
 
 Raw runs stay under ignored `benchmarks/runs/<timestamp>-<run_id>/`. Keep a raw run while debugging; commit benchmark code and README updates, not generated run artifacts
-
-Raw run artifacts update after each completed model. `report/latest` updates only when the runner reaches normal completion with `OTLET_BENCH_PUBLISH_REPORT=1`

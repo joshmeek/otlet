@@ -2,7 +2,7 @@
 set -euo pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-repo_root="$(cd "$script_dir/../.." && pwd)"
+repo_root="$(cd "$script_dir/.." && pwd)"
 
 container="${OTLET_PG_CONTAINER:-otlet-postgres}"
 db="${OTLET_PG_DATABASE:-postgres}"
@@ -106,13 +106,27 @@ download_artifact() {
   local hf_repo="$1"
   local filename="$2"
   local model_key="$3"
+  local requires_split="${4:-false}"
   local dest_dir="$scratch_dir/$model_key"
   local dest="$dest_dir/$(basename "$filename")"
   local tmp="$dest.part"
-  local url="https://huggingface.co/$hf_repo/resolve/main/$filename"
 
   docker exec "$container" sh -lc "mkdir -p $(sh_quote "$dest_dir")"
-  docker exec "$container" sh -lc "rm -f $(sh_quote "$tmp") && curl -fL --retry 3 --connect-timeout 20 $(sh_quote "$url") -o $(sh_quote "$tmp") && mv $(sh_quote "$tmp") $(sh_quote "$dest")"
+  if [[ "$requires_split" = "true" && "$filename" =~ ^(.+)-00001-of-([0-9]+)\.gguf$ ]]; then
+    local prefix="${BASH_REMATCH[1]}"
+    local total="${BASH_REMATCH[2]}"
+    local part
+    for part in $(seq -f "%05g" 1 "$((10#$total))"); do
+      local split_file="${prefix}-${part}-of-${total}.gguf"
+      local split_dest="$dest_dir/$(basename "$split_file")"
+      local split_tmp="$split_dest.part"
+      local split_url="https://huggingface.co/$hf_repo/resolve/main/$split_file"
+      docker exec "$container" sh -lc "rm -f $(sh_quote "$split_tmp") && curl -fL --retry 3 --connect-timeout 20 $(sh_quote "$split_url") -o $(sh_quote "$split_tmp") && mv $(sh_quote "$split_tmp") $(sh_quote "$split_dest")"
+    done
+  else
+    local url="https://huggingface.co/$hf_repo/resolve/main/$filename"
+    docker exec "$container" sh -lc "rm -f $(sh_quote "$tmp") && curl -fL --retry 3 --connect-timeout 20 $(sh_quote "$url") -o $(sh_quote "$tmp") && mv $(sh_quote "$tmp") $(sh_quote "$dest")"
+  fi
   printf '%s\t%s\n' "$model_key" "$dest" >> "$downloaded_paths"
   printf '%s\n' "$dest"
 }
@@ -222,11 +236,21 @@ CREATE TABLE IF NOT EXISTS otlet_bench_source.model_summary (
   diagnostic_confidence_accuracy numeric NOT NULL DEFAULT 0,
   diagnostic_quality_score numeric NOT NULL DEFAULT 0,
   quality_score numeric NOT NULL DEFAULT 0,
+  trusted_quality numeric NOT NULL DEFAULT 0,
+  resource_fit numeric NOT NULL DEFAULT 0,
+  overall_fit numeric NOT NULL DEFAULT 0,
+  diagnostic_fit numeric NOT NULL DEFAULT 0,
   verdict text NOT NULL,
   cleanup_policy text NOT NULL,
   created_at timestamptz NOT NULL DEFAULT now(),
   PRIMARY KEY (run_id, model_key)
 );
+
+ALTER TABLE otlet_bench_source.model_summary
+  ADD COLUMN IF NOT EXISTS trusted_quality numeric NOT NULL DEFAULT 0,
+  ADD COLUMN IF NOT EXISTS resource_fit numeric NOT NULL DEFAULT 0,
+  ADD COLUMN IF NOT EXISTS overall_fit numeric NOT NULL DEFAULT 0,
+  ADD COLUMN IF NOT EXISTS diagnostic_fit numeric NOT NULL DEFAULT 0;
 SQL
 }
 
@@ -614,7 +638,7 @@ SQL
 
 export_run_artifacts() {
   psql_copy "SELECT * FROM otlet_bench_source.case_result WHERE run_id = '$run_id' ORDER BY model_key, case_id" "$case_results_tsv" || return
-  psql_copy "SELECT * FROM otlet_bench_source.model_summary WHERE run_id = '$run_id' ORDER BY correct_jobs_per_second_per_gb DESC NULLS LAST, quality_score DESC, model_key" "$model_summary_tsv" || return
+  psql_copy "SELECT * FROM otlet_bench_source.model_summary WHERE run_id = '$run_id' ORDER BY overall_fit DESC, trusted_quality DESC, model_key" "$model_summary_tsv" || return
   python3 "$script_dir/report.py" "$run_dir" >/dev/null || return
 }
 
@@ -730,8 +754,8 @@ run_one_model() {
     unsupported_reason="manifest tier is blocked"
   elif [[ "$tier" = "heavy" && "$include_heavy" != "1" ]]; then
     unsupported_reason="heavy tier skipped; set OTLET_BENCH_INCLUDE_HEAVY=1"
-  elif [[ "$requires_split" = "true" ]]; then
-    unsupported_reason="split GGUF download is not implemented in V0"
+  elif [[ "$requires_split" = "true" && ! "$filename" =~ -00001-of-[0-9]+\.gguf$ ]]; then
+    unsupported_reason="split GGUF filename must point at part 00001"
   elif [[ -z "$filename" ]]; then
     unsupported_reason="manifest has no runnable GGUF filename"
   elif [[ "$strict_license" = "1" && "$license_note" =~ (verify|other|terms) ]]; then
@@ -758,7 +782,7 @@ run_one_model() {
         fi
       elif [[ "$download_enabled" = "1" ]]; then
         local download_log="$run_dir/${run_model_key}_download.err"
-        if artifact_path="$(download_artifact "$hf_repo" "$filename" "$base_model_key" 2>"$download_log")"; then
+        if artifact_path="$(download_artifact "$hf_repo" "$filename" "$base_model_key" "$requires_split" 2>"$download_log")"; then
           external_artifact=false
           model_name="${run_id}_${base_model_key}"
           if register_model "$model_name" "$artifact_path"; then
@@ -1006,6 +1030,7 @@ write_metadata() {
   append_kv "$metadata_tsv" container "$container"
   append_kv "$metadata_tsv" container_image "$(docker inspect -f '{{.Config.Image}}' "$container" 2>/dev/null || true)"
   append_kv "$metadata_tsv" cpu_gpu_policy "linked_inproc resident worker; model device policy is exported from otlet.runtime_status"
+  append_kv "$metadata_tsv" model_set_policy "default runs use include_by_default=true rows only; candidate, diagnostic, historical, heavy, and blocked rows are explicit manual runs"
   append_kv "$metadata_tsv" reproduction_command "OTLET_BENCH_LIMIT_MODELS=${limit_models:-default} OTLET_BENCH_RUNS=$bench_runs OTLET_BENCH_MAX_ARTIFACT_GB=$max_artifact_gb OTLET_BENCH_TIMEOUT_SECONDS=$timeout_seconds ./benchmarks/run.sh"
   append_kv "$metadata_tsv" timeout_seconds "$timeout_seconds"
   append_kv "$metadata_tsv" min_direct_schema_rate "$min_direct_schema_rate"

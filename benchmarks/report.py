@@ -10,6 +10,7 @@ SMALL_ARTIFACT_GB = 2.0
 RESIDENT_TARGET_GB = 2.5
 P95_TARGET_MS = 20000.0
 ACTIVE_PARAMS_TARGET_B = 3.0
+RESOURCE_WEIGHT = 0.25
 
 
 def read_tsv(path):
@@ -39,6 +40,27 @@ def short(value, n=80):
     return value if len(value) <= n else value[: n - 1] + "..."
 
 
+def plural(count, singular, plural_form=None):
+    return singular if count == 1 else (plural_form or f"{singular}s")
+
+
+def compact_count(value):
+    value = float(value)
+    return str(int(value)) if value.is_integer() else f"{value:.1f}"
+
+
+def clean_lines(lines):
+    cleaned = []
+    previous_blank = False
+    for line in lines:
+        blank = line == ""
+        if blank and previous_blank:
+            continue
+        cleaned.append(line)
+        previous_blank = blank
+    return cleaned
+
+
 def cell(value):
     return " ".join(("" if value is None else str(value)).replace("|", "\\|").split())
 
@@ -49,14 +71,14 @@ def table(headers, rows):
         "runs",
         "repeat_count",
         "otlet_fit",
-        "overall_score",
+        "overall_fit",
         "production_score",
-        "candidate_fit",
+        "overall_fit",
         "diagnostic_fit",
         "fit_min",
         "fit_max",
         "fit_sd",
-        "trusted_gate",
+        "trusted_quality",
         "schema",
         "diag_decision",
         "trusted_decision",
@@ -78,7 +100,7 @@ def table(headers, rows):
         "latency_fit",
         "active_param_fit",
         "correct_jobs_s_gb",
-        "candidate_fit_jobs_s_gb",
+        "overall_fit_jobs_s_gb",
         "quality_per_active_b",
         "contract",
         "entity",
@@ -102,6 +124,21 @@ def table(headers, rows):
         "hallucinated_action",
         "stale_leaks",
         "source_mutated",
+        "cases_before",
+        "cases_after",
+        "overall_before",
+        "overall_after",
+        "overall_delta",
+        "schema_delta",
+        "parse_fail_delta",
+        "false_merge_delta",
+        "confidence_delta",
+        "halluc_action_delta",
+        "trusted_action_delta",
+        "semantic_delta",
+        "row_watch_delta",
+        "p95_ms_delta",
+        "rss_gb_delta",
     }
     separator = [("---:" if header in numeric else "---") for header in headers]
     out = ["| " + " | ".join(headers) + " |", "| " + " | ".join(separator) + " |"]
@@ -113,7 +150,7 @@ def table(headers, rows):
 def ranked(rows):
     return sorted(
         rows,
-        key=lambda row: (num(row.get("trusted_fit_score")), num(row.get("quality_score"))),
+        key=lambda row: (num(row.get("otlet_fit_score")), num(row.get("quality_score"))),
         reverse=True,
     )
 
@@ -129,7 +166,11 @@ def resource_component(row, key, target):
     value = num(value)
     if value <= 0:
         return 0.0
-    return max(0.0, min(1.0, 1.0 - value / target))
+    return min(1.0, target / value)
+
+
+def soft_resource_multiplier(resource_fit):
+    return (1.0 - RESOURCE_WEIGHT) + RESOURCE_WEIGHT * resource_fit
 
 
 def add_otlet_fit(row):
@@ -141,14 +182,20 @@ def add_otlet_fit(row):
     out_of_running = row.get("run_status") not in (None, "", "complete")
     missing_required_metric = row.get("confidence_score") in (None, "")
     trusted_quality = 0.0 if out_of_running or missing_required_metric else num(row.get("quality_score"))
+    diagnostic_quality = 0.0 if out_of_running else num(row.get("diagnostic_quality_score"))
+    otlet_fit = trusted_quality * soft_resource_multiplier(resource_fit)
+    diagnostic_fit = diagnostic_quality * soft_resource_multiplier(resource_fit)
     row["artifact_fit"] = artifact_fit
     row["resident_fit"] = resident_fit
     row["latency_fit"] = latency_fit
     row["active_param_fit"] = active_fit
     row["resource_fit"] = resource_fit
-    row["trusted_fit_score"] = trusted_quality * resource_fit
-    row["diagnostic_fit_score"] = num(row.get("diagnostic_quality_score")) * resource_fit
-    row["otlet_fit_score"] = row["trusted_fit_score"]
+    row["trusted_quality"] = trusted_quality
+    row["trusted_fit_score"] = otlet_fit
+    row["overall_fit"] = otlet_fit
+    row["diagnostic_fit_score"] = diagnostic_fit
+    row["diagnostic_fit"] = diagnostic_fit
+    row["otlet_fit_score"] = otlet_fit
     if out_of_running:
         row["score_status"] = "out_of_running"
     elif missing_required_metric:
@@ -196,6 +243,8 @@ def display_verdict(row):
         return "default_candidate"
     if not failures:
         return "eligible_candidate"
+    if num(row.get("worker_crash_count")) > 0 or truthy(row.get("source_table_mutated")) or num(row.get("stale_leak_count")) > 0:
+        return "unsafe_rejected"
     if (
         failures == ["hallucinated action"]
         and num(row.get("schema_valid_rate")) >= 0.95
@@ -204,12 +253,37 @@ def display_verdict(row):
     ):
         return "hard_case_candidate_needs_action_fix"
     if (
+        num(row.get("schema_valid_rate")) >= 0.50
+        and num(row.get("confidence_score")) >= 0.50
+        and num(row.get("abstention_false_merge_rate")) == 0
+        and num(row.get("hallucinated_trusted_action_rate")) <= 0.01
+    ):
+        return "triage_candidate"
+    if (
         num(row.get("schema_valid_rate")) >= 0.95
         and num(row.get("contract_score")) >= 0.95
         and num(row.get("row_watch_score")) >= 0.80
     ):
         return "row_watch_candidate_limited"
-    return "too_unreliable"
+    if num(row.get("row_watch_score")) >= 0.70 and num(row.get("semantic_materialization_score")) >= 0.50:
+        return "row_watch_candidate"
+    if (
+        num(row.get("entity_resolution_score")) >= 0.50
+        and num(row.get("schema_valid_rate")) >= 0.50
+        and num(row.get("abstention_false_merge_rate")) == 0
+    ):
+        return "hard_case_candidate"
+    if (
+        num(row.get("schema_valid_rate")) >= 0.25
+        or num(row.get("semantic_materialization_score")) >= 0.25
+        or num(row.get("row_watch_score")) >= 0.25
+    ):
+        return "partial_candidate"
+    if num(row.get("diagnostic_quality_score")) >= 0.20:
+        return "diagnostic_only"
+    if num(row.get("schema_valid_rate")) > 0:
+        return "contract_blocked"
+    return "unusable"
 
 
 def gate_status(row):
@@ -228,9 +302,21 @@ def readiness(row):
         return "default_ready"
     if not failures:
         return "eligible_candidate"
-    if display_verdict(row) in ("hard_case_candidate_needs_action_fix", "row_watch_candidate_limited"):
+    verdict = display_verdict(row)
+    if verdict in (
+        "triage_candidate",
+        "hard_case_candidate",
+        "hard_case_candidate_needs_action_fix",
+        "row_watch_candidate",
+        "row_watch_candidate_limited",
+        "partial_candidate",
+    ):
         return "workload_candidate"
-    if num(row.get("schema_valid_rate")) < 0.50 or num(row.get("contract_score")) < 0.50:
+    if verdict == "diagnostic_only":
+        return "diagnostic_only"
+    if verdict == "unusable":
+        return "unusable"
+    if num(row.get("schema_valid_rate")) < 0.25 or num(row.get("contract_score")) < 0.25:
         return "contract_blocked"
     return "research_only"
 
@@ -341,6 +427,11 @@ def with_base_key(row, base_by_model):
 
 def aggregate_summaries(rows, models):
     base_by_model = model_base_map(models)
+    model_by_base = {}
+    for row in models:
+        base = row.get("base_model_key") or row.get("model_key", "")
+        if base and base not in model_by_base:
+            model_by_base[base] = row
     groups = {}
     for row in rows:
         add_otlet_fit(row)
@@ -386,6 +477,7 @@ def aggregate_summaries(rows, models):
     out = []
     for base, group in groups.items():
         aggregate = group[0].copy()
+        aggregate.update({k: v for k, v in model_by_base.get(base, {}).items() if v not in (None, "")})
         aggregate["model_key"] = base
         aggregate["base_model_key"] = base
         aggregate["model_name"] = base
@@ -427,6 +519,8 @@ def aggregate_summaries(rows, models):
         aggregate["trusted_fit_score"] = aggregate["trusted_fit_min"]
         aggregate["diagnostic_fit_score"] = aggregate["diagnostic_fit_min"]
         aggregate["otlet_fit_score"] = aggregate["trusted_fit_score"]
+        aggregate["overall_fit"] = aggregate["trusted_fit_score"]
+        aggregate["diagnostic_fit"] = aggregate["diagnostic_fit_score"]
         aggregate["stability_status"] = "stable_proof" if len(group) >= 3 else "single_run" if len(group) == 1 else "limited_repeats"
         out.append(aggregate)
 
@@ -489,9 +583,19 @@ def add_missing_model_rows(summaries, models):
     return out
 
 
+def current_report_rows(rows):
+    return [
+        row
+        for row in rows
+        if row.get("tier") == "core"
+        and (row.get("include_by_default") == "true" or num(row.get("trusted_fit_score")) > 0)
+        and display_verdict(row) != "unusable"
+    ]
+
+
 def svg_shell(width, height, body):
     return f"""<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">
-<rect width="100%" height="100%" fill="#ffffff"/>
+<rect x="0" y="0" width="{width}" height="{height}" fill="#ffffff"/>
 <style>
 text {{ font: 12px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; fill: #20242a; }}
 .axis {{ stroke: #4b5563; stroke-width: 1; }}
@@ -555,11 +659,11 @@ def write_scatter(path, rows, x_key, y_key, title, x_label, y_label):
         return
     rows = ranked(rows)
     width = 920
-    left, right, top = 72, 48, 42
-    plot_w, plot_h = width - left - right, 500
-    legend_top = top + plot_h + 72
+    left, right, top = 72, 48, 56
+    plot_w, plot_h = width - left - right, 360
+    legend_top = top + plot_h + 66
     legend_rows = math.ceil(len(rows) / 2)
-    height = max(width, legend_top + 24 + legend_rows * 19)
+    height = legend_top + 34 + legend_rows * 19
     legend_x_left = left
     legend_x_right = left + 430
     max_x = nice_max(max(num(r.get(x_key)) for r in rows) or 1.0)
@@ -570,7 +674,7 @@ def write_scatter(path, rows, x_key, y_key, title, x_label, y_label):
         f'<line class="axis" x1="{left}" y1="{top + plot_h}" x2="{left + plot_w}" y2="{top + plot_h}"/>',
         f'<line class="axis" x1="{left}" y1="{top}" x2="{left}" y2="{top + plot_h}"/>',
         f'<text x="{left}" y="{top + plot_h + 42}">{html.escape(x_label)}</text>',
-        f'<text x="18" y="{top + 12}">{html.escape(y_label)}</text>',
+        f'<text x="{left}" y="{top - 12}">{html.escape(y_label)}</text>',
         f'<text x="{left}" y="{legend_top}">rank model score</text>',
     ]
     for i in range(5):
@@ -607,9 +711,9 @@ def write_pareto(path, rows):
         rows,
         "resident_gb",
         "trusted_fit_score",
-        "Pareto: resident GB vs overall score",
+        "Pareto: resident GB vs overall fit",
         "resident GB",
-        "overall score",
+        "overall fit",
     )
 
 
@@ -621,7 +725,7 @@ def write_bar(path, rows, value_key, title):
     longest = max(text_width(r.get("model_key", "model")) for r in rows)
     width = 1040
     row_h = 44
-    height = max(width, 100 + row_h * len(rows))
+    height = 110 + row_h * len(rows)
     left, right, top = max(220, longest + 36), 136, 62
     max_value = nice_max(max(num(r.get(value_key)) for r in rows) or 1.0)
     bar_w = width - left - right
@@ -657,14 +761,14 @@ def write_param_fit(path, rows):
         rows,
         "active_params_b",
         "trusted_fit_score",
-        "Active params vs overall score",
+        "Active params vs overall fit",
         "active params B",
-        "overall score",
+        "overall fit",
     )
 
 
 def write_overall(path, rows):
-    write_bar(path, rows, "trusted_fit_score", "Overall Otlet score, higher is better")
+    write_bar(path, rows, "trusted_fit_score", "Overall Otlet fit, higher is better")
 
 
 def write_scorecard(path, rows):
@@ -678,14 +782,14 @@ def write_scorecard(path, rows):
         "score_status",
         "readiness",
         "production_score",
-        "candidate_fit",
+        "overall_fit",
         "trusted_fit",
         "trusted_fit_mean",
         "trusted_fit_min",
         "trusted_fit_max",
         "trusted_fit_sd",
         "diagnostic_fit",
-        "trusted_gate",
+        "trusted_quality",
         "diagnostic_quality",
         "resource_fit",
         "artifact_fit",
@@ -693,7 +797,7 @@ def write_scorecard(path, rows):
         "latency_fit",
         "active_param_fit",
         "correct_jobs_s_gb",
-        "candidate_fit_jobs_s_gb",
+        "overall_fit_jobs_s_gb",
         "quality_per_active_b",
         "schema",
         "entity",
@@ -727,14 +831,14 @@ def write_scorecard(path, rows):
                     "score_status": row.get("score_status", ""),
                     "readiness": readiness(row),
                     "production_score": f"{production_score(row):.6f}" if scored else "",
-                    "candidate_fit": score("trusted_fit_score"),
+                    "overall_fit": score("trusted_fit_score"),
                     "trusted_fit": score("trusted_fit_score"),
                     "trusted_fit_mean": score("trusted_fit_mean"),
                     "trusted_fit_min": score("trusted_fit_min"),
                     "trusted_fit_max": score("trusted_fit_max"),
                     "trusted_fit_sd": score("trusted_fit_sd"),
                     "diagnostic_fit": score("diagnostic_fit_score"),
-                    "trusted_gate": f'{num(row.get("quality_score")):.6f}',
+                    "trusted_quality": f'{num(row.get("quality_score")):.6f}',
                     "diagnostic_quality": f'{num(row.get("diagnostic_quality_score")):.6f}',
                     "resource_fit": f'{num(row.get("resource_fit")):.6f}',
                     "artifact_fit": f'{num(row.get("artifact_fit")):.6f}',
@@ -742,7 +846,7 @@ def write_scorecard(path, rows):
                     "latency_fit": f'{num(row.get("latency_fit")):.6f}',
                     "active_param_fit": f'{num(row.get("active_param_fit")):.6f}',
                     "correct_jobs_s_gb": f'{num(row.get("correct_jobs_per_second_per_gb")):.6f}',
-                    "candidate_fit_jobs_s_gb": f'{num(row.get("candidate_fit_jobs_per_second_per_gb")):.6f}',
+                    "overall_fit_jobs_s_gb": f'{num(row.get("overall_fit_jobs_per_second_per_gb")):.6f}',
                     "quality_per_active_b": f'{num(row.get("quality_per_active_b")):.6f}',
                     "schema": f'{num(row.get("schema_valid_rate")):.6f}',
                     "entity": f'{num(row.get("entity_accuracy")):.6f}',
@@ -768,12 +872,15 @@ def score_reason(row):
         return f'out of running: {row.get("unsupported_reason") or first_blocker(row)}'
     if status == "needs_current_scoring_run":
         return "missing current scoring metrics"
+    verdict = display_verdict(row)
     if num(row.get("trusted_fit_score")) == 0:
         if num(row.get("quality_score")) == 0:
-            return "ran but created no trusted Otlet quality"
+            if verdict == "diagnostic_only":
+                return "diagnostic signal only; no trusted accepted output"
+            return "ran but created no useful Otlet signal"
         if num(row.get("resource_fit")) == 0:
-            return "trusted work scored but resource fit is zero"
-    return "trusted_gate * resource_fit"
+            return "trusted work scored but no measured resource fit"
+    return "trusted_quality with soft resource adjustment"
 
 
 def score_audit_rows(rows):
@@ -784,12 +891,13 @@ def score_audit_rows(rows):
             {
                 "rank": rank,
                 "model": row.get("model_key", ""),
+                "role": display_verdict(row),
                 "score_status": row.get("score_status", ""),
                 "production_gate": gate_status(row),
                 "readiness": readiness(row),
-                "overall_score": score_label(row.get("trusted_fit_score")) if scored else "",
+                "overall_fit": score_label(row.get("trusted_fit_score")) if scored else "",
                 "production_score": f"{production_score(row):.6f}" if scored else "",
-                "trusted_gate": f'{num(row.get("quality_score")):.6f}' if scored else "",
+                "trusted_quality": f'{num(row.get("quality_score")):.6f}' if scored else "",
                 "resource_fit": f'{num(row.get("resource_fit")):.6f}' if scored else "",
                 "score_reason": score_reason(row),
                 "first_blocker": first_blocker(row),
@@ -815,12 +923,13 @@ def write_score_audit(path, rows):
     fields = [
         "rank",
         "model",
+        "role",
         "score_status",
         "production_gate",
         "readiness",
-        "overall_score",
+        "overall_fit",
         "production_score",
-        "trusted_gate",
+        "trusted_quality",
         "resource_fit",
         "score_reason",
         "first_blocker",
@@ -861,7 +970,7 @@ def write_index_readme(run_dir, context):
     cases_per_model_run = context["cases_per_model_run"]
     direct_gate_skip_count = context.get("direct_gate_skip_count", 0)
     min_direct_schema_rate = context.get("min_direct_schema_rate")
-    model_count = len(context["summaries"])
+    ranked_count = len(scored)
     stable_models = [row for row in scored if num(row.get("repeat_count")) >= 3]
     single_run_count = sum(1 for row in scored if num(row.get("repeat_count")) == 1)
     single_run_label = "model is" if single_run_count == 1 else "models are"
@@ -869,6 +978,11 @@ def write_index_readme(run_dir, context):
     source_run_ids = context["meta"].get("source_run_ids", "")
     run_id = context["meta"].get("run_id") or source_run_ids or ""
     merged_report = "," in source_run_ids
+    default_model_keys = context.get("default_model_keys") or ([scored[0].get("model_key", "")] if scored else [])
+    comparison_model_keys = context.get("comparison_model_keys") or [row.get("model_key", "") for row in scored]
+    default_models = ",".join(default_model_keys)
+    comparison_models = ",".join(comparison_model_keys)
+    debug_model = comparison_model_keys[-1] if len(comparison_model_keys) > 1 else (default_model_keys[0] if default_model_keys else "qwen35_4b")
     latest_kind = (
         "this is a merged current scored report"
         if scored and merged_report
@@ -883,8 +997,9 @@ def write_index_readme(run_dir, context):
             {
                 "rank": rank,
                 "model": row.get("model_key", ""),
-                "overall_score": score_label(row.get("trusted_fit_score")),
-                "trusted_gate": f'{num(row.get("quality_score")):.3f}',
+                "role": display_verdict(row),
+                "overall_fit": score_label(row.get("trusted_fit_score")),
+                "trusted_quality": f'{num(row.get("quality_score")):.3f}',
                 "diagnostic_fit": score_label(row.get("diagnostic_fit_score")),
                 "resource_fit": f'{num(row.get("resource_fit")):.3f}',
                 "first_blocker": first_blocker(row),
@@ -894,11 +1009,11 @@ def write_index_readme(run_dir, context):
     lines = [
         "# Otlet Benchmarks",
         "",
-        "## Overall Score",
+        "## Overall Fit",
         "",
-        "Read this ranking first. `overall_score` is `candidate_fit`: trusted Otlet work times resource fit. A zero means the model ran but produced no trusted state",
+        "Read this ranking first. `overall_fit` is trusted Otlet quality with a soft resource adjustment. Resource fit still matters, but it does not veto a slightly larger model that does the work well",
         "",
-        table(["rank", "model", "overall_score", "trusted_gate", "diagnostic_fit", "resource_fit", "first_blocker"], score_rows)
+        table(["rank", "model", "role", "overall_fit", "trusted_quality", "diagnostic_fit", "resource_fit", "first_blocker"], score_rows)
         if score_rows
         else table(
             ["status", "value"],
@@ -909,27 +1024,50 @@ def write_index_readme(run_dir, context):
             ],
         ),
         "",
+        "![Overall Otlet fit](overall.svg)",
+        "",
         "## Latest Result",
         "",
-        f"Run `{run_id}`: {latest_kind}. It covers {model_count} selected model rows through the benchmark harness. The runner writes generated report artifacts under ignored `benchmarks/report/latest`",
+        f"Run `{run_id}`: {latest_kind}. It ranks {ranked_count} current scored {plural(ranked_count, 'model')} through the benchmark harness",
         "",
         f"Benchmark confidence: `{confidence}`. Next proof: {confidence_next}",
         "",
         (
-            f"`{stable_models[0].get('model_key')}` has same-run repeat proof with {num(stable_models[0].get('repeat_count')):.0f} runs; repeated models rank by their worst candidate-fit repeat. The other {single_run_count} scored {single_run_label} single-run broad comparison rows"
+            f"`{stable_models[0].get('model_key')}` has same-run repeat proof with {num(stable_models[0].get('repeat_count')):.0f} runs; repeated models rank by their worst overall-fit repeat. The other {single_run_count} scored {single_run_label} single-run broad comparison rows"
             if stable_models
             else "All scored models are currently single-run rows; rerun key candidates with `OTLET_BENCH_RUNS=3` before treating stability as proven"
         ),
         "",
-        "A model that completes a current-format run gets an overall score. The harness marks load failures, timeouts, manifest blocks, and missing summaries as out of running instead of assigning a fake zero",
+        "A model that completes a current-format run gets an overall fit score and a role. The harness marks load failures, timeouts, manifest blocks, and missing summaries as out of running instead of assigning a fake zero",
         "",
-        "The TSVs store `overall_score` as `candidate_fit`: trusted Otlet work multiplied by resource fit for artifact size, resident RSS, p95 latency, and active params. Fast invalid output gets an overall score of zero because it creates no trusted Otlet state. `production_score` stays zero until a model passes every production gate",
+        "Score fields are 0.000-1.000. `trusted_quality` is the accepted-output score before resource adjustment. `resource_fit` is a soft footprint and latency score, not a veto. `overall_fit` is trusted quality times the soft resource adjustment. `diagnostic_fit` reads partial signal from rejected or invalid attempts, but it never becomes trusted Otlet state",
         "",
-        f"Current coverage is {cases_per_model_run:.1f} direct gold cases per model run. The current fixture target is 112 deterministic pair cases per model plus row-watch and semantic checks",
+        "A model can show `overall_fit=0.000` when it produced no trusted schema-valid output. The run still keeps failure examples, diagnostic fit, and first blockers",
+        "",
+        "The public ranking keeps the newest scored row per current family/size lane. Superseded rows, unscored candidates, and models with no useful Otlet signal stay out of the README ranking",
+        "",
+        f"Current coverage is {compact_count(cases_per_model_run)} direct gold cases per model run. The current fixture target is 112 deterministic pair cases per model plus row-watch and semantic checks",
         "",
         f"The runner skipped semantic and row-watch phases for {direct_gate_skip_count} scored {direct_gate_label} because direct schema-valid rate was below {min_direct_schema_rate:.2f}"
         if direct_gate_skip_count and min_direct_schema_rate is not None
         else "",
+        "",
+        "## Columns And Roles",
+        "",
+        table(
+            ["name", "meaning"],
+            [
+                {"name": "overall_fit", "meaning": "trusted_quality with a soft resource adjustment; higher is better"},
+                {"name": "trusted_quality", "meaning": "schema-valid accepted output quality before resource adjustment"},
+                {"name": "diagnostic_fit", "meaning": "partial signal from rejected or invalid attempts; never trusted state"},
+                {"name": "resource_fit", "meaning": "soft score for artifact size, resident RSS, latency, and active params"},
+                {"name": "first_blocker", "meaning": "first production gate that kept a model from default readiness"},
+                {"name": "default_candidate", "meaning": "passed the current production gate in this run"},
+                {"name": "triage_candidate", "meaning": "useful trusted output, but not default-ready"},
+                {"name": "row_watch_candidate", "meaning": "useful for watch-style row judgment, but not default-ready"},
+                {"name": "workload_candidate", "meaning": "production-readiness label for a useful non-default model"},
+            ],
+        ),
         "",
         "## Workload Picks",
         "",
@@ -937,9 +1075,9 @@ def write_index_readme(run_dir, context):
         "",
         "## Production Readiness",
         "",
-        "The default-model gate keeps failed models out of production rank. Failed models keep diagnostic evidence, but their production score is zero",
+        "The default-model gate keeps non-passing models out of production rank. Useful partial models keep role labels and diagnostic evidence, but their production score is zero",
         "",
-        table(["rank", "model", "readiness", "production_score", "candidate_fit", "gate", "first_blocker"], readiness_rows),
+        table(["rank", "model", "readiness", "production_score", "overall_fit", "gate", "first_blocker"], readiness_rows),
         "",
         "## First Failure Modes",
         "",
@@ -947,18 +1085,18 @@ def write_index_readme(run_dir, context):
         if failure_mode_rows
         else "The report has no scored case failures",
         "",
-        "## Overall Score Ranking",
+        "## Overall Fit Ranking",
         "",
         table(
-            ["rank", "model", "runs", "readiness", "overall_score", "trusted_gate", "schema", "p95_ms", "rss_gb", "artifact_gb"],
+            ["rank", "model", "runs", "readiness", "overall_fit", "trusted_quality", "schema", "p95_ms", "rss_gb", "artifact_gb"],
             [
                 {
                     "rank": row["rank"],
                     "model": row["model"],
                     "runs": row["repeat_count"],
                     "readiness": row["readiness"],
-                    "overall_score": row["candidate_fit"],
-                    "trusted_gate": row["trusted_gate"],
+                    "overall_fit": row["overall_fit"],
+                    "trusted_quality": row["trusted_quality"],
                     "schema": row["schema"],
                     "p95_ms": row["p95_ms"],
                     "rss_gb": row["rss_gb"],
@@ -974,24 +1112,19 @@ def write_index_readme(run_dir, context):
         "",
         table(["model", "status", "reason", "tier", "artifact_gb"], out_of_running_rows)
         if out_of_running_rows
-        else "No selected models were out of running",
+        else "No ranked models were out of running",
         "",
         "## Drilldown Charts",
         "",
-        "The headline chart ranks overall score. The charts below explain whether that score is quality-limited, memory-limited, latency-limited, or parameter-limited. Treat latency and throughput as useful only after checking `trusted_gate`; instant invalid output is not useful work",
+        "The headline chart ranks overall fit. The charts below explain whether that fit is quality-limited, memory-limited, latency-limited, or parameter-limited. Treat latency and throughput as useful only after checking `trusted_quality`; instant invalid output is not useful work",
         "",
-        "Running the benchmark writes local SVG charts under ignored `benchmarks/report/latest`: overall score, resident memory versus score, active parameters versus score, p95 latency, and trusted throughput per resident GB",
+        "![Resident memory versus overall fit](pareto.svg)",
         "",
-        "## Report Files",
+        "![Active params versus overall fit](params.svg)",
         "",
-        "- Full report: `report/latest/otlet-model-benchmark.md`",
-        "- Overall score chart: `report/latest/overall.svg`",
-        "- Score audit TSV: `report/latest/score_audit.tsv`",
-        "- Gate scorecard TSV: `report/latest/scorecard.tsv`",
-        "- Model summary TSV: `report/latest/model_summary.tsv`",
-        "- Case result TSV: `report/latest/case_results.tsv`",
-        "- Cleanup proof: `report/latest/cleanup.tsv`",
-        "- Planner proof: `report/latest/explain.txt`",
+        "![Generation latency](latency.svg)",
+        "",
+        "![Correct jobs per resident GB](efficiency.svg)",
         "",
         "## Benchmark Scope",
         "",
@@ -1018,38 +1151,44 @@ def write_index_readme(run_dir, context):
         "./scripts/otlet-demo.sh",
         "```",
         "",
-        "Run one model and write a local report:",
+        f"Use the default model for normal harness iteration. The default set is intentionally small and evidence-based; today it is `{default_models}`:",
         "",
         "```sh",
-        "OTLET_BENCH_LIMIT_MODELS=ministral3_3b OTLET_BENCH_RUNS=1 OTLET_BENCH_PUBLISH_REPORT=1 ./benchmarks/run.sh",
+        f"OTLET_BENCH_LIMIT_MODELS={default_models} OTLET_BENCH_RUNS=1 OTLET_BENCH_PUBLISH_REPORT=1 ./benchmarks/run.sh",
         "```",
         "",
-        "Run a subset and write a local report:",
+        "Run a single named model when debugging a candidate:",
         "",
         "```sh",
-        "OTLET_BENCH_LIMIT_MODELS=ministral3_3b,glm_edge_4b,smollm3_3b OTLET_BENCH_RUNS=1 OTLET_BENCH_PUBLISH_REPORT=1 ./benchmarks/run.sh",
+        f"OTLET_BENCH_LIMIT_MODELS={debug_model} OTLET_BENCH_RUNS=1 OTLET_BENCH_PUBLISH_REPORT=1 ./benchmarks/run.sh",
         "```",
         "",
-        "Run the small-model set around the 2 GB artifact target and refresh the report:",
+        "Run the current scored comparison set only after a meaningful prompt/schema/scoring/runtime change:",
         "",
         "```sh",
-        "models=\"$(awk -F '\\t' 'NR > 1 && $6 == \"core\" && $10 <= 2.0 {print $1}' benchmarks/models.tsv | paste -sd, -)\"",
-        "OTLET_BENCH_LIMIT_MODELS=\"$models\" OTLET_BENCH_RUNS=1 OTLET_BENCH_MAX_ARTIFACT_GB=2.0 OTLET_BENCH_PUBLISH_REPORT=1 ./benchmarks/run.sh",
+        f"OTLET_BENCH_LIMIT_MODELS={comparison_models} OTLET_BENCH_RUNS=1 OTLET_BENCH_PUBLISH_REPORT=1 ./benchmarks/run.sh",
+        "```",
+        "",
+        "Run the default-included set when the harness has materially improved and you want the shortest publishable check:",
+        "",
+        "```sh",
+        "models=\"$(awk -F '\\t' 'NR > 1 && $9 == \"true\" {print $1}' benchmarks/models.tsv | paste -sd, -)\"",
+        "OTLET_BENCH_LIMIT_MODELS=\"$models\" OTLET_BENCH_RUNS=1 OTLET_BENCH_PUBLISH_REPORT=1 ./benchmarks/run.sh",
         "```",
         "",
         "The benchmark default timeout is two hours per task phase because the current fixture loads 112 row-pair cases per model and larger local models can cross one hour before semantic refresh starts",
         "",
-        "Run every core model in the manifest and write a local report:",
+        "Run manual candidates only when you have a reason to spend the time. Rows marked `candidate`, `diagnostic`, `historical`, or `heavy` are never part of the default run:",
         "",
         "```sh",
-        "models=\"$(awk -F '\\t' 'NR > 1 && $6 == \"core\" {print $1}' benchmarks/models.tsv | paste -sd, -)\"",
+        "models=\"$(awk -F '\\t' 'NR > 1 && ($6 == \"candidate\" || $6 == \"diagnostic\") {print $1}' benchmarks/models.tsv | paste -sd, -)\"",
         "OTLET_BENCH_LIMIT_MODELS=\"$models\" OTLET_BENCH_RUNS=1 OTLET_BENCH_MAX_ARTIFACT_GB=6 OTLET_BENCH_PUBLISH_REPORT=1 ./benchmarks/run.sh",
         "```",
         "",
-        "Run the Qwen smoke without writing a local report:",
+        "Run a one-model Qwen smoke without writing a local report:",
         "",
         "```sh",
-        "OTLET_BENCH_LIMIT_MODELS=linked_qwen_0_6b,linked_qwen_1_7b OTLET_BENCH_RUNS=1 ./benchmarks/run.sh",
+        "OTLET_BENCH_LIMIT_MODELS=qwen35_4b OTLET_BENCH_RUNS=1 ./benchmarks/run.sh",
         "```",
         "",
         "Refresh model manifest metadata:",
@@ -1058,19 +1197,130 @@ def write_index_readme(run_dir, context):
         "python3 benchmarks/refresh-metadata.py",
         "```",
         "",
-        "`OTLET_BENCH_PUBLISH_REPORT=1` updates local generated Markdown, SVG, TSV, cleanup, and EXPLAIN files under ignored `benchmarks/report/latest/`",
+        "`OTLET_BENCH_PUBLISH_REPORT=1` updates this README and committed chart SVGs. Raw run and debug files stay ignored",
         "",
         "Raw runs stay under ignored `benchmarks/runs/<timestamp>-<run_id>/`. Keep a raw run while debugging; commit benchmark code and README updates, not generated run artifacts",
         "",
-        "Raw run artifacts update after each completed model. `report/latest` updates only when the runner reaches normal completion with `OTLET_BENCH_PUBLISH_REPORT=1`",
+    ]
+    readme.write_text("\n".join(clean_lines(lines)), encoding="utf-8")
+
+
+def publish_index_charts(run_dir, chart_paths):
+    expected = Path(__file__).resolve().parent / "report" / "latest"
+    if run_dir.resolve() != expected:
+        return
+    benchmark_dir = expected.parents[1]
+    for chart in chart_paths:
+        if chart.exists():
+            (benchmark_dir / chart.name).write_text(chart.read_text(encoding="utf-8"), encoding="utf-8")
+
+
+def case_rate(cases, model_key, predicate):
+    rows = [row for row in cases if row.get("model_key") == model_key]
+    if not rows:
+        return 0.0
+    return sum(1 for row in rows if predicate(row)) / len(rows)
+
+
+def compare_runs(baseline_dir, candidate_dir):
+    baseline_models = read_tsv(baseline_dir / "models.tsv")
+    candidate_models = read_tsv(candidate_dir / "models.tsv")
+    baseline_by_base = model_base_map(baseline_models)
+    candidate_by_base = model_base_map(candidate_models)
+    baseline_cases = read_tsv(baseline_dir / "case_results.tsv")
+    candidate_cases = read_tsv(candidate_dir / "case_results.tsv")
+    baseline_summaries = aggregate_summaries(read_tsv(baseline_dir / "model_summary.tsv"), baseline_models)
+    candidate_summaries = aggregate_summaries(read_tsv(candidate_dir / "model_summary.tsv"), candidate_models)
+
+    for row in baseline_cases:
+        with_base_key(row, baseline_by_base)
+    for row in candidate_cases:
+        with_base_key(row, candidate_by_base)
+
+    baseline_by_model = {row.get("model_key", ""): row for row in baseline_summaries}
+    candidate_by_model = {row.get("model_key", ""): row for row in candidate_summaries}
+    model_keys = sorted(set(baseline_by_model) | set(candidate_by_model))
+    rows = []
+    for model_key in model_keys:
+        before = baseline_by_model.get(model_key, {})
+        after = candidate_by_model.get(model_key, {})
+        before_cases = [row for row in baseline_cases if row.get("model_key") == model_key]
+        after_cases = [row for row in candidate_cases if row.get("model_key") == model_key]
+        rows.append(
+            {
+                "model": model_key,
+                "cases_before": len(before_cases),
+                "cases_after": len(after_cases),
+                "overall_before": score_label(before.get("overall_fit")),
+                "overall_after": score_label(after.get("overall_fit")),
+                "overall_delta": score_label(num(after.get("overall_fit")) - num(before.get("overall_fit"))),
+                "schema_delta": score_label(num(after.get("schema_valid_rate")) - num(before.get("schema_valid_rate"))),
+                "parse_fail_delta": score_label(
+                    case_rate(candidate_cases, model_key, lambda row: "invalid model JSON" in row.get("error", ""))
+                    - case_rate(baseline_cases, model_key, lambda row: "invalid model JSON" in row.get("error", ""))
+                ),
+                "false_merge_delta": score_label(num(after.get("abstention_false_merge_rate")) - num(before.get("abstention_false_merge_rate"))),
+                "confidence_delta": score_label(num(after.get("confidence_score")) - num(before.get("confidence_score"))),
+                "halluc_action_delta": score_label(
+                    num(after.get("hallucinated_trusted_action_rate")) - num(before.get("hallucinated_trusted_action_rate"))
+                ),
+                "trusted_action_delta": score_label(num(after.get("typed_action_score")) - num(before.get("typed_action_score"))),
+                "semantic_delta": score_label(
+                    num(after.get("semantic_materialization_score")) - num(before.get("semantic_materialization_score"))
+                ),
+                "row_watch_delta": score_label(num(after.get("row_watch_score")) - num(before.get("row_watch_score"))),
+                "p95_ms_delta": score_label(num(after.get("p95_generate_ms")) - num(before.get("p95_generate_ms"))),
+                "rss_gb_delta": score_label(num(after.get("resident_gb")) - num(before.get("resident_gb"))),
+                "blocker_before": first_blocker(before),
+                "blocker_after": first_blocker(after),
+            }
+        )
+
+    out = candidate_dir / "comparison.md"
+    lines = [
+        "# Otlet Benchmark Comparison",
+        "",
+        f"- Baseline: `{baseline_dir}`",
+        f"- Candidate: `{candidate_dir}`",
+        "- Basis: exported benchmark TSVs; no case rows are dropped by the comparison",
+        "- Good deltas are positive for schema, confidence, trusted action, semantic, row-watch, and overall fit",
+        "- Good deltas are negative for parse failures, false merges, hallucinated actions, p95 latency, and resident RSS",
+        "",
+        table(
+            [
+                "model",
+                "cases_before",
+                "cases_after",
+                "overall_before",
+                "overall_after",
+                "overall_delta",
+                "schema_delta",
+                "parse_fail_delta",
+                "false_merge_delta",
+                "confidence_delta",
+                "halluc_action_delta",
+                "trusted_action_delta",
+                "semantic_delta",
+                "row_watch_delta",
+                "p95_ms_delta",
+                "rss_gb_delta",
+                "blocker_before",
+                "blocker_after",
+            ],
+            rows,
+        ),
         "",
     ]
-    readme.write_text("\n".join(lines), encoding="utf-8")
+    out.write_text("\n".join(clean_lines(lines)), encoding="utf-8")
+    print(out)
 
 
 def main():
+    if len(sys.argv) == 4 and sys.argv[1] == "--compare":
+        compare_runs(Path(sys.argv[2]), Path(sys.argv[3]))
+        return
     if len(sys.argv) != 2:
-        raise SystemExit("usage: report.py RUN_DIR")
+        raise SystemExit("usage: report.py RUN_DIR | report.py --compare BASELINE_RUN_DIR CANDIDATE_RUN_DIR")
     run_dir = Path(sys.argv[1])
     models = read_tsv(run_dir / "models.tsv")
     model_metadata = {row.get("model_key", ""): row for row in read_tsv(run_dir / "models_metadata.tsv")}
@@ -1080,6 +1330,9 @@ def main():
     for row in cases:
         with_base_key(row, base_by_model)
     summaries = add_missing_model_rows(aggregate_summaries(raw_summaries, models), models)
+    report_summaries = current_report_rows(summaries)
+    report_model_keys = {row.get("model_key", "") for row in report_summaries}
+    report_cases = [row for row in cases if row.get("base_model_key") in report_model_keys]
     meta = read_kv(run_dir / "metadata.tsv")
     cleanup = read_kv(run_dir / "cleanup.tsv")
     for row in summaries:
@@ -1095,19 +1348,19 @@ def main():
         else:
             row["correct_jobs_per_second_per_gb"] = correct_jobs_per_second_per_gb
         if resident_gb > 0:
-            row["candidate_fit_jobs_per_second_per_gb"] = (
+            row["overall_fit_jobs_per_second_per_gb"] = (
                 num(row.get("otlet_fit_score")) * num(row.get("jobs_per_second")) / resident_gb
             )
         else:
-            row["candidate_fit_jobs_per_second_per_gb"] = ""
+            row["overall_fit_jobs_per_second_per_gb"] = ""
         if active_params_b > 0:
             row["quality_per_active_b"] = num(row.get("quality_score")) / active_params_b
         else:
             row["quality_per_active_b"] = ""
 
-    runnable_summaries = [row for row in summaries if row.get("run_status") == "complete"]
+    runnable_summaries = [row for row in report_summaries if row.get("run_status") == "complete"]
     scored_summaries = [row for row in runnable_summaries if row.get("score_status") == "scored"]
-    out_of_running = [row for row in summaries if row.get("run_status") != "complete"]
+    out_of_running = [row for row in report_summaries if row.get("run_status") != "complete"]
     pareto = run_dir / "pareto.svg"
     params = run_dir / "params.svg"
     latency = run_dir / "latency.svg"
@@ -1120,12 +1373,23 @@ def main():
     write_param_fit(params, runnable_summaries)
     write_bar(latency, runnable_summaries, "p95_generate_ms", "p95 generation latency ms, higher is slower")
     write_bar(efficiency, runnable_summaries, "correct_jobs_per_second_per_gb", "correct jobs/sec per resident GB")
-    write_scorecard(scorecard, summaries)
-    write_score_audit(score_audit, summaries)
+    publish_index_charts(run_dir, [overall, pareto, params, latency, efficiency])
+    write_scorecard(scorecard, report_summaries)
+    write_score_audit(score_audit, report_summaries)
     ranked_summaries = sorted(
         scored_summaries,
         key=lambda row: (num(row.get("trusted_fit_score")), num(row.get("quality_score"))),
         reverse=True,
+    )
+    default_model_keys = [
+        row.get("model_key", "") for row in ranked_summaries if row.get("include_by_default") == "true"
+    ] or ([ranked_summaries[0].get("model_key", "")] if ranked_summaries else [])
+    comparison_model_keys = [row.get("model_key", "") for row in ranked_summaries]
+    recommended_command = (
+        f"OTLET_BENCH_LIMIT_MODELS={','.join(default_model_keys)} "
+        "OTLET_BENCH_RUNS=1 OTLET_BENCH_PUBLISH_REPORT=1 ./benchmarks/run.sh"
+        if default_model_keys
+        else "OTLET_BENCH_LIMIT_MODELS=qwen35_4b OTLET_BENCH_RUNS=1 OTLET_BENCH_PUBLISH_REPORT=1 ./benchmarks/run.sh"
     )
     diagnostic_ranked_summaries = sorted(
         runnable_summaries,
@@ -1145,12 +1409,12 @@ def main():
                 "readiness": readiness(row),
                 "production_score": f"{production_score(row):.3f}",
                 "otlet_fit": score_label(row.get("trusted_fit_score")),
-                "candidate_fit": score_label(row.get("trusted_fit_score")),
+                "overall_fit": score_label(row.get("trusted_fit_score")),
                 "diagnostic_fit": score_label(row.get("diagnostic_fit_score")),
                 "fit_min": score_label(row.get("trusted_fit_min")),
                 "fit_max": score_label(row.get("trusted_fit_max")),
                 "fit_sd": score_label(row.get("trusted_fit_sd")),
-                "trusted_gate": f'{num(row.get("quality_score")):.3f}',
+                "trusted_quality": f'{num(row.get("quality_score")):.3f}',
                 "schema": f'{num(row.get("schema_valid_rate")):.3f}',
                 "diag_decision": f'{num(row.get("diagnostic_entity_accuracy")):.3f}',
                 "trusted_decision": f'{num(row.get("entity_accuracy")):.3f}',
@@ -1164,7 +1428,7 @@ def main():
                 "rss_gb": f'{num(row.get("resident_gb")):.3f}',
                 "artifact_gb": f'{num(row.get("artifact_gb")):.3f}',
                 "correct_jobs_s_gb": f'{num(row.get("correct_jobs_per_second_per_gb")):.3f}',
-                "candidate_fit_jobs_s_gb": f'{num(row.get("candidate_fit_jobs_per_second_per_gb")):.3f}',
+                "overall_fit_jobs_s_gb": f'{num(row.get("overall_fit_jobs_per_second_per_gb")):.3f}',
                 "quality_per_active_b": f'{num(row.get("quality_per_active_b")):.3f}',
                 "resource_fit": f'{num(row.get("resource_fit")):.3f}',
             }
@@ -1174,6 +1438,8 @@ def main():
     seen_models = set()
     for row in models:
         base = row.get("base_model_key") or row.get("model_key", "")
+        if base not in report_model_keys:
+            continue
         if base in seen_models:
             continue
         seen_models.add(base)
@@ -1261,7 +1527,7 @@ def main():
     for row in diagnostic_ranked_summaries:
         model_key = row.get("model_key", "")
         counts = {}
-        for case in cases:
+        for case in report_cases:
             if case.get("base_model_key") != model_key:
                 continue
             mode = case_failure_mode(case)
@@ -1302,7 +1568,7 @@ def main():
                 "model": row.get("model_key", ""),
                 "readiness": readiness(row),
                 "production_score": f"{production_score(row):.3f}",
-                "candidate_fit": score_label(row.get("trusted_fit_score")),
+                "overall_fit": score_label(row.get("trusted_fit_score")),
                 "first_blocker": first_blocker(row),
                 "gate": gate_status(row),
             }
@@ -1312,22 +1578,23 @@ def main():
         {
             "rank": row["rank"],
             "model": row["model"],
+            "role": row["role"],
             "score_status": row["score_status"],
             "production_gate": row["production_gate"],
-            "overall_score": row["overall_score"],
-            "trusted_gate": score_label(row["trusted_gate"]),
+            "overall_fit": row["overall_fit"],
+            "trusted_quality": score_label(row["trusted_quality"]),
             "resource_fit": score_label(row["resource_fit"]),
             "score_reason": row["score_reason"],
             "first_blocker": row["first_blocker"],
         }
-        for row in score_audit_rows(summaries)
+        for row in score_audit_rows(report_summaries)
     ]
 
     failure_rows = []
     seen_failure_models = set()
     for summary in diagnostic_ranked_summaries:
         model_key = summary.get("model_key", "")
-        for row in cases:
+        for row in report_cases:
             failed = (
                 row.get("schema_valid") != "t"
                 or row.get("match_correct") != "t"
@@ -1358,8 +1625,8 @@ def main():
 
     gate_passes = [row for row in ranked_summaries if gate_status(row) == "pass"]
     best_fit = gate_passes[0] if gate_passes else ranked_summaries[0] if ranked_summaries else {}
-    best_trusted = max(summaries, key=lambda row: num(row.get("quality_score")), default={})
-    best_row_watch = max(summaries, key=lambda row: num(row.get("row_watch_score")), default={})
+    best_trusted = max(report_summaries, key=lambda row: num(row.get("quality_score")), default={})
+    best_row_watch = max(report_summaries, key=lambda row: num(row.get("row_watch_score")), default={})
     if num(best_row_watch.get("row_watch_score")) <= 0:
         best_row_watch = {}
     small_rows = [row for row in scored_summaries if 0 < num(row.get("artifact_gb")) <= SMALL_ARTIFACT_GB]
@@ -1370,8 +1637,8 @@ def main():
             {
                 "rank": rank,
                 "model": row.get("model_key", ""),
-                "candidate_fit": score_label(row.get("trusted_fit_score")),
-                "trusted_gate": f'{num(row.get("quality_score")):.3f}',
+                "overall_fit": score_label(row.get("trusted_fit_score")),
+                "trusted_quality": f'{num(row.get("quality_score")):.3f}',
                 "resource_fit": f'{num(row.get("resource_fit")):.3f}',
                 "schema": f'{num(row.get("schema_valid_rate")):.3f}',
                 "p95_ms": f'{num(row.get("p95_generate_ms")):.0f}',
@@ -1380,7 +1647,7 @@ def main():
             }
         )
     best_hard_case = max(
-        summaries,
+        report_summaries,
         key=lambda row: (
             num(row.get("entity_resolution_score")),
             num(row.get("contract_score")),
@@ -1389,16 +1656,16 @@ def main():
         ),
         default={},
     )
-    qwen06 = next((row for row in diagnostic_ranked_summaries if row.get("model_key") == "linked_qwen_0_6b"), {})
-    qwen17 = next((row for row in diagnostic_ranked_summaries if row.get("model_key") == "linked_qwen_1_7b"), {})
-    rank_by_key = {row.get("model_key"): i for i, row in enumerate(diagnostic_ranked_summaries, start=1)}
-    run_ids = sorted({row.get("run_id", "") for row in summaries if row.get("run_id")})
-    repeat_counts = [num(row.get("repeat_count")) for row in summaries]
+    run_ids = sorted({row.get("run_id", "") for row in report_summaries if row.get("run_id")})
+    if run_ids and not (meta.get("run_id") or meta.get("source_run_ids")):
+        meta["source_run_ids"] = ",".join(run_ids)
+    repeat_counts = [num(row.get("repeat_count")) for row in report_summaries]
     min_repeats = min(repeat_counts) if repeat_counts else 0
     max_repeats = max(repeat_counts) if repeat_counts else 0
-    cases_per_model_run = (len(cases) / len(raw_summaries)) if raw_summaries else 0
+    report_raw_summaries = [row for row in raw_summaries if row.get("model_key", "") in report_model_keys]
+    cases_per_model_run = (len(report_cases) / len(report_raw_summaries)) if report_raw_summaries else 0
     confidence, confidence_reason, confidence_next = benchmark_confidence(
-        summaries, raw_summaries, len(cases), run_ids
+        report_summaries, report_raw_summaries, len(report_cases), run_ids
     )
     min_direct_schema_rate = num(meta.get("min_direct_schema_rate"), None)
     if len(run_ids) > 1:
@@ -1408,25 +1675,31 @@ def main():
     else:
         timing_limit = "- One same-run sweep proves direction; use OTLET_BENCH_RUNS=3 before treating stability as proven"
     if cases_per_model_run >= 100:
-        coverage_limit = f"- Direct gold coverage is frontier-sized at {cases_per_model_run:.1f} cases per model run"
+        coverage_limit = f"- Direct gold coverage is frontier-sized at {compact_count(cases_per_model_run)} cases per model run"
     else:
         coverage_limit = (
-            f"- Direct gold coverage remains smoke-sized at {cases_per_model_run:.1f} cases per model run; "
+            f"- Direct gold coverage remains smoke-sized at {compact_count(cases_per_model_run)} cases per model run; "
             "the frontier target is 100+ cases per model"
         )
 
     findings = []
     findings.append(f"- Benchmark confidence: `{confidence}`")
+    excluded_model_count = len(summaries) - len(report_summaries)
+    if excluded_model_count:
+        findings.append(
+            f"- {excluded_model_count} non-default model {plural(excluded_model_count, 'row')} stayed out of current rankings; explicit runs can still inspect raw TSV evidence"
+        )
+    direct_gate_skips = []
     repeated_summaries = [row for row in ranked_summaries if num(row.get("repeat_count")) >= 3]
     if repeated_summaries:
         repeated = repeated_summaries[0]
         findings.append(
             f'- `{repeated.get("model_key")}` has same-run repeat proof with '
-            f'{num(repeated.get("repeat_count")):.0f} runs; ranking uses its worst candidate-fit repeat '
+            f'{num(repeated.get("repeat_count")):.0f} runs; ranking uses its worst overall-fit repeat '
             f'({score_label(repeated.get("trusted_fit_score"))})'
         )
     if runnable_summaries and not scored_summaries:
-        findings.append("- This run predates required confidence-target scoring and has no current overall scores")
+        findings.append("- This run predates required confidence-target scoring and has no current overall fit scores")
     if min_direct_schema_rate is not None:
         direct_gate_skips = [
             row
@@ -1449,7 +1722,7 @@ def main():
         )
     if best_trusted:
         findings.append(
-            f'- `{best_trusted.get("model_key")}` has the best `trusted_gate` '
+            f'- `{best_trusted.get("model_key")}` has the best `trusted_quality` '
             f'({num(best_trusted.get("quality_score")):.3f})'
         )
     if best_hard_case:
@@ -1465,13 +1738,13 @@ def main():
     if best_small:
         findings.append(
             f'- `{best_small.get("model_key")}` is the best <=2.0 GB artifact candidate '
-            f'({num(best_small.get("artifact_gb")):.3f} GB artifact, {score_label(best_small.get("trusted_fit_score"))} candidate fit)'
+            f'({num(best_small.get("artifact_gb")):.3f} GB artifact, {score_label(best_small.get("trusted_fit_score"))} overall fit)'
         )
-    if qwen06 and qwen17:
-        findings.append(
-            f'- The Qwen demo baselines rank {rank_by_key.get("linked_qwen_1_7b")} '
-            f'and {rank_by_key.get("linked_qwen_0_6b")} on this harder suite'
-        )
+    default_limit = (
+        f'- `{best_fit.get("model_key")}` passed the production gate in this run; repeat with OTLET_BENCH_RUNS=3 before treating it as stable'
+        if gate_passes and best_fit
+        else "- No model passed the production gate, so the report does not recommend a default model"
+    )
 
     def winner_row(workload, row, metric, caveat):
         if not row:
@@ -1496,6 +1769,12 @@ def main():
         if runnable_summaries and not scored_summaries
         else "not a default model unless gate passes"
     )
+
+    def workload_caveat(row):
+        if row and gate_status(row) == "pass":
+            return "production gate passed"
+        return score_caveat
+
     workload_rows = [
         winner_row(
             "default Otlet model",
@@ -1507,46 +1786,48 @@ def main():
             "hard entity resolution",
             best_hard_case,
             f'{num(best_hard_case.get("entity_resolution_score")):.3f}',
-            score_caveat,
+            workload_caveat(best_hard_case),
         ),
         winner_row(
             "row watching",
             best_row_watch,
             f'{num(best_row_watch.get("row_watch_score")):.3f}',
-            score_caveat if best_row_watch else "not proven; direct schema gate skipped row-watch phase",
+            workload_caveat(best_row_watch) if best_row_watch else "not proven; direct schema gate skipped row-watch phase",
         ),
         winner_row(
             "<=2.0 GB artifact",
             best_small,
             score_label(best_small.get("trusted_fit_score")),
-            "small-fit pick, still gate-aware" if best_small else "no current candidate-fit row",
+            "small-fit pick, still gate-aware" if best_small else "no current overall-fit row",
         ),
         winner_row(
             "correct jobs/sec/GB",
             efficiency_row,
             f'{num(efficiency_row.get("correct_jobs_per_second_per_gb")):.3f}',
-            "compare timing after one same-run sweep" if efficiency_row else "no current candidate-fit row",
+            "compare timing after one same-run sweep" if efficiency_row else "no current overall-fit row",
         ),
     ]
 
     lines = [
         "# Otlet Model-Fit Benchmark Report",
         "",
-        "This benchmark scores local GGUF models as Otlet workers inside Postgres. Each case provides the evidence in source rows. The score measures strict JSON, trusted actions, row watching, receipts, semantic materialization, stale safety, EXPLAIN visibility, latency, memory, and artifact size",
+        "This benchmark scores current local GGUF models as Otlet workers inside Postgres. Each case provides the evidence in source rows. The score measures strict JSON, trusted actions, row watching, receipts, semantic materialization, stale safety, EXPLAIN visibility, latency, memory, and artifact size",
         "",
-        "`production_score` is zero until a model passes every production gate. `candidate_fit` is the research score for models that still fail gates: schema-valid accepted outputs, exact confidence targets, trusted actions, semantic state, and stale safety, multiplied by resource fit for artifact GB, resident RSS, p95 latency, and active params. `diagnostic_fit` is separate and can read compact fields from rejected attempts. Invalid JSON never becomes trusted Otlet state or headline score",
+        "`production_score` is zero until a model passes every production gate. `overall_fit` is the broad Otlet research score: trusted output quality with a soft resource adjustment for artifact GB, resident RSS, p95 latency, and active params. `diagnostic_fit` is separate and can read compact fields from rejected attempts. Invalid JSON never becomes trusted Otlet state",
+        "",
+        "The public report uses the current comparable scored set: the default model plus current-family models with nonzero trusted fit. For the same family and size class, keep only the newest version in regular reports, such as Qwen3.5 4B over Qwen3 4B. Zero-score, unscored, superseded, and manual-only rows stay out of the public ranking",
         "",
         "## Findings",
         "",
         *findings,
         "",
-        "A runnable model gets an overall score. The report keeps load failures, manifest blocks, and run-limit skips out of the ranking instead of assigning fake zeros",
+        "A runnable model gets an overall fit score and a role. The report keeps load failures, manifest blocks, and run-limit skips out of the ranking instead of assigning fake zeros",
         "",
-        "Verdicts are gate-aware. A model can be useful for a workload and still fail the production gate. Treat `too_unreliable` as a hard warning, not a near miss",
+        "Verdicts are role-aware. A model can be useful for triage, row watching, hard-case comparison, or diagnostic prompt work while still failing the production gate",
         "",
         "## Current Limits",
         "",
-        "- No model passed the production gate, so the report does not recommend a default model",
+        default_limit,
         timing_limit,
         coverage_limit,
         "- Candidate rankings are useful for deciding what to rerun or improve, not for shipping a model automatically",
@@ -1559,12 +1840,13 @@ def main():
                 {"key": "benchmark_confidence", "value": confidence},
                 {"key": "confidence_reason", "value": confidence_reason},
                 {"key": "next_confidence_step", "value": confidence_next},
-                {"key": "model_rows", "value": len(summaries)},
-                {"key": "raw_model_run_rows", "value": len(raw_summaries)},
-                {"key": "case_rows", "value": len(cases)},
+                {"key": "model_rows", "value": len(report_summaries)},
+                {"key": "non_default_rows_excluded", "value": excluded_model_count},
+                {"key": "raw_model_run_rows", "value": len(report_raw_summaries)},
+                {"key": "case_rows", "value": len(report_cases)},
                 {
                     "key": "direct_gold_cases_per_model_run",
-                    "value": f"{cases_per_model_run:.1f}",
+                    "value": compact_count(cases_per_model_run),
                 },
                 {"key": "repeat_count_range", "value": f"{min_repeats:.0f}-{max_repeats:.0f}"},
                 {"key": "source_run_ids", "value": ", ".join(run_ids)},
@@ -1572,7 +1854,7 @@ def main():
                     "key": "same_run_comparison",
                     "value": "yes" if len(run_ids) <= 1 else "no; latency/RSS compare best after one full rerun",
                 },
-                {"key": "score_basis", "value": "trusted accepted output first; repeated runs rank by worst candidate fit"},
+                {"key": "score_basis", "value": "trusted accepted output first; resource fit is a soft adjustment"},
             ],
         ),
         "",
@@ -1580,17 +1862,17 @@ def main():
         "",
         "A model must pass the production gate before it can be called a default Otlet model. The gate requires no worker crash, no source-table mutation, no stale leak, schema >= 0.95, contract >= 0.95, exact confidence target accuracy >= 0.95, entity >= 0.80, zero false merges, hallucinated trusted actions <= 0.01, and semantic materialization >= 0.95",
         "",
-        "`candidate_fit = trusted_gate * resource_fit` for a single run. `production_score = candidate_fit` only when the production gate passes; otherwise it is 0.000. `resource_fit` weights artifact GB 40%, resident RSS 30%, p95 latency 20%, and active params 10%. The targets are <=2.0 GB artifact, <=2.5 GB resident RSS, <=20s p95 generation, and <=3B active params. A model at or above a target gets no credit for that resource component. Repeated models rank by their worst candidate-fit repeat; the scorecard shows mean, min, max, and standard deviation. `diagnostic_fit` uses the same resource fit but starts from diagnostic fields, so use it for research instead of trusted-state ranking",
+        "`overall_fit = trusted_quality * (0.75 + 0.25 * resource_fit)` for a single run. `production_score = overall_fit` only when the production gate passes; otherwise it is 0.000. `resource_fit` weights artifact GB 40%, resident RSS 30%, p95 latency 20%, and active params 10%. The targets are <=2.0 GB artifact, <=2.5 GB resident RSS, <=20s p95 generation, and <=3B active params. A model over a target is discounted by target/value instead of zeroed out. Repeated models rank by their worst overall-fit repeat; the scorecard shows mean, min, max, and standard deviation. `diagnostic_fit` uses the same soft resource adjustment but starts from diagnostic fields",
         "",
         "## Score Audit",
         "",
-        "This table explains the headline score without requiring a reader to reverse-engineer the TSVs. A scored zero means the model ran and failed to create trusted Otlet work. Out-of-running means the model did not produce a comparable result",
+        "This table explains the headline fit score without requiring a reader to reverse-engineer the TSVs. A scored zero means the model ran and produced no useful trusted or diagnostic Otlet signal. Out-of-running means the model did not produce a comparable result",
         "",
-        table(["rank", "model", "score_status", "production_gate", "overall_score", "trusted_gate", "resource_fit", "score_reason", "first_blocker"], audit_rows),
+        table(["rank", "model", "role", "score_status", "production_gate", "overall_fit", "trusted_quality", "resource_fit", "score_reason", "first_blocker"], audit_rows),
         "",
-        "## Overall Score Chart",
+        "## Overall Fit Chart",
         "",
-        f"![Overall Otlet score]({overall.name})",
+        f"![Overall Otlet fit]({overall.name})",
         "",
         "## Workload Winners",
         "",
@@ -1598,15 +1880,15 @@ def main():
         "",
         "## Production Readiness",
         "",
-        "The default-model gate sets `production_score` to zero for failed models, even when `candidate_fit` is high",
+        "The default-model gate sets `production_score` to zero for non-passing models, even when `overall_fit` or a workload role is useful",
         "",
-        table(["rank", "model", "readiness", "production_score", "candidate_fit", "gate", "first_blocker"], readiness_rows),
+        table(["rank", "model", "readiness", "production_score", "overall_fit", "gate", "first_blocker"], readiness_rows),
         "",
         "## <=2.0 GB Artifact Candidates",
         "",
         "The Otlet-small track includes models whose measured artifact in the run is at or below 2.0 GB",
         "",
-        table(["rank", "model", "candidate_fit", "trusted_gate", "resource_fit", "schema", "p95_ms", "rss_gb", "artifact_gb"], small_candidate_rows)
+        table(["rank", "model", "overall_fit", "trusted_quality", "resource_fit", "schema", "p95_ms", "rss_gb", "artifact_gb"], small_candidate_rows)
         if small_candidate_rows
         else "The run measured no <=2.0 GB artifact candidates",
         "",
@@ -1636,9 +1918,9 @@ def main():
         if out_of_running_rows
         else "No selected models were out of running",
         "",
-        "## Candidate Fit Ranking",
+        "## Overall Fit Ranking",
         "",
-        "The report ranks models by `candidate_fit`, not default readiness. Use this table to choose what to improve or rerun. The production readiness table above decides whether a model is safe to call a default Otlet model",
+        "The report ranks models by `overall_fit`, not default readiness. Use this table to choose what to improve or rerun. The production readiness table above decides whether a model is safe to call a default Otlet model",
         "",
         table(
             [
@@ -1648,12 +1930,12 @@ def main():
                 "verdict",
                 "readiness",
                 "production_score",
-                "candidate_fit",
+                "overall_fit",
                 "diagnostic_fit",
                 "fit_min",
                 "fit_max",
                 "fit_sd",
-                "trusted_gate",
+                "trusted_quality",
                 "schema",
                 "diag_decision",
                 "trusted_decision",
@@ -1667,7 +1949,7 @@ def main():
                 "rss_gb",
                 "artifact_gb",
                 "correct_jobs_s_gb",
-                "candidate_fit_jobs_s_gb",
+                "overall_fit_jobs_s_gb",
                 "quality_per_active_b",
                 "resource_fit",
             ],
@@ -1690,7 +1972,7 @@ def main():
         "",
         "## Charts",
         "",
-        f"- Overall score: `{overall.name}`",
+        f"- Overall fit chart: `{overall.name}`",
         f"- Pareto: `{pareto.name}`",
         f"- Params: `{params.name}`",
         f"- Latency: `{latency.name}`",
@@ -1704,9 +1986,9 @@ def main():
         "",
         "## Run Metadata",
         "",
-        table(["key", "value"], [{"key": k, "value": v} for k, v in sorted(meta.items())]),
+        table(["key", "value"], [{"key": k, "value": v} for k, v in sorted(meta.items()) if k != "reproduction_command"]),
         "",
-        "## Candidate Models",
+        "## Ranked Models",
         "",
         table(
             [
@@ -1731,11 +2013,11 @@ def main():
         "## Reproduce",
         "",
         "```sh",
-        meta.get("reproduction_command", "OTLET_BENCH_LIMIT_MODELS=linked_qwen_0_6b,linked_qwen_1_7b OTLET_BENCH_RUNS=1 ./benchmarks/run.sh"),
+        recommended_command,
         "```",
         "",
     ]
-    report.write_text("\n".join(lines), encoding="utf-8")
+    report.write_text("\n".join(clean_lines(lines)), encoding="utf-8")
     write_index_readme(
         run_dir,
         {
@@ -1752,6 +2034,8 @@ def main():
             "meta": meta,
             "direct_gate_skip_count": len(direct_gate_skips),
             "min_direct_schema_rate": min_direct_schema_rate,
+            "default_model_keys": default_model_keys,
+            "comparison_model_keys": comparison_model_keys,
         },
     )
     print(report)
