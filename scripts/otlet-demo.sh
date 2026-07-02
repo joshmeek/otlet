@@ -6,6 +6,7 @@ runtime_name="${OTLET_RUNTIME_NAME:-linked_inproc}"
 runtime_endpoint="${OTLET_RUNTIME_ENDPOINT:-linked}"
 cheap_model_name="${OTLET_CHEAP_MODEL_NAME:-qwen3_1_7b}"
 strong_model_name="${OTLET_STRONG_MODEL_NAME:-qwen35_4b}"
+strong_alias_model_name="${OTLET_STRONG_ALIAS_MODEL_NAME:-qwen35_4b_policy_alias}"
 cheap_model_artifact="${OTLET_CHEAP_MODEL_ARTIFACT:-}"
 strong_model_artifact="${OTLET_STRONG_MODEL_ARTIFACT:-}"
 entity_task="${OTLET_ENTITY_TASK_NAME:-entity_resolution_demo}"
@@ -102,12 +103,14 @@ register_runtime_models() {
     -v cheap_model_name="$cheap_model_name" \
     -v cheap_model_artifact="$cheap_model_artifact" \
     -v strong_model_name="$strong_model_name" \
+    -v strong_alias_model_name="$strong_alias_model_name" \
     -v strong_model_artifact="$strong_model_artifact" >/dev/null <<'SQL'
 SET client_min_messages TO warning;
 CREATE EXTENSION IF NOT EXISTS otlet;
 SELECT otlet.register_runtime(:'runtime_name', :'runtime_endpoint');
 SELECT otlet.register_model(:'cheap_model_name', :'cheap_model_artifact', :'runtime_name');
 SELECT otlet.register_model(:'strong_model_name', :'strong_model_artifact', :'runtime_name');
+SELECT otlet.register_model(:'strong_alias_model_name', :'strong_model_artifact', :'runtime_name');
 SQL
 }
 
@@ -222,6 +225,7 @@ SQL
 cleanup_task "row_review_demo"
 cleanup_task "entity_hypothesis_demo"
 cleanup_task "row_triage_demo"
+cleanup_task "row_triage_policy_demo"
 cleanup_task "$entity_task"
 cleanup_task "$join_task"
 
@@ -344,6 +348,79 @@ WHERE r.task_name = 'row_triage_demo';
 echo "row_triage_contract=$row_triage_contract"
 [ "$row_triage_contract" = "1|flag|high|1|1" ] || {
   echo "Expected non-ER triage task to produce one flagged output and one valid review action, got $row_triage_contract" >&2
+  exit 1
+}
+
+log "Running non-ER triage selection policy"
+psql_exec \
+  -v cheap_policy_model="$strong_model_name" \
+  -v strong_policy_model="$strong_alias_model_name" >/dev/null <<'SQL'
+INSERT INTO public.otlet_demo_triage_signal
+VALUES (
+  'triage-unclear',
+  0,
+  0,
+  'No decisive blocker and no approval evidence; send to human review'
+)
+ON CONFLICT (id) DO UPDATE
+  SET blockers = EXCLUDED.blockers,
+      approvals = EXCLUDED.approvals,
+      evidence = EXCLUDED.evidence;
+
+SELECT otlet.create_task(
+  'row_triage_policy_demo',
+  $$
+    SELECT
+      id AS subject_id,
+      jsonb_build_object(
+        'case_id', id,
+        'signals', jsonb_build_object('blockers', blockers, 'approvals', approvals),
+        'evidence', evidence
+      ) AS input
+    FROM public.otlet_demo_triage_signal
+    WHERE id = 'triage-unclear'
+  $$,
+  'Classify one operational row. If blockers > 0, output decision flag with confidence high and one review_flag action. If blockers = 0 and approvals > 0, output decision pass with confidence high and no actions. Otherwise output decision unclear with confidence medium and one review_flag action with severity medium. Return JSON only.',
+  '{
+    "type": "object",
+    "required": ["decision", "confidence", "reason"],
+    "additionalProperties": false,
+    "properties": {
+      "decision": {"enum": ["flag", "pass", "unclear"]},
+      "confidence": {"enum": ["low", "medium", "high"]},
+      "reason": {"type": "string", "maxLength": 160}
+    }
+  }'::jsonb,
+  :'cheap_policy_model',
+  '{"max_tokens":160,"reasoning":"off","inference_cache":true}'::jsonb,
+  '{"evidence_fields":["signals"]}'::jsonb,
+  '{"answer_field":"decision","abstain_values":["unclear"],"confidence_field":"confidence","accepted_confidence":["high","medium"]}'::jsonb
+);
+SELECT otlet.set_model_selection_policy(
+  'row_triage_policy_demo',
+  :'cheap_policy_model',
+  :'strong_policy_model',
+  '{"answer_field":"decision","abstain_values":["unclear"],"confidence_field":"confidence","accepted_confidence":["high","medium"]}'::jsonb
+);
+SELECT otlet.run_task('row_triage_policy_demo');
+SQL
+wait_task_complete "row_triage_policy_demo" 1 900 1
+
+row_triage_policy_contract="$(psql_value "
+WITH attempts AS (
+  SELECT selection_role, selection_status, selection_reason
+  FROM otlet.model_selection_attempts
+  WHERE task_name = 'row_triage_policy_demo'
+)
+SELECT
+  (SELECT count(*) FROM attempts WHERE selection_role = 'cheap' AND selection_status = 'rejected' AND selection_reason = 'abstained_output')::text || '|' ||
+  (SELECT count(*) FROM attempts WHERE selection_role = 'strong' AND selection_status = 'accepted')::text || '|' ||
+  COALESCE((SELECT output->>'decision' FROM otlet.runs WHERE task_name = 'row_triage_policy_demo'), '') || '|' ||
+  (SELECT count(*) FROM otlet.action_status WHERE task_name = 'row_triage_policy_demo' AND action_type = 'review_flag')::text;
+")"
+echo "row_triage_policy_contract=$row_triage_policy_contract"
+[ "$row_triage_policy_contract" = "1|1|unclear|1" ] || {
+  echo "Expected declared triage policy to reject cheap unclear then accept strong unclear with one review action, got $row_triage_policy_contract" >&2
   exit 1
 }
 
