@@ -434,12 +434,24 @@ BEGIN
 END;
 $$;
 
-CREATE FUNCTION otlet.action_validation_error(action jsonb) RETURNS text
+CREATE FUNCTION otlet.action_validation_error(
+  action jsonb,
+  output jsonb DEFAULT NULL,
+  job_subject_id text DEFAULT NULL
+) RETURNS text
 LANGUAGE plpgsql
 STABLE
 AS $$
 DECLARE
   v_action_type text := COALESCE(action ->> 'type', '');
+  body jsonb := action -> 'body';
+  output_match text := NULLIF(output ->> 'match', '');
+  output_confidence text := NULLIF(output ->> 'confidence', '');
+  action_confidence text;
+  output_rank int;
+  action_rank int;
+  expected_left_id text;
+  expected_right_id text;
 BEGIN
   IF jsonb_typeof(action) IS DISTINCT FROM 'object' THEN
     RETURN 'action must be an object';
@@ -447,6 +459,14 @@ BEGIN
 
   IF v_action_type = '' THEN
     RETURN 'action missing type';
+  END IF;
+
+  IF EXISTS (
+    SELECT 1
+    FROM jsonb_object_keys(action) AS key
+    WHERE key NOT IN ('type', 'body')
+  ) THEN
+    RETURN 'action has unsupported key';
   END IF;
 
   IF NOT EXISTS (
@@ -457,80 +477,129 @@ BEGIN
     RETURN 'unsupported action type';
   END IF;
 
+  IF jsonb_typeof(body) IS DISTINCT FROM 'object' THEN
+    RETURN 'action body must be an object';
+  END IF;
+
+  IF job_subject_id LIKE '%:%' THEN
+    expected_left_id := split_part(job_subject_id, ':', 1);
+    expected_right_id := split_part(job_subject_id, ':', 2);
+  END IF;
+
+  IF output_confidence IS NOT NULL THEN
+    output_rank := CASE output_confidence
+      WHEN 'low' THEN 1
+      WHEN 'medium' THEN 2
+      WHEN 'high' THEN 3
+      ELSE NULL
+    END;
+  END IF;
+
   IF v_action_type = 'create_record' THEN
     IF NULLIF(action ->> 'record_type', '') IS NULL THEN
       RETURN 'create_record missing record_type';
-    END IF;
-    IF jsonb_typeof(action -> 'body') IS DISTINCT FROM 'object' THEN
-      RETURN 'create_record body must be an object';
     END IF;
     RETURN NULL;
   END IF;
 
   IF v_action_type = 'merge_candidate' THEN
-    IF NULLIF(action ->> 'left_id', '') IS NULL THEN
+    IF output_match IS NOT NULL AND output_match <> 'same_entity' THEN
+      RETURN 'merge_candidate requires same_entity output';
+    END IF;
+    IF NULLIF(body ->> 'left_id', '') IS NULL THEN
       RETURN 'merge_candidate missing left_id';
     END IF;
-    IF NULLIF(action ->> 'right_id', '') IS NULL THEN
+    IF NULLIF(body ->> 'right_id', '') IS NULL THEN
       RETURN 'merge_candidate missing right_id';
     END IF;
-    IF jsonb_typeof(action -> 'confidence') = 'number' THEN
-      IF (action ->> 'confidence')::numeric < 0 OR (action ->> 'confidence')::numeric > 1 THEN
-        RETURN 'merge_candidate numeric confidence must be between 0 and 1';
-      END IF;
-    ELSIF action ->> 'confidence' NOT IN ('low', 'medium', 'high') THEN
-      RETURN 'merge_candidate confidence must be low, medium, high, or a number between 0 and 1';
+    IF expected_left_id IS NOT NULL
+       AND (body ->> 'left_id' <> expected_left_id OR body ->> 'right_id' <> expected_right_id) THEN
+      RETURN 'merge_candidate subject ids must match job subject_id';
     END IF;
-    IF NULLIF(action ->> 'reason', '') IS NULL THEN
+    action_confidence := body ->> 'confidence';
+    IF action_confidence NOT IN ('low', 'medium', 'high') THEN
+      RETURN 'merge_candidate confidence must be low, medium, or high';
+    END IF;
+    action_rank := CASE action_confidence WHEN 'low' THEN 1 WHEN 'medium' THEN 2 WHEN 'high' THEN 3 END;
+    IF output_rank IS NOT NULL AND action_rank > output_rank THEN
+      RETURN 'merge_candidate confidence cannot exceed output confidence';
+    END IF;
+    IF NULLIF(body ->> 'reason', '') IS NULL THEN
       RETURN 'merge_candidate missing reason';
     END IF;
-    IF COALESCE(jsonb_typeof(action -> 'evidence'), '') NOT IN ('array', 'string') THEN
+    IF body ? 'evidence'
+       AND COALESCE(jsonb_typeof(body -> 'evidence'), '') NOT IN ('array', 'string') THEN
       RETURN 'merge_candidate evidence must be an array or string';
+    END IF;
+    IF body ? 'evidence'
+       AND ((jsonb_typeof(body -> 'evidence') = 'array' AND jsonb_array_length(body -> 'evidence') = 0)
+       OR (jsonb_typeof(body -> 'evidence') = 'string' AND btrim(body ->> 'evidence') = '')) THEN
+      RETURN 'merge_candidate missing decisive evidence';
     END IF;
     RETURN NULL;
   END IF;
 
   IF v_action_type = 'new_entity' THEN
-    IF NULLIF(action ->> 'entity_id', '') IS NULL THEN
+    IF output_match IS NOT NULL AND output_match <> 'different_entity' THEN
+      RETURN 'new_entity requires different_entity output';
+    END IF;
+    IF NULLIF(body ->> 'entity_id', '') IS NULL THEN
       RETURN 'new_entity missing entity_id';
     END IF;
-    IF NULLIF(action ->> 'reason', '') IS NULL THEN
+    IF expected_right_id IS NOT NULL AND body ->> 'entity_id' <> expected_right_id THEN
+      RETURN 'new_entity entity_id must match job right subject_id';
+    END IF;
+    IF NULLIF(body ->> 'reason', '') IS NULL THEN
       RETURN 'new_entity missing reason';
     END IF;
-    IF COALESCE(jsonb_typeof(action -> 'evidence'), '') NOT IN ('array', 'string') THEN
+    IF body ? 'evidence'
+       AND COALESCE(jsonb_typeof(body -> 'evidence'), '') NOT IN ('array', 'string') THEN
       RETURN 'new_entity evidence must be an array or string';
+    END IF;
+    IF body ? 'evidence'
+       AND ((jsonb_typeof(body -> 'evidence') = 'array' AND jsonb_array_length(body -> 'evidence') = 0)
+       OR (jsonb_typeof(body -> 'evidence') = 'string' AND btrim(body ->> 'evidence') = '')) THEN
+      RETURN 'new_entity missing separation evidence';
     END IF;
     RETURN NULL;
   END IF;
 
   IF v_action_type = 'review_flag' THEN
-    IF NULLIF(action ->> 'reason', '') IS NULL THEN
+    IF output_match IS NOT NULL AND output_match <> 'unclear' THEN
+      RETURN 'review_flag requires unclear output';
+    END IF;
+    IF expected_left_id IS NOT NULL
+       AND NULLIF(body ->> 'left_id', '') IS NOT NULL
+       AND (body ->> 'left_id' <> expected_left_id OR body ->> 'right_id' <> expected_right_id) THEN
+      RETURN 'review_flag subject ids must match job subject_id';
+    END IF;
+    IF NULLIF(body ->> 'reason', '') IS NULL THEN
       RETURN 'review_flag missing reason';
     END IF;
-    IF action ->> 'severity' NOT IN ('low', 'medium', 'high') THEN
+    IF body ->> 'severity' NOT IN ('low', 'medium', 'high') THEN
       RETURN 'review_flag severity must be low, medium, or high';
     END IF;
     RETURN NULL;
   END IF;
 
   IF v_action_type = 'note' THEN
-    IF NULLIF(action ->> 'subject_id', '') IS NULL THEN
+    IF NULLIF(body ->> 'subject_id', '') IS NULL THEN
       RETURN 'note missing subject_id';
     END IF;
-    IF jsonb_typeof(action -> 'body') IS DISTINCT FROM 'object' THEN
-      RETURN 'note body must be an object';
+    IF NULLIF(body ->> 'text', '') IS NULL THEN
+      RETURN 'note missing text';
     END IF;
     RETURN NULL;
   END IF;
 
   IF v_action_type = 'follow_up_job' THEN
-    IF NULLIF(action ->> 'task_name', '') IS NULL THEN
+    IF NULLIF(body ->> 'task_name', '') IS NULL THEN
       RETURN 'follow_up_job missing task_name';
     END IF;
-    IF NULLIF(action ->> 'subject_id', '') IS NULL THEN
+    IF NULLIF(body ->> 'subject_id', '') IS NULL THEN
       RETURN 'follow_up_job missing subject_id';
     END IF;
-    IF NULLIF(action ->> 'reason', '') IS NULL THEN
+    IF NULLIF(body ->> 'reason', '') IS NULL THEN
       RETURN 'follow_up_job missing reason';
     END IF;
     RETURN NULL;
@@ -567,6 +636,7 @@ DECLARE
   runtime_row otlet.runtimes%ROWTYPE;
   action jsonb;
   action_payload jsonb;
+  action_body jsonb;
   saved_action_id bigint;
   action_error text;
   action_type_name text;
@@ -670,8 +740,12 @@ BEGIN
       WHEN jsonb_typeof(action) = 'object' THEN action
       ELSE jsonb_build_object('invalid_action', action)
     END;
+    action_body := CASE
+      WHEN jsonb_typeof(action_payload -> 'body') = 'object' THEN action_payload -> 'body'
+      ELSE '{}'::jsonb
+    END;
     action_type_name := COALESCE(NULLIF(action ->> 'type', ''), 'invalid');
-    action_error := otlet.action_validation_error(action);
+    action_error := otlet.action_validation_error(action, complete_job.output, job_row.subject_id);
     action_requires_approval := false;
     action_creates_record := false;
     IF action_error IS NULL THEN
@@ -684,6 +758,9 @@ BEGIN
       NULLIF(action_payload ->> 'subject_id', ''),
       NULLIF(action_payload ->> 'entity_id', ''),
       NULLIF(action_payload ->> 'right_id', ''),
+      NULLIF(action_body ->> 'subject_id', ''),
+      NULLIF(action_body ->> 'entity_id', ''),
+      NULLIF(action_body ->> 'right_id', ''),
       job_row.subject_id
     );
     action_status := CASE
@@ -720,7 +797,10 @@ BEGIN
       action_approval_status,
       action_subject_id,
       complete_job.trace_summary #>> '{mvcc,table}',
-      complete_job.trace_summary #>> '{mvcc,source_hash}',
+      COALESCE(
+        complete_job.trace_summary #>> '{mvcc,source_hash}',
+        md5((complete_job.trace_summary -> 'mvcc')::text)
+      ),
       action_error
     )
     RETURNING id INTO saved_action_id;
@@ -730,7 +810,7 @@ BEGIN
         WHEN action_type_name = 'note' THEN COALESCE(NULLIF(action_payload ->> 'record_type', ''), 'note')
         ELSE action_payload ->> 'record_type'
       END;
-      action_record_body := action_payload -> 'body';
+      action_record_body := action_body;
 
       INSERT INTO otlet.records (action_id, record_type, subject_id, body)
       VALUES (
@@ -879,6 +959,162 @@ BEGIN
 
   RETURN NEXT action_row;
 END;
+$$;
+
+CREATE FUNCTION otlet.label_action(
+  action_id bigint,
+  expected_match text DEFAULT NULL,
+  expected_confidence text DEFAULT NULL,
+  expected_action_type text DEFAULT NULL,
+  reason text DEFAULT NULL,
+  label_source text DEFAULT NULL
+) RETURNS SETOF otlet.eval_labels
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  action_row otlet.actions%ROWTYPE;
+  output_body jsonb;
+  receipt_trace jsonb;
+  saved_label otlet.eval_labels%ROWTYPE;
+  final_source text;
+  final_match text;
+  final_confidence text;
+  final_action_type text;
+BEGIN
+  SELECT a.*
+  INTO action_row
+  FROM otlet.actions a
+  WHERE a.id = label_action.action_id;
+
+  IF NOT FOUND THEN
+    RETURN;
+  END IF;
+
+  SELECT o.output
+  INTO output_body
+  FROM otlet.outputs o
+  WHERE o.id = action_row.output_id;
+
+  SELECT r.trace_summary
+  INTO receipt_trace
+  FROM otlet.inference_receipts r
+  WHERE r.id = action_row.receipt_id;
+
+  final_source := COALESCE(
+    NULLIF(label_action.label_source, ''),
+    CASE
+      WHEN action_row.status IN ('approved', 'applied') OR action_row.approval_status = 'approved' THEN 'approved_action'
+      WHEN action_row.status = 'rejected' OR action_row.approval_status = 'rejected' THEN 'rejected_action'
+      ELSE 'manual_correction'
+    END
+  );
+
+  final_match := COALESCE(
+    NULLIF(label_action.expected_match, ''),
+    CASE
+      WHEN action_row.action_type = 'merge_candidate' AND final_source = 'approved_action' THEN 'same_entity'
+      WHEN action_row.action_type = 'merge_candidate' AND final_source = 'rejected_action' THEN 'different_entity'
+      WHEN action_row.action_type = 'new_entity' AND final_source = 'approved_action' THEN 'different_entity'
+      WHEN action_row.action_type = 'review_flag' AND final_source = 'approved_action' THEN 'unclear'
+      ELSE output_body ->> 'match'
+    END
+  );
+  final_confidence := COALESCE(
+    NULLIF(label_action.expected_confidence, ''),
+    output_body ->> 'confidence',
+    CASE WHEN final_match = 'unclear' THEN 'medium' ELSE 'high' END
+  );
+  final_action_type := COALESCE(NULLIF(label_action.expected_action_type, ''), action_row.action_type);
+
+  INSERT INTO otlet.eval_labels (
+    action_id,
+    output_id,
+    receipt_id,
+    source_table,
+    subject_id,
+    source_hash,
+    expected_match,
+    expected_confidence,
+    expected_action_type,
+    label_source,
+    reason
+  )
+  VALUES (
+    action_row.id,
+    action_row.output_id,
+    action_row.receipt_id,
+    COALESCE(action_row.source_table, receipt_trace #>> '{mvcc,table}'),
+    COALESCE(action_row.subject_id, ''),
+    COALESCE(
+      action_row.source_hash,
+      receipt_trace #>> '{mvcc,source_hash}',
+      md5((receipt_trace -> 'mvcc')::text)
+    ),
+    final_match,
+    final_confidence,
+    final_action_type,
+    final_source,
+    label_action.reason
+  )
+  RETURNING * INTO saved_label;
+
+  RETURN NEXT saved_label;
+END;
+$$;
+
+CREATE FUNCTION otlet.export_eval_cases(max_rows integer DEFAULT 1000)
+RETURNS TABLE (
+  label_id bigint,
+  fixture_source text,
+  case_kind text,
+  manual_gold boolean,
+  source_table text,
+  subject_id text,
+  source_hash text,
+  expected_match text,
+  expected_confidence text,
+  expected_action_type text,
+  label_source text,
+  reason text,
+  action_id bigint,
+  output_id bigint,
+  receipt_id bigint,
+  created_at timestamptz
+)
+LANGUAGE sql
+STABLE
+AS $$
+  SELECT
+    l.id,
+    'otlet_eval_labels_generated'::text,
+    CASE
+      WHEN l.expected_action_type = 'merge_candidate'
+        AND l.expected_match = 'same_entity' THEN 'positive_duplicate'
+      WHEN a.action_type = 'merge_candidate'
+        AND l.expected_match = 'different_entity' THEN 'false_merge'
+      WHEN l.expected_action_type = 'new_entity'
+        AND l.expected_match = 'different_entity' THEN 'hard_negative'
+      WHEN l.expected_action_type = 'review_flag'
+        OR l.expected_match = 'unclear' THEN 'abstention'
+      ELSE 'entity_resolution'
+    END,
+    l.label_source = 'manual_correction',
+    l.source_table,
+    l.subject_id,
+    l.source_hash,
+    l.expected_match,
+    l.expected_confidence,
+    l.expected_action_type,
+    l.label_source,
+    l.reason,
+    l.action_id,
+    l.output_id,
+    l.receipt_id,
+    l.created_at
+  FROM otlet.eval_labels l
+  LEFT JOIN otlet.actions a ON a.id = l.action_id
+  ORDER BY l.created_at DESC, l.id DESC
+  LIMIT GREATEST(0, LEAST(COALESCE(max_rows, 1000), 100000));
 $$;
 
 CREATE FUNCTION otlet.fail_job(

@@ -118,35 +118,29 @@ fn model_actions(json: &Value) -> Result<Value, String> {
 
     let mut normalized = Vec::with_capacity(actions.len());
     for action in actions {
-        let mut object = match action {
-            Value::Object(mut object) => {
-                if object.len() == 1 && object.contains_key("action") {
-                    match object.remove("action") {
-                        Some(Value::Object(inner)) => inner,
-                        _ => return Err("model JSON action wrapper must contain object".to_owned()),
-                    }
-                } else {
-                    object
-                }
-            }
-            Value::String(text) => {
-                let parsed = serde_json::from_str::<Value>(&text)
-                    .map_err(|_| "model JSON action string must contain JSON object".to_owned())?;
-                let Value::Object(object) = parsed else {
-                    return Err("model JSON action string must contain JSON object".to_owned());
-                };
-                object
-            }
-            _ => return Err("model JSON actions must contain objects".to_owned()),
+        let Value::Object(object) = action else {
+            return Err("model JSON actions must contain objects".to_owned());
         };
-        if !object.contains_key("type") {
-            if let Some(action_type) = object.remove("action_type") {
-                object.insert("type".to_owned(), action_type);
-            }
+        if let Some(extra_key) = object.keys().find(|key| *key != "type" && *key != "body") {
+            return Err(format!(
+                "model JSON action unsupported key: {extra_key}"
+            ));
         }
-        if !object.contains_key("type") {
+
+        let Some(action_type) = object.get("type").and_then(Value::as_str) else {
             return Err("model JSON actions must contain type".to_owned());
+        };
+        if action_type.trim().is_empty() {
+            return Err("model JSON action type must not be empty".to_owned());
         }
+
+        let Some(body) = object.get("body") else {
+            return Err("model JSON actions must contain body".to_owned());
+        };
+        if !body.is_object() {
+            return Err("model JSON action body must be an object".to_owned());
+        }
+
         normalized.push(Value::Object(object));
     }
 
@@ -154,57 +148,32 @@ fn model_actions(json: &Value) -> Result<Value, String> {
 }
 
 fn parse_model_json(raw_output: &str) -> Result<(Value, String), String> {
-    let mut output_object: Option<(Value, String)> = None;
-    let mut actions_object: Option<(Value, String)> = None;
-
-    // Scan model chatter until it can emit clean JSON only
-    for (index, _) in raw_output.char_indices().filter(|(_, ch)| *ch == '{') {
-        let rest = &raw_output[index..];
-        let mut values = serde_json::Deserializer::from_str(rest).into_iter::<Value>();
-
-        if let Some(Ok(value)) = values.next() {
-            let raw_json = rest[..values.byte_offset()].to_owned();
-            if value.get("output").is_some() && value.get("actions").is_some() {
-                return Ok((value, raw_json));
-            }
-            if value.get("output").is_some() {
-                let mut output_value = value["output"].clone();
-                if let Some(actions) = output_value.get("actions").cloned() {
-                    if let Value::Object(object) = &mut output_value {
-                        object.remove("actions");
-                    }
-                    return Ok((
-                        json!({
-                            "output": output_value,
-                            "actions": actions,
-                        }),
-                        raw_json,
-                    ));
-                }
-            }
-            if value.get("output").is_some() && output_object.is_none() {
-                output_object = Some((value.clone(), raw_json.clone()));
-            }
-            if value.get("actions").is_some() && actions_object.is_none() {
-                actions_object = Some((value, raw_json));
-            }
-            if let (Some((output, output_raw)), Some((actions, actions_raw))) =
-                (&output_object, &actions_object)
-            {
-                let mut output_value = output["output"].clone();
-                if let Value::Object(object) = &mut output_value {
-                    object.remove("actions");
-                }
-                return Ok((
-                    json!({
-                        "output": output_value,
-                        "actions": actions["actions"].clone(),
-                    }),
-                    format!("{output_raw}\n{actions_raw}"),
-                ));
-            }
-        }
+    let trimmed = raw_output.trim();
+    if trimmed.starts_with("```") || trimmed.ends_with("```") {
+        return Err(format!(
+            "invalid model JSON: markdown fences are not allowed: {}",
+            trim_error(raw_output)
+        ));
     }
 
-    Err(format!("invalid model JSON: {}", trim_error(raw_output)))
+    let value = serde_json::from_str::<Value>(trimmed)
+        .map_err(|err| format!("invalid model JSON: {err}: {}", trim_error(raw_output)))?;
+    let Value::Object(object) = &value else {
+        return Err("model JSON must be an object".to_owned());
+    };
+    if !object.contains_key("output") {
+        return Err("model JSON missing output".to_owned());
+    }
+    if !object.contains_key("actions") {
+        return Err("model JSON missing actions".to_owned());
+    }
+    if object
+        .get("output")
+        .and_then(|output| output.get("actions"))
+        .is_some()
+    {
+        return Err("model JSON output must not contain actions".to_owned());
+    }
+
+    Ok((value, trimmed.to_owned()))
 }

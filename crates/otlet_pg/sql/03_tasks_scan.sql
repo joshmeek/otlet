@@ -21,6 +21,68 @@ AS $$
   RETURNING *;
 $$;
 
+CREATE FUNCTION otlet.ask(
+  model_name text,
+  instruction text,
+  input jsonb DEFAULT '{}'::jsonb,
+  output_schema jsonb DEFAULT '{"type":"object"}'::jsonb,
+  runtime_options jsonb DEFAULT '{"max_tokens":256}'::jsonb,
+  timeout_ms integer DEFAULT 30000
+) RETURNS TABLE (
+  output jsonb,
+  job_id bigint,
+  receipt_id bigint,
+  raw_output_hash text
+)
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  actual_input jsonb := COALESCE(ask.input, '{}'::jsonb);
+  actual_schema jsonb := COALESCE(ask.output_schema, '{"type":"object"}'::jsonb);
+  actual_options jsonb := COALESCE(ask.runtime_options, '{"max_tokens":256}'::jsonb);
+  direct_task_name text;
+  direct_subject_id text;
+  completed_job_id bigint;
+BEGIN
+  direct_task_name := 'ask_' || substr(md5(
+    ask.model_name || chr(10) ||
+    ask.instruction || chr(10) ||
+    actual_schema::text || chr(10) ||
+    actual_options::text
+  ), 1, 24);
+  direct_subject_id := 'ask_' || substr(md5(
+    clock_timestamp()::text || chr(10) ||
+    random()::text || chr(10) ||
+    actual_input::text
+  ), 1, 24);
+
+  completed_job_id := otlet.worker_infer_now(
+    direct_task_name,
+    direct_subject_id,
+    actual_input,
+    LEAST(GREATEST(COALESCE(ask.timeout_ms, 30000), 0), 30000),
+    ask.model_name,
+    ask.instruction,
+    actual_schema,
+    actual_options
+  );
+
+  IF completed_job_id = 0 THEN
+    RAISE EXCEPTION 'otlet ask worker is busy';
+  END IF;
+
+  RETURN QUERY
+    SELECT r.output, r.job_id, r.receipt_id, r.raw_output_hash
+    FROM otlet.runs r
+    WHERE r.job_id = completed_job_id
+      AND r.output_id IS NOT NULL;
+
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'otlet ask job % produced no trusted output', completed_job_id;
+  END IF;
+END;
+$$;
+
 CREATE FUNCTION otlet.set_model_selection_policy(
   task_name text,
   cheap_model_name text,

@@ -172,7 +172,8 @@ fn run_linked(
         let token_text = linked_token_to_piece(cache.vocab, token);
         output.push_str(&token_text);
         detailed_trace.observe(token, token_text, sample);
-        if linked_output_complete(&output) {
+        if let Some(end) = linked_output_complete_end(&output) {
+            output.truncate(end);
             stop_reason = "json_complete".to_owned();
             break;
         }
@@ -525,8 +526,44 @@ fn linked_clear_context(context: *mut llama_cpp_sys_4::llama_context) {
     }
 }
 
-fn linked_output_complete(output: &str) -> bool {
-    parse_model_json(output).is_ok()
+fn linked_output_complete_end(output: &str) -> Option<usize> {
+    let mut depth = 0_i32;
+    let mut in_string = false;
+    let mut escape = false;
+    let mut seen_open = false;
+
+    for (index, ch) in output.char_indices() {
+        if in_string {
+            if escape {
+                escape = false;
+            } else if ch == '\\' {
+                escape = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+
+        match ch {
+            '"' => in_string = true,
+            '{' => {
+                depth += 1;
+                seen_open = true;
+            }
+            '}' => {
+                depth -= 1;
+                if seen_open && depth == 0 {
+                    return Some(index + ch.len_utf8());
+                }
+                if depth < 0 {
+                    return Some(index);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    None
 }
 
 fn linked_cancel_requested(job_id: i64) -> Result<bool, ModelError> {

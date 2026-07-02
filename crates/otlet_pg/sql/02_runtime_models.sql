@@ -64,10 +64,14 @@ CREATE FUNCTION otlet.worker_infer_now(
   task_name text,
   subject_id text,
   input jsonb,
-  timeout_ms integer DEFAULT 10000
+  timeout_ms integer DEFAULT 10000,
+  model_name text DEFAULT NULL,
+  instruction text DEFAULT NULL,
+  output_schema jsonb DEFAULT NULL,
+  runtime_options jsonb DEFAULT NULL
 ) RETURNS bigint
 AS 'MODULE_PATHNAME', 'otlet_worker_infer_now'
-LANGUAGE C STRICT;
+LANGUAGE C;
 
 CREATE FUNCTION otlet.worker_infer_now_state() RETURNS jsonb
 AS 'MODULE_PATHNAME', 'otlet_worker_infer_now_state'

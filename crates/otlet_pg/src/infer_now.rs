@@ -9,6 +9,7 @@ const STATE_FAILED: u32 = 4;
 
 const TASK_CAP: usize = 128;
 const SUBJECT_CAP: usize = 256;
+const INLINE_TASK_CAP: usize = 12 * 1024;
 const INPUT_CAP: usize = 8192;
 const ERROR_CAP: usize = 512;
 const MAX_WAIT_MS: u32 = 30_000;
@@ -30,10 +31,12 @@ struct InferNowSlot {
     last_worker_run_ms: u64,
     task_len: u32,
     subject_len: u32,
+    inline_task_len: u32,
     input_len: u32,
     error_len: u32,
     task: [u8; TASK_CAP],
     subject: [u8; SUBJECT_CAP],
+    inline_task: [u8; INLINE_TASK_CAP],
     input: [u8; INPUT_CAP],
     error: [u8; ERROR_CAP],
 }
@@ -53,10 +56,12 @@ impl Default for InferNowSlot {
             last_worker_run_ms: 0,
             task_len: 0,
             subject_len: 0,
+            inline_task_len: 0,
             input_len: 0,
             error_len: 0,
             task: [0; TASK_CAP],
             subject: [0; SUBJECT_CAP],
+            inline_task: [0; INLINE_TASK_CAP],
             input: [0; INPUT_CAP],
             error: [0; ERROR_CAP],
         }
@@ -116,6 +121,7 @@ pub(crate) struct InferNowRequest {
     pub(crate) id: u64,
     pub(crate) task_name: String,
     pub(crate) subject_id: String,
+    pub(crate) inline_task: Option<Value>,
     pub(crate) input: Value,
 }
 
@@ -156,7 +162,21 @@ pub(crate) fn take_request() -> Option<InferNowRequest> {
     let id = slot.request_id;
     let task_name = read_buf(&slot.task, slot.task_len as usize);
     let subject_id = read_buf(&slot.subject, slot.subject_len as usize);
+    let inline_task_text = read_optional_buf(&slot.inline_task, slot.inline_task_len as usize);
     let input_text = read_buf(&slot.input, slot.input_len as usize);
+    let inline_task = match parse_optional_json("inline_task", inline_task_text.as_deref()) {
+        Ok(value) => value,
+        Err(err) => {
+            {
+                let slot = &mut state.slots[slot_index];
+                slot.state = STATE_FAILED;
+                write_error(slot, &err);
+            }
+            state.failed = state.failed.saturating_add(1);
+            signal_requester_latch(&state.slots[slot_index]);
+            return None;
+        }
+    };
     let input = match serde_json::from_str::<Value>(&input_text) {
         Ok(input) => input,
         Err(err) => {
@@ -185,6 +205,7 @@ pub(crate) fn take_request() -> Option<InferNowRequest> {
         id,
         task_name,
         subject_id,
+        inline_task,
         input,
     })
 }
@@ -288,14 +309,72 @@ pub(crate) fn request_infer_now(
     Ok(wait_for_submitted_infer_now(&submitted, timeout_ms)?.map(|completed| completed.job_id))
 }
 
+fn request_infer_now_with_inline_task(
+    task_name: &str,
+    subject_id: &str,
+    model_name: &str,
+    instruction: &str,
+    output_schema: &Value,
+    runtime_options: &Value,
+    input: &Value,
+    timeout_ms: u32,
+) -> Result<Option<i64>, String> {
+    let Some(submitted) = submit_infer_now_with_inline_task(
+        task_name,
+        subject_id,
+        model_name,
+        instruction,
+        output_schema,
+        runtime_options,
+        input,
+    )?
+    else {
+        return Ok(None);
+    };
+    crate::wake::signal_worker_latch_immediate();
+    Ok(wait_for_submitted_infer_now(&submitted, timeout_ms)?.map(|completed| completed.job_id))
+}
+
 pub(crate) fn submit_infer_now(
     task_name: &str,
     subject_id: &str,
     input: &Value,
 ) -> Result<Option<SubmittedInferNow>, String> {
     let input_text = serde_json::to_string(input).map_err(|err| err.to_string())?;
+    submit_infer_now_text(task_name, subject_id, None, &input_text)
+}
+
+fn submit_infer_now_with_inline_task(
+    task_name: &str,
+    subject_id: &str,
+    model_name: &str,
+    instruction: &str,
+    output_schema: &Value,
+    runtime_options: &Value,
+    input: &Value,
+) -> Result<Option<SubmittedInferNow>, String> {
+    let inline_task_text = serde_json::to_string(&json!({
+        "model_name": model_name,
+        "instruction": instruction,
+        "output_schema": output_schema,
+        "runtime_options": runtime_options
+    }))
+    .map_err(|err| err.to_string())?;
+    let input_text = serde_json::to_string(input).map_err(|err| err.to_string())?;
+    submit_infer_now_text(task_name, subject_id, Some(&inline_task_text), &input_text)
+}
+
+fn submit_infer_now_text(
+    task_name: &str,
+    subject_id: &str,
+    inline_task_text: Option<&str>,
+    input_text: &str,
+) -> Result<Option<SubmittedInferNow>, String> {
     check_len("task_name", task_name.len(), TASK_CAP)?;
     check_len("subject_id", subject_id.len(), SUBJECT_CAP)?;
+    if let Some(inline_task_text) = inline_task_text {
+        check_len("inline_task", inline_task_text.len(), INLINE_TASK_CAP)?;
+    }
     check_len("input", input_text.len(), INPUT_CAP)?;
 
     let request_id = {
@@ -325,6 +404,12 @@ pub(crate) fn submit_infer_now(
         slot.error_len = 0;
         slot.task_len = write_buf(&mut slot.task, task_name.as_bytes());
         slot.subject_len = write_buf(&mut slot.subject, subject_id.as_bytes());
+        slot.inline_task_len = inline_task_text
+            .map(|text| write_buf(&mut slot.inline_task, text.as_bytes()))
+            .unwrap_or_else(|| {
+                slot.inline_task.fill(0);
+                0
+            });
         slot.input_len = write_buf(&mut slot.input, input_text.as_bytes());
         request_id
     };
@@ -397,6 +482,8 @@ pub(crate) fn status_json() -> JsonB {
         "task_cap": TASK_CAP,
         "subject_bytes": last_slot.subject_len,
         "subject_cap": SUBJECT_CAP,
+        "inline_task_bytes": last_slot.inline_task_len,
+        "inline_task_cap": INLINE_TASK_CAP,
         "input_bytes": last_slot.input_len,
         "input_cap": INPUT_CAP,
         "error_cap": ERROR_CAP,
@@ -410,7 +497,7 @@ pub(crate) fn status_json() -> JsonB {
         "available_slots": state.slots.iter().filter(|slot| slot.state == STATE_IDLE).count(),
         "active_slot": active_slot,
         "admission_policy": INFER_NOW_ADMISSION_POLICY,
-        "cap_policy": "task_subject_input_byte_caps_reject_before_queue_insert",
+        "cap_policy": "task_subject_inline_task_input_byte_caps_reject_before_queue_insert",
         "timeout_policy": "requester_fail_closed_job_cancel_requested_no_late_materialization",
         "cancellation_policy": "timeout_calls_cancel_job_then_linked_runtime_checks_cancel_requested",
         "mutation_policy": "otlet_tables_only_no_user_table_mutation",
@@ -434,8 +521,29 @@ pub extern "C-unwind" fn otlet_worker_infer_now(fcinfo: pg_sys::FunctionCallInfo
     let timeout_ms = unsafe { pgrx::pg_getarg::<i32>(fcinfo, 3) }
         .unwrap_or(10_000)
         .clamp(0, MAX_WAIT_MS as i32) as u32;
+    let model_name = unsafe { pgrx::pg_getarg::<String>(fcinfo, 4) };
+    let instruction = unsafe { pgrx::pg_getarg::<String>(fcinfo, 5) }.unwrap_or_default();
+    let output_schema = unsafe { pgrx::pg_getarg::<JsonB>(fcinfo, 6) }
+        .map(|json| json.0)
+        .unwrap_or_else(|| json!({"type":"object"}));
+    let runtime_options = unsafe { pgrx::pg_getarg::<JsonB>(fcinfo, 7) }
+        .map(|json| json.0)
+        .unwrap_or_else(|| json!({}));
 
-    let job_id = match request_infer_now(&task_name, &subject_id, &input, timeout_ms) {
+    let job = match model_name.as_deref().filter(|name| !name.is_empty()) {
+        Some(model_name) => request_infer_now_with_inline_task(
+            &task_name,
+            &subject_id,
+            model_name,
+            &instruction,
+            &output_schema,
+            &runtime_options,
+            &input,
+            timeout_ms,
+        ),
+        None => request_infer_now(&task_name, &subject_id, &input, timeout_ms),
+    };
+    let job_id = match job {
         Ok(Some(job_id)) => job_id,
         Ok(None) => 0,
         Err(err) => {
@@ -597,6 +705,19 @@ fn write_buf(target: &mut [u8], value: &[u8]) -> u32 {
 
 fn read_buf(source: &[u8], len: usize) -> String {
     String::from_utf8_lossy(&source[..len.min(source.len())]).into_owned()
+}
+
+fn read_optional_buf(source: &[u8], len: usize) -> Option<String> {
+    (len > 0).then(|| read_buf(source, len))
+}
+
+fn parse_optional_json(label: &str, value: Option<&str>) -> Result<Option<Value>, String> {
+    value
+        .map(|value| {
+            serde_json::from_str::<Value>(value)
+                .map_err(|err| format!("infer-now {label} JSON parse failed: {err}"))
+        })
+        .transpose()
 }
 
 fn write_error(slot: &mut InferNowSlot, error: &str) {
