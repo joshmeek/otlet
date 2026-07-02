@@ -397,12 +397,18 @@ SELECT (count(*) FILTER (WHERE stale AND stale_reason = 'source_update') >= 1)::
 FROM otlet.semantic_materializations
 WHERE task_name = '$row_triage_task'
   AND subject_id = 'triage-1';
+SELECT otlet.semantic_matches('$row_triage_watch', 'triage-1', '{\"decision\":\"flag\"}'::jsonb)::text;
+SELECT count(*)::text
+FROM otlet.${row_triage_watch}_native
+WHERE subject_id = 'triage-1';
 ")"
 row_visible_fresh_before="$(head -n 1 <<<"$row_visible_stale_contract")"
-row_visible_source_update="$(tail -n 1 <<<"$row_visible_stale_contract")"
-echo "row_visible_update_stale_contract=$row_visible_fresh_before|$row_visible_source_update"
-[ "$row_visible_fresh_before|$row_visible_source_update" = "0|true" ] || {
-  echo "Expected visible row update to fail closed with source_update reason, got $row_visible_fresh_before|$row_visible_source_update" >&2
+row_visible_source_update="$(sed -n '2p' <<<"$row_visible_stale_contract")"
+row_visible_predicate_match="$(sed -n '3p' <<<"$row_visible_stale_contract")"
+row_visible_fdw_rows="$(tail -n 1 <<<"$row_visible_stale_contract")"
+echo "row_visible_update_stale_contract=$row_visible_fresh_before|$row_visible_source_update|$row_visible_predicate_match|$row_visible_fdw_rows"
+[ "$row_visible_fresh_before|$row_visible_source_update|$row_visible_predicate_match|$row_visible_fdw_rows" = "0|true|false|0" ] || {
+  echo "Expected visible row update to fail closed across lookup surfaces, got $row_visible_fresh_before|$row_visible_source_update|$row_visible_predicate_match|$row_visible_fdw_rows" >&2
   exit 1
 }
 wait_task_complete "$row_triage_task" 2 900 1
