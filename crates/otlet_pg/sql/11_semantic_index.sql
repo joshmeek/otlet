@@ -11,7 +11,7 @@ AS $$
   END;
 $$;
 
-CREATE FUNCTION otlet.create_semantic_index(
+CREATE FUNCTION otlet.create_watch_row_index(
   index_name text,
   table_name regclass,
   subject_column text,
@@ -135,7 +135,7 @@ BEGIN
 END;
 $$;
 
-CREATE FUNCTION otlet.drop_semantic_index(
+CREATE FUNCTION otlet.drop_watch_row_index(
   index_name text
 ) RETURNS boolean
 LANGUAGE plpgsql
@@ -148,7 +148,7 @@ BEGIN
   SELECT *
   INTO index_row
   FROM otlet.semantic_indexes si
-  WHERE si.name = drop_semantic_index.index_name;
+  WHERE si.name = drop_watch_row_index.index_name;
 
   IF NOT FOUND THEN
     RETURN false;

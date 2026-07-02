@@ -430,6 +430,9 @@ WHERE j.task_name LIKE :'prefix' ESCAPE '\';
 DELETE FROM otlet.model_selection_policies p
 WHERE p.task_name LIKE :'prefix' ESCAPE '\';
 
+DELETE FROM otlet.watches w
+WHERE w.name LIKE :'prefix' ESCAPE '\';
+
 DELETE FROM otlet.semantic_join_indexes sji
 WHERE sji.name LIKE :'prefix' ESCAPE '\';
 

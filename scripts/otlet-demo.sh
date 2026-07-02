@@ -219,7 +219,6 @@ echo "production_status_contract=$production_status_contract"
 }
 
 psql_exec \
-  -v old_index_name="demo_semantic_vendor_idx" \
   -v join_index_name="$join_index_name" \
   -v join_foreign_table="$join_foreign_table" \
   -v row_triage_watch="$row_triage_watch" \
@@ -227,8 +226,6 @@ psql_exec \
 SELECT otlet.drop_watch(:'row_triage_watch');
 SELECT otlet.drop_watch(:'row_triage_policy_watch');
 SELECT otlet.drop_watch(:'join_index_name');
-SELECT otlet.drop_semantic_index(:'old_index_name');
-SELECT otlet.drop_semantic_join_index(:'join_index_name');
 SELECT format('DROP FOREIGN TABLE IF EXISTS otlet.%I', :'join_foreign_table') \gexec
 SQL
 cleanup_task "row_review_demo"

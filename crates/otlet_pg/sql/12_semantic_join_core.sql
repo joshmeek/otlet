@@ -1,4 +1,4 @@
-CREATE FUNCTION otlet.create_semantic_join_index(
+CREATE FUNCTION otlet.create_watch_pair_index(
   index_name text,
   candidate_query text,
   instruction text,
@@ -99,7 +99,7 @@ BEGIN
 END;
 $$;
 
-CREATE FUNCTION otlet.drop_semantic_join_index(
+CREATE FUNCTION otlet.drop_watch_pair_index(
   index_name text
 ) RETURNS boolean
 LANGUAGE plpgsql
@@ -110,7 +110,7 @@ BEGIN
   SELECT *
   INTO index_row
   FROM otlet.semantic_join_indexes sji
-  WHERE sji.name = drop_semantic_join_index.index_name;
+  WHERE sji.name = drop_watch_pair_index.index_name;
 
   IF NOT FOUND THEN
     RETURN false;

@@ -108,9 +108,9 @@ BEGIN
   WHERE w.name = watch_row.name;
 
   IF watch_row.kind = 'row' AND watch_row.semantic_index_name IS NOT NULL THEN
-    PERFORM otlet.drop_semantic_index(watch_row.semantic_index_name);
+    PERFORM otlet.drop_watch_row_index(watch_row.semantic_index_name);
   ELSIF watch_row.kind = 'pair' AND watch_row.semantic_join_index_name IS NOT NULL THEN
-    PERFORM otlet.drop_semantic_join_index(watch_row.semantic_join_index_name);
+    PERFORM otlet.drop_watch_pair_index(watch_row.semantic_join_index_name);
   END IF;
 
   RETURN true;
@@ -205,7 +205,7 @@ BEGIN
 
     SELECT *
     INTO row_index
-    FROM otlet.create_semantic_index(
+    FROM otlet.create_watch_row_index(
       index_name => create_watch.watch_name,
       table_name => create_watch.table_name,
       subject_column => create_watch.subject_column,
@@ -225,7 +225,7 @@ BEGIN
 
     SELECT *
     INTO join_index
-    FROM otlet.create_semantic_join_index(
+    FROM otlet.create_watch_pair_index(
       index_name => create_watch.watch_name,
       candidate_query => create_watch.candidate_query,
       instruction => create_watch.instruction,
