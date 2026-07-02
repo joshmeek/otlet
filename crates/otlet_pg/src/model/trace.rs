@@ -63,6 +63,22 @@ fn generation_trace_summary(
             "decode_constraint_reason".to_owned(),
             Value::String(context.decode_constraint_reason.clone()),
         );
+        object.insert(
+            "decision_contract_hash".to_owned(),
+            Value::String(context.decision_contract_hash.clone()),
+        );
+        object.insert(
+            "shaped_input_bytes".to_owned(),
+            Value::Number(context.shaped_input_bytes.into()),
+        );
+        object.insert(
+            "input_truncated".to_owned(),
+            Value::Bool(context.input_truncated),
+        );
+        object.insert(
+            "input_shaping_applied".to_owned(),
+            Value::Bool(context.input_shaping_applied),
+        );
     }
     summary
 }

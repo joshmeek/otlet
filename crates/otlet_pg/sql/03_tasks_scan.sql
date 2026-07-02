@@ -4,21 +4,77 @@ CREATE FUNCTION otlet.create_task(
   instruction text,
   output_schema jsonb,
   model_name text,
-  runtime_options jsonb DEFAULT '{}'::jsonb
+  runtime_options jsonb DEFAULT '{}'::jsonb,
+  input_shaping jsonb DEFAULT '{}'::jsonb,
+  decision_contract jsonb DEFAULT '{}'::jsonb
 ) RETURNS otlet.tasks
-LANGUAGE sql
+LANGUAGE plpgsql
 AS $$
-  INSERT INTO otlet.tasks (name, input_query, instruction, output_schema, model_name, runtime_options)
-  VALUES ($1, $2, $3, $4, $5, $6)
+DECLARE
+  actual_input_shaping jsonb := COALESCE(create_task.input_shaping, '{}'::jsonb);
+  actual_decision_contract jsonb := COALESCE(create_task.decision_contract, '{}'::jsonb);
+  preset_name text;
+  preset_contract jsonb;
+  saved_task otlet.tasks%ROWTYPE;
+BEGIN
+  IF jsonb_typeof(actual_input_shaping) IS DISTINCT FROM 'object' THEN
+    RAISE EXCEPTION 'otlet input_shaping must be a JSON object';
+  END IF;
+  IF jsonb_typeof(actual_decision_contract) IS DISTINCT FROM 'object' THEN
+    RAISE EXCEPTION 'otlet decision_contract must be a JSON object';
+  END IF;
+
+  preset_name := NULLIF(actual_decision_contract ->> 'preset', '');
+  IF preset_name IS NOT NULL THEN
+    SELECT p.decision_contract
+    INTO preset_contract
+    FROM otlet.decision_rule_presets p
+    WHERE p.name = preset_name;
+
+    IF NOT FOUND THEN
+      RAISE EXCEPTION 'otlet decision rule preset % does not exist', preset_name;
+    END IF;
+
+    actual_decision_contract :=
+      preset_contract
+      || (actual_decision_contract - 'preset')
+      || jsonb_build_object('preset', preset_name);
+  END IF;
+
+  INSERT INTO otlet.tasks (
+    name,
+    input_query,
+    instruction,
+    output_schema,
+    model_name,
+    runtime_options,
+    input_shaping,
+    decision_contract
+  )
+  VALUES (
+    create_task.task_name,
+    create_task.input_query,
+    create_task.instruction,
+    create_task.output_schema,
+    create_task.model_name,
+    COALESCE(create_task.runtime_options, '{}'::jsonb),
+    actual_input_shaping,
+    actual_decision_contract
+  )
   ON CONFLICT (name) DO UPDATE
-    SET (input_query, instruction, output_schema, model_name, runtime_options) = (
+    SET (input_query, instruction, output_schema, model_name, runtime_options, input_shaping, decision_contract) = (
       EXCLUDED.input_query,
       EXCLUDED.instruction,
       EXCLUDED.output_schema,
       EXCLUDED.model_name,
-      EXCLUDED.runtime_options
+      EXCLUDED.runtime_options,
+      EXCLUDED.input_shaping,
+      EXCLUDED.decision_contract
     )
-  RETURNING *;
+  RETURNING * INTO saved_task;
+
+  RETURN saved_task;
+END;
 $$;
 
 CREATE FUNCTION otlet.ask(
@@ -86,32 +142,58 @@ $$;
 CREATE FUNCTION otlet.set_model_selection_policy(
   task_name text,
   cheap_model_name text,
-  strong_model_name text
+  strong_model_name text,
+  accept_field_checks jsonb DEFAULT NULL
 ) RETURNS otlet.model_selection_policies
 LANGUAGE plpgsql
 AS $$
 DECLARE
   saved otlet.model_selection_policies%ROWTYPE;
+  actual_accept_field_checks jsonb;
 BEGIN
   UPDATE otlet.tasks t
   SET model_name = set_model_selection_policy.cheap_model_name
   WHERE t.name = set_model_selection_policy.task_name;
 
+  SELECT COALESCE(
+    set_model_selection_policy.accept_field_checks,
+    NULLIF(jsonb_strip_nulls(jsonb_build_object(
+      'answer_field', t.decision_contract ->> 'answer_field',
+      'abstain_values', t.decision_contract -> 'abstain_values',
+      'confidence_field', t.decision_contract ->> 'confidence_field',
+      'accepted_confidence', t.decision_contract -> 'accepted_confidence'
+    )), '{}'::jsonb),
+    '{"answer_field":"match","abstain_values":["unclear"],"confidence_field":"confidence","accepted_confidence":["high"]}'::jsonb
+  )
+  INTO actual_accept_field_checks
+  FROM otlet.tasks t
+  WHERE t.name = set_model_selection_policy.task_name;
+
+  IF actual_accept_field_checks IS NULL THEN
+    RAISE EXCEPTION 'otlet task % does not exist', set_model_selection_policy.task_name;
+  END IF;
+  IF jsonb_typeof(actual_accept_field_checks) IS DISTINCT FROM 'object' THEN
+    RAISE EXCEPTION 'otlet accept_field_checks must be a JSON object';
+  END IF;
+
   INSERT INTO otlet.model_selection_policies (
     task_name,
     cheap_model_name,
     strong_model_name,
+    accept_field_checks,
     updated_at
   )
   VALUES (
     set_model_selection_policy.task_name,
     set_model_selection_policy.cheap_model_name,
     set_model_selection_policy.strong_model_name,
+    actual_accept_field_checks,
     now()
   )
   ON CONFLICT ON CONSTRAINT model_selection_policies_pkey DO UPDATE
     SET cheap_model_name = EXCLUDED.cheap_model_name,
         strong_model_name = EXCLUDED.strong_model_name,
+        accept_field_checks = EXCLUDED.accept_field_checks,
         updated_at = now()
   RETURNING * INTO saved;
 

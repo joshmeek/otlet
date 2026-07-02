@@ -80,6 +80,7 @@ SELECT
   p.task_name,
   p.cheap_model_name,
   p.strong_model_name,
+  p.accept_field_checks,
   cheap_q.queue_state AS cheap_queue_state,
   cheap_q.queued_jobs AS cheap_queued_jobs,
   cheap_q.running_jobs AS cheap_running_jobs,

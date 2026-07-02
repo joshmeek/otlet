@@ -15,6 +15,8 @@ pub(crate) struct Job {
     pub(crate) runtime_name: String,
     pub(crate) runtime_endpoint: String,
     pub(crate) runtime_options: Value,
+    pub(crate) input_shaping: Value,
+    pub(crate) decision_contract: Value,
 }
 
 pub(crate) struct JobModel {
@@ -28,6 +30,7 @@ pub(crate) struct JobModel {
 pub(crate) struct ModelSelectionPolicy {
     pub(crate) cheap: JobModel,
     pub(crate) strong: JobModel,
+    pub(crate) accept_field_checks: Value,
 }
 
 impl Job {
@@ -66,6 +69,8 @@ macro_rules! job_from_row {
             runtime_name: required_col!($row, String, 10),
             runtime_endpoint: required_col!($row, String, 11),
             runtime_options: required_col!($row, JsonB, 12).0,
+            input_shaping: required_col!($row, JsonB, 13).0,
+            decision_contract: required_col!($row, JsonB, 14).0,
         }
     };
 }
@@ -86,7 +91,9 @@ SELECT
   m.name,
   r.name,
   r.endpoint,
-  t.runtime_options
+  t.runtime_options,
+  t.input_shaping,
+  t.decision_contract
 FROM otlet.claim_jobs() j
 JOIN otlet.tasks t ON t.name = j.task_name
 JOIN otlet.models m ON m.name = t.model_name
@@ -142,7 +149,9 @@ SELECT
   m.name,
   r.name,
   r.endpoint,
-  t.runtime_options
+  t.runtime_options,
+  t.input_shaping,
+  t.decision_contract
 FROM inserted j
 JOIN otlet.tasks t ON t.name = j.task_name
 JOIN otlet.models m ON m.name = t.model_name
@@ -178,7 +187,8 @@ SELECT
   strong.artifact_path,
   strong.artifact_hash,
   strong.runtime_name,
-  strong_runtime.endpoint
+  strong_runtime.endpoint,
+  p.accept_field_checks
 FROM otlet.model_selection_policies p
 JOIN otlet.models cheap ON cheap.name = p.cheap_model_name
 JOIN otlet.runtimes cheap_runtime ON cheap_runtime.name = cheap.runtime_name
@@ -210,6 +220,7 @@ WHERE p.task_name = $1
                 runtime_name: required_col!(row, String, 9),
                 runtime_endpoint: required_col!(row, String, 10),
             },
+            accept_field_checks: required_col!(row, JsonB, 11).0,
         }))
     })
 }

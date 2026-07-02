@@ -257,7 +257,7 @@ fn process_selected_job(job: Job, policy: ModelSelectionPolicy) -> bool {
     let cheap_job = job.with_model(&policy.cheap);
     match run_job(&cheap_job) {
         Ok(run) => {
-            let (accepted, reason) = accepted_by_policy(&run.output);
+            let (accepted, reason) = accepted_by_policy(&run.output, &policy.accept_field_checks);
             if accepted {
                 return accept_attempt(&cheap_job, run, "cheap", &reason);
             }
@@ -292,24 +292,63 @@ fn run_strong_attempt(job: Job, reason: &str) -> bool {
     }
 }
 
-fn accepted_by_policy(output: &serde_json::Value) -> (bool, String) {
-    let confidence = output.get("confidence").and_then(serde_json::Value::as_str);
-    let Some(confidence) = confidence else {
-        return (false, "missing_confidence_field".to_owned());
-    };
-    if confidence != "high" {
-        return (false, "confidence_below_policy".to_owned());
+fn accepted_by_policy(
+    output: &serde_json::Value,
+    accept_field_checks: &serde_json::Value,
+) -> (bool, String) {
+    if let Some(confidence_field) = accept_field_checks
+        .get("confidence_field")
+        .and_then(serde_json::Value::as_str)
+        .filter(|field| !field.is_empty())
+    {
+        let Some(confidence) = output
+            .get(confidence_field)
+            .and_then(serde_json::Value::as_str)
+        else {
+            return (false, "missing_confidence_field".to_owned());
+        };
+        let accepted_confidence = json_string_array(accept_field_checks, "accepted_confidence");
+        if !accepted_confidence.is_empty()
+            && !accepted_confidence
+                .iter()
+                .any(|allowed| allowed == confidence)
+        {
+            return (false, "confidence_below_policy".to_owned());
+        }
     }
 
-    let uncertainty = output.get("match").and_then(serde_json::Value::as_str);
-    let Some(uncertainty) = uncertainty else {
-        return (false, "missing_uncertainty_field".to_owned());
+    let Some(answer_field) = accept_field_checks
+        .get("answer_field")
+        .and_then(serde_json::Value::as_str)
+        .filter(|field| !field.is_empty())
+    else {
+        return (true, "accepted_by_policy".to_owned());
     };
-    if uncertainty == "unclear" {
-        return (false, "uncertain_output".to_owned());
+    let Some(answer) = output.get(answer_field).and_then(serde_json::Value::as_str) else {
+        return (false, "missing_decision_field".to_owned());
+    };
+    if json_string_array(accept_field_checks, "abstain_values")
+        .iter()
+        .any(|abstain| abstain == answer)
+    {
+        return (false, "abstained_output".to_owned());
     }
 
     (true, "accepted_by_policy".to_owned())
+}
+
+fn json_string_array(value: &serde_json::Value, key: &str) -> Vec<String> {
+    value
+        .get(key)
+        .and_then(serde_json::Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn accept_attempt(job: &Job, run: ModelRun, selection_role: &str, selection_reason: &str) -> bool {

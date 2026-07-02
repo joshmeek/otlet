@@ -14,7 +14,7 @@ join_task="${join_index_name}_task"
 join_foreign_table="${OTLET_ENTITY_JOIN_FOREIGN_TABLE:-demo_entity_resolution_pairs}"
 record_type="${OTLET_ENTITY_RECORD_TYPE:-entity_hypothesis}"
 script_started="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
-entity_instruction='Return one JSON object only. Top-level keys must be output and actions. Never use ellipses or placeholder values. Use input.evidence_counts for the decision and input.candidate_evidence only for the short reason. input.action_ids are row IDs for action bodies, not identity evidence. confidence must be low, medium, or high, never unclear. Rule 1: if conflicting_stable_identifiers > 0, output different_entity with confidence high. Rule 2: else if shared_stable_identifiers > 0, output same_entity with confidence high. Rule 3: else output unclear with confidence medium. Never output different_entity when conflicting_stable_identifiers = 0. Never output same_entity when shared_stable_identifiers = 0. weak_matching_signals, missing_or_unknown_identifiers, and row_quality_warnings only explain unclear. Action type must be exactly merge_candidate, new_entity, or review_flag; never same_entity, different_entity, or unclear. same_entity uses merge_candidate body left_id, right_id, confidence, reason. different_entity uses new_entity body entity_id, reason, and entity_id must equal input.action_ids.right_id. unclear uses review_flag body left_id, right_id, severity, reason. Use input.action_ids.left_id and input.action_ids.right_id. Do not include an evidence field in actions. Keep output.reason and action body reason under 18 words. Quote every key and string. No markdown.'
+entity_instruction='Never output different_entity when conflicting_stable_identifiers = 0. Never output same_entity when shared_stable_identifiers = 0. weak_matching_signals, missing_or_unknown_identifiers, and row_quality_warnings only explain unclear. Action type must be exactly merge_candidate, new_entity, or review_flag; never same_entity, different_entity, or unclear. same_entity uses merge_candidate body left_id, right_id, confidence, reason. different_entity uses new_entity body entity_id, reason, and entity_id must equal input.action_ids.right_id. unclear uses review_flag body left_id, right_id, severity, reason. Use input.action_ids.left_id and input.action_ids.right_id. Do not include an evidence field in actions. Keep output.reason and action body reason under 18 words. Quote every key and string. No markdown.'
 
 log() {
   printf '[%s] %s\n' "$(date '+%H:%M:%S')" "$*"
@@ -221,6 +221,7 @@ SELECT format('DROP FOREIGN TABLE IF EXISTS otlet.%I', :'join_foreign_table') \g
 SQL
 cleanup_task "row_review_demo"
 cleanup_task "entity_hypothesis_demo"
+cleanup_task "row_triage_demo"
 cleanup_task "$entity_task"
 cleanup_task "$join_task"
 
@@ -279,6 +280,72 @@ direct_ask_contract="$(sed -n 's/^direct_ask_contract=//p' <<<"$direct_ask_outpu
 direct_ask_receipt_contract="$(sed -n 's/^direct_ask_receipt_contract=//p' <<<"$direct_ask_output")"
 require_regex "$direct_ask_contract" '^review_payment\|[1-9][0-9]*\|[1-9][0-9]*$' "Expected direct ask to return review_payment with job and receipt ids"
 require_regex "$direct_ask_receipt_contract" "^$strong_model_name\\|complete\\|passed\\|[1-9][0-9]*$" "Expected direct ask receipt evidence"
+
+log "Running non-ER row triage task"
+psql_exec -v model_name="$strong_model_name" >/dev/null <<'SQL'
+DROP TABLE IF EXISTS public.otlet_demo_triage_signal;
+CREATE TABLE public.otlet_demo_triage_signal (
+  id text PRIMARY KEY,
+  blockers integer NOT NULL,
+  approvals integer NOT NULL,
+  evidence text NOT NULL
+);
+INSERT INTO public.otlet_demo_triage_signal
+VALUES (
+  'triage-1',
+  2,
+  0,
+  'Wire instructions changed after invoice approval and the requester used urgent payment language'
+);
+
+SELECT otlet.create_task(
+  'row_triage_demo',
+  $$
+    SELECT
+      id AS subject_id,
+      jsonb_build_object(
+        'case_id', id,
+        'signals', jsonb_build_object('blockers', blockers, 'approvals', approvals),
+        'evidence', evidence
+      ) AS input
+    FROM public.otlet_demo_triage_signal
+    ORDER BY id
+  $$,
+  'Classify one operational row. If input.signals.blockers is greater than 0, output decision flag with confidence high and exactly one review_flag action. The review_flag body must have severity high and a short reason. If blockers = 0 and approvals > 0, output decision pass with confidence high and no actions. Otherwise output decision unclear with confidence medium and one review_flag action. Return JSON only.',
+  '{
+    "type": "object",
+    "required": ["decision", "confidence", "reason"],
+    "additionalProperties": false,
+    "properties": {
+      "decision": {"enum": ["flag", "pass", "unclear"]},
+      "confidence": {"enum": ["low", "medium", "high"]},
+      "reason": {"type": "string", "maxLength": 160}
+    }
+  }'::jsonb,
+  :'model_name',
+  '{"max_tokens":160,"reasoning":"off","inference_cache":true}'::jsonb,
+  '{"evidence_fields":["signals"]}'::jsonb,
+  '{"answer_field":"decision","abstain_values":["unclear"],"confidence_field":"confidence","accepted_confidence":["high"]}'::jsonb
+);
+SELECT otlet.run_task('row_triage_demo');
+SQL
+wait_task_complete "row_triage_demo" 1 900 1
+
+row_triage_contract="$(psql_value "
+SELECT count(*) FILTER (WHERE r.status = 'complete')::text || '|' ||
+       COALESCE(max(r.output->>'decision'), '') || '|' ||
+       COALESCE(max(r.output->>'confidence'), '') || '|' ||
+       count(a.action_id)::text || '|' ||
+       count(a.action_id) FILTER (WHERE a.action_type = 'review_flag' AND a.error IS NULL)::text
+FROM otlet.runs r
+LEFT JOIN otlet.action_status a ON a.job_id = r.job_id
+WHERE r.task_name = 'row_triage_demo';
+")"
+echo "row_triage_contract=$row_triage_contract"
+[ "$row_triage_contract" = "1|flag|high|1|1" ] || {
+  echo "Expected non-ER triage task to produce one flagged output and one valid review action, got $row_triage_contract" >&2
+  exit 1
+}
 
 log "Running entity-resolution demo"
 psql_exec >/dev/null <<'SQL'
@@ -427,7 +494,9 @@ SELECT otlet.create_task(
     }
   }'::jsonb,
   :'cheap_model_name',
-  '{"max_tokens":256,"reasoning":"off","inference_cache":true,"generation_trace":true,"generation_trace_max_tokens":16,"generation_trace_top_k":3}'::jsonb
+  '{"max_tokens":256,"reasoning":"off","inference_cache":true,"generation_trace":true,"generation_trace_max_tokens":16,"generation_trace_top_k":3}'::jsonb,
+  '{"evidence_fields":["candidate_evidence"],"action_id_fields":{"left_id":"left_id","right_id":"right_id"}}'::jsonb,
+  '{"preset":"entity_resolution_evidence_v1"}'::jsonb
 );
 
 SELECT otlet.set_model_selection_policy(:'task_name', :'cheap_model_name', :'strong_model_name');

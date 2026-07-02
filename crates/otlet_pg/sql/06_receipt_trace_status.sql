@@ -170,6 +170,21 @@ SELECT
   count(DISTINCT job_id) FILTER (WHERE selection_role = 'strong')::bigint AS escalated_jobs,
   (
     SELECT count(*)::bigint
+    FROM otlet.outputs o
+    JOIN otlet.jobs j ON j.id = o.job_id
+    JOIN otlet.tasks t ON t.name = j.task_name
+    CROSS JOIN LATERAL (
+      SELECT COALESCE(NULLIF(t.decision_contract ->> 'answer_field', ''), 'match') AS answer_field,
+             COALESCE(t.decision_contract -> 'abstain_values', '["unclear"]'::jsonb) AS abstain_values
+    ) contract
+    WHERE EXISTS (
+      SELECT 1
+      FROM jsonb_array_elements_text(contract.abstain_values) value(abstain_value)
+      WHERE o.output ->> contract.answer_field = value.abstain_value
+    )
+  ) AS abstained_outputs,
+  (
+    SELECT count(*)::bigint
     FROM otlet.actions a
     WHERE a.status = 'rejected'
   ) AS rejected_actions,

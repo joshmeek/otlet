@@ -1,3 +1,99 @@
+struct ShapedInput {
+    input: Value,
+    bytes: i64,
+    input_truncated: bool,
+    applied: bool,
+}
+
+fn shape_model_input(input: &Value, shaping: &Value) -> ShapedInput {
+    let mut shaped = input.clone();
+    let mut applied = false;
+
+    if let Value::Object(object) = &mut shaped {
+        if let Some(strip_keys) = shaping.get("strip_keys").and_then(Value::as_array) {
+            for key in strip_keys.iter().filter_map(Value::as_str) {
+                applied |= object.remove(key).is_some();
+            }
+        }
+
+        if !object.contains_key("evidence_counts") {
+            if let Some(counts) = declared_evidence_counts(input, shaping) {
+                object.insert("evidence_counts".to_owned(), counts);
+                applied = true;
+            }
+        }
+
+        if !object.contains_key("action_ids") {
+            if let Some(action_ids) = declared_action_ids(input, shaping) {
+                object.insert("action_ids".to_owned(), action_ids);
+                applied = true;
+            }
+        }
+    }
+
+    let bytes = shaped.to_string().len().min(i64::MAX as usize) as i64;
+    ShapedInput {
+        input: shaped,
+        bytes,
+        input_truncated: false,
+        applied,
+    }
+}
+
+fn declared_evidence_counts(input: &Value, shaping: &Value) -> Option<Value> {
+    let fields = shaping.get("evidence_fields")?.as_array()?;
+    let mut counts = serde_json::Map::new();
+    for field in fields.iter().filter_map(Value::as_str) {
+        let Some(Value::Object(buckets)) = input.get(field) else {
+            continue;
+        };
+        for (bucket, value) in buckets {
+            let count = match value {
+                Value::Array(items) => items.len() as i64,
+                Value::String(text) if !text.trim().is_empty() => 1,
+                Value::Number(_) | Value::Bool(true) | Value::Object(_) => 1,
+                _ => 0,
+            };
+            counts.insert(bucket.clone(), Value::Number(count.into()));
+        }
+    }
+    if counts.is_empty() {
+        None
+    } else {
+        Some(Value::Object(counts))
+    }
+}
+
+fn declared_action_ids(input: &Value, shaping: &Value) -> Option<Value> {
+    let fields = shaping.get("action_id_fields")?.as_object()?;
+    let mut ids = serde_json::Map::new();
+    for (target_key, source_field) in fields {
+        let Some(source_field) = source_field.as_str() else {
+            continue;
+        };
+        if let Some(value) = input.get(source_field) {
+            ids.insert(target_key.clone(), value.clone());
+        }
+    }
+    if ids.is_empty() {
+        None
+    } else {
+        Some(Value::Object(ids))
+    }
+}
+
+fn effective_instruction(instruction: &str, decision_contract: &Value) -> String {
+    let prefix = decision_contract
+        .get("prompt_prefix")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if prefix.is_empty() {
+        instruction.to_owned()
+    } else {
+        format!("{prefix}{instruction}")
+    }
+}
+
 fn validate_output(schema: &Value, output: &Value) -> Result<(), String> {
     let validator =
         jsonschema::validator_for(schema).map_err(|err| format!("invalid output schema: {err}"))?;

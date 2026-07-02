@@ -63,6 +63,25 @@ CREATE TABLE otlet.model_versions (
   created_at timestamptz NOT NULL DEFAULT now()
 );
 
+CREATE TABLE otlet.decision_rule_presets (
+  name text PRIMARY KEY CHECK (name ~ '^[a-z0-9][a-z0-9_-]*$'),
+  decision_contract jsonb NOT NULL CHECK (jsonb_typeof(decision_contract) = 'object'),
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+
+INSERT INTO otlet.decision_rule_presets (name, decision_contract)
+VALUES (
+  'entity_resolution_evidence_v1',
+  jsonb_build_object(
+    'prompt_prefix',
+    'Return one JSON object only. Top-level keys must be output and actions. Never use ellipses or placeholder values. Use input.evidence_counts for the decision and input.candidate_evidence only for the short reason. input.action_ids are row IDs for action bodies, not identity evidence. confidence must be low, medium, or high, never unclear. Rule 1: if conflicting_stable_identifiers > 0, output different_entity with confidence high. Rule 2: else if shared_stable_identifiers > 0, output same_entity with confidence high. Rule 3: else output unclear with confidence medium. ',
+    'answer_field', 'match',
+    'abstain_values', jsonb_build_array('unclear'),
+    'confidence_field', 'confidence',
+    'accepted_confidence', jsonb_build_array('high')
+  )
+);
+
 CREATE TABLE otlet.tasks (
   name text PRIMARY KEY CHECK (name ~ '^[a-z0-9][a-z0-9_-]*$'),
   input_query text,
@@ -70,6 +89,8 @@ CREATE TABLE otlet.tasks (
   output_schema jsonb NOT NULL,
   model_name text NOT NULL REFERENCES otlet.models(name),
   runtime_options jsonb NOT NULL DEFAULT '{}'::jsonb CHECK (jsonb_typeof(runtime_options) = 'object'),
+  input_shaping jsonb NOT NULL DEFAULT '{}'::jsonb CHECK (jsonb_typeof(input_shaping) = 'object'),
+  decision_contract jsonb NOT NULL DEFAULT '{}'::jsonb CHECK (jsonb_typeof(decision_contract) = 'object'),
   created_at timestamptz NOT NULL DEFAULT now()
 );
 
@@ -77,6 +98,7 @@ CREATE TABLE otlet.model_selection_policies (
   task_name text PRIMARY KEY REFERENCES otlet.tasks(name) ON DELETE CASCADE,
   cheap_model_name text NOT NULL REFERENCES otlet.models(name),
   strong_model_name text NOT NULL REFERENCES otlet.models(name),
+  accept_field_checks jsonb NOT NULL DEFAULT '{"answer_field":"match","abstain_values":["unclear"],"confidence_field":"confidence","accepted_confidence":["high"]}'::jsonb CHECK (jsonb_typeof(accept_field_checks) = 'object'),
   created_at timestamptz NOT NULL DEFAULT now(),
   updated_at timestamptz NOT NULL DEFAULT now(),
   CHECK (cheap_model_name <> strong_model_name)
