@@ -123,6 +123,7 @@ fn validate_semantic_index_source(
         "SELECT \
            si.source_table, \
            si.subject_column, \
+           quote_nullable(si.input_columns)::text AS input_columns_sql, \
            si.model_name, \
            otlet.task_contract_hash(t.instruction, t.output_schema, t.model_name, t.runtime_options, t.input_shaping, t.decision_contract) AS contract_hash \
          FROM otlet.semantic_indexes si \
@@ -162,6 +163,10 @@ fn validate_semantic_index_source(
         else {
             return Ok::<Option<SemanticPlannerStats>, String>(None);
         };
+        let input_columns_sql = row
+            .get_by_name::<String, _>("input_columns_sql")
+            .map_err(to_string)?
+            .unwrap_or_else(|| "NULL".to_owned());
         let Some(contract_hash) = row
             .get_by_name::<String, _>("contract_hash")
             .map_err(to_string)?
@@ -174,7 +179,7 @@ fn validate_semantic_index_source(
             return Ok::<Option<SemanticPlannerStats>, String>(None);
         }
 
-        let source_rows_sql = source_rows_sql(&source_table, &subject_column);
+        let source_rows_sql = source_rows_sql(&source_table, &subject_column, &input_columns_sql);
         let matches_expected_sql = row_predicate_match_sql("sm.body", expected_json);
         let stats_query = format!(
             "WITH latest AS ( \

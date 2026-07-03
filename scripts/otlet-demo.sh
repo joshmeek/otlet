@@ -16,6 +16,8 @@ join_foreign_table="${OTLET_ENTITY_JOIN_FOREIGN_TABLE:-demo_entity_resolution_pa
 record_type="${OTLET_ENTITY_RECORD_TYPE:-entity_hypothesis}"
 row_triage_watch="${OTLET_ROW_TRIAGE_WATCH_NAME:-row_triage_demo}"
 row_triage_task="${row_triage_watch}_task"
+row_scoped_watch="${OTLET_ROW_SCOPED_WATCH_NAME:-row_scoped_demo}"
+row_scoped_task="${row_scoped_watch}_task"
 row_triage_policy_watch="${OTLET_ROW_TRIAGE_POLICY_WATCH_NAME:-row_triage_policy_demo}"
 row_triage_policy_task="${row_triage_policy_watch}_task"
 script_started="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
@@ -222,8 +224,10 @@ psql_exec \
   -v join_index_name="$join_index_name" \
   -v join_foreign_table="$join_foreign_table" \
   -v row_triage_watch="$row_triage_watch" \
+  -v row_scoped_watch="$row_scoped_watch" \
   -v row_triage_policy_watch="$row_triage_policy_watch" >/dev/null <<'SQL'
 SELECT otlet.drop_watch(:'row_triage_watch');
+SELECT otlet.drop_watch(:'row_scoped_watch');
 SELECT otlet.drop_watch(:'row_triage_policy_watch');
 SELECT otlet.drop_watch(:'join_index_name');
 SELECT format('DROP FOREIGN TABLE IF EXISTS otlet.%I', :'join_foreign_table') \gexec
@@ -231,8 +235,10 @@ SQL
 cleanup_task "row_review_demo"
 cleanup_task "entity_hypothesis_demo"
 cleanup_task "row_triage_demo"
+cleanup_task "row_scoped_demo"
 cleanup_task "row_triage_policy_demo"
 cleanup_task "$row_triage_task"
+cleanup_task "$row_scoped_task"
 cleanup_task "$row_triage_policy_task"
 cleanup_task "$entity_task"
 cleanup_task "$join_task"
@@ -447,6 +453,82 @@ row_delete_reason="$(tail -n 1 <<<"$row_delete_contract")"
 echo "row_delete_contract=$row_delete_fresh|$row_delete_reason"
 [ "$row_delete_fresh|$row_delete_reason" = "0|true" ] || {
   echo "Expected row delete to fail closed with source_delete reason, got $row_delete_fresh|$row_delete_reason" >&2
+  exit 1
+}
+
+log "Checking column-scoped row freshness"
+psql_exec \
+  -v model_name="$strong_model_name" \
+  -v row_scoped_watch="$row_scoped_watch" >/dev/null <<'SQL'
+DROP TABLE IF EXISTS public.otlet_demo_scoped_signal;
+CREATE TABLE public.otlet_demo_scoped_signal (
+  id text PRIMARY KEY,
+  signal text NOT NULL,
+  ignored_note text NOT NULL
+);
+
+SELECT otlet.create_watch(
+  watch_name => :'row_scoped_watch',
+  kind => 'row',
+  instruction => 'Classify one scoped row. Use only input.row.signal. If signal is approve, output decision pass with confidence high. Otherwise output decision flag with confidence high. Return JSON only.',
+  output_schema => '{
+    "type": "object",
+    "required": ["decision", "confidence"],
+    "additionalProperties": false,
+    "properties": {
+      "decision": {"enum": ["pass", "flag"]},
+      "confidence": {"enum": ["low", "medium", "high"]}
+    }
+  }'::jsonb,
+  model_name => :'model_name',
+  table_name => 'public.otlet_demo_scoped_signal'::regclass,
+  subject_column => 'id',
+  record_type => 'demo_scoped_fact',
+  runtime_options => '{"max_tokens":120,"reasoning":"off","inference_cache":true}'::jsonb,
+  trigger_policy => '{"on_change":"mark_stale"}'::jsonb,
+  decision_contract => '{"answer_field":"decision","abstain_values":[],"confidence_field":"confidence","accepted_confidence":["high"]}'::jsonb,
+  input_columns => ARRAY['signal']
+);
+
+INSERT INTO public.otlet_demo_scoped_signal
+VALUES ('scoped-1', 'approve', 'initial note outside the model input');
+
+SELECT otlet.run_task(:'row_scoped_watch' || '_task');
+SQL
+wait_task_complete "$row_scoped_task" 1 900 1
+row_scoped_receipts_before="$(psql_value "
+SELECT count(*)::text
+FROM otlet.inference_receipts ar
+JOIN otlet.jobs j ON j.id = ar.job_id
+WHERE j.task_name = '$row_scoped_task';
+")"
+psql_exec >/dev/null <<'SQL'
+ALTER TABLE public.otlet_demo_scoped_signal
+ADD COLUMN unrelated_after_watch text DEFAULT 'not in model input';
+UPDATE public.otlet_demo_scoped_signal
+SET ignored_note = ignored_note || '; changed outside scoped input',
+    unrelated_after_watch = 'changed after watch'
+WHERE id = 'scoped-1';
+SQL
+row_scoped_contract="$(psql_value "
+SELECT count(*)::text
+FROM otlet.semantic_index_current_rows('$row_scoped_watch', true);
+SELECT otlet.semantic_matches('$row_scoped_watch', 'scoped-1', '{\"decision\":\"pass\"}'::jsonb)::text;
+SELECT count(*)::text
+FROM otlet.inference_receipts ar
+JOIN otlet.jobs j ON j.id = ar.job_id
+WHERE j.task_name = '$row_scoped_task';
+SELECT COALESCE(input_columns::text, '')
+FROM otlet.watch_status
+WHERE watch_name = '$row_scoped_watch';
+")"
+row_scoped_fresh_after="$(head -n 1 <<<"$row_scoped_contract")"
+row_scoped_match_after="$(sed -n '2p' <<<"$row_scoped_contract")"
+row_scoped_receipts_after="$(sed -n '3p' <<<"$row_scoped_contract")"
+row_scoped_columns="$(tail -n 1 <<<"$row_scoped_contract")"
+echo "row_scoped_contract=$row_scoped_fresh_after|$row_scoped_match_after|$row_scoped_receipts_before|$row_scoped_receipts_after|$row_scoped_columns"
+[ "$row_scoped_fresh_after|$row_scoped_match_after|$row_scoped_receipts_before|$row_scoped_receipts_after|$row_scoped_columns" = "1|true|1|1|{signal}" ] || {
+  echo "Expected scoped watch to stay fresh with unchanged receipts after unrelated column change, got $row_scoped_fresh_after|$row_scoped_match_after|$row_scoped_receipts_before|$row_scoped_receipts_after|$row_scoped_columns" >&2
   exit 1
 }
 

@@ -48,7 +48,6 @@ BEGIN
         WHERE sm.task_name = %3$L
           AND sm.record_type = %4$L
           AND sm.subject_id = otlet_join_input.subject_id
-          AND sm.stale = false
           AND sm.content_hash = otlet.semantic_content_hash(otlet_join_input.input)
           AND sm.contract_hash = %5$L
       )

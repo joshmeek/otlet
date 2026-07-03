@@ -16,6 +16,7 @@ BEGIN
   SELECT
     si.source_table,
     si.subject_column,
+    si.input_columns,
     otlet.task_contract_hash(
       t.instruction,
       t.output_schema,
@@ -37,23 +38,22 @@ BEGIN
     $sql$
       SELECT otlet.semantic_content_hash(jsonb_build_object(
         '_otlet_mvcc', jsonb_build_object(
-          'table', %L,
-          'subject_id', (src.%I)::text,
+          'table', %1$L,
+          'subject_id', (src.%2$I)::text,
           'ctid', src.ctid::text,
           'xmin', src.xmin::text
         ),
-        'table', %L,
-        'row', to_jsonb(src)
+        'table', %1$L,
+        'row', otlet.semantic_project_row(to_jsonb(src), %3$L::text[])
       ))
-      FROM %s AS src
-      WHERE (src.%I)::text = $1
+      FROM %4$s AS src
+      WHERE (src.%2$I)::text = $1
       LIMIT 1
     $sql$,
     index_row.source_table,
     index_row.subject_column,
-    index_row.source_table,
-    index_row.source_table,
-    index_row.subject_column
+    index_row.input_columns,
+    index_row.source_table
   )
   INTO current_content_hash
   USING semantic_matches.subject_id;

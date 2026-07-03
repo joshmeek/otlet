@@ -106,6 +106,26 @@ AS $$
   SELECT md5(otlet.semantic_canonical_jsonb($1 - '_otlet_mvcc' - 'otlet_mvcc')::text);
 $$;
 
+CREATE FUNCTION otlet.semantic_project_row(
+  row_data jsonb,
+  input_columns text[] DEFAULT NULL
+) RETURNS jsonb
+LANGUAGE sql
+IMMUTABLE
+AS $$
+  SELECT CASE
+    WHEN $2 IS NULL THEN COALESCE($1, '{}'::jsonb)
+    ELSE COALESCE(
+      (
+        SELECT jsonb_object_agg(key, value ORDER BY key)
+        FROM jsonb_each(COALESCE($1, '{}'::jsonb))
+        WHERE key = ANY($2)
+      ),
+      '{}'::jsonb
+    )
+  END;
+$$;
+
 CREATE FUNCTION otlet.task_contract_hash(
   instruction text,
   output_schema jsonb,
@@ -397,6 +417,7 @@ CREATE TABLE otlet.semantic_indexes (
   task_name text NOT NULL UNIQUE REFERENCES otlet.tasks(name),
   source_table text NOT NULL,
   subject_column text NOT NULL,
+  input_columns text[],
   record_type text NOT NULL,
   model_name text NOT NULL REFERENCES otlet.models(name),
   created_at timestamptz NOT NULL DEFAULT now(),
@@ -427,6 +448,7 @@ CREATE TABLE otlet.watches (
   semantic_join_index_name text UNIQUE REFERENCES otlet.semantic_join_indexes(name) ON DELETE SET NULL,
   source_table text,
   subject_column text,
+  input_columns text[],
   candidate_query text,
   output_schema jsonb NOT NULL CHECK (jsonb_typeof(output_schema) = 'object'),
   action_types text[] NOT NULL DEFAULT '{}'::text[],

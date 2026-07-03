@@ -76,7 +76,7 @@ BEGIN
               'xmin', src.xmin::text
             ),
             'table', %2$L,
-            'row', to_jsonb(src)
+            'row', otlet.semantic_project_row(to_jsonb(src), %6$L::text[])
           ) AS input
         FROM %3$s AS src
       ),
@@ -98,7 +98,7 @@ BEGIN
           sm.subject_id,
           (
             sm.content_hash IS NOT DISTINCT FROM otlet.semantic_content_hash(ci.input)
-            AND sm.contract_hash IS NOT DISTINCT FROM %6$L
+            AND sm.contract_hash IS NOT DISTINCT FROM %7$L
           ) DESC,
           sm.updated_at DESC,
           sm.id DESC
@@ -110,13 +110,13 @@ BEGIN
           (
             l.subject_id IS NOT NULL
             AND l.content_hash IS NOT DISTINCT FROM otlet.semantic_content_hash(ci.input)
-            AND l.contract_hash IS NOT DISTINCT FROM %6$L
+            AND l.contract_hash IS NOT DISTINCT FROM %7$L
           ) AS is_fresh,
           (
             l.subject_id IS NOT NULL
             AND NOT (
               l.content_hash IS NOT DISTINCT FROM otlet.semantic_content_hash(ci.input)
-              AND l.contract_hash IS NOT DISTINCT FROM %6$L
+              AND l.contract_hash IS NOT DISTINCT FROM %7$L
             )
           ) AS is_stale
         FROM current_inputs ci
@@ -134,6 +134,7 @@ BEGIN
     index_row.source_table,
     index_row.task_name,
     index_row.record_type,
+    index_row.input_columns,
     current_contract_hash
   )
   INTO v_total_subjects, v_fresh_subjects, v_stale_subjects, v_missing_subjects;

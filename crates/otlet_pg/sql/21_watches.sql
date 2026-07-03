@@ -138,7 +138,8 @@ CREATE FUNCTION otlet.create_watch(
   stale_policy text DEFAULT 'refresh_then_fail_closed',
   input_shaping jsonb DEFAULT '{}'::jsonb,
   decision_contract jsonb DEFAULT '{}'::jsonb,
-  max_candidate_rows integer DEFAULT 1000
+  max_candidate_rows integer DEFAULT 1000,
+  input_columns text[] DEFAULT NULL
 ) RETURNS otlet.watches
 LANGUAGE plpgsql
 AS $$
@@ -219,7 +220,8 @@ BEGIN
       runtime_options => actual_runtime_options,
       record_type => actual_record_type,
       input_shaping => actual_input_shaping,
-      decision_contract => actual_decision_contract
+      decision_contract => actual_decision_contract,
+      input_columns => create_watch.input_columns
     );
     task_name := row_index.task_name;
   ELSE
@@ -252,6 +254,7 @@ BEGIN
     semantic_join_index_name,
     source_table,
     subject_column,
+    input_columns,
     candidate_query,
     output_schema,
     action_types,
@@ -274,6 +277,7 @@ BEGIN
     CASE WHEN actual_kind = 'pair' THEN join_index.name END,
     CASE WHEN actual_kind = 'row' THEN source_table_name END,
     CASE WHEN actual_kind = 'row' THEN create_watch.subject_column END,
+    CASE WHEN actual_kind = 'row' THEN row_index.input_columns END,
     CASE WHEN actual_kind = 'pair' THEN create_watch.candidate_query END,
     create_watch.output_schema,
     actual_action_types,
@@ -349,6 +353,7 @@ SELECT
   w.semantic_join_index_name,
   w.source_table,
   w.subject_column,
+  w.input_columns,
   w.record_type,
   w.model_name,
   w.stale_policy,

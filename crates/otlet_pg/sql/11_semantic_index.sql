@@ -21,7 +21,8 @@ CREATE FUNCTION otlet.create_watch_row_index(
   runtime_options jsonb DEFAULT '{}'::jsonb,
   record_type text DEFAULT NULL,
   input_shaping jsonb DEFAULT '{}'::jsonb,
-  decision_contract jsonb DEFAULT '{}'::jsonb
+  decision_contract jsonb DEFAULT '{}'::jsonb,
+  input_columns text[] DEFAULT NULL
 ) RETURNS otlet.semantic_indexes
 LANGUAGE plpgsql
 AS $$
@@ -31,6 +32,7 @@ DECLARE
   semantic_record_type text := COALESCE(record_type, index_name);
   semantic_task_name text := index_name || '_task';
   current_contract_hash text := otlet.task_contract_hash(instruction, output_schema, model_name, runtime_options, input_shaping, decision_contract);
+  actual_input_columns text[];
   query text;
 BEGIN
   IF semantic_task_name !~ '^[a-z0-9][a-z0-9_-]*$' THEN
@@ -54,6 +56,32 @@ BEGIN
   JOIN pg_namespace n ON n.oid = c.relnamespace
   WHERE c.oid = table_name;
 
+  IF input_columns IS NOT NULL THEN
+    SELECT array_agg(DISTINCT column_name ORDER BY column_name)
+    INTO actual_input_columns
+    FROM unnest(input_columns) AS requested(column_name)
+    WHERE NULLIF(column_name, '') IS NOT NULL;
+
+    IF actual_input_columns IS NULL THEN
+      RAISE EXCEPTION 'otlet input_columns cannot be empty when provided';
+    END IF;
+
+    IF EXISTS (
+      SELECT 1
+      FROM unnest(actual_input_columns) AS requested(column_name)
+      WHERE NOT EXISTS (
+        SELECT 1
+        FROM pg_attribute
+        WHERE attrelid = table_name
+          AND attname = requested.column_name
+          AND attnum > 0
+          AND NOT attisdropped
+      )
+    ) THEN
+      RAISE EXCEPTION 'otlet input_columns must all exist on %', table_name;
+    END IF;
+  END IF;
+
   query := format(
     $query$
       SELECT subject_id, input
@@ -68,7 +96,7 @@ BEGIN
               'xmin', src.xmin::text
             ),
             'table', %2$L,
-            'row', to_jsonb(src)
+            'row', otlet.semantic_project_row(to_jsonb(src), %5$L::text[])
           ) AS input
         FROM %3$s AS src
       ) otlet_semantic_input
@@ -78,15 +106,15 @@ BEGIN
         WHERE sm.task_name = %4$L
           AND sm.source_table = %2$L
           AND sm.subject_id = otlet_semantic_input.subject_id
-          AND sm.stale = false
           AND sm.content_hash = otlet.semantic_content_hash(otlet_semantic_input.input)
-          AND sm.contract_hash = %5$L
+          AND sm.contract_hash = %6$L
       )
     $query$,
     subject_column,
     source_table,
     table_name,
     semantic_task_name,
+    actual_input_columns,
     current_contract_hash
   );
 
@@ -106,6 +134,7 @@ BEGIN
     task_name,
     source_table,
     subject_column,
+    input_columns,
     record_type,
     model_name,
     updated_at
@@ -115,6 +144,7 @@ BEGIN
     semantic_task_name,
     source_table,
     subject_column,
+    actual_input_columns,
     semantic_record_type,
     model_name,
     now()
@@ -123,6 +153,7 @@ BEGIN
     SET task_name = EXCLUDED.task_name,
         source_table = EXCLUDED.source_table,
         subject_column = EXCLUDED.subject_column,
+        input_columns = EXCLUDED.input_columns,
         record_type = EXCLUDED.record_type,
         model_name = EXCLUDED.model_name,
         updated_at = now()
@@ -508,7 +539,7 @@ BEGIN
               'xmin', src.xmin::text
             ),
             'table', %2$L,
-            'row', to_jsonb(src)
+            'row', otlet.semantic_project_row(to_jsonb(src), %6$L::text[])
           ) AS input
         FROM %3$s AS src
       ),
@@ -531,7 +562,7 @@ BEGIN
           sm.subject_id,
           (
             sm.content_hash IS NOT DISTINCT FROM otlet.semantic_content_hash(ci.input)
-            AND sm.contract_hash IS NOT DISTINCT FROM %6$L
+            AND sm.contract_hash IS NOT DISTINCT FROM %7$L
           ) DESC,
           sm.updated_at DESC,
           sm.id DESC
@@ -540,16 +571,16 @@ BEGIN
         latest.subject_id,
         latest.body,
         latest.content_hash IS DISTINCT FROM otlet.semantic_content_hash(ci.input)
-          OR latest.contract_hash IS DISTINCT FROM %6$L AS stale,
+          OR latest.contract_hash IS DISTINCT FROM %7$L AS stale,
         latest.source_hash,
         latest.updated_at
       FROM current_inputs ci
       JOIN latest ON latest.subject_id = ci.subject_id
       WHERE (
-        NOT %7$s
+        NOT %8$s
         OR (
           latest.content_hash IS NOT DISTINCT FROM otlet.semantic_content_hash(ci.input)
-          AND latest.contract_hash IS NOT DISTINCT FROM %6$L
+          AND latest.contract_hash IS NOT DISTINCT FROM %7$L
         )
       )
       ORDER BY latest.subject_id, latest.updated_at DESC
@@ -559,6 +590,7 @@ BEGIN
     index_row.source_table,
     index_row.task_name,
     index_row.record_type,
+    index_row.input_columns,
     current_contract_hash,
     CASE WHEN COALESCE(semantic_index_current_rows.fresh_only, true) THEN 'true' ELSE 'false' END
   );
