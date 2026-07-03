@@ -200,11 +200,12 @@ require_container
 register_runtime_models
 
 production_policy_contract="$(psql_value "
-SELECT name || '|' || stale_policy || '|' || max_attempts::text || '|' || worker_claim_batch_size::text
+SELECT name || '|' || stale_policy || '|' || max_attempts::text || '|' ||
+       max_attempt_ms::text || '|' || worker_claim_batch_size::text
 FROM otlet.production_policy_status;
 ")"
 echo "production_policy_contract=$production_policy_contract"
-[ "$production_policy_contract" = "default|refresh_then_fail_closed|3|8" ] || {
+[ "$production_policy_contract" = "default|refresh_then_fail_closed|3|300000|8" ] || {
   echo "Expected default production policy, got $production_policy_contract" >&2
   exit 1
 }
@@ -466,12 +467,83 @@ wait "$queue_lock_pid"
 psql_exec >/dev/null <<'SQL'
 UPDATE otlet.production_policy
 SET max_queued_jobs_per_model = 1000,
+    max_attempt_ms = 300000,
     worker_claim_batch_size = 8,
     worker_claim_task_cursor = ''
 WHERE name = 'default';
 SQL
 [ "$queue_race_contract" = "true|true" ] || {
   echo "Expected concurrent run_task admission to keep queued jobs at the cap, got $queue_race_contract" >&2
+  exit 1
+}
+
+attempt_timeout_task="attempt_timeout_demo"
+cleanup_task "$attempt_timeout_task"
+psql_exec -v task_name="$attempt_timeout_task" -v model_name="$strong_model_name" >/dev/null <<'SQL'
+SELECT otlet.create_task(
+  :'task_name',
+  $source$
+    SELECT 'timeout-1'::text AS subject_id, '{}'::jsonb AS input
+  $source$::text,
+  'Return JSON only: {"output":{"status":"ok"},"actions":[]}',
+  '{"type":"object","required":["status"],"additionalProperties":false,"properties":{"status":{"enum":["ok"]}}}'::jsonb,
+  :'model_name',
+  '{"max_tokens":256,"reasoning":"off","inference_cache":false}'::jsonb
+);
+UPDATE otlet.production_policy
+SET max_attempt_ms = 1
+WHERE name = 'default';
+SELECT otlet.run_task(:'task_name');
+SQL
+attempt_timeout_failed="0"
+attempt_timeout_complete="0"
+for _ in $(seq 1 180); do
+  attempt_timeout_state="$(psql_value "
+SELECT count(*) FILTER (WHERE status IN ('queued','running','cancel_requested'))::text || '|' ||
+       count(*) FILTER (WHERE status = 'failed')::text || '|' ||
+       count(*) FILTER (WHERE status = 'complete')::text
+FROM otlet.jobs
+WHERE task_name = '$attempt_timeout_task';
+")"
+  attempt_timeout_failed="$(cut -d'|' -f2 <<<"$attempt_timeout_state")"
+  attempt_timeout_complete="$(cut -d'|' -f3 <<<"$attempt_timeout_state")"
+  if [ "$attempt_timeout_failed" = "1" ]; then
+    break
+  fi
+  if [ "$attempt_timeout_complete" != "0" ]; then
+    echo "Expected timeout smoke to fail, got state $attempt_timeout_state" >&2
+    exit 1
+  fi
+  sleep 1
+done
+[ "$attempt_timeout_failed" = "1" ] || {
+  echo "Timed out waiting for attempt-timeout smoke, complete=$attempt_timeout_complete failed=$attempt_timeout_failed" >&2
+  exit 1
+}
+attempt_timeout_contract="$(psql_value "
+SELECT j.status || '|' ||
+       COALESCE(j.error, '') || '|' ||
+       COALESCE(s.selection_reason, '') || '|' ||
+       COALESCE(s.schema_validation_status, '') || '|' ||
+       COALESCE(rs.runtime_status, '') || '|' ||
+       COALESCE(rs.slot_state, '')
+FROM otlet.inference_receipt_trace_status s
+JOIN otlet.jobs j ON j.id = s.job_id
+JOIN otlet.runtime_status rs
+  ON rs.runtime_name = '$runtime_name'
+ AND rs.model_name = '$strong_model_name'
+WHERE s.task_name = '$attempt_timeout_task'
+ORDER BY s.receipt_id DESC
+LIMIT 1;
+")"
+echo "attempt_timeout_contract=$attempt_timeout_contract"
+psql_exec >/dev/null <<'SQL'
+UPDATE otlet.production_policy
+SET max_attempt_ms = 300000
+WHERE name = 'default';
+SQL
+[ "$attempt_timeout_contract" = "failed|attempt_timeout|attempt_timeout|failed|ready|ready" ] || {
+  echo "Expected attempt timeout to fail cleanly with healthy worker, got $attempt_timeout_contract" >&2
   exit 1
 }
 
@@ -2005,6 +2077,33 @@ WHERE task_name = '$entity_task';
 ")"
 echo "model_selection_status_contract=$model_selection_status_contract"
 require_regex "$model_selection_status_contract" '^true\|true\|true\|[1-9][0-9]*\|[1-9][0-9]*$' "Expected cheap attempts, strong acceptance, and escalation"
+
+model_swap_contract="$(psql_value "
+WITH swaps AS (
+  SELECT detail
+  FROM otlet.worker_events
+  WHERE event_type = 'model_swap'
+    AND created_at >= '$script_started'::timestamptz
+)
+SELECT (count(*) FILTER (WHERE detail ->> 'model_name' = '$cheap_model_name') >= 1)::text || '|' ||
+       (count(*) FILTER (WHERE detail ->> 'model_name' = '$strong_model_name') >= 1)::text || '|' ||
+       COALESCE(bool_and(
+         COALESCE((detail ->> 'load_ms')::bigint, -1) >= 0
+         AND COALESCE((detail ->> 'model_memory_bytes')::bigint, 0) > 0
+         AND COALESCE((detail ->> 'worker_process_rss_bytes')::bigint, 0) > 0
+         AND (
+           COALESCE((detail ->> 'worker_memory_budget_bytes')::bigint, 0) = 0
+           OR COALESCE((detail ->> 'worker_process_rss_bytes')::bigint, 0)
+              <= COALESCE((detail ->> 'worker_memory_budget_bytes')::bigint, 0)
+         )
+       ), false)::text
+FROM swaps;
+")"
+echo "model_swap_contract=$model_swap_contract"
+[ "$model_swap_contract" = "true|true|true" ] || {
+  echo "Expected model swap events for cheap and strong models with memory evidence, got $model_swap_contract" >&2
+  exit 1
+}
 
 accepted_output_anomalies="$(psql_value "
 SELECT count(*)

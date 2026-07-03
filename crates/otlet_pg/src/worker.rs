@@ -311,7 +311,8 @@ fn process_direct_job(job: Job) -> JobProcessResult {
         }
         Err(err) => {
             let mut result = JobProcessResult::from_error(false, &err);
-            result.completed = fail_attempt(&job, err, "direct", "direct_attempt_failed");
+            let selection_reason = failure_selection_reason(&err, "direct_attempt_failed");
+            result.completed = fail_attempt(&job, err, "direct", selection_reason);
             result
         }
     }
@@ -375,19 +376,28 @@ fn process_selected_job(job: Job, policy: ModelSelectionPolicy) -> JobProcessRes
                 },
             ))
         }
-        Err(err) => JobProcessResult::completed(fail_attempt(
-            &cheap_job,
-            err,
-            "cheap",
-            "cheap_runtime_failed",
-        )),
+        Err(err) => {
+            let selection_reason = failure_selection_reason(&err, "cheap_runtime_failed");
+            JobProcessResult::completed(fail_attempt(&cheap_job, err, "cheap", selection_reason))
+        }
     }
 }
 
 fn run_strong_attempt(job: Job, reason: &str) -> bool {
     match run_job(&job) {
         Ok(run) => accept_attempt(&job, run, "strong", reason),
-        Err(err) => fail_attempt(&job, err, "strong", "strong_attempt_failed"),
+        Err(err) => {
+            let selection_reason = failure_selection_reason(&err, "strong_attempt_failed");
+            fail_attempt(&job, err, "strong", selection_reason)
+        }
+    }
+}
+
+fn failure_selection_reason<'a>(err: &ModelError, fallback: &'a str) -> &'a str {
+    if err.message == "attempt_timeout" {
+        "attempt_timeout"
+    } else {
+        fallback
     }
 }
 
@@ -662,6 +672,25 @@ fn record_metrics(job: &Job, metrics: &ModelMetrics) {
                 Some(1),
                 &args,
             )?;
+            if !metrics.cache_hit && !metrics.inference_cache_hit && metrics.model_memory_bytes > 0
+            {
+                let event_args = [
+                    job.id.into(),
+                    job.runtime_name.as_str().into(),
+                    job.task_name.as_str().into(),
+                    job.model_name.as_str().into(),
+                    metrics.artifact_path.as_str().into(),
+                    metrics.load_ms.into(),
+                    metrics.model_memory_bytes.into(),
+                    metrics.worker_process_rss_bytes.into(),
+                    metrics.worker_memory_budget_bytes.into(),
+                ];
+                client.update(
+                    "SELECT otlet.record_worker_event('model_swap', $1, $2, 'model residency changed', jsonb_build_object('task_name', $3, 'model_name', $4, 'artifact_path', $5, 'load_ms', $6, 'model_memory_bytes', $7, 'worker_process_rss_bytes', $8, 'worker_memory_budget_bytes', $9))",
+                    Some(1),
+                    &event_args,
+                )?;
+            }
             Ok(())
         })
     });

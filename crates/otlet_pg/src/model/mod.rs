@@ -87,6 +87,18 @@ impl ModelError {
         }
     }
 
+    fn attempt_timeout() -> Self {
+        let mut err = Self::new("attempt_timeout".to_owned());
+        err.schema_validation_status = Some("failed".to_owned());
+        err.trace_summary = Some(json!({
+            "trace_version": "otlet_generation_trace_v1",
+            "schema_validation_status": "failed",
+            "schema_force": "attempt_timeout_before_schema_validation",
+            "stop_reason": "attempt_timeout"
+        }));
+        err
+    }
+
     fn with_context(
         message: String,
         raw_output: String,

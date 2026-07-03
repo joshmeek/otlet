@@ -17,6 +17,7 @@ pub(crate) struct Job {
     pub(crate) runtime_options: Value,
     pub(crate) input_shaping: Value,
     pub(crate) decision_contract: Value,
+    pub(crate) max_attempt_ms: i64,
 }
 
 pub(crate) struct JobModel {
@@ -73,6 +74,7 @@ macro_rules! job_from_row {
             runtime_options: required_col!($row, JsonB, 12).0,
             input_shaping: required_col!($row, JsonB, 13).0,
             decision_contract: required_col!($row, JsonB, 14).0,
+            max_attempt_ms: required_col!($row, i32, 15) as i64,
         }
     };
 }
@@ -95,11 +97,13 @@ SELECT
   r.endpoint,
   t.runtime_options,
   t.input_shaping,
-  t.decision_contract
+  t.decision_contract,
+  p.max_attempt_ms
 FROM otlet.claim_jobs() j
 JOIN otlet.tasks t ON t.name = j.task_name
 JOIN otlet.models m ON m.name = t.model_name
 JOIN otlet.runtimes r ON r.name = m.runtime_name
+CROSS JOIN otlet.production_policy p
 "#,
             None,
             &[],
@@ -153,11 +157,13 @@ SELECT
   r.endpoint,
   t.runtime_options,
   t.input_shaping,
-  t.decision_contract
+  t.decision_contract,
+  p.max_attempt_ms
 FROM inserted j
 JOIN otlet.tasks t ON t.name = j.task_name
 JOIN otlet.models m ON m.name = t.model_name
 JOIN otlet.runtimes r ON r.name = m.runtime_name
+CROSS JOIN otlet.production_policy p
 "#,
             Some(1),
             &args,

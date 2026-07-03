@@ -6,6 +6,7 @@ fn run_linked(
 ) -> Result<LinkedRun, ModelError> {
     use std::ffi::CString;
 
+    let attempt_start = Instant::now();
     if job.artifact_path.starts_with("hf:") {
         return Err(ModelError::new(
             "linked llama.cpp runtime requires a local GGUF artifact path".to_owned(),
@@ -204,6 +205,9 @@ fn run_linked(
     let generate_start = Instant::now();
 
     for _ in 0..options.max_tokens {
+        if linked_attempt_timed_out(attempt_start, job.max_attempt_ms) {
+            return Err(ModelError::attempt_timeout());
+        }
         if linked_cancel_requested(job.id)? {
             return Err(ModelError::new("canceled".to_owned()));
         }
@@ -262,6 +266,9 @@ fn run_linked(
         if linked_cancel_requested(job.id)? {
             return Err(ModelError::new("canceled".to_owned()));
         }
+        if linked_attempt_timed_out(attempt_start, job.max_attempt_ms) {
+            return Err(ModelError::attempt_timeout());
+        }
         position += 1;
     }
     let generate_ms = elapsed_ms(generate_start);
@@ -314,6 +321,10 @@ fn run_linked(
             stop_reason,
         },
     })
+}
+
+fn linked_attempt_timed_out(start: Instant, max_attempt_ms: i64) -> bool {
+    max_attempt_ms > 0 && start.elapsed().as_millis() >= max_attempt_ms as u128
 }
 
 fn linked_decode_prompt_tokens(
