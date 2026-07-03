@@ -199,6 +199,7 @@ fn run_linked(
     let mut generated_tokens = 0_i64;
     let mut probability_trace = ProbabilityTrace::default();
     let mut detailed_trace = DetailedGenerationTrace::new(options);
+    let mut json_logit_mask = JsonLogitMask::new(options.json_logit_mask);
     let mut stop_reason = "max_tokens".to_owned();
     let generate_start = Instant::now();
 
@@ -206,8 +207,15 @@ fn run_linked(
         if linked_cancel_requested(job.id)? {
             return Err(ModelError::new("canceled".to_owned()));
         }
-        let token =
-            unsafe { llama_cpp_sys_4::llama_sampler_sample(sampler.ptr, cache.context.ptr, -1) };
+        let token = if options.json_logit_mask {
+            json_logit_mask
+                .sample(cache.context.ptr, cache.vocab)
+                .unwrap_or_else(|| unsafe {
+                    llama_cpp_sys_4::llama_sampler_sample(sampler.ptr, cache.context.ptr, -1)
+                })
+        } else {
+            unsafe { llama_cpp_sys_4::llama_sampler_sample(sampler.ptr, cache.context.ptr, -1) }
+        };
         let sample = unsafe {
             probability_sample(
                 cache.context.ptr,
@@ -227,6 +235,7 @@ fn run_linked(
         }
         generated_tokens += 1;
         let token_text = linked_token_to_piece(cache.vocab, token);
+        json_logit_mask.observe_chosen(&token_text);
         output.push_str(&token_text);
         detailed_trace.observe(token, token_text, sample);
         if let Some(end) = linked_output_complete_end(&output) {
@@ -293,6 +302,13 @@ fn run_linked(
             prompt_prefix_reused_tokens,
             prompt_prefix_reuse_status,
             prompt_prefix_reuse_reason,
+            json_logit_mask_enabled: options.json_logit_mask,
+            json_logit_mask_sampled_tokens: json_logit_mask.sampled_tokens,
+            json_logit_mask_candidates_checked: json_logit_mask.candidates_checked,
+            json_logit_mask_candidates_rejected: json_logit_mask.candidates_rejected,
+            json_logit_mask_fallbacks: json_logit_mask.fallbacks,
+            json_logit_mask_uncertain_pieces: json_logit_mask.uncertain_pieces,
+            json_logit_mask_overhead_ms: json_logit_mask.overhead_ms,
             probability_summary: probability_trace.summary(),
             detailed_trace: detailed_trace.summary(&stop_reason),
             stop_reason,
@@ -336,6 +352,443 @@ fn linked_decode_prompt_tokens(
     }
 
     Ok(())
+}
+
+#[derive(Clone)]
+struct JsonLogitMask {
+    enabled: bool,
+    state: JsonPrefixState,
+    sampled_tokens: i64,
+    candidates_checked: i64,
+    candidates_rejected: i64,
+    fallbacks: i64,
+    uncertain_pieces: i64,
+    overhead_ms: i64,
+}
+
+impl JsonLogitMask {
+    fn new(enabled: bool) -> Self {
+        Self {
+            enabled,
+            state: JsonPrefixState::default(),
+            sampled_tokens: 0,
+            candidates_checked: 0,
+            candidates_rejected: 0,
+            fallbacks: 0,
+            uncertain_pieces: 0,
+            overhead_ms: 0,
+        }
+    }
+
+    fn sample(
+        &mut self,
+        context: *mut llama_cpp_sys_4::llama_context,
+        vocab: *const llama_cpp_sys_4::llama_vocab,
+    ) -> Option<llama_cpp_sys_4::llama_token> {
+        if !self.enabled {
+            return None;
+        }
+
+        let start = Instant::now();
+        self.sampled_tokens += 1;
+        let token = unsafe { self.sample_inner(context, vocab) };
+        self.overhead_ms = self.overhead_ms.saturating_add(elapsed_ms(start));
+        if token.is_none() {
+            self.fallbacks += 1;
+        }
+        token
+    }
+
+    unsafe fn sample_inner(
+        &mut self,
+        context: *mut llama_cpp_sys_4::llama_context,
+        vocab: *const llama_cpp_sys_4::llama_vocab,
+    ) -> Option<llama_cpp_sys_4::llama_token> {
+        unsafe {
+            if context.is_null() || vocab.is_null() {
+                return None;
+            }
+            let logits = llama_cpp_sys_4::llama_get_logits_ith(context, -1);
+            let vocab_tokens = llama_cpp_sys_4::llama_vocab_n_tokens(vocab);
+            if logits.is_null() || vocab_tokens <= 0 {
+                return None;
+            }
+
+            let mut best_token = None;
+            let mut best_logit = f32::NEG_INFINITY;
+            for index in 0..vocab_tokens {
+                let logit = *logits.add(index as usize);
+                if !logit.is_finite() || logit <= best_logit {
+                    continue;
+                }
+
+                let token = index as llama_cpp_sys_4::llama_token;
+                self.candidates_checked += 1;
+                if self.allows_token(vocab, token) {
+                    best_token = Some(token);
+                    best_logit = logit;
+                } else {
+                    self.candidates_rejected += 1;
+                }
+            }
+            best_token
+        }
+    }
+
+    fn allows_token(
+        &mut self,
+        vocab: *const llama_cpp_sys_4::llama_vocab,
+        token: llama_cpp_sys_4::llama_token,
+    ) -> bool {
+        if unsafe { llama_cpp_sys_4::llama_vocab_is_eog(vocab, token) } {
+            return self.state.is_complete();
+        }
+
+        let piece = linked_token_to_piece(vocab, token);
+        if json_piece_uncertain(&piece) {
+            self.uncertain_pieces += 1;
+            return true;
+        }
+
+        let mut state = self.state.clone();
+        state.push_str(&piece).is_ok()
+    }
+
+    fn observe_chosen(&mut self, piece: &str) {
+        if !self.enabled {
+            return;
+        }
+        if json_piece_uncertain(piece) {
+            self.uncertain_pieces += 1;
+            return;
+        }
+        if self.state.push_str(piece).is_err() {
+            self.enabled = false;
+            self.fallbacks += 1;
+        }
+    }
+}
+
+fn json_piece_uncertain(piece: &str) -> bool {
+    piece.is_empty() || piece.contains('\u{fffd}')
+}
+
+#[derive(Clone)]
+struct JsonPrefixState {
+    mode: JsonMode,
+    stack: Vec<JsonFrame>,
+}
+
+impl Default for JsonPrefixState {
+    fn default() -> Self {
+        Self {
+            mode: JsonMode::Root,
+            stack: Vec::new(),
+        }
+    }
+}
+
+impl JsonPrefixState {
+    fn is_complete(&self) -> bool {
+        matches!(self.mode, JsonMode::Done)
+    }
+
+    fn push_str(&mut self, text: &str) -> Result<(), ()> {
+        for ch in text.chars() {
+            self.push_char(ch)?;
+        }
+        Ok(())
+    }
+
+    fn push_char(&mut self, ch: char) -> Result<(), ()> {
+        match &mut self.mode {
+            JsonMode::String {
+                kind,
+                escape,
+                unicode_remaining,
+            } => {
+                if *unicode_remaining > 0 {
+                    if ch.is_ascii_hexdigit() {
+                        *unicode_remaining -= 1;
+                        return Ok(());
+                    }
+                    return Err(());
+                }
+                if *escape {
+                    *escape = false;
+                    if ch == 'u' {
+                        *unicode_remaining = 4;
+                    } else if !matches!(ch, '"' | '\\' | '/' | 'b' | 'f' | 'n' | 'r' | 't') {
+                        return Err(());
+                    }
+                    return Ok(());
+                }
+                if ch == '\\' {
+                    *escape = true;
+                    return Ok(());
+                }
+                if ch == '"' {
+                    let kind = *kind;
+                    if matches!(kind, JsonStringKind::Key) {
+                        self.mode = JsonMode::Normal;
+                        self.set_object_expect(JsonObjectExpect::Colon)?;
+                    } else {
+                        self.finish_value()?;
+                    }
+                    return Ok(());
+                }
+                if ch.is_control() {
+                    return Err(());
+                }
+                Ok(())
+            }
+            JsonMode::Number => {
+                if ch.is_ascii_digit() || matches!(ch, '.' | 'e' | 'E' | '+' | '-') {
+                    Ok(())
+                } else {
+                    self.finish_value()?;
+                    self.push_char(ch)
+                }
+            }
+            JsonMode::Literal { target, index } => {
+                let Some(expected) = target.as_bytes().get(*index).copied() else {
+                    self.finish_value()?;
+                    return self.push_char(ch);
+                };
+                if ch as u8 != expected {
+                    return Err(());
+                }
+                *index += 1;
+                if *index == target.len() {
+                    self.finish_value()?;
+                }
+                Ok(())
+            }
+            JsonMode::Root | JsonMode::Normal | JsonMode::Done => self.push_normal(ch),
+        }
+    }
+
+    fn push_normal(&mut self, ch: char) -> Result<(), ()> {
+        if ch.is_whitespace() {
+            return Ok(());
+        }
+        if matches!(self.mode, JsonMode::Done) {
+            return Err(());
+        }
+
+        match self.current_expect()? {
+            JsonExpect::Root => {
+                if ch == '{' {
+                    self.stack.push(JsonFrame::Object(JsonObjectExpect::KeyOrEnd));
+                    self.mode = JsonMode::Normal;
+                    Ok(())
+                } else {
+                    Err(())
+                }
+            }
+            JsonExpect::ObjectKeyOrEnd => match ch {
+                '}' => {
+                    self.stack.pop();
+                    self.finish_value()
+                }
+                '"' => {
+                    self.mode = JsonMode::String {
+                        kind: JsonStringKind::Key,
+                        escape: false,
+                        unicode_remaining: 0,
+                    };
+                    Ok(())
+                }
+                _ => Err(()),
+            },
+            JsonExpect::ObjectColon => {
+                if ch == ':' {
+                    self.set_object_expect(JsonObjectExpect::Value)
+                } else {
+                    Err(())
+                }
+            }
+            JsonExpect::ObjectValue | JsonExpect::ArrayValueOrEnd => {
+                if matches!(self.current_expect()?, JsonExpect::ArrayValueOrEnd) && ch == ']' {
+                    self.stack.pop();
+                    return self.finish_value();
+                }
+                self.start_value(ch)
+            }
+            JsonExpect::ObjectCommaOrEnd => match ch {
+                ',' => self.set_object_expect(JsonObjectExpect::KeyOrEnd),
+                '}' => {
+                    self.stack.pop();
+                    self.finish_value()
+                }
+                _ => Err(()),
+            },
+            JsonExpect::ArrayCommaOrEnd => match ch {
+                ',' => self.set_array_expect(JsonArrayExpect::ValueOrEnd),
+                ']' => {
+                    self.stack.pop();
+                    self.finish_value()
+                }
+                _ => Err(()),
+            },
+        }
+    }
+
+    fn start_value(&mut self, ch: char) -> Result<(), ()> {
+        match ch {
+            '{' => {
+                self.stack.push(JsonFrame::Object(JsonObjectExpect::KeyOrEnd));
+                Ok(())
+            }
+            '[' => {
+                self.stack.push(JsonFrame::Array(JsonArrayExpect::ValueOrEnd));
+                Ok(())
+            }
+            '"' => {
+                self.mode = JsonMode::String {
+                    kind: JsonStringKind::Value,
+                    escape: false,
+                    unicode_remaining: 0,
+                };
+                Ok(())
+            }
+            '-' | '0'..='9' => {
+                self.mode = JsonMode::Number;
+                Ok(())
+            }
+            't' => {
+                self.mode = JsonMode::Literal {
+                    target: "true",
+                    index: 1,
+                };
+                Ok(())
+            }
+            'f' => {
+                self.mode = JsonMode::Literal {
+                    target: "false",
+                    index: 1,
+                };
+                Ok(())
+            }
+            'n' => {
+                self.mode = JsonMode::Literal {
+                    target: "null",
+                    index: 1,
+                };
+                Ok(())
+            }
+            _ => Err(()),
+        }
+    }
+
+    fn finish_value(&mut self) -> Result<(), ()> {
+        self.mode = JsonMode::Normal;
+        match self.stack.last_mut() {
+            Some(JsonFrame::Object(expect)) => {
+                *expect = JsonObjectExpect::CommaOrEnd;
+                Ok(())
+            }
+            Some(JsonFrame::Array(expect)) => {
+                *expect = JsonArrayExpect::CommaOrEnd;
+                Ok(())
+            }
+            None => {
+                self.mode = JsonMode::Done;
+                Ok(())
+            }
+        }
+    }
+
+    fn current_expect(&self) -> Result<JsonExpect, ()> {
+        match self.stack.last() {
+            None => {
+                if matches!(self.mode, JsonMode::Root) {
+                    Ok(JsonExpect::Root)
+                } else {
+                    Err(())
+                }
+            }
+            Some(JsonFrame::Object(JsonObjectExpect::KeyOrEnd)) => Ok(JsonExpect::ObjectKeyOrEnd),
+            Some(JsonFrame::Object(JsonObjectExpect::Colon)) => Ok(JsonExpect::ObjectColon),
+            Some(JsonFrame::Object(JsonObjectExpect::Value)) => Ok(JsonExpect::ObjectValue),
+            Some(JsonFrame::Object(JsonObjectExpect::CommaOrEnd)) => {
+                Ok(JsonExpect::ObjectCommaOrEnd)
+            }
+            Some(JsonFrame::Array(JsonArrayExpect::ValueOrEnd)) => {
+                Ok(JsonExpect::ArrayValueOrEnd)
+            }
+            Some(JsonFrame::Array(JsonArrayExpect::CommaOrEnd)) => Ok(JsonExpect::ArrayCommaOrEnd),
+        }
+    }
+
+    fn set_object_expect(&mut self, next: JsonObjectExpect) -> Result<(), ()> {
+        let Some(JsonFrame::Object(expect)) = self.stack.last_mut() else {
+            return Err(());
+        };
+        *expect = next;
+        Ok(())
+    }
+
+    fn set_array_expect(&mut self, next: JsonArrayExpect) -> Result<(), ()> {
+        let Some(JsonFrame::Array(expect)) = self.stack.last_mut() else {
+            return Err(());
+        };
+        *expect = next;
+        Ok(())
+    }
+}
+
+#[derive(Clone)]
+enum JsonMode {
+    Root,
+    Normal,
+    String {
+        kind: JsonStringKind,
+        escape: bool,
+        unicode_remaining: u8,
+    },
+    Number,
+    Literal {
+        target: &'static str,
+        index: usize,
+    },
+    Done,
+}
+
+#[derive(Clone)]
+enum JsonFrame {
+    Object(JsonObjectExpect),
+    Array(JsonArrayExpect),
+}
+
+#[derive(Clone, Copy)]
+enum JsonStringKind {
+    Key,
+    Value,
+}
+
+#[derive(Clone, Copy)]
+enum JsonObjectExpect {
+    KeyOrEnd,
+    Colon,
+    Value,
+    CommaOrEnd,
+}
+
+#[derive(Clone, Copy)]
+enum JsonArrayExpect {
+    ValueOrEnd,
+    CommaOrEnd,
+}
+
+enum JsonExpect {
+    Root,
+    ObjectKeyOrEnd,
+    ObjectColon,
+    ObjectValue,
+    ObjectCommaOrEnd,
+    ArrayValueOrEnd,
+    ArrayCommaOrEnd,
 }
 
 fn validate_linked_token_budget(

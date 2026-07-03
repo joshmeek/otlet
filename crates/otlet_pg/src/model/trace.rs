@@ -104,6 +104,34 @@ fn generation_trace_summary(
             Value::String(metrics.prompt_prefix_reuse_reason.clone()),
         );
         object.insert(
+            "json_logit_mask_enabled".to_owned(),
+            Value::Bool(metrics.json_logit_mask_enabled),
+        );
+        object.insert(
+            "json_logit_mask_sampled_tokens".to_owned(),
+            Value::Number(metrics.json_logit_mask_sampled_tokens.into()),
+        );
+        object.insert(
+            "json_logit_mask_candidates_checked".to_owned(),
+            Value::Number(metrics.json_logit_mask_candidates_checked.into()),
+        );
+        object.insert(
+            "json_logit_mask_candidates_rejected".to_owned(),
+            Value::Number(metrics.json_logit_mask_candidates_rejected.into()),
+        );
+        object.insert(
+            "json_logit_mask_fallbacks".to_owned(),
+            Value::Number(metrics.json_logit_mask_fallbacks.into()),
+        );
+        object.insert(
+            "json_logit_mask_uncertain_pieces".to_owned(),
+            Value::Number(metrics.json_logit_mask_uncertain_pieces.into()),
+        );
+        object.insert(
+            "json_logit_mask_overhead_ms".to_owned(),
+            Value::Number(metrics.json_logit_mask_overhead_ms.into()),
+        );
+        object.insert(
             "inference_cache_key_basis".to_owned(),
             Value::String(context.inference_cache_key_basis.clone()),
         );

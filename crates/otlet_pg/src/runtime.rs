@@ -4,6 +4,7 @@ pub(crate) struct RuntimeOptions {
     pub(crate) reasoning: String,
     pub(crate) schema_prompt: String,
     pub(crate) prefix_kv_reuse: bool,
+    pub(crate) json_logit_mask: bool,
     pub(crate) max_tokens: u64,
     pub(crate) inference_cache: bool,
     pub(crate) max_worker_rss_bytes: u64,
@@ -18,6 +19,7 @@ impl Default for RuntimeOptions {
             reasoning: "off".to_owned(),
             schema_prompt: "verbatim".to_owned(),
             prefix_kv_reuse: false,
+            json_logit_mask: false,
             max_tokens: 512,
             inference_cache: true,
             max_worker_rss_bytes: 0,
@@ -40,6 +42,7 @@ pub(crate) fn parse_runtime_options(value: &Value) -> Result<RuntimeOptions, Str
             "reasoning"
                 | "schema_prompt"
                 | "prefix_kv_reuse"
+                | "json_logit_mask"
                 | "max_tokens"
                 | "inference_cache"
                 | "max_worker_rss_bytes"
@@ -75,6 +78,12 @@ pub(crate) fn parse_runtime_options(value: &Value) -> Result<RuntimeOptions, Str
         options.prefix_kv_reuse = value
             .as_bool()
             .ok_or("runtime_options.prefix_kv_reuse must be a boolean")?;
+    }
+
+    if let Some(value) = object.get("json_logit_mask") {
+        options.json_logit_mask = value
+            .as_bool()
+            .ok_or("runtime_options.json_logit_mask must be a boolean")?;
     }
 
     if let Some(value) = object.get("max_tokens") {
@@ -152,6 +161,7 @@ pub(crate) fn runtime_option_status(value: &Value) -> Value {
         "reasoning",
         "schema_prompt",
         "prefix_kv_reuse",
+        "json_logit_mask",
         "max_tokens",
         "inference_cache",
         "max_worker_rss_bytes",

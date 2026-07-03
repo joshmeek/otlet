@@ -37,6 +37,13 @@ pub(crate) struct ModelMetrics {
     pub(crate) prompt_prefix_reused_tokens: i64,
     pub(crate) prompt_prefix_reuse_status: String,
     pub(crate) prompt_prefix_reuse_reason: String,
+    pub(crate) json_logit_mask_enabled: bool,
+    pub(crate) json_logit_mask_sampled_tokens: i64,
+    pub(crate) json_logit_mask_candidates_checked: i64,
+    pub(crate) json_logit_mask_candidates_rejected: i64,
+    pub(crate) json_logit_mask_fallbacks: i64,
+    pub(crate) json_logit_mask_uncertain_pieces: i64,
+    pub(crate) json_logit_mask_overhead_ms: i64,
     pub(crate) generated_tokens: i64,
     pub(crate) generate_ms: i64,
     pub(crate) cache_hit: bool,
@@ -206,9 +213,9 @@ pub(crate) fn run_job(job: &Job) -> Result<ModelRun, ModelError> {
         input_truncated: shaped_input.input_truncated,
         input_shaping_applied: shaped_input.applied,
         schema_prompt: options.schema_prompt.clone(),
-        decode_constraint: LINKED_DECODE_CONSTRAINT.to_owned(),
+        decode_constraint: decode_constraint_name(&options).to_owned(),
         grammar_supported: false,
-        decode_constraint_reason: LINKED_DECODE_CONSTRAINT_REASON.to_owned(),
+        decode_constraint_reason: decode_constraint_reason(&options).to_owned(),
     };
     let content_cache_key = inference_cache_content_key(job, &context);
     let contract_cache_key = inference_cache_contract_key(&context);
@@ -276,6 +283,13 @@ pub(crate) fn run_job(job: &Job) -> Result<ModelRun, ModelError> {
                 prompt_prefix_reused_tokens: 0,
                 prompt_prefix_reuse_status: "not_run".to_owned(),
                 prompt_prefix_reuse_reason: "inference_cache_hit_no_decode".to_owned(),
+                json_logit_mask_enabled: options.json_logit_mask,
+                json_logit_mask_sampled_tokens: 0,
+                json_logit_mask_candidates_checked: 0,
+                json_logit_mask_candidates_rejected: 0,
+                json_logit_mask_fallbacks: 0,
+                json_logit_mask_uncertain_pieces: 0,
+                json_logit_mask_overhead_ms: 0,
                 generated_tokens: 0,
                 generate_ms: 0,
                 cache_hit: false,
@@ -532,6 +546,9 @@ const LINKED_DECODE_CONSTRAINT: &str =
     "greedy_with_balanced_json_object_stop_post_generation_schema_check";
 const LINKED_DECODE_CONSTRAINT_REASON: &str =
     "balanced_json_stop_prevents_trailing_prose_schema_failures_stay_receipts_only";
+const LINKED_JSON_LOGIT_MASK_CONSTRAINT: &str = "json_logit_mask_v1";
+const LINKED_JSON_LOGIT_MASK_CONSTRAINT_REASON: &str =
+    "rust_token_piece_json_prefix_mask_before_argmax_post_generation_schema_check_unchanged";
 const LINKED_CONTEXT_WINDOW_TOKENS: u32 = 4096;
 const LINKED_PROMPT_BATCH_TOKENS: usize = 512;
 const LINKED_ACTIVE_SEQUENCE_ID: llama_cpp_sys_4::llama_seq_id = 0;
@@ -544,3 +561,19 @@ include!("trace.rs");
 include!("linked.rs");
 include!("cache.rs");
 include!("output.rs");
+
+fn decode_constraint_name(options: &crate::runtime::RuntimeOptions) -> &'static str {
+    if options.json_logit_mask {
+        LINKED_JSON_LOGIT_MASK_CONSTRAINT
+    } else {
+        LINKED_DECODE_CONSTRAINT
+    }
+}
+
+fn decode_constraint_reason(options: &crate::runtime::RuntimeOptions) -> &'static str {
+    if options.json_logit_mask {
+        LINKED_JSON_LOGIT_MASK_CONSTRAINT_REASON
+    } else {
+        LINKED_DECODE_CONSTRAINT_REASON
+    }
+}

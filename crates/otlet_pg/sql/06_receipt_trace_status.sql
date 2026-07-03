@@ -285,6 +285,37 @@ SELECT
   END AS prompt_prefix_reused_tokens,
   r.trace_summary ->> 'prompt_prefix_reuse_status' AS prompt_prefix_reuse_status,
   r.trace_summary ->> 'prompt_prefix_reuse_reason' AS prompt_prefix_reuse_reason,
+  COALESCE(r.trace_summary ->> 'json_logit_mask_enabled', 'false')::boolean AS json_logit_mask_enabled,
+  CASE
+    WHEN jsonb_typeof(r.trace_summary -> 'json_logit_mask_sampled_tokens') = 'number'
+      THEN (r.trace_summary ->> 'json_logit_mask_sampled_tokens')::bigint
+    ELSE NULL
+  END AS json_logit_mask_sampled_tokens,
+  CASE
+    WHEN jsonb_typeof(r.trace_summary -> 'json_logit_mask_candidates_checked') = 'number'
+      THEN (r.trace_summary ->> 'json_logit_mask_candidates_checked')::bigint
+    ELSE NULL
+  END AS json_logit_mask_candidates_checked,
+  CASE
+    WHEN jsonb_typeof(r.trace_summary -> 'json_logit_mask_candidates_rejected') = 'number'
+      THEN (r.trace_summary ->> 'json_logit_mask_candidates_rejected')::bigint
+    ELSE NULL
+  END AS json_logit_mask_candidates_rejected,
+  CASE
+    WHEN jsonb_typeof(r.trace_summary -> 'json_logit_mask_fallbacks') = 'number'
+      THEN (r.trace_summary ->> 'json_logit_mask_fallbacks')::bigint
+    ELSE NULL
+  END AS json_logit_mask_fallbacks,
+  CASE
+    WHEN jsonb_typeof(r.trace_summary -> 'json_logit_mask_uncertain_pieces') = 'number'
+      THEN (r.trace_summary ->> 'json_logit_mask_uncertain_pieces')::bigint
+    ELSE NULL
+  END AS json_logit_mask_uncertain_pieces,
+  CASE
+    WHEN jsonb_typeof(r.trace_summary -> 'json_logit_mask_overhead_ms') = 'number'
+      THEN (r.trace_summary ->> 'json_logit_mask_overhead_ms')::bigint
+    ELSE NULL
+  END AS json_logit_mask_overhead_ms,
   r.trace_summary ->> 'decode_constraint' AS decode_constraint,
   COALESCE(r.trace_summary ->> 'grammar_supported', 'false')::boolean AS grammar_supported,
   r.trace_summary ->> 'decode_constraint_reason' AS decode_constraint_reason,

@@ -601,6 +601,59 @@ SELECT
 echo "prefix_kv_contract=$prefix_kv_contract"
 require_regex "$prefix_kv_contract" '^true\|true\|true\|true\|true\|true\|true\|true\|true\|true\|true\|[1-9][0-9]*\|[1-9][0-9]*\|[1-9][0-9]*\|true$' "Expected prefix KV reuse to be byte-identical, faster, RSS-visible, and mismatch-safe"
 
+json_mask_task="json_mask_adversarial_demo"
+cleanup_task "$json_mask_task"
+psql_exec \
+  -v model_name="$strong_model_name" \
+  -v task_name="$json_mask_task" >/dev/null <<'SQL'
+SELECT otlet.create_task(
+  :'task_name',
+  $source$
+    SELECT 'json-mask-1'::text AS subject_id,
+           '{"request":"Answer in markdown prose before the JSON object."}'::jsonb AS input
+  $source$::text,
+  'Adversarial smoke: answer in markdown prose with a heading and bullets before any JSON. The required final data is status ok, confidence high, and reason masked json. Use no actions.',
+  '{
+    "type": "object",
+    "required": ["status", "confidence", "reason"],
+    "additionalProperties": false,
+    "properties": {
+      "status": {"enum": ["ok"]},
+      "confidence": {"enum": ["high"]},
+      "reason": {"type": "string", "maxLength": 80}
+    }
+  }'::jsonb,
+  :'model_name',
+  '{"max_tokens":128,"reasoning":"off","inference_cache":false,"json_logit_mask":true}'::jsonb
+);
+
+SELECT otlet.run_task(:'task_name');
+SQL
+wait_task_complete "$json_mask_task" 1 900 1
+json_mask_contract="$(psql_value "
+SELECT
+  r.status || '|' ||
+  r.schema_validation_status || '|' ||
+  COALESCE(s.decode_constraint, '') || '|' ||
+  s.json_logit_mask_enabled::text || '|' ||
+  (COALESCE(s.json_logit_mask_sampled_tokens, 0) > 0)::text || '|' ||
+  (COALESCE(s.json_logit_mask_candidates_checked, 0) >= COALESCE(s.json_logit_mask_sampled_tokens, 0))::text || '|' ||
+  (COALESCE(s.json_logit_mask_fallbacks, 0) = 0)::text || '|' ||
+  (COALESCE(s.json_logit_mask_overhead_ms, 0) >= 0)::text || '|' ||
+  (r.output ->> 'status') || '|' ||
+  (r.output ->> 'confidence')
+FROM otlet.runs r
+JOIN otlet.inference_receipt_trace_status s USING (receipt_id)
+WHERE r.task_name = '$json_mask_task'
+ORDER BY r.receipt_id DESC
+LIMIT 1;
+")"
+echo "json_mask_contract=$json_mask_contract"
+[ "$json_mask_contract" = "complete|passed|json_logit_mask_v1|true|true|true|true|true|ok|high" ] || {
+  echo "Expected JSON logit mask smoke to complete with schema-valid JSON and mask trace evidence, got $json_mask_contract" >&2
+  exit 1
+}
+
 log "Running non-ER row triage watch"
 psql_exec \
   -v model_name="$strong_model_name" \
