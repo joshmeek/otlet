@@ -31,13 +31,14 @@ fn inference_cache_row_key(content_key: &str, contract_key: &str) -> String {
     )
 }
 
-fn inference_cache_contract_hash(job: &Job, instruction: &str) -> String {
+fn inference_cache_contract_hash(job: &Job, instruction: &str, schema_prompt: &str) -> String {
     hash_text(
         format!(
-            "task={}|instruction={}|schema={}|options={}|input_shaping={}|decision_contract={}",
+            "task={}|instruction={}|schema={}|schema_prompt={}|options={}|input_shaping={}|decision_contract={}",
             job.task_name,
             hash_text(instruction),
             hash_json(&job.output_schema),
+            schema_prompt,
             hash_json(&job.runtime_options),
             hash_json(&job.input_shaping),
             hash_json(&job.decision_contract)

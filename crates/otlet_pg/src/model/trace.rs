@@ -68,6 +68,10 @@ fn generation_trace_summary(
             Value::String(context.decision_contract_hash.clone()),
         );
         object.insert(
+            "schema_prompt".to_owned(),
+            Value::String(context.schema_prompt.clone()),
+        );
+        object.insert(
             "inference_cache_key_basis".to_owned(),
             Value::String(context.inference_cache_key_basis.clone()),
         );

@@ -2,6 +2,7 @@ use serde_json::{Value, json};
 
 pub(crate) struct RuntimeOptions {
     pub(crate) reasoning: String,
+    pub(crate) schema_prompt: String,
     pub(crate) max_tokens: u64,
     pub(crate) inference_cache: bool,
     pub(crate) max_worker_rss_bytes: u64,
@@ -14,6 +15,7 @@ impl Default for RuntimeOptions {
     fn default() -> Self {
         Self {
             reasoning: "off".to_owned(),
+            schema_prompt: "verbatim".to_owned(),
             max_tokens: 512,
             inference_cache: true,
             max_worker_rss_bytes: 0,
@@ -34,6 +36,7 @@ pub(crate) fn parse_runtime_options(value: &Value) -> Result<RuntimeOptions, Str
         if !matches!(
             key.as_str(),
             "reasoning"
+                | "schema_prompt"
                 | "max_tokens"
                 | "inference_cache"
                 | "max_worker_rss_bytes"
@@ -53,6 +56,16 @@ pub(crate) fn parse_runtime_options(value: &Value) -> Result<RuntimeOptions, Str
             return Err("runtime_options.reasoning must be on, off, or auto".to_owned());
         }
         options.reasoning = reasoning.to_owned();
+    }
+
+    if let Some(value) = object.get("schema_prompt") {
+        let schema_prompt = value
+            .as_str()
+            .ok_or("runtime_options.schema_prompt must be a string")?;
+        if !matches!(schema_prompt, "compact" | "verbatim") {
+            return Err("runtime_options.schema_prompt must be compact or verbatim".to_owned());
+        }
+        options.schema_prompt = schema_prompt.to_owned();
     }
 
     if let Some(value) = object.get("max_tokens") {
@@ -128,6 +141,7 @@ pub(crate) fn runtime_option_status(value: &Value) -> Value {
     };
     let controls = [
         "reasoning",
+        "schema_prompt",
         "max_tokens",
         "inference_cache",
         "max_worker_rss_bytes",

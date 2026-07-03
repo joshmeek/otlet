@@ -265,6 +265,7 @@ SELECT
   r.trace_summary ->> 'stale_policy' AS stale_policy,
   r.trace_summary ->> 'stop_reason' AS stop_reason,
   r.trace_summary ->> 'schema_force' AS schema_force,
+  r.trace_summary ->> 'schema_prompt' AS schema_prompt,
   r.trace_summary ->> 'decode_constraint' AS decode_constraint,
   COALESCE(r.trace_summary ->> 'grammar_supported', 'false')::boolean AS grammar_supported,
   r.trace_summary ->> 'decode_constraint_reason' AS decode_constraint_reason,

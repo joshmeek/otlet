@@ -317,6 +317,113 @@ require_regex "$direct_ask_receipt_contract" "^$strong_model_name\\|complete\\|p
   exit 1
 }
 
+prompt_diet_verbatim_task="prompt_diet_verbatim_demo"
+prompt_diet_compact_task="prompt_diet_compact_demo"
+psql_exec \
+  -v model_name="$strong_model_name" \
+  -v verbatim_task="$prompt_diet_verbatim_task" \
+  -v compact_task="$prompt_diet_compact_task" >/dev/null <<'SQL'
+WITH params AS (
+  SELECT
+    'Return every output field with the exact obvious value from its enum: status ok, priority low, category schema_prompt, confidence high, phase alpha, queue primary, policy default, outcome accepted, route review, owner ops, and reason ok. Use no actions.'::text AS instruction,
+    $source$
+      SELECT 'prompt-diet'::text AS subject_id, '{}'::jsonb AS input
+    $source$::text AS input_query,
+    '{
+      "type": "object",
+      "title": "Prompt diet smoke schema",
+      "description": "Verbose JSON Schema metadata that should not be needed in the model prompt because the compact renderer keeps only the field names, required markers, types, and enum values.",
+      "required": ["status", "priority", "category", "confidence", "phase", "queue", "policy", "outcome", "route", "owner", "reason"],
+      "additionalProperties": false,
+      "properties": {
+        "status": {"description": "Fixed smoke status chosen by the instruction", "enum": ["ok", "needs_review"]},
+        "priority": {"description": "Fixed smoke priority chosen by the instruction", "enum": ["low", "medium", "high"]},
+        "category": {"description": "Fixed smoke category chosen by the instruction", "enum": ["schema_prompt", "other"]},
+        "confidence": {"description": "Fixed smoke confidence chosen by the instruction", "enum": ["low", "medium", "high"]},
+        "phase": {"description": "Fixed smoke phase chosen by the instruction", "enum": ["alpha", "beta", "ga"]},
+        "queue": {"description": "Fixed smoke queue chosen by the instruction", "enum": ["primary", "secondary"]},
+        "policy": {"description": "Fixed smoke policy chosen by the instruction", "enum": ["default", "override"]},
+        "outcome": {"description": "Fixed smoke outcome chosen by the instruction", "enum": ["accepted", "rejected"]},
+        "route": {"description": "Fixed smoke route chosen by the instruction", "enum": ["review", "archive"]},
+        "owner": {"description": "Fixed smoke owner chosen by the instruction", "enum": ["ops", "finance"]},
+        "reason": {"description": "Short smoke reason", "type": "string", "maxLength": 240}
+      }
+    }'::jsonb AS schema
+)
+SELECT otlet.create_task(
+  :'verbatim_task',
+  input_query,
+  instruction,
+  schema,
+  :'model_name',
+  '{"max_tokens":192,"reasoning":"off","schema_prompt":"verbatim","generation_trace":true,"generation_trace_max_tokens":4,"generation_trace_top_k":1}'::jsonb
+)
+FROM params;
+
+WITH params AS (
+  SELECT
+    'Return every output field with the exact obvious value from its enum: status ok, priority low, category schema_prompt, confidence high, phase alpha, queue primary, policy default, outcome accepted, route review, owner ops, and reason ok. Use no actions.'::text AS instruction,
+    $source$
+      SELECT 'prompt-diet'::text AS subject_id, '{}'::jsonb AS input
+    $source$::text AS input_query,
+    '{
+      "type": "object",
+      "title": "Prompt diet smoke schema",
+      "description": "Verbose JSON Schema metadata that should not be needed in the model prompt because the compact renderer keeps only the field names, required markers, types, and enum values.",
+      "required": ["status", "priority", "category", "confidence", "phase", "queue", "policy", "outcome", "route", "owner", "reason"],
+      "additionalProperties": false,
+      "properties": {
+        "status": {"description": "Fixed smoke status chosen by the instruction", "enum": ["ok", "needs_review"]},
+        "priority": {"description": "Fixed smoke priority chosen by the instruction", "enum": ["low", "medium", "high"]},
+        "category": {"description": "Fixed smoke category chosen by the instruction", "enum": ["schema_prompt", "other"]},
+        "confidence": {"description": "Fixed smoke confidence chosen by the instruction", "enum": ["low", "medium", "high"]},
+        "phase": {"description": "Fixed smoke phase chosen by the instruction", "enum": ["alpha", "beta", "ga"]},
+        "queue": {"description": "Fixed smoke queue chosen by the instruction", "enum": ["primary", "secondary"]},
+        "policy": {"description": "Fixed smoke policy chosen by the instruction", "enum": ["default", "override"]},
+        "outcome": {"description": "Fixed smoke outcome chosen by the instruction", "enum": ["accepted", "rejected"]},
+        "route": {"description": "Fixed smoke route chosen by the instruction", "enum": ["review", "archive"]},
+        "owner": {"description": "Fixed smoke owner chosen by the instruction", "enum": ["ops", "finance"]},
+        "reason": {"description": "Short smoke reason", "type": "string", "maxLength": 240}
+      }
+    }'::jsonb AS schema
+)
+SELECT otlet.create_task(
+  :'compact_task',
+  input_query,
+  instruction,
+  schema,
+  :'model_name',
+  '{"max_tokens":192,"reasoning":"off","schema_prompt":"compact","generation_trace":true,"generation_trace_max_tokens":4,"generation_trace_top_k":1}'::jsonb
+)
+FROM params;
+
+SELECT otlet.run_task(:'verbatim_task');
+SELECT otlet.run_task(:'compact_task');
+SQL
+wait_task_complete "$prompt_diet_verbatim_task" 1 900 1
+wait_task_complete "$prompt_diet_compact_task" 1 900 1
+prompt_diet_contract="$(psql_value "
+WITH receipt_pairs AS (
+  SELECT
+    max(prompt_tokens) FILTER (WHERE task_name = '$prompt_diet_verbatim_task') AS verbatim_tokens,
+    max(prompt_tokens) FILTER (WHERE task_name = '$prompt_diet_compact_task') AS compact_tokens,
+    count(*) FILTER (WHERE task_name = '$prompt_diet_verbatim_task') AS verbatim_receipts,
+    count(*) FILTER (WHERE task_name = '$prompt_diet_compact_task') AS compact_receipts,
+    bool_and(schema_validation_status = 'passed') AS schema_passed
+  FROM otlet.inference_receipt_trace_status
+  WHERE task_name IN ('$prompt_diet_verbatim_task', '$prompt_diet_compact_task')
+)
+SELECT (verbatim_receipts = 1)::text || '|' ||
+       (compact_receipts = 1)::text || '|' ||
+       verbatim_tokens::text || '|' ||
+       compact_tokens::text || '|' ||
+       (compact_tokens < verbatim_tokens)::text || '|' ||
+       schema_passed::text
+FROM receipt_pairs;
+")"
+echo "prompt_diet_contract=$prompt_diet_contract"
+require_regex "$prompt_diet_contract" '^true\|true\|[0-9]+\|[0-9]+\|true\|true$' "Expected compact schema prompt to reduce prompt tokens with schema-valid direct outputs"
+
 log "Running non-ER row triage watch"
 psql_exec \
   -v model_name="$strong_model_name" \
@@ -1120,7 +1227,7 @@ wait_task_complete "$row_triage_policy_task" 2 900 1
 
 cheap_skip_contract="$(psql_value "
 WITH attempts AS (
-  SELECT selection_role, selection_reason, output
+  SELECT selection_role, selection_status, selection_reason
   FROM otlet.model_selection_attempts
   WHERE task_name = '$row_triage_policy_task'
     AND subject_id = 'triage-skip'
@@ -1128,11 +1235,11 @@ WITH attempts AS (
 SELECT
   (SELECT count(*) FROM attempts WHERE selection_role = 'cheap')::text || '|' ||
   (SELECT count(*) FROM attempts WHERE selection_role = 'strong' AND selection_reason = 'cheap_skipped_low_recent_acceptance')::text || '|' ||
-  COALESCE((SELECT output->>'decision' FROM attempts WHERE selection_role = 'strong'), '') || '|' ||
+  (SELECT count(*) FROM attempts WHERE selection_role = 'strong' AND selection_status = 'accepted')::text || '|' ||
   (SELECT cheap_skipped::text || '|' || cheap_probe_due::text FROM otlet.model_selection_status WHERE task_name = '$row_triage_policy_task');
 ")"
 echo "cheap_skip_contract=$cheap_skip_contract"
-[ "$cheap_skip_contract" = "0|1|unclear|1|true" ] || {
+[ "$cheap_skip_contract" = "0|1|1|1|true" ] || {
   echo "Expected cheap skip and next-job probe due, got $cheap_skip_contract" >&2
   exit 1
 }
