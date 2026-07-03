@@ -5,9 +5,12 @@ AS $$
   WITH policy AS (
     SELECT
       worker_claim_batch_size AS batch_size,
+      worker_claim_task_cursor AS task_cursor,
       max_attempts,
       job_lease_interval
     FROM otlet.production_policy
+    WHERE name = 'default'
+    FOR UPDATE
   ),
   active_model AS (
     SELECT
@@ -24,13 +27,16 @@ AS $$
     JOIN otlet.tasks t ON t.name = j.task_name
     GROUP BY t.model_name
   ),
-  first_job AS (
+  eligible_tasks AS (
     SELECT
-      j.id,
       j.task_name,
       m.name AS model_name,
       m.runtime_name,
-      m.artifact_path
+      m.artifact_path,
+      bool_or(s.status = 'ready' AND s.artifact_path IS NOT DISTINCT FROM m.artifact_path) AS warm_model,
+      min(CASE WHEN j.status IN ('running', 'cancel_requested') AND (j.leased_until IS NULL OR j.leased_until < now()) THEN 0 ELSE 1 END) AS retry_rank,
+      min(j.created_at) AS first_created_at,
+      min(j.id) AS first_job_id
     FROM otlet.jobs j
     JOIN otlet.tasks t ON t.name = j.task_name
     JOIN otlet.models m ON m.name = t.model_name
@@ -55,12 +61,27 @@ AS $$
         COALESCE(active_model.running_jobs, 0)
         + COALESCE(active_model.cancel_requested_jobs, 0)
       ) < m.max_active_jobs
+    GROUP BY
+      j.task_name,
+      m.name,
+      m.runtime_name,
+      m.artifact_path
+  ),
+  selected_task AS (
+    SELECT e.*
+    FROM eligible_tasks e
+    CROSS JOIN policy p
     ORDER BY
-      CASE WHEN s.status = 'ready' AND s.artifact_path IS NOT DISTINCT FROM m.artifact_path THEN 0 ELSE 1 END,
-      CASE WHEN j.status IN ('running', 'cancel_requested') AND (j.leased_until IS NULL OR j.leased_until < now()) THEN 0 ELSE 1 END,
-      j.created_at,
-      j.id
-    FOR UPDATE OF j SKIP LOCKED
+      CASE
+        WHEN COALESCE(p.task_cursor, '') = '' THEN 0
+        WHEN e.task_name > p.task_cursor THEN 0
+        ELSE 1
+      END,
+      e.retry_rank,
+      CASE WHEN e.warm_model THEN 0 ELSE 1 END,
+      e.task_name,
+      e.first_created_at,
+      e.first_job_id
     LIMIT 1
   ),
   claimable AS (
@@ -68,7 +89,7 @@ AS $$
     FROM otlet.jobs j
     JOIN otlet.tasks t ON t.name = j.task_name
     JOIN otlet.models m ON m.name = t.model_name
-    JOIN first_job f
+    JOIN selected_task f
       ON f.task_name = j.task_name
      AND f.model_name = m.name
      AND f.runtime_name = m.runtime_name
@@ -87,12 +108,19 @@ AS $$
         )
       )
     ORDER BY
-      CASE WHEN j.id = f.id THEN 0 ELSE 1 END,
+      CASE WHEN j.id = f.first_job_id THEN 0 ELSE 1 END,
       CASE WHEN j.status IN ('running', 'cancel_requested') AND (j.leased_until IS NULL OR j.leased_until < now()) THEN 0 ELSE 1 END,
       j.created_at,
       j.id
     FOR UPDATE OF j SKIP LOCKED
     LIMIT (SELECT batch_size FROM policy)
+  ),
+  advance_cursor AS (
+    UPDATE otlet.production_policy p
+    SET worker_claim_task_cursor = (SELECT task_name FROM selected_task)
+    WHERE p.name = 'default'
+      AND EXISTS (SELECT 1 FROM claimable)
+    RETURNING p.worker_claim_task_cursor
   ),
   updated AS (
     UPDATE otlet.jobs j
@@ -105,6 +133,7 @@ AS $$
         finished_at = NULL
     FROM claimable
     CROSS JOIN policy p
+    CROSS JOIN advance_cursor
     WHERE j.id = claimable.id
     RETURNING j.*
   )

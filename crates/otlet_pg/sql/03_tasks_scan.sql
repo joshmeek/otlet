@@ -294,20 +294,31 @@ BEGIN
   END IF;
 
   EXECUTE format(
-    'INSERT INTO otlet.jobs (task_name, subject_id, input)
+    'WITH queue_capacity AS (
+       SELECT GREATEST(
+         p.max_queued_jobs_per_model
+           - count(j.id) FILTER (WHERE j.status = ''queued''),
+         0
+       )::integer AS slots
+       FROM otlet.production_policy p
+       LEFT JOIN otlet.tasks queued_tasks ON queued_tasks.model_name = %L
+       LEFT JOIN otlet.jobs j ON j.task_name = queued_tasks.name
+       GROUP BY p.max_queued_jobs_per_model
+     )
+     INSERT INTO otlet.jobs (task_name, subject_id, input)
      SELECT %L, subject_id::text, input::jsonb
      FROM (
        SELECT subject_id::text AS subject_id, input::jsonb AS input
        FROM (%s) otlet_input
        ORDER BY subject_id
-       LIMIT %s
+       LIMIT (SELECT slots FROM queue_capacity)
      ) otlet_bounded_input
      ON CONFLICT (task_name, subject_id)
      WHERE status IN (''queued'', ''running'', ''cancel_requested'')
      DO NOTHING',
+    model_name,
     task_name,
-    query,
-    queue_slots
+    query
   );
   GET DIAGNOSTICS queued = ROW_COUNT;
 
@@ -351,6 +362,9 @@ BEGIN
   RETURN queued;
 END;
 $$;
+
+COMMENT ON FUNCTION otlet.run_task(text) IS
+  'Queues current task source rows up to the model queue cap. Completed subjects are eligible for a new job on direct rerun; queued, running, and cancel-requested subjects are not duplicated.';
 
 CREATE FUNCTION otlet.run_task_subject(
   task_name text,
@@ -411,12 +425,25 @@ BEGIN
   END IF;
 
   EXECUTE format(
-    'INSERT INTO otlet.jobs (task_name, subject_id, input)
+    'WITH queue_capacity AS (
+       SELECT GREATEST(
+         p.max_queued_jobs_per_model
+           - count(j.id) FILTER (WHERE j.status = ''queued''),
+         0
+       )::integer AS slots
+       FROM otlet.production_policy p
+       LEFT JOIN otlet.tasks queued_tasks ON queued_tasks.model_name = %L
+       LEFT JOIN otlet.jobs j ON j.task_name = queued_tasks.name
+       GROUP BY p.max_queued_jobs_per_model
+     )
+     INSERT INTO otlet.jobs (task_name, subject_id, input)
      SELECT %L, subject_id::text, input::jsonb FROM (%s) otlet_input
      WHERE subject_id::text = %L
+       AND (SELECT slots FROM queue_capacity) > 0
      ON CONFLICT (task_name, subject_id)
      WHERE status IN (''queued'', ''running'', ''cancel_requested'')
      DO NOTHING',
+    model_name,
     run_task_subject.task_name,
     query,
     run_task_subject.subject_id

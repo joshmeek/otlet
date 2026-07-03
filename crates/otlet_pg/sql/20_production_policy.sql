@@ -8,6 +8,7 @@ SELECT
   p.semantic_auto_infer_ms,
   p.semantic_auto_max_rows,
   p.worker_claim_batch_size,
+  p.worker_claim_task_cursor,
   p.job_lease_interval,
   p.worker_event_retention,
   p.trace_detail_retention,
@@ -63,7 +64,9 @@ SELECT
   COALESCE((last_batch.detail ->> 'job_count')::bigint, 0) AS last_batch_jobs,
   COALESCE((last_batch.detail ->> 'completed_jobs')::bigint, 0) AS last_batch_completed_jobs,
   COALESCE((last_batch.detail ->> 'failed_jobs')::bigint, 0) AS last_batch_failed_jobs,
-  last_batch.created_at AS last_batch_at
+  COALESCE(last_batch.detail ->> 'task_name', '') AS last_batch_task_name,
+  last_batch.created_at AS last_batch_at,
+  COALESCE(recent_batches.recent_batch_tasks, '[]'::jsonb) AS recent_batch_tasks
 FROM otlet.models m
 CROSS JOIN otlet.production_policy p
 LEFT JOIN otlet.model_queue_status q ON q.model_name = m.name
@@ -76,6 +79,32 @@ LEFT JOIN LATERAL (
   ORDER BY e.created_at DESC, e.id DESC
   LIMIT 1
 ) last_batch ON true
+LEFT JOIN LATERAL (
+  SELECT jsonb_agg(
+           jsonb_build_object(
+             'task_name', recent.task_name,
+             'job_count', recent.job_count,
+             'completed_jobs', recent.completed_jobs,
+             'failed_jobs', recent.failed_jobs
+           )
+           ORDER BY recent.created_at DESC, recent.id DESC
+         ) AS recent_batch_tasks
+  FROM (
+    SELECT
+      e.id,
+      e.created_at,
+      COALESCE(e.detail ->> 'task_name', '') AS task_name,
+      COALESCE((e.detail ->> 'job_count')::bigint, 0) AS job_count,
+      COALESCE((e.detail ->> 'completed_jobs')::bigint, 0) AS completed_jobs,
+      COALESCE((e.detail ->> 'failed_jobs')::bigint, 0) AS failed_jobs
+    FROM otlet.worker_events e
+    WHERE e.event_type = 'worker_batch_finished'
+      AND e.runtime_name = m.runtime_name
+      AND e.detail ->> 'model_name' = m.name
+    ORDER BY e.created_at DESC, e.id DESC
+    LIMIT 16
+  ) recent
+) recent_batches ON true
 GROUP BY
   m.runtime_name,
   m.name,
@@ -85,7 +114,8 @@ GROUP BY
   q.cancel_requested_jobs,
   q.available_queue_slots,
   last_batch.detail,
-  last_batch.created_at;
+  last_batch.created_at,
+  recent_batches.recent_batch_tasks;
 
 CREATE VIEW otlet.model_selection_policy_status AS
 SELECT

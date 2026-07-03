@@ -260,6 +260,221 @@ echo "model_queue_status_contract=$model_queue_status_contract"
   exit 1
 }
 
+queue_fairness_big_task="queue_fairness_big_demo"
+queue_fairness_small_task="queue_fairness_small_demo"
+cleanup_task "$queue_fairness_big_task"
+cleanup_task "$queue_fairness_small_task"
+queue_fairness_output="$(
+  psql_exec \
+    -qAt \
+    -v big_task="$queue_fairness_big_task" \
+    -v small_task="$queue_fairness_small_task" \
+    -v model_name="$strong_model_name" <<'SQL'
+CREATE TEMP TABLE queue_fairness_params (
+  big_task text,
+  small_task text,
+  model_name text
+);
+INSERT INTO queue_fairness_params VALUES (:'big_task', :'small_task', :'model_name');
+CREATE TEMP TABLE queue_fairness_claims (
+  batch_no int,
+  task_name text,
+  job_id bigint
+);
+
+SELECT otlet.create_task(
+  :'big_task',
+  'SELECT NULL::text AS subject_id, ''{}''::jsonb AS input WHERE false',
+  'Queue fairness smoke placeholder',
+  '{"type":"object","required":["status"],"additionalProperties":false,"properties":{"status":{"enum":["ok"]}}}'::jsonb,
+  :'model_name',
+  '{"max_tokens":1,"reasoning":"off"}'::jsonb
+);
+SELECT otlet.create_task(
+  :'small_task',
+  'SELECT NULL::text AS subject_id, ''{}''::jsonb AS input WHERE false',
+  'Queue fairness smoke placeholder',
+  '{"type":"object","required":["status"],"additionalProperties":false,"properties":{"status":{"enum":["ok"]}}}'::jsonb,
+  :'model_name',
+  '{"max_tokens":1,"reasoning":"off"}'::jsonb
+);
+
+INSERT INTO otlet.jobs (task_name, subject_id, input)
+SELECT :'big_task', 'big-' || lpad(i::text, 4, '0'), '{}'::jsonb
+FROM generate_series(1, 1000) AS g(i);
+INSERT INTO otlet.jobs (task_name, subject_id, input)
+SELECT :'small_task', 'small-' || i::text, '{}'::jsonb
+FROM generate_series(1, 4) AS g(i);
+
+UPDATE otlet.production_policy
+SET worker_claim_batch_size = 8,
+    worker_claim_task_cursor = ''
+WHERE name = 'default';
+
+DO $$
+DECLARE
+  batch_no int;
+  claimed_count int;
+  claimed_task text;
+  task_model text;
+  task_runtime text;
+  job_row otlet.jobs%ROWTYPE;
+  small_task_name text;
+BEGIN
+  SELECT small_task INTO small_task_name FROM queue_fairness_params;
+
+  FOR batch_no IN 1..4 LOOP
+    claimed_count := 0;
+    claimed_task := NULL;
+
+    FOR job_row IN SELECT * FROM otlet.claim_jobs() LOOP
+      claimed_count := claimed_count + 1;
+      claimed_task := job_row.task_name;
+      INSERT INTO queue_fairness_claims VALUES (batch_no, job_row.task_name, job_row.id);
+      PERFORM otlet.complete_job(
+        job_row.id,
+        '{"status":"ok"}'::jsonb,
+        '{"output":{"status":"ok"},"actions":[]}',
+        '[]'::jsonb,
+        trace_summary => '{"schema_validation_status":"passed","trace_version":"queue_fairness_smoke"}'::jsonb
+      );
+    END LOOP;
+
+    IF claimed_count > 1 THEN
+      SELECT t.model_name, m.runtime_name
+      INTO task_model, task_runtime
+      FROM otlet.tasks t
+      JOIN otlet.models m ON m.name = t.model_name
+      WHERE t.name = claimed_task;
+
+      PERFORM otlet.record_worker_event(
+        'worker_batch_finished',
+        NULL,
+        task_runtime,
+        'worker_batch_finished',
+        jsonb_build_object(
+          'task_name', claimed_task,
+          'model_name', task_model,
+          'job_count', claimed_count,
+          'completed_jobs', claimed_count,
+          'failed_jobs', 0
+        )
+      );
+    END IF;
+
+    EXIT WHEN (
+      SELECT count(*)
+      FROM otlet.jobs
+      WHERE task_name = small_task_name
+        AND status = 'complete'
+    ) = 4;
+  END LOOP;
+END;
+$$;
+
+WITH params AS (
+  SELECT * FROM queue_fairness_params
+),
+summary AS (
+  SELECT
+    count(*) FILTER (WHERE c.task_name = p.small_task)::bigint AS small_claimed,
+    max(c.batch_no) FILTER (WHERE c.task_name = p.small_task) AS last_small_batch
+  FROM params p
+  LEFT JOIN queue_fairness_claims c ON true
+  GROUP BY p.small_task
+),
+status AS (
+  SELECT w.recent_batch_tasks
+  FROM params p
+  JOIN otlet.worker_throughput_status w ON w.model_name = p.model_name
+),
+visible_batches AS (
+  SELECT
+    EXISTS (
+      SELECT 1
+      FROM status s, params p, jsonb_array_elements(s.recent_batch_tasks) item
+      WHERE item ->> 'task_name' = p.big_task
+    ) AS has_big,
+    EXISTS (
+      SELECT 1
+      FROM status s, params p, jsonb_array_elements(s.recent_batch_tasks) item
+      WHERE item ->> 'task_name' = p.small_task
+    ) AS has_small
+)
+SELECT (small_claimed = 4)::text || '|' ||
+       (last_small_batch <= 2)::text || '|' ||
+       (has_big AND has_small)::text
+FROM summary, visible_batches;
+SQL
+)"
+queue_fairness_contract="$(tail -n 1 <<<"$queue_fairness_output")"
+echo "queue_fairness_contract=$queue_fairness_contract"
+[ "$queue_fairness_contract" = "true|true|true" ] || {
+  echo "Expected queue fairness contract true|true|true, got $queue_fairness_contract" >&2
+  exit 1
+}
+cleanup_task "$queue_fairness_big_task"
+cleanup_task "$queue_fairness_small_task"
+
+queue_race_task="queue_admission_race_demo"
+cleanup_task "$queue_race_task"
+psql_exec -v task_name="$queue_race_task" -v model_name="$strong_model_name" >/dev/null <<'SQL'
+SELECT otlet.create_task(
+  :'task_name',
+  $source$
+    SELECT 'race-' || i::text AS subject_id, '{}'::jsonb AS input
+    FROM generate_series(1, 50) AS g(i)
+  $source$::text,
+  'Queue admission race smoke placeholder',
+  '{"type":"object","required":["status"],"additionalProperties":false,"properties":{"status":{"enum":["ok"]}}}'::jsonb,
+  :'model_name',
+  '{"max_tokens":1,"reasoning":"off"}'::jsonb
+);
+UPDATE otlet.production_policy
+SET max_queued_jobs_per_model = 5,
+    worker_claim_batch_size = 8,
+    worker_claim_task_cursor = ''
+WHERE name = 'default';
+SQL
+psql_exec >/dev/null <<'SQL' &
+BEGIN;
+SELECT 1 FROM otlet.production_policy WHERE name = 'default' FOR UPDATE;
+SELECT pg_sleep(10);
+COMMIT;
+SQL
+queue_lock_pid="$!"
+sleep 1
+queue_race_pids=()
+for _ in $(seq 1 8); do
+  psql_exec -qAt -v task_name="$queue_race_task" >/dev/null <<'SQL' &
+SELECT otlet.run_task(:'task_name');
+SQL
+  queue_race_pids+=("$!")
+done
+for pid in "${queue_race_pids[@]}"; do
+  wait "$pid"
+done
+queue_race_contract="$(psql_value "
+SELECT (count(*) FILTER (WHERE status = 'queued') <= 5)::text || '|' ||
+       (count(*) = 5)::text
+FROM otlet.jobs
+WHERE task_name = '$queue_race_task';
+")"
+echo "queue_admission_race_contract=$queue_race_contract"
+cleanup_task "$queue_race_task"
+wait "$queue_lock_pid"
+psql_exec >/dev/null <<'SQL'
+UPDATE otlet.production_policy
+SET max_queued_jobs_per_model = 1000,
+    worker_claim_batch_size = 8,
+    worker_claim_task_cursor = ''
+WHERE name = 'default';
+SQL
+[ "$queue_race_contract" = "true|true" ] || {
+  echo "Expected concurrent run_task admission to keep queued jobs at the cap, got $queue_race_contract" >&2
+  exit 1
+}
+
 log "Running direct ask demo"
 psql_exec >/dev/null <<'SQL'
 DROP TABLE IF EXISTS public.readme_vendor_note;
@@ -423,6 +638,25 @@ FROM receipt_pairs;
 ")"
 echo "prompt_diet_contract=$prompt_diet_contract"
 require_regex "$prompt_diet_contract" '^true\|true\|[0-9]+\|[0-9]+\|true\|true$' "Expected compact schema prompt to reduce prompt tokens with schema-valid direct outputs"
+
+prompt_diet_requeued="$(psql_value "SELECT otlet.run_task('$prompt_diet_compact_task');")"
+[ "$prompt_diet_requeued" = "1" ] || {
+  echo "Expected direct run_task to re-enqueue one completed compact prompt subject, got $prompt_diet_requeued" >&2
+  exit 1
+}
+wait_task_complete "$prompt_diet_compact_task" 2 900 1
+run_task_reenqueue_contract="$(psql_value "
+SELECT count(*)::text || '|' ||
+       count(DISTINCT subject_id)::text || '|' ||
+       count(*) FILTER (WHERE status = 'complete')::text
+FROM otlet.jobs
+WHERE task_name = '$prompt_diet_compact_task';
+")"
+echo "run_task_reenqueue_contract=$run_task_reenqueue_contract"
+[ "$run_task_reenqueue_contract" = "2|1|2" ] || {
+  echo "Expected direct run_task rerun to create a second completed job for the same subject, got $run_task_reenqueue_contract" >&2
+  exit 1
+}
 
 prefix_kv_off_task="prefix_kv_off_demo"
 prefix_kv_on_task="prefix_kv_on_demo"
