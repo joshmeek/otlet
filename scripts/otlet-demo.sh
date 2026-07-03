@@ -721,6 +721,39 @@ echo "row_scoped_contract=$row_scoped_fresh_after|$row_scoped_match_after|$row_s
   echo "Expected scoped watch to stay fresh with unchanged receipts and revalidated basis after unrelated column change, got $row_scoped_fresh_after|$row_scoped_match_after|$row_scoped_receipts_before|$row_scoped_receipts_after|$row_scoped_columns|$row_scoped_basis" >&2
   exit 1
 }
+row_scoped_fdw_plan="$(
+  psql_exec -P border=2 -P null='' <<SQL
+EXPLAIN (ANALYZE, VERBOSE, COSTS, SUMMARY OFF, TIMING OFF)
+SELECT *
+FROM otlet.${row_scoped_watch}_native
+WHERE subject_id = 'scoped-1';
+SQL
+)"
+printf '%s\n' "$row_scoped_fdw_plan"
+require_contains "$row_scoped_fdw_plan" "Otlet Node: Semantic Foreign Scan" "Expected row FDW explain details"
+require_contains "$row_scoped_fdw_plan" "Selected Path: semantic_lookup" "Expected row FDW lookup path"
+require_contains "$row_scoped_fdw_plan" "Reason: pushed subject rows fresh" "Expected row FDW pushed-subject reason"
+require_contains "$row_scoped_fdw_plan" "Total Subjects: 1" "Expected row FDW scoped total"
+require_contains "$row_scoped_fdw_plan" "Fresh Subjects: 1" "Expected row FDW scoped fresh count"
+require_contains "$row_scoped_fdw_plan" "Count Basis: estimated" "Expected row FDW count basis"
+require_contains "$row_scoped_fdw_plan" "Model Cost Source:" "Expected row FDW model cost source"
+require_contains "$row_scoped_fdw_plan" "Path Cost:" "Expected row FDW path cost"
+require_contains "$row_scoped_fdw_plan" "Actual Rows Loaded: 1" "Expected row FDW loaded row count"
+require_contains "$row_scoped_fdw_plan" "Pushed Subject Id: scoped-1" "Expected row FDW pushed subject"
+row_empty_fdw_plan="$(
+  psql_exec -P border=2 -P null='' <<SQL
+EXPLAIN (ANALYZE, VERBOSE, COSTS, SUMMARY OFF, TIMING OFF)
+SELECT *
+FROM otlet.${row_scoped_watch}_native
+WHERE subject_id = ANY (ARRAY[]::text[]);
+SQL
+)"
+printf '%s\n' "$row_empty_fdw_plan"
+require_contains "$row_empty_fdw_plan" "Selected Path: semantic_lookup" "Expected empty pushed subject lookup path"
+require_contains "$row_empty_fdw_plan" "Reason: pushed subject filter empty" "Expected empty pushed subject reason"
+require_contains "$row_empty_fdw_plan" "Total Subjects: 0" "Expected empty pushed subject total"
+require_contains "$row_empty_fdw_plan" "Actual Rows Loaded: 0" "Expected empty pushed subject loaded row count"
+require_contains "$row_empty_fdw_plan" "Pushed Subject Filter: empty" "Expected empty pushed subject marker"
 psql_exec >/dev/null <<'SQL'
 ALTER TABLE public.otlet_demo_scoped_signal
 DROP COLUMN signal;
@@ -1409,8 +1442,15 @@ printf '%s\n' "$fdw_plan"
 require_contains "$fdw_plan" "Foreign Scan on" "Expected semantic join FDW Foreign Scan"
 require_contains "$fdw_plan" "Otlet Node: Semantic Foreign Scan" "Expected Otlet FDW explain details"
 require_contains "$fdw_plan" "Selected Path: semantic_join_lookup" "Expected FDW selected path"
+require_contains "$fdw_plan" "Reason: pushed subject rows fresh" "Expected join FDW pushed-subject reason"
+require_contains "$fdw_plan" "Total Subjects: 1" "Expected join FDW scoped total"
+require_contains "$fdw_plan" "Fresh Subjects: 1" "Expected join FDW scoped fresh count"
 require_contains "$fdw_plan" "Queue Subjects: 0" "Expected FDW queue subject count"
+require_contains "$fdw_plan" "Count Basis: estimated" "Expected join FDW count basis"
+require_contains "$fdw_plan" "Model Cost Source:" "Expected join FDW model cost source"
 require_contains "$fdw_plan" "Path Cost:" "Expected FDW path cost"
+require_contains "$fdw_plan" "Actual Rows Loaded: 1" "Expected join FDW loaded row count"
+require_contains "$fdw_plan" "Pushed Subject Id: vendor-1001:vendor-42" "Expected join FDW pushed subject"
 
 log "Checking benign entity-resolution source update"
 join_receipts_before_update="$(psql_value "
