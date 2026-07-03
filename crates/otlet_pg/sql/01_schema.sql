@@ -177,9 +177,15 @@ CREATE TABLE otlet.model_selection_policies (
   cheap_model_name text NOT NULL REFERENCES otlet.models(name),
   strong_model_name text NOT NULL REFERENCES otlet.models(name),
   accept_field_checks jsonb NOT NULL DEFAULT '{"answer_field":"match","abstain_values":["unclear"],"confidence_field":"confidence","accepted_confidence":["high"]}'::jsonb CHECK (jsonb_typeof(accept_field_checks) = 'object'),
+  cheap_skip_window integer NOT NULL DEFAULT 0,
+  cheap_min_recent_acceptance double precision NOT NULL DEFAULT 0,
+  cheap_probe_interval integer NOT NULL DEFAULT 10,
   created_at timestamptz NOT NULL DEFAULT now(),
   updated_at timestamptz NOT NULL DEFAULT now(),
-  CHECK (cheap_model_name <> strong_model_name)
+  CHECK (cheap_model_name <> strong_model_name),
+  CHECK (cheap_skip_window BETWEEN 0 AND 100000),
+  CHECK (cheap_min_recent_acceptance >= 0 AND cheap_min_recent_acceptance <= 1),
+  CHECK (cheap_probe_interval BETWEEN 0 AND 100000)
 );
 
 CREATE TABLE otlet.runtime_slots (

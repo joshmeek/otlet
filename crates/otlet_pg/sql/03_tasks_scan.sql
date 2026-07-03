@@ -158,7 +158,10 @@ CREATE FUNCTION otlet.set_model_selection_policy(
   task_name text,
   cheap_model_name text,
   strong_model_name text,
-  accept_field_checks jsonb DEFAULT NULL
+  accept_field_checks jsonb DEFAULT NULL,
+  cheap_skip_window integer DEFAULT 0,
+  cheap_min_recent_acceptance double precision DEFAULT 0,
+  cheap_probe_interval integer DEFAULT 10
 ) RETURNS otlet.model_selection_policies
 LANGUAGE plpgsql
 AS $$
@@ -196,6 +199,9 @@ BEGIN
     cheap_model_name,
     strong_model_name,
     accept_field_checks,
+    cheap_skip_window,
+    cheap_min_recent_acceptance,
+    cheap_probe_interval,
     updated_at
   )
   VALUES (
@@ -203,12 +209,18 @@ BEGIN
     set_model_selection_policy.cheap_model_name,
     set_model_selection_policy.strong_model_name,
     actual_accept_field_checks,
+    COALESCE(set_model_selection_policy.cheap_skip_window, 0),
+    COALESCE(set_model_selection_policy.cheap_min_recent_acceptance, 0),
+    COALESCE(set_model_selection_policy.cheap_probe_interval, 10),
     now()
   )
   ON CONFLICT ON CONSTRAINT model_selection_policies_pkey DO UPDATE
     SET cheap_model_name = EXCLUDED.cheap_model_name,
         strong_model_name = EXCLUDED.strong_model_name,
         accept_field_checks = EXCLUDED.accept_field_checks,
+        cheap_skip_window = EXCLUDED.cheap_skip_window,
+        cheap_min_recent_acceptance = EXCLUDED.cheap_min_recent_acceptance,
+        cheap_probe_interval = EXCLUDED.cheap_probe_interval,
         updated_at = now()
   RETURNING * INTO saved;
 

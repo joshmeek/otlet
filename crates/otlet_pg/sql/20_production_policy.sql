@@ -93,6 +93,9 @@ SELECT
   p.cheap_model_name,
   p.strong_model_name,
   p.accept_field_checks,
+  p.cheap_skip_window,
+  p.cheap_min_recent_acceptance,
+  p.cheap_probe_interval,
   cheap_q.queue_state AS cheap_queue_state,
   cheap_q.queued_jobs AS cheap_queued_jobs,
   cheap_q.running_jobs AS cheap_running_jobs,
@@ -101,9 +104,117 @@ SELECT
 FROM otlet.model_selection_policies p
 LEFT JOIN otlet.model_queue_status cheap_q ON cheap_q.model_name = p.cheap_model_name;
 
+CREATE FUNCTION otlet.model_selection_recent_acceptance(task_name text)
+RETURNS TABLE (
+  cheap_skip_window integer,
+  cheap_min_recent_acceptance double precision,
+  cheap_probe_interval integer,
+  recent_attempts bigint,
+  recent_accepted bigint,
+  recent_acceptance double precision,
+  skipped_since_last_cheap bigint,
+  skip_cheap boolean,
+  probe_due boolean
+)
+LANGUAGE sql
+STABLE
+AS $$
+WITH policy AS (
+  SELECT *
+  FROM otlet.model_selection_policies p
+  WHERE p.task_name = model_selection_recent_acceptance.task_name
+), recent AS (
+  SELECT ranked.selection_status
+  FROM (
+    SELECT
+      r.selection_status,
+      p.cheap_skip_window,
+      row_number() OVER (ORDER BY r.finished_at DESC, r.id DESC) AS row_number
+    FROM otlet.inference_receipts r
+    JOIN policy p ON true
+    WHERE r.task_name = p.task_name
+      AND r.model_name = p.cheap_model_name
+      AND r.selection_role = 'cheap'
+  ) ranked
+  WHERE ranked.row_number <= ranked.cheap_skip_window
+), counts AS (
+  SELECT
+    count(*)::bigint AS recent_attempts,
+    count(*) FILTER (WHERE selection_status = 'accepted')::bigint AS recent_accepted
+  FROM recent
+), latest_cheap AS (
+  SELECT COALESCE(max(r.id), 0) AS latest_cheap_receipt_id
+  FROM policy p
+  LEFT JOIN otlet.inference_receipts r
+    ON r.task_name = p.task_name
+   AND r.model_name = p.cheap_model_name
+   AND r.selection_role = 'cheap'
+), skipped AS (
+  SELECT count(r.id)::bigint AS skipped_since_last_cheap
+  FROM policy p
+  CROSS JOIN latest_cheap latest
+  LEFT JOIN otlet.inference_receipts r
+    ON r.task_name = p.task_name
+   AND r.model_name = p.strong_model_name
+   AND r.selection_role = 'strong'
+   AND r.selection_reason = 'cheap_skipped_low_recent_acceptance'
+   AND r.id > latest.latest_cheap_receipt_id
+), decision AS (
+  SELECT
+    p.cheap_skip_window,
+    p.cheap_min_recent_acceptance,
+    p.cheap_probe_interval,
+    COALESCE(c.recent_attempts, 0) AS recent_attempts,
+    COALESCE(c.recent_accepted, 0) AS recent_accepted,
+    CASE
+      WHEN COALESCE(c.recent_attempts, 0) = 0 THEN 0::double precision
+      ELSE COALESCE(c.recent_accepted, 0)::double precision / c.recent_attempts::double precision
+    END AS recent_acceptance,
+    COALESCE(s.skipped_since_last_cheap, 0) AS skipped_since_last_cheap
+  FROM policy p
+  CROSS JOIN counts c
+  CROSS JOIN skipped s
+)
+SELECT
+  d.cheap_skip_window,
+  d.cheap_min_recent_acceptance,
+  d.cheap_probe_interval,
+  d.recent_attempts,
+  d.recent_accepted,
+  d.recent_acceptance,
+  d.skipped_since_last_cheap,
+  (
+    d.cheap_skip_window > 0
+    AND d.cheap_min_recent_acceptance > 0
+    AND d.recent_attempts >= d.cheap_skip_window
+    AND d.recent_acceptance < d.cheap_min_recent_acceptance
+    AND NOT (
+      d.cheap_probe_interval > 0
+      AND d.skipped_since_last_cheap + 1 >= d.cheap_probe_interval
+    )
+  ) AS skip_cheap,
+  (
+    d.cheap_skip_window > 0
+    AND d.cheap_min_recent_acceptance > 0
+    AND d.recent_attempts >= d.cheap_skip_window
+    AND d.recent_acceptance < d.cheap_min_recent_acceptance
+    AND d.cheap_probe_interval > 0
+    AND d.skipped_since_last_cheap + 1 >= d.cheap_probe_interval
+  ) AS probe_due
+FROM decision d;
+$$;
+
 CREATE VIEW otlet.model_selection_status AS
 SELECT
   p.task_name,
+  p.cheap_skip_window,
+  p.cheap_min_recent_acceptance,
+  p.cheap_probe_interval,
+  COALESCE(recent.recent_attempts, 0)::bigint AS cheap_recent_attempts,
+  COALESCE(recent.recent_accepted, 0)::bigint AS cheap_recent_accepted,
+  COALESCE(recent.recent_acceptance, 0)::double precision AS cheap_recent_acceptance,
+  COALESCE(recent.skip_cheap, false) AS cheap_skip_recommended,
+  COALESCE(recent.probe_due, false) AS cheap_probe_due,
   count(DISTINCT j.id)::bigint AS total_jobs,
   count(DISTINCT j.id) FILTER (WHERE j.status = 'complete')::bigint AS complete_jobs,
   count(DISTINCT j.id) FILTER (WHERE j.status = 'failed')::bigint AS failed_jobs,
@@ -111,14 +222,26 @@ SELECT
   count(r.id) FILTER (WHERE r.selection_role = 'cheap' AND r.selection_status = 'accepted')::bigint AS cheap_accepted,
   count(r.id) FILTER (WHERE r.selection_role = 'cheap' AND r.selection_status = 'rejected')::bigint AS cheap_rejected,
   count(r.id) FILTER (WHERE r.selection_role = 'cheap' AND r.schema_validation_status = 'failed')::bigint AS cheap_schema_failed,
+  count(r.id) FILTER (WHERE r.selection_role = 'cheap' AND r.selection_reason = 'cheap_probe_recent_acceptance')::bigint AS cheap_probe_attempts,
   count(r.id) FILTER (WHERE r.selection_role = 'strong')::bigint AS strong_attempts,
   count(r.id) FILTER (WHERE r.selection_role = 'strong' AND r.selection_status = 'accepted')::bigint AS strong_accepted,
   count(r.id) FILTER (WHERE r.selection_role = 'strong' AND r.selection_status = 'failed')::bigint AS strong_failed,
+  count(r.id) FILTER (WHERE r.selection_role = 'strong' AND r.selection_reason = 'cheap_skipped_low_recent_acceptance')::bigint AS cheap_skipped,
   count(DISTINCT r.job_id) FILTER (WHERE r.selection_role = 'strong')::bigint AS escalated_jobs
 FROM otlet.model_selection_policies p
+LEFT JOIN LATERAL otlet.model_selection_recent_acceptance(p.task_name) recent ON true
 LEFT JOIN otlet.jobs j ON j.task_name = p.task_name
 LEFT JOIN otlet.inference_receipts r ON r.job_id = j.id
-GROUP BY p.task_name;
+GROUP BY
+  p.task_name,
+  p.cheap_skip_window,
+  p.cheap_min_recent_acceptance,
+  p.cheap_probe_interval,
+  recent.recent_attempts,
+  recent.recent_accepted,
+  recent.recent_acceptance,
+  recent.skip_cheap,
+  recent.probe_due;
 
 CREATE VIEW otlet.production_status AS
 WITH queue AS (

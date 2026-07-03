@@ -312,7 +312,10 @@ BEGIN
       saved.task_name,
       cheap_model_name,
       strong_model_name,
-      actual_selection_policy -> 'accept_field_checks'
+      actual_selection_policy -> 'accept_field_checks',
+      NULLIF(actual_selection_policy ->> 'cheap_skip_window', '')::integer,
+      NULLIF(actual_selection_policy ->> 'cheap_min_recent_acceptance', '')::double precision,
+      NULLIF(actual_selection_policy ->> 'cheap_probe_interval', '')::integer
     );
   END IF;
 

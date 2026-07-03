@@ -1059,6 +1059,175 @@ echo "row_triage_policy_contract=$row_triage_policy_contract"
   exit 1
 }
 
+psql_exec \
+  -v task_name="$row_triage_policy_task" \
+  -v cheap_policy_model="$strong_model_name" \
+  -v strong_policy_model="$strong_alias_model_name" >/dev/null <<'SQL'
+SELECT otlet.set_model_selection_policy(
+  :'task_name',
+  :'cheap_policy_model',
+  :'strong_policy_model',
+  '{"answer_field":"decision","abstain_values":["unclear"],"confidence_field":"confidence","accepted_confidence":["high","medium"]}'::jsonb,
+  2,
+  0.5,
+  2
+);
+
+WITH source_job AS (
+  SELECT id
+  FROM otlet.jobs
+  WHERE task_name = :'task_name'
+  ORDER BY id
+  LIMIT 1
+), seeds AS (
+  SELECT generate_series(1, 2)
+)
+SELECT (otlet.record_model_attempt(
+  source_job.id,
+  :'cheap_policy_model',
+  trace_summary => '{"generate_ms":0}'::jsonb,
+  selection_role => 'cheap',
+  selection_status => 'failed',
+  selection_reason => 'seeded_recent_failure',
+  error => 'seeded recent cheap failure'
+)).id
+FROM source_job, seeds;
+SQL
+
+cheap_skip_seed_contract="$(psql_value "
+SELECT recent_attempts::text || '|' ||
+       recent_accepted::text || '|' ||
+       skip_cheap::text || '|' ||
+       probe_due::text
+FROM otlet.model_selection_recent_acceptance('$row_triage_policy_task');
+")"
+echo "cheap_skip_seed_contract=$cheap_skip_seed_contract"
+[ "$cheap_skip_seed_contract" = "2|0|true|false" ] || {
+  echo "Expected seeded cheap failures to enable cheap skip, got $cheap_skip_seed_contract" >&2
+  exit 1
+}
+
+psql_exec >/dev/null <<'SQL'
+INSERT INTO public.otlet_demo_triage_policy_signal
+VALUES (
+  'triage-skip',
+  0,
+  0,
+  'No decisive blocker and no approval evidence; skip cheap after seeded failures'
+);
+SQL
+wait_task_complete "$row_triage_policy_task" 2 900 1
+
+cheap_skip_contract="$(psql_value "
+WITH attempts AS (
+  SELECT selection_role, selection_reason, output
+  FROM otlet.model_selection_attempts
+  WHERE task_name = '$row_triage_policy_task'
+    AND subject_id = 'triage-skip'
+)
+SELECT
+  (SELECT count(*) FROM attempts WHERE selection_role = 'cheap')::text || '|' ||
+  (SELECT count(*) FROM attempts WHERE selection_role = 'strong' AND selection_reason = 'cheap_skipped_low_recent_acceptance')::text || '|' ||
+  COALESCE((SELECT output->>'decision' FROM attempts WHERE selection_role = 'strong'), '') || '|' ||
+  (SELECT cheap_skipped::text || '|' || cheap_probe_due::text FROM otlet.model_selection_status WHERE task_name = '$row_triage_policy_task');
+")"
+echo "cheap_skip_contract=$cheap_skip_contract"
+[ "$cheap_skip_contract" = "0|1|unclear|1|true" ] || {
+  echo "Expected cheap skip and next-job probe due, got $cheap_skip_contract" >&2
+  exit 1
+}
+
+psql_exec >/dev/null <<'SQL'
+INSERT INTO public.otlet_demo_triage_policy_signal
+VALUES (
+  'triage-probe',
+  0,
+  0,
+  'No decisive blocker and no approval evidence; probe cheap at the configured interval'
+);
+SQL
+wait_task_complete "$row_triage_policy_task" 3 900 1
+
+cheap_probe_contract="$(psql_value "
+WITH attempts AS (
+  SELECT selection_role, selection_reason
+  FROM otlet.model_selection_attempts
+  WHERE task_name = '$row_triage_policy_task'
+    AND subject_id = 'triage-probe'
+)
+SELECT
+  (SELECT count(*) FROM attempts WHERE selection_role = 'cheap' AND selection_reason = 'cheap_probe_recent_acceptance')::text || '|' ||
+  (SELECT cheap_probe_attempts::text || '|' || cheap_probe_due::text FROM otlet.model_selection_status WHERE task_name = '$row_triage_policy_task');
+")"
+echo "cheap_probe_contract=$cheap_probe_contract"
+[ "$cheap_probe_contract" = "1|1|false" ] || {
+  echo "Expected configured cheap probe attempt, got $cheap_probe_contract" >&2
+  exit 1
+}
+
+cheap_skip_latency_delta_ms="$(psql_value "
+WITH totals AS (
+  SELECT subject_id, sum(COALESCE(generate_ms, 0))::bigint AS total_ms
+  FROM otlet.model_selection_attempts
+  WHERE task_name = '$row_triage_policy_task'
+    AND subject_id IN ('triage-unclear', 'triage-skip')
+  GROUP BY subject_id
+)
+SELECT 'triage-skip|' ||
+       COALESCE((SELECT total_ms FROM totals WHERE subject_id = 'triage-skip'), 0)::text || '|' ||
+       COALESCE((SELECT total_ms FROM totals WHERE subject_id = 'triage-unclear'), 0)::text || '|' ||
+       (
+         COALESCE((SELECT total_ms FROM totals WHERE subject_id = 'triage-skip'), 0) -
+         COALESCE((SELECT total_ms FROM totals WHERE subject_id = 'triage-unclear'), 0)
+       )::text;
+")"
+echo "cheap_skip_latency_delta_ms=$cheap_skip_latency_delta_ms"
+require_regex "$cheap_skip_latency_delta_ms" '^triage-skip\|[0-9]+\|[0-9]+\|-?[0-9]+$' "Expected receipt-derived cheap-skip latency delta"
+
+psql_exec \
+  -v task_name="$row_triage_policy_task" \
+  -v cheap_policy_model="$strong_model_name" \
+  -v strong_policy_model="$strong_alias_model_name" >/dev/null <<'SQL'
+SELECT otlet.set_model_selection_policy(
+  :'task_name',
+  :'cheap_policy_model',
+  :'strong_policy_model',
+  '{"answer_field":"decision","abstain_values":["unclear"],"confidence_field":"confidence","accepted_confidence":["high","medium"]}'::jsonb,
+  2,
+  0,
+  2
+);
+SQL
+
+psql_exec >/dev/null <<'SQL'
+INSERT INTO public.otlet_demo_triage_policy_signal
+VALUES (
+  'triage-skip-disabled',
+  0,
+  0,
+  'No decisive blocker and no approval evidence; threshold zero must keep cheap-first behavior'
+);
+SQL
+wait_task_complete "$row_triage_policy_task" 4 900 1
+
+cheap_skip_disabled_contract="$(psql_value "
+WITH attempts AS (
+  SELECT selection_role, selection_reason
+  FROM otlet.model_selection_attempts
+  WHERE task_name = '$row_triage_policy_task'
+    AND subject_id = 'triage-skip-disabled'
+)
+SELECT
+  (SELECT count(*) FROM attempts WHERE selection_role = 'cheap')::text || '|' ||
+  (SELECT count(*) FROM attempts WHERE selection_role = 'strong' AND selection_reason = 'cheap_skipped_low_recent_acceptance')::text || '|' ||
+  (SELECT cheap_skip_recommended::text FROM otlet.model_selection_status WHERE task_name = '$row_triage_policy_task');
+")"
+echo "cheap_skip_disabled_contract=$cheap_skip_disabled_contract"
+[ "$cheap_skip_disabled_contract" = "1|0|false" ] || {
+  echo "Expected cheap skip disabled at threshold 0, got $cheap_skip_disabled_contract" >&2
+  exit 1
+}
+
 log "Running entity-resolution demo"
 psql_exec >/dev/null <<'SQL'
 DROP VIEW IF EXISTS public.otlet_demo_vendor_pair_input;

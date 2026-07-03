@@ -254,31 +254,57 @@ fn process_direct_job(job: Job) -> bool {
 }
 
 fn process_selected_job(job: Job, policy: ModelSelectionPolicy) -> bool {
+    if policy.skip_cheap {
+        return run_strong_attempt(
+            job.with_model(&policy.strong),
+            "cheap_skipped_low_recent_acceptance",
+        );
+    }
+
     let cheap_job = job.with_model(&policy.cheap);
+    let cheap_reason = if policy.probe_due {
+        Some("cheap_probe_recent_acceptance")
+    } else {
+        None
+    };
     match run_job(&cheap_job) {
         Ok(run) => {
             let (accepted, reason) = accepted_by_policy(&run.output, &policy.accept_field_checks);
+            let reason = cheap_reason.unwrap_or(&reason);
             if accepted {
-                return accept_attempt(&cheap_job, run, "cheap", &reason);
+                return accept_attempt(&cheap_job, run, "cheap", reason);
             }
             record_metrics_from_run(&cheap_job, &run);
-            if !record_rejected_attempt(&cheap_job, run, "cheap", &reason) {
+            if !record_rejected_attempt(&cheap_job, run, "cheap", reason) {
                 return false;
             }
             run_strong_attempt(
                 job.with_model(&policy.strong),
-                "escalated_after_cheap_rejection",
+                if cheap_reason.is_some() {
+                    "escalated_after_cheap_probe_rejection"
+                } else {
+                    "escalated_after_cheap_rejection"
+                },
             )
         }
         Err(err) if err.message == "canceled" => fail_attempt(&cheap_job, err, "cheap", "canceled"),
         Err(err) if err.raw_output.is_some() => {
             record_metrics_from_error(&cheap_job, &err);
-            if !record_failed_model_attempt(&cheap_job, &err, "cheap", "schema_validation_failed") {
+            if !record_failed_model_attempt(
+                &cheap_job,
+                &err,
+                "cheap",
+                cheap_reason.unwrap_or("schema_validation_failed"),
+            ) {
                 return false;
             }
             run_strong_attempt(
                 job.with_model(&policy.strong),
-                "escalated_after_cheap_schema_failure",
+                if cheap_reason.is_some() {
+                    "escalated_after_cheap_probe_schema_failure"
+                } else {
+                    "escalated_after_cheap_schema_failure"
+                },
             )
         }
         Err(err) => fail_attempt(&cheap_job, err, "cheap", "cheap_runtime_failed"),

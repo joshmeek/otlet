@@ -31,6 +31,8 @@ pub(crate) struct ModelSelectionPolicy {
     pub(crate) cheap: JobModel,
     pub(crate) strong: JobModel,
     pub(crate) accept_field_checks: Value,
+    pub(crate) skip_cheap: bool,
+    pub(crate) probe_due: bool,
 }
 
 impl Job {
@@ -188,12 +190,15 @@ SELECT
   strong.artifact_hash,
   strong.runtime_name,
   strong_runtime.endpoint,
-  p.accept_field_checks
+  p.accept_field_checks,
+  COALESCE(recent.skip_cheap, false),
+  COALESCE(recent.probe_due, false)
 FROM otlet.model_selection_policies p
 JOIN otlet.models cheap ON cheap.name = p.cheap_model_name
 JOIN otlet.runtimes cheap_runtime ON cheap_runtime.name = cheap.runtime_name
 JOIN otlet.models strong ON strong.name = p.strong_model_name
 JOIN otlet.runtimes strong_runtime ON strong_runtime.name = strong.runtime_name
+LEFT JOIN LATERAL otlet.model_selection_recent_acceptance(p.task_name) recent ON true
 WHERE p.task_name = $1
 "#,
             Some(1),
@@ -221,6 +226,8 @@ WHERE p.task_name = $1
                 runtime_endpoint: required_col!(row, String, 10),
             },
             accept_field_checks: required_col!(row, JsonB, 11).0,
+            skip_cheap: required_col!(row, bool, 12),
+            probe_due: required_col!(row, bool, 13),
         }))
     })
 }
