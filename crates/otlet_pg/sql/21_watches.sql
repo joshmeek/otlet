@@ -371,6 +371,7 @@ SELECT
   COALESCE(plan.freshness, 0)::numeric AS freshness,
   COALESCE(plan.worker_queue_depth, 0)::bigint AS worker_queue_depth,
   COALESCE(plan.available_queue_slots, 0)::bigint AS available_queue_slots,
+  COALESCE(plan.count_basis, 'estimated') AS count_basis,
   COALESCE(job_counts.queued_jobs, 0)::bigint AS queued_jobs,
   COALESCE(job_counts.running_jobs, 0)::bigint AS running_jobs,
   COALESCE(job_counts.complete_jobs, 0)::bigint AS complete_jobs,

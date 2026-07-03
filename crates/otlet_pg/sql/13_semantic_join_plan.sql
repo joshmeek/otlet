@@ -163,7 +163,8 @@ CREATE FUNCTION otlet.semantic_plan_from_counts(
   p_fresh_subjects bigint,
   p_stale_subjects bigint,
   p_missing_subjects bigint,
-  p_stale_reasons jsonb DEFAULT '{}'::jsonb
+  p_stale_reasons jsonb DEFAULT '{}'::jsonb,
+  p_count_basis text DEFAULT 'exact'
 ) RETURNS TABLE (
   selected_path text,
   reason text,
@@ -195,6 +196,7 @@ CREATE FUNCTION otlet.semantic_plan_from_counts(
   worker_queue_depth bigint,
   available_queue_slots bigint,
   stale_reasons jsonb,
+  count_basis text,
   checked_at timestamptz
 )
 LANGUAGE plpgsql
@@ -352,12 +354,14 @@ BEGIN
     COALESCE(v_worker_queue_depth, 0),
     COALESCE(v_available_queue_slots, 0),
     v_stale_reasons,
+    COALESCE(NULLIF(p_count_basis, ''), 'exact'),
     clock_timestamp();
 END;
 $$;
 
 CREATE FUNCTION otlet.semantic_join_index_plan(
-  index_name text
+  index_name text,
+  exact boolean DEFAULT false
 ) RETURNS TABLE (
   selected_path text,
   reason text,
@@ -389,6 +393,7 @@ CREATE FUNCTION otlet.semantic_join_index_plan(
   worker_queue_depth bigint,
   available_queue_slots bigint,
   stale_reasons jsonb,
+  count_basis text,
   checked_at timestamptz
 )
 LANGUAGE plpgsql
@@ -400,6 +405,7 @@ DECLARE
   v_stale_subjects bigint := 0;
   v_missing_subjects bigint := 0;
   v_stale_reasons jsonb := '{}'::jsonb;
+  v_count_basis text := CASE WHEN exact THEN 'exact' ELSE 'estimated' END;
   current_contract_hash text;
 BEGIN
   SELECT *
@@ -423,77 +429,155 @@ BEGIN
   FROM otlet.tasks t
   WHERE t.name = index_row.task_name;
 
-  EXECUTE format(
-    $sql$
-      WITH current_inputs AS (
-        SELECT subject_id, input
-        FROM (
-          SELECT subject_id::text AS subject_id, input::jsonb AS input
-          FROM (%1$s) otlet_join_candidate
-          ORDER BY subject_id
-          LIMIT %2$s
-        ) otlet_join_input
-      ),
-      latest AS (
-        SELECT DISTINCT ON (sm.subject_id)
-          sm.subject_id,
-          sm.stale,
-          sm.source_hash,
-          sm.content_hash,
-          sm.contract_hash,
-          sm.stale_reason,
-          sm.updated_at,
-          sm.id
-        FROM current_inputs ci
-        JOIN otlet.semantic_materializations sm
-          ON sm.subject_id = ci.subject_id
-        WHERE sm.task_name = %3$L
-          AND sm.record_type = %4$L
-        ORDER BY
-          sm.subject_id,
-          (
-            sm.content_hash IS NOT DISTINCT FROM otlet.semantic_content_hash(ci.input)
-            AND sm.contract_hash IS NOT DISTINCT FROM %5$L
-          ) DESC,
-          sm.updated_at DESC,
-          sm.id DESC
-      ),
-      classified AS (
+  IF exact THEN
+    EXECUTE format(
+      $sql$
+        WITH current_inputs AS (
+          SELECT subject_id, input
+          FROM (
+            SELECT subject_id::text AS subject_id, input::jsonb AS input
+            FROM (%1$s) otlet_join_candidate
+            ORDER BY subject_id
+            LIMIT %2$s
+          ) otlet_join_input
+        ),
+        latest AS (
+          SELECT DISTINCT ON (sm.subject_id)
+            sm.subject_id,
+            sm.stale,
+            sm.source_hash,
+            sm.content_hash,
+            sm.contract_hash,
+            sm.stale_reason,
+            sm.updated_at,
+            sm.id
+          FROM current_inputs ci
+          JOIN otlet.semantic_materializations sm
+            ON sm.subject_id = ci.subject_id
+          WHERE sm.task_name = %3$L
+            AND sm.record_type = %4$L
+          ORDER BY
+            sm.subject_id,
+            (
+              sm.content_hash IS NOT DISTINCT FROM otlet.semantic_content_hash(ci.input)
+              AND sm.contract_hash IS NOT DISTINCT FROM %5$L
+            ) DESC,
+            sm.updated_at DESC,
+            sm.id DESC
+        ),
+        classified AS (
+          SELECT
+            ci.subject_id,
+            l.subject_id IS NOT NULL AS has_materialization,
+            l.content_hash IS NOT DISTINCT FROM otlet.semantic_content_hash(ci.input)
+              AND l.contract_hash IS NOT DISTINCT FROM %5$L AS source_fresh,
+            COALESCE(l.stale_reason, 'content_revalidation_pending') AS stale_reason
+          FROM current_inputs ci
+          LEFT JOIN latest l USING (subject_id)
+        )
         SELECT
-          ci.subject_id,
-          l.subject_id IS NOT NULL AS has_materialization,
-          l.content_hash IS NOT DISTINCT FROM otlet.semantic_content_hash(ci.input)
-            AND l.contract_hash IS NOT DISTINCT FROM %5$L AS source_fresh,
-          COALESCE(l.stale_reason, 'content_revalidation_pending') AS stale_reason
-        FROM current_inputs ci
-        LEFT JOIN latest l USING (subject_id)
-      )
+          count(*)::bigint,
+          count(*) FILTER (WHERE has_materialization AND source_fresh)::bigint,
+          count(*) FILTER (WHERE has_materialization AND NOT source_fresh)::bigint,
+          count(*) FILTER (WHERE NOT has_materialization)::bigint,
+          COALESCE(
+            (
+              SELECT jsonb_object_agg(reason, reason_count ORDER BY reason)
+              FROM (
+                SELECT stale_reason AS reason, count(*) AS reason_count
+                FROM classified
+                WHERE has_materialization AND NOT source_fresh
+                GROUP BY stale_reason
+              ) reasons
+            ),
+            '{}'::jsonb
+          )
+        FROM classified
+      $sql$,
+      index_row.candidate_query,
+      index_row.max_candidate_rows,
+      index_row.task_name,
+      index_row.record_type,
+      current_contract_hash
+    )
+    INTO v_total_subjects, v_fresh_subjects, v_stale_subjects, v_missing_subjects, v_stale_reasons;
+  ELSE
+    WITH latest AS (
+      SELECT DISTINCT ON (sm.subject_id)
+        sm.subject_id,
+        sm.stale,
+        sm.contract_hash,
+        sm.stale_reason,
+        sm.updated_at,
+        sm.id
+      FROM otlet.semantic_materializations sm
+      WHERE sm.task_name = index_row.task_name
+        AND sm.record_type = index_row.record_type
+      ORDER BY
+        sm.subject_id,
+        (
+          NOT sm.stale
+          AND sm.contract_hash IS NOT DISTINCT FROM current_contract_hash
+        ) DESC,
+        sm.updated_at DESC,
+        sm.id DESC
+    ),
+    classified AS (
       SELECT
-        count(*)::bigint,
-        count(*) FILTER (WHERE has_materialization AND source_fresh)::bigint,
-        count(*) FILTER (WHERE has_materialization AND NOT source_fresh)::bigint,
-        count(*) FILTER (WHERE NOT has_materialization)::bigint,
+        subject_id,
+        (
+          (NOT stale OR stale_reason = 'source_update')
+          AND contract_hash IS NOT DISTINCT FROM current_contract_hash
+        ) AS is_fresh,
+        NOT (
+          (NOT stale OR stale_reason = 'source_update')
+          AND contract_hash IS NOT DISTINCT FROM current_contract_hash
+        ) AS is_stale,
+        CASE
+          WHEN contract_hash IS DISTINCT FROM current_contract_hash THEN 'contract_changed'
+          ELSE COALESCE(stale_reason, 'content_revalidation_pending')
+        END AS stale_reason
+      FROM latest
+    ),
+    materialized AS (
+      SELECT
+        count(*)::bigint AS materialized_subjects,
+        count(*) FILTER (WHERE is_fresh)::bigint AS fresh_subjects,
+        count(*) FILTER (WHERE is_stale)::bigint AS stale_subjects,
         COALESCE(
           (
-            SELECT jsonb_object_agg(reason, reason_count ORDER BY reason)
+            SELECT jsonb_object_agg(reason_rows.reason, reason_rows.reason_count ORDER BY reason_rows.reason)
             FROM (
               SELECT stale_reason AS reason, count(*) AS reason_count
               FROM classified
-              WHERE has_materialization AND NOT source_fresh
+              WHERE is_stale
               GROUP BY stale_reason
-            ) reasons
+            ) reason_rows
           ),
           '{}'::jsonb
-        )
+        ) AS stale_reasons
       FROM classified
-    $sql$,
-    index_row.candidate_query,
-    index_row.max_candidate_rows,
-    index_row.task_name,
-    index_row.record_type,
-    current_contract_hash
-  )
-  INTO v_total_subjects, v_fresh_subjects, v_stale_subjects, v_missing_subjects, v_stale_reasons;
+    )
+    SELECT
+      CASE
+        WHEN m.materialized_subjects > 0 THEN m.materialized_subjects
+        ELSE COALESCE(index_row.max_candidate_rows, 0)::bigint
+      END,
+      m.fresh_subjects,
+      m.stale_subjects,
+      GREATEST(
+        (
+          CASE
+            WHEN m.materialized_subjects > 0 THEN m.materialized_subjects
+            ELSE COALESCE(index_row.max_candidate_rows, 0)::bigint
+          END
+        ) - m.fresh_subjects - m.stale_subjects,
+        0
+      ),
+      m.stale_reasons
+    INTO v_total_subjects, v_fresh_subjects, v_stale_subjects, v_missing_subjects, v_stale_reasons
+    FROM materialized m;
+  END IF;
 
   RETURN QUERY
   SELECT *
@@ -514,7 +598,8 @@ BEGIN
     v_fresh_subjects,
     v_stale_subjects,
     v_missing_subjects,
-    v_stale_reasons
+    v_stale_reasons,
+    v_count_basis
   );
 END;
 $$;

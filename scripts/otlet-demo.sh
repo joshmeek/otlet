@@ -390,13 +390,35 @@ SELECT watch_name || '|' || kind || '|' ||
        stale_subjects::text || '|' ||
        missing_subjects::text || '|' ||
        queued_jobs::text || '|' ||
-       complete_jobs::text
+       complete_jobs::text || '|' ||
+       count_basis
 FROM otlet.watch_status
 WHERE watch_name = '$row_triage_watch';
 ")"
 echo "row_watch_status_contract=$row_watch_status_contract"
-[ "$row_watch_status_contract" = "$row_triage_watch|row|1|1|0|0|0|1" ] || {
+[ "$row_watch_status_contract" = "$row_triage_watch|row|1|1|0|0|0|1|estimated" ] || {
   echo "Expected row watch status to show one fresh completed row, got $row_watch_status_contract" >&2
+  exit 1
+}
+row_plan_basis_contract="$(psql_value "
+SELECT count_basis || '|' ||
+       total_subjects::text || '|' ||
+       fresh_subjects::text || '|' ||
+       stale_subjects::text || '|' ||
+       missing_subjects::text
+FROM otlet.semantic_index_plan('$row_triage_watch');
+SELECT count_basis || '|' ||
+       total_subjects::text || '|' ||
+       fresh_subjects::text || '|' ||
+       stale_subjects::text || '|' ||
+       missing_subjects::text
+FROM otlet.semantic_index_plan('$row_triage_watch', true);
+")"
+row_plan_estimated="$(head -n 1 <<<"$row_plan_basis_contract")"
+row_plan_exact="$(tail -n 1 <<<"$row_plan_basis_contract")"
+echo "row_plan_basis_contract=$row_plan_estimated|exact=$row_plan_exact"
+[ "$row_plan_estimated|$row_plan_exact" = "estimated|1|1|0|0|exact|1|1|0|0" ] || {
+  echo "Expected estimated and exact row plan counts to match on demo row, got $row_plan_estimated|$row_plan_exact" >&2
   exit 1
 }
 row_lookup_basis_contract="$(psql_value "
@@ -452,7 +474,7 @@ SET stale_reason = NULL
 WHERE task_name = '$row_triage_task'
   AND subject_id = 'triage-1';
 SELECT COALESCE(stale_reasons->>'content_revalidation_pending', '0')
-FROM otlet.semantic_index_plan('$row_triage_watch');
+FROM otlet.semantic_index_plan('$row_triage_watch', true);
 ROLLBACK;
 SQL
 )"
@@ -1306,11 +1328,23 @@ SELECT selected_path || '|' ||
        stale_subjects::text || '|' ||
        missing_subjects::text || '|' ||
        queue_subjects::text || '|' ||
-       fail_closed_subjects::text
+       fail_closed_subjects::text || '|' ||
+       count_basis
 FROM otlet.semantic_join_index_plan('$join_index_name');
+SELECT selected_path || '|' ||
+       total_subjects::text || '|' ||
+       fresh_subjects::text || '|' ||
+       stale_subjects::text || '|' ||
+       missing_subjects::text || '|' ||
+       queue_subjects::text || '|' ||
+       fail_closed_subjects::text || '|' ||
+       count_basis
+FROM otlet.semantic_join_index_plan('$join_index_name', true);
 ")"
+join_status_estimated="$(head -n 1 <<<"$join_status_contract")"
+join_status_exact="$(tail -n 1 <<<"$join_status_contract")"
 echo "semantic_join_status_contract=$join_status_contract"
-[ "$join_status_contract" = "semantic_join_lookup|4|4|0|0|0|0" ] || {
+[ "$join_status_estimated|$join_status_exact" = "semantic_join_lookup|4|4|0|0|0|0|estimated|semantic_join_lookup|4|4|0|0|0|0|exact" ] || {
   echo "Expected fresh semantic join status, got $join_status_contract" >&2
   exit 1
 }
@@ -1507,6 +1541,70 @@ for term in \
   "linux_proc_self_status_vmrss_vmsize_sampled_after_worker_run"; do
   require_contains "$runtime_contract" "$term" "Expected runtime status to contain $term"
 done
+
+log "Checking estimated planner on 1M-row source"
+planner_1m_output="$(
+  psql_exec -qAt -v model_name="$strong_model_name" <<'SQL'
+DROP TABLE IF EXISTS public.otlet_plan_1m;
+CREATE TABLE public.otlet_plan_1m AS
+SELECT gs::text AS id, (gs % 10)::int AS bucket, 'plan row ' || gs::text AS note
+FROM generate_series(1, 1000000) AS gs;
+ALTER TABLE public.otlet_plan_1m ADD PRIMARY KEY (id);
+ANALYZE public.otlet_plan_1m;
+SELECT (otlet.create_watch(
+  'plan_1m_demo',
+  'row',
+  'Classify one synthetic row. Return JSON only.',
+  '{"type":"object","required":["decision"],"additionalProperties":false,"properties":{"decision":{"enum":["keep","drop"]}}}'::jsonb,
+  :'model_name',
+  'public.otlet_plan_1m'::regclass,
+  'id',
+  NULL,
+  'plan_fact',
+  '{"max_tokens":16,"reasoning":"off","inference_cache":true}'::jsonb,
+  '{}'::jsonb,
+  '{"on_change":"mark_stale"}'::jsonb,
+  ARRAY[]::text[],
+  'refresh_then_fail_closed',
+  '{}'::jsonb,
+  '{}'::jsonb
+)).name;
+DROP TABLE IF EXISTS pg_temp.otlet_plan_1m_timing;
+CREATE TEMP TABLE otlet_plan_1m_timing (
+  count_basis text,
+  total_subjects bigint,
+  elapsed_ms numeric
+);
+DO $$
+DECLARE
+  started_at timestamptz;
+  planned_row record;
+  elapsed numeric;
+BEGIN
+  started_at := clock_timestamp();
+  SELECT count_basis, total_subjects
+  INTO planned_row
+  FROM otlet.semantic_index_plan('plan_1m_demo');
+  elapsed := EXTRACT(epoch FROM clock_timestamp() - started_at) * 1000;
+  INSERT INTO pg_temp.otlet_plan_1m_timing
+  VALUES (planned_row.count_basis, planned_row.total_subjects, elapsed);
+END $$;
+SELECT count_basis || '|' ||
+       total_subjects::text || '|' ||
+       round(elapsed_ms, 3)::text || '|' ||
+       (elapsed_ms < 100)::text
+FROM pg_temp.otlet_plan_1m_timing;
+SQL
+)"
+planner_1m_contract="$(tail -n 1 <<<"$planner_1m_output")"
+planner_1m_basis="$(cut -d'|' -f1 <<<"$planner_1m_contract")"
+planner_1m_total="$(cut -d'|' -f2 <<<"$planner_1m_contract")"
+planner_1m_fast="$(cut -d'|' -f4 <<<"$planner_1m_contract")"
+echo "planner_1m_contract=$planner_1m_contract"
+[ "$planner_1m_basis" = "estimated" ] && [ "$planner_1m_total" -ge 1000000 ] && [ "$planner_1m_fast" = "true" ] || {
+  echo "Expected estimated 1M-row plan under 100ms, got $planner_1m_contract" >&2
+  exit 1
+}
 
 crash_scan
 log "Otlet demo passed"

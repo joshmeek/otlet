@@ -45,6 +45,7 @@ unsafe extern "C-unwind" fn otlet_semantic_explain_foreign_scan(
             explain_integer("Infer Now Subjects", snapshot.plan.infer_now_subjects, es);
             explain_integer("Fail Closed Subjects", snapshot.plan.fail_closed_subjects, es);
             explain_text("Stale Reasons", &snapshot.plan.stale_reasons, es);
+            explain_text("Count Basis", &snapshot.plan.count_basis, es);
             explain_float("Freshness", snapshot.plan.freshness, "", es);
             explain_float("Model Cost", snapshot.plan.model_ms, "ms", es);
             explain_text("Model Cost Source", &snapshot.plan.model_cost_source, es);
