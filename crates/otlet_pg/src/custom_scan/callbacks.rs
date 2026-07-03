@@ -63,6 +63,7 @@ unsafe extern "C-unwind" fn begin_semantic_custom_scan(
             subject_state_count(&loaded_state.subjects, SubjectSemanticState::FreshMatch);
         (*state).preloaded_fresh_non_matches =
             subject_state_count(&loaded_state.subjects, SubjectSemanticState::FreshNonMatch);
+        (*state).preloaded_freshness_basis = pg_cstr(&loaded_state.freshness_basis_counts);
         (*state).preloaded_stale_subjects =
             subject_state_count(&loaded_state.subjects, SubjectSemanticState::Stale);
         (*state).preloaded_inflight_subjects =
@@ -87,6 +88,7 @@ unsafe extern "C-unwind" fn begin_semantic_custom_scan(
             task_name: loaded_state.task_name,
             record_type: loaded_state.record_type,
             input_columns: private.input_columns,
+            preloaded_freshness_basis: loaded_state.freshness_basis_counts,
             source_reltype: if relation.is_null() {
                 pg_sys::InvalidOid
             } else {

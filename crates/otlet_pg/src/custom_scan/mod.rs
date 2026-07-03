@@ -1,6 +1,6 @@
 use pgrx::{FromDatum, JsonB, direct_function_call, pg_sys};
 use serde_json::{Value, json};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::ffi::{CStr, CString, c_char};
 use std::ptr;
 

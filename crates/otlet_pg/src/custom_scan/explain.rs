@@ -57,6 +57,11 @@ unsafe extern "C-unwind" fn explain_semantic_custom_scan(
                 runtime_preloaded_fresh_count(runtime),
                 es,
             );
+            explain_optional_text(
+                "Preloaded Freshness Basis",
+                nonempty_str(&runtime.preloaded_freshness_basis),
+                es,
+            );
             explain_counter(
                 "Preloaded Stale Subjects",
                 runtime_state_count(runtime, SubjectSemanticState::Stale),
@@ -114,6 +119,11 @@ unsafe extern "C-unwind" fn explain_semantic_custom_scan(
                 (*state)
                     .preloaded_fresh_matches
                     .saturating_add((*state).preloaded_fresh_non_matches),
+                es,
+            );
+            explain_optional_text(
+                "Preloaded Freshness Basis",
+                pg_cstr_str((*state).preloaded_freshness_basis),
                 es,
             );
             explain_counter(

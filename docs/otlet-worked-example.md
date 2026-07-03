@@ -1132,6 +1132,9 @@ Representative output excerpt:
 Foreign Scan on otlet.demo_semantic_vendor_idx_native
   Otlet Node: Semantic Foreign Scan
   Selected Path: semantic_lookup
+  Stale Reasons: {}
+  Count Basis: estimated
+  Model Cost Source: runtime_slot
   Queue Subjects: 0
   Path Cost: 1.05
   Freshness: 1.00
@@ -1139,6 +1142,50 @@ Foreign Scan on otlet.demo_semantic_vendor_idx_native
 ```
 
 The FDW runs inside Postgres as a native access path over Otlet-owned semantic materializations
+
+## EXPLAIN Field Vocabulary
+
+The SQL plan row, FDW EXPLAIN, and CustomScan EXPLAIN use the same terms for the planner contract
+
+| Concept | SQL plan row | FDW EXPLAIN | CustomScan EXPLAIN | Notes |
+| --- | --- | --- | --- | --- |
+| Chosen path | `selected_path` | `Selected Path` | `Planner Selected Path` | CustomScan prefixes planner-owned decisions |
+| Reason | `reason` | `Reason` | `Planner Reason` | Human-readable reason for the chosen path |
+| Count basis | `count_basis` | `Count Basis` | `Count Basis` | `exact` means source rows were counted; `estimated` means planner estimates were used |
+| Model cost basis | `model_cost_source` | `Model Cost Source` | `Model Cost Source` | Usually `task_receipt`, `runtime_slot`, `model_receipt`, or `static_fallback` |
+| Stale reasons | `stale_reasons` | `Stale Reasons` | `Planner Stale Reasons` | JSON count by stale reason where stale subjects are counted |
+| Infer-now prediction | `infer_now_subjects`, `fail_closed_subjects` | `Infer Now Subjects`, `Fail Closed Subjects` | `Planner Infer Now Subjects`, `Planner Fail Closed Subjects` | CustomScan also reports actual executor counters |
+| Freshness basis | `semantic_index_current_rows.freshness_basis` | `freshness_basis` output column | `Preloaded Freshness Basis` | Surface-specific because it describes materialized row freshness, not only path choice |
+
+Captured row-plan excerpt:
+
+```text
+selected_path | semantic_lookup
+stale_reasons | {}
+model_cost_source | task_receipt
+count_basis | exact
+```
+
+Captured FDW EXPLAIN excerpt:
+
+```text
+Selected Path: semantic_lookup
+Stale Reasons: {}
+Count Basis: estimated
+Model Cost Source: runtime_slot
+Freshness: 1.00
+```
+
+Captured CustomScan EXPLAIN excerpt:
+
+```text
+Planner Selected Path: semantic_lookup
+Planner Stale Reasons: {}
+Count Basis: exact
+Model Cost Source: task_receipt
+Preloaded Fresh Subjects: 3
+Preloaded Freshness Basis: {"mvcc_match": 3}
+```
 
 ## Use CustomScan For Source-Row Predicates
 
@@ -1159,7 +1206,11 @@ Custom Scan (Otlet Semantic Source CustomScan) on public.otlet_demo_semantic_ven
   Child Semantic Filter: stripped_before_child_plan
   Semantic Index: demo_semantic_vendor_idx
   Planner Selected Path: semantic_lookup
-  Planner Fresh Rows: 3
+  Count Basis: exact
+  Model Cost Source: task_receipt
+  Planner Stale Reasons: {}
+  Preloaded Fresh Subjects: 3
+  Preloaded Freshness Basis: {"mvcc_match": 3}
   Actual Fresh Subjects: 3
 ```
 
@@ -1239,9 +1290,14 @@ Custom Scan (Otlet Semantic Source CustomScan) on public.otlet_demo_semantic_ven
   Infer Now Timeout Ms: 15000
   Infer Now Max Rows: 1
   Planner Selected Path: bounded_infer_now
-  Planner Stale Rows: 1
+  Count Basis: exact
+  Model Cost Source: task_receipt
+  Planner Infer Now Subjects: 1
+  Planner Fail Closed Subjects: 0
+  Preloaded Stale Subjects: 1
   Actual Infer Resolved Rows: 1
   Infer Now Receipts: 1
+  Infer Now Trace Receipt Id: 42
 ```
 
 The executor refreshed the stale row with a bounded infer-now budget and a receipt

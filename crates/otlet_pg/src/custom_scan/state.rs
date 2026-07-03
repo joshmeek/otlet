@@ -31,6 +31,7 @@ struct OtletSemanticCustomScanState {
     known_subjects: u64,
     preloaded_fresh_matches: u64,
     preloaded_fresh_non_matches: u64,
+    preloaded_freshness_basis: *mut c_char,
     preloaded_stale_subjects: u64,
     preloaded_inflight_subjects: u64,
     rows_seen: u64,
@@ -86,6 +87,7 @@ struct RuntimeState {
     task_name: String,
     record_type: String,
     input_columns: Option<Vec<String>>,
+    preloaded_freshness_basis: String,
     source_reltype: pg_sys::Oid,
     subject_attno: i16,
     subject_typid: pg_sys::Oid,
@@ -173,6 +175,7 @@ struct LoadedSemanticState {
     source_table: String,
     task_name: String,
     record_type: String,
+    freshness_basis_counts: String,
     subjects: HashMap<String, SubjectSemanticState>,
 }
 
