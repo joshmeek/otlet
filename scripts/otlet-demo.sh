@@ -432,6 +432,24 @@ echo "row_visible_update_stale_contract=$row_visible_fresh_before|$row_visible_s
   echo "Expected visible row update to fail closed across lookup surfaces, got $row_visible_fresh_before|$row_visible_source_update|$row_visible_predicate_match|$row_visible_fdw_rows" >&2
   exit 1
 }
+row_pending_reason_probe="$(
+  psql_exec -qAt <<SQL
+BEGIN;
+UPDATE otlet.semantic_materializations
+SET stale_reason = NULL
+WHERE task_name = '$row_triage_task'
+  AND subject_id = 'triage-1';
+SELECT COALESCE(stale_reasons->>'content_revalidation_pending', '0')
+FROM otlet.semantic_index_plan('$row_triage_watch');
+ROLLBACK;
+SQL
+)"
+row_pending_reason="$(grep -E '^[0-9]+$' <<<"$row_pending_reason_probe" | tail -n 1)"
+echo "row_content_revalidation_pending_contract=$row_pending_reason"
+[ "$row_pending_reason" = "1" ] || {
+  echo "Expected stale current row with no stored reason to expose content_revalidation_pending, got $row_pending_reason" >&2
+  exit 1
+}
 wait_task_complete "$row_triage_task" 2 900 1
 row_visible_refresh_contract="$(psql_value "
 SELECT count(*)::text
@@ -447,6 +465,20 @@ row_visible_receipt_delta=$((row_receipts_after_visible_update - row_receipts_be
 echo "row_visible_update_refresh_contract=$row_visible_receipt_delta|$row_visible_fresh_after"
 [ "$row_visible_receipt_delta|$row_visible_fresh_after" = "1|1" ] || {
   echo "Expected visible row update to produce exactly one receipt and one fresh row, got $row_visible_receipt_delta|$row_visible_fresh_after" >&2
+  exit 1
+}
+row_manual_reason_contract="$(psql_value "
+SELECT (otlet.mark_semantic_stale(NULL, 'triage-1', 'manual') >= 1)::text;
+SELECT (count(*) FILTER (WHERE stale AND stale_reason = 'manual') >= 1)::text
+FROM otlet.semantic_materializations
+WHERE task_name = '$row_triage_task'
+  AND subject_id = 'triage-1';
+")"
+row_manual_marked="$(head -n 1 <<<"$row_manual_reason_contract")"
+row_manual_reason="$(tail -n 1 <<<"$row_manual_reason_contract")"
+echo "row_manual_reason_contract=$row_manual_marked|$row_manual_reason"
+[ "$row_manual_marked|$row_manual_reason" = "true|true" ] || {
+  echo "Expected manual mark to expose manual stale reason, got $row_manual_marked|$row_manual_reason" >&2
   exit 1
 }
 
