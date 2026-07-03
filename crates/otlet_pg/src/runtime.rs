@@ -3,6 +3,7 @@ use serde_json::{Value, json};
 pub(crate) struct RuntimeOptions {
     pub(crate) reasoning: String,
     pub(crate) schema_prompt: String,
+    pub(crate) prefix_kv_reuse: bool,
     pub(crate) max_tokens: u64,
     pub(crate) inference_cache: bool,
     pub(crate) max_worker_rss_bytes: u64,
@@ -16,6 +17,7 @@ impl Default for RuntimeOptions {
         Self {
             reasoning: "off".to_owned(),
             schema_prompt: "verbatim".to_owned(),
+            prefix_kv_reuse: false,
             max_tokens: 512,
             inference_cache: true,
             max_worker_rss_bytes: 0,
@@ -37,6 +39,7 @@ pub(crate) fn parse_runtime_options(value: &Value) -> Result<RuntimeOptions, Str
             key.as_str(),
             "reasoning"
                 | "schema_prompt"
+                | "prefix_kv_reuse"
                 | "max_tokens"
                 | "inference_cache"
                 | "max_worker_rss_bytes"
@@ -66,6 +69,12 @@ pub(crate) fn parse_runtime_options(value: &Value) -> Result<RuntimeOptions, Str
             return Err("runtime_options.schema_prompt must be compact or verbatim".to_owned());
         }
         options.schema_prompt = schema_prompt.to_owned();
+    }
+
+    if let Some(value) = object.get("prefix_kv_reuse") {
+        options.prefix_kv_reuse = value
+            .as_bool()
+            .ok_or("runtime_options.prefix_kv_reuse must be a boolean")?;
     }
 
     if let Some(value) = object.get("max_tokens") {
@@ -142,6 +151,7 @@ pub(crate) fn runtime_option_status(value: &Value) -> Value {
     let controls = [
         "reasoning",
         "schema_prompt",
+        "prefix_kv_reuse",
         "max_tokens",
         "inference_cache",
         "max_worker_rss_bytes",

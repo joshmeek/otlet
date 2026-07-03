@@ -72,6 +72,38 @@ fn generation_trace_summary(
             Value::String(context.schema_prompt.clone()),
         );
         object.insert(
+            "prompt_prefix_hash".to_owned(),
+            Value::String(context.prompt_prefix_hash.clone()),
+        );
+        object.insert(
+            "prompt_suffix_hash".to_owned(),
+            Value::String(context.prompt_suffix_hash.clone()),
+        );
+        object.insert(
+            "prompt_prefix_reuse_enabled".to_owned(),
+            Value::Bool(context.prompt_prefix_reuse_enabled),
+        );
+        object.insert(
+            "prompt_prefix_tokens".to_owned(),
+            Value::Number(metrics.prompt_prefix_tokens.into()),
+        );
+        object.insert(
+            "prompt_suffix_tokens".to_owned(),
+            Value::Number(metrics.prompt_suffix_tokens.into()),
+        );
+        object.insert(
+            "prompt_prefix_reused_tokens".to_owned(),
+            Value::Number(metrics.prompt_prefix_reused_tokens.into()),
+        );
+        object.insert(
+            "prompt_prefix_reuse_status".to_owned(),
+            Value::String(metrics.prompt_prefix_reuse_status.clone()),
+        );
+        object.insert(
+            "prompt_prefix_reuse_reason".to_owned(),
+            Value::String(metrics.prompt_prefix_reuse_reason.clone()),
+        );
+        object.insert(
             "inference_cache_key_basis".to_owned(),
             Value::String(context.inference_cache_key_basis.clone()),
         );

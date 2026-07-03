@@ -424,6 +424,183 @@ FROM receipt_pairs;
 echo "prompt_diet_contract=$prompt_diet_contract"
 require_regex "$prompt_diet_contract" '^true\|true\|[0-9]+\|[0-9]+\|true\|true$' "Expected compact schema prompt to reduce prompt tokens with schema-valid direct outputs"
 
+prefix_kv_off_task="prefix_kv_off_demo"
+prefix_kv_on_task="prefix_kv_on_demo"
+prefix_kv_mismatch_task="prefix_kv_mismatch_demo"
+cleanup_task "$prefix_kv_off_task"
+cleanup_task "$prefix_kv_on_task"
+cleanup_task "$prefix_kv_mismatch_task"
+
+psql_exec \
+  -v model_name="$strong_model_name" \
+  -v off_task="$prefix_kv_off_task" >/dev/null <<'SQL'
+WITH params AS (
+  SELECT
+    'For every input row, output status ok, confidence high, and reason prefix kv reuse. Use no actions. Do not copy input fields. Return JSON only.'::text AS instruction,
+    $source$
+      SELECT 'prefix-kv-' || i::text AS subject_id,
+             jsonb_build_object('row_id', i, 'signal', 'constant') AS input
+      FROM generate_series(1, 8) AS g(i)
+    $source$::text AS input_query,
+    '{
+      "type": "object",
+      "required": ["status", "confidence", "reason"],
+      "additionalProperties": false,
+      "properties": {
+        "status": {"enum": ["ok"]},
+        "confidence": {"enum": ["high"]},
+        "reason": {"type": "string", "maxLength": 80}
+      }
+    }'::jsonb AS schema
+)
+SELECT otlet.create_task(
+  :'off_task',
+  input_query,
+  instruction,
+  schema,
+  :'model_name',
+  '{"max_tokens":96,"reasoning":"off","inference_cache":false,"prefix_kv_reuse":false}'::jsonb
+)
+FROM params;
+
+SELECT otlet.run_task(:'off_task');
+SQL
+wait_task_complete "$prefix_kv_off_task" 8 1800 1
+
+psql_exec \
+  -v model_name="$strong_model_name" \
+  -v on_task="$prefix_kv_on_task" >/dev/null <<'SQL'
+WITH params AS (
+  SELECT
+    'For every input row, output status ok, confidence high, and reason prefix kv reuse. Use no actions. Do not copy input fields. Return JSON only.'::text AS instruction,
+    $source$
+      SELECT 'prefix-kv-' || i::text AS subject_id,
+             jsonb_build_object('row_id', i, 'signal', 'constant') AS input
+      FROM generate_series(1, 8) AS g(i)
+    $source$::text AS input_query,
+    '{
+      "type": "object",
+      "required": ["status", "confidence", "reason"],
+      "additionalProperties": false,
+      "properties": {
+        "status": {"enum": ["ok"]},
+        "confidence": {"enum": ["high"]},
+        "reason": {"type": "string", "maxLength": 80}
+      }
+    }'::jsonb AS schema
+)
+SELECT otlet.create_task(
+  :'on_task',
+  input_query,
+  instruction,
+  schema,
+  :'model_name',
+  '{"max_tokens":96,"reasoning":"off","inference_cache":false,"prefix_kv_reuse":true}'::jsonb
+)
+FROM params;
+
+SELECT otlet.run_task(:'on_task');
+SQL
+wait_task_complete "$prefix_kv_on_task" 8 1800 1
+
+psql_exec \
+  -v model_name="$strong_model_name" \
+  -v mismatch_task="$prefix_kv_mismatch_task" >/dev/null <<'SQL'
+WITH params AS (
+  SELECT
+    'For this fallback smoke, output status ok, confidence high, and reason prefix mismatch fallback. Use no actions. Return JSON only.'::text AS instruction,
+    $source$
+      SELECT 'prefix-kv-mismatch'::text AS subject_id,
+             jsonb_build_object('row_id', 99, 'signal', 'different-prefix') AS input
+    $source$::text AS input_query,
+    '{
+      "type": "object",
+      "required": ["status", "confidence", "reason"],
+      "additionalProperties": false,
+      "properties": {
+        "status": {"enum": ["ok"]},
+        "confidence": {"enum": ["high"]},
+        "reason": {"type": "string", "maxLength": 80}
+      }
+    }'::jsonb AS schema
+)
+SELECT otlet.create_task(
+  :'mismatch_task',
+  input_query,
+  instruction,
+  schema,
+  :'model_name',
+  '{"max_tokens":96,"reasoning":"off","inference_cache":false,"prefix_kv_reuse":true}'::jsonb
+)
+FROM params;
+
+SELECT otlet.run_task(:'mismatch_task');
+SQL
+wait_task_complete "$prefix_kv_mismatch_task" 1 900 1
+
+prefix_kv_contract="$(psql_value "
+WITH off_receipts AS (
+  SELECT subject_id, receipt_raw_output_hash AS raw_output_hash
+  FROM otlet.inference_receipt_trace_status
+  WHERE task_name = '$prefix_kv_off_task'
+    AND status = 'complete'
+),
+on_receipts AS (
+  SELECT
+    subject_id,
+    receipt_raw_output_hash AS raw_output_hash,
+    prompt_prefix_hash,
+    prompt_prefix_reused_tokens,
+    prompt_prefix_reuse_status,
+    worker_process_rss_bytes
+  FROM otlet.inference_receipt_trace_status
+  WHERE task_name = '$prefix_kv_on_task'
+    AND status = 'complete'
+),
+off_batch AS (
+  SELECT detail
+  FROM otlet.worker_events
+  WHERE event_type = 'worker_batch_finished'
+    AND detail ->> 'task_name' = '$prefix_kv_off_task'
+  ORDER BY id DESC
+  LIMIT 1
+),
+on_batch AS (
+  SELECT detail
+  FROM otlet.worker_events
+  WHERE event_type = 'worker_batch_finished'
+    AND detail ->> 'task_name' = '$prefix_kv_on_task'
+  ORDER BY id DESC
+  LIMIT 1
+),
+mismatch AS (
+  SELECT prompt_prefix_reuse_status, prompt_prefix_reuse_reason
+  FROM otlet.inference_receipt_trace_status
+  WHERE task_name = '$prefix_kv_mismatch_task'
+  ORDER BY receipt_id DESC
+  LIMIT 1
+),
+batch_numbers AS (
+  SELECT
+    COALESCE((SELECT (detail ->> 'batch_ms')::bigint FROM off_batch), 0) AS off_ms,
+    COALESCE((SELECT (detail ->> 'batch_ms')::bigint FROM on_batch), 0) AS on_ms,
+    COALESCE((SELECT (detail ->> 'prompt_prefix_reused_tokens')::bigint FROM off_batch), 0) AS off_reused,
+    COALESCE((SELECT (detail ->> 'prompt_prefix_reused_tokens')::bigint FROM on_batch), 0) AS on_reused
+)
+SELECT
+  ((SELECT count(*) FROM off_receipts) = 8)::text || '|' ||
+  ((SELECT count(*) FROM on_receipts) = 8)::text || '|' ||
+  COALESCE((SELECT bool_and(o.raw_output_hash = n.raw_output_hash) FROM off_receipts o JOIN on_receipts n USING (subject_id)), false)::text || '|' ||
+  ((SELECT count(*) FROM on_receipts WHERE prompt_prefix_reuse_status = 'hit' AND prompt_prefix_reused_tokens > 0) >= 7)::text || '|' ||
+  ((SELECT COALESCE(sum(prompt_prefix_reused_tokens), 0) FROM on_receipts) > 0)::text || '|' ||
+  ((SELECT count(DISTINCT prompt_prefix_hash) FROM on_receipts) = 1)::text || '|' ||
+  (COALESCE((SELECT min(worker_process_rss_bytes) FROM on_receipts), 0) > 0)::text || '|' ||
+  (SELECT (off_reused = 0)::text || '|' || (on_reused > 0)::text || '|' || (off_ms > 0 AND on_ms > 0)::text || '|' || ((off_ms - on_ms) > 0)::text || '|' || off_ms::text || '|' || on_ms::text || '|' || (off_ms - on_ms)::text FROM batch_numbers) || '|' ||
+  COALESCE((SELECT (prompt_prefix_reuse_status = 'fallback' AND prompt_prefix_reuse_reason = 'prefix_hash_mismatch_full_decode')::text FROM mismatch), 'false');
+")"
+echo "prefix_kv_contract=$prefix_kv_contract"
+require_regex "$prefix_kv_contract" '^true\|true\|true\|true\|true\|true\|true\|true\|true\|true\|true\|[1-9][0-9]*\|[1-9][0-9]*\|[1-9][0-9]*\|true$' "Expected prefix KV reuse to be byte-identical, faster, RSS-visible, and mismatch-safe"
+
 log "Running non-ER row triage watch"
 psql_exec \
   -v model_name="$strong_model_name" \

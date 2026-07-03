@@ -4,7 +4,7 @@ use crate::job::{
 use crate::model::{ModelError, ModelMetrics, ModelRun, run_job};
 use pgrx::JsonB;
 use pgrx::bgworkers::{BackgroundWorker, SignalWakeFlags};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[pgrx::pg_guard]
 #[unsafe(no_mangle)]
@@ -66,13 +66,22 @@ pub extern "C-unwind" fn otlet_worker_main(_arg: pgrx::pg_sys::Datum) {
 
             let mut completed: i64 = 0;
             let mut failed: i64 = 0;
+            let mut prefix_reused_tokens: i64 = 0;
+            let mut prefix_reuse_hits: i64 = 0;
+            let mut prefix_reuse_fallbacks: i64 = 0;
+            let batch_start = Instant::now();
             for job in jobs {
-                if process_job(job) {
+                let result = process_job(job);
+                if result.completed {
                     completed += 1;
                 } else {
                     failed += 1;
                 }
+                prefix_reused_tokens += result.prefix_reused_tokens;
+                prefix_reuse_hits += result.prefix_reuse_hits;
+                prefix_reuse_fallbacks += result.prefix_reuse_fallbacks;
             }
+            let batch_ms = millis_since(batch_start);
 
             if let Some((runtime_name, task_name, model_name, job_count)) = batch {
                 record_worker_batch_finished(
@@ -82,6 +91,10 @@ pub extern "C-unwind" fn otlet_worker_main(_arg: pgrx::pg_sys::Datum) {
                     job_count,
                     completed,
                     failed,
+                    batch_ms,
+                    prefix_reused_tokens,
+                    prefix_reuse_hits,
+                    prefix_reuse_fallbacks,
                 );
                 drained += job_count as u64;
             } else {
@@ -131,7 +144,7 @@ fn process_infer_now_request(request: crate::infer_now::InferNowRequest) {
     crate::infer_now::mark_request_job_started(request.id, job_id);
     let task_name = job.task_name.clone();
     let subject_id = job.subject_id.clone();
-    if !process_job(job) {
+    if !process_job(job).completed {
         let error = infer_now_job_error(job_id);
         crate::infer_now::finish_request(request.id, job_id, Some(&error));
         return;
@@ -209,7 +222,50 @@ fn infer_now_job_error(job_id: i64) -> String {
     }
 }
 
-fn process_job(job: Job) -> bool {
+#[derive(Default)]
+struct JobProcessResult {
+    completed: bool,
+    prefix_reused_tokens: i64,
+    prefix_reuse_hits: i64,
+    prefix_reuse_fallbacks: i64,
+}
+
+impl JobProcessResult {
+    fn completed(completed: bool) -> Self {
+        Self {
+            completed,
+            ..Self::default()
+        }
+    }
+
+    fn from_run(completed: bool, run: &ModelRun) -> Self {
+        let mut result = Self::completed(completed);
+        if let Some(metrics) = run.metrics.as_ref() {
+            result.add_metrics(metrics);
+        }
+        result
+    }
+
+    fn from_error(completed: bool, err: &ModelError) -> Self {
+        let mut result = Self::completed(completed);
+        if let Some(metrics) = err.metrics.as_ref() {
+            result.add_metrics(metrics);
+        }
+        result
+    }
+
+    fn add_metrics(&mut self, metrics: &ModelMetrics) {
+        self.prefix_reused_tokens += metrics.prompt_prefix_reused_tokens;
+        if metrics.prompt_prefix_reuse_status == "hit" {
+            self.prefix_reuse_hits += 1;
+        }
+        if metrics.prompt_prefix_reuse_status == "fallback" {
+            self.prefix_reuse_fallbacks += 1;
+        }
+    }
+}
+
+fn process_job(job: Job) -> JobProcessResult {
     let start_result: pgrx::spi::Result<()> = BackgroundWorker::transaction(|| {
         pgrx::Spi::connect_mut(|client| {
             let args = [job.id.into()];
@@ -226,7 +282,7 @@ fn process_job(job: Job) -> bool {
         Ok(None) => process_direct_job(job),
         Err(err) => {
             pgrx::warning!("otlet model selection policy lookup failed: {err}");
-            fail_attempt(
+            JobProcessResult::completed(fail_attempt(
                 &job,
                 ModelError {
                     message: format!("model selection policy lookup failed: {err}"),
@@ -241,24 +297,32 @@ fn process_job(job: Job) -> bool {
                 },
                 "direct",
                 "policy_lookup_failed",
-            )
+            ))
         }
     }
 }
 
-fn process_direct_job(job: Job) -> bool {
+fn process_direct_job(job: Job) -> JobProcessResult {
     match run_job(&job) {
-        Ok(run) => accept_attempt(&job, run, "direct", "accepted_by_direct_task"),
-        Err(err) => fail_attempt(&job, err, "direct", "direct_attempt_failed"),
+        Ok(run) => {
+            let mut result = JobProcessResult::from_run(false, &run);
+            result.completed = accept_attempt(&job, run, "direct", "accepted_by_direct_task");
+            result
+        }
+        Err(err) => {
+            let mut result = JobProcessResult::from_error(false, &err);
+            result.completed = fail_attempt(&job, err, "direct", "direct_attempt_failed");
+            result
+        }
     }
 }
 
-fn process_selected_job(job: Job, policy: ModelSelectionPolicy) -> bool {
+fn process_selected_job(job: Job, policy: ModelSelectionPolicy) -> JobProcessResult {
     if policy.skip_cheap {
-        return run_strong_attempt(
+        return JobProcessResult::completed(run_strong_attempt(
             job.with_model(&policy.strong),
             "cheap_skipped_low_recent_acceptance",
-        );
+        ));
     }
 
     let cheap_job = job.with_model(&policy.cheap);
@@ -272,22 +336,26 @@ fn process_selected_job(job: Job, policy: ModelSelectionPolicy) -> bool {
             let (accepted, reason) = accepted_by_policy(&run.output, &policy.accept_field_checks);
             let reason = cheap_reason.unwrap_or(&reason);
             if accepted {
-                return accept_attempt(&cheap_job, run, "cheap", reason);
+                return JobProcessResult::completed(accept_attempt(
+                    &cheap_job, run, "cheap", reason,
+                ));
             }
             record_metrics_from_run(&cheap_job, &run);
             if !record_rejected_attempt(&cheap_job, run, "cheap", reason) {
-                return false;
+                return JobProcessResult::completed(false);
             }
-            run_strong_attempt(
+            JobProcessResult::completed(run_strong_attempt(
                 job.with_model(&policy.strong),
                 if cheap_reason.is_some() {
                     "escalated_after_cheap_probe_rejection"
                 } else {
                     "escalated_after_cheap_rejection"
                 },
-            )
+            ))
         }
-        Err(err) if err.message == "canceled" => fail_attempt(&cheap_job, err, "cheap", "canceled"),
+        Err(err) if err.message == "canceled" => {
+            JobProcessResult::completed(fail_attempt(&cheap_job, err, "cheap", "canceled"))
+        }
         Err(err) if err.raw_output.is_some() => {
             record_metrics_from_error(&cheap_job, &err);
             if !record_failed_model_attempt(
@@ -296,18 +364,23 @@ fn process_selected_job(job: Job, policy: ModelSelectionPolicy) -> bool {
                 "cheap",
                 cheap_reason.unwrap_or("schema_validation_failed"),
             ) {
-                return false;
+                return JobProcessResult::completed(false);
             }
-            run_strong_attempt(
+            JobProcessResult::completed(run_strong_attempt(
                 job.with_model(&policy.strong),
                 if cheap_reason.is_some() {
                     "escalated_after_cheap_probe_schema_failure"
                 } else {
                     "escalated_after_cheap_schema_failure"
                 },
-            )
+            ))
         }
-        Err(err) => fail_attempt(&cheap_job, err, "cheap", "cheap_runtime_failed"),
+        Err(err) => JobProcessResult::completed(fail_attempt(
+            &cheap_job,
+            err,
+            "cheap",
+            "cheap_runtime_failed",
+        )),
     }
 }
 
@@ -604,6 +677,10 @@ fn record_worker_batch_finished(
     job_count: i64,
     completed: i64,
     failed: i64,
+    batch_ms: i64,
+    prefix_reused_tokens: i64,
+    prefix_reuse_hits: i64,
+    prefix_reuse_fallbacks: i64,
 ) {
     let result: pgrx::spi::Result<()> = BackgroundWorker::transaction(|| {
         pgrx::Spi::connect_mut(|client| {
@@ -615,9 +692,13 @@ fn record_worker_batch_finished(
                 job_count.into(),
                 completed.into(),
                 failed.into(),
+                batch_ms.into(),
+                prefix_reused_tokens.into(),
+                prefix_reuse_hits.into(),
+                prefix_reuse_fallbacks.into(),
             ];
             client.update(
-                "SELECT otlet.record_worker_event('worker_batch_finished', $1, $2, 'worker_batch_finished', jsonb_build_object('task_name', $3, 'model_name', $4, 'job_count', $5, 'completed_jobs', $6, 'failed_jobs', $7))",
+                "SELECT otlet.record_worker_event('worker_batch_finished', $1, $2, 'worker_batch_finished', jsonb_build_object('task_name', $3, 'model_name', $4, 'job_count', $5, 'completed_jobs', $6, 'failed_jobs', $7, 'batch_ms', $8, 'prompt_prefix_reused_tokens', $9, 'prefix_kv_reuse_hits', $10, 'prefix_kv_reuse_fallbacks', $11))",
                 Some(1),
                 &args,
             )?;
@@ -627,6 +708,10 @@ fn record_worker_batch_finished(
     if let Err(err) = result {
         pgrx::warning!("otlet worker batch event failed: {err}");
     }
+}
+
+fn millis_since(start: Instant) -> i64 {
+    i64::try_from(start.elapsed().as_millis()).unwrap_or(i64::MAX)
 }
 
 fn materialize_completed_semantic_job(job: &Job) {

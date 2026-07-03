@@ -266,6 +266,25 @@ SELECT
   r.trace_summary ->> 'stop_reason' AS stop_reason,
   r.trace_summary ->> 'schema_force' AS schema_force,
   r.trace_summary ->> 'schema_prompt' AS schema_prompt,
+  r.trace_summary ->> 'prompt_prefix_hash' AS prompt_prefix_hash,
+  COALESCE(r.trace_summary ->> 'prompt_prefix_reuse_enabled', 'false')::boolean AS prompt_prefix_reuse_enabled,
+  CASE
+    WHEN jsonb_typeof(r.trace_summary -> 'prompt_prefix_tokens') = 'number'
+      THEN (r.trace_summary ->> 'prompt_prefix_tokens')::bigint
+    ELSE NULL
+  END AS prompt_prefix_tokens,
+  CASE
+    WHEN jsonb_typeof(r.trace_summary -> 'prompt_suffix_tokens') = 'number'
+      THEN (r.trace_summary ->> 'prompt_suffix_tokens')::bigint
+    ELSE NULL
+  END AS prompt_suffix_tokens,
+  CASE
+    WHEN jsonb_typeof(r.trace_summary -> 'prompt_prefix_reused_tokens') = 'number'
+      THEN (r.trace_summary ->> 'prompt_prefix_reused_tokens')::bigint
+    ELSE NULL
+  END AS prompt_prefix_reused_tokens,
+  r.trace_summary ->> 'prompt_prefix_reuse_status' AS prompt_prefix_reuse_status,
+  r.trace_summary ->> 'prompt_prefix_reuse_reason' AS prompt_prefix_reuse_reason,
   r.trace_summary ->> 'decode_constraint' AS decode_constraint,
   COALESCE(r.trace_summary ->> 'grammar_supported', 'false')::boolean AS grammar_supported,
   r.trace_summary ->> 'decode_constraint_reason' AS decode_constraint_reason,
