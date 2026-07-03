@@ -15,6 +15,8 @@ CREATE TABLE otlet.production_policy (
   worker_event_retention interval NOT NULL DEFAULT interval '7 days',
   trace_detail_retention interval NOT NULL DEFAULT interval '7 days',
   eval_label_retention interval NOT NULL DEFAULT interval '90 days',
+  delete_stale_materialization_retention interval NOT NULL DEFAULT interval '30 days',
+  rejected_receipt_raw_output_retention interval NOT NULL DEFAULT interval '7 days',
   CHECK (name = 'default'),
   CHECK (stale_policy IN (
     'lookup_only_fail_closed',
@@ -29,7 +31,9 @@ CREATE TABLE otlet.production_policy (
   CHECK (worker_claim_batch_size BETWEEN 1 AND 128),
   CHECK (job_lease_interval >= interval '1 second'),
   CHECK (job_lease_interval <= interval '1 hour'),
-  CHECK (eval_label_retention >= interval '1 day')
+  CHECK (eval_label_retention >= interval '1 day'),
+  CHECK (delete_stale_materialization_retention >= interval '1 day'),
+  CHECK (rejected_receipt_raw_output_retention >= interval '1 day')
 );
 
 INSERT INTO otlet.production_policy (name)
@@ -54,15 +58,6 @@ CREATE TABLE otlet.models (
   runtime_name text NOT NULL DEFAULT 'linked_inproc' REFERENCES otlet.runtimes(name),
   max_active_jobs int NOT NULL DEFAULT 1 CHECK (max_active_jobs BETWEEN 1 AND 1024),
   last_used_at timestamptz,
-  created_at timestamptz NOT NULL DEFAULT now()
-);
-
-CREATE TABLE otlet.model_versions (
-  id bigserial PRIMARY KEY,
-  model_name text NOT NULL REFERENCES otlet.models(name),
-  artifact_path text NOT NULL,
-  artifact_hash text,
-  runtime_name text NOT NULL REFERENCES otlet.runtimes(name),
   created_at timestamptz NOT NULL DEFAULT now()
 );
 
@@ -327,8 +322,7 @@ VALUES
   ('merge_candidate', true, false),
   ('new_entity', false, false),
   ('review_flag', false, false),
-  ('note', false, true),
-  ('follow_up_job', false, false);
+  ('note', false, true);
 
 CREATE TABLE otlet.actions (
   id bigserial PRIMARY KEY,

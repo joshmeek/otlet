@@ -467,12 +467,6 @@ deleted_slots AS (
   USING names
   WHERE s.model_name = names.model_name
   RETURNING s.model_name
-),
-deleted_versions AS (
-  DELETE FROM otlet.model_versions v
-  USING names
-  WHERE v.model_name = names.model_name
-  RETURNING v.id
 )
 DELETE FROM otlet.models m
 USING names
@@ -493,7 +487,6 @@ WITH names AS (
 )
 SELECT
   (SELECT count(*) FROM otlet.models m JOIN names ON names.model_name = m.name)
-  + (SELECT count(*) FROM otlet.model_versions v JOIN names ON names.model_name = v.model_name)
   + (SELECT count(*) FROM otlet.runtime_slots s JOIN names ON names.model_name = s.model_name);
 SQL
 }

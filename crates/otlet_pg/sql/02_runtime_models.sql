@@ -45,9 +45,6 @@ BEGIN
         max_active_jobs = EXCLUDED.max_active_jobs
   RETURNING * INTO saved;
 
-  INSERT INTO otlet.model_versions (model_name, artifact_path, artifact_hash, runtime_name)
-  VALUES (saved.name, saved.artifact_path, saved.artifact_hash, saved.runtime_name);
-
   RETURN saved;
 END;
 $$;

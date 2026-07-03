@@ -87,6 +87,7 @@ BEGIN
 END;
 $$;
 
+-- CustomScan matches this wrapper name to enable bounded infer-now planning
 CREATE FUNCTION otlet.semantic_matches_auto(
   index_name text,
   subject_id text,

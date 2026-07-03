@@ -13,7 +13,9 @@ SELECT
   p.job_lease_interval,
   p.worker_event_retention,
   p.trace_detail_retention,
-  p.eval_label_retention
+  p.eval_label_retention,
+  p.delete_stale_materialization_retention,
+  p.rejected_receipt_raw_output_retention
 FROM otlet.production_policy p;
 
 CREATE VIEW otlet.model_queue_status AS
@@ -674,6 +676,8 @@ CREATE FUNCTION otlet.cleanup_policy_state(
   token_trace_rows bigint,
   token_alternative_rows bigint,
   eval_labels bigint,
+  delete_stale_materializations bigint,
+  rejected_receipt_raw_outputs bigint,
   dry_run boolean
 )
 LANGUAGE plpgsql
@@ -682,13 +686,27 @@ DECLARE
   worker_retention interval;
   trace_retention interval;
   eval_retention interval;
+  delete_stale_retention interval;
+  rejected_raw_output_retention interval;
   worker_count bigint := 0;
   token_count bigint := 0;
   alternative_count bigint := 0;
   eval_count bigint := 0;
+  delete_stale_count bigint := 0;
+  rejected_raw_output_count bigint := 0;
 BEGIN
-  SELECT worker_event_retention, trace_detail_retention, eval_label_retention
-  INTO worker_retention, trace_retention, eval_retention
+  SELECT
+    worker_event_retention,
+    trace_detail_retention,
+    eval_label_retention,
+    delete_stale_materialization_retention,
+    rejected_receipt_raw_output_retention
+  INTO
+    worker_retention,
+    trace_retention,
+    eval_retention,
+    delete_stale_retention,
+    rejected_raw_output_retention
   FROM otlet.production_policy;
 
   SELECT count(*)
@@ -730,6 +748,20 @@ BEGIN
   FROM otlet.eval_labels l
   WHERE l.created_at < now() - eval_retention;
 
+  SELECT count(*)
+  INTO delete_stale_count
+  FROM otlet.semantic_materializations sm
+  WHERE sm.stale
+    AND sm.stale_reason = 'source_delete'
+    AND sm.updated_at < now() - delete_stale_retention;
+
+  SELECT count(*)
+  INTO rejected_raw_output_count
+  FROM otlet.inference_receipts r
+  WHERE r.selection_status = 'rejected'
+    AND r.raw_output IS NOT NULL
+    AND r.finished_at < now() - rejected_raw_output_retention;
+
   IF NOT cleanup_policy_state.requested_dry_run THEN
     DELETE FROM otlet.worker_events e
     WHERE e.created_at < now() - worker_retention
@@ -763,8 +795,26 @@ BEGIN
 
     DELETE FROM otlet.eval_labels l
     WHERE l.created_at < now() - eval_retention;
+
+    DELETE FROM otlet.semantic_materializations sm
+    WHERE sm.stale
+      AND sm.stale_reason = 'source_delete'
+      AND sm.updated_at < now() - delete_stale_retention;
+
+    UPDATE otlet.inference_receipts r
+    SET raw_output = NULL
+    WHERE r.selection_status = 'rejected'
+      AND r.raw_output IS NOT NULL
+      AND r.finished_at < now() - rejected_raw_output_retention;
   END IF;
 
-  RETURN QUERY SELECT worker_count, token_count, alternative_count, eval_count, cleanup_policy_state.requested_dry_run;
+  RETURN QUERY SELECT
+    worker_count,
+    token_count,
+    alternative_count,
+    eval_count,
+    delete_stale_count,
+    rejected_raw_output_count,
+    cleanup_policy_state.requested_dry_run;
 END;
 $$;

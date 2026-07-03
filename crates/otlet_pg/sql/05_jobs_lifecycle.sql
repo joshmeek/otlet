@@ -628,19 +628,6 @@ BEGIN
     RETURN NULL;
   END IF;
 
-  IF v_action_type = 'follow_up_job' THEN
-    IF NULLIF(body ->> 'task_name', '') IS NULL THEN
-      RETURN 'follow_up_job missing task_name';
-    END IF;
-    IF NULLIF(body ->> 'subject_id', '') IS NULL THEN
-      RETURN 'follow_up_job missing subject_id';
-    END IF;
-    IF NULLIF(body ->> 'reason', '') IS NULL THEN
-      RETURN 'follow_up_job missing reason';
-    END IF;
-    RETURN NULL;
-  END IF;
-
   RETURN 'unsupported action type';
 END;
 $$;

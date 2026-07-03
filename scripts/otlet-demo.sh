@@ -2513,7 +2513,7 @@ action_contract="$(psql_value "
 WITH schema_check AS (
   SELECT string_agg(action_type, '|' ORDER BY action_type) AS value
   FROM otlet.action_type_schemas
-  WHERE action_type IN ('follow_up_job', 'merge_candidate', 'new_entity', 'note', 'review_flag')
+  WHERE action_type IN ('merge_candidate', 'new_entity', 'note', 'review_flag')
 ), type_check AS (
   SELECT COALESCE(string_agg(DISTINCT action_type, '|' ORDER BY action_type), '') AS value
   FROM otlet.action_status
@@ -2542,7 +2542,7 @@ SELECT concat_ws(E'\n',
 FROM schema_check, type_check, status_check, failed_check;
 ")"
 printf '%s\n' "$action_contract"
-require_contains "$action_contract" "action_schema_contract=follow_up_job|merge_candidate|new_entity|note|review_flag" "Expected built-in action schemas"
+require_contains "$action_contract" "action_schema_contract=merge_candidate|new_entity|note|review_flag" "Expected built-in action schemas"
 require_contains "$action_contract" "action_type_contract=merge_candidate|new_entity" "Expected entity-resolution merge_candidate and new_entity actions"
 require_contains "$action_contract" "action_status_contract=4|4|4|0" "Expected four trusted valid entity actions"
 require_contains "$action_contract" "failed_attempt_action_contract=0" "Expected failed/rejected attempts to create no actions"
@@ -2933,11 +2933,14 @@ cleanup_dry_run="$(psql_value "
 SELECT worker_events::text || '|' ||
        token_trace_rows::text || '|' ||
        token_alternative_rows::text || '|' ||
+       eval_labels::text || '|' ||
+       delete_stale_materializations::text || '|' ||
+       rejected_receipt_raw_outputs::text || '|' ||
        dry_run::text
 FROM otlet.cleanup_policy_state(true);
 ")"
 echo "cleanup_policy_dry_run=$cleanup_dry_run"
-require_regex "$cleanup_dry_run" '^[0-9]+\|[0-9]+\|[0-9]+\|true$' "Expected cleanup dry run counts ending in true"
+require_regex "$cleanup_dry_run" '^[0-9]+\|[0-9]+\|[0-9]+\|[0-9]+\|[0-9]+\|[0-9]+\|true$' "Expected cleanup dry run counts ending in true"
 
 runtime_contract="$(psql_value "
 SELECT runtime_status || '|' ||

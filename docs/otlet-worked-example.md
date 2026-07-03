@@ -703,13 +703,13 @@ Representative output:
 ```text
  otlet_base_tables
 -------------------
-                18
+                19
 (1 row)
 ```
 
 The base tables split into a few jobs:
 
-- `runtimes`, `models`, `model_versions`, and `runtime_slots` describe the local model runtime
+- `runtimes`, `models`, and `runtime_slots` describe the local model runtime
 - `tasks`, `model_selection_policies`, and `jobs` describe durable work and cheap-first escalation policy
 - `outputs`, `action_type_schemas`, `actions`, `records`, `inference_receipts`, and `worker_events` describe what happened
 - `production_policy` defines queue admission, leases, invalid output handling, stale-result behavior, and cleanup windows
@@ -920,12 +920,11 @@ Representative output:
    action_type   | requires_approval | creates_record
 -----------------+-------------------+----------------
  create_record   | f                 | t
- follow_up_job   | f                 | f
  merge_candidate | t                 | f
  new_entity      | f                 | f
  note            | f                 | t
  review_flag     | f                 | f
-(6 rows)
+(5 rows)
 
  rejected_action_error
 -----------------------
@@ -947,7 +946,7 @@ FROM otlet.semantic_materializations
 WHERE record_type = 'entity_hypothesis'
 ORDER BY id;
 
-SELECT otlet.refresh_semantic_materializations('entity_hypothesis') AS refreshed_materializations;
+SELECT otlet.materialize_semantic_index('demo_semantic_vendor_idx') AS refreshed_materializations;
 
 SELECT otlet.watch_semantic_stale('public.otlet_entity_vendor'::regclass, 'id') AS stale_trigger_name;
 
@@ -1497,7 +1496,7 @@ production_policy_contract=default|refresh_then_fail_closed|3|8
 production_status_contract=true|true|true|true
 model_queue_status_contract=queue_accepting|0|0
 throughput_status_contract=queue_accepting|0|0|4|4|0
-cleanup_policy_dry_run=0|0|0|true
+cleanup_policy_dry_run=0|0|0|0|0|0|true
 ```
 
 ## Know The Remaining Production Boundaries
@@ -1523,7 +1522,7 @@ WHERE schemaname = 'otlet';
 Representative output:
 
 ```text
-rls_contract=15|0
+rls_contract=19|0
 installed_policies=0
 ```
 
@@ -1543,14 +1542,14 @@ FROM (
 Representative output:
 
 ```text
-grant_contract=DELETE:34|INSERT:34|REFERENCES:34|SELECT:34|TRIGGER:34|TRUNCATE:34|UPDATE:34
+grant_contract=DELETE:44|INSERT:44|REFERENCES:44|SELECT:44|TRIGGER:44|TRUNCATE:44|UPDATE:44
 ```
 
 Your application owns these production boundaries:
 
 - create app roles that expose only the views and functions you want
 - add RLS or schema isolation if multiple tenants share the database
-- schedule `otlet.cleanup_policy_state(false)` if your deployment wants periodic worker-event and trace pruning
+- schedule `otlet.cleanup_policy_state(false)` if your deployment wants periodic worker-event, trace, stale materialization, and rejected raw-output pruning
 - expose `otlet.approve_action`, `otlet.reject_action`, `otlet.dry_run_action`, and `otlet.apply_action` only to roles that can operate actions
 - allow only the action types your application can safely interpret
 
