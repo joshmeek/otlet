@@ -86,7 +86,10 @@ CREATE FUNCTION otlet.record_runtime_slot_metrics(
   memory_accounting_policy text DEFAULT NULL,
   worker_process_rss_bytes bigint DEFAULT 0,
   worker_process_virtual_bytes bigint DEFAULT 0,
-  worker_memory_sample_policy text DEFAULT NULL
+  worker_memory_sample_policy text DEFAULT NULL,
+  inference_cache_max_entries bigint DEFAULT 0,
+  inference_cache_max_bytes bigint DEFAULT 0,
+  inference_cache_eviction_reason text DEFAULT NULL
 ) RETURNS otlet.runtime_slots
 LANGUAGE sql
 AS $$
@@ -120,7 +123,10 @@ AS $$
     inference_cache_misses,
     inference_cache_entries,
     inference_cache_bytes,
+    inference_cache_max_entries,
+    inference_cache_max_bytes,
     inference_cache_evictions,
+    inference_cache_last_eviction_reason,
     inference_cache_last_reason
   )
   VALUES (
@@ -153,7 +159,10 @@ AS $$
     CASE WHEN NOT $10 AND COALESCE($14, '') <> 'disabled' THEN 1 ELSE 0 END,
     GREATEST($11, 0),
     GREATEST($12, 0),
+    GREATEST($23, 0),
+    GREATEST($24, 0),
     GREATEST($13, 0),
+    COALESCE($25, 'none'),
     $14
   )
   ON CONFLICT (runtime_name, model_name) DO UPDATE
@@ -205,10 +214,13 @@ AS $$
           WHEN COALESCE($14, '') = 'disabled' THEN otlet.runtime_slots.inference_cache_bytes
           ELSE EXCLUDED.inference_cache_bytes
         END,
+        inference_cache_max_entries = GREATEST($23, 0),
+        inference_cache_max_bytes = GREATEST($24, 0),
         inference_cache_evictions = CASE
           WHEN COALESCE($14, '') = 'disabled' THEN otlet.runtime_slots.inference_cache_evictions
           ELSE EXCLUDED.inference_cache_evictions
         END,
+        inference_cache_last_eviction_reason = COALESCE($25, otlet.runtime_slots.inference_cache_last_eviction_reason),
         inference_cache_last_reason = COALESCE($14, otlet.runtime_slots.inference_cache_last_reason)
   RETURNING *;
 $$;

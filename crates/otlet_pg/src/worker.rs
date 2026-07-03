@@ -554,9 +554,12 @@ fn record_metrics(job: &Job, metrics: &ModelMetrics) {
                 metrics.worker_process_rss_bytes.into(),
                 metrics.worker_process_virtual_bytes.into(),
                 metrics.worker_memory_sample_policy.as_str().into(),
+                metrics.inference_cache_max_entries.into(),
+                metrics.inference_cache_max_bytes.into(),
+                metrics.inference_cache_eviction_reason.as_str().into(),
             ];
             client.update(
-                "SELECT otlet.record_runtime_slot_metrics($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22)",
+                "SELECT otlet.record_runtime_slot_metrics($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25)",
                 Some(1),
                 &args,
             )?;

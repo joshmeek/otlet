@@ -296,6 +296,7 @@ SELECT
   r.trace_summary ->> 'worker_memory_budget_policy' AS worker_memory_budget_policy,
   COALESCE(r.trace_summary ->> 'model_cache_hit', 'false')::boolean AS model_cache_hit,
   COALESCE(r.trace_summary ->> 'inference_cache_hit', 'false')::boolean AS inference_cache_hit,
+  r.trace_summary ->> 'inference_cache_key_basis' AS inference_cache_key_basis,
   CASE
     WHEN jsonb_typeof(r.trace_summary -> 'inference_cache_entries') = 'number'
       THEN (r.trace_summary ->> 'inference_cache_entries')::bigint
@@ -307,10 +308,21 @@ SELECT
     ELSE NULL
   END AS inference_cache_bytes,
   CASE
+    WHEN jsonb_typeof(r.trace_summary -> 'inference_cache_max_entries') = 'number'
+      THEN (r.trace_summary ->> 'inference_cache_max_entries')::bigint
+    ELSE NULL
+  END AS inference_cache_max_entries,
+  CASE
+    WHEN jsonb_typeof(r.trace_summary -> 'inference_cache_max_bytes') = 'number'
+      THEN (r.trace_summary ->> 'inference_cache_max_bytes')::bigint
+    ELSE NULL
+  END AS inference_cache_max_bytes,
+  CASE
     WHEN jsonb_typeof(r.trace_summary -> 'inference_cache_evictions') = 'number'
       THEN (r.trace_summary ->> 'inference_cache_evictions')::bigint
     ELSE NULL
   END AS inference_cache_evictions,
+  r.trace_summary ->> 'inference_cache_eviction_reason' AS inference_cache_eviction_reason,
   r.trace_summary ->> 'inference_cache_invalidation_reason' AS inference_cache_reason,
   r.finished_at AS receipt_finished_at
 FROM otlet.inference_receipts r

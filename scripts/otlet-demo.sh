@@ -291,13 +291,25 @@ SELECT 'direct_ask_receipt_contract=' || s.model_name || '|' || s.status || '|' 
        s.schema_validation_status || '|' || s.detailed_trace_captured_tokens::text
 FROM otlet.inference_receipt_trace_status s
 WHERE s.receipt_id = :'direct_ask_receipt_id'::bigint;
+SELECT 'direct_ask_cache_contract=' || s.inference_cache_hit::text || '|' ||
+       COALESCE(s.inference_cache_reason, '') || '|' ||
+       COALESCE(s.inference_cache_key_basis, '') || '|' ||
+       (COALESCE(s.inference_cache_max_entries, 0) > 0)::text || '|' ||
+       COALESCE(s.inference_cache_eviction_reason, '')
+FROM otlet.inference_receipt_trace_status s
+WHERE s.receipt_id = :'direct_ask_receipt_id'::bigint;
 SQL
 )"
 printf '%s\n' "$direct_ask_output"
 direct_ask_contract="$(sed -n 's/^direct_ask_contract=//p' <<<"$direct_ask_output")"
 direct_ask_receipt_contract="$(sed -n 's/^direct_ask_receipt_contract=//p' <<<"$direct_ask_output")"
+direct_ask_cache_contract="$(sed -n 's/^direct_ask_cache_contract=//p' <<<"$direct_ask_output")"
 require_regex "$direct_ask_contract" '^review_payment\|[1-9][0-9]*\|[1-9][0-9]*$' "Expected direct ask to return review_payment with job and receipt ids"
 require_regex "$direct_ask_receipt_contract" "^$strong_model_name\\|complete\\|passed\\|[1-9][0-9]*$" "Expected direct ask receipt evidence"
+[ "$direct_ask_cache_contract" = "false|disabled_for_generation_trace|content_hash_contract_hash_model_fingerprint|true|none" ] || {
+  echo "Expected direct ask trace to make cache-disabled-under-generation-trace explicit, got $direct_ask_cache_contract" >&2
+  exit 1
+}
 
 log "Running non-ER row triage watch"
 psql_exec \
@@ -467,6 +479,112 @@ echo "row_visible_update_refresh_contract=$row_visible_receipt_delta|$row_visibl
   echo "Expected visible row update to produce exactly one receipt and one fresh row, got $row_visible_receipt_delta|$row_visible_fresh_after" >&2
   exit 1
 }
+
+log "Checking content-keyed inference cache on row revert"
+psql_exec >/dev/null <<'SQL'
+UPDATE public.otlet_demo_triage_signal
+SET blockers = 2,
+    approvals = 0,
+    evidence = 'Wire instructions changed after invoice approval and the requester used urgent payment language'
+WHERE id = 'triage-1';
+SQL
+psql_exec >/dev/null <<SQL
+INSERT INTO otlet.jobs (task_name, subject_id, input)
+SELECT
+  '$row_triage_task',
+  (src.id)::text,
+  jsonb_build_object(
+    '_otlet_mvcc', jsonb_build_object(
+      'table', 'public.otlet_demo_triage_signal',
+      'subject_id', (src.id)::text,
+      'ctid', src.ctid::text,
+      'xmin', src.xmin::text
+    ),
+    'table', 'public.otlet_demo_triage_signal',
+    'row', otlet.semantic_project_row(to_jsonb(src), NULL::text[])
+  )
+FROM public.otlet_demo_triage_signal AS src
+WHERE src.id = 'triage-1';
+SELECT otlet.wake_worker();
+SQL
+wait_task_complete "$row_triage_task" 3 900 1
+row_cache_revert_contract="$(psql_value "
+SELECT inference_cache_hit::text || '|' ||
+       COALESCE(inference_cache_reason, '') || '|' ||
+       COALESCE(inference_cache_key_basis, '') || '|' ||
+       COALESCE(inference_cache_eviction_reason, '')
+FROM otlet.inference_receipt_trace_status
+WHERE task_name = '$row_triage_task'
+  AND subject_id = 'triage-1'
+  AND status = 'complete'
+ORDER BY receipt_id DESC
+LIMIT 1;
+SELECT count(*)::text
+FROM otlet.semantic_index_current_rows('$row_triage_watch', true);
+")"
+row_cache_revert_trace="$(head -n 1 <<<"$row_cache_revert_contract")"
+row_cache_revert_fresh="$(tail -n 1 <<<"$row_cache_revert_contract")"
+echo "row_cache_revert_contract=$row_cache_revert_trace|fresh=$row_cache_revert_fresh"
+[ "$row_cache_revert_trace|$row_cache_revert_fresh" = "true|hit|content_hash_contract_hash_model_fingerprint|none|1" ] || {
+  echo "Expected reverted row content to hit inference cache and remain fresh, got $row_cache_revert_trace|$row_cache_revert_fresh" >&2
+  exit 1
+}
+
+log "Checking contract-change inference cache miss"
+psql_exec >/dev/null <<SQL
+WITH current_task AS (
+  SELECT *
+  FROM otlet.tasks
+  WHERE name = '$row_triage_task'
+)
+SELECT (otlet.create_task(
+    name,
+    input_query,
+    instruction || ' Cache contract drift demo.',
+    output_schema,
+    model_name,
+    runtime_options,
+    input_shaping,
+    decision_contract
+  )).name
+FROM current_task;
+
+INSERT INTO otlet.jobs (task_name, subject_id, input)
+SELECT
+  '$row_triage_task',
+  (src.id)::text,
+  jsonb_build_object(
+    '_otlet_mvcc', jsonb_build_object(
+      'table', 'public.otlet_demo_triage_signal',
+      'subject_id', (src.id)::text,
+      'ctid', src.ctid::text,
+      'xmin', src.xmin::text
+    ),
+    'table', 'public.otlet_demo_triage_signal',
+    'row', otlet.semantic_project_row(to_jsonb(src), NULL::text[])
+  )
+FROM public.otlet_demo_triage_signal AS src
+WHERE src.id = 'triage-1';
+SELECT otlet.wake_worker();
+SQL
+wait_task_complete "$row_triage_task" 4 900 1
+row_contract_cache_contract="$(psql_value "
+SELECT inference_cache_hit::text || '|' ||
+       COALESCE(inference_cache_reason, '') || '|' ||
+       COALESCE(inference_cache_key_basis, '')
+FROM otlet.inference_receipt_trace_status
+WHERE task_name = '$row_triage_task'
+  AND subject_id = 'triage-1'
+  AND status = 'complete'
+ORDER BY receipt_id DESC
+LIMIT 1;
+")"
+echo "row_contract_cache_contract=$row_contract_cache_contract"
+[ "$row_contract_cache_contract" = "false|contract_changed|content_hash_contract_hash_model_fingerprint" ] || {
+  echo "Expected contract edit to miss inference cache with contract_changed reason, got $row_contract_cache_contract" >&2
+  exit 1
+}
+
 row_manual_reason_contract="$(psql_value "
 SELECT (otlet.mark_semantic_stale(NULL, 'triage-1', 'manual') >= 1)::text;
 SELECT (count(*) FILTER (WHERE stale AND stale_reason = 'manual') >= 1)::text
@@ -1371,6 +1489,9 @@ SELECT runtime_status || '|' ||
        slot_state || '|' ||
        COALESCE(tokens_per_second::text, '') || '|' ||
        (COALESCE(inference_cache_entries, 0) <= COALESCE(inference_cache_max_entries, 0))::text || '|' ||
+       (COALESCE(inference_cache_max_entries, 0) > 0)::text || '|' ||
+       (COALESCE(inference_cache_max_bytes, 0) > 0)::text || '|' ||
+       COALESCE(inference_cache_last_eviction_reason, '') || '|' ||
        COALESCE(worker_memory_sample_policy, '')
 FROM otlet.runtime_status
 WHERE runtime_name = '$runtime_name'
@@ -1381,6 +1502,8 @@ echo "runtime_status_contract=$runtime_contract"
 for term in \
   "ready|ready" \
   "|true|" \
+  "|true|true|" \
+  "|none|" \
   "linux_proc_self_status_vmrss_vmsize_sampled_after_worker_run"; do
   require_contains "$runtime_contract" "$term" "Expected runtime status to contain $term"
 done

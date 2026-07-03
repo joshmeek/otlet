@@ -214,7 +214,10 @@ CREATE TABLE otlet.runtime_slots (
   inference_cache_misses bigint NOT NULL DEFAULT 0,
   inference_cache_entries bigint NOT NULL DEFAULT 0,
   inference_cache_bytes bigint NOT NULL DEFAULT 0,
+  inference_cache_max_entries bigint NOT NULL DEFAULT 0,
+  inference_cache_max_bytes bigint NOT NULL DEFAULT 0,
   inference_cache_evictions bigint NOT NULL DEFAULT 0,
+  inference_cache_last_eviction_reason text,
   inference_cache_last_reason text,
   PRIMARY KEY (runtime_name, model_name)
 );

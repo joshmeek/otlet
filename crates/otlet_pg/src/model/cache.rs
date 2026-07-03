@@ -1,30 +1,46 @@
-fn inference_cache_key(job: &Job, context: &RunContext) -> String {
+fn inference_cache_key(row_key: &str, model_key: &str) -> String {
     hash_text(
         format!(
-            "task={}|subject={}|model={}|runtime={}|model_fingerprint={}|prompt={}|input={}|schema={}|options={}|content={}",
-            job.task_name,
-            job.subject_id,
-            job.model_name,
-            job.runtime_name,
-            context.model_fingerprint_hash,
-            context.prompt_hash,
-            context.input_hash,
-            context.output_schema_hash,
-            context.runtime_options_hash,
-            input_content_hash(&job.input)
+            "row={row_key}|model={model_key}",
         )
         .as_str(),
     )
 }
 
-fn inference_cache_row_key(job: &Job) -> String {
+fn inference_cache_content_key(job: &Job, context: &RunContext) -> String {
     hash_text(
         format!(
-            "task={}|subject={}|model={}|row={}",
+            "task={}|subject={}|content={}",
             job.task_name,
             job.subject_id,
-            job.model_name,
-            input_mvcc_row_identity(&job.input, &job.subject_id)
+            context.input_content_hash
+        )
+        .as_str(),
+    )
+}
+
+fn inference_cache_contract_key(context: &RunContext) -> String {
+    hash_text(
+        format!("contract={}", context.inference_cache_contract_hash).as_str(),
+    )
+}
+
+fn inference_cache_row_key(content_key: &str, contract_key: &str) -> String {
+    hash_text(
+        format!("content={content_key}|contract={contract_key}").as_str(),
+    )
+}
+
+fn inference_cache_contract_hash(job: &Job, instruction: &str) -> String {
+    hash_text(
+        format!(
+            "task={}|instruction={}|schema={}|options={}|input_shaping={}|decision_contract={}",
+            job.task_name,
+            hash_text(instruction),
+            hash_json(&job.output_schema),
+            hash_json(&job.runtime_options),
+            hash_json(&job.input_shaping),
+            hash_json(&job.decision_contract)
         )
         .as_str(),
     )
@@ -224,16 +240,30 @@ impl CacheLookup {
     }
 }
 
-#[derive(Default, Clone, Copy)]
+#[derive(Clone)]
 struct InferenceCacheStats {
     entries: i64,
     bytes: i64,
     evictions: i64,
+    eviction_reason: String,
+}
+
+impl Default for InferenceCacheStats {
+    fn default() -> Self {
+        Self {
+            entries: 0,
+            bytes: 0,
+            evictions: 0,
+            eviction_reason: "none".to_owned(),
+        }
+    }
 }
 
 struct InferenceCacheEntry {
     key: String,
     row_key: String,
+    content_key: String,
+    contract_key: String,
     model_key: String,
     raw_output: String,
     bytes: usize,
@@ -246,9 +276,16 @@ struct InferenceCache {
     hits: i64,
     misses: i64,
     evictions: i64,
+    last_eviction_reason: String,
 }
 
-fn inference_cache_get(key: &str, row_key: &str, model_key: &str) -> CacheLookup {
+fn inference_cache_get(
+    key: &str,
+    row_key: &str,
+    content_key: &str,
+    contract_key: &str,
+    model_key: &str,
+) -> CacheLookup {
     let cache = INFERENCE_CACHE.get_or_init(|| Mutex::new(InferenceCache::default()));
     let mut cache = match cache.lock() {
         Ok(cache) => cache,
@@ -277,6 +314,12 @@ fn inference_cache_get(key: &str, row_key: &str, model_key: &str) -> CacheLookup
     let reason = if cache
         .entries
         .iter()
+        .any(|entry| entry.content_key == content_key && entry.contract_key != contract_key)
+    {
+        "contract_changed"
+    } else if cache
+        .entries
+        .iter()
         .any(|entry| entry.row_key == row_key && entry.model_key != model_key)
     {
         "model_fingerprint_changed"
@@ -295,6 +338,8 @@ fn inference_cache_get(key: &str, row_key: &str, model_key: &str) -> CacheLookup
 fn inference_cache_put(
     key: String,
     row_key: String,
+    content_key: String,
+    contract_key: String,
     model_key: String,
     raw_output: String,
 ) -> InferenceCacheStats {
@@ -304,8 +349,14 @@ fn inference_cache_put(
         Err(_) => return InferenceCacheStats::default(),
     };
 
-    let bytes = key.len() + row_key.len() + model_key.len() + raw_output.len();
+    let bytes = key.len()
+        + row_key.len()
+        + content_key.len()
+        + contract_key.len()
+        + model_key.len()
+        + raw_output.len();
     if bytes > INFERENCE_CACHE_MAX_BYTES {
+        cache.last_eviction_reason = "entry_too_large".to_owned();
         return cache.stats();
     }
 
@@ -318,6 +369,8 @@ fn inference_cache_put(
     cache.entries.push(InferenceCacheEntry {
         key,
         row_key,
+        content_key,
+        contract_key,
         model_key,
         raw_output,
         bytes,
@@ -329,6 +382,12 @@ fn inference_cache_put(
         if cache.entries.is_empty() {
             break;
         }
+        cache.last_eviction_reason = if cache.entries.len() > INFERENCE_CACHE_MAX_ENTRIES {
+            "entry_count_limit"
+        } else {
+            "byte_limit"
+        }
+        .to_owned();
         let old = cache.entries.remove(0);
         cache.bytes = cache.bytes.saturating_sub(old.bytes);
         cache.evictions += 1;
@@ -343,6 +402,19 @@ impl InferenceCache {
             entries: self.entries.len() as i64,
             bytes: self.bytes as i64,
             evictions: self.evictions,
+            eviction_reason: if self.last_eviction_reason.is_empty() {
+                "none".to_owned()
+            } else {
+                self.last_eviction_reason.clone()
+            },
         }
     }
+}
+
+fn inference_cache_max_entries() -> i64 {
+    INFERENCE_CACHE_MAX_ENTRIES as i64
+}
+
+fn inference_cache_max_bytes() -> i64 {
+    INFERENCE_CACHE_MAX_BYTES as i64
 }

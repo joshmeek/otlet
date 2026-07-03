@@ -16,6 +16,8 @@ WITH per_receipt AS (
     s.executor_origin,
     s.executor_node,
     s.inference_cache_hit,
+    s.inference_cache_key_basis,
+    s.inference_cache_eviction_reason,
     s.inference_cache_reason,
     pg_column_size(r.trace_summary)::bigint AS trace_summary_bytes,
     COALESCE(jsonb_array_length(r.trace_summary #> '{detailed_trace,chosen_token_ids}'), 0)::bigint AS chosen_token_ids,
@@ -96,6 +98,8 @@ SELECT
       AND error IS NOT NULL
   )::bigint AS error_receipts,
   count(*) FILTER (WHERE inference_cache_reason IS NOT NULL)::bigint AS cache_state_receipts,
+  count(*) FILTER (WHERE inference_cache_key_basis IS NOT NULL)::bigint AS cache_key_basis_receipts,
+  count(*) FILTER (WHERE inference_cache_eviction_reason IS NOT NULL)::bigint AS cache_eviction_reason_receipts,
   count(*) FILTER (
     WHERE detailed_trace_status = 'available'
       AND inference_cache_hit = false

@@ -68,6 +68,22 @@ fn generation_trace_summary(
             Value::String(context.decision_contract_hash.clone()),
         );
         object.insert(
+            "inference_cache_key_basis".to_owned(),
+            Value::String(context.inference_cache_key_basis.clone()),
+        );
+        object.insert(
+            "inference_cache_max_entries".to_owned(),
+            Value::Number(metrics.inference_cache_max_entries.into()),
+        );
+        object.insert(
+            "inference_cache_max_bytes".to_owned(),
+            Value::Number(metrics.inference_cache_max_bytes.into()),
+        );
+        object.insert(
+            "inference_cache_eviction_reason".to_owned(),
+            Value::String(metrics.inference_cache_eviction_reason.clone()),
+        );
+        object.insert(
             "shaped_input_bytes".to_owned(),
             Value::Number(context.shaped_input_bytes.into()),
         );
