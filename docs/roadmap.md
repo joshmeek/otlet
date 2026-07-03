@@ -14,7 +14,13 @@ Otlet has three public surfaces today:
 | `scripts/otlet-demo.sh` | run the worked demo path with local inference |
 | `benchmarks/run.sh` | compare local GGUF models on Otlet-specific SQL, receipt, action, row-watch, materialization, stale, and planner contracts |
 
-Otlet keeps source rows in user tables. Users choose rows with SQL. `otlet.ask(...)` handles one-off row questions through the resident worker, while named tasks handle repeatable watches, queues, semantic refresh, and model selection. Otlet passes compact JSON to resident local models, runs cheap-first model selection when a task has a policy, drains bounded compatible queue batches, and stores derived outputs, attempts, actions, traces, receipts, eval labels, and semantic materializations under the `otlet` schema. The model harness uses a strict `output` plus `actions` envelope, stores invalid output as receipt evidence, and exposes decode mode through SQL. The benchmark lives under `benchmarks/` and reports SQL-scored evidence for Otlet behavior. Each score uses row JSON evidence and contract checks
+Otlet keeps source rows in user tables. Users choose rows with SQL. `otlet.ask(...)` handles one-off row questions through the resident worker, while named tasks handle repeatable watches, queues, semantic refresh, and model selection. Otlet passes compact JSON to resident local models, runs cheap-first model selection when a task has a policy, drains bounded compatible queue batches, and stores derived outputs, attempts, actions, traces, receipts, eval labels, and semantic materializations under the `otlet` schema. The model harness uses a strict `output` plus `actions` envelope, stores invalid output as receipt evidence, and exposes decode mode through SQL
+
+The current planner contract covers semantic lookup, fail-closed stale reads, queue refresh, wait, fresh inference, bounded CustomScan infer-now, FDW subject pushdown, cache decisions, and live EXPLAIN vocabulary. Cache keys, invalidation reasons, hit/miss counters, size bounds, runtime status, and demo checks are SQL-visible. Semantic row and join state tracks source updates, deletes, schema drift, contract changes, and candidate-set changes without silently reusing stale rows. Queue admission, fair claims, attempt bounds, cancellation, RSS budget failures, and malformed-schema failures produce clean SQL receipts and worker state
+
+Reproduce the current contract with `./scripts/otlet-demo.sh` after `./scripts/otlet-setup.sh`
+
+The benchmark lives under `benchmarks/` and reports SQL-scored evidence for Otlet behavior. Each score uses row JSON evidence and contract checks
 
 ## Priorities
 
@@ -35,12 +41,12 @@ Otlet keeps source rows in user tables. Users choose rows with SQL. `otlet.ask(.
 | --- | --- |
 | SQL proposal actions | Let models propose bounded SQL through typed, inspectable actions with dry-run, approval, receipts, and no silent user-table writes |
 | Review queue contract | Expose pending review, approval, rejection, correction, unclear state, reviewer reasons, and eval labels through SQL |
-| Watch definition contract | Define source queries, candidate queries, stale policy, output schema, action schema, and runtime policy as named SQL state |
-| Cache contract | Put cache keys, invalidation reasons, hit rates, bounds, and EXPLAIN/runtime visibility in the SQL contract |
+| Watch definition import/export | Make named source queries, candidate queries, stale policy, output schema, action schema, and runtime policy portable across installs |
+| Persisted cache storage | Add disk-backed cache only after the bounded in-process cache misses a proven workload |
 | Grammar-constrained decode | Retry grammar or JSON-schema decoding only behind a reliable linked llama hook; reject the exposed sampler path while it can abort the resident worker |
-| Semantic dependency tracking | Track freshness across source rows, joins, deletes, candidate-query changes, and schema drift |
+| Semantic dependency audit export | Export the source rows, joins, deletes, candidate-query changes, and schema-drift decisions that already drive stale/fresh state |
 | Action execution sandbox | Prove dry-run, target allowlists, idempotency, approval, replay, failure receipts, and source-table write checks |
-| Admission control and resource policy | Keep model work bounded with per-task budgets, queue fairness, cancellation, RSS policy, and fail-closed behavior |
+| Multi-worker admission policy | Extend the current queue, fairness, cancellation, RSS, and fail-closed policy when multiple workers share the same database |
 | Managed Postgres deployment | Test the extension path where allowed and the customer-VPC agent path where providers block native workers |
 | External worker protocol | Let a trusted process claim jobs, heartbeat, write receipts, actions, and results, and fail closed through SQL when native workers are unavailable |
 | Entity resolution packs | Ship MIT vendor, customer, and product packs with candidate SQL, prompts, schemas, actions, fixtures, and benchmark gates |
@@ -69,7 +75,7 @@ Benchmark follow-up objective:
 
 Use one inspectable decision vocabulary for semantic lookup, queue refresh, wait, fail-closed, fresh inference, bounded infer-now, and cache reuse. Keep SQL plan functions, semantic status views, FDW EXPLAIN, CustomScan EXPLAIN, receipts, and demo output aligned on that vocabulary
 
-Make `EXPLAIN (ANALYZE, VERBOSE)` show selected model, resident state, source identity, source hash, stale policy, cache decision, worker handoff, token counts, schema validation, trace policy, receipt IDs, provenance links, estimated model time, and model runtime
+`EXPLAIN (ANALYZE, VERBOSE)` shows selected model, resident state, source identity, source hash, stale policy, cache decision, worker handoff, token counts, schema validation, trace policy, receipt IDs, provenance links, estimated model time, and model runtime
 
 Keep cache work inside the existing runtime contract. Require cache keys, invalidation reasons, hit and miss counters, size bounds, EXPLAIN output, runtime status, and benchmark gates to agree. Add persisted cache storage after the bounded in-process cache misses a proven workload
 
@@ -85,7 +91,7 @@ Turn approval, rejection, correction, and unclear decisions into eval labels wit
 
 ## Semantic Freshness
 
-Cover more than one source row. Track the source dependencies behind row indexes, semantic joins, candidate queries, deletes, and schema changes so stale state fails closed or refreshes before lookup
+Otlet covers more than one source row. It tracks the source dependencies behind row indexes, semantic joins, candidate queries, deletes, and schema changes so stale state fails closed or refreshes before lookup
 
 For each answer, record the source rows read, trusted hash or MVCC identity, candidate set, and reason a later query reused or rejected the materialized state
 

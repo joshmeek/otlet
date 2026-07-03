@@ -30,7 +30,7 @@ A model can show `overall_fit=0.000` when it produced no trusted schema-valid ou
 
 The public ranking keeps the newest scored row per current family/size lane. Superseded rows, unscored candidates, and models with no useful Otlet signal stay out of the README ranking
 
-Current published coverage is 112 direct gold cases per model run. The harness now defines 112 deterministic pair cases plus 30 triage cases; the next published benchmark run will include the triage rows
+Current published coverage is 112 direct gold cases per model run. The harness target now includes 112 deterministic pair cases, 30 triage cases, row-watch checks, and semantic checks; rerun with `OTLET_BENCH_PUBLISH_REPORT=1` before treating triage rankings as published
 
 ## Columns And Roles
 
@@ -41,6 +41,11 @@ Current published coverage is 112 direct gold cases per model run. The harness n
 | diagnostic_fit | partial signal from rejected or invalid attempts; never trusted state |
 | resource_fit | soft score for artifact size, resident RSS, latency, and active params |
 | first_blocker | first production gate that kept a model from default readiness |
+| correct_jobs_per_second_per_gb | accepted quality times jobs/sec per resident GB |
+| overall_fit_jobs_per_second_per_gb | overall fit times jobs/sec per resident GB |
+| triage_score | non-ER triage phase score across flag, pass, abstain, and adversarial rows |
+| triage_abstention_score | triage abstention score |
+| semantic_materialization_score | row/join materialization and stale-safety score |
 | default_candidate | passed the production gate with at least 3 same-run repeats |
 | triage_candidate | useful trusted output, but not default-ready |
 | row_watch_candidate | useful for watch-style row judgment, but not default-ready |
@@ -120,7 +125,7 @@ The score covers:
 - row-watch classification
 - semantic materialization and stale-result safety
 - receipt, trace, source-hash, FDW, and CustomScan visibility
-- p95 latency, tokens/sec, resident RSS, artifact size, active params, and fit per resident GB
+- p95 latency, tokens/sec, resident RSS, artifact size, active params, correct jobs/sec per resident GB, and overall-fit jobs/sec per resident GB
 
 ## Rerun
 
@@ -156,7 +161,7 @@ models="$(awk -F '\t' 'NR > 1 && $9 == "true" {print $1}' benchmarks/models.tsv 
 OTLET_BENCH_LIMIT_MODELS="$models" OTLET_BENCH_RUNS=1 OTLET_BENCH_PUBLISH_REPORT=1 ./benchmarks/run.sh
 ```
 
-The benchmark default timeout is two hours per task phase because the current fixture loads 112 row-pair cases per model and larger local models can cross one hour before semantic refresh starts
+The benchmark default timeout is two hours per task phase because the current fixture loads 112 row-pair cases, 30 triage cases, row-watch checks, and semantic checks per model, and larger local models can cross one hour before semantic refresh starts
 
 Run manual candidates only when you have a reason to spend the time. Rows marked `candidate`, `diagnostic`, `historical`, or `heavy` are never part of the default run:
 
