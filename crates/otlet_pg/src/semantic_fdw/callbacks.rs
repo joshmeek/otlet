@@ -152,15 +152,20 @@ unsafe extern "C-unwind" fn otlet_semantic_iterate_foreign_scan(
         state.next += 1;
         state.rows_emitted += 1;
 
-        let values = std::slice::from_raw_parts_mut((*slot).tts_values, 5);
-        let nulls = std::slice::from_raw_parts_mut((*slot).tts_isnull, 5);
+        let values = std::slice::from_raw_parts_mut((*slot).tts_values, 6);
+        let nulls = std::slice::from_raw_parts_mut((*slot).tts_isnull, 6);
         nulls.fill(false);
 
         set_text(&mut values[0], &mut nulls[0], row.subject_id.as_deref());
         set_jsonb(&mut values[1], &mut nulls[1], row.body.as_ref());
         set_bool(&mut values[2], &mut nulls[2], row.stale);
         set_text(&mut values[3], &mut nulls[3], row.source_hash.as_deref());
-        set_text(&mut values[4], &mut nulls[4], row.updated_at.as_deref());
+        set_text(
+            &mut values[4],
+            &mut nulls[4],
+            row.freshness_basis.as_deref(),
+        );
+        set_text(&mut values[5], &mut nulls[5], row.updated_at.as_deref());
 
         pg_sys::ExecStoreVirtualTuple(slot)
     }

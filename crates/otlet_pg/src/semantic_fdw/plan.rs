@@ -209,6 +209,7 @@ fn load_scan_state(
                     body: Some(serde_json::from_str(&body_text).map_err(to_string)?),
                     stale: row.get_by_name("stale").map_err(to_string)?,
                     source_hash: row.get_by_name("source_hash").map_err(to_string)?,
+                    freshness_basis: row.get_by_name("freshness_basis").map_err(to_string)?,
                     updated_at: row.get_by_name("updated_at").map_err(to_string)?,
                 });
             }
@@ -241,7 +242,7 @@ fn lookup_rows_query(
 ) -> String {
     match opts.access_kind {
         SemanticAccessKind::RowIndex => format!(
-            "SELECT latest.subject_id, latest.body::text AS body, latest.stale, latest.source_hash, latest.updated_at::text AS updated_at \
+            "SELECT latest.subject_id, latest.body::text AS body, latest.stale, latest.source_hash, latest.freshness_basis, latest.updated_at::text AS updated_at \
              FROM otlet.semantic_index_current_rows({}, true) latest \
              WHERE true{} \
              ORDER BY latest.subject_id",
@@ -249,7 +250,7 @@ fn lookup_rows_query(
             subject_filter
         ),
         SemanticAccessKind::JoinIndex => format!(
-            "SELECT latest.subject_id, latest.body::text AS body, latest.stale, latest.source_hash, latest.updated_at::text AS updated_at \
+            "SELECT latest.subject_id, latest.body::text AS body, latest.stale, latest.source_hash, latest.freshness_basis, latest.updated_at::text AS updated_at \
              FROM otlet.semantic_join_index_current_rows({}, true) latest \
              WHERE true{} \
              ORDER BY latest.subject_id",

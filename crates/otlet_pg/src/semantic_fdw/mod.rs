@@ -55,6 +55,7 @@ struct SemanticFdwRow {
     body: Option<Value>,
     stale: Option<bool>,
     source_hash: Option<String>,
+    freshness_basis: Option<String>,
     updated_at: Option<String>,
 }
 

@@ -145,6 +145,7 @@ SELECT
   s.semantic_index_name,
   s.row_identity,
   s.mvcc,
+  s.freshness_basis,
   s.worker_handoff,
   s.stale_policy,
   s.stop_reason,

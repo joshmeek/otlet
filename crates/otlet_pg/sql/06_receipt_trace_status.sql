@@ -260,6 +260,7 @@ SELECT
   END AS detailed_trace_skipped_tokens,
   r.trace_summary ->> 'row_identity' AS row_identity,
   r.trace_summary -> 'mvcc' AS mvcc,
+  materialization.freshness_basis,
   r.trace_summary ->> 'worker_handoff' AS worker_handoff,
   r.trace_summary ->> 'stale_policy' AS stale_policy,
   r.trace_summary ->> 'stop_reason' AS stop_reason,
@@ -313,4 +314,13 @@ SELECT
   r.trace_summary ->> 'inference_cache_invalidation_reason' AS inference_cache_reason,
   r.finished_at AS receipt_finished_at
 FROM otlet.inference_receipts r
-LEFT JOIN otlet.outputs o ON o.receipt_id = r.id;
+LEFT JOIN otlet.outputs o ON o.receipt_id = r.id
+LEFT JOIN LATERAL (
+  SELECT sm.freshness_basis
+  FROM otlet.semantic_materializations sm
+  JOIN otlet.records rec ON rec.id = sm.record_id
+  JOIN otlet.actions a ON a.id = rec.action_id
+  WHERE a.receipt_id = r.id
+  ORDER BY sm.updated_at DESC, sm.id DESC
+  LIMIT 1
+) materialization ON true;

@@ -354,13 +354,19 @@ SELECT count(DISTINCT r.job_id) FILTER (WHERE r.status = 'complete')::text || '|
        COALESCE(max(r.output->>'decision'), '') || '|' ||
        COALESCE(max(r.output->>'confidence'), '') || '|' ||
        count(a.action_id) FILTER (WHERE a.action_type = 'review_flag')::text || '|' ||
-       count(a.action_id) FILTER (WHERE a.action_type = 'review_flag' AND a.error IS NULL)::text
+       count(a.action_id) FILTER (WHERE a.action_type = 'review_flag' AND a.error IS NULL)::text || '|' ||
+       (
+         SELECT (count(*) FILTER (WHERE s.freshness_basis = 'content_hash_match') >= 1)::text
+         FROM otlet.inference_receipt_trace_status s
+         WHERE s.task_name = '$row_triage_task'
+           AND s.accepted
+       )
 FROM otlet.runs r
 LEFT JOIN otlet.action_status a ON a.job_id = r.job_id
 WHERE r.task_name = '$row_triage_task';
 ")"
 echo "row_triage_contract=$row_triage_contract"
-[ "$row_triage_contract" = "1|flag|high|1|1" ] || {
+[ "$row_triage_contract" = "1|flag|high|1|1|true" ] || {
   echo "Expected non-ER triage task to produce one flagged output and one valid review action, got $row_triage_contract" >&2
   exit 1
 }
@@ -379,6 +385,15 @@ WHERE watch_name = '$row_triage_watch';
 echo "row_watch_status_contract=$row_watch_status_contract"
 [ "$row_watch_status_contract" = "$row_triage_watch|row|1|1|0|0|0|1" ] || {
   echo "Expected row watch status to show one fresh completed row, got $row_watch_status_contract" >&2
+  exit 1
+}
+row_lookup_basis_contract="$(psql_value "
+SELECT COALESCE(string_agg(freshness_basis, ',' ORDER BY subject_id), '')
+FROM otlet.semantic_index_current_rows('$row_triage_watch', true);
+")"
+echo "row_lookup_basis_contract=$row_lookup_basis_contract"
+[ "$row_lookup_basis_contract" = "mvcc_match" ] || {
+  echo "Expected unchanged row lookup to report mvcc_match freshness basis, got $row_lookup_basis_contract" >&2
   exit 1
 }
 
@@ -521,14 +536,17 @@ WHERE j.task_name = '$row_scoped_task';
 SELECT COALESCE(input_columns::text, '')
 FROM otlet.watch_status
 WHERE watch_name = '$row_scoped_watch';
+SELECT COALESCE(string_agg(freshness_basis, ',' ORDER BY subject_id), '')
+FROM otlet.${row_scoped_watch}_native;
 ")"
 row_scoped_fresh_after="$(head -n 1 <<<"$row_scoped_contract")"
 row_scoped_match_after="$(sed -n '2p' <<<"$row_scoped_contract")"
 row_scoped_receipts_after="$(sed -n '3p' <<<"$row_scoped_contract")"
-row_scoped_columns="$(tail -n 1 <<<"$row_scoped_contract")"
-echo "row_scoped_contract=$row_scoped_fresh_after|$row_scoped_match_after|$row_scoped_receipts_before|$row_scoped_receipts_after|$row_scoped_columns"
-[ "$row_scoped_fresh_after|$row_scoped_match_after|$row_scoped_receipts_before|$row_scoped_receipts_after|$row_scoped_columns" = "1|true|1|1|{signal}" ] || {
-  echo "Expected scoped watch to stay fresh with unchanged receipts after unrelated column change, got $row_scoped_fresh_after|$row_scoped_match_after|$row_scoped_receipts_before|$row_scoped_receipts_after|$row_scoped_columns" >&2
+row_scoped_columns="$(sed -n '4p' <<<"$row_scoped_contract")"
+row_scoped_basis="$(tail -n 1 <<<"$row_scoped_contract")"
+echo "row_scoped_contract=$row_scoped_fresh_after|$row_scoped_match_after|$row_scoped_receipts_before|$row_scoped_receipts_after|$row_scoped_columns|$row_scoped_basis"
+[ "$row_scoped_fresh_after|$row_scoped_match_after|$row_scoped_receipts_before|$row_scoped_receipts_after|$row_scoped_columns|$row_scoped_basis" = "1|true|1|1|{signal}|revalidated_after_benign_update" ] || {
+  echo "Expected scoped watch to stay fresh with unchanged receipts and revalidated basis after unrelated column change, got $row_scoped_fresh_after|$row_scoped_match_after|$row_scoped_receipts_before|$row_scoped_receipts_after|$row_scoped_columns|$row_scoped_basis" >&2
   exit 1
 }
 psql_exec >/dev/null <<'SQL'

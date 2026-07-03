@@ -39,6 +39,7 @@ BEGIN
         body jsonb,
         stale boolean,
         source_hash text,
+        freshness_basis text,
         updated_at text
       )
       SERVER otlet_semantic_server
@@ -85,6 +86,7 @@ BEGIN
         body jsonb,
         stale boolean,
         source_hash text,
+        freshness_basis text,
         updated_at text
       )
       SERVER otlet_semantic_server

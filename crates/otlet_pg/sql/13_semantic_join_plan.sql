@@ -6,6 +6,7 @@ CREATE FUNCTION otlet.semantic_join_index_current_rows(
   body jsonb,
   stale boolean,
   source_hash text,
+  freshness_basis text,
   updated_at timestamptz
 )
 LANGUAGE plpgsql
@@ -56,6 +57,7 @@ BEGIN
           sm.source_hash,
           sm.content_hash,
           sm.contract_hash,
+          sm.freshness_basis,
           sm.updated_at,
           sm.id
         FROM current_inputs ci
@@ -78,6 +80,13 @@ BEGIN
         latest.content_hash IS DISTINCT FROM otlet.semantic_content_hash(ci.input)
           OR latest.contract_hash IS DISTINCT FROM %5$L AS stale,
         latest.source_hash,
+        CASE
+          WHEN latest.content_hash IS DISTINCT FROM otlet.semantic_content_hash(ci.input)
+            OR latest.contract_hash IS DISTINCT FROM %5$L THEN NULL
+          WHEN latest.stale THEN 'revalidated_after_benign_update'
+          WHEN latest.source_hash IS NOT DISTINCT FROM md5(ci.input::text) THEN 'mvcc_match'
+          ELSE COALESCE(latest.freshness_basis, 'content_hash_match')
+        END AS freshness_basis,
         latest.updated_at
       FROM current_inputs ci
       JOIN latest ON latest.subject_id = ci.subject_id
