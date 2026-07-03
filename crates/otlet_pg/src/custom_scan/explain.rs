@@ -30,7 +30,20 @@ unsafe extern "C-unwind" fn explain_semantic_custom_scan(
                 es,
             );
             explain_text("Planner Selected Path", &runtime.planner_selected_path, es);
+            explain_text("Planner Reason", &runtime.planner_reason, es);
             explain_text("Planner Stale Reasons", &runtime.planner_stale_reasons, es);
+            explain_text("Count Basis", &runtime.planner_count_basis, es);
+            explain_text("Model Cost Source", &runtime.planner_model_cost_source, es);
+            explain_counter(
+                "Planner Infer Now Subjects",
+                runtime.planner_infer_decision_rows,
+                es,
+            );
+            explain_counter(
+                "Planner Fail Closed Subjects",
+                runtime.planner_fail_closed_decision_rows,
+                es,
+            );
             explain_text("Source Relation", &runtime.source_table, es);
             explain_text("Task", &runtime.task_name, es);
             explain_text("Record Type", &runtime.record_type, es);
@@ -40,13 +53,8 @@ unsafe extern "C-unwind" fn explain_semantic_custom_scan(
                 es,
             );
             explain_counter(
-                "Preloaded Fresh Match Subjects",
-                runtime_state_count(runtime, SubjectSemanticState::FreshMatch),
-                es,
-            );
-            explain_counter(
-                "Preloaded Fresh Non Match Subjects",
-                runtime_state_count(runtime, SubjectSemanticState::FreshNonMatch),
+                "Preloaded Fresh Subjects",
+                runtime_preloaded_fresh_count(runtime),
                 es,
             );
             explain_counter(
@@ -87,19 +95,25 @@ unsafe extern "C-unwind" fn explain_semantic_custom_scan(
                 es,
             );
             explain_text("Planner Selected Path", &private.selected_path, es);
+            explain_text("Planner Reason", &private.reason, es);
             explain_text("Planner Stale Reasons", &private.stale_reasons, es);
+            explain_text("Count Basis", &private.count_basis, es);
+            explain_text("Model Cost Source", &private.model_cost_source, es);
+            explain_counter("Planner Infer Now Subjects", private.infer_decision_rows, es);
+            explain_counter(
+                "Planner Fail Closed Subjects",
+                private.fail_closed_decision_rows,
+                es,
+            );
             explain_pg_cstr("Source Relation", (*state).source_table, es);
             explain_pg_cstr("Task", (*state).task_name, es);
             explain_pg_cstr("Record Type", (*state).record_type, es);
             explain_counter("Known Semantic Subjects", (*state).known_subjects, es);
             explain_counter(
-                "Preloaded Fresh Match Subjects",
-                (*state).preloaded_fresh_matches,
-                es,
-            );
-            explain_counter(
-                "Preloaded Fresh Non Match Subjects",
-                (*state).preloaded_fresh_non_matches,
+                "Preloaded Fresh Subjects",
+                (*state)
+                    .preloaded_fresh_matches
+                    .saturating_add((*state).preloaded_fresh_non_matches),
                 es,
             );
             explain_counter(
@@ -234,6 +248,11 @@ fn runtime_state_count(runtime: &RuntimeState, state: SubjectSemanticState) -> u
         .values()
         .filter(|value| **value == state)
         .count() as u64
+}
+
+fn runtime_preloaded_fresh_count(runtime: &RuntimeState) -> u64 {
+    runtime_state_count(runtime, SubjectSemanticState::FreshMatch)
+        .saturating_add(runtime_state_count(runtime, SubjectSemanticState::FreshNonMatch))
 }
 
 unsafe fn explain_runtime_trace(runtime: &RuntimeState, es: *mut pg_sys::ExplainState) {

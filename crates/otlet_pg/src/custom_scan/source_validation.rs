@@ -118,12 +118,14 @@ fn validate_semantic_index_source(
     infer_ms: u32,
     infer_max_rows: u32,
     auto_policy: bool,
-) -> Option<SemanticPlannerStats> {
+) -> Option<(SemanticPlannerStats, Option<Vec<String>>)> {
     let metadata_query = format!(
         "SELECT \
            si.source_table, \
+           si.task_name, \
            si.subject_column, \
            quote_nullable(si.input_columns)::text AS input_columns_sql, \
+           CASE WHEN si.input_columns IS NULL THEN NULL ELSE to_jsonb(si.input_columns)::text END AS input_columns_json, \
            si.model_name, \
            otlet.task_contract_hash(t.instruction, t.output_schema, t.model_name, t.runtime_options, t.input_shaping, t.decision_contract) AS contract_hash \
          FROM otlet.semantic_indexes si \
@@ -139,44 +141,52 @@ fn validate_semantic_index_source(
             .select(metadata_query.as_str(), Some(1), &[])
             .map_err(to_string)?;
         if metadata.is_empty() {
-            return Ok::<Option<SemanticPlannerStats>, String>(None);
+            return Ok::<Option<(SemanticPlannerStats, Option<Vec<String>>)>, String>(None);
         }
         let row = metadata.first();
         let Some(source_table) = row
             .get_by_name::<String, _>("source_table")
             .map_err(to_string)?
         else {
-            return Ok::<Option<SemanticPlannerStats>, String>(None);
+            return Ok::<Option<(SemanticPlannerStats, Option<Vec<String>>)>, String>(None);
         };
         let Some(subject_column) = row
             .get_by_name::<String, _>("subject_column")
             .map_err(to_string)?
         else {
-            return Ok::<Option<SemanticPlannerStats>, String>(None);
+            return Ok::<Option<(SemanticPlannerStats, Option<Vec<String>>)>, String>(None);
         };
         if source_table.is_empty() || subject_column.is_empty() {
-            return Ok::<Option<SemanticPlannerStats>, String>(None);
+            return Ok::<Option<(SemanticPlannerStats, Option<Vec<String>>)>, String>(None);
         }
+        let Some(task_name) = row.get_by_name::<String, _>("task_name").map_err(to_string)? else {
+            return Ok::<Option<(SemanticPlannerStats, Option<Vec<String>>)>, String>(None);
+        };
         let Some(model_name) = row
             .get_by_name::<String, _>("model_name")
             .map_err(to_string)?
         else {
-            return Ok::<Option<SemanticPlannerStats>, String>(None);
+            return Ok::<Option<(SemanticPlannerStats, Option<Vec<String>>)>, String>(None);
         };
         let input_columns_sql = row
             .get_by_name::<String, _>("input_columns_sql")
             .map_err(to_string)?
             .unwrap_or_else(|| "NULL".to_owned());
+        let input_columns = row
+            .get_by_name::<String, _>("input_columns_json")
+            .map_err(to_string)?
+            .map(|json| serde_json::from_str::<Vec<String>>(&json).map_err(to_string))
+            .transpose()?;
         let Some(contract_hash) = row
             .get_by_name::<String, _>("contract_hash")
             .map_err(to_string)?
         else {
-            return Ok::<Option<SemanticPlannerStats>, String>(None);
+            return Ok::<Option<(SemanticPlannerStats, Option<Vec<String>>)>, String>(None);
         };
         let subject_column_cstr = CString::new(subject_column.as_str()).map_err(to_string)?;
         let indexed_attno = unsafe { pg_sys::get_attnum(relid, subject_column_cstr.as_ptr()) };
         if indexed_attno != subject_attno {
-            return Ok::<Option<SemanticPlannerStats>, String>(None);
+            return Ok::<Option<(SemanticPlannerStats, Option<Vec<String>>)>, String>(None);
         }
 
         let source_rows_sql = source_rows_sql(&source_table, &subject_column, &input_columns_sql);
@@ -203,15 +213,46 @@ fn validate_semantic_index_source(
                {} \
              ), \
              runtime_model AS ( \
-               SELECT COALESCE(( \
-                 SELECT NULLIF(rs.last_generate_ms, 0)::float8 \
+               SELECT \
+                 COALESCE(task_receipt.generate_ms, slot_cost.last_generate_ms, model_receipt.generate_ms, 2500)::float8 AS model_ms, \
+                 CASE \
+                   WHEN task_receipt.generate_ms IS NOT NULL THEN 'task_receipt' \
+                   WHEN slot_cost.last_generate_ms IS NOT NULL THEN 'runtime_slot' \
+                   WHEN model_receipt.generate_ms IS NOT NULL THEN 'model_receipt' \
+                   ELSE 'static_fallback' \
+                 END AS model_cost_source \
+               FROM (SELECT 1) one \
+               LEFT JOIN LATERAL ( \
+                 SELECT r.generate_ms::float8 AS generate_ms \
+                 FROM otlet.inference_receipts r \
+                 WHERE r.task_name = {} \
+                   AND r.model_name = {} \
+                   AND r.status = 'complete' \
+                   AND r.schema_validation_status = 'passed' \
+                   AND COALESCE(r.generate_ms, 0) > 0 \
+                 ORDER BY r.finished_at DESC \
+                 LIMIT 1 \
+               ) task_receipt ON true \
+               LEFT JOIN LATERAL ( \
+                 SELECT rs.last_generate_ms::float8 AS last_generate_ms \
                  FROM otlet.runtime_slots rs \
                  JOIN otlet.models m ON m.name = {} \
                  WHERE rs.model_name = {} \
                    AND rs.runtime_name = m.runtime_name \
+                   AND COALESCE(rs.last_generate_ms, 0) > 0 \
                  ORDER BY rs.last_used_at DESC NULLS LAST \
                  LIMIT 1 \
-               ), 2500)::float8 AS model_ms \
+               ) slot_cost ON true \
+               LEFT JOIN LATERAL ( \
+                 SELECT r.generate_ms::float8 AS generate_ms \
+                 FROM otlet.inference_receipts r \
+                 WHERE r.model_name = {} \
+                   AND r.status = 'complete' \
+                   AND r.schema_validation_status = 'passed' \
+                   AND COALESCE(r.generate_ms, 0) > 0 \
+                 ORDER BY r.finished_at DESC \
+                 LIMIT 1 \
+               ) model_receipt ON true \
              ), \
              classified AS ( \
                SELECT \
@@ -243,6 +284,7 @@ fn validate_semantic_index_source(
                count(*) FILTER (WHERE state = 'in_flight')::bigint AS inflight_rows, \
                count(*) FILTER (WHERE state = 'stale' AND cache_reusable)::bigint AS cache_reusable_rows, \
                (SELECT model_ms FROM runtime_model)::float8 AS model_ms, \
+               (SELECT model_cost_source FROM runtime_model)::text AS model_cost_source, \
                COALESCE(( \
                  SELECT jsonb_object_agg(reason, reason_count ORDER BY reason)::text \
                  FROM ( \
@@ -257,6 +299,9 @@ fn validate_semantic_index_source(
             sql_literal(index_name),
             sql_literal(index_name),
             source_rows_sql,
+            sql_literal(&task_name),
+            sql_literal(&model_name),
+            sql_literal(&model_name),
             sql_literal(&model_name),
             sql_literal(&model_name),
             sql_literal(&contract_hash),
@@ -315,11 +360,16 @@ fn validate_semantic_index_source(
                 .map_err(to_string)?
                 .unwrap_or(2500.0)
                 .max(1.0),
+            model_cost_source: row
+                .get_by_name::<String, _>("model_cost_source")
+                .map_err(to_string)?
+                .unwrap_or_else(|| "static_fallback".to_string()),
             path_cost: 0.0,
             stale_reasons: row
                 .get_by_name::<String, _>("stale_reasons")
                 .map_err(to_string)?
                 .unwrap_or_else(|| "{}".to_string()),
+            count_basis: "exact".to_string(),
         };
         finish_planner_stats(
             &mut stats,
@@ -329,7 +379,10 @@ fn validate_semantic_index_source(
             infer_max_rows,
             auto_policy,
         );
-        Ok::<Option<SemanticPlannerStats>, String>(Some(stats))
+        Ok::<Option<(SemanticPlannerStats, Option<Vec<String>>)>, String>(Some((
+            stats,
+            input_columns,
+        )))
     }) {
         Ok(stats) => stats,
         Err(err) => {
@@ -366,6 +419,8 @@ fn validate_semantic_join_index_source(
            COALESCE((SELECT inflight_subjects FROM plan), 0)::bigint AS inflight_rows, \
            0::bigint AS cache_reusable_rows, \
            COALESCE((SELECT model_ms FROM plan), 2500)::float8 AS model_ms, \
+           COALESCE((SELECT model_cost_source FROM plan), 'static_fallback')::text AS model_cost_source, \
+           COALESCE((SELECT count_basis FROM plan), 'estimated')::text AS count_basis, \
            COALESCE((SELECT stale_reasons::text FROM plan), '{{}}'::text) AS stale_reasons \
          FROM current_rows",
         sql_literal(index_name),
@@ -429,11 +484,19 @@ fn validate_semantic_join_index_source(
                 .map_err(to_string)?
                 .unwrap_or(2500.0)
                 .max(1.0),
+            model_cost_source: row
+                .get_by_name::<String, _>("model_cost_source")
+                .map_err(to_string)?
+                .unwrap_or_else(|| "static_fallback".to_string()),
             path_cost: 0.0,
             stale_reasons: row
                 .get_by_name::<String, _>("stale_reasons")
                 .map_err(to_string)?
                 .unwrap_or_else(|| "{}".to_string()),
+            count_basis: row
+                .get_by_name::<String, _>("count_basis")
+                .map_err(to_string)?
+                .unwrap_or_else(|| "estimated".to_string()),
         };
         finish_planner_stats(
             &mut stats,

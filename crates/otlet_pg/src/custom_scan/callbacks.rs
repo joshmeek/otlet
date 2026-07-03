@@ -77,10 +77,16 @@ unsafe extern "C-unwind" fn begin_semantic_custom_scan(
             infer_ms: policy.infer_ms,
             infer_max_rows: policy.infer_max_rows,
             planner_selected_path: private.selected_path,
+            planner_reason: private.reason,
             planner_stale_reasons: private.stale_reasons,
+            planner_model_cost_source: private.model_cost_source,
+            planner_count_basis: private.count_basis,
+            planner_infer_decision_rows: private.infer_decision_rows,
+            planner_fail_closed_decision_rows: private.fail_closed_decision_rows,
             source_table: loaded_state.source_table,
             task_name: loaded_state.task_name,
             record_type: loaded_state.record_type,
+            input_columns: private.input_columns,
             source_reltype: if relation.is_null() {
                 pg_sys::InvalidOid
             } else {

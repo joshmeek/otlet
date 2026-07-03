@@ -5,7 +5,13 @@ struct CustomScanPrivate {
     subject_attno: i16,
     subject_typid: pg_sys::Oid,
     selected_path: String,
+    reason: String,
     stale_reasons: String,
+    model_cost_source: String,
+    count_basis: String,
+    infer_decision_rows: u64,
+    fail_closed_decision_rows: u64,
+    input_columns: Option<Vec<String>>,
 }
 
 unsafe fn custom_private_from_predicate(predicate: &SemanticMatchPredicate) -> *mut pg_sys::List {
@@ -17,7 +23,13 @@ unsafe fn custom_private_from_predicate(predicate: &SemanticMatchPredicate) -> *
             "subject_attno": predicate.subject_attno,
             "subject_typid": predicate.subject_typid.to_u32(),
             "selected_path": &predicate.planner_stats.selected_path,
-            "stale_reasons": &predicate.planner_stats.stale_reasons
+            "reason": &predicate.planner_stats.reason,
+            "stale_reasons": &predicate.planner_stats.stale_reasons,
+            "model_cost_source": &predicate.planner_stats.model_cost_source,
+            "count_basis": &predicate.planner_stats.count_basis,
+            "infer_decision_rows": predicate.planner_stats.infer_decision_rows,
+            "fail_closed_decision_rows": predicate.planner_stats.fail_closed_decision_rows,
+            "input_columns": &predicate.input_columns
         });
         let mut list = ptr::null_mut();
         list = append_string_node(list, CUSTOM_PRIVATE_MARKER);
@@ -61,11 +73,44 @@ unsafe fn custom_private_from_list(private: *mut pg_sys::List) -> Option<CustomS
             subject_attno: payload.get("subject_attno")?.as_i64()?.try_into().ok()?,
             subject_typid: pg_sys::Oid::from(payload.get("subject_typid")?.as_u64()? as u32),
             selected_path: payload.get("selected_path")?.as_str()?.to_string(),
+            reason: payload
+                .get("reason")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
             stale_reasons: payload
                 .get("stale_reasons")
                 .and_then(Value::as_str)
                 .unwrap_or("{}")
                 .to_string(),
+            model_cost_source: payload
+                .get("model_cost_source")
+                .and_then(Value::as_str)
+                .unwrap_or("static_fallback")
+                .to_string(),
+            count_basis: payload
+                .get("count_basis")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown")
+                .to_string(),
+            infer_decision_rows: payload
+                .get("infer_decision_rows")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+            fail_closed_decision_rows: payload
+                .get("fail_closed_decision_rows")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+            input_columns: payload
+                .get("input_columns")
+                .and_then(Value::as_array)
+                .map(|columns| {
+                    columns
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect()
+                }),
         })
     }
 }

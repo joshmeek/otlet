@@ -18,6 +18,8 @@ row_triage_watch="${OTLET_ROW_TRIAGE_WATCH_NAME:-row_triage_demo}"
 row_triage_task="${row_triage_watch}_task"
 row_scoped_watch="${OTLET_ROW_SCOPED_WATCH_NAME:-row_scoped_demo}"
 row_scoped_task="${row_scoped_watch}_task"
+row_customscan_watch="${OTLET_ROW_CUSTOMSCAN_WATCH_NAME:-row_customscan_demo}"
+row_customscan_task="${row_customscan_watch}_task"
 row_triage_policy_watch="${OTLET_ROW_TRIAGE_POLICY_WATCH_NAME:-row_triage_policy_demo}"
 row_triage_policy_task="${row_triage_policy_watch}_task"
 script_started="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
@@ -225,9 +227,11 @@ psql_exec \
   -v join_foreign_table="$join_foreign_table" \
   -v row_triage_watch="$row_triage_watch" \
   -v row_scoped_watch="$row_scoped_watch" \
+  -v row_customscan_watch="$row_customscan_watch" \
   -v row_triage_policy_watch="$row_triage_policy_watch" >/dev/null <<'SQL'
 SELECT otlet.drop_watch(:'row_triage_watch');
 SELECT otlet.drop_watch(:'row_scoped_watch');
+SELECT otlet.drop_watch(:'row_customscan_watch');
 SELECT otlet.drop_watch(:'row_triage_policy_watch');
 SELECT otlet.drop_watch(:'join_index_name');
 SELECT format('DROP FOREIGN TABLE IF EXISTS otlet.%I', :'join_foreign_table') \gexec
@@ -236,9 +240,11 @@ cleanup_task "row_review_demo"
 cleanup_task "entity_hypothesis_demo"
 cleanup_task "row_triage_demo"
 cleanup_task "row_scoped_demo"
+cleanup_task "row_customscan_demo"
 cleanup_task "row_triage_policy_demo"
 cleanup_task "$row_triage_task"
 cleanup_task "$row_scoped_task"
+cleanup_task "$row_customscan_task"
 cleanup_task "$row_triage_policy_task"
 cleanup_task "$entity_task"
 cleanup_task "$join_task"
@@ -430,6 +436,25 @@ echo "row_lookup_basis_contract=$row_lookup_basis_contract"
   echo "Expected unchanged row lookup to report mvcc_match freshness basis, got $row_lookup_basis_contract" >&2
   exit 1
 }
+row_fresh_customscan_plan="$(
+  psql_exec -P border=2 -P null='' <<SQL
+EXPLAIN (ANALYZE, VERBOSE, COSTS, SUMMARY OFF, TIMING OFF)
+SELECT id
+FROM public.otlet_demo_triage_signal
+WHERE otlet.semantic_matches_auto('$row_triage_watch', id, '{"decision":"flag"}'::jsonb);
+SQL
+)"
+printf '%s\n' "$row_fresh_customscan_plan"
+require_contains "$row_fresh_customscan_plan" "Otlet Node: Semantic Source CustomScan" "Expected fresh CustomScan explain details"
+require_contains "$row_fresh_customscan_plan" "Planner Selected Path: semantic_lookup" "Expected fresh CustomScan lookup path"
+require_contains "$row_fresh_customscan_plan" "Count Basis: exact" "Expected fresh CustomScan exact count basis"
+require_contains "$row_fresh_customscan_plan" "Model Cost Source:" "Expected fresh CustomScan model cost source"
+require_contains "$row_fresh_customscan_plan" "Preloaded Fresh Subjects: 1" "Expected fresh CustomScan preload count"
+require_contains "$row_fresh_customscan_plan" "Rows Returned: 1" "Expected fresh CustomScan returned row"
+require_contains "$row_fresh_customscan_plan" "Actual Fresh Subjects: 1" "Expected fresh CustomScan fresh count"
+require_contains "$row_fresh_customscan_plan" "Actual Stale Subjects: 0" "Expected fresh CustomScan stale count"
+require_contains "$row_fresh_customscan_plan" "Infer Now Batches: 0" "Expected fresh CustomScan zero infer-now"
+require_contains "$row_fresh_customscan_plan" "Infer Now Receipts: 0" "Expected fresh CustomScan zero infer-now receipts"
 
 log "Checking visible row update freshness"
 row_receipts_before_visible_update="$(psql_value "
@@ -793,16 +818,117 @@ require_contains "$row_schema_fdw_plan" "Stale Reasons:" "Expected row FDW stale
 require_contains "$row_schema_fdw_plan" "schema_drift" "Expected row FDW stale reason to include schema_drift"
 row_schema_customscan_plan="$(
   psql_exec -P border=2 -P null='' <<SQL
-EXPLAIN (VERBOSE, COSTS, SUMMARY OFF)
+EXPLAIN (ANALYZE, VERBOSE, COSTS, SUMMARY OFF, TIMING OFF)
 SELECT id
 FROM public.otlet_demo_scoped_signal
-WHERE otlet.semantic_matches_auto('$row_scoped_watch', id, '{"decision":"pass"}'::jsonb);
+WHERE otlet.semantic_matches('$row_scoped_watch', id, '{"decision":"pass"}'::jsonb);
 SQL
 )"
 printf '%s\n' "$row_schema_customscan_plan"
 require_contains "$row_schema_customscan_plan" "Otlet Node: Semantic Source CustomScan" "Expected CustomScan explain details"
+require_contains "$row_schema_customscan_plan" "Planner Selected Path: lookup_fail_closed" "Expected stale CustomScan fail-closed path"
+require_contains "$row_schema_customscan_plan" "Planner Reason: fail closed" "Expected stale CustomScan fail-closed reason"
 require_contains "$row_schema_customscan_plan" "Planner Stale Reasons:" "Expected CustomScan stale reason breakdown"
 require_contains "$row_schema_customscan_plan" "schema_drift" "Expected CustomScan stale reason to include schema_drift"
+require_contains "$row_schema_customscan_plan" "Count Basis: exact" "Expected stale CustomScan exact count basis"
+require_contains "$row_schema_customscan_plan" "Model Cost Source:" "Expected stale CustomScan model cost source"
+require_contains "$row_schema_customscan_plan" "Planner Fail Closed Subjects: 1" "Expected stale CustomScan planned fail-closed count"
+require_contains "$row_schema_customscan_plan" "Actual Fail Closed Rows: 1" "Expected stale CustomScan actual fail-closed count"
+require_contains "$row_schema_customscan_plan" "Actual Stale Subjects: 1" "Expected stale CustomScan actual stale count"
+require_contains "$row_schema_customscan_plan" "Rows Returned: 0" "Expected stale CustomScan to return no rows"
+
+log "Checking CustomScan bounded infer-now"
+psql_exec \
+  -v model_name="$strong_model_name" \
+  -v row_customscan_watch="$row_customscan_watch" >/dev/null <<'SQL'
+DROP TABLE IF EXISTS public.otlet_demo_customscan_signal;
+CREATE TABLE public.otlet_demo_customscan_signal (
+  id text PRIMARY KEY,
+  signal text NOT NULL
+);
+
+SELECT otlet.create_watch(
+  watch_name => :'row_customscan_watch',
+  kind => 'row',
+  instruction => 'Classify one CustomScan proof row. Use only input.row.signal. If signal is flag, output decision flag with confidence high. Otherwise output decision pass with confidence high. Return JSON only.',
+  output_schema => '{
+    "type": "object",
+    "required": ["decision", "confidence"],
+    "additionalProperties": false,
+    "properties": {
+      "decision": {"enum": ["pass", "flag"]},
+      "confidence": {"enum": ["low", "medium", "high"]}
+    }
+  }'::jsonb,
+  model_name => :'model_name',
+  table_name => 'public.otlet_demo_customscan_signal'::regclass,
+  subject_column => 'id',
+  record_type => 'demo_customscan_fact',
+  runtime_options => '{"max_tokens":120,"reasoning":"off","inference_cache":true}'::jsonb,
+  trigger_policy => '{"on_change":"mark_stale"}'::jsonb,
+  decision_contract => '{"answer_field":"decision","abstain_values":[],"confidence_field":"confidence","accepted_confidence":["high"]}'::jsonb,
+  input_columns => ARRAY['signal']
+);
+
+INSERT INTO public.otlet_demo_customscan_signal
+VALUES
+  ('customscan-1', 'flag'),
+  ('customscan-2', 'flag');
+
+SELECT otlet.run_task(:'row_customscan_watch' || '_task');
+SQL
+wait_task_complete "$row_customscan_task" 2 900 1
+psql_exec \
+  -v row_customscan_watch="$row_customscan_watch" >/dev/null <<'SQL'
+UPDATE public.otlet_demo_customscan_signal
+SET signal = 'pass';
+
+SELECT otlet.run_task(:'row_customscan_watch' || '_task');
+SQL
+wait_task_complete "$row_customscan_task" 4 900 1
+psql_exec >/dev/null <<'SQL'
+UPDATE public.otlet_demo_customscan_signal
+SET signal = 'flag';
+
+UPDATE otlet.production_policy
+SET stale_policy = 'lookup_only_fail_closed',
+    semantic_auto_wait_ms = 0,
+    semantic_auto_infer_ms = 30000,
+    semantic_auto_max_rows = 1
+WHERE name = 'default';
+SQL
+row_customscan_infer_plan="$(
+  psql_exec -P border=2 -P null='' <<SQL
+EXPLAIN (ANALYZE, VERBOSE, COSTS, SUMMARY OFF, TIMING OFF)
+SELECT id
+FROM public.otlet_demo_customscan_signal
+WHERE otlet.semantic_matches_auto('$row_customscan_watch', id, '{}'::jsonb);
+SQL
+)"
+psql_exec >/dev/null <<'SQL'
+UPDATE otlet.production_policy
+SET stale_policy = 'refresh_then_fail_closed',
+    semantic_auto_wait_ms = 10000,
+    semantic_auto_infer_ms = 15000,
+    semantic_auto_max_rows = 1
+WHERE name = 'default';
+SQL
+printf '%s\n' "$row_customscan_infer_plan"
+require_contains "$row_customscan_infer_plan" "Planner Selected Path: bounded_infer_now" "Expected CustomScan bounded infer-now path"
+require_contains "$row_customscan_infer_plan" "Count Basis: exact" "Expected infer CustomScan exact count basis"
+require_contains "$row_customscan_infer_plan" "Model Cost Source:" "Expected infer CustomScan model cost source"
+require_contains "$row_customscan_infer_plan" "Planner Infer Now Subjects: 1" "Expected planned infer-now count"
+require_contains "$row_customscan_infer_plan" "Planner Fail Closed Subjects: 1" "Expected planned fail-closed count"
+require_contains "$row_customscan_infer_plan" "Infer Now Max Rows: 1" "Expected bounded infer-now max rows"
+require_contains "$row_customscan_infer_plan" "Infer Now Admission Policy: bounded_shared_memory_infer_queue_4_slots" "Expected infer-now admission details"
+require_contains "$row_customscan_infer_plan" "Actual Infer Resolved Rows: 1" "Expected one stale row to resolve through bounded infer-now"
+require_contains "$row_customscan_infer_plan" "Actual Infer Returned Rows: 1" "Expected one inferred row to return"
+require_contains "$row_customscan_infer_plan" "Actual Fail Closed Rows: 1" "Expected one stale row to fail closed after bounded infer-now"
+require_contains "$row_customscan_infer_plan" "Actual Stale Subjects: 2" "Expected two stale source rows"
+require_contains "$row_customscan_infer_plan" "Infer Now Batches: 1" "Expected one infer-now batch"
+require_contains "$row_customscan_infer_plan" "Infer Now Receipts: 1" "Expected one infer-now receipt"
+require_contains "$row_customscan_infer_plan" "Infer Now Trace Receipt Id:" "Expected infer-now receipt pointer"
+require_contains "$row_customscan_infer_plan" "Rows Returned: 1" "Expected one inferred row returned after bounded infer-now"
 
 queue_suppression_output="$(psql_value "
 BEGIN;
@@ -1418,6 +1544,30 @@ echo "semantic_join_match_contract=$join_match_contract"
   echo "Expected semantic join matches, got $join_match_contract" >&2
   exit 1
 }
+join_customscan_plan="$(
+  psql_exec -P border=2 -P null='' <<SQL
+EXPLAIN (ANALYZE, VERBOSE, COSTS, SUMMARY OFF, TIMING OFF)
+SELECT subject_id
+FROM (
+  SELECT subject_id
+  FROM public.otlet_demo_vendor_pair_input
+  OFFSET 0
+) pair_subjects
+WHERE otlet.semantic_join_matches_auto('$join_index_name', subject_id, '{"match":"same_entity"}'::jsonb);
+SQL
+)"
+printf '%s\n' "$join_customscan_plan"
+require_contains "$join_customscan_plan" "Otlet Node: Semantic Source CustomScan" "Expected join CustomScan explain details"
+require_contains "$join_customscan_plan" "Semantic Index Kind: join" "Expected join CustomScan index kind"
+require_contains "$join_customscan_plan" "Planner Selected Path: semantic_join_lookup" "Expected join CustomScan lookup path"
+require_contains "$join_customscan_plan" "Count Basis: estimated" "Expected join CustomScan estimated count basis"
+require_contains "$join_customscan_plan" "Model Cost Source:" "Expected join CustomScan model cost source"
+require_contains "$join_customscan_plan" "Preloaded Fresh Subjects: 4" "Expected join CustomScan preload count"
+require_contains "$join_customscan_plan" "Actual Fresh Subjects: 4" "Expected join CustomScan fresh count"
+require_contains "$join_customscan_plan" "Actual Stale Subjects: 0" "Expected join CustomScan stale count"
+require_contains "$join_customscan_plan" "Actual Lookup Rows: 4" "Expected join CustomScan lookup rows"
+require_contains "$join_customscan_plan" "Infer Now Batches: 0" "Expected join CustomScan zero infer-now"
+require_contains "$join_customscan_plan" "Child Plan Source Rows: 4" "Expected join CustomScan child rows"
 
 psql_exec \
   -v foreign_table="$join_foreign_table" \

@@ -76,10 +76,16 @@ struct RuntimeState {
     infer_ms: u32,
     infer_max_rows: u32,
     planner_selected_path: String,
+    planner_reason: String,
     planner_stale_reasons: String,
+    planner_model_cost_source: String,
+    planner_count_basis: String,
+    planner_infer_decision_rows: u64,
+    planner_fail_closed_decision_rows: u64,
     source_table: String,
     task_name: String,
     record_type: String,
+    input_columns: Option<Vec<String>>,
     source_reltype: pg_sys::Oid,
     subject_attno: i16,
     subject_typid: pg_sys::Oid,
@@ -195,6 +201,7 @@ struct SemanticMatchPredicate {
     subject_typid: pg_sys::Oid,
     restrict_info: *mut pg_sys::RestrictInfo,
     estimated_rows: f64,
+    input_columns: Option<Vec<String>>,
     planner_stats: SemanticPlannerStats,
 }
 
@@ -215,6 +222,8 @@ struct SemanticPlannerStats {
     queue_decision_rows: u64,
     fail_closed_decision_rows: u64,
     model_ms: f64,
+    model_cost_source: String,
     path_cost: f64,
     stale_reasons: String,
+    count_basis: String,
 }
