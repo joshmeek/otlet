@@ -288,11 +288,17 @@ WITH queue AS (
 receipts AS (
   SELECT
     count(*)::bigint AS receipt_count,
+    count(*) FILTER (WHERE status IN ('complete', 'failed'))::bigint AS model_invocations,
+    COALESCE(sum(COALESCE(prompt_tokens, 0) + COALESCE(generated_tokens, 0)) FILTER (WHERE status IN ('complete', 'failed')), 0)::bigint AS model_processed_tokens,
     count(*) FILTER (WHERE status = 'failed')::bigint AS failed_receipts,
     count(*) FILTER (WHERE schema_validation_status = 'passed')::bigint AS schema_passed_receipts,
     count(*) FILTER (WHERE schema_validation_status = 'failed')::bigint AS schema_failed_receipts,
     count(*) FILTER (WHERE schema_validation_status IS DISTINCT FROM 'passed' AND status = 'complete')::bigint AS complete_without_schema_pass
   FROM otlet.inference_receipts
+),
+trusted_output_rows AS (
+  SELECT count(*)::bigint AS trusted_output_rows
+  FROM otlet.outputs
 ),
 semantic_state AS (
   SELECT
@@ -336,6 +342,17 @@ SELECT
   q.failed_jobs,
   q.canceled_jobs,
   r.receipt_count,
+  r.model_invocations,
+  trusted.trusted_output_rows,
+  CASE
+    WHEN trusted.trusted_output_rows > 0 THEN r.model_invocations::numeric / trusted.trusted_output_rows::numeric
+    ELSE 0::numeric
+  END AS model_invocations_per_trusted_row,
+  r.model_processed_tokens,
+  CASE
+    WHEN trusted.trusted_output_rows > 0 THEN r.model_processed_tokens::numeric / trusted.trusted_output_rows::numeric
+    ELSE 0::numeric
+  END AS model_processed_tokens_per_trusted_row,
   r.failed_receipts,
   r.schema_passed_receipts,
   r.schema_failed_receipts,
@@ -362,6 +379,7 @@ SELECT
 FROM otlet.production_policy p
 CROSS JOIN queue q
 CROSS JOIN receipts r
+CROSS JOIN trusted_output_rows trusted
 CROSS JOIN semantic_state s
 CROSS JOIN runtime
 CROSS JOIN trace;

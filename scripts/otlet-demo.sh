@@ -2638,5 +2638,16 @@ echo "planner_1m_contract=$planner_1m_contract"
   exit 1
 }
 
+performance_ratio_contract="$(psql_value "
+SELECT trusted_output_rows::text || '|' ||
+       model_invocations::text || '|' ||
+       round(model_invocations_per_trusted_row, 3)::text || '|' ||
+       model_processed_tokens::text || '|' ||
+       round(model_processed_tokens_per_trusted_row, 3)::text
+FROM otlet.production_status;
+")"
+echo "performance_ratio_contract=$performance_ratio_contract"
+require_regex "$performance_ratio_contract" '^[1-9][0-9]*\|[1-9][0-9]*\|[0-9]+(\.[0-9]+)?\|[1-9][0-9]*\|[0-9]+(\.[0-9]+)?$' "Expected production_status to expose positive model-work ratios"
+
 crash_scan
 log "Otlet demo passed"
