@@ -99,6 +99,18 @@ impl ModelError {
         err
     }
 
+    fn clean_failure(message: String, schema_force: &str, stop_reason: &str) -> Self {
+        let mut err = Self::new(message);
+        err.schema_validation_status = Some("failed".to_owned());
+        err.trace_summary = Some(json!({
+            "trace_version": "otlet_generation_trace_v1",
+            "schema_validation_status": "failed",
+            "schema_force": schema_force,
+            "stop_reason": stop_reason
+        }));
+        err
+    }
+
     fn with_context(
         message: String,
         raw_output: String,
@@ -178,7 +190,13 @@ struct PromptParts {
 
 pub(crate) fn run_job(job: &Job) -> Result<ModelRun, ModelError> {
     let options = parse_runtime_options(&job.runtime_options).map_err(ModelError::new)?;
-    validate_output_schema(&job.output_schema).map_err(ModelError::new)?;
+    validate_output_schema(&job.output_schema).map_err(|err| {
+        ModelError::clean_failure(
+            err,
+            "invalid_output_schema_before_generation",
+            "invalid_output_schema",
+        )
+    })?;
     let shaped_input = shape_model_input(&job.input, &job.input_shaping);
     let instruction = effective_instruction(&job.instruction, &job.decision_contract);
     let rendered_schema = render_output_schema(&job.output_schema, &options.schema_prompt);

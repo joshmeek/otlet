@@ -136,18 +136,26 @@ fn enforce_worker_rss_budget(
         return Ok(());
     }
     if sample.rss_bytes <= 0 {
-        return Err(ModelError::new(format!(
-            "linked worker RSS budget could not be enforced: rss sample unavailable policy={} max_worker_rss_bytes={}",
-            sample.policy, max_worker_rss_bytes
-        )));
+        return Err(ModelError::clean_failure(
+            format!(
+                "linked worker RSS budget could not be enforced: rss sample unavailable policy={} max_worker_rss_bytes={}",
+                sample.policy, max_worker_rss_bytes
+            ),
+            "worker_rss_budget_before_generation",
+            "worker_rss_sample_unavailable",
+        ));
     }
     if sample.rss_bytes as u64 > max_worker_rss_bytes {
-        return Err(ModelError::new(format!(
-            "linked worker RSS budget exceeded: rss_bytes={} max_worker_rss_bytes={} policy={}",
-            sample.rss_bytes,
-            max_worker_rss_bytes,
-            worker_memory_budget_policy(max_worker_rss_bytes)
-        )));
+        return Err(ModelError::clean_failure(
+            format!(
+                "linked worker RSS budget exceeded: rss_bytes={} max_worker_rss_bytes={} policy={}",
+                sample.rss_bytes,
+                max_worker_rss_bytes,
+                worker_memory_budget_policy(max_worker_rss_bytes)
+            ),
+            "worker_rss_budget_before_generation",
+            "worker_rss_budget_exceeded",
+        ));
     }
     Ok(())
 }

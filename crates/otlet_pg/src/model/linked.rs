@@ -808,21 +808,31 @@ fn validate_linked_token_budget(
     context_window_tokens: i64,
 ) -> Result<(), ModelError> {
     let Ok(context_window_tokens) = usize::try_from(context_window_tokens) else {
-        return Err(ModelError::new(
+        return Err(ModelError::clean_failure(
             "linked llama.cpp context window is invalid".to_owned(),
+            "prompt_token_budget_before_generation",
+            "invalid_context_window",
         ));
     };
     if prompt_tokens >= context_window_tokens {
-        return Err(ModelError::new(format!(
-            "linked llama.cpp prompt has {prompt_tokens} tokens, exceeds context window {context_window_tokens}"
-        )));
+        return Err(ModelError::clean_failure(
+            format!(
+                "linked llama.cpp prompt has {prompt_tokens} tokens, exceeds context window {context_window_tokens}"
+            ),
+            "prompt_token_budget_before_generation",
+            "prompt_exceeds_context_window",
+        ));
     }
 
     let max_tokens = usize::try_from(max_tokens).unwrap_or(usize::MAX);
     if prompt_tokens.saturating_add(max_tokens) > context_window_tokens {
-        return Err(ModelError::new(format!(
-            "linked llama.cpp prompt has {prompt_tokens} tokens plus max_tokens {max_tokens}, exceeds context window {context_window_tokens}"
-        )));
+        return Err(ModelError::clean_failure(
+            format!(
+                "linked llama.cpp prompt has {prompt_tokens} tokens plus max_tokens {max_tokens}, exceeds context window {context_window_tokens}"
+            ),
+            "prompt_token_budget_before_generation",
+            "prompt_and_generation_exceed_context_window",
+        ));
     }
 
     Ok(())
@@ -988,7 +998,11 @@ fn tokenize_linked(
     let text = std::ffi::CString::new(text)
         .map_err(|_| ModelError::new("linked llama.cpp prompt contains null byte".to_owned()))?;
     let text_len = i32::try_from(text.as_bytes().len()).map_err(|_| {
-        ModelError::new("linked llama.cpp prompt is too large to tokenize".to_owned())
+        ModelError::clean_failure(
+            "linked llama.cpp prompt is too large to tokenize".to_owned(),
+            "prompt_token_budget_before_generation",
+            "prompt_exceeds_context_window",
+        )
     })?;
     let size = unsafe {
         llama_cpp_sys_4::llama_tokenize(
@@ -1006,9 +1020,13 @@ fn tokenize_linked(
         return Ok(Vec::new());
     }
     if capacity as u32 > LINKED_CONTEXT_WINDOW_TOKENS {
-        return Err(ModelError::new(format!(
-            "linked llama.cpp prompt has at least {capacity} tokens, exceeds context window {LINKED_CONTEXT_WINDOW_TOKENS}"
-        )));
+        return Err(ModelError::clean_failure(
+            format!(
+                "linked llama.cpp prompt has at least {capacity} tokens, exceeds context window {LINKED_CONTEXT_WINDOW_TOKENS}"
+            ),
+            "prompt_token_budget_before_generation",
+            "prompt_exceeds_context_window",
+        ));
     }
 
     let mut tokens = vec![0; capacity as usize];

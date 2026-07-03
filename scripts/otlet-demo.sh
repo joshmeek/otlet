@@ -188,6 +188,36 @@ SQL
   return 1
 }
 
+wait_task_failed() {
+  local task="$1"
+  local expected_failed="${2:-1}"
+  local attempts="${3:-300}"
+  local delay="${4:-1}"
+  local active complete failed
+
+  for _ in $(seq 1 "$attempts"); do
+    active="$(psql_value "SELECT count(*) FROM otlet.jobs WHERE task_name = '$task' AND status IN ('queued','running','cancel_requested');")"
+    complete="$(psql_value "SELECT count(*) FROM otlet.jobs WHERE task_name = '$task' AND status = 'complete';")"
+    failed="$(psql_value "SELECT count(*) FROM otlet.jobs WHERE task_name = '$task' AND status IN ('failed','canceled');")"
+    if [ "$failed" -ge "$expected_failed" ] && [ "$active" = "0" ]; then
+      return 0
+    fi
+    if [ "$complete" != "0" ]; then
+      psql_exec -P border=2 -P null='' -v task_name="$task" <<'SQL'
+SELECT job_id, task_name, subject_id, status, error, raw_output
+FROM otlet.runs
+WHERE task_name = :'task_name'
+ORDER BY job_id;
+SQL
+      return 1
+    fi
+    sleep "$delay"
+  done
+
+  echo "Timed out waiting for task $task failed=$failed active=$active expected=$expected_failed" >&2
+  return 1
+}
+
 crash_scan() {
   if docker logs --since "$script_started" "$container" 2>&1 | grep -Eiq 'segmentation|sigsegv|signal 11|core dump|panicked|assertion failed|server process .* was terminated'; then
     docker logs --since "$script_started" "$container" >&2
@@ -544,6 +574,234 @@ WHERE name = 'default';
 SQL
 [ "$attempt_timeout_contract" = "failed|attempt_timeout|attempt_timeout|failed|ready|ready" ] || {
   echo "Expected attempt timeout to fail cleanly with healthy worker, got $attempt_timeout_contract" >&2
+  exit 1
+}
+
+malformed_schema_task="malformed_schema_worker_demo"
+cleanup_task "$malformed_schema_task"
+psql_exec -v task_name="$malformed_schema_task" -v model_name="$strong_model_name" >/dev/null <<'SQL'
+SELECT otlet.create_task(
+  :'task_name',
+  $source$
+    SELECT 'malformed-schema-1'::text AS subject_id, '{}'::jsonb AS input
+  $source$::text,
+  'Return JSON only.',
+  '{"type":"not_a_valid_json_schema_type"}'::jsonb,
+  :'model_name',
+  '{"max_tokens":16,"reasoning":"off","inference_cache":false}'::jsonb
+);
+SELECT otlet.run_task(:'task_name');
+SQL
+wait_task_failed "$malformed_schema_task" 1 120 1
+malformed_schema_contract="$(psql_value "
+WITH job_row AS (
+  SELECT id, status, error
+  FROM otlet.jobs
+  WHERE task_name = '$malformed_schema_task'
+  ORDER BY id DESC
+  LIMIT 1
+),
+receipt_row AS (
+  SELECT status, selection_status, selection_reason, schema_validation_status, trace_summary
+  FROM otlet.inference_receipts
+  WHERE job_id = (SELECT id FROM job_row)
+  ORDER BY id DESC
+  LIMIT 1
+)
+SELECT j.status || '|' ||
+       (j.error LIKE 'invalid output schema:%')::text || '|' ||
+       r.status || '|' ||
+       r.selection_status || '|' ||
+       r.selection_reason || '|' ||
+       r.schema_validation_status || '|' ||
+       COALESCE(r.trace_summary ->> 'stop_reason', '') || '|' ||
+       (SELECT count(*) FROM otlet.outputs WHERE job_id = j.id)::text || '|' ||
+       COALESCE(rs.runtime_status, '') || '|' ||
+       COALESCE(rs.slot_state, '')
+FROM job_row j
+CROSS JOIN receipt_row r
+JOIN otlet.runtime_status rs
+  ON rs.runtime_name = '$runtime_name'
+ AND rs.model_name = '$strong_model_name';
+")"
+echo "malformed_schema_worker_contract=$malformed_schema_contract"
+[ "$malformed_schema_contract" = "failed|true|failed|failed|direct_attempt_failed|failed|invalid_output_schema|0|ready|ready" ] || {
+  echo "Expected malformed schema to produce a clean failed receipt and healthy worker, got $malformed_schema_contract" >&2
+  exit 1
+}
+
+rss_budget_task="rss_budget_worker_demo"
+cleanup_task "$rss_budget_task"
+psql_exec -v task_name="$rss_budget_task" -v model_name="$strong_model_name" >/dev/null <<'SQL'
+SELECT otlet.create_task(
+  :'task_name',
+  $source$
+    SELECT 'rss-budget-1'::text AS subject_id, '{}'::jsonb AS input
+  $source$::text,
+  'Return JSON only: {"output":{"status":"ok"},"actions":[]}',
+  '{"type":"object","required":["status"],"additionalProperties":false,"properties":{"status":{"enum":["ok"]}}}'::jsonb,
+  :'model_name',
+  '{"max_tokens":16,"reasoning":"off","inference_cache":false,"max_worker_rss_bytes":1}'::jsonb
+);
+SELECT otlet.run_task(:'task_name');
+SQL
+wait_task_failed "$rss_budget_task" 1 240 1
+rss_budget_contract="$(psql_value "
+WITH job_row AS (
+  SELECT id, status, error
+  FROM otlet.jobs
+  WHERE task_name = '$rss_budget_task'
+  ORDER BY id DESC
+  LIMIT 1
+),
+receipt_row AS (
+  SELECT status, selection_status, selection_reason, schema_validation_status, trace_summary
+  FROM otlet.inference_receipts
+  WHERE job_id = (SELECT id FROM job_row)
+  ORDER BY id DESC
+  LIMIT 1
+)
+SELECT j.status || '|' ||
+       (j.error LIKE 'linked worker RSS budget%')::text || '|' ||
+       r.status || '|' ||
+       r.selection_status || '|' ||
+       r.selection_reason || '|' ||
+       r.schema_validation_status || '|' ||
+       COALESCE(r.trace_summary ->> 'stop_reason', '') || '|' ||
+       (SELECT count(*) FROM otlet.outputs WHERE job_id = j.id)::text || '|' ||
+       COALESCE(rs.runtime_status, '') || '|' ||
+       COALESCE(rs.slot_state, '')
+FROM job_row j
+CROSS JOIN receipt_row r
+JOIN otlet.runtime_status rs
+  ON rs.runtime_name = '$runtime_name'
+ AND rs.model_name = '$strong_model_name';
+")"
+echo "rss_budget_worker_contract=$rss_budget_contract"
+[ "$rss_budget_contract" = "failed|true|failed|failed|direct_attempt_failed|failed|worker_rss_budget_exceeded|0|ready|ready" ] || {
+  echo "Expected RSS budget hit to produce a clean failed receipt and healthy worker, got $rss_budget_contract" >&2
+  exit 1
+}
+
+oversized_prompt_task="oversized_prompt_worker_demo"
+cleanup_task "$oversized_prompt_task"
+psql_exec -v task_name="$oversized_prompt_task" -v model_name="$strong_model_name" >/dev/null <<'SQL'
+SELECT otlet.create_task(
+  :'task_name',
+  $source$
+    SELECT 'oversized-prompt-1'::text AS subject_id,
+           jsonb_build_object('payload', repeat('oversized prompt ', 50000)) AS input
+  $source$::text,
+  'Return JSON only: {"output":{"status":"ok"},"actions":[]}',
+  '{"type":"object","required":["status"],"additionalProperties":false,"properties":{"status":{"enum":["ok"]}}}'::jsonb,
+  :'model_name',
+  '{"max_tokens":4096,"reasoning":"off","inference_cache":false}'::jsonb
+);
+SELECT otlet.run_task(:'task_name');
+SQL
+wait_task_failed "$oversized_prompt_task" 1 300 1
+oversized_prompt_contract="$(psql_value "
+WITH job_row AS (
+  SELECT id, status, error
+  FROM otlet.jobs
+  WHERE task_name = '$oversized_prompt_task'
+  ORDER BY id DESC
+  LIMIT 1
+),
+receipt_row AS (
+  SELECT status, selection_status, selection_reason, schema_validation_status, trace_summary
+  FROM otlet.inference_receipts
+  WHERE job_id = (SELECT id FROM job_row)
+  ORDER BY id DESC
+  LIMIT 1
+)
+SELECT j.status || '|' ||
+       (j.error LIKE 'linked llama.cpp prompt has%exceeds context window%')::text || '|' ||
+       r.status || '|' ||
+       r.selection_status || '|' ||
+       r.selection_reason || '|' ||
+       r.schema_validation_status || '|' ||
+       COALESCE(r.trace_summary ->> 'stop_reason', '') || '|' ||
+       (SELECT count(*) FROM otlet.outputs WHERE job_id = j.id)::text || '|' ||
+       COALESCE(rs.runtime_status, '') || '|' ||
+       COALESCE(rs.slot_state, '')
+FROM job_row j
+CROSS JOIN receipt_row r
+JOIN otlet.runtime_status rs
+  ON rs.runtime_name = '$runtime_name'
+ AND rs.model_name = '$strong_model_name';
+")"
+echo "oversized_prompt_worker_contract=$oversized_prompt_contract"
+require_regex "$oversized_prompt_contract" '^failed\|true\|failed\|failed\|direct_attempt_failed\|failed\|prompt(_and_generation)?_exceed(s_context_window|_context_window)\|0\|ready\|ready$' "Expected oversized prompt to produce a clean failed receipt and healthy worker"
+
+cancel_decode_task="cancel_decode_worker_demo"
+cleanup_task "$cancel_decode_task"
+psql_exec -v task_name="$cancel_decode_task" -v model_name="$strong_model_name" >/dev/null <<'SQL'
+SELECT otlet.create_task(
+  :'task_name',
+  $source$
+    SELECT 'cancel-decode-1'::text AS subject_id,
+           jsonb_build_object('payload', repeat('cancel decode ', 1000)) AS input
+  $source$::text,
+  'Return JSON only: {"output":{"status":"ok"},"actions":[]}',
+  '{"type":"object","required":["status"],"additionalProperties":false,"properties":{"status":{"enum":["ok"]}}}'::jsonb,
+  :'model_name',
+  '{"max_tokens":512,"reasoning":"off","inference_cache":false}'::jsonb
+);
+SELECT otlet.run_task(:'task_name');
+SQL
+cancel_decode_job_id=""
+for _ in $(seq 1 300); do
+  cancel_decode_job_id="$(psql_value "SELECT id FROM otlet.jobs WHERE task_name = '$cancel_decode_task' AND status = 'running' ORDER BY id DESC LIMIT 1;")"
+  if [ -n "$cancel_decode_job_id" ]; then
+    psql_value "SELECT count(*) FROM otlet.cancel_job($cancel_decode_job_id, 'demo cancel mid-decode');" >/dev/null
+    break
+  fi
+  cancel_decode_terminal="$(psql_value "SELECT COALESCE(max(status), '') FROM otlet.jobs WHERE task_name = '$cancel_decode_task' AND status IN ('complete','failed','canceled');")"
+  if [ -n "$cancel_decode_terminal" ]; then
+    echo "Expected cancel smoke to reach running state before terminal status, got $cancel_decode_terminal" >&2
+    exit 1
+  fi
+  sleep 0.2
+done
+[ -n "$cancel_decode_job_id" ] || {
+  echo "Timed out waiting for cancel smoke job to run" >&2
+  exit 1
+}
+wait_task_failed "$cancel_decode_task" 1 240 1
+cancel_decode_contract="$(psql_value "
+WITH job_row AS (
+  SELECT id, status, error
+  FROM otlet.jobs
+  WHERE task_name = '$cancel_decode_task'
+  ORDER BY id DESC
+  LIMIT 1
+),
+receipt_row AS (
+  SELECT status, selection_status, selection_reason, schema_validation_status
+  FROM otlet.inference_receipts
+  WHERE job_id = (SELECT id FROM job_row)
+  ORDER BY id DESC
+  LIMIT 1
+)
+SELECT j.status || '|' ||
+       (j.error = 'demo cancel mid-decode')::text || '|' ||
+       r.status || '|' ||
+       r.selection_status || '|' ||
+       r.selection_reason || '|' ||
+       COALESCE(r.schema_validation_status, '') || '|' ||
+       (SELECT count(*) FROM otlet.outputs WHERE job_id = j.id)::text || '|' ||
+       COALESCE(rs.runtime_status, '') || '|' ||
+       COALESCE(rs.slot_state, '')
+FROM job_row j
+CROSS JOIN receipt_row r
+JOIN otlet.runtime_status rs
+  ON rs.runtime_name = '$runtime_name'
+ AND rs.model_name = '$strong_model_name';
+")"
+echo "cancel_decode_worker_contract=$cancel_decode_contract"
+[ "$cancel_decode_contract" = "canceled|true|canceled|failed|canceled||0|ready|ready" ] || {
+  echo "Expected mid-decode cancel to produce a clean canceled receipt and healthy worker, got $cancel_decode_contract" >&2
   exit 1
 }
 
