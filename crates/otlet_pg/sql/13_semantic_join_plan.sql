@@ -153,7 +153,8 @@ CREATE FUNCTION otlet.semantic_plan_from_counts(
   p_total_subjects bigint,
   p_fresh_subjects bigint,
   p_stale_subjects bigint,
-  p_missing_subjects bigint
+  p_missing_subjects bigint,
+  p_stale_reasons jsonb DEFAULT '{}'::jsonb
 ) RETURNS TABLE (
   selected_path text,
   reason text,
@@ -184,6 +185,7 @@ CREATE FUNCTION otlet.semantic_plan_from_counts(
   path_cost numeric,
   worker_queue_depth bigint,
   available_queue_slots bigint,
+  stale_reasons jsonb,
   checked_at timestamptz
 )
 LANGUAGE plpgsql
@@ -209,6 +211,7 @@ DECLARE
   v_selected_path text;
   v_reason text;
   v_runtime_name text := 'linked_inproc';
+  v_stale_reasons jsonb := COALESCE(p_stale_reasons, '{}'::jsonb);
 BEGIN
   v_refresh_subjects := v_stale_subjects + v_missing_subjects;
 
@@ -339,6 +342,7 @@ BEGIN
     v_path_cost,
     COALESCE(v_worker_queue_depth, 0),
     COALESCE(v_available_queue_slots, 0),
+    v_stale_reasons,
     clock_timestamp();
 END;
 $$;
@@ -375,6 +379,7 @@ CREATE FUNCTION otlet.semantic_join_index_plan(
   path_cost numeric,
   worker_queue_depth bigint,
   available_queue_slots bigint,
+  stale_reasons jsonb,
   checked_at timestamptz
 )
 LANGUAGE plpgsql
@@ -385,6 +390,7 @@ DECLARE
   v_fresh_subjects bigint := 0;
   v_stale_subjects bigint := 0;
   v_missing_subjects bigint := 0;
+  v_stale_reasons jsonb := '{}'::jsonb;
   current_contract_hash text;
 BEGIN
   SELECT *
@@ -426,6 +432,7 @@ BEGIN
           sm.source_hash,
           sm.content_hash,
           sm.contract_hash,
+          sm.stale_reason,
           sm.updated_at,
           sm.id
         FROM current_inputs ci
@@ -447,7 +454,8 @@ BEGIN
           ci.subject_id,
           l.subject_id IS NOT NULL AS has_materialization,
           l.content_hash IS NOT DISTINCT FROM otlet.semantic_content_hash(ci.input)
-            AND l.contract_hash IS NOT DISTINCT FROM %5$L AS source_fresh
+            AND l.contract_hash IS NOT DISTINCT FROM %5$L AS source_fresh,
+          COALESCE(l.stale_reason, 'content_revalidation_pending') AS stale_reason
         FROM current_inputs ci
         LEFT JOIN latest l USING (subject_id)
       )
@@ -455,7 +463,19 @@ BEGIN
         count(*)::bigint,
         count(*) FILTER (WHERE has_materialization AND source_fresh)::bigint,
         count(*) FILTER (WHERE has_materialization AND NOT source_fresh)::bigint,
-        count(*) FILTER (WHERE NOT has_materialization)::bigint
+        count(*) FILTER (WHERE NOT has_materialization)::bigint,
+        COALESCE(
+          (
+            SELECT jsonb_object_agg(reason, reason_count ORDER BY reason)
+            FROM (
+              SELECT stale_reason AS reason, count(*) AS reason_count
+              FROM classified
+              WHERE has_materialization AND NOT source_fresh
+              GROUP BY stale_reason
+            ) reasons
+          ),
+          '{}'::jsonb
+        )
       FROM classified
     $sql$,
     index_row.candidate_query,
@@ -464,7 +484,7 @@ BEGIN
     index_row.record_type,
     current_contract_hash
   )
-  INTO v_total_subjects, v_fresh_subjects, v_stale_subjects, v_missing_subjects;
+  INTO v_total_subjects, v_fresh_subjects, v_stale_subjects, v_missing_subjects, v_stale_reasons;
 
   RETURN QUERY
   SELECT *
@@ -484,7 +504,8 @@ BEGIN
     v_total_subjects,
     v_fresh_subjects,
     v_stale_subjects,
-    v_missing_subjects
+    v_missing_subjects,
+    v_stale_reasons
   );
 END;
 $$;

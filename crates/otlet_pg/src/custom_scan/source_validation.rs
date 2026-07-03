@@ -184,7 +184,7 @@ fn validate_semantic_index_source(
         let stats_query = format!(
             "WITH latest AS ( \
                SELECT DISTINCT ON (sm.subject_id) \
-                 sm.subject_id, sm.stale, sm.source_hash, sm.content_hash, sm.contract_hash, {} AS matches_expected, sm.updated_at, sm.id \
+                 sm.subject_id, sm.stale, sm.source_hash, sm.content_hash, sm.contract_hash, sm.stale_reason, {} AS matches_expected, sm.updated_at, sm.id \
                FROM otlet.semantic_materializations sm \
                JOIN otlet.semantic_indexes si \
                  ON si.task_name = sm.task_name \
@@ -222,6 +222,7 @@ fn validate_semantic_index_source(
                    WHEN l.matches_expected THEN 'fresh_match' \
                    ELSE 'fresh_non_match' \
                  END AS state, \
+                 COALESCE(l.stale_reason, 'content_revalidation_pending') AS stale_reason, \
                  ( \
                    a.subject_id IS NULL \
                    AND l.subject_id IS NOT NULL \
@@ -241,7 +242,16 @@ fn validate_semantic_index_source(
                count(*) FILTER (WHERE state = 'missing')::bigint AS missing_rows, \
                count(*) FILTER (WHERE state = 'in_flight')::bigint AS inflight_rows, \
                count(*) FILTER (WHERE state = 'stale' AND cache_reusable)::bigint AS cache_reusable_rows, \
-               (SELECT model_ms FROM runtime_model)::float8 AS model_ms \
+               (SELECT model_ms FROM runtime_model)::float8 AS model_ms, \
+               COALESCE(( \
+                 SELECT jsonb_object_agg(reason, reason_count ORDER BY reason)::text \
+                 FROM ( \
+                   SELECT stale_reason AS reason, count(*) AS reason_count \
+                   FROM classified \
+                   WHERE state = 'stale' \
+                   GROUP BY stale_reason \
+                 ) reasons \
+               ), '{{}}'::text) AS stale_reasons \
              FROM classified",
             matches_expected_sql,
             sql_literal(index_name),
@@ -306,6 +316,10 @@ fn validate_semantic_index_source(
                 .unwrap_or(2500.0)
                 .max(1.0),
             path_cost: 0.0,
+            stale_reasons: row
+                .get_by_name::<String, _>("stale_reasons")
+                .map_err(to_string)?
+                .unwrap_or_else(|| "{}".to_string()),
         };
         finish_planner_stats(
             &mut stats,
@@ -335,24 +349,25 @@ fn validate_semantic_join_index_source(
     auto_policy: bool,
 ) -> Option<SemanticPlannerStats> {
     let stats_query = format!(
-            "WITH plan AS ( \
-	           SELECT * \
-	           FROM otlet.semantic_join_index_plan({}) \
-	         ), \
-	         current_rows AS ( \
-	           SELECT subject_id, body, stale \
-	           FROM otlet.semantic_join_index_current_rows({}, false) \
-	         ) \
-	         SELECT \
-	           COALESCE((SELECT total_subjects FROM plan), 0)::bigint AS source_rows, \
-	           count(*) FILTER (WHERE stale = false AND body @> {}::jsonb)::bigint AS fresh_matches, \
-	           count(*) FILTER (WHERE stale = false AND NOT (body @> {}::jsonb))::bigint AS fresh_non_matches, \
-	           COALESCE((SELECT stale_subjects FROM plan), 0)::bigint AS stale_rows, \
-	           COALESCE((SELECT missing_subjects FROM plan), 0)::bigint AS missing_rows, \
-	           COALESCE((SELECT inflight_subjects FROM plan), 0)::bigint AS inflight_rows, \
-	           0::bigint AS cache_reusable_rows, \
-	           COALESCE((SELECT model_ms FROM plan), 2500)::float8 AS model_ms \
-	         FROM current_rows",
+        "WITH plan AS ( \
+           SELECT * \
+           FROM otlet.semantic_join_index_plan({}) \
+         ), \
+         current_rows AS ( \
+           SELECT subject_id, body, stale \
+           FROM otlet.semantic_join_index_current_rows({}, false) \
+         ) \
+         SELECT \
+           COALESCE((SELECT total_subjects FROM plan), 0)::bigint AS source_rows, \
+           count(*) FILTER (WHERE stale = false AND body @> {}::jsonb)::bigint AS fresh_matches, \
+           count(*) FILTER (WHERE stale = false AND NOT (body @> {}::jsonb))::bigint AS fresh_non_matches, \
+           COALESCE((SELECT stale_subjects FROM plan), 0)::bigint AS stale_rows, \
+           COALESCE((SELECT missing_subjects FROM plan), 0)::bigint AS missing_rows, \
+           COALESCE((SELECT inflight_subjects FROM plan), 0)::bigint AS inflight_rows, \
+           0::bigint AS cache_reusable_rows, \
+           COALESCE((SELECT model_ms FROM plan), 2500)::float8 AS model_ms, \
+           COALESCE((SELECT stale_reasons::text FROM plan), '{{}}'::text) AS stale_reasons \
+         FROM current_rows",
         sql_literal(index_name),
         sql_literal(index_name),
         sql_literal(expected_json),
@@ -415,6 +430,10 @@ fn validate_semantic_join_index_source(
                 .unwrap_or(2500.0)
                 .max(1.0),
             path_cost: 0.0,
+            stale_reasons: row
+                .get_by_name::<String, _>("stale_reasons")
+                .map_err(to_string)?
+                .unwrap_or_else(|| "{}".to_string()),
         };
         finish_planner_stats(
             &mut stats,

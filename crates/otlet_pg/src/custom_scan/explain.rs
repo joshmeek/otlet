@@ -30,6 +30,7 @@ unsafe extern "C-unwind" fn explain_semantic_custom_scan(
                 es,
             );
             explain_text("Planner Selected Path", &runtime.planner_selected_path, es);
+            explain_text("Planner Stale Reasons", &runtime.planner_stale_reasons, es);
             explain_text("Source Relation", &runtime.source_table, es);
             explain_text("Task", &runtime.task_name, es);
             explain_text("Record Type", &runtime.record_type, es);
@@ -86,6 +87,7 @@ unsafe extern "C-unwind" fn explain_semantic_custom_scan(
                 es,
             );
             explain_text("Planner Selected Path", &private.selected_path, es);
+            explain_text("Planner Stale Reasons", &private.stale_reasons, es);
             explain_pg_cstr("Source Relation", (*state).source_table, es);
             explain_pg_cstr("Task", (*state).task_name, es);
             explain_pg_cstr("Record Type", (*state).record_type, es);

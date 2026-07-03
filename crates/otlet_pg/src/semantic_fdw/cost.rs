@@ -26,6 +26,7 @@ fn load_effective_plan(
         plan.queue_subjects = 0;
         plan.infer_now_subjects = 0;
         plan.fail_closed_subjects = 0;
+        plan.stale_reasons = "{}".to_string();
         plan.freshness = scoped_freshness(stats.source_rows, unresolved_subjects);
         plan.lookup_ms = scoped_lookup_ms(stats.fresh_rows);
         plan.queue_ms = plan.lookup_ms + unresolved_subjects as f64 * plan.model_ms.max(1.0);
@@ -142,6 +143,7 @@ fn clear_subject_counts(plan: &mut SemanticFdwPlan) {
     plan.queue_subjects = 0;
     plan.infer_now_subjects = 0;
     plan.fail_closed_subjects = 0;
+    plan.stale_reasons = "{}".to_string();
     plan.freshness = 1.0;
     plan.lookup_ms = scoped_lookup_ms(0);
     plan.queue_ms = plan.lookup_ms;

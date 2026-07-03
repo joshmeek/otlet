@@ -205,6 +205,7 @@ fn planner_stats_unknown() -> SemanticPlannerStats {
         fail_closed_decision_rows: 0,
         model_ms: 2500.0,
         path_cost: 1.0,
+        stale_reasons: "{}".to_string(),
     }
 }
 

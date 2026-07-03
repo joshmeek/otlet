@@ -5,6 +5,7 @@ struct CustomScanPrivate {
     subject_attno: i16,
     subject_typid: pg_sys::Oid,
     selected_path: String,
+    stale_reasons: String,
 }
 
 unsafe fn custom_private_from_predicate(predicate: &SemanticMatchPredicate) -> *mut pg_sys::List {
@@ -15,7 +16,8 @@ unsafe fn custom_private_from_predicate(predicate: &SemanticMatchPredicate) -> *
             "expected_json": &predicate.expected_json,
             "subject_attno": predicate.subject_attno,
             "subject_typid": predicate.subject_typid.to_u32(),
-            "selected_path": &predicate.planner_stats.selected_path
+            "selected_path": &predicate.planner_stats.selected_path,
+            "stale_reasons": &predicate.planner_stats.stale_reasons
         });
         let mut list = ptr::null_mut();
         list = append_string_node(list, CUSTOM_PRIVATE_MARKER);
@@ -59,6 +61,11 @@ unsafe fn custom_private_from_list(private: *mut pg_sys::List) -> Option<CustomS
             subject_attno: payload.get("subject_attno")?.as_i64()?.try_into().ok()?,
             subject_typid: pg_sys::Oid::from(payload.get("subject_typid")?.as_u64()? as u32),
             selected_path: payload.get("selected_path")?.as_str()?.to_string(),
+            stale_reasons: payload
+                .get("stale_reasons")
+                .and_then(Value::as_str)
+                .unwrap_or("{}")
+                .to_string(),
         })
     }
 }

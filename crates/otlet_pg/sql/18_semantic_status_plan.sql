@@ -30,6 +30,7 @@ CREATE FUNCTION otlet.semantic_index_plan(
   path_cost numeric,
   worker_queue_depth bigint,
   available_queue_slots bigint,
+  stale_reasons jsonb,
   checked_at timestamptz
 )
 LANGUAGE plpgsql
@@ -41,6 +42,7 @@ DECLARE
   v_fresh_subjects bigint := 0;
   v_stale_subjects bigint := 0;
   v_missing_subjects bigint := 0;
+  v_stale_reasons jsonb := '{}'::jsonb;
   current_contract_hash text;
 BEGIN
   SELECT *
@@ -90,6 +92,7 @@ BEGIN
           sm.source_hash,
           sm.content_hash,
           sm.contract_hash,
+          sm.stale_reason,
           sm.updated_at,
           sm.id
         FROM current_inputs ci
@@ -121,7 +124,8 @@ BEGIN
               l.content_hash IS NOT DISTINCT FROM otlet.semantic_content_hash(ci.input)
               AND l.contract_hash IS NOT DISTINCT FROM %7$L
             )
-          ) AS is_stale
+          ) AS is_stale,
+          COALESCE(l.stale_reason, 'content_revalidation_pending') AS stale_reason
         FROM current_inputs ci
         LEFT JOIN latest l USING (subject_id)
       )
@@ -129,7 +133,19 @@ BEGIN
         count(*)::bigint,
         count(*) FILTER (WHERE is_fresh)::bigint,
         count(*) FILTER (WHERE is_stale)::bigint,
-        count(*) FILTER (WHERE NOT has_materialization)::bigint
+        count(*) FILTER (WHERE NOT has_materialization)::bigint,
+        COALESCE(
+          (
+            SELECT jsonb_object_agg(reason, reason_count ORDER BY reason)
+            FROM (
+              SELECT stale_reason AS reason, count(*) AS reason_count
+              FROM classified
+              WHERE is_stale
+              GROUP BY stale_reason
+            ) reasons
+          ),
+          '{}'::jsonb
+        )
       FROM classified
     $sql$,
     index_row.subject_column,
@@ -140,7 +156,7 @@ BEGIN
     index_row.input_columns,
     current_contract_hash
   )
-  INTO v_total_subjects, v_fresh_subjects, v_stale_subjects, v_missing_subjects;
+  INTO v_total_subjects, v_fresh_subjects, v_stale_subjects, v_missing_subjects, v_stale_reasons;
 
   RETURN QUERY
   SELECT *
@@ -160,7 +176,8 @@ BEGIN
     v_total_subjects,
     v_fresh_subjects,
     v_stale_subjects,
-    v_missing_subjects
+    v_missing_subjects,
+    v_stale_reasons
   );
 END;
 $$;
@@ -186,6 +203,7 @@ SELECT
   plan.queue_subjects,
   plan.infer_now_subjects,
   plan.fail_closed_subjects,
+  plan.stale_reasons,
   plan.selected_path,
   plan.reason,
   plan.freshness,

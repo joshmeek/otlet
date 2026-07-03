@@ -77,6 +77,7 @@ unsafe extern "C-unwind" fn begin_semantic_custom_scan(
             infer_ms: policy.infer_ms,
             infer_max_rows: policy.infer_max_rows,
             planner_selected_path: private.selected_path,
+            planner_stale_reasons: private.stale_reasons,
             source_table: loaded_state.source_table,
             task_name: loaded_state.task_name,
             record_type: loaded_state.record_type,

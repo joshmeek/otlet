@@ -47,6 +47,7 @@ struct SemanticFdwPlan {
     path_cost: f64,
     worker_queue_depth: i64,
     available_queue_slots: i64,
+    stale_reasons: String,
 }
 
 struct SemanticFdwRow {

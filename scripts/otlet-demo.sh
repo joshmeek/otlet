@@ -542,14 +542,44 @@ SELECT (count(*) FILTER (WHERE stale AND stale_reason = 'schema_drift') >= 1)::t
 FROM otlet.semantic_materializations
 WHERE task_name = '$row_scoped_task'
   AND subject_id = 'scoped-1';
+SELECT COALESCE(stale_reasons->>'schema_drift', '0')
+FROM otlet.semantic_index_plan('$row_scoped_watch');
+SELECT COALESCE(stale_reasons->>'schema_drift', '0')
+FROM otlet.semantic_index_status
+WHERE name = '$row_scoped_watch';
 ")"
 row_schema_drift_fresh="$(head -n 1 <<<"$row_schema_drift_contract")"
-row_schema_drift_reason="$(tail -n 1 <<<"$row_schema_drift_contract")"
-echo "row_schema_drift_contract=$row_schema_drift_fresh|$row_schema_drift_reason"
-[ "$row_schema_drift_fresh|$row_schema_drift_reason" = "0|true" ] || {
-  echo "Expected dropped scoped input column to write schema_drift and fail closed, got $row_schema_drift_fresh|$row_schema_drift_reason" >&2
+row_schema_drift_reason="$(sed -n '2p' <<<"$row_schema_drift_contract")"
+row_schema_drift_plan_reason="$(sed -n '3p' <<<"$row_schema_drift_contract")"
+row_schema_drift_status_reason="$(tail -n 1 <<<"$row_schema_drift_contract")"
+echo "row_schema_drift_contract=$row_schema_drift_fresh|$row_schema_drift_reason|$row_schema_drift_plan_reason|$row_schema_drift_status_reason"
+[ "$row_schema_drift_fresh|$row_schema_drift_reason|$row_schema_drift_plan_reason|$row_schema_drift_status_reason" = "0|true|1|1" ] || {
+  echo "Expected dropped scoped input column to write schema_drift and expose it in plan/status, got $row_schema_drift_fresh|$row_schema_drift_reason|$row_schema_drift_plan_reason|$row_schema_drift_status_reason" >&2
   exit 1
 }
+row_schema_fdw_plan="$(
+  psql_exec -P border=2 -P null='' <<SQL
+EXPLAIN (VERBOSE, COSTS, SUMMARY OFF)
+SELECT *
+FROM otlet.${row_scoped_watch}_native;
+SQL
+)"
+printf '%s\n' "$row_schema_fdw_plan"
+require_contains "$row_schema_fdw_plan" "Otlet Node: Semantic Foreign Scan" "Expected row FDW explain details"
+require_contains "$row_schema_fdw_plan" "Stale Reasons:" "Expected row FDW stale reason breakdown"
+require_contains "$row_schema_fdw_plan" "schema_drift" "Expected row FDW stale reason to include schema_drift"
+row_schema_customscan_plan="$(
+  psql_exec -P border=2 -P null='' <<SQL
+EXPLAIN (VERBOSE, COSTS, SUMMARY OFF)
+SELECT id
+FROM public.otlet_demo_scoped_signal
+WHERE otlet.semantic_matches_auto('$row_scoped_watch', id, '{"decision":"pass"}'::jsonb);
+SQL
+)"
+printf '%s\n' "$row_schema_customscan_plan"
+require_contains "$row_schema_customscan_plan" "Otlet Node: Semantic Source CustomScan" "Expected CustomScan explain details"
+require_contains "$row_schema_customscan_plan" "Planner Stale Reasons:" "Expected CustomScan stale reason breakdown"
+require_contains "$row_schema_customscan_plan" "schema_drift" "Expected CustomScan stale reason to include schema_drift"
 
 queue_suppression_output="$(psql_value "
 BEGIN;

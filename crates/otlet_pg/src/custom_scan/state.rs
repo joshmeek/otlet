@@ -76,6 +76,7 @@ struct RuntimeState {
     infer_ms: u32,
     infer_max_rows: u32,
     planner_selected_path: String,
+    planner_stale_reasons: String,
     source_table: String,
     task_name: String,
     record_type: String,
@@ -215,4 +216,5 @@ struct SemanticPlannerStats {
     fail_closed_decision_rows: u64,
     model_ms: f64,
     path_cost: f64,
+    stale_reasons: String,
 }

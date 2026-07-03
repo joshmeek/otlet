@@ -90,7 +90,8 @@ fn load_plan(opts: &SemanticFdwOptions) -> Result<SemanticFdwPlan, String> {
          freshness::float8 AS freshness, model_ms::float8 AS model_ms, model_cost_source, \
          cache_hit_ms::float8 AS cache_hit_ms, lookup_ms::float8 AS lookup_ms, \
          queue_ms::float8 AS queue_ms, infer_now_ms::float8 AS infer_now_ms, \
-         path_cost::float8 AS path_cost, worker_queue_depth, available_queue_slots \
+         path_cost::float8 AS path_cost, worker_queue_depth, available_queue_slots, \
+         stale_reasons::text AS stale_reasons \
          FROM {}({})",
         plan_function,
         sql_literal(&opts.index_name)
@@ -155,6 +156,7 @@ fn load_plan(opts: &SemanticFdwOptions) -> Result<SemanticFdwPlan, String> {
             path_cost: f64_value!("path_cost", 1.0),
             worker_queue_depth: i64_value!("worker_queue_depth"),
             available_queue_slots: i64_value!("available_queue_slots"),
+            stale_reasons: text!("stale_reasons", "{}"),
         })
     })
 }
