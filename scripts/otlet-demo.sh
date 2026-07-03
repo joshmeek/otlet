@@ -2833,7 +2833,7 @@ require_contains "$fdw_plan" "Path Cost:" "Expected FDW path cost"
 require_contains "$fdw_plan" "Actual Rows Loaded: 1" "Expected join FDW loaded row count"
 require_contains "$fdw_plan" "Pushed Subject Id: vendor-1001:vendor-42" "Expected join FDW pushed subject"
 
-log "Checking benign entity-resolution source update"
+log "Checking entity-resolution dependency update"
 join_receipts_before_update="$(psql_value "
 SELECT count(*)::text
 FROM otlet.inference_receipts ar
@@ -2861,8 +2861,8 @@ join_stale_subjects="$(head -n 1 <<<"$join_stale_contract")"
 join_fresh_after_lookup="$(sed -n '2p' <<<"$join_stale_contract")"
 join_receipts_after_update="$(tail -n 1 <<<"$join_stale_contract")"
 echo "semantic_join_stale_contract=$join_stale_subjects|fresh_after_lookup=$join_fresh_after_lookup|receipts=$join_receipts_before_update|$join_receipts_after_update"
-if [ "$join_stale_subjects|$join_fresh_after_lookup" != "0|4|4" ] || [ "$join_receipts_before_update" != "$join_receipts_after_update" ]; then
-  echo "Expected semantic join benign-update contract 0|4|4 with unchanged receipts, got $join_stale_subjects|$join_fresh_after_lookup|$join_receipts_before_update|$join_receipts_after_update" >&2
+if [ "$join_stale_subjects|$join_fresh_after_lookup" != "4|0|0" ] || [ "$join_receipts_before_update" != "$join_receipts_after_update" ]; then
+  echo "Expected semantic join dependency update to fail closed with unchanged receipts, got $join_stale_subjects|$join_fresh_after_lookup|$join_receipts_before_update|$join_receipts_after_update" >&2
   exit 1
 fi
 
@@ -3219,7 +3219,7 @@ SELECT (SELECT value FROM colon_subject_contract_parts WHERE key = 'before_mark'
        (SELECT invalid_pair FROM validation);
 ")"
 echo "colon_subject_safety_contract=$colon_subject_contract"
-[ "$colon_subject_contract" = "1|0|0|1|1|1|ok|merge_candidate subject ids must match job subject_id" ] || {
+[ "$colon_subject_contract" = "1|0|0|1|1|0|ok|merge_candidate subject ids must match job subject_id" ] || {
   echo "Expected colon subject IDs to validate and stale-mark only by exact subject, got $colon_subject_contract" >&2
   exit 1
 }

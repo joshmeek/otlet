@@ -257,9 +257,9 @@ fn validate_semantic_index_source(
              classified AS ( \
                SELECT \
                  CASE \
-                   WHEN a.subject_id IS NOT NULL AND (l.subject_id IS NULL OR l.content_hash IS DISTINCT FROM src.content_hash OR l.contract_hash IS DISTINCT FROM {}) THEN 'in_flight' \
+                   WHEN a.subject_id IS NOT NULL AND (l.subject_id IS NULL OR l.content_hash IS DISTINCT FROM src.content_hash OR l.contract_hash IS DISTINCT FROM {} OR (l.stale AND l.stale_reason IS DISTINCT FROM 'source_update')) THEN 'in_flight' \
                    WHEN l.subject_id IS NULL THEN 'missing' \
-                   WHEN l.content_hash IS DISTINCT FROM src.content_hash OR l.contract_hash IS DISTINCT FROM {} THEN 'stale' \
+                   WHEN l.content_hash IS DISTINCT FROM src.content_hash OR l.contract_hash IS DISTINCT FROM {} OR (l.stale AND l.stale_reason IS DISTINCT FROM 'source_update') THEN 'stale' \
                    WHEN l.matches_expected THEN 'fresh_match' \
                    ELSE 'fresh_non_match' \
                  END AS state, \
@@ -270,6 +270,7 @@ fn validate_semantic_index_source(
                    AND l.stale \
                    AND l.content_hash IS NOT DISTINCT FROM src.content_hash \
                    AND l.contract_hash IS NOT DISTINCT FROM {} \
+                   AND l.stale_reason = 'source_update' \
                  ) AS cache_reusable \
                FROM source_rows src \
                LEFT JOIN latest l USING (subject_id) \

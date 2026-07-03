@@ -60,8 +60,9 @@ fn load_semantic_states(
              sm.subject_id, \
              sm.stale, \
              sm.source_hash, \
-	             sm.content_hash, \
+             sm.content_hash, \
 	             sm.contract_hash, \
+	             sm.stale_reason, \
 	             sm.freshness_basis, \
 	             {} AS matches_expected, \
              sm.updated_at, \
@@ -84,14 +85,14 @@ fn load_semantic_states(
            SELECT \
              src.subject_id, \
 	             CASE \
-	               WHEN a.subject_id IS NOT NULL AND (l.subject_id IS NULL OR l.content_hash IS DISTINCT FROM src.content_hash OR l.contract_hash IS DISTINCT FROM {}) THEN 'in_flight' \
+	               WHEN a.subject_id IS NOT NULL AND (l.subject_id IS NULL OR l.content_hash IS DISTINCT FROM src.content_hash OR l.contract_hash IS DISTINCT FROM {} OR (l.stale AND l.stale_reason IS DISTINCT FROM 'source_update')) THEN 'in_flight' \
 	               WHEN l.subject_id IS NULL THEN 'missing' \
-	               WHEN l.content_hash IS DISTINCT FROM src.content_hash OR l.contract_hash IS DISTINCT FROM {} THEN 'stale' \
+	               WHEN l.content_hash IS DISTINCT FROM src.content_hash OR l.contract_hash IS DISTINCT FROM {} OR (l.stale AND l.stale_reason IS DISTINCT FROM 'source_update') THEN 'stale' \
 	               WHEN l.matches_expected THEN 'fresh_match' \
 	               ELSE 'fresh_non_match' \
 	             END AS semantic_state, \
 	             CASE \
-	               WHEN l.content_hash IS DISTINCT FROM src.content_hash OR l.contract_hash IS DISTINCT FROM {} THEN NULL \
+	               WHEN l.content_hash IS DISTINCT FROM src.content_hash OR l.contract_hash IS DISTINCT FROM {} OR (l.stale AND l.stale_reason IS DISTINCT FROM 'source_update') THEN NULL \
 	               WHEN l.stale THEN 'revalidated_after_benign_update' \
 	               WHEN l.source_hash IS NOT DISTINCT FROM src.source_hash THEN 'mvcc_match' \
 	               ELSE COALESCE(l.freshness_basis, 'content_hash_match') \

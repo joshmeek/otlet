@@ -388,6 +388,7 @@ CREATE TABLE otlet.semantic_materializations (
   record_type text NOT NULL,
   source_table text,
   subject_id text,
+  source_dependencies jsonb NOT NULL DEFAULT '[]'::jsonb CHECK (jsonb_typeof(source_dependencies) = 'array'),
   task_name text NOT NULL,
   model_name text NOT NULL,
   body jsonb NOT NULL,
@@ -417,6 +418,9 @@ ON otlet.semantic_materializations (task_name, record_type, stale, subject_id);
 
 CREATE INDEX semantic_materializations_source_idx
 ON otlet.semantic_materializations (source_table, subject_id, task_name, record_type, stale);
+
+CREATE INDEX semantic_materializations_dependencies_idx
+ON otlet.semantic_materializations USING gin (source_dependencies jsonb_path_ops);
 
 CREATE TABLE otlet.semantic_indexes (
   name text PRIMARY KEY CHECK (name ~ '^[a-z0-9][a-z0-9_-]*$'),

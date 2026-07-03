@@ -80,6 +80,7 @@ BEGIN
         AND sm.subject_id = semantic_matches.subject_id
         AND sm.content_hash = current_content_hash
         AND sm.contract_hash = index_row.contract_hash
+        AND (NOT sm.stale OR sm.stale_reason = 'source_update')
       ORDER BY sm.subject_id, sm.updated_at DESC, sm.id DESC
     ) latest
     WHERE latest.body @> semantic_matches.expected

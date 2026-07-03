@@ -6,17 +6,13 @@ Read this ranking first. `overall_fit` is trusted Otlet quality with a soft reso
 
 | rank | model | role | overall_fit | trusted_quality | diagnostic_fit | resource_fit | first_blocker |
 | ---: | --- | --- | ---: | ---: | ---: | ---: | --- |
-| 1 | qwen35_4b | eligible_candidate | 0.948 | 0.999 | 0.949 | 0.799 | repeat_count < 3 |
-| 2 | gemma4_e2b | triage_candidate | 0.745 | 0.791 | 0.866 | 0.768 | confidence < 0.95 |
-| 3 | gemma4_e4b | triage_candidate | 0.675 | 0.756 | 0.796 | 0.568 | confidence < 0.95 |
-| 4 | phi4_mini | row_watch_candidate | 0.668 | 0.700 | 0.777 | 0.822 | confidence < 0.95 |
-| 5 | ministral3_3b | row_watch_candidate | 0.597 | 0.608 | 0.821 | 0.927 | confidence < 0.95 |
+| 1 | qwen35_4b | triage_candidate | 0.933 | 0.982 | 0.941 | 0.799 | semantic < 0.95 |
 
 ![Overall Otlet fit](overall.svg)
 
 ## Latest Result
 
-Run `b1782932034`: this is a current scored run. It ranks 5 current scored models through the benchmark harness
+Run `b1783095175`: this is a current scored run. It ranks 1 current scored model through the benchmark harness
 
 Benchmark confidence: `provisional_single_run`. Next proof: Rerun with OTLET_BENCH_RUNS=3
 
@@ -30,7 +26,7 @@ A model can show `overall_fit=0.000` when it produced no trusted schema-valid ou
 
 The public ranking keeps the newest scored row per current family/size lane. Superseded rows, unscored candidates, and models with no useful Otlet signal stay out of the README ranking
 
-Current published coverage is 112 direct gold cases per model run. The harness target now includes 112 deterministic pair cases, 30 triage cases, row-watch checks, and semantic checks; rerun with `OTLET_BENCH_PUBLISH_REPORT=1` before treating triage rankings as published
+Current coverage is 142 scored cases per model run. The fixture target includes 112 deterministic pair cases, 30 triage cases, row-watch checks, and semantic checks
 
 ## Columns And Roles
 
@@ -41,11 +37,6 @@ Current published coverage is 112 direct gold cases per model run. The harness t
 | diagnostic_fit | partial signal from rejected or invalid attempts; never trusted state |
 | resource_fit | soft score for artifact size, resident RSS, latency, and active params |
 | first_blocker | first production gate that kept a model from default readiness |
-| correct_jobs_per_second_per_gb | accepted quality times jobs/sec per resident GB |
-| overall_fit_jobs_per_second_per_gb | overall fit times jobs/sec per resident GB |
-| triage_score | non-ER triage phase score across flag, pass, abstain, and adversarial rows |
-| triage_abstention_score | triage abstention score |
-| semantic_materialization_score | row/join materialization and stale-safety score |
 | default_candidate | passed the production gate with at least 3 same-run repeats |
 | triage_candidate | useful trusted output, but not default-ready |
 | row_watch_candidate | useful for watch-style row judgment, but not default-ready |
@@ -55,44 +46,32 @@ Current published coverage is 112 direct gold cases per model run. The harness t
 
 | workload | model | metric | gate | caveat |
 | --- | --- | --- | --- | --- |
-| default Otlet model |  |  |  | no model has 3-run repeat proof |
-| hard entity resolution | qwen35_4b | 1.000 | fail | needs repeat proof before a default claim |
-| row watching | ministral3_3b | 0.991 | fail | not a default model unless gate passes |
-| triage |  |  |  | latest published run predates triage scoring |
+| default Otlet model |  |  |  | none passed production gates |
+| hard entity resolution | qwen35_4b | 1.000 | fail | not a default model unless gate passes |
+| row watching | qwen35_4b | 0.991 | fail | not a default model unless gate passes |
+| triage | qwen35_4b | 1.000 | fail | not a default model unless gate passes |
 | <=2.0 GB artifact |  |  |  | no current overall-fit row |
-| correct jobs/sec/GB | gemma4_e2b | 0.012 | fail | compare timing after one same-run sweep |
+| correct jobs/sec/GB | qwen35_4b | 0.008 | fail | compare timing after one same-run sweep |
 
 ## Production Readiness
 
-The default-model gate keeps non-passing models out of production rank. Useful partial models keep role labels and diagnostic evidence, but their production score is zero
+The repeat-aware default-model gate keeps non-passing models out of production rank. Useful partial models keep role labels and diagnostic evidence, but their production score is zero
 
 | rank | model | readiness | production_score | overall_fit | gate | first_blocker |
 | ---: | --- | --- | ---: | ---: | --- | --- |
-| 1 | qwen35_4b | needs_repeat_proof | 0.000 | 0.948 | fail | repeat_count < 3 |
-| 2 | gemma4_e2b | workload_candidate | 0.000 | 0.745 | fail | confidence < 0.95 |
-| 3 | gemma4_e4b | workload_candidate | 0.000 | 0.675 | fail | confidence < 0.95 |
-| 4 | phi4_mini | workload_candidate | 0.000 | 0.668 | fail | confidence < 0.95 |
-| 5 | ministral3_3b | workload_candidate | 0.000 | 0.597 | fail | confidence < 0.95 |
+| 1 | qwen35_4b | workload_candidate | 0.000 | 0.933 | fail | semantic < 0.95 |
 
 ## First Failure Modes
 
 | model | top_failure | count | passed_cases |
 | --- | --- | ---: | ---: |
-| qwen35_4b | passed | 0 | 112 |
-| gemma4_e2b | schema_missing | 17 | 94 |
-| gemma4_e4b | schema_missing | 22 | 87 |
-| phi4_mini | wrong_match | 37 | 72 |
-| ministral3_3b | invalid_json | 37 | 62 |
+| qwen35_4b | passed | 0 | 142 |
 
 ## Overall Fit Ranking
 
 | rank | model | runs | readiness | overall_fit | trusted_quality | schema | p95_ms | rss_gb | artifact_gb |
 | ---: | --- | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| 1 | qwen35_4b | 1 | needs_repeat_proof | 0.948 | 0.999 | 1.000 | 9000 | 3.227 | 2.741 |
-| 2 | gemma4_e2b | 1 | workload_candidate | 0.745 | 0.791 | 0.848 | 3197 | 3.568 | 3.107 |
-| 3 | gemma4_e4b | 1 | workload_candidate | 0.675 | 0.756 | 0.777 | 10432 | 5.665 | 4.977 |
-| 4 | phi4_mini | 1 | workload_candidate | 0.668 | 0.700 | 1.000 | 9174 | 3.379 | 2.492 |
-| 5 | ministral3_3b | 1 | workload_candidate | 0.597 | 0.608 | 0.670 | 6666 | 2.946 | 2.147 |
+| 1 | qwen35_4b | 1 | workload_candidate | 0.933 | 0.982 | 1.000 | 12381 | 3.226 | 2.741 |
 
 ## Out Of Running
 
@@ -118,14 +97,14 @@ The score covers:
 
 - schema-valid trusted output
 - explicit production gates and repeat proof before any default-model claim
-- entity-resolution decisions across duplicates, hard negatives, sparse rows, dirty rows, and abstention cases
 - non-ER triage decisions across flag, pass, abstain, and adversarial row-text cases
+- entity-resolution decisions across duplicates, hard negatives, sparse rows, dirty rows, and abstention cases
 - exact confidence targets, so overconfident or underconfident outputs do not get silent credit
 - typed actions with no source-table writes
 - row-watch classification
 - semantic materialization and stale-result safety
 - receipt, trace, source-hash, FDW, and CustomScan visibility
-- p95 latency, tokens/sec, resident RSS, artifact size, active params, correct jobs/sec per resident GB, and overall-fit jobs/sec per resident GB
+- p95 latency, tokens/sec, resident RSS, artifact size, active params, and fit per resident GB
 
 ## Rerun
 
@@ -145,13 +124,13 @@ OTLET_BENCH_LIMIT_MODELS=qwen35_4b OTLET_BENCH_RUNS=1 OTLET_BENCH_PUBLISH_REPORT
 Run a single named model when debugging a candidate:
 
 ```sh
-OTLET_BENCH_LIMIT_MODELS=ministral3_3b OTLET_BENCH_RUNS=1 OTLET_BENCH_PUBLISH_REPORT=1 ./benchmarks/run.sh
+OTLET_BENCH_LIMIT_MODELS=qwen35_4b OTLET_BENCH_RUNS=1 OTLET_BENCH_PUBLISH_REPORT=1 ./benchmarks/run.sh
 ```
 
 Run the current scored comparison set only after a meaningful prompt/schema/scoring/runtime change:
 
 ```sh
-OTLET_BENCH_LIMIT_MODELS=qwen35_4b,gemma4_e2b,gemma4_e4b,phi4_mini,ministral3_3b OTLET_BENCH_RUNS=1 OTLET_BENCH_PUBLISH_REPORT=1 ./benchmarks/run.sh
+OTLET_BENCH_LIMIT_MODELS=qwen35_4b OTLET_BENCH_RUNS=1 OTLET_BENCH_PUBLISH_REPORT=1 ./benchmarks/run.sh
 ```
 
 Run the default-included set when the harness has materially improved and you want the shortest publishable check:
@@ -161,7 +140,7 @@ models="$(awk -F '\t' 'NR > 1 && $9 == "true" {print $1}' benchmarks/models.tsv 
 OTLET_BENCH_LIMIT_MODELS="$models" OTLET_BENCH_RUNS=1 OTLET_BENCH_PUBLISH_REPORT=1 ./benchmarks/run.sh
 ```
 
-The benchmark default timeout is two hours per task phase because the current fixture loads 112 row-pair cases, 30 triage cases, row-watch checks, and semantic checks per model, and larger local models can cross one hour before semantic refresh starts
+The benchmark default timeout is two hours per task phase because the current fixture loads 112 row-pair cases per model and larger local models can cross one hour before semantic refresh starts
 
 Run manual candidates only when you have a reason to spend the time. Rows marked `candidate`, `diagnostic`, `historical`, or `heavy` are never part of the default run:
 

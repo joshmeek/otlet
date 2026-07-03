@@ -123,12 +123,14 @@ BEGIN
               l.subject_id IS NOT NULL
               AND l.content_hash IS NOT DISTINCT FROM otlet.semantic_content_hash(ci.input)
               AND l.contract_hash IS NOT DISTINCT FROM %7$L
+              AND (NOT l.stale OR l.stale_reason = 'source_update')
             ) AS is_fresh,
             (
               l.subject_id IS NOT NULL
               AND NOT (
                 l.content_hash IS NOT DISTINCT FROM otlet.semantic_content_hash(ci.input)
                 AND l.contract_hash IS NOT DISTINCT FROM %7$L
+                AND (NOT l.stale OR l.stale_reason = 'source_update')
               )
             ) AS is_stale,
             COALESCE(l.stale_reason, 'content_revalidation_pending') AS stale_reason

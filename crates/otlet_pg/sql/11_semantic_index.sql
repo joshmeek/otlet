@@ -370,6 +370,7 @@ BEGIN
         record_type,
         source_table,
         subject_id,
+        source_dependencies,
         task_name,
         model_name,
         body,
@@ -386,6 +387,7 @@ BEGIN
         r.record_type,
         %3$L,
         j.subject_id,
+        otlet.semantic_input_dependencies(j.input),
         j.task_name,
         ar.model_name,
         r.body,
@@ -407,6 +409,7 @@ BEGIN
         SET record_type = EXCLUDED.record_type,
             source_table = EXCLUDED.source_table,
             subject_id = EXCLUDED.subject_id,
+            source_dependencies = EXCLUDED.source_dependencies,
             task_name = EXCLUDED.task_name,
             model_name = EXCLUDED.model_name,
             body = EXCLUDED.body,
@@ -495,6 +498,7 @@ BEGIN
         record_type,
         source_table,
         subject_id,
+        source_dependencies,
         task_name,
         model_name,
         body,
@@ -511,6 +515,7 @@ BEGIN
         r.record_type,
         %2$L,
         j.subject_id,
+        otlet.semantic_input_dependencies(j.input),
         j.task_name,
         ar.model_name,
         r.body,
@@ -532,6 +537,7 @@ BEGIN
         SET record_type = EXCLUDED.record_type,
             source_table = EXCLUDED.source_table,
             subject_id = EXCLUDED.subject_id,
+            source_dependencies = EXCLUDED.source_dependencies,
             task_name = EXCLUDED.task_name,
             model_name = EXCLUDED.model_name,
             body = EXCLUDED.body,
@@ -623,6 +629,7 @@ BEGIN
           sm.source_hash,
           sm.content_hash,
           sm.contract_hash,
+          sm.stale_reason,
           sm.freshness_basis,
           sm.updated_at,
           sm.id
@@ -643,12 +650,18 @@ BEGIN
       SELECT
         latest.subject_id,
         latest.body,
-        latest.content_hash IS DISTINCT FROM otlet.semantic_content_hash(ci.input)
-          OR latest.contract_hash IS DISTINCT FROM %7$L AS stale,
+        NOT (
+          latest.content_hash IS NOT DISTINCT FROM otlet.semantic_content_hash(ci.input)
+          AND latest.contract_hash IS NOT DISTINCT FROM %7$L
+          AND (NOT latest.stale OR latest.stale_reason = 'source_update')
+        ) AS stale,
         latest.source_hash,
         CASE
-          WHEN latest.content_hash IS DISTINCT FROM otlet.semantic_content_hash(ci.input)
-            OR latest.contract_hash IS DISTINCT FROM %7$L THEN NULL
+          WHEN NOT (
+            latest.content_hash IS NOT DISTINCT FROM otlet.semantic_content_hash(ci.input)
+            AND latest.contract_hash IS NOT DISTINCT FROM %7$L
+            AND (NOT latest.stale OR latest.stale_reason = 'source_update')
+          ) THEN NULL
           WHEN latest.stale THEN 'revalidated_after_benign_update'
           WHEN latest.source_hash IS NOT DISTINCT FROM md5(ci.input::text) THEN 'mvcc_match'
           ELSE COALESCE(latest.freshness_basis, 'content_hash_match')
@@ -661,6 +674,7 @@ BEGIN
         OR (
           latest.content_hash IS NOT DISTINCT FROM otlet.semantic_content_hash(ci.input)
           AND latest.contract_hash IS NOT DISTINCT FROM %7$L
+          AND (NOT latest.stale OR latest.stale_reason = 'source_update')
         )
       )
       ORDER BY latest.subject_id, latest.updated_at DESC

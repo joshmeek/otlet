@@ -57,6 +57,7 @@ BEGIN
           sm.source_hash,
           sm.content_hash,
           sm.contract_hash,
+          sm.stale_reason,
           sm.freshness_basis,
           sm.updated_at,
           sm.id
@@ -77,12 +78,18 @@ BEGIN
       SELECT
         latest.subject_id,
         latest.body,
-        latest.content_hash IS DISTINCT FROM otlet.semantic_content_hash(ci.input)
-          OR latest.contract_hash IS DISTINCT FROM %5$L AS stale,
+        NOT (
+          latest.content_hash IS NOT DISTINCT FROM otlet.semantic_content_hash(ci.input)
+          AND latest.contract_hash IS NOT DISTINCT FROM %5$L
+          AND (NOT latest.stale OR latest.stale_reason = 'source_update')
+        ) AS stale,
         latest.source_hash,
         CASE
-          WHEN latest.content_hash IS DISTINCT FROM otlet.semantic_content_hash(ci.input)
-            OR latest.contract_hash IS DISTINCT FROM %5$L THEN NULL
+          WHEN NOT (
+            latest.content_hash IS NOT DISTINCT FROM otlet.semantic_content_hash(ci.input)
+            AND latest.contract_hash IS NOT DISTINCT FROM %5$L
+            AND (NOT latest.stale OR latest.stale_reason = 'source_update')
+          ) THEN NULL
           WHEN latest.stale THEN 'revalidated_after_benign_update'
           WHEN latest.source_hash IS NOT DISTINCT FROM md5(ci.input::text) THEN 'mvcc_match'
           ELSE COALESCE(latest.freshness_basis, 'content_hash_match')
@@ -95,6 +102,7 @@ BEGIN
         OR (
           latest.content_hash IS NOT DISTINCT FROM otlet.semantic_content_hash(ci.input)
           AND latest.contract_hash IS NOT DISTINCT FROM %5$L
+          AND (NOT latest.stale OR latest.stale_reason = 'source_update')
         )
       )
       ORDER BY latest.subject_id
@@ -470,7 +478,8 @@ BEGIN
             ci.subject_id,
             l.subject_id IS NOT NULL AS has_materialization,
             l.content_hash IS NOT DISTINCT FROM otlet.semantic_content_hash(ci.input)
-              AND l.contract_hash IS NOT DISTINCT FROM %5$L AS source_fresh,
+              AND l.contract_hash IS NOT DISTINCT FROM %5$L
+              AND (NOT l.stale OR l.stale_reason = 'source_update') AS source_fresh,
             COALESCE(l.stale_reason, 'content_revalidation_pending') AS stale_reason
           FROM current_inputs ci
           LEFT JOIN latest l USING (subject_id)
