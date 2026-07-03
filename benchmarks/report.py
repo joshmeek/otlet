@@ -106,8 +106,11 @@ def table(headers, rows):
         "entity",
         "abstain",
         "dirty",
+        "triage",
+        "triage_abstain",
         "actions",
         "diag_actions",
+        "diag_triage",
         "semantic",
         "count",
         "passed_cases",
@@ -205,33 +208,36 @@ def add_otlet_fit(row):
 
 
 def gate_failures(row):
-    if row.get("_gate_failures"):
-        return row["_gate_failures"]
-    failures = []
-    if row.get("run_status") and row.get("run_status") != "complete":
-        return [row.get("unsupported_reason") or "run not complete"]
-    if num(row.get("worker_crash_count")) > 0:
-        failures.append("worker crash")
-    if truthy(row.get("source_table_mutated")):
-        failures.append("source table mutated")
-    if num(row.get("stale_leak_count")) > 0:
-        failures.append("stale result leaked")
-    if num(row.get("schema_valid_rate")) < 0.95:
-        failures.append("schema < 0.95")
-    if num(row.get("contract_score")) < 0.95:
-        failures.append("contract < 0.95")
-    if row.get("confidence_score") in (None, ""):
-        failures.append("confidence not measured")
-    elif num(row.get("confidence_score")) < 0.95:
-        failures.append("confidence < 0.95")
-    if num(row.get("entity_accuracy")) < 0.80:
-        failures.append("entity < 0.80")
-    if num(row.get("abstention_false_merge_rate")) > 0:
-        failures.append("false merge")
-    if num(row.get("hallucinated_trusted_action_rate")) > 0.01:
-        failures.append("hallucinated action")
-    if num(row.get("semantic_materialization_score")) < 0.95:
-        failures.append("semantic < 0.95")
+    failures = list(row.get("_gate_failures") or [])
+    if not failures:
+        if row.get("run_status") and row.get("run_status") != "complete":
+            return [row.get("unsupported_reason") or "run not complete"]
+        if num(row.get("worker_crash_count")) > 0:
+            failures.append("worker crash")
+        if truthy(row.get("source_table_mutated")):
+            failures.append("source table mutated")
+        if num(row.get("stale_leak_count")) > 0:
+            failures.append("stale result leaked")
+        if num(row.get("schema_valid_rate")) < 0.95:
+            failures.append("schema < 0.95")
+        if num(row.get("contract_score")) < 0.95:
+            failures.append("contract < 0.95")
+        if row.get("confidence_score") in (None, ""):
+            failures.append("confidence not measured")
+        elif num(row.get("confidence_score")) < 0.95:
+            failures.append("confidence < 0.95")
+        if num(row.get("entity_accuracy")) < 0.80:
+            failures.append("entity < 0.80")
+        if metric_present(row, "triage_score") and num(row.get("triage_score")) < 0.80:
+            failures.append("triage < 0.80")
+        if num(row.get("abstention_false_merge_rate")) > 0:
+            failures.append("false merge")
+        if num(row.get("hallucinated_trusted_action_rate")) > 0.01:
+            failures.append("hallucinated action")
+        if num(row.get("semantic_materialization_score")) < 0.95:
+            failures.append("semantic < 0.95")
+    if row.get("run_status") == "complete" and metric_present(row, "repeat_count") and not repeat_proven(row):
+        failures.append("repeat_count < 3")
     return failures
 
 
@@ -239,6 +245,8 @@ def display_verdict(row):
     if row.get("run_status") and row.get("run_status") != "complete":
         return "not_supported"
     failures = gate_failures(row)
+    if failures == ["repeat_count < 3"] and num(row.get("quality_score")) >= 0.90:
+        return "eligible_candidate"
     if not failures and num(row.get("quality_score")) >= 0.90:
         return "default_candidate"
     if not failures:
@@ -253,7 +261,8 @@ def display_verdict(row):
     ):
         return "hard_case_candidate_needs_action_fix"
     if (
-        num(row.get("schema_valid_rate")) >= 0.50
+        num(row.get("triage_score")) >= 0.70
+        and num(row.get("schema_valid_rate")) >= 0.50
         and num(row.get("confidence_score")) >= 0.50
         and num(row.get("abstention_false_merge_rate")) == 0
         and num(row.get("hallucinated_trusted_action_rate")) <= 0.01
@@ -298,6 +307,8 @@ def readiness(row):
     if row.get("run_status") and row.get("run_status") != "complete":
         return "not_supported"
     failures = gate_failures(row)
+    if failures == ["repeat_count < 3"] and num(row.get("quality_score")) >= 0.90:
+        return "needs_repeat_proof"
     if not failures and num(row.get("quality_score")) >= 0.90:
         return "default_ready"
     if not failures:
@@ -455,11 +466,14 @@ def aggregate_summaries(rows, models):
         "entity_resolution_score",
         "abstention_score",
         "dirty_data_score",
+        "triage_score",
+        "triage_abstention_score",
         "row_watch_score",
         "typed_action_score",
         "semantic_materialization_score",
         "confidence_score",
         "diagnostic_entity_accuracy",
+        "diagnostic_triage_accuracy",
         "diagnostic_action_accuracy",
         "diagnostic_confidence_accuracy",
         "diagnostic_quality_score",
@@ -566,10 +580,13 @@ def add_missing_model_rows(summaries, models):
             "entity_resolution_score",
             "abstention_score",
             "dirty_data_score",
+            "triage_score",
+            "triage_abstention_score",
             "row_watch_score",
             "typed_action_score",
             "semantic_materialization_score",
             "diagnostic_entity_accuracy",
+            "diagnostic_triage_accuracy",
             "diagnostic_action_accuracy",
             "diagnostic_confidence_accuracy",
             "diagnostic_quality_score",
@@ -644,6 +661,14 @@ def score_label(value):
     if abs(value) < 0.001:
         return f"{value:.6f}"
     return f"{value:.3f}"
+
+
+def metric_present(row, key):
+    return row.get(key) not in (None, "")
+
+
+def repeat_proven(row):
+    return num(row.get("repeat_count")) >= 3
 
 
 def write_empty_chart(path, title):
@@ -804,9 +829,12 @@ def write_scorecard(path, rows):
         "contract",
         "abstain",
         "dirty",
+        "triage",
+        "triage_abstain",
         "row_watch",
         "actions",
         "confidence",
+        "diag_triage",
         "diag_confidence",
         "semantic",
         "p95_ms",
@@ -853,9 +881,12 @@ def write_scorecard(path, rows):
                     "contract": f'{num(row.get("contract_score")):.6f}',
                     "abstain": f'{num(row.get("abstention_score")):.6f}',
                     "dirty": f'{num(row.get("dirty_data_score")):.6f}',
+                    "triage": f'{num(row.get("triage_score")):.6f}' if metric_present(row, "triage_score") else "",
+                    "triage_abstain": f'{num(row.get("triage_abstention_score")):.6f}' if metric_present(row, "triage_abstention_score") else "",
                     "row_watch": f'{num(row.get("row_watch_score")):.6f}',
                     "actions": f'{num(row.get("typed_action_score")):.6f}',
                     "confidence": f'{num(row.get("confidence_score")):.6f}' if row.get("confidence_score") not in (None, "") else "",
+                    "diag_triage": f'{num(row.get("diagnostic_triage_accuracy")):.6f}' if metric_present(row, "diagnostic_triage_accuracy") else "",
                     "diag_confidence": f'{num(row.get("diagnostic_confidence_accuracy")):.6f}' if row.get("diagnostic_confidence_accuracy") not in (None, "") else "",
                     "semantic": f'{num(row.get("semantic_materialization_score")):.6f}',
                     "p95_ms": f'{num(row.get("p95_generate_ms")):.3f}',
@@ -905,6 +936,7 @@ def score_audit_rows(rows):
                 "contract": f'{num(row.get("contract_score")):.6f}',
                 "entity": f'{num(row.get("entity_accuracy")):.6f}',
                 "confidence": f'{num(row.get("confidence_score")):.6f}' if row.get("confidence_score") not in (None, "") else "",
+                "triage": f'{num(row.get("triage_score")):.6f}' if metric_present(row, "triage_score") else "",
                 "row_watch": f'{num(row.get("row_watch_score")):.6f}',
                 "semantic": f'{num(row.get("semantic_materialization_score")):.6f}',
                 "false_merge": f'{num(row.get("abstention_false_merge_rate")):.6f}',
@@ -937,6 +969,7 @@ def write_score_audit(path, rows):
         "contract",
         "entity",
         "confidence",
+        "triage",
         "row_watch",
         "semantic",
         "false_merge",
@@ -1046,7 +1079,7 @@ def write_index_readme(run_dir, context):
         "",
         "The public ranking keeps the newest scored row per current family/size lane. Superseded rows, unscored candidates, and models with no useful Otlet signal stay out of the README ranking",
         "",
-        f"Current coverage is {compact_count(cases_per_model_run)} direct gold cases per model run. The current fixture target is 112 deterministic pair cases per model plus row-watch and semantic checks",
+        f"Current coverage is {compact_count(cases_per_model_run)} scored cases per model run. The fixture target includes 112 deterministic pair cases, 30 triage cases, row-watch checks, and semantic checks",
         "",
         f"The runner skipped semantic and row-watch phases for {direct_gate_skip_count} scored {direct_gate_label} because direct schema-valid rate was below {min_direct_schema_rate:.2f}"
         if direct_gate_skip_count and min_direct_schema_rate is not None
@@ -1062,7 +1095,7 @@ def write_index_readme(run_dir, context):
                 {"name": "diagnostic_fit", "meaning": "partial signal from rejected or invalid attempts; never trusted state"},
                 {"name": "resource_fit", "meaning": "soft score for artifact size, resident RSS, latency, and active params"},
                 {"name": "first_blocker", "meaning": "first production gate that kept a model from default readiness"},
-                {"name": "default_candidate", "meaning": "passed the current production gate in this run"},
+                {"name": "default_candidate", "meaning": "passed the production gate with at least 3 same-run repeats"},
                 {"name": "triage_candidate", "meaning": "useful trusted output, but not default-ready"},
                 {"name": "row_watch_candidate", "meaning": "useful for watch-style row judgment, but not default-ready"},
                 {"name": "workload_candidate", "meaning": "production-readiness label for a useful non-default model"},
@@ -1075,7 +1108,7 @@ def write_index_readme(run_dir, context):
         "",
         "## Production Readiness",
         "",
-        "The default-model gate keeps non-passing models out of production rank. Useful partial models keep role labels and diagnostic evidence, but their production score is zero",
+        "The repeat-aware default-model gate keeps non-passing models out of production rank. Useful partial models keep role labels and diagnostic evidence, but their production score is zero",
         "",
         table(["rank", "model", "readiness", "production_score", "overall_fit", "gate", "first_blocker"], readiness_rows),
         "",
@@ -1133,7 +1166,8 @@ def write_index_readme(run_dir, context):
         "The score covers:",
         "",
         "- schema-valid trusted output",
-        "- explicit production gates before any default-model claim",
+        "- explicit production gates and repeat proof before any default-model claim",
+        "- non-ER triage decisions across flag, pass, abstain, and adversarial row-text cases",
         "- entity-resolution decisions across duplicates, hard negatives, sparse rows, dirty rows, and abstention cases",
         "- exact confidence targets, so overconfident or underconfident outputs do not get silent credit",
         "- typed actions with no source-table writes",
@@ -1151,7 +1185,7 @@ def write_index_readme(run_dir, context):
         "./scripts/otlet-demo.sh",
         "```",
         "",
-        f"Use the default model for normal harness iteration. The default set is intentionally small and evidence-based; today it is `{default_models}`:",
+        f"Use the default-included model set for normal harness iteration. The set is intentionally small and evidence-based; today it is `{default_models}`:",
         "",
         "```sh",
         f"OTLET_BENCH_LIMIT_MODELS={default_models} OTLET_BENCH_RUNS=1 OTLET_BENCH_PUBLISH_REPORT=1 ./benchmarks/run.sh",
@@ -1475,9 +1509,12 @@ def main():
                 "entity": f'{num(row.get("entity_resolution_score")):.3f}',
                 "abstain": f'{num(row.get("abstention_score")):.3f}',
                 "dirty": f'{num(row.get("dirty_data_score")):.3f}',
+                "triage": f'{num(row.get("triage_score")):.3f}' if metric_present(row, "triage_score") else "",
+                "triage_abstain": f'{num(row.get("triage_abstention_score")):.3f}' if metric_present(row, "triage_abstention_score") else "",
                 "row_watch": f'{num(row.get("row_watch_score")):.3f}',
                 "actions": f'{num(row.get("typed_action_score")):.3f}',
                 "confidence": f'{num(row.get("confidence_score")):.3f}' if row.get("confidence_score") not in (None, "") else "",
+                "diag_triage": f'{num(row.get("diagnostic_triage_accuracy")):.3f}' if metric_present(row, "diagnostic_triage_accuracy") else "",
                 "diag_actions": f'{num(row.get("diagnostic_action_accuracy")):.3f}',
                 "diag_confidence": f'{num(row.get("diagnostic_confidence_accuracy")):.3f}' if row.get("diagnostic_confidence_accuracy") not in (None, "") else "",
                 "semantic": f'{num(row.get("semantic_materialization_score")):.3f}',
@@ -1501,6 +1538,7 @@ def main():
                 "contract": f'{num(row.get("contract_score")):.3f}',
                 "entity": f'{num(row.get("entity_accuracy")):.3f}',
                 "abstain": f'{num(row.get("abstention_score")):.3f}',
+                "triage": f'{num(row.get("triage_score")):.3f}' if metric_present(row, "triage_score") else "",
                 "actions": f'{num(row.get("typed_action_score")):.3f}',
                 "confidence": f'{num(row.get("confidence_score")):.3f}' if row.get("confidence_score") not in (None, "") else "",
                 "semantic": f'{num(row.get("semantic_materialization_score")):.3f}',
@@ -1626,6 +1664,11 @@ def main():
     gate_passes = [row for row in ranked_summaries if gate_status(row) == "pass"]
     best_fit = gate_passes[0] if gate_passes else ranked_summaries[0] if ranked_summaries else {}
     best_trusted = max(report_summaries, key=lambda row: num(row.get("quality_score")), default={})
+    best_triage = max(
+        [row for row in scored_summaries if metric_present(row, "triage_score")],
+        key=lambda row: num(row.get("triage_score")),
+        default={},
+    )
     best_row_watch = max(report_summaries, key=lambda row: num(row.get("row_watch_score")), default={})
     if num(best_row_watch.get("row_watch_score")) <= 0:
         best_row_watch = {}
@@ -1730,6 +1773,11 @@ def main():
             f'- `{best_hard_case.get("model_key")}` has the best hard entity-resolution track score '
             f'({num(best_hard_case.get("entity_resolution_score")):.3f})'
         )
+    if best_triage and num(best_triage.get("triage_score")) > 0:
+        findings.append(
+            f'- `{best_triage.get("model_key")}` has the best triage phase score '
+            f'({num(best_triage.get("triage_score")):.3f})'
+        )
     if best_row_watch:
         findings.append(
             f'- `{best_row_watch.get("model_key")}` has the best row-watch score '
@@ -1741,7 +1789,7 @@ def main():
             f'({num(best_small.get("artifact_gb")):.3f} GB artifact, {score_label(best_small.get("trusted_fit_score"))} overall fit)'
         )
     default_limit = (
-        f'- `{best_fit.get("model_key")}` passed the production gate in this run; repeat with OTLET_BENCH_RUNS=3 before treating it as stable'
+        f'- `{best_fit.get("model_key")}` passed the production gate with at least 3 same-run repeats'
         if gate_passes and best_fit
         else "- No model passed the production gate, so the report does not recommend a default model"
     )
@@ -1795,6 +1843,12 @@ def main():
             workload_caveat(best_row_watch) if best_row_watch else "not proven; direct schema gate skipped row-watch phase",
         ),
         winner_row(
+            "triage",
+            best_triage,
+            f'{num(best_triage.get("triage_score")):.3f}',
+            workload_caveat(best_triage) if best_triage else "not scored in this run",
+        ),
+        winner_row(
             "<=2.0 GB artifact",
             best_small,
             score_label(best_small.get("trusted_fit_score")),
@@ -1813,9 +1867,9 @@ def main():
         "",
         "This benchmark scores current local GGUF models as Otlet workers inside Postgres. Each case provides the evidence in source rows. The score measures strict JSON, trusted actions, row watching, receipts, semantic materialization, stale safety, EXPLAIN visibility, latency, memory, and artifact size",
         "",
-        "`production_score` is zero until a model passes every production gate. `overall_fit` is the broad Otlet research score: trusted output quality with a soft resource adjustment for artifact GB, resident RSS, p95 latency, and active params. `diagnostic_fit` is separate and can read compact fields from rejected attempts. Invalid JSON never becomes trusted Otlet state",
+        "`production_score` is zero until a model passes every production gate with at least 3 same-run repeats. `overall_fit` is the broad Otlet research score: trusted output quality with a soft resource adjustment for artifact GB, resident RSS, p95 latency, and active params. `diagnostic_fit` is separate and can read compact fields from rejected attempts. Invalid JSON never becomes trusted Otlet state",
         "",
-        "The public report uses the current comparable scored set: the default model plus current-family models with nonzero trusted fit. For the same family and size class, keep only the newest version in regular reports, such as Qwen3.5 4B over Qwen3 4B. Zero-score, unscored, superseded, and manual-only rows stay out of the public ranking",
+        "The public report uses the current comparable scored set: default-included models plus current-family models with nonzero trusted fit. For the same family and size class, keep only the newest version in regular reports, such as Qwen3.5 4B over Qwen3 4B. Zero-score, unscored, superseded, and manual-only rows stay out of the public ranking",
         "",
         "## Findings",
         "",
@@ -1845,7 +1899,7 @@ def main():
                 {"key": "raw_model_run_rows", "value": len(report_raw_summaries)},
                 {"key": "case_rows", "value": len(report_cases)},
                 {
-                    "key": "direct_gold_cases_per_model_run",
+                    "key": "scored_cases_per_model_run",
                     "value": compact_count(cases_per_model_run),
                 },
                 {"key": "repeat_count_range", "value": f"{min_repeats:.0f}-{max_repeats:.0f}"},
@@ -1860,9 +1914,9 @@ def main():
         "",
         "## Score Contract",
         "",
-        "A model must pass the production gate before it can be called a default Otlet model. The gate requires no worker crash, no source-table mutation, no stale leak, schema >= 0.95, contract >= 0.95, exact confidence target accuracy >= 0.95, entity >= 0.80, zero false merges, hallucinated trusted actions <= 0.01, and semantic materialization >= 0.95",
+        "A model must pass the production gate with at least 3 same-run repeats before it can be called a default Otlet model. The gate requires no worker crash, no source-table mutation, no stale leak, schema >= 0.95, contract >= 0.95, exact confidence target accuracy >= 0.95, entity >= 0.80, triage >= 0.80, zero false merges, hallucinated trusted actions <= 0.01, semantic materialization >= 0.95, and repeat_count >= 3",
         "",
-        "`overall_fit = trusted_quality * (0.75 + 0.25 * resource_fit)` for a single run. `production_score = overall_fit` only when the production gate passes; otherwise it is 0.000. `resource_fit` weights artifact GB 40%, resident RSS 30%, p95 latency 20%, and active params 10%. The targets are <=2.0 GB artifact, <=2.5 GB resident RSS, <=20s p95 generation, and <=3B active params. A model over a target is discounted by target/value instead of zeroed out. Repeated models rank by their worst overall-fit repeat; the scorecard shows mean, min, max, and standard deviation. `diagnostic_fit` uses the same soft resource adjustment but starts from diagnostic fields",
+        "`overall_fit = trusted_quality * (0.75 + 0.25 * resource_fit)` for a single run. `production_score = overall_fit` only when the production gate and repeat proof pass; otherwise it is 0.000. `trusted_quality` includes contract, entity-resolution, abstention, dirty-data, triage, row-watch, typed-action, semantic-materialization, and confidence scores. `resource_fit` weights artifact GB 40%, resident RSS 30%, p95 latency 20%, and active params 10%. The targets are <=2.0 GB artifact, <=2.5 GB resident RSS, <=20s p95 generation, and <=3B active params. A model over a target is discounted by target/value instead of zeroed out. Repeated models rank by their worst overall-fit repeat; the scorecard shows mean, min, max, and standard deviation. `diagnostic_fit` uses the same soft resource adjustment but starts from diagnostic fields",
         "",
         "## Score Audit",
         "",
@@ -1880,7 +1934,7 @@ def main():
         "",
         "## Production Readiness",
         "",
-        "The default-model gate sets `production_score` to zero for non-passing models, even when `overall_fit` or a workload role is useful",
+        "The repeat-aware default-model gate sets `production_score` to zero for non-passing models, even when `overall_fit` or a workload role is useful",
         "",
         table(["rank", "model", "readiness", "production_score", "overall_fit", "gate", "first_blocker"], readiness_rows),
         "",
@@ -1910,7 +1964,7 @@ def main():
         "",
         "## Gate Summary",
         "",
-        table(["model", "runs", "verdict", "gate", "failed_gate", "schema", "contract", "confidence", "entity", "abstain", "actions", "semantic"], gate_rows),
+        table(["model", "runs", "verdict", "gate", "failed_gate", "schema", "contract", "confidence", "entity", "abstain", "triage", "actions", "semantic"], gate_rows),
         "",
         "## Out Of Running",
         "",
@@ -1960,7 +2014,7 @@ def main():
         "",
         "## Track Breakdown",
         "",
-        table(["model", "contract", "entity", "abstain", "dirty", "row_watch", "actions", "confidence", "diag_actions", "diag_confidence", "semantic"], track_rows),
+        table(["model", "contract", "entity", "abstain", "dirty", "triage", "triage_abstain", "row_watch", "actions", "confidence", "diag_triage", "diag_actions", "diag_confidence", "semantic"], track_rows),
         "",
         "## Selected Failure Examples",
         "",

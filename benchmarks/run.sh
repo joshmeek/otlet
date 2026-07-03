@@ -227,11 +227,14 @@ CREATE TABLE IF NOT EXISTS otlet_bench_source.model_summary (
   entity_resolution_score numeric NOT NULL DEFAULT 0,
   abstention_score numeric NOT NULL DEFAULT 0,
   dirty_data_score numeric NOT NULL DEFAULT 0,
+  triage_score numeric NOT NULL DEFAULT 0,
+  triage_abstention_score numeric NOT NULL DEFAULT 0,
   row_watch_score numeric NOT NULL DEFAULT 0,
   typed_action_score numeric NOT NULL DEFAULT 0,
   semantic_materialization_score numeric NOT NULL DEFAULT 0,
   confidence_score numeric NOT NULL DEFAULT 0,
   diagnostic_entity_accuracy numeric NOT NULL DEFAULT 0,
+  diagnostic_triage_accuracy numeric NOT NULL DEFAULT 0,
   diagnostic_action_accuracy numeric NOT NULL DEFAULT 0,
   diagnostic_confidence_accuracy numeric NOT NULL DEFAULT 0,
   diagnostic_quality_score numeric NOT NULL DEFAULT 0,
@@ -250,7 +253,10 @@ ALTER TABLE otlet_bench_source.model_summary
   ADD COLUMN IF NOT EXISTS trusted_quality numeric NOT NULL DEFAULT 0,
   ADD COLUMN IF NOT EXISTS resource_fit numeric NOT NULL DEFAULT 0,
   ADD COLUMN IF NOT EXISTS overall_fit numeric NOT NULL DEFAULT 0,
-  ADD COLUMN IF NOT EXISTS diagnostic_fit numeric NOT NULL DEFAULT 0;
+  ADD COLUMN IF NOT EXISTS diagnostic_fit numeric NOT NULL DEFAULT 0,
+  ADD COLUMN IF NOT EXISTS triage_score numeric NOT NULL DEFAULT 0,
+  ADD COLUMN IF NOT EXISTS triage_abstention_score numeric NOT NULL DEFAULT 0,
+  ADD COLUMN IF NOT EXISTS diagnostic_triage_accuracy numeric NOT NULL DEFAULT 0;
 SQL
 }
 
@@ -688,13 +694,14 @@ score_model_run() {
   local artifact_bytes="${13}"
   local external_artifact="${14}"
   local direct_task="${15}"
-  local join_task="${16}"
-  local row_task="${17}"
-  local join_index="${18}"
-  local wall_ms="${19}"
-  local source_unchanged="${20}"
-  local stale_leak_count="${21}"
-  local worker_crash_count="${22}"
+  local triage_task="${16}"
+  local join_task="${17}"
+  local row_task="${18}"
+  local join_index="${19}"
+  local wall_ms="${20}"
+  local source_unchanged="${21}"
+  local stale_leak_count="${22}"
+  local worker_crash_count="${23}"
 
   psql_file "$script_dir/scoring.sql" \
     -v run_id="$run_id" \
@@ -712,6 +719,7 @@ score_model_run() {
     -v artifact_bytes="$artifact_bytes" \
     -v external_artifact="$external_artifact" \
     -v direct_task="$direct_task" \
+    -v triage_task="$triage_task" \
     -v join_task="$join_task" \
     -v row_task="$row_task" \
     -v join_index="$join_index" \
@@ -821,6 +829,7 @@ run_one_model() {
   fi
 
   local direct_task="${run_id}_${run_model_key}_direct"
+  local triage_task="${run_id}_${run_model_key}_triage"
   local join_index="${run_id}_${run_model_key}_join"
   local join_task="${join_index}_task"
   local row_index="${run_id}_${run_model_key}_row"
@@ -851,6 +860,7 @@ run_one_model() {
   if ! psql_file "$script_dir/fixtures.sql" \
     -v model_name="$model_name" \
     -v direct_task="$direct_task" \
+    -v triage_task="$triage_task" \
     -v join_index="$join_index" \
     -v row_index="$row_index" >/dev/null; then
     fail_current_model "fixture setup failed"
@@ -871,6 +881,18 @@ SQL
   fi
   if ! wait_for_task "$direct_task"; then
     fail_current_model "direct task timed out"
+    return
+  fi
+
+  if ! psql_exec -v task_name="$triage_task" >/dev/null <<'SQL'
+SELECT otlet.run_task(:'task_name');
+SQL
+  then
+    fail_current_model "triage task enqueue failed"
+    return
+  fi
+  if ! wait_for_task "$triage_task"; then
+    fail_current_model "triage task timed out"
     return
   fi
 
@@ -913,6 +935,7 @@ SQL
       "$artifact_bytes" \
       "$external_artifact" \
       "$direct_task" \
+      "$triage_task" \
       "$join_task" \
       "$row_task" \
       "$join_index" \
@@ -1010,6 +1033,7 @@ SQL
     "$artifact_bytes" \
     "$external_artifact" \
     "$direct_task" \
+    "$triage_task" \
     "$join_task" \
     "$row_task" \
     "$join_index" \

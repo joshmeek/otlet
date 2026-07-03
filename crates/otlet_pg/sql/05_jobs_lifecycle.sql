@@ -1117,15 +1117,16 @@ AS $$
     l.id,
     'otlet_eval_labels_generated'::text,
     CASE
-      WHEN l.expected_action_type = 'merge_candidate'
-        AND l.expected_match = 'same_entity' THEN 'positive_duplicate'
       WHEN a.action_type = 'merge_candidate'
-        AND l.expected_match = 'different_entity' THEN 'false_merge'
+        AND l.expected_match <> 'same_entity' THEN 'false_trusted'
+      WHEN l.label_source = 'manual_correction' THEN 'gold'
+      WHEN l.expected_action_type = 'merge_candidate'
+        AND l.expected_match = 'same_entity' THEN 'positive'
       WHEN l.expected_action_type = 'new_entity'
         AND l.expected_match = 'different_entity' THEN 'hard_negative'
       WHEN l.expected_action_type = 'review_flag'
         OR l.expected_match = 'unclear' THEN 'abstention'
-      ELSE 'entity_resolution'
+      ELSE 'gold'
     END,
     l.label_source = 'manual_correction',
     l.source_table,

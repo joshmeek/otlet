@@ -6,7 +6,7 @@ Read this ranking first. `overall_fit` is trusted Otlet quality with a soft reso
 
 | rank | model | role | overall_fit | trusted_quality | diagnostic_fit | resource_fit | first_blocker |
 | ---: | --- | --- | ---: | ---: | ---: | ---: | --- |
-| 1 | qwen35_4b | default_candidate | 0.948 | 0.999 | 0.949 | 0.799 |  |
+| 1 | qwen35_4b | eligible_candidate | 0.948 | 0.999 | 0.949 | 0.799 | repeat_count < 3 |
 | 2 | gemma4_e2b | triage_candidate | 0.745 | 0.791 | 0.866 | 0.768 | confidence < 0.95 |
 | 3 | gemma4_e4b | triage_candidate | 0.675 | 0.756 | 0.796 | 0.568 | confidence < 0.95 |
 | 4 | phi4_mini | row_watch_candidate | 0.668 | 0.700 | 0.777 | 0.822 | confidence < 0.95 |
@@ -30,7 +30,7 @@ A model can show `overall_fit=0.000` when it produced no trusted schema-valid ou
 
 The public ranking keeps the newest scored row per current family/size lane. Superseded rows, unscored candidates, and models with no useful Otlet signal stay out of the README ranking
 
-Current coverage is 112 direct gold cases per model run. The current fixture target is 112 deterministic pair cases per model plus row-watch and semantic checks
+Current published coverage is 112 direct gold cases per model run. The harness now defines 112 deterministic pair cases plus 30 triage cases; the next published benchmark run will include the triage rows
 
 ## Columns And Roles
 
@@ -41,7 +41,7 @@ Current coverage is 112 direct gold cases per model run. The current fixture tar
 | diagnostic_fit | partial signal from rejected or invalid attempts; never trusted state |
 | resource_fit | soft score for artifact size, resident RSS, latency, and active params |
 | first_blocker | first production gate that kept a model from default readiness |
-| default_candidate | passed the current production gate in this run |
+| default_candidate | passed the production gate with at least 3 same-run repeats |
 | triage_candidate | useful trusted output, but not default-ready |
 | row_watch_candidate | useful for watch-style row judgment, but not default-ready |
 | workload_candidate | production-readiness label for a useful non-default model |
@@ -50,9 +50,10 @@ Current coverage is 112 direct gold cases per model run. The current fixture tar
 
 | workload | model | metric | gate | caveat |
 | --- | --- | --- | --- | --- |
-| default Otlet model | qwen35_4b | 0.948 | pass | production gate passed |
-| hard entity resolution | qwen35_4b | 1.000 | pass | production gate passed |
+| default Otlet model |  |  |  | no model has 3-run repeat proof |
+| hard entity resolution | qwen35_4b | 1.000 | fail | needs repeat proof before a default claim |
 | row watching | ministral3_3b | 0.991 | fail | not a default model unless gate passes |
+| triage |  |  |  | latest published run predates triage scoring |
 | <=2.0 GB artifact |  |  |  | no current overall-fit row |
 | correct jobs/sec/GB | gemma4_e2b | 0.012 | fail | compare timing after one same-run sweep |
 
@@ -62,7 +63,7 @@ The default-model gate keeps non-passing models out of production rank. Useful p
 
 | rank | model | readiness | production_score | overall_fit | gate | first_blocker |
 | ---: | --- | --- | ---: | ---: | --- | --- |
-| 1 | qwen35_4b | default_ready | 0.948 | 0.948 | pass |  |
+| 1 | qwen35_4b | needs_repeat_proof | 0.000 | 0.948 | fail | repeat_count < 3 |
 | 2 | gemma4_e2b | workload_candidate | 0.000 | 0.745 | fail | confidence < 0.95 |
 | 3 | gemma4_e4b | workload_candidate | 0.000 | 0.675 | fail | confidence < 0.95 |
 | 4 | phi4_mini | workload_candidate | 0.000 | 0.668 | fail | confidence < 0.95 |
@@ -82,7 +83,7 @@ The default-model gate keeps non-passing models out of production rank. Useful p
 
 | rank | model | runs | readiness | overall_fit | trusted_quality | schema | p95_ms | rss_gb | artifact_gb |
 | ---: | --- | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| 1 | qwen35_4b | 1 | default_ready | 0.948 | 0.999 | 1.000 | 9000 | 3.227 | 2.741 |
+| 1 | qwen35_4b | 1 | needs_repeat_proof | 0.948 | 0.999 | 1.000 | 9000 | 3.227 | 2.741 |
 | 2 | gemma4_e2b | 1 | workload_candidate | 0.745 | 0.791 | 0.848 | 3197 | 3.568 | 3.107 |
 | 3 | gemma4_e4b | 1 | workload_candidate | 0.675 | 0.756 | 0.777 | 10432 | 5.665 | 4.977 |
 | 4 | phi4_mini | 1 | workload_candidate | 0.668 | 0.700 | 1.000 | 9174 | 3.379 | 2.492 |
@@ -111,8 +112,9 @@ The suite measures Otlet fit, not background model knowledge. Each case puts the
 The score covers:
 
 - schema-valid trusted output
-- explicit production gates before any default-model claim
+- explicit production gates and repeat proof before any default-model claim
 - entity-resolution decisions across duplicates, hard negatives, sparse rows, dirty rows, and abstention cases
+- non-ER triage decisions across flag, pass, abstain, and adversarial row-text cases
 - exact confidence targets, so overconfident or underconfident outputs do not get silent credit
 - typed actions with no source-table writes
 - row-watch classification
@@ -129,7 +131,7 @@ Start from the normal Otlet proof path:
 ./scripts/otlet-demo.sh
 ```
 
-Use the default model for normal harness iteration. The default set is intentionally small and evidence-based; today it is `qwen35_4b`:
+Use the default-included model set for normal harness iteration. The set is intentionally small and evidence-based; today it is `qwen35_4b`:
 
 ```sh
 OTLET_BENCH_LIMIT_MODELS=qwen35_4b OTLET_BENCH_RUNS=1 OTLET_BENCH_PUBLISH_REPORT=1 ./benchmarks/run.sh
