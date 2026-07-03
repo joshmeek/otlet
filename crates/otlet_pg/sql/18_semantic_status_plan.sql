@@ -33,6 +33,7 @@ CREATE FUNCTION otlet.semantic_index_plan(
   checked_at timestamptz
 )
 LANGUAGE plpgsql
+VOLATILE
 AS $$
 DECLARE
   index_row otlet.semantic_indexes%ROWTYPE;
@@ -50,6 +51,8 @@ BEGIN
   IF NOT FOUND THEN
     RAISE EXCEPTION 'otlet semantic index % does not exist', semantic_index_plan.index_name;
   END IF;
+
+  PERFORM otlet.mark_semantic_schema_drift(index_row.name);
 
   SELECT otlet.task_contract_hash(
     t.instruction,

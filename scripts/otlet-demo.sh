@@ -531,6 +531,25 @@ echo "row_scoped_contract=$row_scoped_fresh_after|$row_scoped_match_after|$row_s
   echo "Expected scoped watch to stay fresh with unchanged receipts after unrelated column change, got $row_scoped_fresh_after|$row_scoped_match_after|$row_scoped_receipts_before|$row_scoped_receipts_after|$row_scoped_columns" >&2
   exit 1
 }
+psql_exec >/dev/null <<'SQL'
+ALTER TABLE public.otlet_demo_scoped_signal
+DROP COLUMN signal;
+SQL
+row_schema_drift_contract="$(psql_value "
+SELECT count(*)::text
+FROM otlet.semantic_index_current_rows('$row_scoped_watch', true);
+SELECT (count(*) FILTER (WHERE stale AND stale_reason = 'schema_drift') >= 1)::text
+FROM otlet.semantic_materializations
+WHERE task_name = '$row_scoped_task'
+  AND subject_id = 'scoped-1';
+")"
+row_schema_drift_fresh="$(head -n 1 <<<"$row_schema_drift_contract")"
+row_schema_drift_reason="$(tail -n 1 <<<"$row_schema_drift_contract")"
+echo "row_schema_drift_contract=$row_schema_drift_fresh|$row_schema_drift_reason"
+[ "$row_schema_drift_fresh|$row_schema_drift_reason" = "0|true" ] || {
+  echo "Expected dropped scoped input column to write schema_drift and fail closed, got $row_schema_drift_fresh|$row_schema_drift_reason" >&2
+  exit 1
+}
 
 queue_suppression_output="$(psql_value "
 BEGIN;

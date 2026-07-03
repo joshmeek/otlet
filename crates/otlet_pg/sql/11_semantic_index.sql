@@ -260,6 +260,64 @@ BEGIN
 END;
 $$;
 
+CREATE FUNCTION otlet.mark_semantic_schema_drift(
+  index_name text
+) RETURNS bigint
+LANGUAGE plpgsql
+VOLATILE
+AS $$
+DECLARE
+  index_row otlet.semantic_indexes%ROWTYPE;
+  updated_count bigint := 0;
+BEGIN
+  SELECT *
+  INTO index_row
+  FROM otlet.semantic_indexes si
+  WHERE si.name = mark_semantic_schema_drift.index_name;
+
+  IF NOT FOUND OR index_row.input_columns IS NULL THEN
+    RETURN 0;
+  END IF;
+
+  EXECUTE format(
+    $sql$
+      WITH current_rows AS (
+        SELECT
+          (src.%1$I)::text AS subject_id,
+          to_jsonb(src) AS row_data
+        FROM %2$s AS src
+      ),
+      drift_subjects AS (
+        SELECT cr.subject_id
+        FROM current_rows cr
+        WHERE EXISTS (
+          SELECT 1
+          FROM unnest(%3$L::text[]) AS expected(column_name)
+          WHERE NOT (cr.row_data ? expected.column_name)
+        )
+      )
+      UPDATE otlet.semantic_materializations sm
+      SET stale = true,
+          stale_reason = 'schema_drift',
+          updated_at = now()
+      FROM drift_subjects ds
+      WHERE sm.task_name = %4$L
+        AND sm.record_type = %5$L
+        AND sm.subject_id = ds.subject_id
+        AND sm.stale_reason IS DISTINCT FROM 'schema_drift'
+    $sql$,
+    index_row.subject_column,
+    index_row.source_table,
+    index_row.input_columns,
+    index_row.task_name,
+    index_row.record_type
+  );
+
+  GET DIAGNOSTICS updated_count = ROW_COUNT;
+  RETURN updated_count;
+END;
+$$;
+
 CREATE FUNCTION otlet.materialize_semantic_index(
   index_name text
 ) RETURNS bigint
@@ -499,7 +557,7 @@ CREATE FUNCTION otlet.semantic_index_current_rows(
   updated_at timestamptz
 )
 LANGUAGE plpgsql
-STABLE
+VOLATILE
 AS $$
 DECLARE
   index_row otlet.semantic_indexes%ROWTYPE;
@@ -513,6 +571,8 @@ BEGIN
   IF NOT FOUND THEN
     RAISE EXCEPTION 'otlet semantic index % does not exist', semantic_index_current_rows.index_name;
   END IF;
+
+  PERFORM otlet.mark_semantic_schema_drift(index_row.name);
 
   SELECT otlet.task_contract_hash(
     t.instruction,
