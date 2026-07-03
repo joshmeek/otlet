@@ -466,7 +466,8 @@ $$;
 CREATE FUNCTION otlet.action_validation_error(
   action jsonb,
   output jsonb DEFAULT NULL,
-  job_subject_id text DEFAULT NULL
+  job_subject_id text DEFAULT NULL,
+  job_input jsonb DEFAULT NULL
 ) RETURNS text
 LANGUAGE plpgsql
 STABLE
@@ -510,7 +511,13 @@ BEGIN
     RETURN 'action body must be an object';
   END IF;
 
-  IF job_subject_id LIKE '%:%' THEN
+  expected_left_id := NULLIF(job_input #>> '{action_ids,left_id}', '');
+  expected_right_id := NULLIF(job_input #>> '{action_ids,right_id}', '');
+
+  IF expected_left_id IS NULL
+     AND expected_right_id IS NULL
+     AND job_subject_id LIKE '%:%'
+     AND array_length(string_to_array(job_subject_id, ':'), 1) = 2 THEN
     expected_left_id := split_part(job_subject_id, ':', 1);
     expected_right_id := split_part(job_subject_id, ':', 2);
   END IF;
@@ -774,7 +781,7 @@ BEGIN
       ELSE '{}'::jsonb
     END;
     action_type_name := COALESCE(NULLIF(action ->> 'type', ''), 'invalid');
-    action_error := otlet.action_validation_error(action, complete_job.output, job_row.subject_id);
+    action_error := otlet.action_validation_error(action, complete_job.output, job_row.subject_id, job_row.input);
     action_requires_approval := false;
     action_creates_record := false;
     IF action_error IS NULL THEN

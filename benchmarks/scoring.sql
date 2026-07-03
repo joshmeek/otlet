@@ -620,6 +620,18 @@ SELECT
   :'cleanup_policy'
 FROM fit_metrics;
 
+DO $$
+DECLARE
+  violation_count bigint;
+BEGIN
+  SELECT count(*) INTO violation_count
+  FROM otlet.verify_invariants();
+
+  IF violation_count <> 0 THEN
+    RAISE EXCEPTION 'otlet invariant violations after benchmark scoring: %', violation_count;
+  END IF;
+END $$;
+
 SELECT
   model_key,
   total_cases,

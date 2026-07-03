@@ -81,7 +81,6 @@ BEGIN
     AND (
       mark_semantic_stale.subject_id IS NULL
       OR sm.subject_id = mark_semantic_stale.subject_id
-      OR mark_semantic_stale.subject_id = ANY(string_to_array(sm.subject_id, ':'))
     );
 
   GET DIAGNOSTICS marked = ROW_COUNT;

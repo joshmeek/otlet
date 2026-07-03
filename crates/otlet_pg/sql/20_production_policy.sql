@@ -274,6 +274,289 @@ GROUP BY
   recent.skip_cheap,
   recent.probe_due;
 
+CREATE FUNCTION otlet.verify_invariants()
+RETURNS TABLE (
+  invariant_name text,
+  object_type text,
+  object_id text,
+  detail jsonb
+)
+LANGUAGE plpgsql
+VOLATILE
+AS $$
+DECLARE
+  index_row record;
+  join_row record;
+  current_contract_hash text;
+BEGIN
+  RETURN QUERY
+  SELECT
+    'one_accepted_output_per_job'::text,
+    'job'::text,
+    o.job_id::text,
+    jsonb_build_object('output_count', count(*))
+  FROM otlet.outputs o
+  GROUP BY o.job_id
+  HAVING count(*) > 1;
+
+  RETURN QUERY
+  SELECT
+    'every_output_has_accepted_receipt'::text,
+    'output'::text,
+    o.id::text,
+    jsonb_build_object(
+      'job_id', o.job_id,
+      'receipt_id', o.receipt_id,
+      'receipt_status', r.status,
+      'selection_status', r.selection_status,
+      'schema_validation_status', r.schema_validation_status,
+      'receipt_job_id', r.job_id,
+      'job_status', j.status
+    )
+  FROM otlet.outputs o
+  LEFT JOIN otlet.inference_receipts r ON r.id = o.receipt_id
+  LEFT JOIN otlet.jobs j ON j.id = o.job_id
+  WHERE r.id IS NULL
+     OR r.job_id IS DISTINCT FROM o.job_id
+     OR r.status IS DISTINCT FROM 'complete'
+     OR r.selection_status IS DISTINCT FROM 'accepted'
+     OR r.schema_validation_status IS DISTINCT FROM 'passed'
+     OR j.status IS DISTINCT FROM 'complete';
+
+  RETURN QUERY
+  SELECT
+    'no_action_without_receipt_lineage'::text,
+    'action'::text,
+    a.id::text,
+    jsonb_build_object(
+      'job_id', a.job_id,
+      'output_id', a.output_id,
+      'receipt_id', a.receipt_id,
+      'receipt_job_id', r.job_id,
+      'output_job_id', o.job_id,
+      'output_receipt_id', o.receipt_id
+    )
+  FROM otlet.actions a
+  LEFT JOIN otlet.inference_receipts r ON r.id = a.receipt_id
+  LEFT JOIN otlet.outputs o ON o.id = a.output_id
+  WHERE a.receipt_id IS NULL
+     OR r.id IS NULL
+     OR r.job_id IS DISTINCT FROM a.job_id
+     OR a.output_id IS NULL
+     OR o.id IS NULL
+     OR o.job_id IS DISTINCT FROM a.job_id
+     OR o.receipt_id IS DISTINCT FROM a.receipt_id;
+
+  RETURN QUERY
+  SELECT
+    'no_applied_action_without_approval'::text,
+    'action'::text,
+    a.id::text,
+    jsonb_build_object(
+      'action_type', a.action_type,
+      'status', a.status,
+      'approval_status', a.approval_status,
+      'apply_status', a.apply_status
+    )
+  FROM otlet.actions a
+  WHERE a.apply_status = 'applied'
+    AND a.approval_status IS DISTINCT FROM 'approved';
+
+  FOR index_row IN
+    SELECT
+      si.name,
+      si.task_name,
+      si.source_table,
+      si.subject_column,
+      si.input_columns,
+      si.record_type,
+      t.instruction,
+      t.output_schema,
+      t.model_name,
+      t.runtime_options,
+      t.input_shaping,
+      t.decision_contract
+    FROM otlet.semantic_indexes si
+    JOIN otlet.tasks t ON t.name = si.task_name
+  LOOP
+    current_contract_hash := otlet.task_contract_hash(
+      index_row.instruction,
+      index_row.output_schema,
+      index_row.model_name,
+      index_row.runtime_options,
+      index_row.input_shaping,
+      index_row.decision_contract
+    );
+
+    BEGIN
+      RETURN QUERY EXECUTE format(
+        $sql$
+          WITH current_inputs AS (
+            SELECT
+              (src.%1$I)::text AS subject_id,
+              jsonb_build_object(
+                '_otlet_mvcc', jsonb_build_object(
+                  'table', %2$L,
+                  'subject_id', (src.%1$I)::text,
+                  'ctid', src.ctid::text,
+                  'xmin', src.xmin::text
+                ),
+                'table', %2$L,
+                'row', otlet.semantic_project_row(to_jsonb(src), %6$L::text[])
+              ) AS input
+            FROM %3$s AS src
+          ),
+          current_hashes AS (
+            SELECT DISTINCT ON (subject_id)
+              subject_id,
+              otlet.semantic_content_hash(input) AS content_hash
+            FROM current_inputs
+            ORDER BY subject_id, input::text
+          )
+          SELECT
+            'fresh_materialization_content_hash_matches_source'::text,
+            'semantic_materialization'::text,
+            sm.id::text,
+            jsonb_build_object(
+              'semantic_index', %8$L,
+              'task_name', sm.task_name,
+              'record_type', sm.record_type,
+              'source_table', sm.source_table,
+              'subject_id', sm.subject_id,
+              'stored_content_hash', sm.content_hash,
+              'current_content_hash', ch.content_hash,
+              'stored_contract_hash', sm.contract_hash,
+              'current_contract_hash', %7$L
+            )
+          FROM otlet.semantic_materializations sm
+          LEFT JOIN current_hashes ch ON ch.subject_id = sm.subject_id
+          WHERE sm.task_name = %4$L
+            AND sm.record_type = %5$L
+            AND sm.source_table = %2$L
+            AND sm.stale = false
+            AND (
+              ch.subject_id IS NULL
+              OR sm.content_hash IS DISTINCT FROM ch.content_hash
+              OR sm.contract_hash IS DISTINCT FROM %7$L
+            )
+        $sql$,
+        index_row.subject_column,
+        index_row.source_table,
+        index_row.source_table,
+        index_row.task_name,
+        index_row.record_type,
+        index_row.input_columns,
+        current_contract_hash,
+        index_row.name
+      );
+    EXCEPTION WHEN OTHERS THEN
+      RETURN QUERY
+      SELECT
+        'fresh_materialization_source_query_runs'::text,
+        'semantic_index'::text,
+        index_row.name::text,
+        jsonb_build_object(
+          'task_name', index_row.task_name,
+          'source_table', index_row.source_table,
+          'error', SQLERRM
+        );
+    END;
+  END LOOP;
+
+  FOR join_row IN
+    SELECT
+      sji.name,
+      sji.task_name,
+      sji.candidate_query,
+      sji.record_type,
+      sji.max_candidate_rows,
+      t.instruction,
+      t.output_schema,
+      t.model_name,
+      t.runtime_options,
+      t.input_shaping,
+      t.decision_contract
+    FROM otlet.semantic_join_indexes sji
+    JOIN otlet.tasks t ON t.name = sji.task_name
+  LOOP
+    current_contract_hash := otlet.task_contract_hash(
+      join_row.instruction,
+      join_row.output_schema,
+      join_row.model_name,
+      join_row.runtime_options,
+      join_row.input_shaping,
+      join_row.decision_contract
+    );
+
+    BEGIN
+      RETURN QUERY EXECUTE format(
+        $sql$
+          WITH current_inputs AS (
+            SELECT subject_id, input
+            FROM (
+              SELECT subject_id::text AS subject_id, input::jsonb AS input
+              FROM (%1$s) otlet_join_candidate
+              ORDER BY subject_id
+              LIMIT %2$s
+            ) otlet_join_input
+          ),
+          current_hashes AS (
+            SELECT DISTINCT ON (subject_id)
+              subject_id,
+              otlet.semantic_content_hash(input) AS content_hash
+            FROM current_inputs
+            ORDER BY subject_id, input::text
+          )
+          SELECT
+            'fresh_materialization_content_hash_matches_source'::text,
+            'semantic_materialization'::text,
+            sm.id::text,
+            jsonb_build_object(
+              'semantic_join_index', %6$L,
+              'task_name', sm.task_name,
+              'record_type', sm.record_type,
+              'source_table', sm.source_table,
+              'subject_id', sm.subject_id,
+              'stored_content_hash', sm.content_hash,
+              'current_content_hash', ch.content_hash,
+              'stored_contract_hash', sm.contract_hash,
+              'current_contract_hash', %5$L
+            )
+          FROM otlet.semantic_materializations sm
+          LEFT JOIN current_hashes ch ON ch.subject_id = sm.subject_id
+          WHERE sm.task_name = %3$L
+            AND sm.record_type = %4$L
+            AND sm.source_table = %7$L
+            AND sm.stale = false
+            AND (
+              ch.subject_id IS NULL
+              OR sm.content_hash IS DISTINCT FROM ch.content_hash
+              OR sm.contract_hash IS DISTINCT FROM %5$L
+            )
+        $sql$,
+        join_row.candidate_query,
+        join_row.max_candidate_rows,
+        join_row.task_name,
+        join_row.record_type,
+        current_contract_hash,
+        join_row.name,
+        'otlet.semantic_join:' || join_row.name
+      );
+    EXCEPTION WHEN OTHERS THEN
+      RETURN QUERY
+      SELECT
+        'fresh_materialization_source_query_runs'::text,
+        'semantic_join_index'::text,
+        join_row.name::text,
+        jsonb_build_object(
+          'task_name', join_row.task_name,
+          'error', SQLERRM
+        );
+    END;
+  END LOOP;
+END;
+$$;
+
 CREATE VIEW otlet.production_status AS
 WITH queue AS (
   SELECT

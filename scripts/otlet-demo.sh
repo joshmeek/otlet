@@ -547,6 +547,137 @@ SQL
   exit 1
 }
 
+invalid_json_task="invalid_json_safety_demo"
+cleanup_task "$invalid_json_task"
+psql_exec -v task_name="$invalid_json_task" -v model_name="$strong_model_name" >/dev/null <<'SQL'
+SELECT otlet.create_task(
+  :'task_name',
+  $source$
+    SELECT 'invalid-json-1'::text AS subject_id, '{}'::jsonb AS input
+  $source$::text,
+  'Return JSON only.',
+  '{"type":"object","required":["status"],"additionalProperties":false,"properties":{"status":{"enum":["ok"]}}}'::jsonb,
+  :'model_name',
+  '{"max_tokens":32,"reasoning":"off","inference_cache":false}'::jsonb
+);
+CREATE TEMP TABLE invalid_json_claim AS
+WITH inserted AS (
+  INSERT INTO otlet.jobs (task_name, subject_id, input, status, attempts, started_at, leased_until)
+  VALUES (:'task_name', 'invalid-json-1', '{}'::jsonb, 'running', 1, now(), now() + interval '5 minutes')
+  RETURNING id
+)
+SELECT id FROM inserted;
+SELECT otlet.fail_job(
+  id,
+  'invalid model JSON: expected object',
+  'not json',
+  NULL,
+  NULL,
+  NULL,
+  md5('not json'),
+  now(),
+  'failed',
+  '{"schema_validation_status":"failed"}'::jsonb,
+  :'model_name',
+  'direct',
+  'failed',
+  'invalid_model_json'
+)
+FROM invalid_json_claim;
+SQL
+invalid_json_contract="$(psql_value "
+WITH job_row AS (
+  SELECT id, status, error
+  FROM otlet.jobs
+  WHERE task_name = '$invalid_json_task'
+  ORDER BY id DESC
+  LIMIT 1
+),
+receipt_row AS (
+  SELECT status, selection_status, schema_validation_status
+  FROM otlet.inference_receipts
+  WHERE job_id = (SELECT id FROM job_row)
+  ORDER BY id DESC
+  LIMIT 1
+),
+materialized AS (
+  SELECT count(*)::bigint AS materialization_count
+  FROM otlet.semantic_materializations sm
+  JOIN otlet.records rec ON rec.id = sm.record_id
+  JOIN otlet.actions act ON act.id = rec.action_id
+  WHERE act.job_id = (SELECT id FROM job_row)
+)
+SELECT j.status || '|' ||
+       (j.error LIKE 'invalid model JSON:%')::text || '|' ||
+       r.status || '|' ||
+       r.selection_status || '|' ||
+       r.schema_validation_status || '|' ||
+       (SELECT count(*) FROM otlet.outputs WHERE job_id = j.id)::text || '|' ||
+       (SELECT count(*) FROM otlet.actions WHERE job_id = j.id)::text || '|' ||
+       (SELECT materialization_count FROM materialized)::text
+FROM job_row j
+CROSS JOIN receipt_row r;
+")"
+echo "invalid_json_safety_contract=$invalid_json_contract"
+[ "$invalid_json_contract" = "failed|true|failed|failed|failed|0|0|0" ] || {
+  echo "Expected invalid JSON to leave only a failed receipt, got $invalid_json_contract" >&2
+  exit 1
+}
+
+hallucinated_action_task="hallucinated_action_safety_demo"
+cleanup_task "$hallucinated_action_task"
+psql_exec -v task_name="$hallucinated_action_task" -v model_name="$strong_model_name" >/dev/null <<'SQL'
+SELECT otlet.create_task(
+  :'task_name',
+  $source$
+    SELECT 'hallucinated-action-1'::text AS subject_id, '{}'::jsonb AS input
+  $source$::text,
+  'Return JSON only.',
+  '{"type":"object","required":["status"],"additionalProperties":false,"properties":{"status":{"enum":["ok"]}}}'::jsonb,
+  :'model_name',
+  '{"max_tokens":32,"reasoning":"off","inference_cache":false}'::jsonb
+);
+CREATE TEMP TABLE hallucinated_action_claim AS
+WITH inserted AS (
+  INSERT INTO otlet.jobs (task_name, subject_id, input, status, attempts, started_at, leased_until)
+  VALUES (:'task_name', 'hallucinated-action-1', '{}'::jsonb, 'running', 1, now(), now() + interval '5 minutes')
+  RETURNING id
+)
+SELECT id FROM inserted;
+SELECT otlet.complete_job(
+  id,
+  '{"status":"ok"}'::jsonb,
+  '{"output":{"status":"ok"},"actions":[{"type":"invented_action","body":{"subject_id":"hallucinated-action-1","text":"no record"}}]}',
+  '[{"type":"invented_action","body":{"subject_id":"hallucinated-action-1","text":"no record"}}]'::jsonb,
+  NULL,
+  NULL,
+  NULL,
+  md5('{"output":{"status":"ok"},"actions":[{"type":"invented_action","body":{"subject_id":"hallucinated-action-1","text":"no record"}}]}'),
+  now(),
+  '{"schema_validation_status":"passed"}'::jsonb,
+  :'model_name'
+)
+FROM hallucinated_action_claim;
+SQL
+hallucinated_action_contract="$(psql_value "
+WITH job_row AS (
+  SELECT id
+  FROM otlet.jobs
+  WHERE task_name = '$hallucinated_action_task'
+  ORDER BY id DESC
+  LIMIT 1
+)
+SELECT (SELECT count(*) FROM otlet.outputs WHERE job_id = j.id)::text || '|' ||
+       COALESCE((SELECT status || '|' || COALESCE(error, '') FROM otlet.actions WHERE job_id = j.id ORDER BY id DESC LIMIT 1), '') || '|' ||
+       (SELECT count(*) FROM otlet.records r JOIN otlet.actions a ON a.id = r.action_id WHERE a.job_id = j.id)::text
+FROM job_row j;
+")"
+echo "hallucinated_action_safety_contract=$hallucinated_action_contract"
+[ "$hallucinated_action_contract" = "1|rejected|unsupported action type|0" ] || {
+  echo "Expected hallucinated action type to be rejected without a record, got $hallucinated_action_contract" >&2
+  exit 1
+}
+
 log "Running direct ask demo"
 psql_exec >/dev/null <<'SQL'
 DROP TABLE IF EXISTS public.readme_vendor_note;
@@ -2638,6 +2769,204 @@ echo "planner_1m_contract=$planner_1m_contract"
   exit 1
 }
 
+colon_subject_watch="colon_subject_demo"
+colon_subject_task="${colon_subject_watch}_task"
+psql_exec -v watch_name="$colon_subject_watch" >/dev/null <<'SQL'
+SELECT otlet.drop_watch(:'watch_name');
+DROP TABLE IF EXISTS public.otlet_demo_colon_subject;
+SQL
+psql_exec \
+  -v watch_name="$colon_subject_watch" \
+  -v task_name="$colon_subject_task" \
+  -v model_name="$strong_model_name" >/dev/null <<'SQL'
+CREATE TABLE public.otlet_demo_colon_subject (
+  id text PRIMARY KEY,
+  signal text NOT NULL
+);
+INSERT INTO public.otlet_demo_colon_subject VALUES ('tenant:colon-fragment-only:1', 'pass');
+
+SELECT otlet.create_watch(
+  watch_name => :'watch_name',
+  kind => 'row',
+  table_name => 'public.otlet_demo_colon_subject'::regclass,
+  subject_column => 'id',
+  instruction => 'Classify the row as pass. Return JSON only.',
+  output_schema => '{
+    "type": "object",
+    "required": ["decision", "confidence", "reason"],
+    "additionalProperties": false,
+    "properties": {
+      "decision": {"enum": ["pass"]},
+      "confidence": {"enum": ["high"]},
+      "reason": {"type": "string", "maxLength": 80}
+    }
+  }'::jsonb,
+  model_name => :'model_name',
+  record_type => 'colon_subject_record',
+  runtime_options => '{"max_tokens":64,"reasoning":"off","inference_cache":false}'::jsonb,
+  trigger_policy => '{"on_change":"mark_stale"}'::jsonb
+);
+
+CREATE TEMP TABLE colon_subject_claim AS
+WITH inserted AS (
+  INSERT INTO otlet.jobs (task_name, subject_id, input, status, attempts, started_at, leased_until)
+  SELECT
+    :'task_name',
+    src.id,
+    jsonb_build_object(
+      '_otlet_mvcc', jsonb_build_object(
+        'table', 'public.otlet_demo_colon_subject',
+        'subject_id', src.id::text,
+        'ctid', src.ctid::text,
+        'xmin', src.xmin::text
+      ),
+      'table', 'public.otlet_demo_colon_subject',
+      'row', otlet.semantic_project_row(to_jsonb(src), NULL::text[])
+    ),
+    'running',
+    1,
+    now(),
+    now() + interval '5 minutes'
+  FROM public.otlet_demo_colon_subject src
+  WHERE src.id = 'tenant:colon-fragment-only:1'
+  RETURNING id
+)
+SELECT id FROM inserted;
+SELECT otlet.complete_job(
+  id,
+  '{"decision":"pass","confidence":"high","reason":"colon subject"}'::jsonb,
+  '{"output":{"decision":"pass","confidence":"high","reason":"colon subject"},"actions":[]}',
+  '[]'::jsonb,
+  NULL,
+  NULL,
+  NULL,
+  md5('{"output":{"decision":"pass","confidence":"high","reason":"colon subject"},"actions":[]}'),
+  now(),
+  '{"schema_validation_status":"passed"}'::jsonb,
+  :'model_name'
+)
+FROM colon_subject_claim;
+WITH output_row AS (
+  SELECT
+    j.id AS job_id,
+    j.subject_id,
+    j.input,
+    o.id AS output_id,
+    o.receipt_id,
+    o.output
+  FROM colon_subject_claim c
+  JOIN otlet.jobs j ON j.id = c.id
+  JOIN otlet.outputs o ON o.job_id = j.id
+),
+action_row AS (
+  INSERT INTO otlet.actions (
+    job_id,
+    output_id,
+    receipt_id,
+    action_type,
+    payload,
+    status,
+    subject_id,
+    source_table,
+    source_hash
+  )
+  SELECT
+    job_id,
+    output_id,
+    receipt_id,
+    'create_record',
+    jsonb_build_object(
+      'type', 'create_record',
+      'record_type', 'colon_subject_record',
+      'subject_id', subject_id,
+      'body', output
+    ),
+    'complete',
+    subject_id,
+    'public.otlet_demo_colon_subject',
+    md5(input::text)
+  FROM output_row
+  RETURNING id, subject_id
+)
+INSERT INTO otlet.records (action_id, record_type, subject_id, body)
+SELECT
+  a.id,
+  'colon_subject_record',
+  o.subject_id,
+  o.output
+FROM action_row a
+JOIN output_row o ON o.subject_id = a.subject_id;
+SELECT otlet.materialize_semantic_index_subject(:'watch_name', 'tenant:colon-fragment-only:1');
+SQL
+colon_subject_contract="$(psql_value "
+CREATE TEMP TABLE colon_subject_contract_parts (
+  key text PRIMARY KEY,
+  value text NOT NULL
+);
+INSERT INTO colon_subject_contract_parts
+SELECT 'before_mark',
+       count(*)::text
+FROM otlet.semantic_index_current_rows('$colon_subject_watch', true)
+WHERE subject_id = 'tenant:colon-fragment-only:1';
+INSERT INTO colon_subject_contract_parts
+SELECT 'fragment_mark',
+       otlet.mark_semantic_stale(NULL, 'colon-fragment-only', 'manual')::text;
+INSERT INTO colon_subject_contract_parts
+SELECT 'after_fragment',
+       count(*)::text
+FROM otlet.semantic_materializations
+WHERE task_name = '$colon_subject_task'
+  AND subject_id = 'tenant:colon-fragment-only:1'
+  AND stale;
+INSERT INTO colon_subject_contract_parts
+SELECT 'exact_mark',
+       otlet.mark_semantic_stale(NULL, 'tenant:colon-fragment-only:1', 'manual')::text;
+INSERT INTO colon_subject_contract_parts
+SELECT 'after_exact',
+       count(*)::text
+FROM otlet.semantic_materializations
+WHERE task_name = '$colon_subject_task'
+  AND subject_id = 'tenant:colon-fragment-only:1'
+  AND stale;
+INSERT INTO colon_subject_contract_parts
+SELECT 'lookup_after_exact',
+       count(*)::text
+FROM otlet.semantic_index_current_rows('$colon_subject_watch', true)
+WHERE subject_id = 'tenant:colon-fragment-only:1';
+WITH validation AS (
+  SELECT
+    COALESCE(otlet.action_validation_error(
+      '{\"type\":\"merge_candidate\",\"body\":{\"left_id\":\"tenant:left:1\",\"right_id\":\"tenant:right:2\",\"confidence\":\"high\",\"reason\":\"same\"}}'::jsonb,
+      '{\"match\":\"same_entity\",\"confidence\":\"high\",\"reason\":\"same\"}'::jsonb,
+      'tenant:left:1:tenant:right:2',
+      '{\"action_ids\":{\"left_id\":\"tenant:left:1\",\"right_id\":\"tenant:right:2\"}}'::jsonb
+    ), 'ok') AS valid_pair,
+    COALESCE(otlet.action_validation_error(
+      '{\"type\":\"merge_candidate\",\"body\":{\"left_id\":\"tenant:left:1\",\"right_id\":\"tenant:right:wrong\",\"confidence\":\"high\",\"reason\":\"same\"}}'::jsonb,
+      '{\"match\":\"same_entity\",\"confidence\":\"high\",\"reason\":\"same\"}'::jsonb,
+      'tenant:left:1:tenant:right:2',
+      '{\"action_ids\":{\"left_id\":\"tenant:left:1\",\"right_id\":\"tenant:right:2\"}}'::jsonb
+    ), 'ok') AS invalid_pair
+)
+SELECT (SELECT value FROM colon_subject_contract_parts WHERE key = 'before_mark') || '|' ||
+       (SELECT value FROM colon_subject_contract_parts WHERE key = 'fragment_mark') || '|' ||
+       (SELECT value FROM colon_subject_contract_parts WHERE key = 'after_fragment') || '|' ||
+       (SELECT value FROM colon_subject_contract_parts WHERE key = 'exact_mark') || '|' ||
+       (SELECT value FROM colon_subject_contract_parts WHERE key = 'after_exact') || '|' ||
+       (SELECT value FROM colon_subject_contract_parts WHERE key = 'lookup_after_exact') || '|' ||
+       (SELECT valid_pair FROM validation) || '|' ||
+       (SELECT invalid_pair FROM validation);
+")"
+echo "colon_subject_safety_contract=$colon_subject_contract"
+[ "$colon_subject_contract" = "1|0|0|1|1|1|ok|merge_candidate subject ids must match job subject_id" ] || {
+  echo "Expected colon subject IDs to validate and stale-mark only by exact subject, got $colon_subject_contract" >&2
+  exit 1
+}
+psql_exec -v watch_name="$colon_subject_watch" >/dev/null <<'SQL'
+SELECT otlet.drop_watch(:'watch_name');
+DROP TABLE IF EXISTS public.otlet_demo_colon_subject;
+SQL
+
 performance_ratio_contract="$(psql_value "
 SELECT trusted_output_rows::text || '|' ||
        model_invocations::text || '|' ||
@@ -2648,6 +2977,19 @@ FROM otlet.production_status;
 ")"
 echo "performance_ratio_contract=$performance_ratio_contract"
 require_regex "$performance_ratio_contract" '^[1-9][0-9]*\|[1-9][0-9]*\|[0-9]+(\.[0-9]+)?\|[1-9][0-9]*\|[0-9]+(\.[0-9]+)?$' "Expected production_status to expose positive model-work ratios"
+
+invariant_contract="$(psql_value "SELECT count(*) FROM otlet.verify_invariants();")"
+echo "invariant_contract=$invariant_contract"
+if [ "$invariant_contract" != "0" ]; then
+  psql_exec -P border=2 -P null='' <<'SQL'
+SELECT invariant_name, object_type, object_id, detail
+FROM otlet.verify_invariants()
+ORDER BY invariant_name, object_type, object_id
+LIMIT 20;
+SQL
+  echo "Expected zero Otlet invariant violations, got $invariant_contract" >&2
+  exit 1
+fi
 
 crash_scan
 log "Otlet demo passed"
