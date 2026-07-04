@@ -1701,6 +1701,70 @@ echo "row_delete_contract=$row_delete_fresh|$row_delete_reason"
   exit 1
 }
 
+psql_exec -v task_name="$row_triage_task" -v model_name="$strong_model_name" >/dev/null <<'SQL'
+CREATE TEMP TABLE row_triage_invalid_claim AS
+WITH inserted AS (
+  INSERT INTO otlet.jobs (task_name, subject_id, input, status, attempts, started_at, leased_until)
+  VALUES (
+    :'task_name',
+    'triage-invalid-json',
+    '{"row":{"id":"triage-invalid-json","blockers":1,"approvals":0,"evidence":"invalid model answer smoke"}}'::jsonb,
+    'running',
+    1,
+    now(),
+    now() + interval '5 minutes'
+  )
+  RETURNING id
+)
+SELECT id FROM inserted;
+
+SELECT otlet.fail_job(
+  id,
+  'invalid model JSON: expected object',
+  'not json',
+  NULL,
+  NULL,
+  md5('{"type":"object","required":["decision","confidence","reason"]}'),
+  md5('not json'),
+  now(),
+  'failed',
+  '{"schema_validation_status":"failed"}'::jsonb,
+  :'model_name',
+  'direct',
+  'failed',
+  'invalid_model_json'
+)
+FROM row_triage_invalid_claim;
+SQL
+row_triage_invalid_contract="$(psql_value "
+SELECT j.status || '|' ||
+       (j.error LIKE 'invalid model JSON:%')::text || '|' ||
+       r.status || '|' ||
+       r.selection_status || '|' ||
+       r.schema_validation_status || '|' ||
+       (r.raw_output_hash = md5('not json'))::text || '|' ||
+       (SELECT count(*) FROM otlet.outputs WHERE job_id = j.id)::text || '|' ||
+       (SELECT count(*) FROM otlet.actions WHERE job_id = j.id)::text || '|' ||
+       (
+         SELECT count(*)::text
+         FROM otlet.semantic_materializations sm
+         JOIN otlet.records rec ON rec.id = sm.record_id
+         JOIN otlet.actions act ON act.id = rec.action_id
+         WHERE act.job_id = j.id
+       )
+FROM otlet.jobs j
+JOIN otlet.inference_receipts r ON r.job_id = j.id
+WHERE j.task_name = '$row_triage_task'
+  AND j.subject_id = 'triage-invalid-json'
+ORDER BY j.id DESC, r.id DESC
+LIMIT 1;
+")"
+echo "row_triage_invalid_answer_contract=$row_triage_invalid_contract"
+[ "$row_triage_invalid_contract" = "failed|true|failed|failed|failed|true|0|0|0" ] || {
+  echo "Expected invalid non-ER model answer to leave only a failed receipt, got $row_triage_invalid_contract" >&2
+  exit 1
+}
+
 log "Checking column-scoped row freshness"
 psql_exec \
   -v model_name="$strong_model_name" \
