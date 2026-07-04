@@ -246,6 +246,17 @@ VALUES (
     'confidence_field', 'confidence',
     'accepted_confidence', jsonb_build_array('high')
   )
+),
+(
+  'row_triage_decision_v1',
+  jsonb_build_object(
+    'prompt_prefix',
+    'Return one JSON object only. Top-level keys must be output and actions. Never use ellipses or placeholder values. Use input.row.blockers and input.row.approvals for the decision. confidence must be low, medium, or high, never unclear. Rule 1: if blockers > 0, output flag with confidence high. Rule 2: else if approvals > 0, output pass with confidence high. Rule 3: else output unclear with confidence medium. ',
+    'answer_field', 'decision',
+    'abstain_values', jsonb_build_array('unclear'),
+    'confidence_field', 'confidence',
+    'accepted_confidence', jsonb_build_array('high', 'medium')
+  )
 );
 
 CREATE TABLE otlet.tasks (

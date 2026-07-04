@@ -22,6 +22,8 @@ row_customscan_watch="${OTLET_ROW_CUSTOMSCAN_WATCH_NAME:-row_customscan_demo}"
 row_customscan_task="${row_customscan_watch}_task"
 row_triage_policy_watch="${OTLET_ROW_TRIAGE_POLICY_WATCH_NAME:-row_triage_policy_demo}"
 row_triage_policy_task="${row_triage_policy_watch}_task"
+prompt_identity_preset_task="prompt_identity_preset_smoke"
+prompt_identity_direct_task="prompt_identity_direct_smoke"
 script_started="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
 entity_instruction='Never output different_entity when conflicting_stable_identifiers = 0. Never output same_entity when shared_stable_identifiers = 0. weak_matching_signals, missing_or_unknown_identifiers, and row_quality_warnings only explain unclear. Action type must be exactly merge_candidate, new_entity, or review_flag; never same_entity, different_entity, or unclear. same_entity uses merge_candidate body left_id, right_id, confidence, reason. different_entity uses new_entity body entity_id, reason, and entity_id must equal input.action_ids.right_id. unclear uses review_flag body left_id, right_id, severity, reason. Use input.action_ids.left_id and input.action_ids.right_id. Do not include an evidence field in actions. Keep output.reason and action body reason under 18 words. Quote every key and string. No markdown.'
 
@@ -273,6 +275,8 @@ cleanup_task "row_triage_demo"
 cleanup_task "row_scoped_demo"
 cleanup_task "row_customscan_demo"
 cleanup_task "row_triage_policy_demo"
+cleanup_task "$prompt_identity_preset_task"
+cleanup_task "$prompt_identity_direct_task"
 cleanup_task "input_shape_mvcc_raw_demo"
 cleanup_task "input_shape_mvcc_hand_demo"
 cleanup_task "input_shape_truncate_demo"
@@ -993,6 +997,115 @@ require_regex "$direct_ask_contract" '^review_payment\|[1-9][0-9]*\|[1-9][0-9]*$
 require_regex "$direct_ask_receipt_contract" "^$strong_model_name\\|complete\\|passed\\|[1-9][0-9]*$" "Expected direct ask receipt evidence"
 [ "$direct_ask_cache_contract" = "false|disabled_for_generation_trace|content_hash_contract_hash_model_fingerprint|true|none" ] || {
   echo "Expected direct ask trace to make cache-disabled-under-generation-trace explicit, got $direct_ask_cache_contract" >&2
+  exit 1
+}
+
+log "Checking decision-contract prompt identity"
+psql_exec \
+  -v model_name="$strong_model_name" \
+  -v preset_task="$prompt_identity_preset_task" \
+  -v direct_task="$prompt_identity_direct_task" \
+  -v entity_instruction="$entity_instruction" >/dev/null <<'SQL'
+WITH params AS (
+  SELECT
+    '{
+      "type": "object",
+      "required": ["match", "confidence", "reason"],
+      "additionalProperties": false,
+      "properties": {
+        "match": {"enum": ["same_entity", "different_entity", "unclear"]},
+        "confidence": {"enum": ["low", "medium", "high"]},
+        "reason": {"type": "string", "maxLength": 240}
+      }
+    }'::jsonb AS output_schema,
+    '{"max_tokens":256,"reasoning":"off","inference_cache":false}'::jsonb AS runtime_options,
+    '{"evidence_fields":["candidate_evidence"],"action_id_fields":{"left_id":"left_id","right_id":"right_id"}}'::jsonb AS input_shaping
+)
+SELECT otlet.create_task(
+  :'preset_task',
+  $source$
+    SELECT 'prompt-identity'::text AS subject_id,
+           jsonb_build_object(
+             'left_id', 'vendor-1001',
+             'right_id', 'vendor-42',
+             'candidate_evidence', jsonb_build_object(
+               'shared_stable_identifiers', jsonb_build_array('same tax id 36-9918821'),
+               'conflicting_stable_identifiers', '[]'::jsonb,
+               'weak_matching_signals', jsonb_build_array('similar name'),
+               'missing_or_unknown_identifiers', '[]'::jsonb,
+               'row_quality_warnings', '[]'::jsonb
+             )
+           ) AS input
+  $source$::text,
+  :'entity_instruction',
+  output_schema,
+  :'model_name',
+  runtime_options,
+  input_shaping,
+  '{"preset":"entity_resolution_evidence_v1"}'::jsonb
+)
+FROM params;
+
+WITH params AS (
+  SELECT
+    '{
+      "type": "object",
+      "required": ["match", "confidence", "reason"],
+      "additionalProperties": false,
+      "properties": {
+        "match": {"enum": ["same_entity", "different_entity", "unclear"]},
+        "confidence": {"enum": ["low", "medium", "high"]},
+        "reason": {"type": "string", "maxLength": 240}
+      }
+    }'::jsonb AS output_schema,
+    '{"max_tokens":256,"reasoning":"off","inference_cache":false}'::jsonb AS runtime_options,
+    '{"evidence_fields":["candidate_evidence"],"action_id_fields":{"left_id":"left_id","right_id":"right_id"}}'::jsonb AS input_shaping
+)
+SELECT otlet.create_task(
+  :'direct_task',
+  $source$
+    SELECT 'prompt-identity'::text AS subject_id,
+           jsonb_build_object(
+             'left_id', 'vendor-1001',
+             'right_id', 'vendor-42',
+             'candidate_evidence', jsonb_build_object(
+               'shared_stable_identifiers', jsonb_build_array('same tax id 36-9918821'),
+               'conflicting_stable_identifiers', '[]'::jsonb,
+               'weak_matching_signals', jsonb_build_array('similar name'),
+               'missing_or_unknown_identifiers', '[]'::jsonb,
+               'row_quality_warnings', '[]'::jsonb
+             )
+           ) AS input
+  $source$::text,
+  :'entity_instruction',
+  output_schema,
+  :'model_name',
+  runtime_options,
+  input_shaping,
+  (SELECT decision_contract FROM otlet.decision_rule_presets WHERE name = 'entity_resolution_evidence_v1')
+)
+FROM params;
+
+SELECT otlet.run_task(:'preset_task');
+SELECT otlet.run_task(:'direct_task');
+SQL
+wait_task_complete "$prompt_identity_preset_task" 1 900 1
+wait_task_complete "$prompt_identity_direct_task" 1 900 1
+prompt_identity_contract="$(psql_value "
+WITH receipts AS (
+  SELECT task_name, prompt_hash, status, schema_validation_status
+  FROM otlet.inference_receipt_trace_status
+  WHERE task_name IN ('$prompt_identity_preset_task', '$prompt_identity_direct_task')
+)
+SELECT count(*)::text || '|' ||
+       count(DISTINCT prompt_hash)::text || '|' ||
+       bool_and(status = 'complete')::text || '|' ||
+       bool_and(schema_validation_status = 'passed')::text
+FROM receipts;
+")"
+echo "prompt_identity_contract=$prompt_identity_contract"
+[ "$prompt_identity_contract" = "2|1|true|true" ] || {
+  echo "Expected preset and expanded decision contract to produce byte-identical prompts, got $prompt_identity_contract" >&2
   exit 1
 }
 
@@ -2226,14 +2339,13 @@ SELECT otlet.create_watch(
   '{"max_tokens":160,"reasoning":"off","inference_cache":true}'::jsonb,
   jsonb_build_object(
     'cheap_model_name', :'cheap_policy_model',
-    'strong_model_name', :'strong_policy_model',
-    'accept_field_checks', '{"answer_field":"decision","abstain_values":["unclear"],"confidence_field":"confidence","accepted_confidence":["high","medium"]}'::jsonb
+    'strong_model_name', :'strong_policy_model'
   ),
   '{"on_change":"mark_stale_and_enqueue"}'::jsonb,
   ARRAY['review_flag'],
   'refresh_then_fail_closed',
   '{}'::jsonb,
-  '{"answer_field":"decision","abstain_values":["unclear"],"confidence_field":"confidence","accepted_confidence":["high","medium"]}'::jsonb
+  '{"preset":"row_triage_decision_v1"}'::jsonb
 );
 
 INSERT INTO public.otlet_demo_triage_policy_signal
@@ -2263,6 +2375,44 @@ echo "row_triage_policy_contract=$row_triage_policy_contract"
   echo "Expected declared triage policy to reject cheap unclear then accept strong unclear with one review action, got $row_triage_policy_contract" >&2
   exit 1
 }
+row_triage_preset_contract="$(psql_value "
+SELECT COALESCE(t.decision_contract ->> 'preset', '') || '|' ||
+       COALESCE(p.accept_field_checks ->> 'answer_field', '') || '|' ||
+       (p.accept_field_checks -> 'abstain_values' ? 'unclear')::text || '|' ||
+       (p.accept_field_checks -> 'accepted_confidence' ? 'medium')::text
+FROM otlet.tasks t
+JOIN otlet.model_selection_policies p ON p.task_name = t.name
+WHERE t.name = '$row_triage_policy_task';
+")"
+echo "row_triage_preset_contract=$row_triage_preset_contract"
+[ "$row_triage_preset_contract" = "row_triage_decision_v1|decision|true|true" ] || {
+  echo "Expected triage preset to drive selection policy labels, got $row_triage_preset_contract" >&2
+  exit 1
+}
+row_triage_abstention_contract="$(psql_value "
+WITH task_abstentions AS (
+  SELECT count(*)::bigint AS abstained_outputs
+  FROM otlet.outputs o
+  JOIN otlet.jobs j ON j.id = o.job_id
+  JOIN otlet.tasks t ON t.name = j.task_name
+  CROSS JOIN LATERAL (
+    SELECT COALESCE(NULLIF(t.decision_contract ->> 'answer_field', ''), 'match') AS answer_field,
+           COALESCE(t.decision_contract -> 'abstain_values', '[]'::jsonb) AS abstain_values
+  ) contract
+  WHERE j.task_name = '$row_triage_policy_task'
+    AND EXISTS (
+      SELECT 1
+      FROM jsonb_array_elements_text(contract.abstain_values) value(abstain_value)
+      WHERE o.output ->> contract.answer_field = value.abstain_value
+    )
+)
+SELECT task_abstentions.abstained_outputs::text || '|' ||
+       output_reliability_status.abstained_outputs::text
+FROM task_abstentions
+CROSS JOIN otlet.output_reliability_status;
+")"
+echo "row_triage_abstention_contract=$row_triage_abstention_contract"
+require_regex "$row_triage_abstention_contract" '^[1-9][0-9]*\|[1-9][0-9]*$' "Expected nonzero abstention counters for the triage preset"
 
 psql_exec \
   -v task_name="$row_triage_policy_task" \
