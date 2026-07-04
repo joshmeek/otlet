@@ -24,6 +24,9 @@ row_triage_policy_watch="${OTLET_ROW_TRIAGE_POLICY_WATCH_NAME:-row_triage_policy
 row_triage_policy_task="${row_triage_policy_watch}_task"
 prompt_identity_preset_task="prompt_identity_preset_smoke"
 prompt_identity_direct_task="prompt_identity_direct_smoke"
+output_envelope_task="output_envelope_safety_demo"
+prompt_diet_verbatim_task="prompt_diet_verbatim_demo"
+prompt_diet_compact_task="prompt_diet_compact_demo"
 script_started="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
 entity_instruction='Never output different_entity when conflicting_stable_identifiers = 0. Never output same_entity when shared_stable_identifiers = 0. weak_matching_signals, missing_or_unknown_identifiers, and row_quality_warnings only explain unclear. Action type must be exactly merge_candidate, new_entity, or review_flag; never same_entity, different_entity, or unclear. same_entity uses merge_candidate body left_id, right_id, confidence, reason. different_entity uses new_entity body entity_id, reason, and entity_id must equal input.action_ids.right_id. unclear uses review_flag body left_id, right_id, severity, reason. Use input.action_ids.left_id and input.action_ids.right_id. Do not include an evidence field in actions. Keep output.reason and action body reason under 18 words. Quote every key and string. No markdown.'
 
@@ -277,6 +280,9 @@ cleanup_task "row_customscan_demo"
 cleanup_task "row_triage_policy_demo"
 cleanup_task "$prompt_identity_preset_task"
 cleanup_task "$prompt_identity_direct_task"
+cleanup_task "$output_envelope_task"
+cleanup_task "$prompt_diet_verbatim_task"
+cleanup_task "$prompt_diet_compact_task"
 cleanup_task "input_shape_mvcc_raw_demo"
 cleanup_task "input_shape_mvcc_hand_demo"
 cleanup_task "input_shape_truncate_demo"
@@ -889,6 +895,128 @@ echo "invalid_json_safety_contract=$invalid_json_contract"
   exit 1
 }
 
+cleanup_task "$output_envelope_task"
+psql_exec -v task_name="$output_envelope_task" -v model_name="$strong_model_name" >/dev/null <<'SQL'
+SELECT otlet.create_task(
+  :'task_name',
+  $source$
+    SELECT 'unused'::text AS subject_id, '{}'::jsonb AS input WHERE false
+  $source$::text,
+  'Return JSON only.',
+  '{"type":"object","required":["status"],"additionalProperties":false,"properties":{"status":{"enum":["ok"]}}}'::jsonb,
+  :'model_name',
+  '{"max_tokens":32,"reasoning":"off","inference_cache":false}'::jsonb
+);
+
+CREATE TEMP TABLE output_envelope_cases (
+  subject_id text PRIMARY KEY,
+  expected_error text NOT NULL,
+  raw_output text NOT NULL
+);
+
+INSERT INTO output_envelope_cases (subject_id, expected_error, raw_output)
+VALUES
+  (
+    'markdown-fence',
+    $err$invalid model JSON: markdown fences are not allowed: ```json
+{"output":{"status":"ok"},"actions":[]}
+```$err$,
+    $raw$```json
+{"output":{"status":"ok"},"actions":[]}
+```$raw$
+  ),
+  (
+    'extra-top-level',
+    'model JSON unsupported top-level key: extra',
+    '{"output":{"status":"ok"},"actions":[],"extra":true}'
+  ),
+  (
+    'non-object-action',
+    'model JSON actions must contain objects',
+    '{"output":{"status":"ok"},"actions":["bad"]}'
+  );
+
+WITH inserted AS (
+  INSERT INTO otlet.jobs (task_name, subject_id, input, status, attempts, started_at, leased_until)
+  SELECT :'task_name', subject_id, '{}'::jsonb, 'running', 1, now(), now() + interval '5 minutes'
+  FROM output_envelope_cases
+  RETURNING id, subject_id
+)
+SELECT otlet.fail_job(
+  inserted.id,
+  cases.expected_error,
+  cases.raw_output,
+  NULL,
+  NULL,
+  NULL,
+  md5(cases.raw_output),
+  now(),
+  'failed',
+  '{}'::jsonb,
+  :'model_name',
+  'direct',
+  'failed',
+  'output_envelope_contract'
+)
+FROM inserted
+JOIN output_envelope_cases cases USING (subject_id);
+SQL
+output_envelope_contract="$(psql_value "
+WITH cases(subject_id, expected_error, raw_output) AS (
+  VALUES
+    (
+      'markdown-fence',
+      \$err\$invalid model JSON: markdown fences are not allowed: \`\`\`json
+{\"output\":{\"status\":\"ok\"},\"actions\":[]}
+\`\`\`\$err\$,
+      \$raw\$\`\`\`json
+{\"output\":{\"status\":\"ok\"},\"actions\":[]}
+\`\`\`\$raw\$
+    ),
+    (
+      'extra-top-level',
+      'model JSON unsupported top-level key: extra',
+      '{\"output\":{\"status\":\"ok\"},\"actions\":[],\"extra\":true}'
+    ),
+    (
+      'non-object-action',
+      'model JSON actions must contain objects',
+      '{\"output\":{\"status\":\"ok\"},\"actions\":[\"bad\"]}'
+    )
+), rows AS (
+  SELECT c.subject_id,
+         c.expected_error,
+         c.raw_output AS expected_raw_output,
+         j.id AS job_id,
+         j.status AS job_status,
+         j.error AS job_error,
+         r.status AS receipt_status,
+         r.selection_status,
+         r.schema_validation_status,
+         r.error AS receipt_error,
+         r.raw_output,
+         r.raw_output_hash
+  FROM cases c
+  JOIN otlet.jobs j
+    ON j.task_name = '$output_envelope_task'
+   AND j.subject_id = c.subject_id
+  JOIN otlet.inference_receipts r ON r.job_id = j.id
+)
+SELECT count(*) FILTER (WHERE subject_id = 'markdown-fence' AND job_error = expected_error AND receipt_error = expected_error)::text || '|' ||
+       count(*) FILTER (WHERE subject_id = 'extra-top-level' AND job_error = expected_error AND receipt_error = expected_error)::text || '|' ||
+       count(*) FILTER (WHERE subject_id = 'non-object-action' AND job_error = expected_error AND receipt_error = expected_error)::text || '|' ||
+       bool_and(job_status = 'failed' AND receipt_status = 'failed' AND selection_status = 'failed' AND schema_validation_status = 'failed')::text || '|' ||
+       bool_and(raw_output = expected_raw_output AND raw_output_hash = md5(expected_raw_output))::text || '|' ||
+       (SELECT count(*) FROM otlet.outputs WHERE job_id IN (SELECT job_id FROM rows))::text || '|' ||
+       (SELECT count(*) FROM otlet.actions WHERE job_id IN (SELECT job_id FROM rows))::text
+FROM rows;
+")"
+echo "output_envelope_contract=$output_envelope_contract"
+[ "$output_envelope_contract" = "1|1|1|true|true|0|0" ] || {
+  echo "Expected strict output envelope failures with raw output hashes, got $output_envelope_contract" >&2
+  exit 1
+}
+
 hallucinated_action_task="hallucinated_action_safety_demo"
 cleanup_task "$hallucinated_action_task"
 psql_exec -v task_name="$hallucinated_action_task" -v model_name="$strong_model_name" >/dev/null <<'SQL'
@@ -1215,8 +1343,6 @@ echo "input_shape_truncate_contract=$input_shape_truncate_contract"
   exit 1
 }
 
-prompt_diet_verbatim_task="prompt_diet_verbatim_demo"
-prompt_diet_compact_task="prompt_diet_compact_demo"
 psql_exec \
   -v model_name="$strong_model_name" \
   -v verbatim_task="$prompt_diet_verbatim_task" \
@@ -1718,14 +1844,13 @@ FROM otlet.inference_receipts ar
 JOIN otlet.jobs j ON j.id = ar.job_id
 WHERE j.task_name = '$row_triage_task';
 ")"
-psql_exec >/dev/null <<'SQL'
+row_visible_stale_contract="$(psql_value "
+BEGIN;
 UPDATE public.otlet_demo_triage_signal
 SET blockers = 0,
     approvals = 1,
     evidence = 'Updated review cleared the blocker and recorded manager approval'
 WHERE id = 'triage-1';
-SQL
-row_visible_stale_contract="$(psql_value "
 SELECT count(*)::text
 FROM otlet.semantic_index_current_rows('$row_triage_watch', true);
 SELECT (count(*) FILTER (WHERE stale AND stale_reason = 'source_update') >= 1)::text
@@ -1736,29 +1861,26 @@ SELECT otlet.semantic_matches('$row_triage_watch', 'triage-1', '{\"decision\":\"
 SELECT count(*)::text
 FROM otlet.${row_triage_watch}_native
 WHERE subject_id = 'triage-1';
-")"
-row_visible_fresh_before="$(head -n 1 <<<"$row_visible_stale_contract")"
-row_visible_source_update="$(sed -n '2p' <<<"$row_visible_stale_contract")"
-row_visible_predicate_match="$(sed -n '3p' <<<"$row_visible_stale_contract")"
-row_visible_fdw_rows="$(tail -n 1 <<<"$row_visible_stale_contract")"
-echo "row_visible_update_stale_contract=$row_visible_fresh_before|$row_visible_source_update|$row_visible_predicate_match|$row_visible_fdw_rows"
-[ "$row_visible_fresh_before|$row_visible_source_update|$row_visible_predicate_match|$row_visible_fdw_rows" = "0|true|false|0" ] || {
-  echo "Expected visible row update to fail closed across lookup surfaces, got $row_visible_fresh_before|$row_visible_source_update|$row_visible_predicate_match|$row_visible_fdw_rows" >&2
-  exit 1
-}
-row_pending_reason_probe="$(
-  psql_exec -qAt <<SQL
-BEGIN;
+SAVEPOINT pending_reason_probe;
 UPDATE otlet.semantic_materializations
 SET stale_reason = NULL
 WHERE task_name = '$row_triage_task'
   AND subject_id = 'triage-1';
 SELECT COALESCE(stale_reasons->>'content_revalidation_pending', '0')
 FROM otlet.semantic_index_plan('$row_triage_watch', true);
-ROLLBACK;
-SQL
-)"
-row_pending_reason="$(grep -E '^[0-9]+$' <<<"$row_pending_reason_probe" | tail -n 1)"
+ROLLBACK TO SAVEPOINT pending_reason_probe;
+COMMIT;
+")"
+row_visible_fresh_before="$(head -n 1 <<<"$row_visible_stale_contract")"
+row_visible_source_update="$(sed -n '2p' <<<"$row_visible_stale_contract")"
+row_visible_predicate_match="$(sed -n '3p' <<<"$row_visible_stale_contract")"
+row_visible_fdw_rows="$(sed -n '4p' <<<"$row_visible_stale_contract")"
+row_pending_reason="$(sed -n '5p' <<<"$row_visible_stale_contract")"
+echo "row_visible_update_stale_contract=$row_visible_fresh_before|$row_visible_source_update|$row_visible_predicate_match|$row_visible_fdw_rows"
+[ "$row_visible_fresh_before|$row_visible_source_update|$row_visible_predicate_match|$row_visible_fdw_rows" = "0|true|false|0" ] || {
+  echo "Expected visible row update to fail closed across lookup surfaces, got $row_visible_fresh_before|$row_visible_source_update|$row_visible_predicate_match|$row_visible_fdw_rows" >&2
+  exit 1
+}
 echo "row_content_revalidation_pending_contract=$row_pending_reason"
 [ "$row_pending_reason" = "1" ] || {
   echo "Expected stale current row with no stored reason to expose content_revalidation_pending, got $row_pending_reason" >&2
@@ -1842,7 +1964,7 @@ WITH current_task AS (
 SELECT (otlet.create_task(
     name,
     input_query,
-    instruction || ' Cache contract drift demo.',
+    instruction || ' Cache contract drift demo $script_started.',
     output_schema,
     model_name,
     runtime_options,
