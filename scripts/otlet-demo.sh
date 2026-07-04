@@ -1930,6 +1930,42 @@ SQL
 echo "row_eval_label_reject_contract=$row_eval_label_reject_contract"
 require_contains "$row_eval_label_reject_contract" "otlet expected_answer same_entity is not valid for task $row_triage_task field decision" "Expected invalid expected_answer to be rejected against task enum"
 
+row_review_queue_contract="$(psql_value "
+SELECT count(*)::text || '|' ||
+       COALESCE(max(queue_kind), '') || '|' ||
+       COALESCE(max(watch_name), '') || '|' ||
+       COALESCE(max(source_stale::text), '') || '|' ||
+       (max(receipt_id) IS NOT NULL)::text
+FROM otlet.review_queue
+WHERE action_id = $row_triage_action_id;
+")"
+echo "row_review_queue_contract=$row_review_queue_contract"
+[ "$row_review_queue_contract" = "1|review_flag|$row_triage_watch|false|true" ] || {
+  echo "Expected row review action in review_queue with receipt and fresh source identity, got $row_review_queue_contract" >&2
+  exit 1
+}
+psql_exec >/dev/null <<SQL
+SELECT * FROM otlet.correct_action(
+  $row_triage_action_id,
+  '{"expected_answer":"pass","expected_confidence":"high","expected_action_type":"review_flag"}'::jsonb,
+  'demo correction'
+);
+SQL
+row_correction_contract="$(psql_value "
+SELECT a.status || '|' ||
+       a.approval_status || '|' ||
+       (SELECT count(*) FROM otlet.eval_labels WHERE action_id = $row_triage_action_id AND label_source = 'manual_correction')::text || '|' ||
+       (SELECT count(*) FROM otlet.export_eval_cases(50) WHERE action_id = $row_triage_action_id AND case_kind = 'gold')::text || '|' ||
+       (SELECT count(*) FROM otlet.review_queue WHERE action_id = $row_triage_action_id)::text
+FROM otlet.actions a
+WHERE a.id = $row_triage_action_id;
+")"
+echo "row_correction_contract=$row_correction_contract"
+[ "$row_correction_contract" = "rejected|rejected|1|1|0" ] || {
+  echo "Expected correction to reject action, write gold label, and remove review queue row, got $row_correction_contract" >&2
+  exit 1
+}
+
 row_watch_status_contract="$(psql_value "
 SELECT watch_name || '|' || kind || '|' ||
        total_subjects::text || '|' ||
@@ -2930,7 +2966,10 @@ CROSS JOIN LATERAL (
       'shared_stable_identifiers', jsonb_build_array(
         'same remittance account ending 8821',
         'same tax id 36-9918821',
-        'Northstar rebrand after acquisition'
+        CASE
+          WHEN r.notes ILIKE '%rebranded after acquisition%' THEN 'Northstar rebrand after acquisition'
+          ELSE 'no rebrand evidence in notes'
+        END
       ),
       'conflicting_stable_identifiers', '[]'::jsonb,
       'weak_matching_signals', jsonb_build_array('similar address'),
@@ -3247,6 +3286,34 @@ JOIN exported USING (action_id);
 echo "er_eval_label_contract=$er_eval_label_contract"
 [ "$er_eval_label_contract" = "2|same_entity|positive|different_entity|hard_negative" ] || {
   echo "Expected ER eval export parity after expected_answer rename, got $er_eval_label_contract" >&2
+  exit 1
+}
+
+dry_run_source_identity_contract="$(
+  psql_exec -qAt -v action_id="$merge_action_id" <<'SQL'
+CREATE TEMP TABLE dry_run_source_identity_original(notes text);
+CREATE TEMP TABLE dry_run_source_identity_result(ord int, phase text, status text, dry_run_status text, error text);
+INSERT INTO dry_run_source_identity_original
+SELECT notes FROM public.otlet_demo_vendor_entity WHERE id = 'vendor-42';
+UPDATE public.otlet_demo_vendor_entity
+SET notes = replace(notes, 'rebranded after acquisition', 'separate vendor without acquisition')
+WHERE id = 'vendor-42';
+INSERT INTO dry_run_source_identity_result
+SELECT 1, 'after_update', status, dry_run_status, COALESCE(error, '')
+FROM otlet.dry_run_action(:action_id);
+UPDATE public.otlet_demo_vendor_entity
+SET notes = (SELECT notes FROM dry_run_source_identity_original)
+WHERE id = 'vendor-42';
+INSERT INTO dry_run_source_identity_result
+SELECT 2, 'after_revert', status, dry_run_status, COALESCE(error, '')
+FROM otlet.dry_run_action(:action_id);
+SELECT string_agg(phase || ':' || status || ':' || dry_run_status || ':' || error, '|' ORDER BY ord)
+FROM dry_run_source_identity_result;
+SQL
+)"
+echo "dry_run_source_identity_contract=$dry_run_source_identity_contract"
+[ "$dry_run_source_identity_contract" = "after_update:approved:failed:source identity stale|after_revert:approved:passed:" ] || {
+  echo "Expected dry-run source identity failure after edit and pass after revert, got $dry_run_source_identity_contract" >&2
   exit 1
 }
 

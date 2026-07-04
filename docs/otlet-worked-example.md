@@ -450,6 +450,72 @@ Representative output:
 (1 row)
 ```
 
+## Review The Queue
+
+`otlet.review_queue` gathers actions that need attention, abstention outputs, and review flags with receipt and source-freshness context:
+
+```sql
+SELECT queue_kind, task_name, watch_name, subject_id, action_id, receipt_id, source_stale
+FROM otlet.review_queue
+WHERE task_name IN ('entity_resolution_demo', 'demo_entity_resolution_idx_task')
+ORDER BY created_at, task_name
+LIMIT 5;
+```
+
+Representative output:
+
+```text
+    queue_kind    |            task_name            |         watch_name         | subject_id | action_id | receipt_id | source_stale
+------------------+---------------------------------+----------------------------+------------+-----------+------------+--------------
+ pending_approval | demo_entity_resolution_idx_task | demo_entity_resolution_idx | vendor-42  |        35 |         85 | f
+(1 row)
+```
+
+Manual correction is one atomic call: reject the action and write a gold `manual_correction` eval label. This example rolls back so the later approval flow can still run:
+
+```sql
+BEGIN;
+
+WITH target AS (
+  SELECT
+    q.action_id,
+    q.action_type,
+    q.output ->> COALESCE(NULLIF(t.decision_contract ->> 'answer_field', ''), 'match') AS expected_answer,
+    COALESCE(q.output ->> 'confidence', 'high') AS expected_confidence
+  FROM otlet.review_queue q
+  JOIN otlet.tasks t ON t.name = q.task_name
+  WHERE q.action_id IS NOT NULL
+    AND q.task_name IN ('entity_resolution_demo', 'demo_entity_resolution_idx_task')
+  ORDER BY q.created_at, q.task_name
+  LIMIT 1
+), correction AS (
+  SELECT l.*
+  FROM target t,
+  LATERAL otlet.correct_action(
+    t.action_id,
+    jsonb_build_object(
+      'expected_answer', t.expected_answer,
+      'expected_confidence', t.expected_confidence,
+      'expected_action_type', t.action_type
+    ),
+    'worked example correction'
+  ) l
+)
+SELECT action_id, expected_answer, expected_confidence, expected_action_type, label_source
+FROM correction;
+
+ROLLBACK;
+```
+
+Representative output:
+
+```text
+ action_id | expected_answer | expected_confidence | expected_action_type |   label_source
+-----------+-----------------+---------------------+----------------------+-------------------
+        35 | same_entity     | high                | merge_candidate      | manual_correction
+(1 row)
+```
+
 Approve, dry-run, and apply one merge proposal:
 
 ```sql

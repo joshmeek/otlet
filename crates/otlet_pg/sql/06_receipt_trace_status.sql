@@ -117,6 +117,7 @@ SELECT
   a.apply_status,
   a.source_table,
   a.source_hash,
+  a.content_hash,
   a.error,
   a.payload,
   a.output_id,
@@ -159,6 +160,136 @@ LEFT JOIN otlet.jobs j ON j.id = a.job_id
 LEFT JOIN otlet.tasks t ON t.name = j.task_name
 LEFT JOIN otlet.outputs o ON o.id = l.output_id
 LEFT JOIN otlet.inference_receipts r ON r.id = l.receipt_id;
+
+CREATE VIEW otlet.review_queue AS
+WITH action_items AS (
+  SELECT
+    CASE
+      WHEN a.approval_status = 'required' AND a.status = 'proposed' THEN 'pending_approval'
+      ELSE 'review_flag'
+    END AS queue_kind,
+    j.task_name,
+    w.name AS watch_name,
+    j.subject_id AS job_subject_id,
+    a.subject_id,
+    a.id AS action_id,
+    a.output_id,
+    a.receipt_id,
+    a.action_type,
+    a.status AS action_status,
+    a.approval_status,
+    o.output,
+    a.source_table,
+    a.source_hash,
+    a.content_hash,
+    otlet.current_task_subject_content_hash(j.task_name, j.subject_id) AS current_content_hash,
+    a.created_at
+  FROM otlet.actions a
+  JOIN otlet.jobs j ON j.id = a.job_id
+  LEFT JOIN otlet.watches w ON w.task_name = j.task_name
+  LEFT JOIN otlet.outputs o ON o.id = a.output_id
+  WHERE (
+      (
+        a.approval_status = 'required'
+        AND a.status = 'proposed'
+      )
+      OR (
+        a.action_type = 'review_flag'
+        AND a.status <> 'rejected'
+      )
+    )
+    AND NOT EXISTS (
+      SELECT 1
+      FROM otlet.eval_labels l
+      WHERE l.action_id = a.id
+        AND l.label_source = 'manual_correction'
+    )
+),
+abstention_items AS (
+  SELECT
+    'abstention_output'::text AS queue_kind,
+    j.task_name,
+    w.name AS watch_name,
+    j.subject_id AS job_subject_id,
+    j.subject_id AS subject_id,
+    NULL::bigint AS action_id,
+    o.id AS output_id,
+    o.receipt_id,
+    NULL::text AS action_type,
+    NULL::text AS action_status,
+    NULL::text AS approval_status,
+    o.output,
+    r.trace_summary #>> '{mvcc,table}' AS source_table,
+    COALESCE(r.trace_summary #>> '{mvcc,source_hash}', md5((r.trace_summary -> 'mvcc')::text)) AS source_hash,
+    otlet.semantic_content_hash(j.input, t.input_shaping) AS content_hash,
+    otlet.current_task_subject_content_hash(j.task_name, j.subject_id) AS current_content_hash,
+    o.created_at
+  FROM otlet.outputs o
+  JOIN otlet.jobs j ON j.id = o.job_id
+  JOIN otlet.tasks t ON t.name = j.task_name
+  JOIN otlet.inference_receipts r ON r.id = o.receipt_id
+  LEFT JOIN otlet.watches w ON w.task_name = j.task_name
+  CROSS JOIN LATERAL (
+    SELECT
+      COALESCE(NULLIF(t.decision_contract ->> 'answer_field', ''), 'match') AS answer_field,
+      COALESCE(
+        (
+          SELECT array_agg(value)
+          FROM jsonb_array_elements_text(COALESCE(t.decision_contract -> 'abstain_values', '["unclear"]'::jsonb)) AS abstain(value)
+        ),
+        ARRAY[]::text[]
+      ) AS abstain_values
+  ) contract
+  WHERE o.output ->> contract.answer_field = ANY(contract.abstain_values)
+    AND NOT EXISTS (
+      SELECT 1
+      FROM otlet.eval_labels l
+      WHERE l.output_id = o.id
+        AND l.label_source = 'manual_correction'
+    )
+)
+SELECT
+  queue_kind,
+  task_name,
+  watch_name,
+  job_subject_id,
+  subject_id,
+  action_id,
+  output_id,
+  receipt_id,
+  action_type,
+  action_status,
+  approval_status,
+  output,
+  source_table,
+  source_hash,
+  content_hash,
+  current_content_hash,
+  (content_hash IS NOT NULL AND current_content_hash IS DISTINCT FROM content_hash) AS source_stale,
+  created_at
+FROM action_items
+UNION ALL
+SELECT
+  queue_kind,
+  task_name,
+  watch_name,
+  job_subject_id,
+  subject_id,
+  action_id,
+  output_id,
+  receipt_id,
+  action_type,
+  action_status,
+  approval_status,
+  output,
+  source_table,
+  source_hash,
+  content_hash,
+  current_content_hash,
+  (content_hash IS NOT NULL AND current_content_hash IS DISTINCT FROM content_hash) AS source_stale,
+  created_at
+FROM abstention_items
+ORDER BY created_at, task_name, job_subject_id, queue_kind;
 
 CREATE VIEW otlet.output_reliability_status AS
 SELECT

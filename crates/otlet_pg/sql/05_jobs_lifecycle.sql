@@ -903,6 +903,7 @@ BEGIN
       subject_id,
       source_table,
       source_hash,
+      content_hash,
       error
     )
     VALUES (
@@ -919,6 +920,7 @@ BEGIN
         complete_job.trace_summary #>> '{mvcc,source_hash}',
         md5((complete_job.trace_summary -> 'mvcc')::text)
       ),
+      otlet.semantic_content_hash(job_row.input, task_row.input_shaping),
       action_error
     )
     RETURNING id INTO saved_action_id;
@@ -989,11 +991,90 @@ BEGIN
 END;
 $$;
 
+CREATE FUNCTION otlet.current_task_subject_content_hash(
+  task_name text,
+  subject_id text
+) RETURNS text
+LANGUAGE plpgsql
+VOLATILE
+AS $$
+DECLARE
+  task_row otlet.tasks%ROWTYPE;
+  index_row otlet.semantic_indexes%ROWTYPE;
+  current_input jsonb;
+BEGIN
+  SELECT *
+  INTO task_row
+  FROM otlet.tasks t
+  WHERE t.name = current_task_subject_content_hash.task_name;
+
+  IF NOT FOUND THEN
+    RETURN NULL;
+  END IF;
+
+  SELECT *
+  INTO index_row
+  FROM otlet.semantic_indexes si
+  WHERE si.task_name = task_row.name;
+
+  IF FOUND THEN
+    EXECUTE format(
+      $sql$
+        SELECT jsonb_build_object(
+          '_otlet_mvcc', jsonb_build_object(
+            'table', %2$L,
+            'subject_id', (src.%1$I)::text,
+            'ctid', src.ctid::text,
+            'xmin', src.xmin::text
+          ),
+          'table', %2$L,
+          'row', otlet.semantic_project_row(to_jsonb(src), %4$L::text[])
+        )
+        FROM %3$s AS src
+        WHERE (src.%1$I)::text = $1
+        LIMIT 1
+      $sql$,
+      index_row.subject_column,
+      index_row.source_table,
+      index_row.source_table,
+      index_row.input_columns
+    )
+    INTO current_input
+    USING current_task_subject_content_hash.subject_id;
+
+    IF current_input IS NULL THEN
+      RETURN NULL;
+    END IF;
+
+    RETURN otlet.semantic_content_hash(current_input, task_row.input_shaping);
+  END IF;
+
+  IF NULLIF(task_row.input_query, '') IS NULL THEN
+    RETURN NULL;
+  END IF;
+
+  EXECUTE format(
+    'SELECT q.input FROM (%s) AS q WHERE q.subject_id = $1 LIMIT 1',
+    task_row.input_query
+  )
+  INTO current_input
+  USING current_task_subject_content_hash.subject_id;
+
+  IF current_input IS NULL THEN
+    RETURN NULL;
+  END IF;
+
+  RETURN otlet.semantic_content_hash(current_input, task_row.input_shaping);
+END;
+$$;
+
 CREATE FUNCTION otlet.dry_run_action(action_id bigint) RETURNS SETOF otlet.actions
 LANGUAGE plpgsql
 AS $$
 DECLARE
   action_row otlet.actions%ROWTYPE;
+  job_row otlet.jobs%ROWTYPE;
+  current_content_hash text;
   validation_error text;
 BEGIN
   SELECT *
@@ -1006,14 +1087,24 @@ BEGIN
     RETURN;
   END IF;
 
+  SELECT *
+  INTO job_row
+  FROM otlet.jobs j
+  WHERE j.id = action_row.job_id;
+
+  current_content_hash := otlet.current_task_subject_content_hash(job_row.task_name, job_row.subject_id);
   validation_error := otlet.action_validation_error(action_row.payload);
+  IF action_row.content_hash IS NOT NULL
+     AND current_content_hash IS DISTINCT FROM action_row.content_hash THEN
+    validation_error := 'source identity stale';
+  END IF;
   IF action_row.status = 'rejected' THEN
     validation_error := COALESCE(action_row.error, validation_error, 'rejected action cannot be dry-run');
   END IF;
 
   UPDATE otlet.actions
   SET dry_run_status = CASE WHEN validation_error IS NULL THEN 'passed' ELSE 'failed' END,
-      error = COALESCE(validation_error, error)
+      error = validation_error
   WHERE id = action_row.id
   RETURNING * INTO action_row;
 
@@ -1267,6 +1358,52 @@ BEGIN
   RETURNING * INTO saved_label;
 
   RETURN NEXT saved_label;
+END;
+$$;
+
+CREATE FUNCTION otlet.correct_action(
+  action_id bigint,
+  corrected jsonb DEFAULT '{}'::jsonb,
+  reason text DEFAULT NULL
+) RETURNS SETOF otlet.eval_labels
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  rejected_action otlet.actions%ROWTYPE;
+  correction jsonb := COALESCE(correct_action.corrected, '{}'::jsonb);
+BEGIN
+  SELECT *
+  INTO rejected_action
+  FROM otlet.reject_action(
+    correct_action.action_id,
+    COALESCE(NULLIF(correct_action.reason, ''), 'manual correction')
+  );
+
+  IF NOT FOUND THEN
+    RETURN;
+  END IF;
+
+  RETURN QUERY
+  SELECT *
+  FROM otlet.label_action(
+    rejected_action.id,
+    expected_answer => COALESCE(
+      NULLIF(correction ->> 'expected_answer', ''),
+      NULLIF(correction ->> 'answer', ''),
+      NULLIF(correction ->> 'decision', ''),
+      NULLIF(correction ->> 'match', '')
+    ),
+    expected_confidence => COALESCE(
+      NULLIF(correction ->> 'expected_confidence', ''),
+      NULLIF(correction ->> 'confidence', '')
+    ),
+    expected_action_type => COALESCE(
+      NULLIF(correction ->> 'expected_action_type', ''),
+      NULLIF(correction ->> 'action_type', '')
+    ),
+    reason => correct_action.reason,
+    label_source => 'manual_correction'
+  );
 END;
 $$;
 

@@ -493,6 +493,7 @@ CREATE TABLE otlet.actions (
   source_table text,
   subject_id text,
   source_hash text,
+  content_hash text,
   error text,
   created_at timestamptz NOT NULL DEFAULT now(),
   approved_at timestamptz,
