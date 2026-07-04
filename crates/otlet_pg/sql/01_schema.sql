@@ -410,20 +410,74 @@ CREATE TABLE otlet.action_type_schemas (
   action_type text PRIMARY KEY,
   requires_approval boolean NOT NULL DEFAULT false,
   creates_record boolean NOT NULL DEFAULT false,
+  payload_schema jsonb NOT NULL DEFAULT '{}'::jsonb CHECK (jsonb_typeof(payload_schema) = 'object'),
   created_at timestamptz NOT NULL DEFAULT now()
 );
 
 INSERT INTO otlet.action_type_schemas (
   action_type,
   requires_approval,
-  creates_record
+  creates_record,
+  payload_schema
 )
 VALUES
-  ('create_record', false, true),
-  ('merge_candidate', true, false),
-  ('new_entity', false, false),
-  ('review_flag', false, false),
-  ('note', false, true);
+  ('create_record', false, true, '{}'::jsonb),
+  ('merge_candidate', true, false, $schema$
+    {
+      "required": ["left_id", "right_id", "reason"],
+      "properties": {
+        "left_id": {"type": "string", "minLength": 1, "required_error": "merge_candidate missing left_id"},
+        "right_id": {"type": "string", "minLength": 1, "required_error": "merge_candidate missing right_id"},
+        "confidence": {"type": "string", "enum": ["low", "medium", "high"], "enum_error": "merge_candidate confidence must be low, medium, or high"},
+        "reason": {"type": "string", "minLength": 1, "required_error": "merge_candidate missing reason"},
+        "evidence": {"type": ["array", "string"], "nonEmpty": true, "type_error": "merge_candidate evidence must be an array or string", "empty_error": "merge_candidate missing decisive evidence"}
+      },
+      "rules": [
+        {"kind": "output_equals", "field": "match", "value": "same_entity", "error": "merge_candidate requires same_entity output"},
+        {"kind": "subject_pair_matches", "left_field": "left_id", "right_field": "right_id", "error": "merge_candidate subject ids must match job subject_id"},
+        {"kind": "confidence_not_above_output", "field": "confidence", "output_field": "confidence", "error": "merge_candidate confidence cannot exceed output confidence"}
+      ]
+    }
+  $schema$::jsonb),
+  ('new_entity', false, false, $schema$
+    {
+      "required": ["entity_id", "reason"],
+      "properties": {
+        "entity_id": {"type": "string", "minLength": 1, "required_error": "new_entity missing entity_id"},
+        "reason": {"type": "string", "minLength": 1, "required_error": "new_entity missing reason"},
+        "evidence": {"type": ["array", "string"], "nonEmpty": true, "type_error": "new_entity evidence must be an array or string", "empty_error": "new_entity missing separation evidence"}
+      },
+      "rules": [
+        {"kind": "output_equals", "field": "match", "value": "different_entity", "error": "new_entity requires different_entity output"},
+        {"kind": "field_matches_expected_right", "field": "entity_id", "error": "new_entity entity_id must match job right subject_id"}
+      ]
+    }
+  $schema$::jsonb),
+  ('review_flag', false, false, $schema$
+    {
+      "required": ["reason"],
+      "properties": {
+        "left_id": {"type": "string", "minLength": 1},
+        "right_id": {"type": "string", "minLength": 1},
+        "reason": {"type": "string", "minLength": 1, "required_error": "review_flag missing reason"},
+        "severity": {"type": "string", "enum": ["low", "medium", "high"], "enum_error": "review_flag severity must be low, medium, or high"}
+      },
+      "rules": [
+        {"kind": "output_equals", "field": "match", "value": "unclear", "error": "review_flag requires unclear output"},
+        {"kind": "subject_pair_matches_when_present", "left_field": "left_id", "right_field": "right_id", "error": "review_flag subject ids must match job subject_id"}
+      ]
+    }
+  $schema$::jsonb),
+  ('note', false, true, $schema$
+    {
+      "required": ["subject_id", "text"],
+      "properties": {
+        "subject_id": {"type": "string", "minLength": 1, "required_error": "note missing subject_id"},
+        "text": {"type": "string", "minLength": 1, "required_error": "note missing text"},
+        "record_type": {"type": "string", "minLength": 1}
+      }
+    }
+  $schema$::jsonb);
 
 CREATE TABLE otlet.actions (
   id bigserial PRIMARY KEY,

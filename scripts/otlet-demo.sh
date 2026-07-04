@@ -27,6 +27,7 @@ prompt_identity_direct_task="prompt_identity_direct_smoke"
 output_envelope_task="output_envelope_safety_demo"
 prompt_diet_verbatim_task="prompt_diet_verbatim_demo"
 prompt_diet_compact_task="prompt_diet_compact_demo"
+custom_action_schema_task="custom_action_schema_demo"
 script_started="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
 entity_instruction='Never output different_entity when conflicting_stable_identifiers = 0. Never output same_entity when shared_stable_identifiers = 0. weak_matching_signals, missing_or_unknown_identifiers, and row_quality_warnings only explain unclear. Action type must be exactly merge_candidate, new_entity, or review_flag; never same_entity, different_entity, or unclear. same_entity uses merge_candidate body left_id, right_id, confidence, reason. different_entity uses new_entity body entity_id, reason, and entity_id must equal input.action_ids.right_id. unclear uses review_flag body left_id, right_id, severity, reason. Use input.action_ids.left_id and input.action_ids.right_id. Do not include an evidence field in actions. Keep output.reason and action body reason under 18 words. Quote every key and string. No markdown.'
 
@@ -283,6 +284,7 @@ cleanup_task "$prompt_identity_direct_task"
 cleanup_task "$output_envelope_task"
 cleanup_task "$prompt_diet_verbatim_task"
 cleanup_task "$prompt_diet_compact_task"
+cleanup_task "$custom_action_schema_task"
 cleanup_task "input_shape_mvcc_raw_demo"
 cleanup_task "input_shape_mvcc_hand_demo"
 cleanup_task "input_shape_truncate_demo"
@@ -1068,6 +1070,101 @@ FROM job_row j;
 echo "hallucinated_action_safety_contract=$hallucinated_action_contract"
 [ "$hallucinated_action_contract" = "1|rejected|unsupported action type|0" ] || {
   echo "Expected hallucinated action type to be rejected without a record, got $hallucinated_action_contract" >&2
+  exit 1
+}
+
+cleanup_task "$custom_action_schema_task"
+psql_exec -v task_name="$custom_action_schema_task" -v model_name="$strong_model_name" >/dev/null <<'SQL'
+DELETE FROM otlet.action_type_schemas
+WHERE action_type = 'custom_review';
+
+INSERT INTO otlet.action_type_schemas (
+  action_type,
+  requires_approval,
+  creates_record,
+  payload_schema
+)
+VALUES (
+  'custom_review',
+  false,
+  false,
+  '{
+    "required": ["subject_id", "severity"],
+    "additionalProperties": false,
+    "properties": {
+      "subject_id": {"type": "string", "minLength": 1, "required_error": "custom_review missing subject_id"},
+      "severity": {"type": "string", "enum": ["low", "high"], "enum_error": "custom_review severity must be low or high"},
+      "reason": {"type": "string", "minLength": 1}
+    }
+  }'::jsonb
+);
+
+SELECT otlet.create_task(
+  :'task_name',
+  $source$
+    SELECT 'custom-action-valid'::text AS subject_id, '{}'::jsonb AS input
+    UNION ALL
+    SELECT 'custom-action-invalid'::text AS subject_id, '{}'::jsonb AS input
+  $source$::text,
+  'Return JSON only.',
+  '{"type":"object","required":["status"],"additionalProperties":false,"properties":{"status":{"enum":["ok"]}}}'::jsonb,
+  :'model_name',
+  '{"max_tokens":32,"reasoning":"off","inference_cache":false}'::jsonb
+);
+
+CREATE TEMP TABLE custom_action_claim AS
+WITH inserted AS (
+  INSERT INTO otlet.jobs (task_name, subject_id, input, status, attempts, started_at, leased_until)
+  VALUES
+    (:'task_name', 'custom-action-valid', '{}'::jsonb, 'running', 1, now(), now() + interval '5 minutes'),
+    (:'task_name', 'custom-action-invalid', '{}'::jsonb, 'running', 1, now(), now() + interval '5 minutes')
+  RETURNING id, subject_id
+)
+SELECT id, subject_id FROM inserted;
+
+SELECT otlet.complete_job(
+  id,
+  '{"status":"ok"}'::jsonb,
+  '{"output":{"status":"ok"},"actions":[{"type":"custom_review","body":{"subject_id":"custom-action-valid","severity":"high","reason":"ok"}}]}',
+  '[{"type":"custom_review","body":{"subject_id":"custom-action-valid","severity":"high","reason":"ok"}}]'::jsonb,
+  NULL,
+  NULL,
+  NULL,
+  md5('{"output":{"status":"ok"},"actions":[{"type":"custom_review","body":{"subject_id":"custom-action-valid","severity":"high","reason":"ok"}}]}'),
+  now(),
+  '{"schema_validation_status":"passed"}'::jsonb,
+  :'model_name'
+)
+FROM custom_action_claim
+WHERE subject_id = 'custom-action-valid';
+
+SELECT otlet.complete_job(
+  id,
+  '{"status":"ok"}'::jsonb,
+  '{"output":{"status":"ok"},"actions":[{"type":"custom_review","body":{"subject_id":"custom-action-invalid","severity":"urgent","reason":"bad"}}]}',
+  '[{"type":"custom_review","body":{"subject_id":"custom-action-invalid","severity":"urgent","reason":"bad"}}]'::jsonb,
+  NULL,
+  NULL,
+  NULL,
+  md5('{"output":{"status":"ok"},"actions":[{"type":"custom_review","body":{"subject_id":"custom-action-invalid","severity":"urgent","reason":"bad"}}]}'),
+  now(),
+  '{"schema_validation_status":"passed"}'::jsonb,
+  :'model_name'
+)
+FROM custom_action_claim
+WHERE subject_id = 'custom-action-invalid';
+SQL
+custom_action_schema_contract="$(psql_value "
+SELECT count(*) FILTER (WHERE action_type = 'custom_review' AND status = 'proposed' AND approval_status = 'not_required' AND error IS NULL)::text || '|' ||
+       count(*) FILTER (WHERE action_type = 'custom_review' AND status = 'rejected' AND error = 'custom_review severity must be low or high')::text || '|' ||
+       count(*) FILTER (WHERE receipt_id IS NOT NULL AND output_id IS NOT NULL)::text || '|' ||
+       (SELECT (payload_schema ? 'properties')::text FROM otlet.action_type_schemas WHERE action_type = 'custom_review')
+FROM otlet.action_status
+WHERE task_name = '$custom_action_schema_task';
+")"
+echo "custom_action_schema_contract=$custom_action_schema_contract"
+[ "$custom_action_schema_contract" = "1|1|2|true" ] || {
+  echo "Expected custom action payload schema accept/reject evidence, got $custom_action_schema_contract" >&2
   exit 1
 }
 
