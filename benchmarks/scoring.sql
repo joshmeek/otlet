@@ -586,7 +586,7 @@ FROM scored;
 
 CREATE TEMP TABLE IF NOT EXISTS otlet_bench_user_suite_labels (
   label_id bigint PRIMARY KEY
-) ON COMMIT DROP;
+);
 
 TRUNCATE otlet_bench_user_suite_labels;
 
@@ -1017,7 +1017,7 @@ FROM fit_metrics;
 
 CREATE TEMP TABLE IF NOT EXISTS otlet_bench_invariant_task_scope (
   task_name text PRIMARY KEY
-) ON COMMIT DROP;
+);
 
 TRUNCATE otlet_bench_invariant_task_scope;
 
@@ -1033,7 +1033,7 @@ ON CONFLICT (task_name) DO NOTHING;
 
 CREATE TEMP TABLE IF NOT EXISTS otlet_bench_invariant_join_scope (
   join_index text PRIMARY KEY
-) ON COMMIT DROP;
+);
 
 TRUNCATE otlet_bench_invariant_join_scope;
 
