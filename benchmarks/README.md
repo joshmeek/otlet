@@ -26,7 +26,7 @@ A model can show `overall_fit=0.000` when it produced no trusted schema-valid ou
 
 The public ranking keeps the newest scored row per current family/size lane. Superseded rows, unscored candidates, and models with no useful Otlet signal stay out of the README ranking
 
-Current coverage is 142 scored cases per model run. The fixture target includes 112 deterministic pair cases, 30 triage cases, row-watch checks, and semantic checks
+Current coverage is 142 scored cases per model run. The fixture target includes 112 deterministic pair cases, 30 triage cases, 8 extraction cases, 8 policy-check cases, one exported user-suite correction, row-watch checks, and semantic checks
 
 ## Columns And Roles
 
