@@ -106,7 +106,7 @@ BEGIN
         WHERE sm.task_name = %4$L
           AND sm.source_table = %2$L
           AND sm.subject_id = otlet_semantic_input.subject_id
-          AND sm.content_hash = otlet.semantic_content_hash(otlet_semantic_input.input)
+          AND sm.content_hash = otlet.semantic_content_hash(otlet_semantic_input.input, %7$L::jsonb)
           AND sm.contract_hash = %6$L
       )
     $query$,
@@ -115,7 +115,8 @@ BEGIN
     table_name,
     semantic_task_name,
     actual_input_columns,
-    current_contract_hash
+    current_contract_hash,
+    input_shaping
   );
 
   PERFORM otlet.create_task(
@@ -393,7 +394,7 @@ BEGIN
         r.body,
         false,
         md5(j.input::text),
-        otlet.semantic_content_hash(j.input),
+        otlet.semantic_content_hash(j.input, t.input_shaping),
         otlet.task_contract_hash(t.instruction, t.output_schema, t.model_name, t.runtime_options, t.input_shaping, t.decision_contract),
         NULL,
         'content_hash_match',
@@ -521,7 +522,7 @@ BEGIN
         r.body,
         false,
         md5(j.input::text),
-        otlet.semantic_content_hash(j.input),
+        otlet.semantic_content_hash(j.input, t.input_shaping),
         otlet.task_contract_hash(t.instruction, t.output_schema, t.model_name, t.runtime_options, t.input_shaping, t.decision_contract),
         NULL,
         'content_hash_match',
@@ -580,6 +581,7 @@ AS $$
 DECLARE
   index_row otlet.semantic_indexes%ROWTYPE;
   current_contract_hash text;
+  current_input_shaping jsonb := '{}'::jsonb;
 BEGIN
   SELECT *
   INTO index_row
@@ -592,15 +594,17 @@ BEGIN
 
   PERFORM otlet.mark_semantic_schema_drift(index_row.name);
 
-  SELECT otlet.task_contract_hash(
-    t.instruction,
-    t.output_schema,
-    t.model_name,
-    t.runtime_options,
-    t.input_shaping,
-    t.decision_contract
-  )
-  INTO current_contract_hash
+  SELECT
+    otlet.task_contract_hash(
+      t.instruction,
+      t.output_schema,
+      t.model_name,
+      t.runtime_options,
+      t.input_shaping,
+      t.decision_contract
+    ),
+    t.input_shaping
+  INTO current_contract_hash, current_input_shaping
   FROM otlet.tasks t
   WHERE t.name = index_row.task_name;
 
@@ -641,7 +645,7 @@ BEGIN
         ORDER BY
           sm.subject_id,
           (
-            sm.content_hash IS NOT DISTINCT FROM otlet.semantic_content_hash(ci.input)
+            sm.content_hash IS NOT DISTINCT FROM otlet.semantic_content_hash(ci.input, %9$L::jsonb)
             AND sm.contract_hash IS NOT DISTINCT FROM %7$L
           ) DESC,
           sm.updated_at DESC,
@@ -651,14 +655,14 @@ BEGIN
         latest.subject_id,
         latest.body,
         NOT (
-          latest.content_hash IS NOT DISTINCT FROM otlet.semantic_content_hash(ci.input)
+          latest.content_hash IS NOT DISTINCT FROM otlet.semantic_content_hash(ci.input, %9$L::jsonb)
           AND latest.contract_hash IS NOT DISTINCT FROM %7$L
           AND (NOT latest.stale OR latest.stale_reason = 'source_update')
         ) AS stale,
         latest.source_hash,
         CASE
           WHEN NOT (
-            latest.content_hash IS NOT DISTINCT FROM otlet.semantic_content_hash(ci.input)
+            latest.content_hash IS NOT DISTINCT FROM otlet.semantic_content_hash(ci.input, %9$L::jsonb)
             AND latest.contract_hash IS NOT DISTINCT FROM %7$L
             AND (NOT latest.stale OR latest.stale_reason = 'source_update')
           ) THEN NULL
@@ -672,7 +676,7 @@ BEGIN
       WHERE (
         NOT %8$s
         OR (
-          latest.content_hash IS NOT DISTINCT FROM otlet.semantic_content_hash(ci.input)
+          latest.content_hash IS NOT DISTINCT FROM otlet.semantic_content_hash(ci.input, %9$L::jsonb)
           AND latest.contract_hash IS NOT DISTINCT FROM %7$L
           AND (NOT latest.stale OR latest.stale_reason = 'source_update')
         )
@@ -686,7 +690,8 @@ BEGIN
     index_row.record_type,
     index_row.input_columns,
     current_contract_hash,
-    CASE WHEN COALESCE(semantic_index_current_rows.fresh_only, true) THEN 'true' ELSE 'false' END
+    CASE WHEN COALESCE(semantic_index_current_rows.fresh_only, true) THEN 'true' ELSE 'false' END,
+    current_input_shaping
   );
 END;
 $$;

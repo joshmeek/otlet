@@ -47,6 +47,7 @@ DECLARE
   v_stale_reasons jsonb := '{}'::jsonb;
   v_count_basis text := CASE WHEN exact THEN 'exact' ELSE 'estimated' END;
   current_contract_hash text;
+  current_input_shaping jsonb := '{}'::jsonb;
 BEGIN
   SELECT *
   INTO index_row
@@ -61,15 +62,17 @@ BEGIN
     PERFORM otlet.mark_semantic_schema_drift(index_row.name);
   END IF;
 
-  SELECT otlet.task_contract_hash(
-    t.instruction,
-    t.output_schema,
-    t.model_name,
-    t.runtime_options,
-    t.input_shaping,
-    t.decision_contract
-  )
-  INTO current_contract_hash
+  SELECT
+    otlet.task_contract_hash(
+      t.instruction,
+      t.output_schema,
+      t.model_name,
+      t.runtime_options,
+      t.input_shaping,
+      t.decision_contract
+    ),
+    t.input_shaping
+  INTO current_contract_hash, current_input_shaping
   FROM otlet.tasks t
   WHERE t.name = index_row.task_name;
 
@@ -109,7 +112,7 @@ BEGIN
           ORDER BY
             sm.subject_id,
             (
-              sm.content_hash IS NOT DISTINCT FROM otlet.semantic_content_hash(ci.input)
+              sm.content_hash IS NOT DISTINCT FROM otlet.semantic_content_hash(ci.input, %8$L::jsonb)
               AND sm.contract_hash IS NOT DISTINCT FROM %7$L
             ) DESC,
             sm.updated_at DESC,
@@ -121,14 +124,14 @@ BEGIN
             l.subject_id IS NOT NULL AS has_materialization,
             (
               l.subject_id IS NOT NULL
-              AND l.content_hash IS NOT DISTINCT FROM otlet.semantic_content_hash(ci.input)
+              AND l.content_hash IS NOT DISTINCT FROM otlet.semantic_content_hash(ci.input, %8$L::jsonb)
               AND l.contract_hash IS NOT DISTINCT FROM %7$L
               AND (NOT l.stale OR l.stale_reason = 'source_update')
             ) AS is_fresh,
             (
               l.subject_id IS NOT NULL
               AND NOT (
-                l.content_hash IS NOT DISTINCT FROM otlet.semantic_content_hash(ci.input)
+                l.content_hash IS NOT DISTINCT FROM otlet.semantic_content_hash(ci.input, %8$L::jsonb)
                 AND l.contract_hash IS NOT DISTINCT FROM %7$L
                 AND (NOT l.stale OR l.stale_reason = 'source_update')
               )
@@ -162,7 +165,8 @@ BEGIN
       index_row.task_name,
       index_row.record_type,
       index_row.input_columns,
-      current_contract_hash
+      current_contract_hash,
+      current_input_shaping
     )
     INTO v_total_subjects, v_fresh_subjects, v_stale_subjects, v_missing_subjects, v_stale_reasons;
   ELSE

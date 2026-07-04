@@ -17,6 +17,7 @@ BEGIN
     si.source_table,
     si.subject_column,
     si.input_columns,
+    t.input_shaping,
     otlet.task_contract_hash(
       t.instruction,
       t.output_schema,
@@ -45,7 +46,7 @@ BEGIN
         ),
         'table', %1$L,
         'row', otlet.semantic_project_row(to_jsonb(src), %3$L::text[])
-      ))
+      ), %5$L::jsonb)
       FROM %4$s AS src
       WHERE (src.%2$I)::text = $1
       LIMIT 1
@@ -53,7 +54,8 @@ BEGIN
     index_row.source_table,
     index_row.subject_column,
     index_row.input_columns,
-    index_row.source_table
+    index_row.source_table,
+    index_row.input_shaping
   )
   INTO current_content_hash
   USING semantic_matches.subject_id;

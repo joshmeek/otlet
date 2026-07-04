@@ -217,6 +217,7 @@ SELECT
   r.status,
   r.model_name,
   r.runtime_name,
+  r.prompt_hash,
   r.prompt_tokens,
   r.generated_tokens,
   r.generate_ms,
@@ -260,6 +261,23 @@ SELECT
   END AS detailed_trace_skipped_tokens,
   r.trace_summary ->> 'row_identity' AS row_identity,
   r.trace_summary -> 'mvcc' AS mvcc,
+  CASE
+    WHEN jsonb_typeof(r.trace_summary -> 'shaped_input_bytes') = 'number'
+      THEN (r.trace_summary ->> 'shaped_input_bytes')::bigint
+    ELSE NULL
+  END AS shaped_input_bytes,
+  CASE
+    WHEN jsonb_typeof(r.trace_summary -> 'original_shaped_input_bytes') = 'number'
+      THEN (r.trace_summary ->> 'original_shaped_input_bytes')::bigint
+    ELSE NULL
+  END AS original_shaped_input_bytes,
+  CASE
+    WHEN jsonb_typeof(r.trace_summary -> 'max_shaped_input_bytes') = 'number'
+      THEN (r.trace_summary ->> 'max_shaped_input_bytes')::bigint
+    ELSE NULL
+  END AS max_shaped_input_bytes,
+  COALESCE(r.trace_summary ->> 'input_truncated', 'false')::boolean AS input_truncated,
+  COALESCE(r.trace_summary ->> 'input_shaping_applied', 'false')::boolean AS input_shaping_applied,
   materialization.freshness_basis,
   r.trace_summary ->> 'worker_handoff' AS worker_handoff,
   r.trace_summary ->> 'stale_policy' AS stale_policy,

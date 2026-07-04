@@ -152,6 +152,14 @@ fn generation_trace_summary(
             Value::Number(context.shaped_input_bytes.into()),
         );
         object.insert(
+            "original_shaped_input_bytes".to_owned(),
+            Value::Number(context.original_shaped_input_bytes.into()),
+        );
+        object.insert(
+            "max_shaped_input_bytes".to_owned(),
+            Value::Number(context.max_shaped_input_bytes.into()),
+        );
+        object.insert(
             "input_truncated".to_owned(),
             Value::Bool(context.input_truncated),
         );

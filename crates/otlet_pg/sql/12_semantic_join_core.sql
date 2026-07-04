@@ -48,7 +48,7 @@ BEGIN
         WHERE sm.task_name = %3$L
           AND sm.record_type = %4$L
           AND sm.subject_id = otlet_join_input.subject_id
-          AND sm.content_hash = otlet.semantic_content_hash(otlet_join_input.input)
+          AND sm.content_hash = otlet.semantic_content_hash(otlet_join_input.input, %6$L::jsonb)
           AND sm.contract_hash = %5$L
       )
     $query$,
@@ -56,7 +56,8 @@ BEGIN
     bounded_rows,
     semantic_task_name,
     semantic_record_type,
-    current_contract_hash
+    current_contract_hash,
+    input_shaping
   );
 
   PERFORM otlet.create_task(
@@ -237,7 +238,7 @@ BEGIN
         r.body,
         false,
         md5(j.input::text),
-        otlet.semantic_content_hash(j.input),
+        otlet.semantic_content_hash(j.input, t.input_shaping),
         otlet.task_contract_hash(t.instruction, t.output_schema, t.model_name, t.runtime_options, t.input_shaping, t.decision_contract),
         NULL,
         'content_hash_match',
@@ -356,7 +357,7 @@ BEGIN
         r.body,
         false,
         md5(j.input::text),
-        otlet.semantic_content_hash(j.input),
+        otlet.semantic_content_hash(j.input, t.input_shaping),
         otlet.task_contract_hash(t.instruction, t.output_schema, t.model_name, t.runtime_options, t.input_shaping, t.decision_contract),
         NULL,
         'content_hash_match',

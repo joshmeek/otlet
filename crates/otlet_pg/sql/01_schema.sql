@@ -94,14 +94,104 @@ AS $$
   END;
 $$;
 
+CREATE FUNCTION otlet.semantic_shaped_input(
+  input jsonb,
+  input_shaping jsonb DEFAULT '{}'::jsonb
+) RETURNS jsonb
+LANGUAGE plpgsql
+IMMUTABLE
+STRICT
+AS $$
+DECLARE
+  actual_input jsonb := COALESCE(input, '{}'::jsonb);
+  shaping jsonb := COALESCE(input_shaping, '{}'::jsonb);
+  shaped jsonb := actual_input;
+  counts jsonb := '{}'::jsonb;
+  ids jsonb := '{}'::jsonb;
+  field_name text;
+  target_key text;
+  source_field text;
+  bucket_key text;
+  bucket_value jsonb;
+  bucket_count integer;
+  original_bytes integer;
+  max_bytes integer := 0;
+BEGIN
+  IF jsonb_typeof(shaped) IS DISTINCT FROM 'object' THEN
+    RETURN shaped;
+  END IF;
+
+  shaped := shaped - '_otlet_mvcc' - 'otlet_mvcc';
+
+  IF jsonb_typeof(shaping -> 'strip_keys') = 'array' THEN
+    FOR field_name IN SELECT jsonb_array_elements_text(shaping -> 'strip_keys') LOOP
+      shaped := shaped - field_name;
+    END LOOP;
+  END IF;
+
+  IF NOT shaped ? 'evidence_counts'
+     AND jsonb_typeof(shaping -> 'evidence_fields') = 'array' THEN
+    FOR field_name IN SELECT jsonb_array_elements_text(shaping -> 'evidence_fields') LOOP
+      IF jsonb_typeof(actual_input -> field_name) = 'object' THEN
+        FOR bucket_key, bucket_value IN SELECT key, value FROM jsonb_each(actual_input -> field_name) LOOP
+          bucket_count := CASE
+            WHEN jsonb_typeof(bucket_value) = 'array' THEN jsonb_array_length(bucket_value)
+            WHEN jsonb_typeof(bucket_value) = 'string' AND btrim(bucket_value #>> '{}') <> '' THEN 1
+            WHEN jsonb_typeof(bucket_value) IN ('number', 'object') THEN 1
+            WHEN jsonb_typeof(bucket_value) = 'boolean' AND bucket_value = 'true'::jsonb THEN 1
+            ELSE 0
+          END;
+          counts := counts || jsonb_build_object(bucket_key, bucket_count);
+        END LOOP;
+      END IF;
+    END LOOP;
+    IF counts <> '{}'::jsonb THEN
+      shaped := jsonb_set(shaped, '{evidence_counts}', counts, true);
+    END IF;
+  END IF;
+
+  IF NOT shaped ? 'action_ids'
+     AND jsonb_typeof(shaping -> 'action_id_fields') = 'object' THEN
+    FOR target_key, source_field IN SELECT key, value FROM jsonb_each_text(shaping -> 'action_id_fields') LOOP
+      IF actual_input ? source_field THEN
+        ids := ids || jsonb_build_object(target_key, actual_input -> source_field);
+      END IF;
+    END LOOP;
+    IF ids <> '{}'::jsonb THEN
+      shaped := jsonb_set(shaped, '{action_ids}', ids, true);
+    END IF;
+  END IF;
+
+  IF jsonb_typeof(shaping -> 'max_shaped_input_bytes') = 'number' THEN
+    max_bytes := LEAST(
+      GREATEST((shaping ->> 'max_shaped_input_bytes')::numeric, 0),
+      1048576
+    )::integer;
+  END IF;
+  original_bytes := length(otlet.semantic_canonical_jsonb(shaped)::text);
+  IF max_bytes > 0 AND original_bytes > max_bytes THEN
+    shaped := jsonb_build_object(
+      '_otlet_input_truncated', true,
+      'truncation_policy', 'max_shaped_input_bytes_fail_toward_abstention',
+      'original_shaped_input_bytes', original_bytes,
+      'max_shaped_input_bytes', max_bytes,
+      'truncated_input_preview', left(otlet.semantic_canonical_jsonb(shaped)::text, LEAST(max_bytes, 1024))
+    );
+  END IF;
+
+  RETURN shaped;
+END;
+$$;
+
 CREATE FUNCTION otlet.semantic_content_hash(
-  input jsonb
+  input jsonb,
+  input_shaping jsonb DEFAULT '{}'::jsonb
 ) RETURNS text
 LANGUAGE sql
 IMMUTABLE
 STRICT
 AS $$
-  SELECT md5(otlet.semantic_canonical_jsonb($1 - '_otlet_mvcc' - 'otlet_mvcc')::text);
+  SELECT md5(otlet.semantic_canonical_jsonb(otlet.semantic_shaped_input($1, $2))::text);
 $$;
 
 CREATE FUNCTION otlet.semantic_project_row(

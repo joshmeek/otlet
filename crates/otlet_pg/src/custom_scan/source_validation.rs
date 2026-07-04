@@ -127,6 +127,7 @@ fn validate_semantic_index_source(
            quote_nullable(si.input_columns)::text AS input_columns_sql, \
            CASE WHEN si.input_columns IS NULL THEN NULL ELSE to_jsonb(si.input_columns)::text END AS input_columns_json, \
            si.model_name, \
+           quote_nullable(t.input_shaping::text)::text AS input_shaping_sql, \
            otlet.task_contract_hash(t.instruction, t.output_schema, t.model_name, t.runtime_options, t.input_shaping, t.decision_contract) AS contract_hash \
          FROM otlet.semantic_indexes si \
          JOIN otlet.tasks t ON t.name = si.task_name \
@@ -177,6 +178,10 @@ fn validate_semantic_index_source(
             .map_err(to_string)?
             .map(|json| serde_json::from_str::<Vec<String>>(&json).map_err(to_string))
             .transpose()?;
+        let input_shaping_sql = row
+            .get_by_name::<String, _>("input_shaping_sql")
+            .map_err(to_string)?
+            .unwrap_or_else(|| "'{}'".to_owned());
         let Some(contract_hash) = row
             .get_by_name::<String, _>("contract_hash")
             .map_err(to_string)?
@@ -189,7 +194,12 @@ fn validate_semantic_index_source(
             return Ok::<Option<(SemanticPlannerStats, Option<Vec<String>>)>, String>(None);
         }
 
-        let source_rows_sql = source_rows_sql(&source_table, &subject_column, &input_columns_sql);
+        let source_rows_sql = source_rows_sql(
+            &source_table,
+            &subject_column,
+            &input_columns_sql,
+            &input_shaping_sql,
+        );
         let matches_expected_sql = row_predicate_match_sql("sm.body", expected_json);
         let stats_query = format!(
             "WITH latest AS ( \

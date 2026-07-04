@@ -1,15 +1,19 @@
 struct ShapedInput {
     input: Value,
     bytes: i64,
+    original_bytes: i64,
     input_truncated: bool,
     applied: bool,
 }
 
-fn shape_model_input(input: &Value, shaping: &Value) -> ShapedInput {
+fn shape_model_input(input: &Value, shaping: &Value, max_bytes: u64) -> ShapedInput {
     let mut shaped = input.clone();
     let mut applied = false;
 
     if let Value::Object(object) = &mut shaped {
+        applied |= object.remove("_otlet_mvcc").is_some();
+        applied |= object.remove("otlet_mvcc").is_some();
+
         if let Some(strip_keys) = shaping.get("strip_keys").and_then(Value::as_array) {
             for key in strip_keys.iter().filter_map(Value::as_str) {
                 applied |= object.remove(key).is_some();
@@ -31,13 +35,43 @@ fn shape_model_input(input: &Value, shaping: &Value) -> ShapedInput {
         }
     }
 
-    let bytes = shaped.to_string().len().min(i64::MAX as usize) as i64;
+    let shaped_text = canonical_jsonb_text(&shaped);
+    let original_bytes = shaped_text.len().min(i64::MAX as usize) as i64;
+    let mut bytes = original_bytes;
+    let mut input_truncated = false;
+    if max_bytes > 0 && (original_bytes as u64) > max_bytes {
+        let preview_max = max_bytes.min(1024) as usize;
+        let preview = shaped_text
+            .chars()
+            .take(preview_max)
+            .collect::<String>();
+        shaped = json!({
+            "_otlet_input_truncated": true,
+            "truncation_policy": "max_shaped_input_bytes_fail_toward_abstention",
+            "original_shaped_input_bytes": original_bytes,
+            "max_shaped_input_bytes": max_bytes,
+            "truncated_input_preview": preview
+        });
+        bytes = shaped.to_string().len().min(i64::MAX as usize) as i64;
+        input_truncated = true;
+        applied = true;
+    }
+
     ShapedInput {
         input: shaped,
         bytes,
-        input_truncated: false,
+        original_bytes,
+        input_truncated,
         applied,
     }
+}
+
+fn declared_max_shaped_input_bytes(shaping: &Value) -> u64 {
+    shaping
+        .get("max_shaped_input_bytes")
+        .and_then(Value::as_u64)
+        .unwrap_or(0)
+        .min(1_048_576)
 }
 
 fn declared_evidence_counts(input: &Value, shaping: &Value) -> Option<Value> {

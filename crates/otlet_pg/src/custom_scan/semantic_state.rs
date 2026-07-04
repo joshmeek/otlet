@@ -12,6 +12,7 @@ fn load_semantic_states(
                si.source_table, \
                si.subject_column, \
                quote_nullable(si.input_columns)::text AS input_columns_sql, \
+               quote_nullable(t.input_shaping::text)::text AS input_shaping_sql, \
                si.task_name, \
                si.record_type, \
                otlet.task_contract_hash(t.instruction, t.output_schema, t.model_name, t.runtime_options, t.input_shaping, t.decision_contract) AS contract_hash \
@@ -44,6 +45,10 @@ fn load_semantic_states(
             .get_by_name::<String, _>("input_columns_sql")
             .map_err(to_string)?
             .unwrap_or_else(|| "NULL".to_owned());
+        let input_shaping_sql = row
+            .get_by_name::<String, _>("input_shaping_sql")
+            .map_err(to_string)?
+            .unwrap_or_else(|| "'{}'".to_owned());
         let record_type = row
             .get_by_name::<String, _>("record_type")
             .map_err(to_string)?
@@ -52,7 +57,12 @@ fn load_semantic_states(
             .get_by_name::<String, _>("contract_hash")
             .map_err(to_string)?
             .ok_or_else(|| format!("otlet semantic index {index_name} has no contract hash"))?;
-        let source_rows_sql = source_rows_sql(&source_table, &subject_column, &input_columns_sql);
+        let source_rows_sql = source_rows_sql(
+            &source_table,
+            &subject_column,
+            &input_columns_sql,
+            &input_shaping_sql,
+        );
         let matches_expected_sql = row_predicate_match_sql("sm.body", expected_json);
         let query = format!(
             "WITH latest_materializations AS ( \

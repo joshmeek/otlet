@@ -411,7 +411,7 @@ BEGIN
           current_hashes AS (
             SELECT DISTINCT ON (subject_id)
               subject_id,
-              otlet.semantic_content_hash(input) AS content_hash
+              otlet.semantic_content_hash(input, %9$L::jsonb) AS content_hash
             FROM current_inputs
             ORDER BY subject_id, input::text
           )
@@ -449,7 +449,8 @@ BEGIN
         index_row.record_type,
         index_row.input_columns,
         current_contract_hash,
-        index_row.name
+        index_row.name,
+        index_row.input_shaping
       );
     EXCEPTION WHEN OTHERS THEN
       RETURN QUERY
@@ -505,7 +506,7 @@ BEGIN
           current_hashes AS (
             SELECT DISTINCT ON (subject_id)
               subject_id,
-              otlet.semantic_content_hash(input) AS content_hash
+              otlet.semantic_content_hash(input, %8$L::jsonb) AS content_hash
             FROM current_inputs
             ORDER BY subject_id, input::text
           )
@@ -542,7 +543,8 @@ BEGIN
         join_row.record_type,
         current_contract_hash,
         join_row.name,
-        'otlet.semantic_join:' || join_row.name
+        'otlet.semantic_join:' || join_row.name,
+        join_row.input_shaping
       );
     EXCEPTION WHEN OTHERS THEN
       RETURN QUERY

@@ -273,6 +273,9 @@ cleanup_task "row_triage_demo"
 cleanup_task "row_scoped_demo"
 cleanup_task "row_customscan_demo"
 cleanup_task "row_triage_policy_demo"
+cleanup_task "input_shape_mvcc_raw_demo"
+cleanup_task "input_shape_mvcc_hand_demo"
+cleanup_task "input_shape_truncate_demo"
 cleanup_task "$row_triage_task"
 cleanup_task "$row_scoped_task"
 cleanup_task "$row_customscan_task"
@@ -990,6 +993,112 @@ require_regex "$direct_ask_contract" '^review_payment\|[1-9][0-9]*\|[1-9][0-9]*$
 require_regex "$direct_ask_receipt_contract" "^$strong_model_name\\|complete\\|passed\\|[1-9][0-9]*$" "Expected direct ask receipt evidence"
 [ "$direct_ask_cache_contract" = "false|disabled_for_generation_trace|content_hash_contract_hash_model_fingerprint|true|none" ] || {
   echo "Expected direct ask trace to make cache-disabled-under-generation-trace explicit, got $direct_ask_cache_contract" >&2
+  exit 1
+}
+
+psql_exec \
+  -v model_name="$strong_model_name" \
+  -v raw_task="input_shape_mvcc_raw_demo" \
+  -v hand_task="input_shape_mvcc_hand_demo" \
+  -v trunc_task="input_shape_truncate_demo" >/dev/null <<'SQL'
+WITH params AS (
+  SELECT
+    'Return status ok with confidence high and no actions.'::text AS instruction,
+    '{"type":"object","required":["status","confidence"],"additionalProperties":false,"properties":{"status":{"enum":["ok"]},"confidence":{"enum":["high"]}}}'::jsonb AS output_schema,
+    '{"max_tokens":64,"reasoning":"off","inference_cache":false}'::jsonb AS runtime_options
+)
+SELECT otlet.create_task(
+  :'raw_task',
+  $source$
+    SELECT 'shape-mvcc'::text AS subject_id,
+           '{"_otlet_mvcc":{"table":"public.shape","subject_id":"shape-mvcc","ctid":"(0,1)","xmin":"7"},"row":{"status":"ok"}}'::jsonb AS input
+  $source$::text,
+  instruction,
+  output_schema,
+  :'model_name',
+  runtime_options,
+  '{}'::jsonb,
+  '{"answer_field":"status","abstain_values":[],"confidence_field":"confidence","accepted_confidence":["high"]}'::jsonb
+)
+FROM params;
+
+WITH params AS (
+  SELECT
+    'Return status ok with confidence high and no actions.'::text AS instruction,
+    '{"type":"object","required":["status","confidence"],"additionalProperties":false,"properties":{"status":{"enum":["ok"]},"confidence":{"enum":["high"]}}}'::jsonb AS output_schema,
+    '{"max_tokens":64,"reasoning":"off","inference_cache":false}'::jsonb AS runtime_options
+)
+SELECT otlet.create_task(
+  :'hand_task',
+  $source$
+    SELECT 'shape-mvcc'::text AS subject_id,
+           '{"row":{"status":"ok"}}'::jsonb AS input
+  $source$::text,
+  instruction,
+  output_schema,
+  :'model_name',
+  runtime_options,
+  '{}'::jsonb,
+  '{"answer_field":"status","abstain_values":[],"confidence_field":"confidence","accepted_confidence":["high"]}'::jsonb
+)
+FROM params;
+
+SELECT otlet.create_task(
+  :'trunc_task',
+  $source$
+    SELECT 'shape-truncate'::text AS subject_id,
+           jsonb_build_object('row', jsonb_build_object('payload', repeat('oversized input ', 400))) AS input
+  $source$::text,
+  'If input._otlet_input_truncated is true, return status truncated with confidence high and no actions. Return JSON only.',
+  '{"type":"object","required":["status","confidence"],"additionalProperties":false,"properties":{"status":{"enum":["truncated"]},"confidence":{"enum":["high"]}}}'::jsonb,
+  :'model_name',
+  '{"max_tokens":64,"reasoning":"off","inference_cache":false}'::jsonb,
+  '{"max_shaped_input_bytes":256}'::jsonb,
+  '{"answer_field":"status","abstain_values":["truncated"],"confidence_field":"confidence","accepted_confidence":["high"]}'::jsonb
+);
+
+SELECT otlet.run_task(:'raw_task');
+SELECT otlet.run_task(:'hand_task');
+SELECT otlet.run_task(:'trunc_task');
+SQL
+wait_task_complete "input_shape_mvcc_raw_demo" 1 900 1
+wait_task_complete "input_shape_mvcc_hand_demo" 1 900 1
+wait_task_complete "input_shape_truncate_demo" 1 900 1
+input_shape_mvcc_contract="$(psql_value "
+WITH receipts AS (
+  SELECT task_name, prompt_hash, input_shaping_applied
+  FROM otlet.inference_receipt_trace_status
+  WHERE task_name IN ('input_shape_mvcc_raw_demo', 'input_shape_mvcc_hand_demo')
+)
+SELECT count(*)::text || '|' ||
+       count(DISTINCT prompt_hash)::text || '|' ||
+       bool_or(input_shaping_applied)::text || '|' ||
+       (NOT (otlet.semantic_shaped_input('{\"_otlet_mvcc\":{\"xmin\":\"7\"},\"row\":{\"status\":\"ok\"}}'::jsonb, '{}'::jsonb) ? '_otlet_mvcc'))::text || '|' ||
+       (
+         otlet.semantic_content_hash('{\"_otlet_mvcc\":{\"xmin\":\"7\"},\"row\":{\"status\":\"ok\"}}'::jsonb, '{}'::jsonb)
+         = otlet.semantic_content_hash('{\"row\":{\"status\":\"ok\"}}'::jsonb, '{}'::jsonb)
+       )::text
+FROM receipts;
+")"
+echo "input_shape_mvcc_contract=$input_shape_mvcc_contract"
+[ "$input_shape_mvcc_contract" = "2|1|true|true|true" ] || {
+  echo "Expected MVCC stripping to produce equal prompt/content hashes, got $input_shape_mvcc_contract" >&2
+  exit 1
+}
+input_shape_truncate_contract="$(psql_value "
+SELECT input_truncated::text || '|' ||
+       input_shaping_applied::text || '|' ||
+       (original_shaped_input_bytes > max_shaped_input_bytes)::text || '|' ||
+       max_shaped_input_bytes::text || '|' ||
+       (shaped_input_bytes > 0)::text
+FROM otlet.inference_receipt_trace_status
+WHERE task_name = 'input_shape_truncate_demo'
+ORDER BY receipt_id DESC
+LIMIT 1;
+")"
+echo "input_shape_truncate_contract=$input_shape_truncate_contract"
+[ "$input_shape_truncate_contract" = "true|true|true|256|true" ] || {
+  echo "Expected oversized shaped input truncation evidence, got $input_shape_truncate_contract" >&2
   exit 1
 }
 

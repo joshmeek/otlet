@@ -26,7 +26,12 @@ fn sql_identifier(value: &str) -> String {
     format!("\"{}\"", value.replace('"', "\"\""))
 }
 
-fn source_rows_sql(source_table: &str, subject_column: &str, input_columns_sql: &str) -> String {
+fn source_rows_sql(
+    source_table: &str,
+    subject_column: &str,
+    input_columns_sql: &str,
+    input_shaping_sql: &str,
+) -> String {
     let subject_identifier = sql_identifier(subject_column);
     let source_table_literal = sql_literal(source_table);
     format!(
@@ -50,7 +55,7 @@ fn source_rows_sql(source_table: &str, subject_column: &str, input_columns_sql: 
                   ), \
                   'table', {source_table_literal}, \
                   'row', otlet.semantic_project_row(to_jsonb(src), {input_columns_sql}::text[]) \
-                )) AS content_hash \
+                ), {input_shaping_sql}::jsonb) AS content_hash \
          FROM {source_table} AS src"
     )
 }

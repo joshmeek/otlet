@@ -16,6 +16,7 @@ DECLARE
   index_row otlet.semantic_join_indexes%ROWTYPE;
   fresh_sql text := CASE WHEN COALESCE(fresh_only, true) THEN 'true' ELSE 'false' END;
   current_contract_hash text;
+  current_input_shaping jsonb := '{}'::jsonb;
 BEGIN
   SELECT *
   INTO index_row
@@ -26,15 +27,17 @@ BEGIN
     RAISE EXCEPTION 'otlet semantic join index % does not exist', semantic_join_index_current_rows.index_name;
   END IF;
 
-  SELECT otlet.task_contract_hash(
-    t.instruction,
-    t.output_schema,
-    t.model_name,
-    t.runtime_options,
-    t.input_shaping,
-    t.decision_contract
-  )
-  INTO current_contract_hash
+  SELECT
+    otlet.task_contract_hash(
+      t.instruction,
+      t.output_schema,
+      t.model_name,
+      t.runtime_options,
+      t.input_shaping,
+      t.decision_contract
+    ),
+    t.input_shaping
+  INTO current_contract_hash, current_input_shaping
   FROM otlet.tasks t
   WHERE t.name = index_row.task_name;
 
@@ -69,7 +72,7 @@ BEGIN
         ORDER BY
           sm.subject_id,
           (
-            sm.content_hash IS NOT DISTINCT FROM otlet.semantic_content_hash(ci.input)
+            sm.content_hash IS NOT DISTINCT FROM otlet.semantic_content_hash(ci.input, %7$L::jsonb)
             AND sm.contract_hash IS NOT DISTINCT FROM %5$L
           ) DESC,
           sm.updated_at DESC,
@@ -79,14 +82,14 @@ BEGIN
         latest.subject_id,
         latest.body,
         NOT (
-          latest.content_hash IS NOT DISTINCT FROM otlet.semantic_content_hash(ci.input)
+          latest.content_hash IS NOT DISTINCT FROM otlet.semantic_content_hash(ci.input, %7$L::jsonb)
           AND latest.contract_hash IS NOT DISTINCT FROM %5$L
           AND (NOT latest.stale OR latest.stale_reason = 'source_update')
         ) AS stale,
         latest.source_hash,
         CASE
           WHEN NOT (
-            latest.content_hash IS NOT DISTINCT FROM otlet.semantic_content_hash(ci.input)
+            latest.content_hash IS NOT DISTINCT FROM otlet.semantic_content_hash(ci.input, %7$L::jsonb)
             AND latest.contract_hash IS NOT DISTINCT FROM %5$L
             AND (NOT latest.stale OR latest.stale_reason = 'source_update')
           ) THEN NULL
@@ -100,7 +103,7 @@ BEGIN
       WHERE (
         NOT %6$s
         OR (
-          latest.content_hash IS NOT DISTINCT FROM otlet.semantic_content_hash(ci.input)
+          latest.content_hash IS NOT DISTINCT FROM otlet.semantic_content_hash(ci.input, %7$L::jsonb)
           AND latest.contract_hash IS NOT DISTINCT FROM %5$L
           AND (NOT latest.stale OR latest.stale_reason = 'source_update')
         )
@@ -112,7 +115,8 @@ BEGIN
     index_row.task_name,
     index_row.record_type,
     current_contract_hash,
-    fresh_sql
+    fresh_sql,
+    current_input_shaping
   );
 END;
 $$;
@@ -415,6 +419,7 @@ DECLARE
   v_stale_reasons jsonb := '{}'::jsonb;
   v_count_basis text := CASE WHEN exact THEN 'exact' ELSE 'estimated' END;
   current_contract_hash text;
+  current_input_shaping jsonb := '{}'::jsonb;
 BEGIN
   SELECT *
   INTO index_row
@@ -425,15 +430,17 @@ BEGIN
     RAISE EXCEPTION 'otlet semantic join index % does not exist', semantic_join_index_plan.index_name;
   END IF;
 
-  SELECT otlet.task_contract_hash(
-    t.instruction,
-    t.output_schema,
-    t.model_name,
-    t.runtime_options,
-    t.input_shaping,
-    t.decision_contract
-  )
-  INTO current_contract_hash
+  SELECT
+    otlet.task_contract_hash(
+      t.instruction,
+      t.output_schema,
+      t.model_name,
+      t.runtime_options,
+      t.input_shaping,
+      t.decision_contract
+    ),
+    t.input_shaping
+  INTO current_contract_hash, current_input_shaping
   FROM otlet.tasks t
   WHERE t.name = index_row.task_name;
 
@@ -467,7 +474,7 @@ BEGIN
           ORDER BY
             sm.subject_id,
             (
-              sm.content_hash IS NOT DISTINCT FROM otlet.semantic_content_hash(ci.input)
+              sm.content_hash IS NOT DISTINCT FROM otlet.semantic_content_hash(ci.input, %6$L::jsonb)
               AND sm.contract_hash IS NOT DISTINCT FROM %5$L
             ) DESC,
             sm.updated_at DESC,
@@ -477,7 +484,7 @@ BEGIN
           SELECT
             ci.subject_id,
             l.subject_id IS NOT NULL AS has_materialization,
-            l.content_hash IS NOT DISTINCT FROM otlet.semantic_content_hash(ci.input)
+            l.content_hash IS NOT DISTINCT FROM otlet.semantic_content_hash(ci.input, %6$L::jsonb)
               AND l.contract_hash IS NOT DISTINCT FROM %5$L
               AND (NOT l.stale OR l.stale_reason = 'source_update') AS source_fresh,
             COALESCE(l.stale_reason, 'content_revalidation_pending') AS stale_reason
@@ -507,7 +514,8 @@ BEGIN
       index_row.max_candidate_rows,
       index_row.task_name,
       index_row.record_type,
-      current_contract_hash
+      current_contract_hash,
+      current_input_shaping
     )
     INTO v_total_subjects, v_fresh_subjects, v_stale_subjects, v_missing_subjects, v_stale_reasons;
   ELSE

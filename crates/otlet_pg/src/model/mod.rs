@@ -174,6 +174,8 @@ struct RunContext {
     row_identity: String,
     mvcc: Value,
     shaped_input_bytes: i64,
+    original_shaped_input_bytes: i64,
+    max_shaped_input_bytes: i64,
     input_truncated: bool,
     input_shaping_applied: bool,
     schema_prompt: String,
@@ -197,7 +199,8 @@ pub(crate) fn run_job(job: &Job) -> Result<ModelRun, ModelError> {
             "invalid_output_schema",
         )
     })?;
-    let shaped_input = shape_model_input(&job.input, &job.input_shaping);
+    let max_shaped_input_bytes = declared_max_shaped_input_bytes(&job.input_shaping);
+    let shaped_input = shape_model_input(&job.input, &job.input_shaping, max_shaped_input_bytes);
     let instruction = effective_instruction(&job.instruction, &job.decision_contract);
     let rendered_schema = render_output_schema(&job.output_schema, &options.schema_prompt);
     let schema_label = if options.schema_prompt == "compact" {
@@ -205,7 +208,7 @@ pub(crate) fn run_job(job: &Job) -> Result<ModelRun, ModelError> {
     } else {
         "Output schema"
     };
-    let input_content_hash = input_content_hash(&job.input);
+    let input_content_hash = input_content_hash(&shaped_input.input);
     let inference_cache_contract_hash =
         inference_cache_contract_hash(job, &instruction, &options.schema_prompt);
     let prompt = build_prompt_parts(
@@ -240,6 +243,8 @@ pub(crate) fn run_job(job: &Job) -> Result<ModelRun, ModelError> {
         row_identity: input_mvcc_row_identity(&job.input, &job.subject_id),
         mvcc: input_mvcc_payload(&job.input),
         shaped_input_bytes: shaped_input.bytes,
+        original_shaped_input_bytes: shaped_input.original_bytes,
+        max_shaped_input_bytes: u64_to_i64_saturating(max_shaped_input_bytes),
         input_truncated: shaped_input.input_truncated,
         input_shaping_applied: shaped_input.applied,
         schema_prompt: options.schema_prompt.clone(),
