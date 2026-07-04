@@ -383,6 +383,43 @@ WITH bench_jobs AS (
   SELECT id
   FROM otlet.jobs
   WHERE task_name LIKE :'prefix' ESCAPE '\'
+),
+bench_actions AS (
+  SELECT a.id
+  FROM otlet.actions a
+  JOIN bench_jobs bj ON bj.id = a.job_id
+),
+bench_outputs AS (
+  SELECT o.id
+  FROM otlet.outputs o
+  JOIN bench_jobs bj ON bj.id = o.job_id
+),
+bench_receipts AS (
+  SELECT r.id
+  FROM otlet.inference_receipts r
+  JOIN bench_jobs bj ON bj.id = r.job_id
+)
+DELETE FROM otlet.eval_labels l
+WHERE EXISTS (
+    SELECT 1
+    FROM bench_actions a
+    WHERE a.id = l.action_id
+  )
+  OR EXISTS (
+    SELECT 1
+    FROM bench_outputs o
+    WHERE o.id = l.output_id
+  )
+  OR EXISTS (
+    SELECT 1
+    FROM bench_receipts r
+    WHERE r.id = l.receipt_id
+  );
+
+WITH bench_jobs AS (
+  SELECT id
+  FROM otlet.jobs
+  WHERE task_name LIKE :'prefix' ESCAPE '\'
 )
 DELETE FROM otlet.semantic_materializations sm
 USING otlet.records r, otlet.actions a, bench_jobs bj

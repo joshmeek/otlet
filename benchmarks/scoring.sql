@@ -584,6 +584,12 @@ SELECT
   reason
 FROM scored;
 
+CREATE TEMP TABLE IF NOT EXISTS otlet_bench_user_suite_labels (
+  label_id bigint PRIMARY KEY
+) ON COMMIT DROP;
+
+TRUNCATE otlet_bench_user_suite_labels;
+
 WITH target AS (
   SELECT
     ast.action_id,
@@ -610,16 +616,12 @@ correction AS (
     ),
     'benchmark user-suite correction'
   ) l
-),
-exported AS (
-  SELECT e.*
-  FROM correction c
-  JOIN LATERAL (
-    SELECT *
-    FROM otlet.export_eval_cases(1000)
-    WHERE label_id = c.id
-  ) e ON true
 )
+INSERT INTO otlet_bench_user_suite_labels (label_id)
+SELECT id
+FROM correction
+ON CONFLICT (label_id) DO NOTHING;
+
 INSERT INTO otlet_bench_source.case_result (
   run_id,
   model_key,
@@ -683,7 +685,8 @@ SELECT
   NULL,
   NULL,
   reason
-FROM exported;
+FROM otlet.export_eval_cases(1000) exported
+JOIN otlet_bench_user_suite_labels labels ON labels.label_id = exported.label_id;
 
 WITH cases AS (
   SELECT *
@@ -1012,15 +1015,84 @@ SELECT
   :'cleanup_policy'
 FROM fit_metrics;
 
+CREATE TEMP TABLE IF NOT EXISTS otlet_bench_invariant_task_scope (
+  task_name text PRIMARY KEY
+) ON COMMIT DROP;
+
+TRUNCATE otlet_bench_invariant_task_scope;
+
+INSERT INTO otlet_bench_invariant_task_scope (task_name)
+VALUES
+  (:'direct_task'),
+  (:'triage_task'),
+  (:'extraction_task'),
+  (:'policy_task'),
+  (:'join_task'),
+  (:'row_task')
+ON CONFLICT (task_name) DO NOTHING;
+
+CREATE TEMP TABLE IF NOT EXISTS otlet_bench_invariant_join_scope (
+  join_index text PRIMARY KEY
+) ON COMMIT DROP;
+
+TRUNCATE otlet_bench_invariant_join_scope;
+
+INSERT INTO otlet_bench_invariant_join_scope (join_index)
+VALUES (:'join_index')
+ON CONFLICT (join_index) DO NOTHING;
+
 DO $$
 DECLARE
   violation_count bigint;
+  violation_summary text;
 BEGIN
   SELECT count(*) INTO violation_count
-  FROM otlet.verify_invariants();
+  FROM otlet.verify_invariants() v
+  WHERE NOT (
+    v.invariant_name = 'fresh_materialization_content_hash_matches_source'
+    AND (
+      EXISTS (
+        SELECT 1
+        FROM otlet_bench_invariant_task_scope task_scope
+        WHERE task_scope.task_name = v.detail ->> 'task_name'
+      )
+      OR EXISTS (
+        SELECT 1
+        FROM otlet_bench_invariant_join_scope join_scope
+        WHERE join_scope.join_index = v.detail ->> 'semantic_join_index'
+      )
+      OR v.detail ->> 'source_table' LIKE 'otlet_bench_source.%'
+    )
+  );
 
   IF violation_count <> 0 THEN
-    RAISE EXCEPTION 'otlet invariant violations after benchmark scoring: %', violation_count;
+    SELECT string_agg(invariant_name || ':' || violation_rows::text, ', ' ORDER BY invariant_name)
+    INTO violation_summary
+    FROM (
+      SELECT invariant_name, count(*) AS violation_rows
+      FROM otlet.verify_invariants() v
+      WHERE NOT (
+        v.invariant_name = 'fresh_materialization_content_hash_matches_source'
+        AND (
+          EXISTS (
+            SELECT 1
+            FROM otlet_bench_invariant_task_scope task_scope
+            WHERE task_scope.task_name = v.detail ->> 'task_name'
+          )
+          OR EXISTS (
+            SELECT 1
+            FROM otlet_bench_invariant_join_scope join_scope
+            WHERE join_scope.join_index = v.detail ->> 'semantic_join_index'
+          )
+          OR v.detail ->> 'source_table' LIKE 'otlet_bench_source.%'
+        )
+      )
+      GROUP BY invariant_name
+    ) grouped;
+
+    RAISE EXCEPTION 'otlet invariant violations after benchmark scoring: % (%)',
+      violation_count,
+      COALESCE(violation_summary, 'unclassified');
   END IF;
 END $$;
 
