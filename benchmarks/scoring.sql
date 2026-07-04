@@ -657,7 +657,7 @@ INSERT INTO otlet_bench_source.case_result (
 SELECT
   :'run_id',
   :'model_key',
-  'user_suite_' || label_id::text,
+  'user_suite_' || exported.label_id::text,
   'user_suite',
   subject_id,
   expected_answer,
