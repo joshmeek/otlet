@@ -136,6 +136,11 @@ DELETE FROM otlet.worker_events e
 USING otlet.jobs j
 WHERE e.job_id = j.id
   AND j.task_name = :'task_name';
+DELETE FROM otlet.eval_labels l
+USING otlet.actions a, otlet.jobs j
+WHERE l.action_id = a.id
+  AND a.job_id = j.id
+  AND j.task_name = :'task_name';
 DELETE FROM otlet.semantic_materializations sm
 USING otlet.records r, otlet.actions a, otlet.jobs j
 WHERE sm.record_id = r.id
@@ -1866,6 +1871,65 @@ echo "row_triage_contract=$row_triage_contract"
   exit 1
 }
 
+row_triage_action_id="$(psql_value "
+SELECT min(action_id)
+FROM otlet.action_status
+WHERE task_name = '$row_triage_task'
+  AND action_type = 'review_flag'
+  AND error IS NULL;
+")"
+[ -n "$row_triage_action_id" ] || {
+  echo "Expected row triage review action id" >&2
+  exit 1
+}
+psql_exec >/dev/null <<SQL
+SELECT * FROM otlet.label_action($row_triage_action_id, label_source => 'approved_action');
+SQL
+row_eval_label_contract="$(psql_value "
+WITH status AS (
+  SELECT *
+  FROM otlet.eval_label_status
+  WHERE action_id = $row_triage_action_id
+), exported AS (
+  SELECT *
+  FROM otlet.export_eval_cases(50)
+  WHERE action_id = $row_triage_action_id
+)
+SELECT count(*)::text || '|' ||
+       COALESCE(max(status.expected_answer), '') || '|' ||
+       COALESCE(max(status.observed_answer), '') || '|' ||
+       COALESCE(max(exported.expected_answer), '') || '|' ||
+       COALESCE(max(exported.case_kind), '')
+FROM status, exported;
+")"
+echo "row_eval_label_contract=$row_eval_label_contract"
+[ "$row_eval_label_contract" = "1|flag|flag|flag|positive" ] || {
+  echo "Expected row triage eval label/export to use decision as expected_answer, got $row_eval_label_contract" >&2
+  exit 1
+}
+row_eval_label_reject_contract="$(
+  psql_exec -qAt -v action_id="$row_triage_action_id" <<'SQL'
+CREATE TEMP TABLE eval_label_reject_params(action_id bigint);
+CREATE TEMP TABLE eval_label_reject_result(message text);
+INSERT INTO eval_label_reject_params VALUES (:action_id);
+DO $$
+DECLARE
+  target_action_id bigint;
+BEGIN
+  SELECT action_id INTO target_action_id FROM eval_label_reject_params;
+  BEGIN
+    PERFORM * FROM otlet.label_action(target_action_id, expected_answer => 'same_entity');
+    INSERT INTO eval_label_reject_result VALUES ('no error');
+  EXCEPTION WHEN others THEN
+    INSERT INTO eval_label_reject_result VALUES (SQLERRM);
+  END;
+END $$;
+SELECT message FROM eval_label_reject_result;
+SQL
+)"
+echo "row_eval_label_reject_contract=$row_eval_label_reject_contract"
+require_contains "$row_eval_label_reject_contract" "otlet expected_answer same_entity is not valid for task $row_triage_task field decision" "Expected invalid expected_answer to be rejected against task enum"
+
 row_watch_status_contract="$(psql_value "
 SELECT watch_name || '|' || kind || '|' ||
        total_subjects::text || '|' ||
@@ -3155,6 +3219,34 @@ source_write_contract="$source_rows_before|$source_rows_after"
 echo "source_write_contract=$source_write_contract"
 [ "$source_rows_before" = "$source_rows_after" ] || {
   echo "Expected action approval/apply to leave source rows unchanged" >&2
+  exit 1
+}
+
+psql_exec >/dev/null <<SQL
+SELECT * FROM otlet.label_action($merge_action_id);
+SELECT * FROM otlet.label_action($new_entity_action_id);
+SQL
+er_eval_label_contract="$(psql_value "
+WITH labels AS (
+  SELECT *
+  FROM otlet.eval_labels
+  WHERE action_id IN ($merge_action_id, $new_entity_action_id)
+), exported AS (
+  SELECT *
+  FROM otlet.export_eval_cases(50)
+  WHERE action_id IN ($merge_action_id, $new_entity_action_id)
+)
+SELECT count(*)::text || '|' ||
+       COALESCE(max(labels.expected_answer) FILTER (WHERE labels.action_id = $merge_action_id), '') || '|' ||
+       COALESCE(max(exported.case_kind) FILTER (WHERE exported.action_id = $merge_action_id), '') || '|' ||
+       COALESCE(max(labels.expected_answer) FILTER (WHERE labels.action_id = $new_entity_action_id), '') || '|' ||
+       COALESCE(max(exported.case_kind) FILTER (WHERE exported.action_id = $new_entity_action_id), '')
+FROM labels
+JOIN exported USING (action_id);
+")"
+echo "er_eval_label_contract=$er_eval_label_contract"
+[ "$er_eval_label_contract" = "2|same_entity|positive|different_entity|hard_negative" ] || {
+  echo "Expected ER eval export parity after expected_answer rename, got $er_eval_label_contract" >&2
   exit 1
 }
 

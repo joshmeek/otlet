@@ -520,13 +520,12 @@ CREATE TABLE otlet.eval_labels (
   source_table text,
   subject_id text NOT NULL,
   source_hash text,
-  expected_match text NOT NULL,
+  expected_answer text NOT NULL,
   expected_confidence text NOT NULL,
   expected_action_type text NOT NULL,
   label_source text NOT NULL,
   reason text,
   created_at timestamptz NOT NULL DEFAULT now(),
-  CHECK (expected_match IN ('same_entity', 'different_entity', 'unclear')),
   CHECK (expected_confidence IN ('high', 'medium', 'low')),
   CHECK (label_source IN ('approved_action', 'rejected_action', 'manual_correction'))
 );

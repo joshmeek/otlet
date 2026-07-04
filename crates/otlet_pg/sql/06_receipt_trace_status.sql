@@ -139,7 +139,7 @@ SELECT
   l.source_table,
   l.subject_id,
   l.source_hash,
-  l.expected_match,
+  l.expected_answer,
   l.expected_confidence,
   l.expected_action_type,
   l.label_source,
@@ -147,14 +147,16 @@ SELECT
   a.action_type AS observed_action_type,
   a.status AS action_status,
   a.approval_status,
-  o.output ->> 'match' AS observed_match,
-  o.output ->> 'confidence' AS observed_confidence,
+  o.output ->> COALESCE(NULLIF(t.decision_contract ->> 'answer_field', ''), 'match') AS observed_answer,
+  o.output ->> COALESCE(NULLIF(t.decision_contract ->> 'confidence_field', ''), 'confidence') AS observed_confidence,
   r.model_name,
   r.selection_role,
   r.selection_status,
   l.created_at
 FROM otlet.eval_labels l
 LEFT JOIN otlet.actions a ON a.id = l.action_id
+LEFT JOIN otlet.jobs j ON j.id = a.job_id
+LEFT JOIN otlet.tasks t ON t.name = j.task_name
 LEFT JOIN otlet.outputs o ON o.id = l.output_id
 LEFT JOIN otlet.inference_receipts r ON r.id = l.receipt_id;
 
