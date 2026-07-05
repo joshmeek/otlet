@@ -33,7 +33,7 @@ text { font: 12px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; fill
 <line class="grid" x1="72" y1="416.0" x2="872" y2="416.0"/>
 <text text-anchor="middle" x="872.0" y="434.0">5</text>
 <text text-anchor="end" x="64" y="420.0">0</text>
-<circle class="point" cx="712.0" cy="80.1" r="15.0"/>
-<text style="fill:#ffffff" text-anchor="middle" x="712.0" y="84.1">1</text>
-<text x="72" y="506">1. qwen35_4b 0.933</text>
+<circle class="point" cx="712.0" cy="88.1" r="15.0"/>
+<text style="fill:#ffffff" text-anchor="middle" x="712.0" y="92.1">1</text>
+<text x="72" y="506">1. qwen35_4b 0.911</text>
 </svg>

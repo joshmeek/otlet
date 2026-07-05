@@ -6,13 +6,13 @@ Read this ranking first. `overall_fit` is trusted Otlet quality with a soft reso
 
 | rank | model | role | overall_fit | trusted_quality | diagnostic_fit | resource_fit | first_blocker |
 | ---: | --- | --- | ---: | ---: | ---: | ---: | --- |
-| 1 | qwen35_4b | triage_candidate | 0.933 | 0.982 | 0.941 | 0.799 | semantic < 0.95 |
+| 1 | qwen35_4b | triage_candidate | 0.911 | 0.959 | 0.936 | 0.798 | semantic < 0.95 |
 
 ![Overall Otlet fit](overall.svg)
 
 ## Latest Result
 
-Run `b1783095175`: this is a current scored run. It ranks 1 current scored model through the benchmark harness
+Run `b1783189726`: this is a current scored run. It ranks 1 current scored model through the benchmark harness
 
 Benchmark confidence: `provisional_single_run`. Next proof: Rerun with OTLET_BENCH_RUNS=3
 
@@ -26,7 +26,7 @@ A model can show `overall_fit=0.000` when it produced no trusted schema-valid ou
 
 The public ranking keeps the newest scored row per current family/size lane. Superseded rows, unscored candidates, and models with no useful Otlet signal stay out of the README ranking
 
-Current coverage is 142 scored cases per model run. The fixture target includes 112 deterministic pair cases, 30 triage cases, 8 extraction cases, 8 policy-check cases, one exported user-suite correction, row-watch checks, and semantic checks
+Current coverage is 159 scored cases per model run. The fixture target includes 112 deterministic pair cases, 30 triage cases, 8 extraction cases, 8 policy-check cases, one exported user-suite correction, row-watch checks, and semantic checks
 
 ## Columns And Roles
 
@@ -48,7 +48,7 @@ Current coverage is 142 scored cases per model run. The fixture target includes 
 | --- | --- | --- | --- | --- |
 | default Otlet model |  |  |  | none passed production gates |
 | hard entity resolution | qwen35_4b | 1.000 | fail | not a default model unless gate passes |
-| row watching | qwen35_4b | 0.991 | fail | not a default model unless gate passes |
+| row watching | qwen35_4b | 0.982 | fail | not a default model unless gate passes |
 | triage | qwen35_4b | 1.000 | fail | not a default model unless gate passes |
 | <=2.0 GB artifact |  |  |  | no current overall-fit row |
 | correct jobs/sec/GB | qwen35_4b | 0.008 | fail | compare timing after one same-run sweep |
@@ -59,19 +59,19 @@ The repeat-aware default-model gate keeps non-passing models out of production r
 
 | rank | model | readiness | production_score | overall_fit | gate | first_blocker |
 | ---: | --- | --- | ---: | ---: | --- | --- |
-| 1 | qwen35_4b | workload_candidate | 0.000 | 0.933 | fail | semantic < 0.95 |
+| 1 | qwen35_4b | workload_candidate | 0.000 | 0.911 | fail | semantic < 0.95 |
 
 ## First Failure Modes
 
 | model | top_failure | count | passed_cases |
 | --- | --- | ---: | ---: |
-| qwen35_4b | passed | 0 | 142 |
+| qwen35_4b | wrong_match | 3 | 156 |
 
 ## Overall Fit Ranking
 
 | rank | model | runs | readiness | overall_fit | trusted_quality | schema | p95_ms | rss_gb | artifact_gb |
 | ---: | --- | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| 1 | qwen35_4b | 1 | workload_candidate | 0.933 | 0.982 | 1.000 | 12381 | 3.226 | 2.741 |
+| 1 | qwen35_4b | 1 | workload_candidate | 0.911 | 0.959 | 1.000 | 12596 | 3.239 | 2.741 |
 
 ## Out Of Running
 
