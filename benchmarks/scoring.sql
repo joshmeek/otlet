@@ -726,7 +726,8 @@ metrics AS (
     COALESCE(avg((schema_valid AND match_correct AND confidence_correct AND action_correct)::int) FILTER (WHERE track = 'policy_check'), 0)::numeric AS policy_check_score,
     COALESCE(avg((schema_valid AND match_correct AND confidence_correct AND action_correct AND source_hash_present)::int) FILTER (WHERE track = 'user_suite'), 0)::numeric AS user_suite_score,
     COALESCE(avg(action_correct::int), 0)::numeric AS typed_action_score,
-    COALESCE(avg((materialized AND source_hash_present)::int), 0)::numeric AS semantic_materialization_score
+    COALESCE(avg((materialized AND source_hash_present)::int)
+      FILTER (WHERE track IN ('contract', 'entity_resolution', 'abstention', 'dirty_data')), 0)::numeric AS semantic_materialization_score
   FROM cases
 ),
 row_watch AS (

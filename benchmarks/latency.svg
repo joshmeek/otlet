@@ -12,14 +12,14 @@ text { font: 12px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; fill
 <line class="grid" x1="220.0" y1="54" x2="220.0" y2="116"/>
 <text text-anchor="middle" x="220.0" y="134">0</text>
 <line class="grid" x1="391.0" y1="54" x2="391.0" y2="116"/>
-<text text-anchor="middle" x="391.0" y="134">5000</text>
+<text text-anchor="middle" x="391.0" y="134">2500</text>
 <line class="grid" x1="562.0" y1="54" x2="562.0" y2="116"/>
-<text text-anchor="middle" x="562.0" y="134">10000</text>
+<text text-anchor="middle" x="562.0" y="134">5000</text>
 <line class="grid" x1="733.0" y1="54" x2="733.0" y2="116"/>
-<text text-anchor="middle" x="733.0" y="134">15000</text>
+<text text-anchor="middle" x="733.0" y="134">7500</text>
 <line class="grid" x1="904.0" y1="54" x2="904.0" y2="116"/>
-<text text-anchor="middle" x="904.0" y="134">20000</text>
+<text text-anchor="middle" x="904.0" y="134">10000</text>
 <text x="24" y="80">qwen35_4b</text>
-<rect class="bar" x="220" y="62" width="430.8" height="20" rx="2"/>
-<text x="656.8" y="77">12596</text>
+<rect class="bar" x="220" y="62" width="675.2" height="20" rx="2"/>
+<text x="901.2" y="77">9872</text>
 </svg>
