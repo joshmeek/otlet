@@ -17,7 +17,13 @@ def read_tsv(path):
     if not path.exists() or path.stat().st_size == 0:
         return []
     with path.open(newline="") as f:
-        return list(csv.DictReader(f, delimiter="\t"))
+        rows = list(csv.DictReader(f, delimiter="\t"))
+    for row in rows:
+        if "single_run_verdict" not in row and "verdict" in row:
+            row["single_run_verdict"] = row["verdict"]
+        if "verdict" not in row and "single_run_verdict" in row:
+            row["verdict"] = row["single_run_verdict"]
+    return rows
 
 
 def read_kv(path):
@@ -108,12 +114,14 @@ def table(headers, rows):
         "dirty",
         "triage",
         "triage_abstain",
+        "numeric",
         "extraction",
         "policy",
         "user_suite",
         "actions",
         "diag_actions",
         "diag_triage",
+        "diag_numeric",
         "semantic",
         "count",
         "passed_cases",
@@ -233,6 +241,10 @@ def gate_failures(row):
             failures.append("entity < 0.80")
         if metric_present(row, "triage_score") and num(row.get("triage_score")) < 0.80:
             failures.append("triage < 0.80")
+        if metric_present(row, "extraction_score") and num(row.get("extraction_score")) < 0.80:
+            failures.append("extraction < 0.80")
+        if metric_present(row, "policy_check_score") and num(row.get("policy_check_score")) < 0.80:
+            failures.append("policy < 0.80")
         if num(row.get("abstention_false_merge_rate")) > 0:
             failures.append("false merge")
         if num(row.get("hallucinated_trusted_action_rate")) > 0.01:
@@ -471,6 +483,7 @@ def aggregate_summaries(rows, models):
         "dirty_data_score",
         "triage_score",
         "triage_abstention_score",
+        "numeric_evidence_score",
         "extraction_score",
         "policy_check_score",
         "user_suite_score",
@@ -480,6 +493,7 @@ def aggregate_summaries(rows, models):
         "confidence_score",
         "diagnostic_entity_accuracy",
         "diagnostic_triage_accuracy",
+        "diagnostic_numeric_accuracy",
         "diagnostic_action_accuracy",
         "diagnostic_confidence_accuracy",
         "diagnostic_quality_score",
@@ -588,6 +602,7 @@ def add_missing_model_rows(summaries, models):
             "dirty_data_score",
             "triage_score",
             "triage_abstention_score",
+            "numeric_evidence_score",
             "extraction_score",
             "policy_check_score",
             "user_suite_score",
@@ -596,6 +611,7 @@ def add_missing_model_rows(summaries, models):
             "semantic_materialization_score",
             "diagnostic_entity_accuracy",
             "diagnostic_triage_accuracy",
+            "diagnostic_numeric_accuracy",
             "diagnostic_action_accuracy",
             "diagnostic_confidence_accuracy",
             "diagnostic_quality_score",
@@ -840,6 +856,7 @@ def write_scorecard(path, rows):
         "dirty",
         "triage",
         "triage_abstain",
+        "numeric",
         "extraction",
         "policy",
         "user_suite",
@@ -847,6 +864,7 @@ def write_scorecard(path, rows):
         "actions",
         "confidence",
         "diag_triage",
+        "diag_numeric",
         "diag_confidence",
         "semantic",
         "p95_ms",
@@ -895,6 +913,7 @@ def write_scorecard(path, rows):
                     "dirty": f'{num(row.get("dirty_data_score")):.6f}',
                     "triage": f'{num(row.get("triage_score")):.6f}' if metric_present(row, "triage_score") else "",
                     "triage_abstain": f'{num(row.get("triage_abstention_score")):.6f}' if metric_present(row, "triage_abstention_score") else "",
+                    "numeric": f'{num(row.get("numeric_evidence_score")):.6f}' if metric_present(row, "numeric_evidence_score") else "",
                     "extraction": f'{num(row.get("extraction_score")):.6f}' if metric_present(row, "extraction_score") else "",
                     "policy": f'{num(row.get("policy_check_score")):.6f}' if metric_present(row, "policy_check_score") else "",
                     "user_suite": f'{num(row.get("user_suite_score")):.6f}' if metric_present(row, "user_suite_score") else "",
@@ -902,6 +921,7 @@ def write_scorecard(path, rows):
                     "actions": f'{num(row.get("typed_action_score")):.6f}',
                     "confidence": f'{num(row.get("confidence_score")):.6f}' if row.get("confidence_score") not in (None, "") else "",
                     "diag_triage": f'{num(row.get("diagnostic_triage_accuracy")):.6f}' if metric_present(row, "diagnostic_triage_accuracy") else "",
+                    "diag_numeric": f'{num(row.get("diagnostic_numeric_accuracy")):.6f}' if metric_present(row, "diagnostic_numeric_accuracy") else "",
                     "diag_confidence": f'{num(row.get("diagnostic_confidence_accuracy")):.6f}' if row.get("diagnostic_confidence_accuracy") not in (None, "") else "",
                     "semantic": f'{num(row.get("semantic_materialization_score")):.6f}',
                     "p95_ms": f'{num(row.get("p95_generate_ms")):.3f}',
@@ -1526,6 +1546,7 @@ def main():
                 "dirty": f'{num(row.get("dirty_data_score")):.3f}',
                 "triage": f'{num(row.get("triage_score")):.3f}' if metric_present(row, "triage_score") else "",
                 "triage_abstain": f'{num(row.get("triage_abstention_score")):.3f}' if metric_present(row, "triage_abstention_score") else "",
+                "numeric": f'{num(row.get("numeric_evidence_score")):.3f}' if metric_present(row, "numeric_evidence_score") else "",
                 "extraction": f'{num(row.get("extraction_score")):.3f}' if metric_present(row, "extraction_score") else "",
                 "policy": f'{num(row.get("policy_check_score")):.3f}' if metric_present(row, "policy_check_score") else "",
                 "user_suite": f'{num(row.get("user_suite_score")):.3f}' if metric_present(row, "user_suite_score") else "",
@@ -1533,6 +1554,7 @@ def main():
                 "actions": f'{num(row.get("typed_action_score")):.3f}',
                 "confidence": f'{num(row.get("confidence_score")):.3f}' if row.get("confidence_score") not in (None, "") else "",
                 "diag_triage": f'{num(row.get("diagnostic_triage_accuracy")):.3f}' if metric_present(row, "diagnostic_triage_accuracy") else "",
+                "diag_numeric": f'{num(row.get("diagnostic_numeric_accuracy")):.3f}' if metric_present(row, "diagnostic_numeric_accuracy") else "",
                 "diag_actions": f'{num(row.get("diagnostic_action_accuracy")):.3f}',
                 "diag_confidence": f'{num(row.get("diagnostic_confidence_accuracy")):.3f}' if row.get("diagnostic_confidence_accuracy") not in (None, "") else "",
                 "semantic": f'{num(row.get("semantic_materialization_score")):.3f}',
@@ -1557,6 +1579,8 @@ def main():
                 "entity": f'{num(row.get("entity_accuracy")):.3f}',
                 "abstain": f'{num(row.get("abstention_score")):.3f}',
                 "triage": f'{num(row.get("triage_score")):.3f}' if metric_present(row, "triage_score") else "",
+                "extraction": f'{num(row.get("extraction_score")):.3f}' if metric_present(row, "extraction_score") else "",
+                "policy": f'{num(row.get("policy_check_score")):.3f}' if metric_present(row, "policy_check_score") else "",
                 "actions": f'{num(row.get("typed_action_score")):.3f}',
                 "confidence": f'{num(row.get("confidence_score")):.3f}' if row.get("confidence_score") not in (None, "") else "",
                 "semantic": f'{num(row.get("semantic_materialization_score")):.3f}',
@@ -1932,9 +1956,9 @@ def main():
         "",
         "## Score Contract",
         "",
-        "A model must pass the production gate with at least 3 same-run repeats before it can be called a default Otlet model. The gate requires no worker crash, no source-table mutation, no stale leak, schema >= 0.95, contract >= 0.95, exact confidence target accuracy >= 0.95, entity >= 0.80, triage >= 0.80, zero false merges, hallucinated trusted actions <= 0.01, semantic materialization >= 0.95, and repeat_count >= 3",
+        "A model must pass the production gate with at least 3 same-run repeats before it can be called a default Otlet model. The gate requires no worker crash, no source-table mutation, no stale leak, schema >= 0.95, contract >= 0.95, exact confidence target accuracy >= 0.95, entity >= 0.80, triage >= 0.80, extraction >= 0.80, policy >= 0.80, zero false merges, hallucinated trusted actions <= 0.01, semantic materialization >= 0.95, and repeat_count >= 3",
         "",
-        "`overall_fit = trusted_quality * (0.75 + 0.25 * resource_fit)` for a single run. `production_score = overall_fit` only when the production gate and repeat proof pass; otherwise it is 0.000. `trusted_quality` includes contract, entity-resolution, abstention, dirty-data, triage, extraction, policy-check, user-suite, row-watch, typed-action, semantic-materialization, and confidence scores. `resource_fit` weights artifact GB 40%, resident RSS 30%, p95 latency 20%, and active params 10%. The targets are <=2.0 GB artifact, <=2.5 GB resident RSS, <=20s p95 generation, and <=3B active params. A model over a target is discounted by target/value instead of zeroed out. Repeated models rank by their worst overall-fit repeat; the scorecard shows mean, min, max, and standard deviation. `diagnostic_fit` uses the same soft resource adjustment but starts from diagnostic fields",
+        "`overall_fit = trusted_quality * (0.75 + 0.25 * resource_fit)` for a single run. `production_score = overall_fit` only when the production gate and repeat proof pass; otherwise it is 0.000. `trusted_quality` includes contract, entity-resolution, abstention, dirty-data, triage, numeric-evidence, extraction, policy-check, user-suite, row-watch, typed-action, semantic-materialization, and confidence scores. `resource_fit` weights artifact GB 40%, resident RSS 30%, p95 latency 20%, and active params 10%. The targets are <=2.0 GB artifact, <=2.5 GB resident RSS, <=20s p95 generation, and <=3B active params. A model over a target is discounted by target/value instead of zeroed out. Repeated models rank by their worst overall-fit repeat; the scorecard shows mean, min, max, and standard deviation. `diagnostic_fit` uses the same soft resource adjustment but starts from diagnostic fields",
         "",
         "## Score Audit",
         "",
@@ -1982,7 +2006,7 @@ def main():
         "",
         "## Gate Summary",
         "",
-        table(["model", "runs", "verdict", "gate", "failed_gate", "schema", "contract", "confidence", "entity", "abstain", "triage", "actions", "semantic"], gate_rows),
+        table(["model", "runs", "verdict", "gate", "failed_gate", "schema", "contract", "confidence", "entity", "abstain", "triage", "extraction", "policy", "actions", "semantic"], gate_rows),
         "",
         "## Out Of Running",
         "",
@@ -2032,7 +2056,7 @@ def main():
         "",
         "## Track Breakdown",
         "",
-        table(["model", "contract", "entity", "abstain", "dirty", "triage", "triage_abstain", "extraction", "policy", "user_suite", "row_watch", "actions", "confidence", "diag_triage", "diag_actions", "diag_confidence", "semantic"], track_rows),
+        table(["model", "contract", "entity", "abstain", "dirty", "triage", "triage_abstain", "numeric", "extraction", "policy", "user_suite", "row_watch", "actions", "confidence", "diag_triage", "diag_numeric", "diag_actions", "diag_confidence", "semantic"], track_rows),
         "",
         "## Selected Failure Examples",
         "",

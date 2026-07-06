@@ -31,7 +31,7 @@ A model can show `overall_fit=0.000` when it produced no trusted schema-valid ou
 
 The public ranking keeps the newest scored row per current family/size lane. Superseded rows, unscored candidates, and models with no useful Otlet signal stay out of the README ranking
 
-Current coverage is 159 scored cases per model run. The fixture target includes 112 deterministic pair cases, 30 triage cases, 8 extraction cases, 8 policy-check cases, one exported user-suite correction, row-watch checks, and semantic checks
+The harness now emits up to 340 scored cases per full model run: 112 deterministic pair cases, 30 triage cases, 20 numeric-evidence cases, 30 extraction cases, 30 policy-check cases, at least 5 exported user-suite corrections when trusted actions exist, 113 row-watch case rows, plus semantic stale-safety checks. The latest published tables above still show the pre-expansion 159-case report until the next benchmark run
 
 ## Columns And Roles
 
@@ -46,6 +46,8 @@ Current coverage is 159 scored cases per model run. The fixture target includes 
 | triage_candidate | useful trusted output, but not default-ready |
 | row_watch_candidate | useful for watch-style row judgment, but not default-ready |
 | workload_candidate | production-readiness label for a useful non-default model |
+
+The SQL summary column is `single_run_verdict`; report tables still display it as `verdict`
 
 ## Workload Picks
 
@@ -117,10 +119,12 @@ The score covers:
 - schema-valid trusted output
 - explicit production gates and repeat proof before any default-model claim
 - non-ER triage decisions across flag, pass, abstain, and adversarial row-text cases
+- numeric-evidence decisions across threshold pass, threshold breach, incomplete evidence, and adversarial row-text cases
+- extraction and policy-check phases with roughly 30 cases each and production gates at 0.80
 - entity-resolution decisions across duplicates, hard negatives, sparse rows, dirty rows, and abstention cases
 - exact confidence targets, so overconfident or underconfident outputs do not get silent credit
 - typed actions with no source-table writes
-- row-watch classification
+- row-watch classification as per-row case results
 - semantic materialization and stale-result safety
 - receipt, trace, source-hash, FDW, and CustomScan visibility
 - p95 latency, tokens/sec, resident RSS, artifact size, active params, and fit per resident GB

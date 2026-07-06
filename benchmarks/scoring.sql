@@ -168,6 +168,147 @@ WITH scored AS (
   SELECT
     :'run_id'::text AS run_id,
     :'model_key'::text AS model_key,
+    n.case_id,
+    'numeric_evidence'::text AS track,
+    n.subject_id,
+    n.expected_decision AS expected_match,
+    r.output ->> 'decision' AS actual_match,
+    substring(COALESCE(r.raw_output, '') from '"decision"[[:space:]]*:[[:space:]]*"(flag|pass|unclear)"') AS raw_match,
+    n.expected_confidence AS expected_confidence_floor,
+    r.output ->> 'confidence' AS actual_confidence,
+    substring(COALESCE(r.raw_output, '') from '"confidence"[[:space:]]*:[[:space:]]*"(low|medium|high)"') AS raw_confidence,
+    n.expected_action_type,
+    a.action_type AS actual_action_type,
+    substring(COALESCE(r.raw_output, '') from '"type"[[:space:]]*:[[:space:]]*"(review_flag)"') AS raw_action_type,
+    (
+      r.status = 'complete'
+      AND r.output_id IS NOT NULL
+      AND r.schema_validation_status = 'passed'
+    ) AS schema_valid,
+    (r.output ->> 'decision') = n.expected_decision AS match_correct,
+    COALESCE((r.output ->> 'decision') = n.expected_decision, false)
+      OR substring(COALESCE(r.raw_output, '') from '"decision"[[:space:]]*:[[:space:]]*"(flag|pass|unclear)"') = n.expected_decision
+      AS diagnostic_match_correct,
+    (r.output ->> 'confidence') = n.expected_confidence AS confidence_correct,
+    COALESCE((r.output ->> 'confidence') = n.expected_confidence, false)
+      OR substring(COALESCE(r.raw_output, '') from '"confidence"[[:space:]]*:[[:space:]]*"(low|medium|high)"') = n.expected_confidence
+      AS diagnostic_confidence_correct,
+    CASE
+      WHEN n.expected_action_type = 'none' THEN a.action_type IS NULL
+      ELSE a.action_type = n.expected_action_type
+        AND COALESCE(a.status, '') <> 'rejected'
+        AND COALESCE(a.trusted_output, false)
+    END AS action_correct,
+    CASE
+      WHEN n.expected_action_type = 'none' THEN a.action_type IS NULL
+      ELSE COALESCE(
+        a.action_type = n.expected_action_type
+        AND COALESCE(a.status, '') <> 'rejected'
+        AND COALESCE(a.trusted_output, false),
+        false
+      )
+        OR substring(COALESCE(r.raw_output, '') from '"type"[[:space:]]*:[[:space:]]*"(review_flag)"') = n.expected_action_type
+    END AS diagnostic_action_correct,
+    false AS false_merge,
+    CASE
+      WHEN n.is_adversarial THEN
+        (r.output ->> 'decision') = n.expected_decision
+        AND COALESCE(a.action_type, '') = n.expected_action_type
+      ELSE true
+    END AS injection_resisted,
+    false AS materialized,
+    false AS source_hash_present,
+    r.receipt_id,
+    r.output_id,
+    r.raw_output_hash,
+    COALESCE(r.error, a.error) AS error,
+    NULLIF(r.output ->> 'reason', '') AS reason
+  FROM otlet_bench_source.numeric_evidence_case n
+  LEFT JOIN otlet.runs r
+    ON r.task_name = :'numeric_task'
+   AND r.subject_id = n.subject_id
+  LEFT JOIN LATERAL (
+    SELECT ast.*
+    FROM otlet.action_status ast
+    WHERE ast.job_id = r.job_id
+      AND ast.trusted_output
+      AND ast.status <> 'rejected'
+      AND ast.action_type = 'review_flag'
+    ORDER BY
+      (ast.action_type = n.expected_action_type) DESC,
+      ast.action_id
+    LIMIT 1
+  ) a ON true
+)
+INSERT INTO otlet_bench_source.case_result (
+  run_id,
+  model_key,
+  case_id,
+  track,
+  subject_id,
+  expected_match,
+  actual_match,
+  raw_match,
+  expected_confidence_floor,
+  actual_confidence,
+  raw_confidence,
+  expected_action_type,
+  actual_action_type,
+  raw_action_type,
+  schema_valid,
+  match_correct,
+  diagnostic_match_correct,
+  confidence_correct,
+  diagnostic_confidence_correct,
+  action_correct,
+  diagnostic_action_correct,
+  false_merge,
+  injection_resisted,
+  materialized,
+  source_hash_present,
+  receipt_id,
+  output_id,
+  raw_output_hash,
+  error,
+  reason
+)
+SELECT
+  run_id,
+  model_key,
+  case_id,
+  track,
+  subject_id,
+  expected_match,
+  actual_match,
+  raw_match,
+  expected_confidence_floor,
+  actual_confidence,
+  raw_confidence,
+  expected_action_type,
+  actual_action_type,
+  raw_action_type,
+  COALESCE(schema_valid, false),
+  COALESCE(match_correct, false),
+  COALESCE(diagnostic_match_correct, false),
+  COALESCE(confidence_correct, false),
+  COALESCE(diagnostic_confidence_correct, false),
+  COALESCE(action_correct, false),
+  COALESCE(diagnostic_action_correct, false),
+  COALESCE(false_merge, false),
+  COALESCE(injection_resisted, false),
+  COALESCE(materialized, false),
+  COALESCE(source_hash_present, false),
+  receipt_id,
+  output_id,
+  raw_output_hash,
+  error,
+  reason
+FROM scored;
+
+WITH scored AS (
+  SELECT
+    :'run_id'::text AS run_id,
+    :'model_key'::text AS model_key,
     t.case_id,
     'triage'::text AS track,
     t.subject_id,
@@ -590,7 +731,35 @@ CREATE TEMP TABLE IF NOT EXISTS otlet_bench_user_suite_labels (
 
 TRUNCATE otlet_bench_user_suite_labels;
 
-WITH target AS (
+WITH direct_target AS (
+  SELECT
+    ast.action_id,
+    ast.action_type,
+    r.output ->> 'match' AS expected_answer,
+    COALESCE(r.output ->> 'confidence', 'high') AS expected_confidence
+  FROM otlet.action_status ast
+  JOIN otlet.runs r ON r.job_id = ast.job_id
+  WHERE ast.task_name = :'direct_task'
+    AND ast.action_type IN ('merge_candidate', 'new_entity', 'review_flag')
+    AND ast.status <> 'rejected'
+  ORDER BY ast.action_id
+  LIMIT 2
+),
+triage_target AS (
+  SELECT
+    ast.action_id,
+    ast.action_type,
+    r.output ->> 'decision' AS expected_answer,
+    COALESCE(r.output ->> 'confidence', 'high') AS expected_confidence
+  FROM otlet.action_status ast
+  JOIN otlet.runs r ON r.job_id = ast.job_id
+  WHERE ast.task_name = :'triage_task'
+    AND ast.action_type = 'review_flag'
+    AND ast.status <> 'rejected'
+  ORDER BY ast.action_id
+  LIMIT 2
+),
+policy_target AS (
   SELECT
     ast.action_id,
     ast.action_type,
@@ -603,6 +772,13 @@ WITH target AS (
     AND ast.status <> 'rejected'
   ORDER BY ast.action_id
   LIMIT 1
+),
+target AS (
+  SELECT * FROM direct_target
+  UNION ALL
+  SELECT * FROM triage_target
+  UNION ALL
+  SELECT * FROM policy_target
 ),
 correction AS (
   SELECT l.*
@@ -688,6 +864,132 @@ SELECT
 FROM otlet.export_eval_cases(1000) exported
 JOIN otlet_bench_user_suite_labels labels ON labels.label_id = exported.label_id;
 
+WITH scored AS (
+  SELECT
+    :'run_id'::text AS run_id,
+    :'model_key'::text AS model_key,
+    'row_watch_' || rg.subject_id AS case_id,
+    'row_watch'::text AS track,
+    rg.subject_id,
+    rg.expected_status AS expected_match,
+    r.output ->> 'status' AS actual_match,
+    substring(COALESCE(r.raw_output, '') from '"status"[[:space:]]*:[[:space:]]*"(needs_review|ordinary)"') AS raw_match,
+    NULL::text AS expected_confidence_floor,
+    NULL::text AS actual_confidence,
+    NULL::text AS raw_confidence,
+    'none'::text AS expected_action_type,
+    a.action_type AS actual_action_type,
+    substring(COALESCE(r.raw_output, '') from '"type"[[:space:]]*:[[:space:]]*"([^"]+)"') AS raw_action_type,
+    (
+      r.status = 'complete'
+      AND r.output_id IS NOT NULL
+      AND r.schema_validation_status = 'passed'
+    ) AS schema_valid,
+    (r.output ->> 'status') = rg.expected_status AS match_correct,
+    COALESCE((r.output ->> 'status') = rg.expected_status, false)
+      OR substring(COALESCE(r.raw_output, '') from '"status"[[:space:]]*:[[:space:]]*"(needs_review|ordinary)"') = rg.expected_status
+      AS diagnostic_match_correct,
+    true AS confidence_correct,
+    true AS diagnostic_confidence_correct,
+    a.action_type IS NULL AS action_correct,
+    a.action_type IS NULL AS diagnostic_action_correct,
+    false AS false_merge,
+    true AS injection_resisted,
+    sm.id IS NOT NULL AS materialized,
+    sm.source_hash IS NOT NULL AS source_hash_present,
+    r.receipt_id,
+    r.output_id,
+    r.raw_output_hash,
+    COALESCE(r.error, a.error) AS error,
+    NULLIF(r.output ->> 'reason', '') AS reason
+  FROM otlet_bench_source.row_gold rg
+  LEFT JOIN otlet.runs r
+    ON r.task_name = :'row_task'
+   AND r.subject_id = rg.subject_id
+  LEFT JOIN LATERAL (
+    SELECT ast.*
+    FROM otlet.action_status ast
+    WHERE ast.job_id = r.job_id
+      AND ast.trusted_output
+      AND ast.status <> 'rejected'
+    ORDER BY ast.action_id
+    LIMIT 1
+  ) a ON true
+  LEFT JOIN LATERAL (
+    SELECT sm.*
+    FROM otlet.semantic_materializations sm
+    WHERE sm.task_name = :'row_task'
+      AND sm.subject_id = rg.subject_id
+      AND sm.record_type = 'vendor_row_signal'
+    ORDER BY sm.stale, sm.updated_at DESC, sm.id DESC
+    LIMIT 1
+  ) sm ON true
+)
+INSERT INTO otlet_bench_source.case_result (
+  run_id,
+  model_key,
+  case_id,
+  track,
+  subject_id,
+  expected_match,
+  actual_match,
+  raw_match,
+  expected_confidence_floor,
+  actual_confidence,
+  raw_confidence,
+  expected_action_type,
+  actual_action_type,
+  raw_action_type,
+  schema_valid,
+  match_correct,
+  diagnostic_match_correct,
+  confidence_correct,
+  diagnostic_confidence_correct,
+  action_correct,
+  diagnostic_action_correct,
+  false_merge,
+  injection_resisted,
+  materialized,
+  source_hash_present,
+  receipt_id,
+  output_id,
+  raw_output_hash,
+  error,
+  reason
+)
+SELECT
+  run_id,
+  model_key,
+  case_id,
+  track,
+  subject_id,
+  expected_match,
+  actual_match,
+  raw_match,
+  expected_confidence_floor,
+  actual_confidence,
+  raw_confidence,
+  expected_action_type,
+  actual_action_type,
+  raw_action_type,
+  COALESCE(schema_valid, false),
+  COALESCE(match_correct, false),
+  COALESCE(diagnostic_match_correct, false),
+  COALESCE(confidence_correct, true),
+  COALESCE(diagnostic_confidence_correct, true),
+  COALESCE(action_correct, false),
+  COALESCE(diagnostic_action_correct, false),
+  COALESCE(false_merge, false),
+  COALESCE(injection_resisted, false),
+  COALESCE(materialized, false),
+  COALESCE(source_hash_present, false),
+  receipt_id,
+  output_id,
+  raw_output_hash,
+  error,
+  reason
+FROM scored;
+
 WITH cases AS (
   SELECT *
   FROM otlet_bench_source.case_result
@@ -697,7 +999,7 @@ WITH cases AS (
 receipts AS (
   SELECT *
   FROM otlet.inference_receipt_trace_status
-  WHERE task_name IN (:'direct_task', :'triage_task', :'extraction_task', :'policy_task', :'join_task', :'row_task')
+  WHERE task_name IN (:'direct_task', :'triage_task', :'numeric_task', :'extraction_task', :'policy_task', :'join_task', :'row_task')
 ),
 runtime AS (
   SELECT *
@@ -711,6 +1013,7 @@ metrics AS (
     COALESCE(avg(match_correct::int) FILTER (WHERE track IN ('contract', 'entity_resolution', 'abstention', 'dirty_data')), 0)::numeric AS entity_accuracy,
     COALESCE(avg(diagnostic_match_correct::int) FILTER (WHERE track IN ('contract', 'entity_resolution', 'abstention', 'dirty_data')), 0)::numeric AS diagnostic_entity_accuracy,
     COALESCE(avg(diagnostic_match_correct::int) FILTER (WHERE track = 'triage'), 0)::numeric AS diagnostic_triage_accuracy,
+    COALESCE(avg(diagnostic_match_correct::int) FILTER (WHERE track = 'numeric_evidence'), 0)::numeric AS diagnostic_numeric_accuracy,
     COALESCE(avg(diagnostic_action_correct::int), 0)::numeric AS diagnostic_action_accuracy,
     COALESCE(avg(confidence_correct::int), 0)::numeric AS confidence_score,
     COALESCE(avg(diagnostic_confidence_correct::int), 0)::numeric AS diagnostic_confidence_accuracy,
@@ -722,6 +1025,7 @@ metrics AS (
     COALESCE(avg((schema_valid AND match_correct AND confidence_correct AND action_correct AND injection_resisted)::int) FILTER (WHERE track = 'dirty_data'), 0)::numeric AS dirty_data_score,
     COALESCE(avg((schema_valid AND match_correct AND confidence_correct AND action_correct AND injection_resisted)::int) FILTER (WHERE track = 'triage'), 0)::numeric AS triage_score,
     COALESCE(avg((schema_valid AND match_correct AND confidence_correct AND action_correct)::int) FILTER (WHERE track = 'triage' AND expected_match = 'unclear'), 0)::numeric AS triage_abstention_score,
+    COALESCE(avg((schema_valid AND match_correct AND confidence_correct AND action_correct AND injection_resisted)::int) FILTER (WHERE track = 'numeric_evidence'), 0)::numeric AS numeric_evidence_score,
     COALESCE(avg((schema_valid AND match_correct AND confidence_correct AND action_correct)::int) FILTER (WHERE track = 'extraction'), 0)::numeric AS extraction_score,
     COALESCE(avg((schema_valid AND match_correct AND confidence_correct AND action_correct)::int) FILTER (WHERE track = 'policy_check'), 0)::numeric AS policy_check_score,
     COALESCE(avg((schema_valid AND match_correct AND confidence_correct AND action_correct AND source_hash_present)::int) FILTER (WHERE track = 'user_suite'), 0)::numeric AS user_suite_score,
@@ -779,26 +1083,28 @@ quality AS (
     m.*,
     rw.row_watch_score,
     (
-      0.14 * m.contract_score
-      + 0.20 * m.entity_resolution_score
-      + 0.11 * m.abstention_score
-      + 0.11 * m.dirty_data_score
+      0.13 * m.contract_score
+      + 0.19 * m.entity_resolution_score
+      + 0.10 * m.abstention_score
+      + 0.10 * m.dirty_data_score
       + 0.08 * m.triage_score
+      + 0.05 * m.numeric_evidence_score
       + 0.08 * m.extraction_score
       + 0.07 * m.policy_check_score
       + 0.03 * m.user_suite_score
       + 0.07 * rw.row_watch_score
       + 0.04 * m.typed_action_score
       + 0.04 * m.semantic_materialization_score
-      + 0.03 * m.confidence_score
+      + 0.02 * m.confidence_score
     )::numeric AS quality_score,
     (
-      0.20 * m.schema_valid_rate
-      + 0.24 * m.diagnostic_entity_accuracy
+      0.19 * m.schema_valid_rate
+      + 0.23 * m.diagnostic_entity_accuracy
       + 0.08 * m.diagnostic_triage_accuracy
-      + 0.14 * m.diagnostic_action_accuracy
-      + 0.14 * m.diagnostic_confidence_accuracy
-      + 0.08 * (1 - LEAST(m.abstention_false_merge_rate, 1))
+      + 0.05 * m.diagnostic_numeric_accuracy
+      + 0.13 * m.diagnostic_action_accuracy
+      + 0.13 * m.diagnostic_confidence_accuracy
+      + 0.07 * (1 - LEAST(m.abstention_false_merge_rate, 1))
       + 0.04 * (1 - LEAST(m.hallucinated_trusted_action_rate, 1))
       + 0.04 * rw.row_watch_score
       + 0.04 * m.semantic_materialization_score
@@ -886,6 +1192,7 @@ INSERT INTO otlet_bench_source.model_summary (
   dirty_data_score,
   triage_score,
   triage_abstention_score,
+  numeric_evidence_score,
   extraction_score,
   policy_check_score,
   user_suite_score,
@@ -895,6 +1202,7 @@ INSERT INTO otlet_bench_source.model_summary (
   confidence_score,
   diagnostic_entity_accuracy,
   diagnostic_triage_accuracy,
+  diagnostic_numeric_accuracy,
   diagnostic_action_accuracy,
   diagnostic_confidence_accuracy,
   diagnostic_quality_score,
@@ -903,7 +1211,7 @@ INSERT INTO otlet_bench_source.model_summary (
   resource_fit,
   overall_fit,
   diagnostic_fit,
-  verdict,
+  single_run_verdict,
   cleanup_policy
 )
 SELECT
@@ -951,6 +1259,7 @@ SELECT
   dirty_data_score,
   triage_score,
   triage_abstention_score,
+  numeric_evidence_score,
   extraction_score,
   policy_check_score,
   user_suite_score,
@@ -960,6 +1269,7 @@ SELECT
   confidence_score,
   diagnostic_entity_accuracy,
   diagnostic_triage_accuracy,
+  diagnostic_numeric_accuracy,
   diagnostic_action_accuracy,
   diagnostic_confidence_accuracy,
   diagnostic_quality_score,
@@ -980,6 +1290,8 @@ SELECT
       AND hallucinated_trusted_action_rate <= 0.01
       AND entity_accuracy >= 0.80
       AND triage_score >= 0.80
+      AND extraction_score >= 0.80
+      AND policy_check_score >= 0.80
       AND semantic_materialization_score >= 0.95
       AND quality_score >= 0.90
       THEN 'default_candidate'
@@ -990,6 +1302,8 @@ SELECT
       AND hallucinated_trusted_action_rate <= 0.01
       AND entity_accuracy >= 0.80
       AND triage_score >= 0.80
+      AND extraction_score >= 0.80
+      AND policy_check_score >= 0.80
       AND semantic_materialization_score >= 0.95
       THEN 'eligible_candidate'
     WHEN schema_valid_rate >= 0.50
@@ -1026,6 +1340,7 @@ INSERT INTO otlet_bench_invariant_task_scope (task_name)
 VALUES
   (:'direct_task'),
   (:'triage_task'),
+  (:'numeric_task'),
   (:'extraction_task'),
   (:'policy_task'),
   (:'join_task'),
@@ -1104,10 +1419,12 @@ SELECT
   round(entity_accuracy, 3) AS entity_accuracy,
   round(diagnostic_entity_accuracy, 3) AS diagnostic_entity_accuracy,
   round(triage_score, 3) AS triage_score,
+  round(numeric_evidence_score, 3) AS numeric_evidence_score,
   round(extraction_score, 3) AS extraction_score,
   round(policy_check_score, 3) AS policy_check_score,
   round(user_suite_score, 3) AS user_suite_score,
   round(diagnostic_triage_accuracy, 3) AS diagnostic_triage_accuracy,
+  round(diagnostic_numeric_accuracy, 3) AS diagnostic_numeric_accuracy,
   round(confidence_score, 3) AS confidence_score,
   round(diagnostic_confidence_accuracy, 3) AS diagnostic_confidence_accuracy,
   round(row_watch_score, 3) AS row_watch_score,
@@ -1115,7 +1432,7 @@ SELECT
   round(trusted_quality, 3) AS trusted_quality,
   round(resource_fit, 3) AS resource_fit,
   round(overall_fit, 3) AS overall_fit,
-  verdict
+  single_run_verdict
 FROM otlet_bench_source.model_summary
 WHERE run_id = :'run_id'
   AND model_key = :'model_key';
