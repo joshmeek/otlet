@@ -2378,15 +2378,26 @@ CREATE TEMP TABLE no_abstain_eval_result (
   key text PRIMARY KEY,
   value text NOT NULL
 );
+CREATE TEMP TABLE no_abstain_eval_params (
+  task_name text NOT NULL,
+  model_name text NOT NULL
+);
+INSERT INTO no_abstain_eval_params VALUES (:'task_name', :'model_name');
 DO $$
 DECLARE
+  task_name_value text;
+  model_name_value text;
   positive_job_id bigint;
   alias_job_id bigint;
   positive_action_id bigint;
   alias_action_id bigint;
 BEGIN
+  SELECT task_name, model_name
+  INTO task_name_value, model_name_value
+  FROM no_abstain_eval_params;
+
   PERFORM otlet.create_task(
-    :'task_name',
+    task_name_value,
     $source$
       SELECT 'no-abstain-positive'::text AS subject_id,
              '{"action_ids":{"left_id":"noab-left","right_id":"noab-right"}}'::jsonb AS input
@@ -2396,13 +2407,13 @@ BEGIN
     $source$::text,
     'Return JSON only.',
     '{"type":"object","required":["match","confidence"],"additionalProperties":false,"properties":{"match":{"enum":["same_entity","different_entity"]},"confidence":{"enum":["high"]}}}'::jsonb,
-    :'model_name',
+    model_name_value,
     '{"max_tokens":32,"reasoning":"off","inference_cache":false}'::jsonb
   );
 
   INSERT INTO otlet.jobs (task_name, subject_id, input, status, attempts, started_at, leased_until)
   VALUES (
-    :'task_name',
+    task_name_value,
     'no-abstain-positive',
     '{"action_ids":{"left_id":"noab-left","right_id":"noab-right"}}'::jsonb,
     'running',
@@ -2423,12 +2434,12 @@ BEGIN
     md5('{"output":{"match":"same_entity","confidence":"high"},"actions":[{"type":"merge_candidate","body":{"left_id":"noab-left","right_id":"noab-right","confidence":"high","reason":"same"}}]}'),
     now(),
     '{"schema_validation_status":"passed"}'::jsonb,
-    :'model_name'
+    model_name_value
   );
 
   INSERT INTO otlet.jobs (task_name, subject_id, input, status, attempts, started_at, leased_until)
   VALUES (
-    :'task_name',
+    task_name_value,
     'alias-match',
     '{"action_ids":{"left_id":"alias-left","right_id":"alias-right"}}'::jsonb,
     'running',
@@ -2449,7 +2460,7 @@ BEGIN
     md5('{"output":{"match":"same_entity","confidence":"high"},"actions":[{"type":"merge_candidate","body":{"left_id":"alias-left","right_id":"alias-right","confidence":"high","reason":"same"}}]}'),
     now(),
     '{"schema_validation_status":"passed"}'::jsonb,
-    :'model_name'
+    model_name_value
   );
 
   SELECT a.id INTO positive_action_id
@@ -3836,12 +3847,23 @@ WHERE task_name = '$entity_task'
 }
 
 action_approve_contract="$(psql_value "
-SELECT status || '|' || approval_status
-FROM otlet.approve_action($merge_action_id);
+SELECT status || '|' || approval_status || '|' || COALESCE(review_reason, '')
+FROM otlet.approve_action($merge_action_id, 'demo approval reason');
 ")"
 echo "action_approve_contract=$action_approve_contract"
-[ "$action_approve_contract" = "approved|approved" ] || {
+[ "$action_approve_contract" = "approved|approved|demo approval reason" ] || {
   echo "Expected merge_candidate approval, got $action_approve_contract" >&2
+  exit 1
+}
+
+action_review_reason_contract="$(psql_value "
+SELECT approval_status || '|' || COALESCE(review_reason, '')
+FROM otlet.action_status
+WHERE action_id = $merge_action_id;
+")"
+echo "action_review_reason_contract=$action_review_reason_contract"
+[ "$action_review_reason_contract" = "approved|demo approval reason" ] || {
+  echo "Expected approval reason in action_status, got $action_review_reason_contract" >&2
   exit 1
 }
 
@@ -3883,27 +3905,38 @@ CREATE TEMP TABLE posthoc_rule_result (
   status text NOT NULL,
   error text NOT NULL
 );
+CREATE TEMP TABLE posthoc_rule_params (
+  task_name text NOT NULL,
+  model_name text NOT NULL
+);
+INSERT INTO posthoc_rule_params VALUES (:'task_name', :'model_name');
 DO $$
 DECLARE
+  task_name_value text;
+  model_name_value text;
   selected_job_id bigint;
   selected_action_id bigint;
   action_state otlet.actions%ROWTYPE;
 BEGIN
+  SELECT task_name, model_name
+  INTO task_name_value, model_name_value
+  FROM posthoc_rule_params;
+
   PERFORM otlet.create_task(
-    :'task_name',
+    task_name_value,
     $source$
       SELECT 'posthoc-left:posthoc-right'::text AS subject_id,
              '{"action_ids":{"left_id":"posthoc-left","right_id":"posthoc-right"}}'::jsonb AS input
     $source$::text,
     'Return JSON only.',
     '{"type":"object","required":["match","confidence"],"additionalProperties":false,"properties":{"match":{"enum":["same_entity","different_entity"]},"confidence":{"enum":["high"]}}}'::jsonb,
-    :'model_name',
+    model_name_value,
     '{"max_tokens":32,"reasoning":"off","inference_cache":false}'::jsonb
   );
 
   INSERT INTO otlet.jobs (task_name, subject_id, input, status, attempts, started_at, leased_until)
   VALUES (
-    :'task_name',
+    task_name_value,
     'posthoc-left:posthoc-right',
     '{"action_ids":{"left_id":"posthoc-left","right_id":"posthoc-right"}}'::jsonb,
     'running',
@@ -3924,14 +3957,14 @@ BEGIN
     md5('{"output":{"match":"same_entity","confidence":"high"},"actions":[{"type":"merge_candidate","body":{"left_id":"posthoc-left","right_id":"posthoc-right","confidence":"high","reason":"same"}}]}'),
     now(),
     '{"schema_validation_status":"passed"}'::jsonb,
-    :'model_name'
+    model_name_value
   );
 
   SELECT a.id
   INTO selected_action_id
   FROM otlet.actions a
   JOIN otlet.jobs j ON j.id = a.job_id
-  WHERE j.task_name = :'task_name'
+  WHERE j.task_name = task_name_value
   ORDER BY a.id DESC
   LIMIT 1;
 
@@ -3947,7 +3980,7 @@ BEGIN
   SET output = '{"match":"different_entity","confidence":"high"}'::jsonb
   FROM otlet.jobs j
   WHERE o.job_id = j.id
-    AND j.task_name = :'task_name';
+    AND j.task_name = task_name_value;
 
   SELECT *
   INTO action_state

@@ -953,7 +953,10 @@ BEGIN
 END;
 $$;
 
-CREATE FUNCTION otlet.approve_action(action_id bigint) RETURNS SETOF otlet.actions
+CREATE FUNCTION otlet.approve_action(
+  action_id bigint,
+  review_reason text DEFAULT NULL
+) RETURNS SETOF otlet.actions
 LANGUAGE plpgsql
 AS $$
 DECLARE
@@ -963,7 +966,8 @@ BEGIN
   SET status = 'approved',
       approval_status = 'approved',
       approved_at = now(),
-      error = NULL
+      error = NULL,
+      review_reason = NULLIF(approve_action.review_reason, '')
   WHERE id = approve_action.action_id
     AND status = 'proposed'
     AND approval_status = 'required'
@@ -977,7 +981,8 @@ $$;
 
 CREATE FUNCTION otlet.reject_action(
   action_id bigint,
-  reason text DEFAULT 'rejected'
+  reason text DEFAULT 'rejected',
+  review_reason text DEFAULT NULL
 ) RETURNS SETOF otlet.actions
 LANGUAGE plpgsql
 AS $$
@@ -987,7 +992,8 @@ BEGIN
   UPDATE otlet.actions
   SET status = 'rejected',
       approval_status = 'rejected',
-      error = reject_action.reason
+      error = reject_action.reason,
+      review_reason = COALESCE(NULLIF(reject_action.review_reason, ''), NULLIF(reject_action.reason, ''))
   WHERE id = reject_action.action_id
     AND status <> 'applied'
   RETURNING * INTO action_row;

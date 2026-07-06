@@ -520,6 +520,7 @@ CREATE TABLE otlet.actions (
   source_hash text,
   content_hash text,
   error text,
+  review_reason text,
   created_at timestamptz NOT NULL DEFAULT now(),
   approved_at timestamptz,
   applied_at timestamptz,

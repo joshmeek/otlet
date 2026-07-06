@@ -119,6 +119,7 @@ SELECT
   a.source_hash,
   a.content_hash,
   a.error,
+  a.review_reason,
   a.payload,
   a.output_id,
   a.receipt_id,
@@ -178,16 +179,33 @@ WITH action_items AS (
     a.action_type,
     a.status AS action_status,
     a.approval_status,
+    a.review_reason,
     o.output,
     a.source_table,
     a.source_hash,
     a.content_hash,
-    otlet.current_task_subject_content_hash(j.task_name, j.subject_id) AS current_content_hash,
+    COALESCE(materialization.content_hash, a.content_hash) AS current_content_hash,
+    (
+      COALESCE(materialization.stale, false)
+      OR (
+        a.content_hash IS NOT NULL
+        AND materialization.content_hash IS NOT NULL
+        AND materialization.content_hash IS DISTINCT FROM a.content_hash
+      )
+    ) AS source_stale,
     a.created_at
   FROM otlet.actions a
   JOIN otlet.jobs j ON j.id = a.job_id
   LEFT JOIN otlet.watches w ON w.task_name = j.task_name
   LEFT JOIN otlet.outputs o ON o.id = a.output_id
+  LEFT JOIN LATERAL (
+    SELECT sm.content_hash, sm.stale
+    FROM otlet.semantic_materializations sm
+    WHERE sm.task_name = j.task_name
+      AND sm.subject_id = j.subject_id
+    ORDER BY sm.updated_at DESC, sm.id DESC
+    LIMIT 1
+  ) materialization ON true
   WHERE (
       (
         a.approval_status = 'required'
@@ -218,17 +236,33 @@ abstention_items AS (
     NULL::text AS action_type,
     NULL::text AS action_status,
     NULL::text AS approval_status,
+    NULL::text AS review_reason,
     o.output,
     r.trace_summary #>> '{mvcc,table}' AS source_table,
     COALESCE(r.trace_summary #>> '{mvcc,source_hash}', md5((r.trace_summary -> 'mvcc')::text)) AS source_hash,
     otlet.semantic_content_hash(j.input, t.input_shaping) AS content_hash,
-    otlet.current_task_subject_content_hash(j.task_name, j.subject_id) AS current_content_hash,
+    COALESCE(materialization.content_hash, otlet.semantic_content_hash(j.input, t.input_shaping)) AS current_content_hash,
+    (
+      COALESCE(materialization.stale, false)
+      OR (
+        materialization.content_hash IS NOT NULL
+        AND materialization.content_hash IS DISTINCT FROM otlet.semantic_content_hash(j.input, t.input_shaping)
+      )
+    ) AS source_stale,
     o.created_at
   FROM otlet.outputs o
   JOIN otlet.jobs j ON j.id = o.job_id
   JOIN otlet.tasks t ON t.name = j.task_name
   JOIN otlet.inference_receipts r ON r.id = o.receipt_id
   LEFT JOIN otlet.watches w ON w.task_name = j.task_name
+  LEFT JOIN LATERAL (
+    SELECT sm.content_hash, sm.stale
+    FROM otlet.semantic_materializations sm
+    WHERE sm.task_name = j.task_name
+      AND sm.subject_id = j.subject_id
+    ORDER BY sm.updated_at DESC, sm.id DESC
+    LIMIT 1
+  ) materialization ON true
   CROSS JOIN LATERAL (
     SELECT
       COALESCE(NULLIF(t.decision_contract ->> 'answer_field', ''), 'match') AS answer_field,
@@ -261,16 +295,32 @@ direct_rejected_items AS (
     NULL::text AS action_type,
     NULL::text AS action_status,
     NULL::text AS approval_status,
+    NULL::text AS review_reason,
     r.raw_output::jsonb -> 'output' AS output,
     r.trace_summary #>> '{mvcc,table}' AS source_table,
     COALESCE(r.trace_summary #>> '{mvcc,source_hash}', md5((r.trace_summary -> 'mvcc')::text)) AS source_hash,
     otlet.semantic_content_hash(j.input, t.input_shaping) AS content_hash,
-    otlet.current_task_subject_content_hash(j.task_name, j.subject_id) AS current_content_hash,
+    COALESCE(materialization.content_hash, otlet.semantic_content_hash(j.input, t.input_shaping)) AS current_content_hash,
+    (
+      COALESCE(materialization.stale, false)
+      OR (
+        materialization.content_hash IS NOT NULL
+        AND materialization.content_hash IS DISTINCT FROM otlet.semantic_content_hash(j.input, t.input_shaping)
+      )
+    ) AS source_stale,
     r.finished_at AS created_at
   FROM otlet.inference_receipts r
   JOIN otlet.jobs j ON j.id = r.job_id
   JOIN otlet.tasks t ON t.name = j.task_name
   LEFT JOIN otlet.watches w ON w.task_name = j.task_name
+  LEFT JOIN LATERAL (
+    SELECT sm.content_hash, sm.stale
+    FROM otlet.semantic_materializations sm
+    WHERE sm.task_name = j.task_name
+      AND sm.subject_id = j.subject_id
+    ORDER BY sm.updated_at DESC, sm.id DESC
+    LIMIT 1
+  ) materialization ON true
   WHERE r.selection_role = 'direct'
     AND r.selection_status = 'rejected'
     AND r.selection_reason = 'direct_rejected_by_decision_contract'
@@ -295,12 +345,13 @@ SELECT
   action_type,
   action_status,
   approval_status,
+  review_reason,
   output,
   source_table,
   source_hash,
   content_hash,
   current_content_hash,
-  (content_hash IS NOT NULL AND current_content_hash IS DISTINCT FROM content_hash) AS source_stale,
+  source_stale,
   created_at
 FROM action_items
 UNION ALL
@@ -316,12 +367,13 @@ SELECT
   action_type,
   action_status,
   approval_status,
+  review_reason,
   output,
   source_table,
   source_hash,
   content_hash,
   current_content_hash,
-  (content_hash IS NOT NULL AND current_content_hash IS DISTINCT FROM content_hash) AS source_stale,
+  source_stale,
   created_at
 FROM abstention_items
 UNION ALL
@@ -337,15 +389,47 @@ SELECT
   action_type,
   action_status,
   approval_status,
+  review_reason,
   output,
   source_table,
   source_hash,
   content_hash,
   current_content_hash,
-  (content_hash IS NOT NULL AND current_content_hash IS DISTINCT FROM content_hash) AS source_stale,
+  source_stale,
   created_at
 FROM direct_rejected_items
 ORDER BY created_at, task_name, job_subject_id, queue_kind;
+
+CREATE FUNCTION otlet.review_queue_live()
+RETURNS SETOF otlet.review_queue
+LANGUAGE sql
+STABLE
+AS $$
+  SELECT
+    q.queue_kind,
+    q.task_name,
+    q.watch_name,
+    q.job_subject_id,
+    q.subject_id,
+    q.action_id,
+    q.output_id,
+    q.receipt_id,
+    q.action_type,
+    q.action_status,
+    q.approval_status,
+    q.review_reason,
+    q.output,
+    q.source_table,
+    q.source_hash,
+    q.content_hash,
+    live.current_content_hash,
+    (q.content_hash IS NOT NULL AND live.current_content_hash IS DISTINCT FROM q.content_hash) AS source_stale,
+    q.created_at
+  FROM otlet.review_queue q
+  CROSS JOIN LATERAL (
+    SELECT otlet.current_task_subject_content_hash(q.task_name, q.job_subject_id) AS current_content_hash
+  ) live;
+$$;
 
 CREATE VIEW otlet.output_reliability_status AS
 SELECT

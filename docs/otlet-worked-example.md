@@ -516,6 +516,25 @@ Representative output:
 (1 row)
 ```
 
+The same correction is immediately available as local eval data:
+
+```sql
+SELECT action_id, case_kind, expected_answer, expected_action_type, manual_gold
+FROM otlet.export_eval_cases(5)
+WHERE label_source = 'manual_correction'
+ORDER BY created_at DESC
+LIMIT 1;
+```
+
+Representative output:
+
+```text
+ action_id | case_kind | expected_answer | expected_action_type | manual_gold
+-----------+-----------+-----------------+----------------------+-------------
+        35 | gold      | same_entity     | merge_candidate      | t
+(1 row)
+```
+
 Eval label confidence is intentionally the same small vocabulary used by model outputs: `low`, `medium`, or `high`. Keep calibration notes in `reason` or task-specific fields rather than expanding `expected_confidence`
 
 Approve, dry-run, and apply one merge proposal:
