@@ -22,6 +22,8 @@ row_customscan_watch="${OTLET_ROW_CUSTOMSCAN_WATCH_NAME:-row_customscan_demo}"
 row_customscan_task="${row_customscan_watch}_task"
 row_triage_policy_watch="${OTLET_ROW_TRIAGE_POLICY_WATCH_NAME:-row_triage_policy_demo}"
 row_triage_policy_task="${row_triage_policy_watch}_task"
+numeric_triage_watch="numeric_triage_demo"
+numeric_triage_task="${numeric_triage_watch}_task"
 prompt_identity_preset_task="prompt_identity_preset_smoke"
 prompt_identity_direct_task="prompt_identity_direct_smoke"
 output_envelope_task="output_envelope_safety_demo"
@@ -274,11 +276,13 @@ psql_exec \
   -v row_scoped_watch="$row_scoped_watch" \
   -v row_customscan_watch="$row_customscan_watch" \
   -v row_triage_policy_watch="$row_triage_policy_watch" \
+  -v numeric_triage_watch="$numeric_triage_watch" \
   -v action_allowlist_watch="$action_allowlist_watch" >/dev/null <<'SQL'
 SELECT otlet.drop_watch(:'row_triage_watch');
 SELECT otlet.drop_watch(:'row_scoped_watch');
 SELECT otlet.drop_watch(:'row_customscan_watch');
 SELECT otlet.drop_watch(:'row_triage_policy_watch');
+SELECT otlet.drop_watch(:'numeric_triage_watch');
 SELECT otlet.drop_watch(:'action_allowlist_watch');
 SELECT otlet.drop_watch(:'join_index_name');
 SELECT format('DROP FOREIGN TABLE IF EXISTS otlet.%I', :'join_foreign_table') \gexec
@@ -289,6 +293,7 @@ cleanup_task "row_triage_demo"
 cleanup_task "row_scoped_demo"
 cleanup_task "row_customscan_demo"
 cleanup_task "row_triage_policy_demo"
+cleanup_task "$numeric_triage_task"
 cleanup_task "$prompt_identity_preset_task"
 cleanup_task "$prompt_identity_direct_task"
 cleanup_task "$output_envelope_task"
@@ -2125,6 +2130,117 @@ WHERE a.id = $row_triage_action_id;
 echo "row_correction_contract=$row_correction_contract"
 [ "$row_correction_contract" = "rejected|rejected|1|1|0" ] || {
   echo "Expected correction to reject action, write gold label, and remove review queue row, got $row_correction_contract" >&2
+  exit 1
+}
+
+log "Running numeric evidence triage watch"
+psql_exec \
+  -v model_name="$strong_model_name" \
+  -v numeric_triage_watch="$numeric_triage_watch" >/dev/null <<'SQL'
+DROP TABLE IF EXISTS public.otlet_demo_numeric_triage;
+CREATE TABLE public.otlet_demo_numeric_triage (
+  id text PRIMARY KEY,
+  amount_cents integer NOT NULL,
+  limit_cents integer NOT NULL,
+  note text NOT NULL
+);
+
+SELECT otlet.create_watch(
+  :'numeric_triage_watch',
+  'row',
+  'Classify one numeric control row. Use only input.row.amount_cents and input.row.limit_cents. If amount_cents is greater than limit_cents, output decision flag with confidence high and exactly one review_flag action. The review_flag body must have severity high and a short reason. Return JSON only.',
+  '{
+    "type": "object",
+    "required": ["decision", "confidence", "reason"],
+    "additionalProperties": false,
+    "properties": {
+      "decision": {"enum": ["flag"]},
+      "confidence": {"enum": ["high"]},
+      "reason": {"type": "string", "maxLength": 120}
+    }
+  }'::jsonb,
+  :'model_name',
+  'public.otlet_demo_numeric_triage'::regclass,
+  'id',
+  NULL,
+  'numeric_triage_fact',
+  '{"max_tokens":160,"reasoning":"off","inference_cache":true}'::jsonb,
+  '{}'::jsonb,
+  '{"on_change":"mark_stale_and_enqueue"}'::jsonb,
+  ARRAY['review_flag'],
+  'refresh_then_fail_closed',
+  '{}'::jsonb,
+  '{"answer_field":"decision","abstain_values":[],"confidence_field":"confidence","accepted_confidence":["high"]}'::jsonb
+);
+
+INSERT INTO public.otlet_demo_numeric_triage
+VALUES (
+  'numeric-1',
+  25000,
+  10000,
+  'Payment exceeds the declared approval threshold'
+);
+SQL
+wait_task_complete "$numeric_triage_task" 1 900 1
+numeric_triage_action_id="$(psql_value "
+SELECT min(action_id)
+FROM otlet.action_status
+WHERE task_name = '$numeric_triage_task'
+  AND action_type = 'review_flag'
+  AND error IS NULL;
+")"
+[ -n "$numeric_triage_action_id" ] || {
+  echo "Expected numeric triage review_flag action" >&2
+  exit 1
+}
+numeric_triage_contract="$(psql_value "
+SELECT r.status || '|' ||
+       COALESCE(r.output->>'decision', '') || '|' ||
+       COALESCE(r.output->>'confidence', '') || '|' ||
+       (r.output_id IS NOT NULL)::text || '|' ||
+       (msa.receipt_id IS NOT NULL)::text || '|' ||
+       COALESCE(a.action_type, '') || '|' ||
+       (a.output_id IS NOT NULL)::text || '|' ||
+       (rq.receipt_id IS NOT NULL)::text || '|' ||
+       COALESCE(rq.queue_kind, '')
+FROM otlet.runs r
+JOIN otlet.model_selection_attempts msa ON msa.job_id = r.job_id
+JOIN otlet.action_status a
+  ON a.job_id = r.job_id
+ AND a.action_type = 'review_flag'
+LEFT JOIN otlet.review_queue rq ON rq.action_id = a.action_id
+WHERE r.task_name = '$numeric_triage_task'
+ORDER BY r.job_id DESC
+LIMIT 1;
+")"
+echo "numeric_triage_contract=$numeric_triage_contract"
+[ "$numeric_triage_contract" = "complete|flag|high|true|true|review_flag|true|true|review_flag" ] || {
+  echo "Expected numeric triage surfaces to render without NULL surprises, got $numeric_triage_contract" >&2
+  exit 1
+}
+psql_exec >/dev/null <<SQL
+SELECT * FROM otlet.label_action($numeric_triage_action_id, label_source => 'approved_action');
+SQL
+numeric_triage_label_contract="$(psql_value "
+WITH status AS (
+  SELECT *
+  FROM otlet.eval_label_status
+  WHERE action_id = $numeric_triage_action_id
+), exported AS (
+  SELECT *
+  FROM otlet.export_eval_cases(50)
+  WHERE action_id = $numeric_triage_action_id
+)
+SELECT count(*)::text || '|' ||
+       COALESCE(max(status.expected_answer), '') || '|' ||
+       COALESCE(max(status.observed_answer), '') || '|' ||
+       COALESCE(max(exported.expected_action_type), '') || '|' ||
+       COALESCE(max(exported.case_kind), '')
+FROM status, exported;
+")"
+echo "numeric_triage_label_contract=$numeric_triage_label_contract"
+[ "$numeric_triage_label_contract" = "1|flag|flag|review_flag|positive" ] || {
+  echo "Expected numeric triage label/export to round trip through non-ER action, got $numeric_triage_label_contract" >&2
   exit 1
 }
 
