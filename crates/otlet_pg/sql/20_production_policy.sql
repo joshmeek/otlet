@@ -5,6 +5,7 @@ SELECT
   p.max_queued_jobs_per_model,
   p.max_attempts,
   p.max_attempt_ms,
+  p.default_runtime_options,
   p.semantic_auto_wait_ms,
   p.semantic_auto_infer_ms,
   p.semantic_auto_max_rows,
@@ -129,6 +130,8 @@ SELECT
   p.cheap_skip_window,
   p.cheap_min_recent_acceptance,
   p.cheap_probe_interval,
+  policy.default_runtime_options,
+  policy.default_runtime_options || t.runtime_options AS effective_runtime_options,
   CASE
     WHEN (t.runtime_options ->> 'max_attempt_ms') ~ '^[0-9]+$'
     THEN (t.runtime_options ->> 'max_attempt_ms')::integer
@@ -657,6 +660,7 @@ SELECT
   p.max_queued_jobs_per_model,
   p.max_attempts,
   p.max_attempt_ms,
+  p.default_runtime_options,
   p.semantic_auto_wait_ms,
   p.semantic_auto_infer_ms,
   p.semantic_auto_max_rows,

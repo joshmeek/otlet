@@ -33,6 +33,8 @@ prompt_identity_direct_task="prompt_identity_direct_smoke"
 output_envelope_task="output_envelope_safety_demo"
 prompt_diet_verbatim_task="prompt_diet_verbatim_demo"
 prompt_diet_compact_task="prompt_diet_compact_demo"
+prompt_diet_default_task="prompt_diet_default_demo"
+prompt_diet_override_task="prompt_diet_override_demo"
 custom_action_schema_task="custom_action_schema_demo"
 posthoc_output_rule_task="posthoc_output_rule_demo"
 action_allowlist_watch="action_allowlist_demo"
@@ -309,6 +311,8 @@ cleanup_task "$prompt_identity_direct_task"
 cleanup_task "$output_envelope_task"
 cleanup_task "$prompt_diet_verbatim_task"
 cleanup_task "$prompt_diet_compact_task"
+cleanup_task "$prompt_diet_default_task"
+cleanup_task "$prompt_diet_override_task"
 cleanup_task "$custom_action_schema_task"
 cleanup_task "$posthoc_output_rule_task"
 cleanup_task "$action_allowlist_task"
@@ -1745,7 +1749,13 @@ echo "pair_strip_contract=$pair_strip_contract"
 psql_exec \
   -v model_name="$strong_model_name" \
   -v verbatim_task="$prompt_diet_verbatim_task" \
-  -v compact_task="$prompt_diet_compact_task" >/dev/null <<'SQL'
+  -v compact_task="$prompt_diet_compact_task" \
+  -v default_task="$prompt_diet_default_task" \
+  -v override_task="$prompt_diet_override_task" >/dev/null <<'SQL'
+UPDATE otlet.production_policy
+SET default_runtime_options = '{"schema_prompt":"compact","json_logit_mask":true}'::jsonb
+WHERE name = 'default';
+
 WITH params AS (
   SELECT
     'Return every output field with the exact obvious value from its enum: status ok, priority low, category schema_prompt, confidence high, phase alpha, queue primary, policy default, outcome accepted, route review, owner ops, and reason ok. Use no actions.'::text AS instruction,
@@ -1820,11 +1830,89 @@ SELECT otlet.create_task(
 )
 FROM params;
 
+WITH params AS (
+  SELECT
+    'Return every output field with the exact obvious value from its enum: status ok, priority low, category schema_prompt, confidence high, phase alpha, queue primary, policy default, outcome accepted, route review, owner ops, and reason ok. Use no actions.'::text AS instruction,
+    $source$
+      SELECT 'prompt-diet'::text AS subject_id, '{}'::jsonb AS input
+    $source$::text AS input_query,
+    '{
+      "type": "object",
+      "title": "Prompt diet smoke schema",
+      "description": "Verbose JSON Schema metadata that should not be needed in the model prompt because the compact renderer keeps only the field names, required markers, types, and enum values.",
+      "required": ["status", "priority", "category", "confidence", "phase", "queue", "policy", "outcome", "route", "owner", "reason"],
+      "additionalProperties": false,
+      "properties": {
+        "status": {"description": "Fixed smoke status chosen by the instruction", "enum": ["ok", "needs_review"]},
+        "priority": {"description": "Fixed smoke priority chosen by the instruction", "enum": ["low", "medium", "high"]},
+        "category": {"description": "Fixed smoke category chosen by the instruction", "enum": ["schema_prompt", "other"]},
+        "confidence": {"description": "Fixed smoke confidence chosen by the instruction", "enum": ["low", "medium", "high"]},
+        "phase": {"description": "Fixed smoke phase chosen by the instruction", "enum": ["alpha", "beta", "ga"]},
+        "queue": {"description": "Fixed smoke queue chosen by the instruction", "enum": ["primary", "secondary"]},
+        "policy": {"description": "Fixed smoke policy chosen by the instruction", "enum": ["default", "override"]},
+        "outcome": {"description": "Fixed smoke outcome chosen by the instruction", "enum": ["accepted", "rejected"]},
+        "route": {"description": "Fixed smoke route chosen by the instruction", "enum": ["review", "archive"]},
+        "owner": {"description": "Fixed smoke owner chosen by the instruction", "enum": ["ops", "finance"]},
+        "reason": {"description": "Short smoke reason", "type": "string", "maxLength": 240}
+      }
+    }'::jsonb AS schema
+)
+SELECT otlet.create_task(
+  :'default_task',
+  input_query,
+  instruction,
+  schema,
+  :'model_name',
+  '{"max_tokens":192,"reasoning":"off","generation_trace":true,"generation_trace_max_tokens":4,"generation_trace_top_k":1}'::jsonb
+)
+FROM params;
+
+WITH params AS (
+  SELECT
+    'Return every output field with the exact obvious value from its enum: status ok, priority low, category schema_prompt, confidence high, phase alpha, queue primary, policy default, outcome accepted, route review, owner ops, and reason ok. Use no actions.'::text AS instruction,
+    $source$
+      SELECT 'prompt-diet'::text AS subject_id, '{}'::jsonb AS input
+    $source$::text AS input_query,
+    '{
+      "type": "object",
+      "title": "Prompt diet smoke schema",
+      "description": "Verbose JSON Schema metadata that should not be needed in the model prompt because the compact renderer keeps only the field names, required markers, types, and enum values.",
+      "required": ["status", "priority", "category", "confidence", "phase", "queue", "policy", "outcome", "route", "owner", "reason"],
+      "additionalProperties": false,
+      "properties": {
+        "status": {"description": "Fixed smoke status chosen by the instruction", "enum": ["ok", "needs_review"]},
+        "priority": {"description": "Fixed smoke priority chosen by the instruction", "enum": ["low", "medium", "high"]},
+        "category": {"description": "Fixed smoke category chosen by the instruction", "enum": ["schema_prompt", "other"]},
+        "confidence": {"description": "Fixed smoke confidence chosen by the instruction", "enum": ["low", "medium", "high"]},
+        "phase": {"description": "Fixed smoke phase chosen by the instruction", "enum": ["alpha", "beta", "ga"]},
+        "queue": {"description": "Fixed smoke queue chosen by the instruction", "enum": ["primary", "secondary"]},
+        "policy": {"description": "Fixed smoke policy chosen by the instruction", "enum": ["default", "override"]},
+        "outcome": {"description": "Fixed smoke outcome chosen by the instruction", "enum": ["accepted", "rejected"]},
+        "route": {"description": "Fixed smoke route chosen by the instruction", "enum": ["review", "archive"]},
+        "owner": {"description": "Fixed smoke owner chosen by the instruction", "enum": ["ops", "finance"]},
+        "reason": {"description": "Short smoke reason", "type": "string", "maxLength": 240}
+      }
+    }'::jsonb AS schema
+)
+SELECT otlet.create_task(
+  :'override_task',
+  input_query,
+  instruction,
+  schema,
+  :'model_name',
+  '{"max_tokens":192,"reasoning":"off","schema_prompt":"verbatim","generation_trace":true,"generation_trace_max_tokens":4,"generation_trace_top_k":1}'::jsonb
+)
+FROM params;
+
 SELECT otlet.run_task(:'verbatim_task');
 SELECT otlet.run_task(:'compact_task');
+SELECT otlet.run_task(:'default_task');
+SELECT otlet.run_task(:'override_task');
 SQL
 wait_task_complete "$prompt_diet_verbatim_task" 1 900 1
 wait_task_complete "$prompt_diet_compact_task" 1 900 1
+wait_task_complete "$prompt_diet_default_task" 1 900 1
+wait_task_complete "$prompt_diet_override_task" 1 900 1
 prompt_diet_contract="$(psql_value "
 WITH receipt_pairs AS (
   SELECT
@@ -1846,6 +1934,38 @@ FROM receipt_pairs;
 ")"
 echo "prompt_diet_contract=$prompt_diet_contract"
 require_regex "$prompt_diet_contract" '^true\|true\|[0-9]+\|[0-9]+\|true\|true$' "Expected compact schema prompt to reduce prompt tokens with schema-valid direct outputs"
+prompt_default_options_contract="$(psql_value "
+WITH receipts AS (
+  SELECT
+    task_name,
+    schema_prompt,
+    json_logit_mask_enabled,
+    decode_constraint,
+    prompt_tokens,
+    schema_validation_status
+  FROM otlet.inference_receipt_trace_status
+  WHERE task_name IN ('$prompt_diet_compact_task', '$prompt_diet_default_task', '$prompt_diet_verbatim_task', '$prompt_diet_override_task')
+)
+SELECT
+  COALESCE(max(schema_prompt) FILTER (WHERE task_name = '$prompt_diet_default_task'), '') || '|' ||
+  COALESCE(max(decode_constraint) FILTER (WHERE task_name = '$prompt_diet_default_task'), '') || '|' ||
+  COALESCE(max(schema_prompt) FILTER (WHERE task_name = '$prompt_diet_override_task'), '') || '|' ||
+  COALESCE(max(decode_constraint) FILTER (WHERE task_name = '$prompt_diet_override_task'), '') || '|' ||
+  (max(prompt_tokens) FILTER (WHERE task_name = '$prompt_diet_default_task') = max(prompt_tokens) FILTER (WHERE task_name = '$prompt_diet_compact_task'))::text || '|' ||
+  (max(prompt_tokens) FILTER (WHERE task_name = '$prompt_diet_override_task') = max(prompt_tokens) FILTER (WHERE task_name = '$prompt_diet_verbatim_task'))::text || '|' ||
+  bool_and(schema_validation_status = 'passed')::text
+FROM receipts;
+")"
+echo "prompt_default_options_contract=$prompt_default_options_contract"
+[ "$prompt_default_options_contract" = "compact|json_logit_mask_v1|verbatim|json_logit_mask_v1|true|true|true" ] || {
+  echo "Expected policy default runtime options to merge under task options, got $prompt_default_options_contract" >&2
+  exit 1
+}
+psql_exec >/dev/null <<'SQL'
+UPDATE otlet.production_policy
+SET default_runtime_options = '{}'::jsonb
+WHERE name = 'default';
+SQL
 
 prompt_diet_requeued="$(psql_value "SELECT otlet.run_task('$prompt_diet_compact_task');")"
 [ "$prompt_diet_requeued" = "1" ] || {
