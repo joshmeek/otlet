@@ -32,11 +32,13 @@ unsafe extern "C-unwind" fn otlet_semantic_get_foreign_rel_size(
     foreigntableid: pg_sys::Oid,
 ) {
     unsafe {
-        let rows = semantic_options(foreigntableid)
-            .ok()
-            .and_then(|opts| load_plan(&opts).ok())
-            .map(|plan| plan.total_subjects.max(1) as f64)
-            .unwrap_or(1000.0);
+        let rows = match semantic_options(foreigntableid).and_then(|opts| load_plan(&opts)) {
+            Ok(plan) => plan.total_subjects.max(1) as f64,
+            Err(err) => {
+                pgrx::warning!("otlet semantic FDW using fallback row estimate: {err}");
+                1000.0
+            }
+        };
         (*baserel).rows = rows;
     }
 }
@@ -50,10 +52,10 @@ unsafe extern "C-unwind" fn otlet_semantic_get_foreign_paths(
     unsafe {
         let pushdown =
             semantic_pushdown_from_restrictinfos((*baserel).baserestrictinfo, (*baserel).relid);
-        let (rows, cost) = semantic_options(foreigntableid)
-            .ok()
-            .and_then(|opts| load_effective_plan(&opts, &pushdown).ok())
-            .map(|plan| {
+        let (rows, cost) = match semantic_options(foreigntableid)
+            .and_then(|opts| load_effective_plan(&opts, &pushdown))
+        {
+            Ok(plan) => {
                 let mut rows = if pushdown.has_filters() {
                     plan.total_subjects.max(0) as f64
                 } else {
@@ -68,8 +70,12 @@ unsafe extern "C-unwind" fn otlet_semantic_get_foreign_paths(
                     rows = pushed_rows;
                 }
                 (rows, cost.max(1.0))
-            })
-            .unwrap_or(((*baserel).rows.max(1.0), 1000.0));
+            }
+            Err(err) => {
+                pgrx::warning!("otlet semantic FDW using fallback path cost: {err}");
+                ((*baserel).rows.max(1.0), 1000.0)
+            }
+        };
 
         let path = pg_sys::create_foreignscan_path(
             root,
@@ -165,7 +171,7 @@ unsafe extern "C-unwind" fn otlet_semantic_iterate_foreign_scan(
             &mut nulls[4],
             row.freshness_basis.as_deref(),
         );
-        set_text(&mut values[5], &mut nulls[5], row.updated_at.as_deref());
+        set_timestamptz(&mut values[5], &mut nulls[5], row.updated_at);
 
         pg_sys::ExecStoreVirtualTuple(slot)
     }

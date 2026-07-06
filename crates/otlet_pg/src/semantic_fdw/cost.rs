@@ -4,6 +4,7 @@ fn load_effective_plan(
 ) -> Result<SemanticFdwPlan, String> {
     let mut plan = load_plan(opts)?;
     if let Some(pushed_subject_ids) = pushdown.subjects() {
+        plan.count_basis = "pushdown_scoped".to_string();
         let subjects = unique_subject_ids(pushed_subject_ids);
         if subjects.is_empty() {
             plan.selected_path = lookup_path(opts).to_string();

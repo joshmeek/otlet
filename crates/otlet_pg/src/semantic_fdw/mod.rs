@@ -20,6 +20,7 @@ enum SemanticAccessKind {
 
 #[derive(Clone)]
 struct SemanticFdwPlan {
+    plan_source: String,
     selected_path: String,
     reason: String,
     task_name: String,
@@ -57,7 +58,7 @@ struct SemanticFdwRow {
     stale: Option<bool>,
     source_hash: Option<String>,
     freshness_basis: Option<String>,
-    updated_at: Option<String>,
+    updated_at: Option<TimestampWithTimeZone>,
 }
 
 struct SubjectScopeStats {

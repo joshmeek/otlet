@@ -98,6 +98,11 @@ BEGIN
         updated_at = now()
   RETURNING * INTO saved;
 
+  PERFORM otlet.create_semantic_join_foreign_table(
+    otlet.semantic_native_table_name(index_name),
+    index_name
+  );
+
   RETURN saved;
 END;
 $$;
@@ -125,6 +130,11 @@ BEGIN
 
   DELETE FROM otlet.semantic_join_indexes sji
   WHERE sji.name = index_row.name;
+
+  EXECUTE format(
+    'DROP FOREIGN TABLE IF EXISTS otlet.%I',
+    otlet.semantic_native_table_name(index_row.name)
+  );
 
   DELETE FROM otlet.tasks t
   WHERE t.name = index_row.task_name

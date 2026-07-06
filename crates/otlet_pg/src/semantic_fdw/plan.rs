@@ -28,6 +28,20 @@ fn set_bool(value: &mut pg_sys::Datum, is_null: &mut bool, flag: Option<bool>) {
     }
 }
 
+fn set_timestamptz(
+    value: &mut pg_sys::Datum,
+    is_null: &mut bool,
+    timestamp: Option<TimestampWithTimeZone>,
+) {
+    if let Some(timestamp) = timestamp {
+        *value = timestamp.into_datum().unwrap();
+        *is_null = false;
+    } else {
+        *value = pg_sys::Datum::from(0usize);
+        *is_null = true;
+    }
+}
+
 unsafe fn semantic_options(relid: pg_sys::Oid) -> Result<SemanticFdwOptions, String> {
     unsafe {
         let table = pg_sys::GetForeignTable(relid);
@@ -98,6 +112,34 @@ fn load_plan(opts: &SemanticFdwOptions) -> Result<SemanticFdwPlan, String> {
     );
 
     pgrx::Spi::connect(|client| {
+        let exists_query = match opts.access_kind {
+            SemanticAccessKind::RowIndex => format!(
+                "SELECT EXISTS (SELECT 1 FROM otlet.semantic_indexes WHERE name = {}) AS found",
+                sql_literal(&opts.index_name)
+            ),
+            SemanticAccessKind::JoinIndex => format!(
+                "SELECT EXISTS (SELECT 1 FROM otlet.semantic_join_indexes WHERE name = {}) AS found",
+                sql_literal(&opts.index_name)
+            ),
+        };
+        let exists = client
+            .select(exists_query.as_str(), Some(1), &[])
+            .map_err(to_string)?
+            .first()
+            .get_by_name::<bool, _>("found")
+            .map_err(to_string)?
+            .unwrap_or(false);
+        if !exists {
+            return Err(format!(
+                "otlet semantic {} {} does not exist",
+                match opts.access_kind {
+                    SemanticAccessKind::RowIndex => "index",
+                    SemanticAccessKind::JoinIndex => "join index",
+                },
+                opts.index_name
+            ));
+        }
+
         let table = client
             .select(query.as_str(), Some(1), &[])
             .map_err(to_string)?;
@@ -129,6 +171,7 @@ fn load_plan(opts: &SemanticFdwOptions) -> Result<SemanticFdwPlan, String> {
             };
         }
         Ok(SemanticFdwPlan {
+            plan_source: "plan_function".to_string(),
             selected_path: text!("selected_path"),
             reason: text!("reason"),
             task_name: text!("task_name"),
@@ -243,7 +286,7 @@ fn lookup_rows_query(
 ) -> String {
     match opts.access_kind {
         SemanticAccessKind::RowIndex => format!(
-            "SELECT latest.subject_id, latest.body::text AS body, latest.stale, latest.source_hash, latest.freshness_basis, latest.updated_at::text AS updated_at \
+            "SELECT latest.subject_id, latest.body::text AS body, latest.stale, latest.source_hash, latest.freshness_basis, latest.updated_at \
              FROM otlet.semantic_index_current_rows({}, true) latest \
              WHERE true{} \
              ORDER BY latest.subject_id",
@@ -251,7 +294,7 @@ fn lookup_rows_query(
             subject_filter
         ),
         SemanticAccessKind::JoinIndex => format!(
-            "SELECT latest.subject_id, latest.body::text AS body, latest.stale, latest.source_hash, latest.freshness_basis, latest.updated_at::text AS updated_at \
+            "SELECT latest.subject_id, latest.body::text AS body, latest.stale, latest.source_hash, latest.freshness_basis, latest.updated_at \
              FROM otlet.semantic_join_index_current_rows({}, true) latest \
              WHERE true{} \
              ORDER BY latest.subject_id",
@@ -265,6 +308,10 @@ fn load_explain_state(
     opts: SemanticFdwOptions,
     pushdown: SemanticPushdown,
 ) -> Result<SemanticFdwState, String> {
+    let plan = load_effective_plan(&opts, &pushdown).unwrap_or_else(|err| {
+        pgrx::warning!("otlet semantic FDW using fallback plan: {err}");
+        fallback_plan(&opts, &err)
+    });
     Ok(SemanticFdwState {
         rows: Vec::new(),
         next: 0,
@@ -272,8 +319,43 @@ fn load_explain_state(
         rows_emitted: 0,
         queued_jobs: 0,
         rescans: 0,
-        plan: load_effective_plan(&opts, &pushdown)?,
+        plan,
         opts,
         pushdown,
     })
+}
+
+fn fallback_plan(opts: &SemanticFdwOptions, reason: &str) -> SemanticFdwPlan {
+    SemanticFdwPlan {
+        plan_source: "fallback_default".to_string(),
+        selected_path: lookup_path(opts).to_string(),
+        reason: format!("plan load failed: {reason}"),
+        task_name: String::new(),
+        record_type: String::new(),
+        model_name: String::new(),
+        runtime_name: String::new(),
+        source_relation: opts.index_name.clone(),
+        total_subjects: 1000,
+        fresh_subjects: 0,
+        stale_subjects: 0,
+        missing_subjects: 1000,
+        inflight_subjects: 0,
+        lookup_subjects: 0,
+        wait_subjects: 0,
+        queue_subjects: 0,
+        infer_now_subjects: 0,
+        fail_closed_subjects: 1000,
+        freshness: 0.0,
+        model_ms: 2500.0,
+        model_cost_source: "static_fallback".to_string(),
+        cache_hit_ms: 0.05,
+        lookup_ms: 1.0,
+        queue_ms: 1000.0,
+        infer_now_ms: 0.0,
+        path_cost: 1000.0,
+        worker_queue_depth: 0,
+        available_queue_slots: 0,
+        stale_reasons: "{}".to_string(),
+        count_basis: "fallback_default".to_string(),
+    }
 }

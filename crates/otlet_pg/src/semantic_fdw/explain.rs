@@ -27,6 +27,7 @@ unsafe extern "C-unwind" fn otlet_semantic_explain_foreign_scan(
                 },
                 es,
             );
+            explain_text("Plan Source", &snapshot.plan.plan_source, es);
             explain_text("Selected Path", &snapshot.plan.selected_path, es);
             explain_text("Reason", &snapshot.plan.reason, es);
             explain_text("Task Name", &snapshot.plan.task_name, es);

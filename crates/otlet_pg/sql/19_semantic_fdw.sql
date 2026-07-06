@@ -40,7 +40,7 @@ BEGIN
         stale boolean,
         source_hash text,
         freshness_basis text,
-        updated_at text
+        updated_at timestamptz
       )
       SERVER otlet_semantic_server
       OPTIONS (
@@ -87,7 +87,7 @@ BEGIN
         stale boolean,
         source_hash text,
         freshness_basis text,
-        updated_at text
+        updated_at timestamptz
       )
       SERVER otlet_semantic_server
       OPTIONS (
