@@ -447,6 +447,9 @@ CREATE TABLE otlet.inference_receipts (
   CHECK (selection_status IN ('accepted', 'rejected', 'failed'))
 );
 
+CREATE INDEX inference_receipts_task_model_role_finished_idx
+ON otlet.inference_receipts (task_name, model_name, selection_role, finished_at DESC, id DESC);
+
 CREATE TABLE otlet.worker_events (
   id bigserial PRIMARY KEY,
   event_type text NOT NULL,

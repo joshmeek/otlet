@@ -157,31 +157,35 @@ WITH policy AS (
   FROM otlet.model_selection_policies p
   WHERE p.task_name = model_selection_recent_acceptance.task_name
 ), recent AS (
-  SELECT ranked.selection_status
-  FROM (
+  SELECT recent_receipts.selection_status
+  FROM policy p
+  CROSS JOIN LATERAL (
     SELECT
-      r.selection_status,
-      p.cheap_skip_window,
-      row_number() OVER (ORDER BY r.finished_at DESC, r.id DESC) AS row_number
+      r.selection_status
     FROM otlet.inference_receipts r
-    JOIN policy p ON true
     WHERE r.task_name = p.task_name
       AND r.model_name = p.cheap_model_name
       AND r.selection_role = 'cheap'
-  ) ranked
-  WHERE ranked.row_number <= ranked.cheap_skip_window
+    ORDER BY r.finished_at DESC, r.id DESC
+    LIMIT GREATEST(p.cheap_skip_window, 0)
+  ) recent_receipts
 ), counts AS (
   SELECT
     count(*)::bigint AS recent_attempts,
     count(*) FILTER (WHERE selection_status = 'accepted')::bigint AS recent_accepted
   FROM recent
 ), latest_cheap AS (
-  SELECT COALESCE(max(r.id), 0) AS latest_cheap_receipt_id
+  SELECT COALESCE(latest.id, 0) AS latest_cheap_receipt_id
   FROM policy p
-  LEFT JOIN otlet.inference_receipts r
-    ON r.task_name = p.task_name
-   AND r.model_name = p.cheap_model_name
-   AND r.selection_role = 'cheap'
+  LEFT JOIN LATERAL (
+    SELECT r.id
+    FROM otlet.inference_receipts r
+    WHERE r.task_name = p.task_name
+      AND r.model_name = p.cheap_model_name
+      AND r.selection_role = 'cheap'
+    ORDER BY r.id DESC
+    LIMIT 1
+  ) latest ON true
 ), skipped AS (
   SELECT count(r.id)::bigint AS skipped_since_last_cheap
   FROM policy p
@@ -276,7 +280,7 @@ GROUP BY
   recent.skip_cheap,
   recent.probe_due;
 
-CREATE FUNCTION otlet.verify_invariants()
+CREATE FUNCTION otlet.verify_invariants(sample_limit integer DEFAULT NULL)
 RETURNS TABLE (
   invariant_name text,
   object_type text,
@@ -290,7 +294,20 @@ DECLARE
   index_row record;
   join_row record;
   current_contract_hash text;
+  bounded_sample_limit integer := NULLIF(GREATEST(COALESCE(sample_limit, 0), 0), 0);
+  sample_clause text := '';
+  sample_detail jsonb := '{}'::jsonb;
 BEGIN
+  IF bounded_sample_limit IS NOT NULL THEN
+    sample_clause := format('ORDER BY subject_id LIMIT %s', bounded_sample_limit);
+    sample_detail := jsonb_build_object(
+      'scan_mode',
+      'sampled',
+      'sample_limit',
+      bounded_sample_limit
+    );
+  END IF;
+
   RETURN QUERY
   SELECT
     'one_accepted_output_per_job'::text,
@@ -393,7 +410,7 @@ BEGIN
     BEGIN
       RETURN QUERY EXECUTE format(
         $sql$
-          WITH current_inputs AS (
+          WITH source_inputs AS (
             SELECT
               (src.%1$I)::text AS subject_id,
               jsonb_build_object(
@@ -407,6 +424,11 @@ BEGIN
                 'row', otlet.semantic_project_row(to_jsonb(src), %6$L::text[])
               ) AS input
             FROM %3$s AS src
+          ),
+          current_inputs AS (
+            SELECT *
+            FROM source_inputs
+            %11$s
           ),
           current_hashes AS (
             SELECT DISTINCT ON (subject_id)
@@ -429,7 +451,7 @@ BEGIN
               'current_content_hash', ch.content_hash,
               'stored_contract_hash', sm.contract_hash,
               'current_contract_hash', %7$L
-            )
+            ) || %10$L::jsonb
           FROM otlet.semantic_materializations sm
           LEFT JOIN current_hashes ch ON ch.subject_id = sm.subject_id
           WHERE sm.task_name = %4$L
@@ -450,7 +472,9 @@ BEGIN
         index_row.input_columns,
         current_contract_hash,
         index_row.name,
-        index_row.input_shaping
+        index_row.input_shaping,
+        sample_detail,
+        sample_clause
       );
     EXCEPTION WHEN OTHERS THEN
       RETURN QUERY
@@ -462,7 +486,7 @@ BEGIN
           'task_name', index_row.task_name,
           'source_table', index_row.source_table,
           'error', SQLERRM
-        );
+        ) || sample_detail;
     END;
   END LOOP;
 
@@ -494,7 +518,7 @@ BEGIN
     BEGIN
       RETURN QUERY EXECUTE format(
         $sql$
-          WITH current_inputs AS (
+          WITH source_inputs AS (
             SELECT subject_id, input
             FROM (
               SELECT subject_id::text AS subject_id, input::jsonb AS input
@@ -502,6 +526,11 @@ BEGIN
               ORDER BY subject_id
               LIMIT %2$s
             ) otlet_join_input
+          ),
+          current_inputs AS (
+            SELECT *
+            FROM source_inputs
+            %10$s
           ),
           current_hashes AS (
             SELECT DISTINCT ON (subject_id)
@@ -524,7 +553,7 @@ BEGIN
               'current_content_hash', ch.content_hash,
               'stored_contract_hash', sm.contract_hash,
               'current_contract_hash', %5$L
-            )
+            ) || %9$L::jsonb
           FROM otlet.semantic_materializations sm
           LEFT JOIN current_hashes ch ON ch.subject_id = sm.subject_id
           WHERE sm.task_name = %3$L
@@ -544,7 +573,9 @@ BEGIN
         current_contract_hash,
         join_row.name,
         'otlet.semantic_join:' || join_row.name,
-        join_row.input_shaping
+        join_row.input_shaping,
+        sample_detail,
+        sample_clause
       );
     EXCEPTION WHEN OTHERS THEN
       RETURN QUERY
@@ -555,7 +586,7 @@ BEGIN
         jsonb_build_object(
           'task_name', join_row.task_name,
           'error', SQLERRM
-        );
+        ) || sample_detail;
     END;
   END LOOP;
 END;
