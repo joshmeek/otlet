@@ -680,3 +680,70 @@ LEFT JOIN LATERAL (
   ORDER BY sm.updated_at DESC, sm.id DESC
   LIMIT 1
 ) materialization ON true;
+
+CREATE VIEW otlet.task_inference_cache_status AS
+WITH receipt_cache AS (
+  SELECT
+    task_name,
+    receipt_id,
+    selection_status,
+    inference_cache_hit,
+    inference_cache_key_basis,
+    inference_cache_reason,
+    receipt_finished_at,
+    (
+      inference_cache_reason IS NOT NULL
+      AND inference_cache_reason NOT IN ('disabled', 'disabled_for_generation_trace')
+    ) AS cache_enabled
+  FROM otlet.inference_receipt_trace_status
+),
+task_cache AS (
+  SELECT
+    task_name,
+    count(*)::bigint AS receipt_count,
+    count(*) FILTER (WHERE selection_status = 'accepted')::bigint AS accepted_receipts,
+    count(*) FILTER (WHERE selection_status = 'rejected')::bigint AS rejected_receipts,
+    count(*) FILTER (WHERE selection_status = 'failed')::bigint AS failed_receipts,
+    count(*) FILTER (WHERE cache_enabled)::bigint AS cache_enabled_receipts,
+    count(*) FILTER (WHERE inference_cache_hit)::bigint AS inference_cache_hits,
+    count(*) FILTER (WHERE cache_enabled AND NOT inference_cache_hit)::bigint AS inference_cache_misses,
+    count(*) FILTER (WHERE selection_status = 'accepted' AND inference_cache_hit)::bigint AS accepted_cache_hits,
+    count(*) FILTER (WHERE selection_status = 'rejected' AND inference_cache_hit)::bigint AS rejected_cache_hits,
+    count(*) FILTER (WHERE selection_status = 'failed' AND inference_cache_hit)::bigint AS failed_cache_hits,
+    array_remove(array_agg(DISTINCT inference_cache_key_basis), NULL) AS key_basis_values,
+    (array_agg(inference_cache_reason ORDER BY receipt_finished_at DESC, receipt_id DESC))[1] AS last_cache_reason
+  FROM receipt_cache
+  GROUP BY task_name
+)
+SELECT
+  c.task_name,
+  c.receipt_count,
+  c.accepted_receipts,
+  c.rejected_receipts,
+  c.failed_receipts,
+  c.cache_enabled_receipts,
+  c.inference_cache_hits,
+  c.inference_cache_misses,
+  CASE
+    WHEN c.cache_enabled_receipts > 0
+      THEN c.inference_cache_hits::numeric / c.cache_enabled_receipts
+    ELSE NULL
+  END AS inference_cache_hit_rate,
+  c.accepted_cache_hits,
+  c.rejected_cache_hits,
+  c.failed_cache_hits,
+  to_jsonb(c.key_basis_values) AS inference_cache_key_bases,
+  c.last_cache_reason,
+  COALESCE(reasons.cache_reasons, '{}'::jsonb) AS cache_reasons
+FROM task_cache c
+LEFT JOIN LATERAL (
+  SELECT jsonb_object_agg(reason, receipt_count ORDER BY reason) AS cache_reasons
+  FROM (
+    SELECT
+      COALESCE(r.inference_cache_reason, 'unknown') AS reason,
+      count(*)::bigint AS receipt_count
+    FROM receipt_cache r
+    WHERE r.task_name = c.task_name
+    GROUP BY COALESCE(r.inference_cache_reason, 'unknown')
+  ) reason_counts
+) reasons ON true;

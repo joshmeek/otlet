@@ -665,6 +665,18 @@ The worker keeps the local model/context warm across jobs. SQL can see the slot 
 
 SQL shows whether the model loaded, is busy, failed, cached, or went over budget
 
+The inference-output cache stores schema-valid raw model output before selection trust is applied. Accepted abstentions and rejected-but-valid attempts may reuse cached bytes, while invalid JSON/schema failures are never cached. The receipt still records accepted/rejected/failed status, and the cache key basis stays content hash + contract hash + model fingerprint
+
+```sql
+SELECT task_name,
+       cache_enabled_receipts,
+       inference_cache_hits,
+       inference_cache_hit_rate,
+       inference_cache_key_bases
+FROM otlet.task_inference_cache_status
+WHERE task_name = 'entity_resolution_demo';
+```
+
 ## Inspect Token Traces
 
 The task enabled bounded generation tracing:
