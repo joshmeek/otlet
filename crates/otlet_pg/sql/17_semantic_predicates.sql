@@ -72,6 +72,8 @@ BEGIN
         sm.body,
         sm.content_hash,
         sm.contract_hash,
+        sm.stale,
+        sm.stale_reason,
         sm.updated_at,
         sm.id
       FROM otlet.semantic_materializations sm
@@ -80,12 +82,27 @@ BEGIN
        AND si.record_type = sm.record_type
       WHERE si.name = semantic_matches.index_name
         AND sm.subject_id = semantic_matches.subject_id
-        AND sm.content_hash = current_content_hash
-        AND sm.contract_hash = index_row.contract_hash
-        AND (NOT sm.stale OR sm.stale_reason = 'source_update')
-      ORDER BY sm.subject_id, sm.updated_at DESC, sm.id DESC
+      ORDER BY
+        sm.subject_id,
+        (
+          sm.content_hash IS NOT DISTINCT FROM current_content_hash
+          AND sm.contract_hash IS NOT DISTINCT FROM index_row.contract_hash
+        ) DESC,
+        sm.updated_at DESC,
+        sm.id DESC
     ) latest
-    WHERE latest.body @> semantic_matches.expected
+    CROSS JOIN LATERAL otlet.semantic_freshness_status(
+      latest.content_hash,
+      latest.contract_hash,
+      latest.stale,
+      latest.stale_reason,
+      NULL,
+      current_content_hash,
+      index_row.contract_hash,
+      NULL
+    ) status
+    WHERE status.is_fresh
+      AND latest.body @> semantic_matches.expected
   );
 END;
 $$;

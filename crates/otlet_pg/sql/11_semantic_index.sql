@@ -319,31 +319,19 @@ BEGIN
 END;
 $$;
 
-CREATE FUNCTION otlet.materialize_semantic_index(
-  index_name text
+CREATE FUNCTION otlet.materialize_semantic_records(
+  task_name text,
+  record_type text,
+  source_table text,
+  current_input_query text
 ) RETURNS bigint
 LANGUAGE plpgsql
 AS $$
 DECLARE
-  index_row otlet.semantic_indexes%ROWTYPE;
   refreshed bigint;
 BEGIN
-  SELECT *
-  INTO index_row
-  FROM otlet.semantic_indexes
-  WHERE name = materialize_semantic_index.index_name;
-
-  IF NOT FOUND THEN
-    RAISE EXCEPTION 'otlet semantic index % does not exist', materialize_semantic_index.index_name;
-  END IF;
-
-  SELECT t.input_query
-  INTO input_query
-  FROM otlet.tasks t
-  WHERE t.name = index_row.task_name;
-
-  IF input_query IS NULL THEN
-    RAISE EXCEPTION 'otlet semantic index % task % does not exist', materialize_semantic_index.index_name, index_row.task_name;
+  IF NULLIF(materialize_semantic_records.current_input_query, '') IS NULL THEN
+    RAISE EXCEPTION 'otlet materialize_semantic_records requires current_input_query';
   END IF;
 
   EXECUTE format(
@@ -422,14 +410,50 @@ BEGIN
             freshness_basis = EXCLUDED.freshness_basis,
             updated_at = now()
     $sql$,
-    input_query,
-    index_row.task_name,
-    index_row.source_table,
-    index_row.record_type
+    materialize_semantic_records.current_input_query,
+    materialize_semantic_records.task_name,
+    materialize_semantic_records.source_table,
+    materialize_semantic_records.record_type
   );
 
   GET DIAGNOSTICS refreshed = ROW_COUNT;
   RETURN refreshed;
+END;
+$$;
+
+CREATE FUNCTION otlet.materialize_semantic_index(
+  index_name text
+) RETURNS bigint
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  index_row otlet.semantic_indexes%ROWTYPE;
+  input_query text;
+BEGIN
+  SELECT *
+  INTO index_row
+  FROM otlet.semantic_indexes
+  WHERE name = materialize_semantic_index.index_name;
+
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'otlet semantic index % does not exist', materialize_semantic_index.index_name;
+  END IF;
+
+  SELECT t.input_query
+  INTO input_query
+  FROM otlet.tasks t
+  WHERE t.name = index_row.task_name;
+
+  IF input_query IS NULL THEN
+    RAISE EXCEPTION 'otlet semantic index % task % does not exist', materialize_semantic_index.index_name, index_row.task_name;
+  END IF;
+
+  RETURN otlet.materialize_semantic_records(
+    index_row.task_name,
+    index_row.record_type,
+    index_row.source_table,
+    input_query
+  );
 END;
 $$;
 
@@ -442,7 +466,6 @@ AS $$
 DECLARE
   index_row otlet.semantic_indexes%ROWTYPE;
   input_query text;
-  refreshed bigint;
 BEGIN
   SELECT *
   INTO index_row
@@ -461,9 +484,8 @@ BEGIN
     RAISE EXCEPTION 'otlet semantic index % task % does not exist', materialize_semantic_index_subject.index_name, index_row.task_name;
   END IF;
 
-  EXECUTE format(
+  input_query := format(
     $sql$
-      WITH current_inputs AS (
         SELECT
           (src.%1$I)::text AS subject_id,
           jsonb_build_object(
@@ -474,93 +496,24 @@ BEGIN
               'xmin', src.xmin::text
             ),
             'table', %2$L,
-            'row', otlet.semantic_project_row(to_jsonb(src), %7$L::text[])
+            'row', otlet.semantic_project_row(to_jsonb(src), %5$L::text[])
           ) AS input
         FROM %3$s AS src
         WHERE (src.%1$I)::text = %4$L
-      ),
-      latest_jobs AS (
-        SELECT DISTINCT ON (j.subject_id)
-          j.id,
-          j.subject_id,
-          j.task_name,
-          j.input
-        FROM otlet.jobs j
-        JOIN current_inputs ci
-          ON ci.subject_id = j.subject_id
-         AND md5(ci.input::text) = md5(j.input::text)
-        WHERE j.task_name = %5$L
-          AND j.subject_id = %4$L
-          AND j.status = 'complete'
-        ORDER BY j.subject_id, j.finished_at DESC NULLS LAST, j.id DESC
-      )
-      INSERT INTO otlet.semantic_materializations (
-        record_id,
-        record_type,
-        source_table,
-        subject_id,
-        source_dependencies,
-        task_name,
-        model_name,
-        body,
-        stale,
-        source_hash,
-        content_hash,
-        contract_hash,
-        stale_reason,
-        freshness_basis,
-        updated_at
-      )
-      SELECT
-        r.id,
-        r.record_type,
-        %2$L,
-        j.subject_id,
-        otlet.semantic_input_dependencies(j.input),
-        j.task_name,
-        ar.model_name,
-        r.body,
-        false,
-        md5(j.input::text),
-        otlet.semantic_content_hash(j.input, t.input_shaping),
-        otlet.task_contract_hash(t.instruction, t.output_schema, t.model_name, t.runtime_options, t.input_shaping, t.decision_contract),
-        NULL,
-        'content_hash_match',
-        now()
-      FROM otlet.records r
-      JOIN otlet.actions a ON a.id = r.action_id
-      JOIN latest_jobs j ON j.id = a.job_id
-      JOIN otlet.tasks t ON t.name = j.task_name
-      JOIN otlet.outputs o ON o.id = a.output_id
-      JOIN otlet.inference_receipts ar ON ar.id = o.receipt_id
-      WHERE r.record_type = %6$L
-      ON CONFLICT (record_id) DO UPDATE
-        SET record_type = EXCLUDED.record_type,
-            source_table = EXCLUDED.source_table,
-            subject_id = EXCLUDED.subject_id,
-            source_dependencies = EXCLUDED.source_dependencies,
-            task_name = EXCLUDED.task_name,
-            model_name = EXCLUDED.model_name,
-            body = EXCLUDED.body,
-            stale = false,
-            source_hash = EXCLUDED.source_hash,
-            content_hash = EXCLUDED.content_hash,
-            contract_hash = EXCLUDED.contract_hash,
-            stale_reason = NULL,
-            freshness_basis = EXCLUDED.freshness_basis,
-            updated_at = now()
     $sql$,
     index_row.subject_column,
     index_row.source_table,
     index_row.source_table,
     materialize_semantic_index_subject.subject_id,
-    index_row.task_name,
-    index_row.record_type,
     index_row.input_columns
   );
 
-  GET DIAGNOSTICS refreshed = ROW_COUNT;
-  RETURN refreshed;
+  RETURN otlet.materialize_semantic_records(
+    index_row.task_name,
+    index_row.record_type,
+    index_row.source_table,
+    input_query
+  );
 END;
 $$;
 
@@ -610,7 +563,7 @@ BEGIN
 
   RETURN QUERY EXECUTE format(
     $sql$
-      WITH current_inputs AS (
+      WITH raw_inputs AS (
         SELECT
           (src.%1$I)::text AS subject_id,
           jsonb_build_object(
@@ -624,6 +577,14 @@ BEGIN
             'row', otlet.semantic_project_row(to_jsonb(src), %6$L::text[])
           ) AS input
         FROM %3$s AS src
+      ),
+      current_inputs AS (
+        SELECT
+          subject_id,
+          input,
+          md5(input::text) AS source_hash,
+          otlet.semantic_content_hash(input, %9$L::jsonb) AS content_hash
+        FROM raw_inputs
       ),
       latest AS (
         SELECT DISTINCT ON (sm.subject_id)
@@ -645,7 +606,7 @@ BEGIN
         ORDER BY
           sm.subject_id,
           (
-            sm.content_hash IS NOT DISTINCT FROM otlet.semantic_content_hash(ci.input, %9$L::jsonb)
+            sm.content_hash IS NOT DISTINCT FROM ci.content_hash
             AND sm.contract_hash IS NOT DISTINCT FROM %7$L
           ) DESC,
           sm.updated_at DESC,
@@ -654,32 +615,28 @@ BEGIN
       SELECT
         latest.subject_id,
         latest.body,
-        NOT (
-          latest.content_hash IS NOT DISTINCT FROM otlet.semantic_content_hash(ci.input, %9$L::jsonb)
-          AND latest.contract_hash IS NOT DISTINCT FROM %7$L
-          AND (NOT latest.stale OR latest.stale_reason = 'source_update')
-        ) AS stale,
+        status.is_stale AS stale,
         latest.source_hash,
         CASE
-          WHEN NOT (
-            latest.content_hash IS NOT DISTINCT FROM otlet.semantic_content_hash(ci.input, %9$L::jsonb)
-            AND latest.contract_hash IS NOT DISTINCT FROM %7$L
-            AND (NOT latest.stale OR latest.stale_reason = 'source_update')
-          ) THEN NULL
-          WHEN latest.stale THEN 'revalidated_after_benign_update'
-          WHEN latest.source_hash IS NOT DISTINCT FROM md5(ci.input::text) THEN 'mvcc_match'
-          ELSE COALESCE(latest.freshness_basis, 'content_hash_match')
+          WHEN status.freshness_basis = 'content_hash_match' THEN COALESCE(latest.freshness_basis, status.freshness_basis)
+          ELSE status.freshness_basis
         END AS freshness_basis,
         latest.updated_at
       FROM current_inputs ci
       JOIN latest ON latest.subject_id = ci.subject_id
+      CROSS JOIN LATERAL otlet.semantic_freshness_status(
+        latest.content_hash,
+        latest.contract_hash,
+        latest.stale,
+        latest.stale_reason,
+        latest.source_hash,
+        ci.content_hash,
+        %7$L,
+        ci.source_hash
+      ) status
       WHERE (
         NOT %8$s
-        OR (
-          latest.content_hash IS NOT DISTINCT FROM otlet.semantic_content_hash(ci.input, %9$L::jsonb)
-          AND latest.contract_hash IS NOT DISTINCT FROM %7$L
-          AND (NOT latest.stale OR latest.stale_reason = 'source_update')
-        )
+        OR status.is_fresh
       )
       ORDER BY latest.subject_id, latest.updated_at DESC
     $sql$,

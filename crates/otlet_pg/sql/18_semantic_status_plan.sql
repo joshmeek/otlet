@@ -79,7 +79,7 @@ BEGIN
   IF exact THEN
     EXECUTE format(
       $sql$
-        WITH current_inputs AS (
+        WITH raw_inputs AS (
           SELECT
             (src.%1$I)::text AS subject_id,
             jsonb_build_object(
@@ -93,6 +93,14 @@ BEGIN
               'row', otlet.semantic_project_row(to_jsonb(src), %6$L::text[])
             ) AS input
           FROM %3$s AS src
+        ),
+        current_inputs AS (
+          SELECT
+            subject_id,
+            input,
+            md5(input::text) AS source_hash,
+            otlet.semantic_content_hash(input, %8$L::jsonb) AS content_hash
+          FROM raw_inputs
         ),
         latest AS (
           SELECT DISTINCT ON (sm.subject_id)
@@ -112,7 +120,7 @@ BEGIN
           ORDER BY
             sm.subject_id,
             (
-              sm.content_hash IS NOT DISTINCT FROM otlet.semantic_content_hash(ci.input, %8$L::jsonb)
+              sm.content_hash IS NOT DISTINCT FROM ci.content_hash
               AND sm.contract_hash IS NOT DISTINCT FROM %7$L
             ) DESC,
             sm.updated_at DESC,
@@ -122,23 +130,21 @@ BEGIN
           SELECT
             ci.subject_id,
             l.subject_id IS NOT NULL AS has_materialization,
-            (
-              l.subject_id IS NOT NULL
-              AND l.content_hash IS NOT DISTINCT FROM otlet.semantic_content_hash(ci.input, %8$L::jsonb)
-              AND l.contract_hash IS NOT DISTINCT FROM %7$L
-              AND (NOT l.stale OR l.stale_reason = 'source_update')
-            ) AS is_fresh,
-            (
-              l.subject_id IS NOT NULL
-              AND NOT (
-                l.content_hash IS NOT DISTINCT FROM otlet.semantic_content_hash(ci.input, %8$L::jsonb)
-                AND l.contract_hash IS NOT DISTINCT FROM %7$L
-                AND (NOT l.stale OR l.stale_reason = 'source_update')
-              )
-            ) AS is_stale,
-            COALESCE(l.stale_reason, 'content_revalidation_pending') AS stale_reason
+            COALESCE(status.is_fresh, false) AS is_fresh,
+            (l.subject_id IS NOT NULL AND COALESCE(status.is_stale, true)) AS is_stale,
+            COALESCE(status.stale_reason, 'content_revalidation_pending') AS stale_reason
           FROM current_inputs ci
           LEFT JOIN latest l USING (subject_id)
+          LEFT JOIN LATERAL otlet.semantic_freshness_status(
+            l.content_hash,
+            l.contract_hash,
+            l.stale,
+            l.stale_reason,
+            l.source_hash,
+            ci.content_hash,
+            %7$L,
+            ci.source_hash
+          ) status ON l.subject_id IS NOT NULL
         )
         SELECT
           count(*)::bigint,
@@ -174,6 +180,8 @@ BEGIN
       SELECT DISTINCT ON (sm.subject_id)
         sm.subject_id,
         sm.stale,
+        sm.source_hash,
+        sm.content_hash,
         sm.contract_hash,
         sm.stale_reason,
         sm.updated_at,
@@ -193,19 +201,20 @@ BEGIN
     classified AS (
       SELECT
         subject_id,
-        (
-          (NOT stale OR stale_reason = 'source_update')
-          AND contract_hash IS NOT DISTINCT FROM current_contract_hash
-        ) AS is_fresh,
-        NOT (
-          (NOT stale OR stale_reason = 'source_update')
-          AND contract_hash IS NOT DISTINCT FROM current_contract_hash
-        ) AS is_stale,
-        CASE
-          WHEN contract_hash IS DISTINCT FROM current_contract_hash THEN 'contract_changed'
-          ELSE COALESCE(stale_reason, 'content_revalidation_pending')
-        END AS stale_reason
+        status.is_fresh,
+        status.is_stale,
+        COALESCE(status.stale_reason, 'content_revalidation_pending') AS stale_reason
       FROM latest
+      CROSS JOIN LATERAL otlet.semantic_freshness_status(
+        content_hash,
+        contract_hash,
+        stale,
+        stale_reason,
+        source_hash,
+        content_hash,
+        current_contract_hash,
+        source_hash
+      ) status
     ),
     source_estimate AS (
       SELECT GREATEST(COALESCE(c.reltuples, 0), 0)::bigint AS estimated_rows

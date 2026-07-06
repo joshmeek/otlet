@@ -201,16 +201,26 @@ fn validate_semantic_index_source(
             &input_shaping_sql,
         );
         let matches_expected_sql = row_predicate_match_sql("sm.body", expected_json);
+        let contract_hash_sql = sql_literal(&contract_hash);
+        let freshness_status_sql =
+            semantic_freshness_status_sql("l", "src.content_hash", &contract_hash_sql, "src.source_hash");
         let stats_query = format!(
-            "WITH latest AS ( \
+            "WITH source_rows AS ( \
+               {} \
+             ), \
+             latest AS ( \
                SELECT DISTINCT ON (sm.subject_id) \
                  sm.subject_id, sm.stale, sm.source_hash, sm.content_hash, sm.contract_hash, sm.stale_reason, {} AS matches_expected, sm.updated_at, sm.id \
-               FROM otlet.semantic_materializations sm \
+               FROM source_rows src \
+               JOIN otlet.semantic_materializations sm \
+                 ON sm.subject_id = src.subject_id \
                JOIN otlet.semantic_indexes si \
                  ON si.task_name = sm.task_name \
                 AND si.record_type = sm.record_type \
                WHERE si.name = {} \
-               ORDER BY sm.subject_id, sm.updated_at DESC, sm.id DESC \
+               ORDER BY sm.subject_id, \
+                 (sm.content_hash IS NOT DISTINCT FROM src.content_hash AND sm.contract_hash IS NOT DISTINCT FROM {}) DESC, \
+                 sm.updated_at DESC, sm.id DESC \
              ), \
              active_jobs AS ( \
                SELECT DISTINCT j.subject_id \
@@ -218,9 +228,6 @@ fn validate_semantic_index_source(
                JOIN otlet.semantic_indexes si ON si.task_name = j.task_name \
                WHERE si.name = {} \
                  AND j.status IN ('queued', 'running', 'cancel_requested') \
-             ), \
-             source_rows AS ( \
-               {} \
              ), \
              runtime_model AS ( \
                SELECT \
@@ -267,23 +274,22 @@ fn validate_semantic_index_source(
              classified AS ( \
                SELECT \
                  CASE \
-                   WHEN a.subject_id IS NOT NULL AND (l.subject_id IS NULL OR l.content_hash IS DISTINCT FROM src.content_hash OR l.contract_hash IS DISTINCT FROM {} OR (l.stale AND l.stale_reason IS DISTINCT FROM 'source_update')) THEN 'in_flight' \
+                   WHEN a.subject_id IS NOT NULL AND (l.subject_id IS NULL OR status.is_stale) THEN 'in_flight' \
                    WHEN l.subject_id IS NULL THEN 'missing' \
-                   WHEN l.content_hash IS DISTINCT FROM src.content_hash OR l.contract_hash IS DISTINCT FROM {} OR (l.stale AND l.stale_reason IS DISTINCT FROM 'source_update') THEN 'stale' \
+                   WHEN status.is_stale THEN 'stale' \
                    WHEN l.matches_expected THEN 'fresh_match' \
                    ELSE 'fresh_non_match' \
                  END AS state, \
-                 COALESCE(l.stale_reason, 'content_revalidation_pending') AS stale_reason, \
+                 COALESCE(status.stale_reason, 'content_revalidation_pending') AS stale_reason, \
                  ( \
                    a.subject_id IS NULL \
                    AND l.subject_id IS NOT NULL \
                    AND l.stale \
-                   AND l.content_hash IS NOT DISTINCT FROM src.content_hash \
-                   AND l.contract_hash IS NOT DISTINCT FROM {} \
-                   AND l.stale_reason = 'source_update' \
+                   AND status.is_fresh \
                  ) AS cache_reusable \
                FROM source_rows src \
                LEFT JOIN latest l USING (subject_id) \
+               LEFT JOIN LATERAL {} status ON l.subject_id IS NOT NULL \
                LEFT JOIN active_jobs a USING (subject_id) \
              ) \
              SELECT \
@@ -304,20 +310,19 @@ fn validate_semantic_index_source(
                    WHERE state = 'stale' \
                    GROUP BY stale_reason \
                  ) reasons \
-               ), '{{}}'::text) AS stale_reasons \
+             ), '{{}}'::text) AS stale_reasons \
              FROM classified",
+            source_rows_sql,
             matches_expected_sql,
             sql_literal(index_name),
+            contract_hash_sql,
             sql_literal(index_name),
-            source_rows_sql,
             sql_literal(&task_name),
             sql_literal(&model_name),
             sql_literal(&model_name),
             sql_literal(&model_name),
             sql_literal(&model_name),
-            sql_literal(&contract_hash),
-            sql_literal(&contract_hash),
-            sql_literal(&contract_hash)
+            freshness_status_sql
         );
         let stats_table = client
             .select(stats_query.as_str(), Some(1), &[])

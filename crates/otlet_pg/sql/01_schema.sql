@@ -247,6 +247,57 @@ AS $$
   )::text);
 $$;
 
+-- Truth table for semantic freshness:
+-- content mismatch -> stale, reason = stale_reason or content_revalidation_pending
+-- contract mismatch -> stale, reason = contract_changed
+-- stale = false and content/contract match -> fresh
+-- stale = true with source_update and content/contract match -> fresh revalidation candidate
+-- any other stale reason with content/contract match -> stale
+CREATE FUNCTION otlet.semantic_freshness_status(
+  material_content_hash text,
+  material_contract_hash text,
+  material_stale boolean,
+  material_stale_reason text,
+  material_source_hash text,
+  current_content_hash text,
+  current_contract_hash text,
+  current_source_hash text DEFAULT NULL
+) RETURNS TABLE (
+  is_fresh boolean,
+  is_stale boolean,
+  stale_reason text,
+  freshness_basis text
+)
+LANGUAGE sql
+IMMUTABLE
+AS $$
+  WITH classified AS (
+    SELECT (
+      material_content_hash IS NOT DISTINCT FROM current_content_hash
+      AND material_contract_hash IS NOT DISTINCT FROM current_contract_hash
+      AND (
+        NOT COALESCE(material_stale, false)
+        OR material_stale_reason = 'source_update'
+      )
+    ) AS fresh
+  )
+  SELECT
+    fresh AS is_fresh,
+    NOT fresh AS is_stale,
+    CASE
+      WHEN fresh THEN NULL::text
+      WHEN material_contract_hash IS DISTINCT FROM current_contract_hash THEN 'contract_changed'
+      ELSE COALESCE(material_stale_reason, 'content_revalidation_pending')
+    END AS stale_reason,
+    CASE
+      WHEN NOT fresh THEN NULL::text
+      WHEN COALESCE(material_stale, false) THEN 'revalidated_after_benign_update'
+      WHEN material_source_hash IS NOT DISTINCT FROM current_source_hash THEN 'mvcc_match'
+      ELSE 'content_hash_match'
+    END AS freshness_basis
+  FROM classified;
+$$;
+
 INSERT INTO otlet.decision_rule_presets (name, decision_contract)
 VALUES (
   'entity_resolution_evidence_v1',

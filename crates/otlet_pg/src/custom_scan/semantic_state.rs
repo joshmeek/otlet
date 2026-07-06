@@ -64,8 +64,20 @@ fn load_semantic_states(
             &input_shaping_sql,
         );
         let matches_expected_sql = row_predicate_match_sql("sm.body", expected_json);
+        let contract_hash_sql = sql_literal(&contract_hash);
+        let freshness_status_sql =
+            semantic_freshness_status_sql("l", "src.content_hash", &contract_hash_sql, "src.source_hash");
         let query = format!(
-            "WITH latest_materializations AS ( \
+            "WITH active_jobs AS ( \
+           SELECT DISTINCT j.subject_id \
+           FROM otlet.jobs j \
+           WHERE j.task_name = {} \
+             AND j.status IN ('queued', 'running', 'cancel_requested') \
+         ), \
+         source_rows AS ( \
+           {} \
+         ), \
+         latest_materializations AS ( \
            SELECT DISTINCT ON (sm.subject_id) \
              sm.subject_id, \
              sm.stale, \
@@ -77,51 +89,44 @@ fn load_semantic_states(
 	             {} AS matches_expected, \
              sm.updated_at, \
              sm.id \
-           FROM otlet.semantic_materializations sm \
+           FROM source_rows src \
+           JOIN otlet.semantic_materializations sm \
+             ON sm.subject_id = src.subject_id \
            WHERE sm.task_name = {} \
              AND sm.record_type = {} \
-           ORDER BY sm.subject_id, sm.updated_at DESC, sm.id DESC \
-         ), \
-         active_jobs AS ( \
-           SELECT DISTINCT j.subject_id \
-           FROM otlet.jobs j \
-           WHERE j.task_name = {} \
-             AND j.status IN ('queued', 'running', 'cancel_requested') \
-         ), \
-         source_rows AS ( \
-           {} \
+           ORDER BY sm.subject_id, \
+             (sm.content_hash IS NOT DISTINCT FROM src.content_hash AND sm.contract_hash IS NOT DISTINCT FROM {}) DESC, \
+             sm.updated_at DESC, sm.id DESC \
          ), \
          semantic_state AS ( \
            SELECT \
              src.subject_id, \
 	             CASE \
-	               WHEN a.subject_id IS NOT NULL AND (l.subject_id IS NULL OR l.content_hash IS DISTINCT FROM src.content_hash OR l.contract_hash IS DISTINCT FROM {} OR (l.stale AND l.stale_reason IS DISTINCT FROM 'source_update')) THEN 'in_flight' \
+	               WHEN a.subject_id IS NOT NULL AND (l.subject_id IS NULL OR status.is_stale) THEN 'in_flight' \
 	               WHEN l.subject_id IS NULL THEN 'missing' \
-	               WHEN l.content_hash IS DISTINCT FROM src.content_hash OR l.contract_hash IS DISTINCT FROM {} OR (l.stale AND l.stale_reason IS DISTINCT FROM 'source_update') THEN 'stale' \
+	               WHEN status.is_stale THEN 'stale' \
 	               WHEN l.matches_expected THEN 'fresh_match' \
 	               ELSE 'fresh_non_match' \
 	             END AS semantic_state, \
 	             CASE \
-	               WHEN l.content_hash IS DISTINCT FROM src.content_hash OR l.contract_hash IS DISTINCT FROM {} OR (l.stale AND l.stale_reason IS DISTINCT FROM 'source_update') THEN NULL \
-	               WHEN l.stale THEN 'revalidated_after_benign_update' \
-	               WHEN l.source_hash IS NOT DISTINCT FROM src.source_hash THEN 'mvcc_match' \
-	               ELSE COALESCE(l.freshness_basis, 'content_hash_match') \
+	               WHEN status.freshness_basis = 'content_hash_match' THEN COALESCE(l.freshness_basis, status.freshness_basis) \
+	               ELSE status.freshness_basis \
 	             END AS freshness_basis \
-	           FROM source_rows src \
+           FROM source_rows src \
            LEFT JOIN latest_materializations l USING (subject_id) \
+           LEFT JOIN LATERAL {} status ON l.subject_id IS NOT NULL \
            LEFT JOIN active_jobs a USING (subject_id) \
          ) \
 	         SELECT subject_id, semantic_state, freshness_basis \
 	         FROM semantic_state \
          ORDER BY subject_id NULLS LAST",
+            sql_literal(&task_name),
+            source_rows_sql,
             matches_expected_sql,
             sql_literal(&task_name),
             sql_literal(&record_type),
-            sql_literal(&task_name),
-            source_rows_sql,
-            sql_literal(&contract_hash),
-            sql_literal(&contract_hash),
-            sql_literal(&contract_hash)
+            contract_hash_sql,
+            freshness_status_sql
         );
         let table = client
             .select(query.as_str(), None, &[])

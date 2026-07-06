@@ -43,7 +43,7 @@ BEGIN
 
   RETURN QUERY EXECUTE format(
     $sql$
-      WITH current_inputs AS (
+      WITH raw_inputs AS (
         SELECT subject_id, input
         FROM (
           SELECT subject_id::text AS subject_id, input::jsonb AS input
@@ -51,6 +51,14 @@ BEGIN
           ORDER BY subject_id
           LIMIT %2$s
         ) otlet_join_input
+      ),
+      current_inputs AS (
+        SELECT
+          subject_id,
+          input,
+          md5(input::text) AS source_hash,
+          otlet.semantic_content_hash(input, %7$L::jsonb) AS content_hash
+        FROM raw_inputs
       ),
       latest AS (
         SELECT DISTINCT ON (sm.subject_id)
@@ -72,7 +80,7 @@ BEGIN
         ORDER BY
           sm.subject_id,
           (
-            sm.content_hash IS NOT DISTINCT FROM otlet.semantic_content_hash(ci.input, %7$L::jsonb)
+            sm.content_hash IS NOT DISTINCT FROM ci.content_hash
             AND sm.contract_hash IS NOT DISTINCT FROM %5$L
           ) DESC,
           sm.updated_at DESC,
@@ -81,32 +89,28 @@ BEGIN
       SELECT
         latest.subject_id,
         latest.body,
-        NOT (
-          latest.content_hash IS NOT DISTINCT FROM otlet.semantic_content_hash(ci.input, %7$L::jsonb)
-          AND latest.contract_hash IS NOT DISTINCT FROM %5$L
-          AND (NOT latest.stale OR latest.stale_reason = 'source_update')
-        ) AS stale,
+        status.is_stale AS stale,
         latest.source_hash,
         CASE
-          WHEN NOT (
-            latest.content_hash IS NOT DISTINCT FROM otlet.semantic_content_hash(ci.input, %7$L::jsonb)
-            AND latest.contract_hash IS NOT DISTINCT FROM %5$L
-            AND (NOT latest.stale OR latest.stale_reason = 'source_update')
-          ) THEN NULL
-          WHEN latest.stale THEN 'revalidated_after_benign_update'
-          WHEN latest.source_hash IS NOT DISTINCT FROM md5(ci.input::text) THEN 'mvcc_match'
-          ELSE COALESCE(latest.freshness_basis, 'content_hash_match')
+          WHEN status.freshness_basis = 'content_hash_match' THEN COALESCE(latest.freshness_basis, status.freshness_basis)
+          ELSE status.freshness_basis
         END AS freshness_basis,
         latest.updated_at
       FROM current_inputs ci
       JOIN latest ON latest.subject_id = ci.subject_id
+      CROSS JOIN LATERAL otlet.semantic_freshness_status(
+        latest.content_hash,
+        latest.contract_hash,
+        latest.stale,
+        latest.stale_reason,
+        latest.source_hash,
+        ci.content_hash,
+        %5$L,
+        ci.source_hash
+      ) status
       WHERE (
         NOT %6$s
-        OR (
-          latest.content_hash IS NOT DISTINCT FROM otlet.semantic_content_hash(ci.input, %7$L::jsonb)
-          AND latest.contract_hash IS NOT DISTINCT FROM %5$L
-          AND (NOT latest.stale OR latest.stale_reason = 'source_update')
-        )
+        OR status.is_fresh
       )
       ORDER BY latest.subject_id
     $sql$,
@@ -457,7 +461,7 @@ BEGIN
   IF exact THEN
     EXECUTE format(
       $sql$
-        WITH current_inputs AS (
+        WITH raw_inputs AS (
           SELECT subject_id, input
           FROM (
             SELECT subject_id::text AS subject_id, input::jsonb AS input
@@ -465,6 +469,14 @@ BEGIN
             ORDER BY subject_id
             LIMIT %2$s
           ) otlet_join_input
+        ),
+        current_inputs AS (
+          SELECT
+            subject_id,
+            input,
+            md5(input::text) AS source_hash,
+            otlet.semantic_content_hash(input, %6$L::jsonb) AS content_hash
+          FROM raw_inputs
         ),
         latest AS (
           SELECT DISTINCT ON (sm.subject_id)
@@ -484,7 +496,7 @@ BEGIN
           ORDER BY
             sm.subject_id,
             (
-              sm.content_hash IS NOT DISTINCT FROM otlet.semantic_content_hash(ci.input, %6$L::jsonb)
+              sm.content_hash IS NOT DISTINCT FROM ci.content_hash
               AND sm.contract_hash IS NOT DISTINCT FROM %5$L
             ) DESC,
             sm.updated_at DESC,
@@ -494,17 +506,26 @@ BEGIN
           SELECT
             ci.subject_id,
             l.subject_id IS NOT NULL AS has_materialization,
-            l.content_hash IS NOT DISTINCT FROM otlet.semantic_content_hash(ci.input, %6$L::jsonb)
-              AND l.contract_hash IS NOT DISTINCT FROM %5$L
-              AND (NOT l.stale OR l.stale_reason = 'source_update') AS source_fresh,
-            COALESCE(l.stale_reason, 'content_revalidation_pending') AS stale_reason
+            COALESCE(status.is_fresh, false) AS source_fresh,
+            (l.subject_id IS NOT NULL AND COALESCE(status.is_stale, true)) AS source_stale,
+            COALESCE(status.stale_reason, 'content_revalidation_pending') AS stale_reason
           FROM current_inputs ci
           LEFT JOIN latest l USING (subject_id)
+          LEFT JOIN LATERAL otlet.semantic_freshness_status(
+            l.content_hash,
+            l.contract_hash,
+            l.stale,
+            l.stale_reason,
+            l.source_hash,
+            ci.content_hash,
+            %5$L,
+            ci.source_hash
+          ) status ON l.subject_id IS NOT NULL
         )
         SELECT
           count(*)::bigint,
           count(*) FILTER (WHERE has_materialization AND source_fresh)::bigint,
-          count(*) FILTER (WHERE has_materialization AND NOT source_fresh)::bigint,
+          count(*) FILTER (WHERE source_stale)::bigint,
           count(*) FILTER (WHERE NOT has_materialization)::bigint,
           COALESCE(
             (
@@ -512,7 +533,7 @@ BEGIN
               FROM (
                 SELECT stale_reason AS reason, count(*) AS reason_count
                 FROM classified
-                WHERE has_materialization AND NOT source_fresh
+                WHERE source_stale
                 GROUP BY stale_reason
               ) reasons
             ),
@@ -533,6 +554,8 @@ BEGIN
       SELECT DISTINCT ON (sm.subject_id)
         sm.subject_id,
         sm.stale,
+        sm.source_hash,
+        sm.content_hash,
         sm.contract_hash,
         sm.stale_reason,
         sm.updated_at,
@@ -552,19 +575,20 @@ BEGIN
     classified AS (
       SELECT
         subject_id,
-        (
-          (NOT stale OR stale_reason = 'source_update')
-          AND contract_hash IS NOT DISTINCT FROM current_contract_hash
-        ) AS is_fresh,
-        NOT (
-          (NOT stale OR stale_reason = 'source_update')
-          AND contract_hash IS NOT DISTINCT FROM current_contract_hash
-        ) AS is_stale,
-        CASE
-          WHEN contract_hash IS DISTINCT FROM current_contract_hash THEN 'contract_changed'
-          ELSE COALESCE(stale_reason, 'content_revalidation_pending')
-        END AS stale_reason
+        status.is_fresh,
+        status.is_stale,
+        COALESCE(status.stale_reason, 'content_revalidation_pending') AS stale_reason
       FROM latest
+      CROSS JOIN LATERAL otlet.semantic_freshness_status(
+        content_hash,
+        contract_hash,
+        stale,
+        stale_reason,
+        source_hash,
+        content_hash,
+        current_contract_hash,
+        source_hash
+      ) status
     ),
     materialized AS (
       SELECT
