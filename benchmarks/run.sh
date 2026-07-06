@@ -928,6 +928,62 @@ SQL
     return
   fi
 
+  local direct_rate
+  if ! direct_rate="$(direct_schema_rate "$direct_task")"; then
+    fail_current_model "direct schema-rate query failed"
+    return
+  fi
+  if awk "BEGIN { exit !($direct_rate < $min_direct_schema_rate) }"; then
+    if ! after_hash="$(source_hash)"; then
+      fail_current_model "source hash after direct task failed"
+      return
+    fi
+    if [[ "$before_hash" = "$after_hash" ]]; then
+      source_unchanged=true
+    else
+      source_unchanged=false
+    fi
+    ended_s="$(date +%s)"
+    wall_ms="$(( (ended_s - started_s) * 1000 ))"
+    stale_leak_count=0
+    if ! worker_crash_count="$(count_worker_crashes "$started_at")"; then
+      fail_current_model "worker crash query failed"
+      return
+    fi
+    printf 'model=%s skip_diagnostics=true direct_schema_valid_rate=%s min_direct_schema_rate=%s\n' "$run_model_key" "$direct_rate" "$min_direct_schema_rate"
+    if ! score_model_run \
+      "$run_model_key" \
+      "$base_model_key" \
+      "$model_name" \
+      "$family" \
+      "$tier" \
+      "$quant" \
+      "$declared_params_b" \
+      "$active_params_b" \
+      "$context_tokens" \
+      "$license_note" \
+      "$source_url" \
+      "$artifact_path" \
+      "$artifact_bytes" \
+      "$external_artifact" \
+      "$direct_task" \
+      "$triage_task" \
+      "$extraction_task" \
+      "$policy_task" \
+      "$join_task" \
+      "$row_task" \
+      "$join_index" \
+      "$wall_ms" \
+      "$source_unchanged" \
+      "$stale_leak_count" \
+      "$worker_crash_count"; then
+      fail_current_model "scoring failed after direct task"
+      return
+    fi
+    cleanup_downloaded_model "$model_name" "$base_model_key" "$external_artifact"
+    return
+  fi
+
   if ! psql_exec -v task_name="$triage_task" >/dev/null <<'SQL'
 SELECT otlet.run_task(:'task_name');
 SQL
@@ -964,7 +1020,6 @@ SQL
     return
   fi
 
-  local direct_rate
   if ! direct_rate="$(direct_schema_rate "$direct_task")"; then
     fail_current_model "direct schema-rate query failed"
     return

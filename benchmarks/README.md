@@ -6,15 +6,20 @@ Read this ranking first. `overall_fit` is trusted Otlet quality with a soft reso
 
 | rank | model | role | overall_fit | trusted_quality | diagnostic_fit | resource_fit | first_blocker |
 | ---: | --- | --- | ---: | ---: | ---: | ---: | --- |
-| 1 | qwen35_4b | eligible_candidate | 0.948 | 0.999 | 0.949 | 0.799 | repeat_count < 3 |
+| 1 | qwen35_4b | eligible_candidate | 0.949 | 0.999 | 0.949 | 0.798 | repeat_count < 3 |
+| 2 | ministral3_3b | row_watch_candidate_limited | 0.934 | 0.951 | 0.940 | 0.927 | hallucinated action |
+| 3 | gemma4_e2b | eligible_candidate | 0.898 | 0.953 | 0.902 | 0.769 | repeat_count < 3 |
+| 4 | glm_edge_4b | triage_candidate | 0.867 | 0.912 | 0.934 | 0.800 | confidence < 0.95 |
+| 5 | gemma4_e4b | triage_candidate | 0.779 | 0.869 | 0.854 | 0.587 | repeat_count < 3 |
+| 6 | phi4_mini | row_watch_candidate | 0.408 | 0.427 | 0.812 | 0.821 | confidence < 0.95 |
 
 ![Overall Otlet fit](overall.svg)
 
 ## Latest Result
 
-Run `b1783212885`: this is a current scored run. It ranks 1 current scored model through the benchmark harness
+Run `b1783256415,b1783336647`: this is a merged current scored report. It ranks 6 current scored models through the benchmark harness
 
-Benchmark confidence: `provisional_single_run`. Next proof: Rerun with OTLET_BENCH_RUNS=3
+Benchmark confidence: `merged_provisional`. Next proof: Run the same selected model set in one OTLET_BENCH_RUNS=3 publish run
 
 All scored models are currently single-run rows; rerun key candidates with `OTLET_BENCH_RUNS=3` before treating stability as proven
 
@@ -48,10 +53,10 @@ Current coverage is 159 scored cases per model run. The fixture target includes 
 | --- | --- | --- | --- | --- |
 | default Otlet model |  |  |  | none passed production gates |
 | hard entity resolution | qwen35_4b | 1.000 | fail | not a default model unless gate passes |
-| row watching | qwen35_4b | 0.982 | fail | not a default model unless gate passes |
+| row watching | qwen35_4b | 0.991 | fail | not a default model unless gate passes |
 | triage | qwen35_4b | 1.000 | fail | not a default model unless gate passes |
 | <=2.0 GB artifact |  |  |  | no current overall-fit row |
-| correct jobs/sec/GB | qwen35_4b | 0.009 | fail | compare timing after one same-run sweep |
+| correct jobs/sec/GB | ministral3_3b | 0.015 | fail | compare timing after one same-run sweep |
 
 ## Production Readiness
 
@@ -59,19 +64,33 @@ The repeat-aware default-model gate keeps non-passing models out of production r
 
 | rank | model | readiness | production_score | overall_fit | gate | first_blocker |
 | ---: | --- | --- | ---: | ---: | --- | --- |
-| 1 | qwen35_4b | needs_repeat_proof | 0.000 | 0.948 | fail | repeat_count < 3 |
+| 1 | qwen35_4b | needs_repeat_proof | 0.000 | 0.949 | fail | repeat_count < 3 |
+| 2 | gemma4_e2b | needs_repeat_proof | 0.000 | 0.898 | fail | repeat_count < 3 |
+| 3 | ministral3_3b | workload_candidate | 0.000 | 0.934 | fail | hallucinated action |
+| 4 | glm_edge_4b | workload_candidate | 0.000 | 0.867 | fail | confidence < 0.95 |
+| 5 | gemma4_e4b | workload_candidate | 0.000 | 0.779 | fail | repeat_count < 3 |
+| 6 | phi4_mini | workload_candidate | 0.000 | 0.408 | fail | confidence < 0.95 |
 
 ## First Failure Modes
 
 | model | top_failure | count | passed_cases |
 | --- | --- | ---: | ---: |
 | qwen35_4b | passed | 0 | 159 |
+| gemma4_e2b | wrong_match | 6 | 153 |
+| ministral3_3b | schema_invalid | 6 | 148 |
+| glm_edge_4b | wrong_action | 8 | 143 |
+| gemma4_e4b | schema_missing | 6 | 153 |
 
 ## Overall Fit Ranking
 
 | rank | model | runs | readiness | overall_fit | trusted_quality | schema | p95_ms | rss_gb | artifact_gb |
 | ---: | --- | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| 1 | qwen35_4b | 1 | needs_repeat_proof | 0.948 | 0.999 | 1.000 | 9872 | 3.235 | 2.741 |
+| 1 | qwen35_4b | 1 | needs_repeat_proof | 0.949 | 0.999 | 1.000 | 12377 | 3.244 | 2.741 |
+| 2 | ministral3_3b | 1 | workload_candidate | 0.934 | 0.951 | 0.962 | 3641 | 2.953 | 2.147 |
+| 3 | gemma4_e2b | 1 | needs_repeat_proof | 0.898 | 0.953 | 1.000 | 4349 | 3.548 | 3.107 |
+| 4 | glm_edge_4b | 1 | workload_candidate | 0.867 | 0.912 | 0.994 | 11685 | 3.405 | 2.627 |
+| 5 | gemma4_e4b | 1 | workload_candidate | 0.779 | 0.869 | 0.962 | 8976 | 4.961 | 4.977 |
+| 6 | phi4_mini | 1 | workload_candidate | 0.408 | 0.427 | 1.000 | 6686 | 3.393 | 2.492 |
 
 ## Out Of Running
 
@@ -124,13 +143,13 @@ OTLET_BENCH_LIMIT_MODELS=qwen35_4b OTLET_BENCH_RUNS=1 OTLET_BENCH_PUBLISH_REPORT
 Run a single named model when debugging a candidate:
 
 ```sh
-OTLET_BENCH_LIMIT_MODELS=qwen35_4b OTLET_BENCH_RUNS=1 OTLET_BENCH_PUBLISH_REPORT=1 ./benchmarks/run.sh
+OTLET_BENCH_LIMIT_MODELS=phi4_mini OTLET_BENCH_RUNS=1 OTLET_BENCH_PUBLISH_REPORT=1 ./benchmarks/run.sh
 ```
 
 Run the current scored comparison set only after a meaningful prompt/schema/scoring/runtime change:
 
 ```sh
-OTLET_BENCH_LIMIT_MODELS=qwen35_4b OTLET_BENCH_RUNS=1 OTLET_BENCH_PUBLISH_REPORT=1 ./benchmarks/run.sh
+OTLET_BENCH_LIMIT_MODELS=qwen35_4b,ministral3_3b,gemma4_e2b,glm_edge_4b,gemma4_e4b,phi4_mini OTLET_BENCH_RUNS=1 OTLET_BENCH_PUBLISH_REPORT=1 ./benchmarks/run.sh
 ```
 
 Run the default-included set when the harness has materially improved and you want the shortest publishable check:

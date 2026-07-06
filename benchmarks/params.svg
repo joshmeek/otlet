@@ -1,5 +1,5 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="920" height="535" viewBox="0 0 920 535">
-<rect x="0" y="0" width="920" height="535" fill="#ffffff"/>
+<svg xmlns="http://www.w3.org/2000/svg" width="920" height="573" viewBox="0 0 920 573">
+<rect x="0" y="0" width="920" height="573" fill="#ffffff"/>
 <style>
 text { font: 12px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; fill: #20242a; }
 .axis { stroke: #4b5563; stroke-width: 1; }
@@ -33,7 +33,22 @@ text { font: 12px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; fill
 <line class="grid" x1="72" y1="416.0" x2="872" y2="416.0"/>
 <text text-anchor="middle" x="872.0" y="434.0">5</text>
 <text text-anchor="end" x="64" y="420.0">0</text>
-<circle class="point" cx="712.0" cy="74.5" r="15.0"/>
-<text style="fill:#ffffff" text-anchor="middle" x="712.0" y="78.5">1</text>
-<text x="72" y="506">1. qwen35_4b 0.948</text>
+<circle class="point" cx="712.0" cy="74.4" r="12.4"/>
+<text style="fill:#ffffff" text-anchor="middle" x="712.0" y="78.4">1</text>
+<text x="72" y="506">1. qwen35_4b 0.949</text>
+<circle class="point" cx="552.0" cy="79.9" r="11.6"/>
+<text style="fill:#ffffff" text-anchor="middle" x="552.0" y="83.9">2</text>
+<text x="72" y="525">2. ministral3_3b 0.934</text>
+<circle class="point" cx="392.0" cy="92.6" r="12.9"/>
+<text style="fill:#ffffff" text-anchor="middle" x="392.0" y="96.6">3</text>
+<text x="72" y="544">3. gemma4_e2b 0.898</text>
+<circle class="point" cx="712.0" cy="104.0" r="12.3"/>
+<text style="fill:#ffffff" text-anchor="middle" x="712.0" y="108.0">4</text>
+<text x="502" y="506">4. glm_edge_4b 0.867</text>
+<circle class="point" cx="712.0" cy="135.5" r="15.0"/>
+<text style="fill:#ffffff" text-anchor="middle" x="712.0" y="139.5">5</text>
+<text x="502" y="525">5. gemma4_e4b 0.779</text>
+<circle class="point" cx="680.0" cy="269.2" r="12.1"/>
+<text style="fill:#ffffff" text-anchor="middle" x="680.0" y="273.2">6</text>
+<text x="502" y="544">6. phi4_mini 0.408</text>
 </svg>
