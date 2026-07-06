@@ -544,6 +544,7 @@ SELECT
   COALESCE(row_index.last_lookup_at, join_index.last_lookup_at) AS last_lookup_at,
   join_index.last_materialized_at AS last_join_materialized_at,
   materialized.last_materialized_at,
+  COALESCE(materialized.revalidated_materializations, 0)::bigint AS revalidated_materializations,
   COALESCE(plan.checked_at, now()) AS checked_at
 FROM otlet.watches w
 LEFT JOIN otlet.semantic_indexes row_index ON row_index.name = w.semantic_index_name
@@ -576,7 +577,9 @@ LEFT JOIN LATERAL (
     AND e.detail ->> 'task_name' = w.task_name
 ) suppression ON true
 LEFT JOIN LATERAL (
-  SELECT max(sm.updated_at) AS last_materialized_at
+  SELECT
+    max(sm.updated_at) AS last_materialized_at,
+    count(*) FILTER (WHERE sm.freshness_basis = 'revalidated_after_benign_update')::bigint AS revalidated_materializations
   FROM otlet.semantic_materializations sm
   WHERE sm.task_name = w.task_name
     AND sm.record_type = w.record_type
