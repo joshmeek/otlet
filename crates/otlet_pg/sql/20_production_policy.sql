@@ -381,6 +381,30 @@ BEGIN
 
   RETURN QUERY
   SELECT
+    'queued_jobs_within_model_cap'::text,
+    'model'::text,
+    q.model_name::text,
+    jsonb_build_object(
+      'queued_jobs',
+      q.queued_jobs,
+      'max_queued_jobs_per_model',
+      q.max_queued_jobs_per_model
+    )
+  FROM (
+    SELECT
+      m.name AS model_name,
+      count(j.id) FILTER (WHERE j.status = 'queued')::bigint AS queued_jobs,
+      p.max_queued_jobs_per_model
+    FROM otlet.production_policy p
+    JOIN otlet.models m ON true
+    LEFT JOIN otlet.tasks t ON t.model_name = m.name
+    LEFT JOIN otlet.jobs j ON j.task_name = t.name
+    GROUP BY m.name, p.max_queued_jobs_per_model
+  ) q
+  WHERE q.queued_jobs > q.max_queued_jobs_per_model;
+
+  RETURN QUERY
+  SELECT
     'no_applied_action_without_approval'::text,
     'action'::text,
     a.id::text,

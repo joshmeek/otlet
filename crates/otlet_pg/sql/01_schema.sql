@@ -406,7 +406,8 @@ CREATE TABLE otlet.jobs (
   created_at timestamptz NOT NULL DEFAULT now(),
   started_at timestamptz,
   finished_at timestamptz,
-  cancel_requested_at timestamptz
+  cancel_requested_at timestamptz,
+  CHECK (status IN ('queued', 'running', 'complete', 'failed', 'canceled', 'cancel_requested'))
 );
 
 CREATE UNIQUE INDEX jobs_active_subject_idx

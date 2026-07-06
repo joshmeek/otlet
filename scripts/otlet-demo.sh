@@ -491,6 +491,29 @@ echo "queue_fairness_contract=$queue_fairness_contract"
   echo "Expected queue fairness contract true|true|true, got $queue_fairness_contract" >&2
   exit 1
 }
+jobs_status_check_contract="$(
+  psql_exec -qAt -v task_name="$queue_fairness_big_task" <<'SQL'
+CREATE TEMP TABLE jobs_status_params (task_name text);
+INSERT INTO jobs_status_params VALUES (:'task_name');
+DO $$
+DECLARE
+  status_task text;
+BEGIN
+  SELECT task_name INTO status_task FROM jobs_status_params;
+  INSERT INTO otlet.jobs (task_name, subject_id, input, status)
+  VALUES (status_task, 'bad-status', '{}'::jsonb, 'not_a_status');
+  RAISE EXCEPTION 'expected jobs.status check violation';
+EXCEPTION WHEN check_violation THEN
+  NULL;
+END $$;
+SELECT 'rejected';
+SQL
+)"
+echo "jobs_status_check_contract=$jobs_status_check_contract"
+[ "$jobs_status_check_contract" = "rejected" ] || {
+  echo "Expected invalid jobs.status insert to be rejected, got $jobs_status_check_contract" >&2
+  exit 1
+}
 cleanup_task "$queue_fairness_big_task"
 cleanup_task "$queue_fairness_small_task"
 
@@ -539,6 +562,12 @@ FROM otlet.jobs
 WHERE task_name = '$queue_race_task';
 ")"
 echo "queue_admission_race_contract=$queue_race_contract"
+queue_cap_invariant_contract="$(psql_value "
+SELECT (count(*) = 0)::text
+FROM otlet.verify_invariants()
+WHERE invariant_name = 'queued_jobs_within_model_cap';
+")"
+echo "queue_cap_invariant_contract=$queue_cap_invariant_contract"
 cleanup_task "$queue_race_task"
 wait "$queue_lock_pid"
 psql_exec >/dev/null <<'SQL'
@@ -551,6 +580,10 @@ WHERE name = 'default';
 SQL
 [ "$queue_race_contract" = "true|true" ] || {
   echo "Expected concurrent run_task admission to keep queued jobs at the cap, got $queue_race_contract" >&2
+  exit 1
+}
+[ "$queue_cap_invariant_contract" = "true" ] || {
+  echo "Expected queued-per-model invariant to hold at the admission cap, got $queue_cap_invariant_contract" >&2
   exit 1
 }
 

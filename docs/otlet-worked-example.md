@@ -1619,6 +1619,8 @@ The value reports a ready runtime, a ready model slot, bounded cache entries, an
 
 The production policy row and status views are ordinary SQL state under `otlet`: `production_policy_status`, `production_status`, `model_queue_status`, `worker_throughput_status`, and `cleanup_policy_state(true)`
 
+Queue caps are admission-time controls. Rows should enter `otlet.jobs` through `run_task`, watch refresh, semantic refresh, or `ask`; direct inserts are internal/testing-only and can bypass admission accounting. `verify_invariants()` reports `queued_jobs_within_model_cap` if the current queued depth for any model exceeds `max_queued_jobs_per_model`
+
 Representative output from the demo contract:
 
 ```text
