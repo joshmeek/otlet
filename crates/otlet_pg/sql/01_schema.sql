@@ -67,6 +67,18 @@ CREATE TABLE otlet.decision_rule_presets (
   created_at timestamptz NOT NULL DEFAULT now()
 );
 
+CREATE FUNCTION otlet.reject_decision_rule_preset_update() RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+BEGIN
+  RAISE EXCEPTION 'otlet decision rule preset % is immutable; create a new preset name', OLD.name;
+END;
+$$;
+
+CREATE TRIGGER decision_rule_presets_immutable
+BEFORE UPDATE ON otlet.decision_rule_presets
+FOR EACH ROW EXECUTE FUNCTION otlet.reject_decision_rule_preset_update();
+
 CREATE FUNCTION otlet.semantic_canonical_jsonb(
   input jsonb
 ) RETURNS jsonb

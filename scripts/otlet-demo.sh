@@ -26,6 +26,7 @@ numeric_triage_watch="numeric_triage_demo"
 numeric_triage_task="${numeric_triage_watch}_task"
 pair_strip_watch="pair_strip_demo"
 pair_strip_task="${pair_strip_watch}_task"
+skip_abstain_task="skip_abstain_vocab_demo"
 prompt_identity_preset_task="prompt_identity_preset_smoke"
 prompt_identity_direct_task="prompt_identity_direct_smoke"
 output_envelope_task="output_envelope_safety_demo"
@@ -299,6 +300,7 @@ cleanup_task "row_customscan_demo"
 cleanup_task "row_triage_policy_demo"
 cleanup_task "$numeric_triage_task"
 cleanup_task "$pair_strip_task"
+cleanup_task "$skip_abstain_task"
 cleanup_task "$prompt_identity_preset_task"
 cleanup_task "$prompt_identity_direct_task"
 cleanup_task "$output_envelope_task"
@@ -3087,6 +3089,7 @@ echo "row_triage_policy_contract=$row_triage_policy_contract"
 }
 row_triage_preset_contract="$(psql_value "
 SELECT COALESCE(t.decision_contract ->> 'preset', '') || '|' ||
+       ((t.decision_contract ->> 'preset_contract_hash') ~ '^[0-9a-f]{32}$')::text || '|' ||
        COALESCE(p.accept_field_checks ->> 'answer_field', '') || '|' ||
        (p.accept_field_checks -> 'abstain_values' ? 'unclear')::text || '|' ||
        (p.accept_field_checks -> 'accepted_confidence' ? 'medium')::text
@@ -3095,8 +3098,49 @@ JOIN otlet.model_selection_policies p ON p.task_name = t.name
 WHERE t.name = '$row_triage_policy_task';
 ")"
 echo "row_triage_preset_contract=$row_triage_preset_contract"
-[ "$row_triage_preset_contract" = "row_triage_decision_v1|decision|true|true" ] || {
+[ "$row_triage_preset_contract" = "row_triage_decision_v1|true|decision|true|true" ] || {
   echo "Expected triage preset to drive selection policy labels, got $row_triage_preset_contract" >&2
+  exit 1
+}
+row_triage_preset_trace_contract="$(psql_value "
+SELECT COALESCE(s.decision_preset_name, '') || '|' ||
+       (s.decision_preset_contract_hash = t.decision_contract ->> 'preset_contract_hash')::text || '|' ||
+       (s.decision_preset_contract_hash = md5(otlet.semantic_canonical_jsonb(p.decision_contract)::text))::text
+FROM otlet.inference_receipt_trace_status s
+JOIN otlet.tasks t ON t.name = s.task_name
+JOIN otlet.decision_rule_presets p ON p.name = s.decision_preset_name
+WHERE s.task_name = '$row_triage_policy_task'
+  AND s.selection_role = 'strong'
+  AND s.selection_status = 'accepted'
+ORDER BY s.receipt_id DESC
+LIMIT 1;
+")"
+echo "row_triage_preset_trace_contract=$row_triage_preset_trace_contract"
+[ "$row_triage_preset_trace_contract" = "row_triage_decision_v1|true|true" ] || {
+  echo "Expected receipt trace status to expose row triage preset provenance, got $row_triage_preset_trace_contract" >&2
+  exit 1
+}
+preset_immutability_contract="$(
+  psql_exec -qAt <<'SQL'
+DO $$
+BEGIN
+  UPDATE otlet.decision_rule_presets
+  SET decision_contract = decision_contract || '{"demo_edit":true}'::jsonb
+  WHERE name = 'row_triage_decision_v1';
+  RAISE EXCEPTION 'expected preset update to be rejected';
+EXCEPTION
+  WHEN OTHERS THEN
+    IF SQLERRM NOT LIKE 'otlet decision rule preset row_triage_decision_v1 is immutable%' THEN
+      RAISE;
+    END IF;
+END;
+$$;
+SELECT 'raised';
+SQL
+)"
+echo "preset_immutability_contract=$preset_immutability_contract"
+[ "$preset_immutability_contract" = "raised" ] || {
+  echo "Expected decision rule preset updates to be rejected, got $preset_immutability_contract" >&2
   exit 1
 }
 row_triage_abstention_contract="$(psql_value "
@@ -3123,6 +3167,53 @@ CROSS JOIN otlet.output_reliability_status;
 ")"
 echo "row_triage_abstention_contract=$row_triage_abstention_contract"
 require_regex "$row_triage_abstention_contract" '^[1-9][0-9]*\|[1-9][0-9]*$' "Expected nonzero abstention counters for the triage preset"
+
+psql_exec \
+  -v task_name="$skip_abstain_task" \
+  -v model_name="$strong_model_name" >/dev/null <<'SQL'
+SELECT otlet.create_task(
+  :'task_name',
+  $source$
+    SELECT 'skip-1'::text AS subject_id,
+           '{"row":{"note":"no evidence available"}}'::jsonb AS input
+  $source$::text,
+  'Return decision skip with confidence medium and no actions. Return JSON only.',
+  '{"type":"object","required":["decision","confidence"],"additionalProperties":false,"properties":{"decision":{"enum":["skip"]},"confidence":{"enum":["medium"]}}}'::jsonb,
+  :'model_name',
+  '{"max_tokens":64,"reasoning":"off","inference_cache":false}'::jsonb,
+  '{}'::jsonb,
+  '{"answer_field":"decision","abstain_values":["skip"],"confidence_field":"confidence","accepted_confidence":["high"]}'::jsonb
+);
+SELECT otlet.run_task(:'task_name');
+SQL
+wait_task_complete "$skip_abstain_task" 1 900 1
+skip_abstention_contract="$(psql_value "
+WITH task_abstentions AS (
+  SELECT count(*)::bigint AS abstained_outputs
+  FROM otlet.outputs o
+  JOIN otlet.jobs j ON j.id = o.job_id
+  JOIN otlet.tasks t ON t.name = j.task_name
+  CROSS JOIN LATERAL (
+    SELECT COALESCE(NULLIF(t.decision_contract ->> 'answer_field', ''), 'match') AS answer_field,
+           COALESCE(t.decision_contract -> 'abstain_values', '[]'::jsonb) AS abstain_values
+  ) contract
+  WHERE j.task_name = '$skip_abstain_task'
+    AND EXISTS (
+      SELECT 1
+      FROM jsonb_array_elements_text(contract.abstain_values) value(abstain_value)
+      WHERE o.output ->> contract.answer_field = value.abstain_value
+    )
+)
+SELECT task_abstentions.abstained_outputs::text || '|' ||
+       (output_reliability_status.abstained_outputs >= task_abstentions.abstained_outputs)::text
+FROM task_abstentions
+CROSS JOIN otlet.output_reliability_status;
+")"
+echo "skip_abstention_contract=$skip_abstention_contract"
+[ "$skip_abstention_contract" = "1|true" ] || {
+  echo "Expected non-default skip abstention vocabulary to count, got $skip_abstention_contract" >&2
+  exit 1
+}
 
 psql_exec \
   -v task_name="$row_triage_policy_task" \

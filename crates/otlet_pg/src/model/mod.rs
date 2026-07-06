@@ -160,6 +160,8 @@ struct RunContext {
     runtime_options_status: Value,
     model_fingerprint_hash: String,
     decision_contract_hash: String,
+    decision_preset_name: String,
+    decision_preset_contract_hash: String,
     input_content_hash: String,
     prompt_prefix_hash: String,
     prompt_suffix_hash: String,
@@ -229,6 +231,18 @@ pub(crate) fn run_job(job: &Job) -> Result<ModelRun, ModelError> {
         runtime_options_status: runtime_option_status(&job.runtime_options),
         model_fingerprint_hash: hash_text(&model_fingerprint(job)),
         decision_contract_hash: hash_json(&job.decision_contract),
+        decision_preset_name: job
+            .decision_contract
+            .get("preset")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
+        decision_preset_contract_hash: job
+            .decision_contract
+            .get("preset_contract_hash")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
         input_content_hash,
         prompt_prefix_hash,
         prompt_suffix_hash,

@@ -68,6 +68,14 @@ fn generation_trace_summary(
             Value::String(context.decision_contract_hash.clone()),
         );
         object.insert(
+            "decision_preset_name".to_owned(),
+            Value::String(context.decision_preset_name.clone()),
+        );
+        object.insert(
+            "decision_preset_contract_hash".to_owned(),
+            Value::String(context.decision_preset_contract_hash.clone()),
+        );
+        object.insert(
             "schema_prompt".to_owned(),
             Value::String(context.schema_prompt.clone()),
         );

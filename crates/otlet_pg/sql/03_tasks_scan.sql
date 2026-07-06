@@ -15,6 +15,7 @@ DECLARE
   actual_decision_contract jsonb := COALESCE(create_task.decision_contract, '{}'::jsonb);
   preset_name text;
   preset_contract jsonb;
+  preset_contract_hash text;
   saved_task otlet.tasks%ROWTYPE;
 BEGIN
   IF jsonb_typeof(actual_input_shaping) IS DISTINCT FROM 'object' THEN
@@ -26,8 +27,10 @@ BEGIN
 
   preset_name := NULLIF(actual_decision_contract ->> 'preset', '');
   IF preset_name IS NOT NULL THEN
-    SELECT p.decision_contract
-    INTO preset_contract
+    SELECT
+      p.decision_contract,
+      md5(otlet.semantic_canonical_jsonb(p.decision_contract)::text)
+    INTO preset_contract, preset_contract_hash
     FROM otlet.decision_rule_presets p
     WHERE p.name = preset_name;
 
@@ -38,7 +41,10 @@ BEGIN
     actual_decision_contract :=
       preset_contract
       || (actual_decision_contract - 'preset')
-      || jsonb_build_object('preset', preset_name);
+      || jsonb_build_object(
+        'preset', preset_name,
+        'preset_contract_hash', preset_contract_hash
+      );
   END IF;
 
   INSERT INTO otlet.tasks (

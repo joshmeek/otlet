@@ -413,6 +413,8 @@ SELECT
   r.tokens_per_second,
   r.schema_validation_status,
   r.trace_summary ->> 'trace_version' AS trace_version,
+  NULLIF(r.trace_summary ->> 'decision_preset_name', '') AS decision_preset_name,
+  NULLIF(r.trace_summary ->> 'decision_preset_contract_hash', '') AS decision_preset_contract_hash,
   r.trace_summary -> 'runtime_options_status' AS runtime_options_status,
   r.trace_summary ->> 'executor_origin' AS executor_origin,
   r.trace_summary ->> 'executor_node' AS executor_node,
