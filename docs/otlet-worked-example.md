@@ -1077,6 +1077,15 @@ UPDATE 1
 
 The trigger does not rerun the model. It marks the previous derived fact stale so reads can fail closed or request refresh
 
+Plain `mark_stale` row watches treat INSERT as missing semantic state rather than stale semantic state. Exact planning shows the new row as unresolved until refresh or infer-now:
+
+```sql
+SELECT missing_subjects, queue_subjects, count_basis
+FROM otlet.semantic_index_plan('demo_semantic_vendor_idx', true);
+```
+
+Use `{"on_change":"mark_stale_and_enqueue"}` when inserts should enqueue immediately
+
 ## Build A Row Watch
 
 A row watch wraps a source table with an Otlet task, materialized records, stale tracking, trigger policy, and a native FDW table
@@ -1452,14 +1461,23 @@ FROM otlet.create_watch(
   candidate_query => $$
     SELECT
       a.id::text || ':' || b.id::text AS subject_id,
-      jsonb_build_object('left', to_jsonb(a), 'right', to_jsonb(b)) AS input
+      jsonb_build_object(
+        '_otlet_mvcc', jsonb_build_object(
+          'table', 'public.learning_entity',
+          'subject_id', a.id::text,
+          'right_id', b.id::text
+        ),
+        'left', to_jsonb(a),
+        'right', to_jsonb(b)
+      ) AS input
     FROM public.learning_entity a
     JOIN public.learning_entity b ON a.id < b.id
   $$,
   record_type => 'learning_entity_pair',
   runtime_options => '{"max_tokens":160,"reasoning":"off"}'::jsonb,
   trigger_policy => '{"on_change":"mark_stale"}'::jsonb,
-  max_candidate_rows => 10
+  max_candidate_rows => 10,
+  pair_sources => '[{"table":"public.learning_entity","subject_column":"id"}]'::jsonb
 );
 
 SELECT 'semantic_join_refresh_queued=' ||
@@ -1484,6 +1502,8 @@ semantic_join_create_contract=learning_entity_pair_idx|learning_entity_pair_idx_
 semantic_join_refresh_queued=1
 semantic_join_auto_materialized=1
 ```
+
+`pair_sources` installs the same stale trigger used by row indexes. Updates to declared source rows mark matching pair materializations through `_otlet_mvcc` dependencies, and `drop_watch` removes the trigger when no row index or pair watch still needs it
 
 Now inspect the join index:
 

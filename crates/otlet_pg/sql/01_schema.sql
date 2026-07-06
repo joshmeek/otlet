@@ -640,6 +640,7 @@ CREATE TABLE otlet.watches (
   source_table text,
   subject_column text,
   input_columns text[],
+  pair_sources jsonb NOT NULL DEFAULT '[]'::jsonb CHECK (jsonb_typeof(pair_sources) = 'array'),
   candidate_query text,
   output_schema jsonb NOT NULL CHECK (jsonb_typeof(output_schema) = 'object'),
   action_types text[] NOT NULL DEFAULT '{}'::text[],
@@ -658,7 +659,7 @@ CREATE TABLE otlet.watches (
   created_at timestamptz NOT NULL DEFAULT now(),
   updated_at timestamptz NOT NULL DEFAULT now(),
   CHECK (
-    (kind = 'row' AND semantic_index_name IS NOT NULL AND semantic_join_index_name IS NULL AND source_table IS NOT NULL AND subject_column IS NOT NULL AND candidate_query IS NULL)
+    (kind = 'row' AND semantic_index_name IS NOT NULL AND semantic_join_index_name IS NULL AND source_table IS NOT NULL AND subject_column IS NOT NULL AND pair_sources = '[]'::jsonb AND candidate_query IS NULL)
     OR
     (kind = 'pair' AND semantic_index_name IS NULL AND semantic_join_index_name IS NOT NULL AND source_table IS NULL AND subject_column IS NULL AND candidate_query IS NOT NULL)
   )
