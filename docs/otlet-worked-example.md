@@ -559,6 +559,8 @@ Semantic refresh jobs create typed `create_record` actions, `otlet.records` rows
 
 Semantic materializations keep two row identities. `source_hash` is MVCC-coupled provenance for the exact row version that produced a job. `content_hash` is the model-input identity used for freshness, excluding Otlet's MVCC envelope so benign row churn can revalidate without rerunning the model
 
+Input shaping fields are top-level in the task input. Row watches wrap source rows under `row`, so `evidence_fields` does not traverse `row.evidence`; project evidence to a top-level object in the input or pair candidate query. Pair watches treat the candidate query as the shaping declaration, with `strip_keys` available for top-level volatile fields
+
 ## Inspect Model Selection Attempts
 
 ```sql

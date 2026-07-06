@@ -24,6 +24,8 @@ row_triage_policy_watch="${OTLET_ROW_TRIAGE_POLICY_WATCH_NAME:-row_triage_policy
 row_triage_policy_task="${row_triage_policy_watch}_task"
 numeric_triage_watch="numeric_triage_demo"
 numeric_triage_task="${numeric_triage_watch}_task"
+pair_strip_watch="pair_strip_demo"
+pair_strip_task="${pair_strip_watch}_task"
 prompt_identity_preset_task="prompt_identity_preset_smoke"
 prompt_identity_direct_task="prompt_identity_direct_smoke"
 output_envelope_task="output_envelope_safety_demo"
@@ -277,12 +279,14 @@ psql_exec \
   -v row_customscan_watch="$row_customscan_watch" \
   -v row_triage_policy_watch="$row_triage_policy_watch" \
   -v numeric_triage_watch="$numeric_triage_watch" \
+  -v pair_strip_watch="$pair_strip_watch" \
   -v action_allowlist_watch="$action_allowlist_watch" >/dev/null <<'SQL'
 SELECT otlet.drop_watch(:'row_triage_watch');
 SELECT otlet.drop_watch(:'row_scoped_watch');
 SELECT otlet.drop_watch(:'row_customscan_watch');
 SELECT otlet.drop_watch(:'row_triage_policy_watch');
 SELECT otlet.drop_watch(:'numeric_triage_watch');
+SELECT otlet.drop_watch(:'pair_strip_watch');
 SELECT otlet.drop_watch(:'action_allowlist_watch');
 SELECT otlet.drop_watch(:'join_index_name');
 SELECT format('DROP FOREIGN TABLE IF EXISTS otlet.%I', :'join_foreign_table') \gexec
@@ -294,6 +298,7 @@ cleanup_task "row_scoped_demo"
 cleanup_task "row_customscan_demo"
 cleanup_task "row_triage_policy_demo"
 cleanup_task "$numeric_triage_task"
+cleanup_task "$pair_strip_task"
 cleanup_task "$prompt_identity_preset_task"
 cleanup_task "$prompt_identity_direct_task"
 cleanup_task "$output_envelope_task"
@@ -1609,6 +1614,114 @@ LIMIT 1;
 echo "input_shape_truncate_contract=$input_shape_truncate_contract"
 [ "$input_shape_truncate_contract" = "true|true|true|256|true" ] || {
   echo "Expected oversized shaped input truncation evidence, got $input_shape_truncate_contract" >&2
+  exit 1
+}
+
+input_shape_sql_contract="$(psql_value "
+WITH sample AS (
+  SELECT
+    '{\"_otlet_mvcc\":{\"xmin\":\"7\"},\"keep\":\"visible\",\"strip_me\":\"volatile\",\"left_id\":\"left-1\",\"candidate_evidence\":{\"shared\":[\"a\",\"b\"],\"warning\":\"manual check\",\"ignored\":false}}'::jsonb AS input,
+    '{\"strip_keys\":[\"strip_me\"],\"evidence_fields\":[\"candidate_evidence\"],\"action_id_fields\":{\"left_id\":\"left_id\"}}'::jsonb AS shaping
+), expected AS (
+  SELECT '{\"keep\":\"visible\",\"left_id\":\"left-1\",\"candidate_evidence\":{\"shared\":[\"a\",\"b\"],\"warning\":\"manual check\",\"ignored\":false},\"evidence_counts\":{\"shared\":2,\"warning\":1,\"ignored\":0},\"action_ids\":{\"left_id\":\"left-1\"}}'::jsonb AS shaped
+)
+SELECT (otlet.semantic_shaped_input(input, shaping) = expected.shaped)::text || '|' ||
+       (NOT (otlet.semantic_shaped_input(input, shaping) ? '_otlet_mvcc'))::text || '|' ||
+       (NOT (otlet.semantic_shaped_input(input, shaping) ? 'strip_me'))::text
+FROM sample, expected;
+")"
+echo "input_shape_sql_contract=$input_shape_sql_contract"
+[ "$input_shape_sql_contract" = "true|true|true" ] || {
+  echo "Expected SQL input shaping vector to match Rust semantics, got $input_shape_sql_contract" >&2
+  exit 1
+}
+
+log "Checking pair strip-key freshness"
+psql_exec \
+  -v watch_name="$pair_strip_watch" \
+  -v model_name="$strong_model_name" >/dev/null <<'SQL'
+DROP VIEW IF EXISTS public.otlet_demo_pair_strip_input;
+DROP TABLE IF EXISTS public.otlet_demo_pair_strip;
+CREATE TABLE public.otlet_demo_pair_strip (
+  id text PRIMARY KEY,
+  left_name text NOT NULL,
+  right_name text NOT NULL,
+  volatile_note text NOT NULL
+);
+INSERT INTO public.otlet_demo_pair_strip
+VALUES ('pair-strip-1', 'Northstar Logistics LLC', 'N-Star Freight Services', 'first volatile note');
+CREATE VIEW public.otlet_demo_pair_strip_input AS
+SELECT
+  id AS subject_id,
+  jsonb_build_object(
+    '_otlet_mvcc', jsonb_build_object(
+      'table', 'public.otlet_demo_pair_strip',
+      'subject_id', id
+    ),
+    'left_name', left_name,
+    'right_name', right_name,
+    'volatile_note', volatile_note
+  ) AS input
+FROM public.otlet_demo_pair_strip;
+
+SELECT otlet.create_watch(
+  watch_name => :'watch_name',
+  kind => 'pair',
+  instruction => 'Return status ok with confidence high and no actions. Return JSON only.',
+  output_schema => '{"type":"object","required":["status","confidence"],"additionalProperties":false,"properties":{"status":{"enum":["ok"]},"confidence":{"enum":["high"]}}}'::jsonb,
+  model_name => :'model_name',
+  candidate_query => $$
+    SELECT subject_id, input
+    FROM public.otlet_demo_pair_strip_input
+  $$,
+  record_type => 'pair_strip_result',
+  runtime_options => '{"max_tokens":64,"reasoning":"off","inference_cache":false}'::jsonb,
+  trigger_policy => '{"on_change":"mark_stale"}'::jsonb,
+  input_shaping => '{"strip_keys":["volatile_note"]}'::jsonb,
+  decision_contract => '{"answer_field":"status","abstain_values":[],"confidence_field":"confidence","accepted_confidence":["high"]}'::jsonb,
+  max_candidate_rows => 5
+);
+SELECT otlet.refresh_semantic_join_index(:'watch_name');
+SQL
+wait_task_complete "$pair_strip_task" 1 900 1
+pair_strip_receipts_before="$(psql_value "
+SELECT count(*)
+FROM otlet.inference_receipts r
+JOIN otlet.jobs j ON j.id = r.job_id
+WHERE j.task_name = '$pair_strip_task';
+")"
+psql_exec >/dev/null <<'SQL'
+UPDATE public.otlet_demo_pair_strip
+SET volatile_note = 'second volatile note'
+WHERE id = 'pair-strip-1';
+SQL
+pair_strip_contract="$(psql_value "
+WITH live AS (
+  SELECT input
+  FROM public.otlet_demo_pair_strip_input
+  WHERE subject_id = 'pair-strip-1'
+), materialized AS (
+  SELECT sm.source_hash
+  FROM otlet.semantic_materializations sm
+  WHERE sm.task_name = '$pair_strip_task'
+    AND sm.subject_id = 'pair-strip-1'
+  ORDER BY sm.updated_at DESC, sm.id DESC
+  LIMIT 1
+)
+SELECT (SELECT count(*) FROM otlet.semantic_join_index_current_rows('$pair_strip_watch', true))::text || '|' ||
+       (SELECT stale_subjects::text FROM otlet.semantic_join_index_plan('$pair_strip_watch', true)) || '|' ||
+       (SELECT (materialized.source_hash IS DISTINCT FROM md5(live.input::text))::text FROM materialized, live) || '|' ||
+       '$pair_strip_receipts_before' || '|' ||
+       (
+         SELECT count(*)::text
+         FROM otlet.inference_receipts r
+         JOIN otlet.jobs j ON j.id = r.job_id
+         WHERE j.task_name = '$pair_strip_task'
+       );
+")"
+echo "pair_strip_contract=$pair_strip_contract"
+[ "$pair_strip_contract" = "1|0|true|1|1" ] || {
+  echo "Expected pair strip-key update to stay fresh with unchanged receipts, got $pair_strip_contract" >&2
   exit 1
 }
 

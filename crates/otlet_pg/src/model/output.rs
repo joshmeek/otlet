@@ -116,6 +116,76 @@ fn declared_action_ids(input: &Value, shaping: &Value) -> Option<Value> {
     }
 }
 
+#[cfg(test)]
+mod input_shaping_tests {
+    use super::*;
+
+    fn sample_input() -> Value {
+        json!({
+            "_otlet_mvcc": {"xmin": "7"},
+            "keep": "visible",
+            "strip_me": "volatile",
+            "left_id": "left-1",
+            "candidate_evidence": {
+                "shared": ["a", "b"],
+                "warning": "manual check",
+                "ignored": false
+            }
+        })
+    }
+
+    fn sample_shaping() -> Value {
+        json!({
+            "strip_keys": ["strip_me"],
+            "evidence_fields": ["candidate_evidence"],
+            "action_id_fields": {"left_id": "left_id"}
+        })
+    }
+
+    #[test]
+    fn shape_model_input_matches_sql_vector() {
+        let shaped = shape_model_input(&sample_input(), &sample_shaping(), 0);
+
+        assert_eq!(
+            shaped.input,
+            json!({
+                "keep": "visible",
+                "left_id": "left-1",
+                "candidate_evidence": {
+                    "shared": ["a", "b"],
+                    "warning": "manual check",
+                    "ignored": false
+                },
+                "evidence_counts": {
+                    "shared": 2,
+                    "warning": 1,
+                    "ignored": 0
+                },
+                "action_ids": {"left_id": "left-1"}
+            })
+        );
+        assert!(shaped.applied);
+        assert!(!shaped.input_truncated);
+    }
+
+    #[test]
+    fn shape_model_input_truncates_to_abstention_envelope() {
+        let input = json!({"row": {"payload": "x".repeat(400)}});
+        let shaped = shape_model_input(&input, &json!({}), 80);
+
+        assert!(shaped.applied);
+        assert!(shaped.input_truncated);
+        assert_eq!(shaped.input["_otlet_input_truncated"], json!(true));
+        assert_eq!(
+            shaped.input["truncation_policy"],
+            json!("max_shaped_input_bytes_fail_toward_abstention")
+        );
+        assert_eq!(shaped.input["max_shaped_input_bytes"], json!(80));
+        assert!(shaped.original_bytes > 80);
+        assert!(shaped.bytes > 0);
+    }
+}
+
 fn effective_instruction(instruction: &str, decision_contract: &Value) -> String {
     let prefix = decision_contract
         .get("prompt_prefix")
