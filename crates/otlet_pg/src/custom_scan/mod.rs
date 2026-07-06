@@ -52,7 +52,7 @@ macro_rules! explain_scan_counters {
         );
         explain_counter("Child Plan Source Rows", source.child_plan_rows, $es);
         explain_counter("Estimated Model Cost Ms", $estimated_model_cost_ms, $es);
-        explain_counter("Actual Model Cost Ms", source.infer_now_ms, $es);
+        explain_counter("Actual Model Cost Ms", source.infer_trace_generate_ms, $es);
     }};
 }
 

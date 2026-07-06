@@ -366,10 +366,7 @@ fn validate_semantic_index_source(
                 .map_err(to_string)?
                 .unwrap_or(0)
                 .max(0) as u64,
-            lookup_decision_rows: 0,
-            wait_decision_rows: 0,
             infer_decision_rows: 0,
-            queue_decision_rows: 0,
             fail_closed_decision_rows: 0,
             model_ms: row
                 .get_by_name::<f64, _>("model_ms")
@@ -490,10 +487,7 @@ fn validate_semantic_join_index_source(
                 .map_err(to_string)?
                 .unwrap_or(0)
                 .max(0) as u64,
-            lookup_decision_rows: 0,
-            wait_decision_rows: 0,
             infer_decision_rows: 0,
-            queue_decision_rows: 0,
             fail_closed_decision_rows: 0,
             model_ms: row
                 .get_by_name::<f64, _>("model_ms")

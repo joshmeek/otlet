@@ -52,14 +52,17 @@ unsafe extern "C-unwind" fn explain_semantic_custom_scan(
                 runtime.semantic_states.len() as u64,
                 es,
             );
-            explain_counter(
-                "Preloaded Fresh Subjects",
-                runtime_preloaded_fresh_count(runtime),
+            explain_text(
+                "Preloaded Fresh Subjects / Basis",
+                &fresh_subject_basis_line(
+                    runtime_preloaded_fresh_count(runtime),
+                    &runtime.preloaded_freshness_basis,
+                ),
                 es,
             );
             explain_optional_text(
-                "Preloaded Freshness Basis",
-                nonempty_str(&runtime.preloaded_freshness_basis),
+                "Emitted Freshness Basis",
+                nonempty_str(&freshness_basis_counts_json(&runtime.emitted_freshness_basis)),
                 es,
             );
             explain_counter(
@@ -75,7 +78,10 @@ unsafe extern "C-unwind" fn explain_semantic_custom_scan(
             explain_scan_counters!(
                 runtime,
                 nonempty_str(&runtime.infer_now_last_error),
-                estimated_model_cost_ms(runtime.infer_ms, runtime.infer_max_rows),
+                estimated_model_cost_ms(
+                    runtime.planner_model_ms,
+                    runtime.planner_infer_decision_rows,
+                ),
                 es
             );
             explain_runtime_trace(runtime, es);
@@ -114,16 +120,20 @@ unsafe extern "C-unwind" fn explain_semantic_custom_scan(
             explain_pg_cstr("Task", (*state).task_name, es);
             explain_pg_cstr("Record Type", (*state).record_type, es);
             explain_counter("Known Semantic Subjects", (*state).known_subjects, es);
-            explain_counter(
-                "Preloaded Fresh Subjects",
-                (*state)
-                    .preloaded_fresh_matches
-                    .saturating_add((*state).preloaded_fresh_non_matches),
+            let preloaded_fresh = (*state)
+                .preloaded_fresh_matches
+                .saturating_add((*state).preloaded_fresh_non_matches);
+            explain_text(
+                "Preloaded Fresh Subjects / Basis",
+                &fresh_subject_basis_line(
+                    preloaded_fresh,
+                    pg_cstr_str((*state).preloaded_freshness_basis).unwrap_or(""),
+                ),
                 es,
             );
             explain_optional_text(
-                "Preloaded Freshness Basis",
-                pg_cstr_str((*state).preloaded_freshness_basis),
+                "Emitted Freshness Basis",
+                pg_cstr_str((*state).emitted_freshness_basis),
                 es,
             );
             explain_counter(
@@ -139,7 +149,7 @@ unsafe extern "C-unwind" fn explain_semantic_custom_scan(
             explain_scan_counters!(
                 &*state,
                 pg_cstr_str((*state).infer_now_last_error),
-                estimated_model_cost_ms(policy.infer_ms, policy.infer_max_rows),
+                estimated_model_cost_ms(private.model_ms, private.infer_decision_rows),
                 es
             );
             explain_state_trace(state, es);
@@ -258,6 +268,11 @@ fn runtime_state_count(runtime: &RuntimeState, state: SubjectSemanticState) -> u
         .values()
         .filter(|value| **value == state)
         .count() as u64
+}
+
+fn fresh_subject_basis_line(count: u64, basis: &str) -> String {
+    let basis = if basis.trim().is_empty() { "{}" } else { basis };
+    format!("{count} {basis}")
 }
 
 fn runtime_preloaded_fresh_count(runtime: &RuntimeState) -> u64 {

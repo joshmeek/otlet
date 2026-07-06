@@ -1264,7 +1264,7 @@ The SQL plan row, FDW EXPLAIN, and CustomScan EXPLAIN use the same terms for the
 | Model cost basis | `model_cost_source` | `Model Cost Source` | `Model Cost Source` | Usually `task_receipt`, `runtime_slot`, `model_receipt`, or `static_fallback` |
 | Stale reasons | `stale_reasons` | `Stale Reasons` | `Planner Stale Reasons` | JSON count by stale reason where stale subjects are counted |
 | Infer-now prediction | `infer_now_subjects`, `fail_closed_subjects` | `Infer Now Subjects`, `Fail Closed Subjects` | `Planner Infer Now Subjects`, `Planner Fail Closed Subjects` | CustomScan also reports actual executor counters |
-| Freshness basis | `semantic_index_current_rows.freshness_basis` | `freshness_basis` output column | `Preloaded Freshness Basis` | Surface-specific because it describes materialized row freshness, not only path choice |
+| Freshness basis | `semantic_index_current_rows.freshness_basis` | `freshness_basis` output column | `Preloaded Fresh Subjects / Basis`, `Emitted Freshness Basis` | Surface-specific because it describes materialized row freshness, not only path choice |
 
 Captured row-plan excerpt:
 
@@ -1292,8 +1292,8 @@ Planner Selected Path: semantic_lookup
 Planner Stale Reasons: {}
 Count Basis: exact
 Model Cost Source: task_receipt
-Preloaded Fresh Subjects: 3
-Preloaded Freshness Basis: {"mvcc_match": 3}
+Preloaded Fresh Subjects / Basis: 3 {"mvcc_match": 3}
+Emitted Freshness Basis: {"mvcc_match": 3}
 ```
 
 ## Use CustomScan For Source-Row Predicates
@@ -1318,12 +1318,14 @@ Custom Scan (Otlet Semantic Source CustomScan) on public.otlet_demo_semantic_ven
   Count Basis: exact
   Model Cost Source: task_receipt
   Planner Stale Reasons: {}
-  Preloaded Fresh Subjects: 3
-  Preloaded Freshness Basis: {"mvcc_match": 3}
+  Preloaded Fresh Subjects / Basis: 3 {"mvcc_match": 3}
+  Emitted Freshness Basis: {"mvcc_match": 3}
   Actual Fresh Subjects: 3
 ```
 
 The child scan reads the source table. Otlet strips the semantic predicate from the child plan and evaluates it against preloaded semantic state
+
+CustomScan uses statement preload semantics. Row-marked queries such as `FOR UPDATE` stay on the ordinary Postgres plan because the CustomScan planner path is blocked when rowmarks are present; locking and row recheck behavior remain owned by Postgres. For non-rowmark CustomScan, concurrent source changes are picked up by stale triggers and the next statement rather than by a per-tuple recheck inside the same scan
 
 ## Fail Closed On Stale Rows
 

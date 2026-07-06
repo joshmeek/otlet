@@ -8,6 +8,7 @@ struct CustomScanPrivate {
     reason: String,
     stale_reasons: String,
     model_cost_source: String,
+    model_ms: f64,
     count_basis: String,
     infer_decision_rows: u64,
     fail_closed_decision_rows: u64,
@@ -26,6 +27,7 @@ unsafe fn custom_private_from_predicate(predicate: &SemanticMatchPredicate) -> *
             "reason": &predicate.planner_stats.reason,
             "stale_reasons": &predicate.planner_stats.stale_reasons,
             "model_cost_source": &predicate.planner_stats.model_cost_source,
+            "model_ms": predicate.planner_stats.model_ms,
             "count_basis": &predicate.planner_stats.count_basis,
             "infer_decision_rows": predicate.planner_stats.infer_decision_rows,
             "fail_closed_decision_rows": predicate.planner_stats.fail_closed_decision_rows,
@@ -88,6 +90,10 @@ unsafe fn custom_private_from_list(private: *mut pg_sys::List) -> Option<CustomS
                 .and_then(Value::as_str)
                 .unwrap_or("static_fallback")
                 .to_string(),
+            model_ms: payload
+                .get("model_ms")
+                .and_then(Value::as_f64)
+                .unwrap_or(2500.0),
             count_basis: payload
                 .get("count_basis")
                 .and_then(Value::as_str)

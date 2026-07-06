@@ -133,6 +133,7 @@ fn load_semantic_states(
             .map_err(to_string)?;
         let mut subjects = HashMap::new();
         let mut freshness_basis_counts = BTreeMap::new();
+        let mut freshness_basis_by_subject = HashMap::new();
         for row in table {
             if let Some(subject_id) = row
                 .get_by_name::<String, _>("subject_id")
@@ -150,7 +151,10 @@ fn load_semantic_states(
                         .get_by_name::<String, _>("freshness_basis")
                         .map_err(to_string)?
                     {
-                        *freshness_basis_counts.entry(freshness_basis).or_insert(0) += 1;
+                        *freshness_basis_counts
+                            .entry(freshness_basis.clone())
+                            .or_insert(0) += 1;
+                        freshness_basis_by_subject.insert(subject_id.clone(), freshness_basis);
                     }
                     subjects.insert(subject_id, state);
                 }
@@ -161,6 +165,7 @@ fn load_semantic_states(
             task_name,
             record_type,
             freshness_basis_counts: freshness_basis_counts_json(&freshness_basis_counts),
+            freshness_basis_by_subject,
             subjects,
         })
     })
@@ -228,6 +233,7 @@ fn load_semantic_join_states(
             .map_err(to_string)?;
         let mut subjects = HashMap::new();
         let mut freshness_basis_counts = BTreeMap::new();
+        let mut freshness_basis_by_subject = HashMap::new();
         for row in table {
             if let Some(subject_id) = row
                 .get_by_name::<String, _>("subject_id")
@@ -245,7 +251,10 @@ fn load_semantic_join_states(
                         .get_by_name::<String, _>("freshness_basis")
                         .map_err(to_string)?
                     {
-                        *freshness_basis_counts.entry(freshness_basis).or_insert(0) += 1;
+                        *freshness_basis_counts
+                            .entry(freshness_basis.clone())
+                            .or_insert(0) += 1;
+                        freshness_basis_by_subject.insert(subject_id.clone(), freshness_basis);
                     }
                     subjects.insert(subject_id, state);
                 }
@@ -256,6 +265,7 @@ fn load_semantic_join_states(
             task_name,
             record_type,
             freshness_basis_counts: freshness_basis_counts_json(&freshness_basis_counts),
+            freshness_basis_by_subject,
             subjects,
         })
     })

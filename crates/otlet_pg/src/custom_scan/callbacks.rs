@@ -64,6 +64,7 @@ unsafe extern "C-unwind" fn begin_semantic_custom_scan(
         (*state).preloaded_fresh_non_matches =
             subject_state_count(&loaded_state.subjects, SubjectSemanticState::FreshNonMatch);
         (*state).preloaded_freshness_basis = pg_cstr(&loaded_state.freshness_basis_counts);
+        (*state).emitted_freshness_basis = pg_cstr("");
         (*state).preloaded_stale_subjects =
             subject_state_count(&loaded_state.subjects, SubjectSemanticState::Stale);
         (*state).preloaded_inflight_subjects =
@@ -81,6 +82,7 @@ unsafe extern "C-unwind" fn begin_semantic_custom_scan(
             planner_reason: private.reason,
             planner_stale_reasons: private.stale_reasons,
             planner_model_cost_source: private.model_cost_source,
+            planner_model_ms: private.model_ms,
             planner_count_basis: private.count_basis,
             planner_infer_decision_rows: private.infer_decision_rows,
             planner_fail_closed_decision_rows: private.fail_closed_decision_rows,
@@ -99,6 +101,8 @@ unsafe extern "C-unwind" fn begin_semantic_custom_scan(
             child_plan,
             owns_child_plan,
             semantic_states: loaded_state.subjects,
+            subject_freshness_basis: loaded_state.freshness_basis_by_subject,
+            emitted_freshness_basis: BTreeMap::new(),
             rows_seen: 0,
             rows_returned: 0,
             lookup_rows: 0,
@@ -188,6 +192,7 @@ unsafe extern "C-unwind" fn semantic_custom_scan_access(
                 SubjectSemanticState::FreshMatch => {
                     runtime.fresh_matches += 1;
                     runtime.lookup_rows += 1;
+                    record_emitted_freshness_basis(runtime, &subject_id);
                     runtime.rows_returned += 1;
                     return slot;
                 }
@@ -245,6 +250,7 @@ unsafe fn resolve_stale_or_missing_subject(
             SemanticResolution::Unresolved
         }) {
             SemanticResolution::Match => {
+                record_emitted_freshness_basis(runtime, subject_id);
                 runtime.rows_returned += 1;
                 return Some(slot);
             }
@@ -256,6 +262,7 @@ unsafe fn resolve_stale_or_missing_subject(
             SemanticResolution::Match => {
                 runtime.infer_resolved_rows += 1;
                 runtime.infer_returned_rows += 1;
+                record_emitted_freshness_basis(runtime, subject_id);
                 runtime.rows_returned += 1;
                 Some(slot)
             }
@@ -282,6 +289,7 @@ fn resolve_inflight_subject(
         SemanticResolution::Unresolved
     }) {
         SemanticResolution::Match => {
+            record_emitted_freshness_basis(runtime, subject_id);
             runtime.rows_returned += 1;
             Some(slot)
         }
@@ -407,6 +415,7 @@ unsafe extern "C-unwind" fn rescan_semantic_custom_scan(node: *mut pg_sys::Custo
             runtime.infer_trace_detailed_captured_tokens = 0;
             runtime.infer_trace_detailed_top_k = 0;
             runtime.child_plan_rows = 0;
+            runtime.emitted_freshness_basis.clear();
             runtime.queued_refresh_subjects.clear();
             runtime.pending_output_rows.clear();
             if !runtime.child_plan.is_null() {

@@ -120,6 +120,7 @@ unsafe fn prefetch_infer_now_batch(
             SubjectSemanticState::FreshMatch => {
                 runtime.fresh_matches = runtime.fresh_matches.saturating_add(1);
                 runtime.lookup_rows = runtime.lookup_rows.saturating_add(1);
+                record_emitted_freshness_basis(runtime, &subject_id);
                 rows.push(PrefetchedRow::Ready(unsafe { copy_slot_buffer(slot)? }));
             }
             SubjectSemanticState::FreshNonMatch => {
@@ -209,6 +210,7 @@ fn resolve_prefetched_rows(runtime: &mut RuntimeState, rows: Vec<PrefetchedRow>)
                     Ok(SemanticResolution::Match) => {
                         runtime.infer_resolved_rows = runtime.infer_resolved_rows.saturating_add(1);
                         runtime.infer_returned_rows = runtime.infer_returned_rows.saturating_add(1);
+                        record_emitted_freshness_basis(runtime, &pending.subject_id);
                         runtime.pending_output_rows.push_back(pending.slot);
                     }
                     Ok(SemanticResolution::NonMatch) => {

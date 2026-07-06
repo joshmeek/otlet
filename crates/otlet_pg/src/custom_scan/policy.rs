@@ -93,8 +93,11 @@ unsafe fn source_tuple_provider_from_state(
     }
 }
 
-fn estimated_model_cost_ms(infer_ms: u32, infer_max_rows: u32) -> u64 {
-    (infer_ms as u64).saturating_mul(infer_max_rows as u64)
+fn estimated_model_cost_ms(model_ms: f64, infer_subjects: u64) -> u64 {
+    if !model_ms.is_finite() || model_ms <= 0.0 {
+        return 0;
+    }
+    (model_ms * infer_subjects as f64).round().max(0.0) as u64
 }
 
 fn with_latest_snapshot<T>(f: impl FnOnce() -> T) -> T {
