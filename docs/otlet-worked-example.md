@@ -315,6 +315,32 @@ The task has seven parts:
 
 The schema separates model judgment from database state Otlet stores
 
+Decision-rule presets are immutable. Edit behavior by creating a new preset name, not by rewriting the shipped preset row:
+
+```sql
+DO $$
+BEGIN
+  UPDATE otlet.decision_rule_presets
+  SET decision_contract = decision_contract || '{"demo_edit":true}'::jsonb
+  WHERE name = 'row_triage_decision_v1';
+  RAISE EXCEPTION 'expected preset update to be rejected';
+EXCEPTION
+  WHEN OTHERS THEN
+    IF SQLERRM NOT LIKE 'otlet decision rule preset row_triage_decision_v1 is immutable%' THEN
+      RAISE;
+    END IF;
+END;
+$$;
+
+SELECT 'preset_immutability_contract=raised' AS preset_immutability_contract;
+```
+
+Representative output:
+
+```text
+preset_immutability_contract=raised
+```
+
 If the model returns malformed JSON, missing fields, unknown fields, or values outside the enum, Otlet marks the job failed and keeps the raw evidence. Otlet stores no trusted output or records
 
 ## Enqueue The Jobs
@@ -1621,9 +1647,28 @@ The production policy row and status views are ordinary SQL state under `otlet`:
 
 Queue caps are admission-time controls. Rows should enter `otlet.jobs` through `run_task`, watch refresh, semantic refresh, or `ask`; direct inserts are internal/testing-only and can bypass admission accounting. `verify_invariants()` reports `queued_jobs_within_model_cap` if the current queued depth for any model exceeds `max_queued_jobs_per_model`
 
-Suppressed queue-admission events are debounced per task and reason for one minute, so a full queue stays visible without flooding `worker_events`. `production_status` also exposes `semantic_materialization_failed_events` and `semantic_materialization_last_failed_at`. Nonzero `max_worker_rss_bytes` budgets require Linux process-status RSS sampling; unsupported builds reject the option during runtime-option validation instead of letting jobs fail later
+Suppressed queue-admission events are debounced per task and reason for one minute, so a full queue stays visible without flooding `worker_events`. `production_status` also exposes `semantic_materialization_failed_events` and `semantic_materialization_last_failed_at`. Nonzero `max_worker_rss_bytes` budgets require Linux process-status RSS sampling; unsupported builds reject the option during runtime-option validation instead of letting jobs fail later. Cleanup can prune old failed/canceled jobs only when outputs, actions, eval labels, and receipt references no longer keep them alive
 
 The resident worker currently attaches to the `postgres` database. Multi-database worker registration needs separate shared-memory and latch routing work before it is a supported deployment shape
+
+Native llama.cpp faults happen below Rust's normal error boundary. Otlet's containment contract is Postgres worker restart plus lease recovery: no partial model output is trusted, and `otlet.sweep_expired_jobs()` fails expired running jobs that reached the attempt limit with a receipt. The full demo also scans container logs and prints `docker_crash_log_scan=ok` when no worker crash, panic, assertion, or terminated server process appears during the run
+
+```sql
+SELECT otlet.sweep_expired_jobs();
+
+SELECT j.status, j.error, r.status AS receipt_status, r.selection_reason
+FROM otlet.jobs j
+JOIN otlet.inference_receipts r ON r.job_id = j.id
+WHERE r.selection_reason = 'job_lease_expired_after_max_attempts'
+ORDER BY r.id DESC
+LIMIT 1;
+```
+
+Representative targeted smoke output:
+
+```text
+ffi_sweep_safety_contract=1|failed|job lease expired after max attempts|failed|failed|job_lease_expired_after_max_attempts
+```
 
 Representative output from the demo contract:
 
@@ -1632,7 +1677,7 @@ production_policy_contract=default|refresh_then_fail_closed|3|8
 production_status_contract=true|true|true|true
 model_queue_status_contract=queue_accepting|0|0
 throughput_status_contract=queue_accepting|0|0|4|4|0
-cleanup_policy_dry_run=0|0|0|0|0|0|true
+cleanup_policy_dry_run=0|0|0|0|0|0|0|true
 ```
 
 ## Know The Remaining Production Boundaries
@@ -1685,7 +1730,7 @@ Your application owns these production boundaries:
 
 - create app roles that expose only the views and functions you want
 - add RLS or schema isolation if multiple tenants share the database
-- schedule `otlet.cleanup_policy_state(false)` if your deployment wants periodic worker-event, trace, stale materialization, and rejected raw-output pruning
+- schedule `otlet.cleanup_policy_state(false)` if your deployment wants periodic worker-event, trace, stale materialization, rejected raw-output, and unreferenced failed/canceled job pruning
 - expose `otlet.approve_action`, `otlet.reject_action`, `otlet.dry_run_action`, and `otlet.apply_action` only to roles that can operate actions
 - allow only the action types your application can safely interpret
 

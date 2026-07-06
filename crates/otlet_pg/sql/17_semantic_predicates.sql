@@ -127,6 +127,12 @@ BEGIN
 END;
 $$;
 
+COMMENT ON FUNCTION otlet.semantic_matches_auto(text, text, jsonb)
+IS 'CustomScan hook anchor; intentionally delegates to semantic_matches without duplicating policy';
+
+COMMENT ON FUNCTION otlet.semantic_join_matches_auto(text, text, jsonb)
+IS 'CustomScan hook anchor; intentionally delegates to semantic_join_matches without duplicating policy';
+
 ALTER FUNCTION otlet.semantic_join_matches(text, text, jsonb) VOLATILE PARALLEL RESTRICTED;
 ALTER FUNCTION otlet.semantic_join_matches_auto(text, text, jsonb) VOLATILE PARALLEL RESTRICTED;
 

@@ -3364,7 +3364,7 @@ SQL
 wait_task_complete "$row_customscan_task" 4 900 1
 psql_exec >/dev/null <<'SQL'
 UPDATE public.otlet_demo_customscan_signal
-SET signal = 'flag';
+SET signal = 'manual-review';
 
 UPDATE otlet.production_policy
 SET stale_policy = 'lookup_only_fail_closed',
@@ -3373,14 +3373,6 @@ SET stale_policy = 'lookup_only_fail_closed',
     semantic_auto_max_rows = 1
 WHERE name = 'default';
 SQL
-row_customscan_infer_plan="$(
-  psql_exec -P border=2 -P null='' <<SQL
-EXPLAIN (ANALYZE, VERBOSE, COSTS, SUMMARY OFF, TIMING OFF)
-SELECT id
-FROM public.otlet_demo_customscan_signal
-WHERE otlet.semantic_matches_auto('$row_customscan_watch', id, '{}'::jsonb);
-SQL
-)"
 row_customscan_sql_plan_contract="$(psql_value "
 SELECT selected_path || '|' ||
        infer_now_subjects::text || '|' ||
@@ -3389,6 +3381,14 @@ SELECT selected_path || '|' ||
        count_basis
 FROM otlet.semantic_index_plan('$row_customscan_watch', true);
 ")"
+row_customscan_infer_plan="$(
+  psql_exec -P border=2 -P null='' <<SQL
+EXPLAIN (ANALYZE, VERBOSE, COSTS, SUMMARY OFF, TIMING OFF)
+SELECT id
+FROM public.otlet_demo_customscan_signal
+WHERE otlet.semantic_matches_auto('$row_customscan_watch', id, '{}'::jsonb);
+SQL
+)"
 psql_exec >/dev/null <<'SQL'
 UPDATE otlet.production_policy
 SET stale_policy = 'refresh_then_fail_closed',
@@ -4908,11 +4908,12 @@ SELECT worker_events::text || '|' ||
        eval_labels::text || '|' ||
        delete_stale_materializations::text || '|' ||
        rejected_receipt_raw_outputs::text || '|' ||
+       failed_canceled_jobs::text || '|' ||
        dry_run::text
 FROM otlet.cleanup_policy_state(true);
 ")"
 echo "cleanup_policy_dry_run=$cleanup_dry_run"
-require_regex "$cleanup_dry_run" '^[0-9]+\|[0-9]+\|[0-9]+\|[0-9]+\|[0-9]+\|[0-9]+\|true$' "Expected cleanup dry run counts ending in true"
+require_regex "$cleanup_dry_run" '^[0-9]+\|[0-9]+\|[0-9]+\|[0-9]+\|[0-9]+\|[0-9]+\|[0-9]+\|true$' "Expected cleanup dry run counts ending in true"
 
 runtime_contract="$(psql_value "
 SELECT runtime_status || '|' ||

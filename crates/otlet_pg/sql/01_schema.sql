@@ -19,6 +19,7 @@ CREATE TABLE otlet.production_policy (
   eval_label_retention interval NOT NULL DEFAULT interval '90 days',
   delete_stale_materialization_retention interval NOT NULL DEFAULT interval '30 days',
   rejected_receipt_raw_output_retention interval NOT NULL DEFAULT interval '7 days',
+  failed_job_retention interval NOT NULL DEFAULT interval '30 days',
   CHECK (name = 'default'),
   CHECK (stale_policy IN (
     'lookup_only_fail_closed',
@@ -36,7 +37,8 @@ CREATE TABLE otlet.production_policy (
   CHECK (job_lease_interval <= interval '1 hour'),
   CHECK (eval_label_retention >= interval '1 day'),
   CHECK (delete_stale_materialization_retention >= interval '1 day'),
-  CHECK (rejected_receipt_raw_output_retention >= interval '1 day')
+  CHECK (rejected_receipt_raw_output_retention >= interval '1 day'),
+  CHECK (failed_job_retention >= interval '1 day')
 );
 
 INSERT INTO otlet.production_policy (name)
@@ -337,11 +339,18 @@ CREATE TABLE otlet.tasks (
   created_at timestamptz NOT NULL DEFAULT now()
 );
 
+CREATE FUNCTION otlet.default_accept_field_checks() RETURNS jsonb
+LANGUAGE sql
+IMMUTABLE
+AS $$
+  SELECT '{"answer_field":"match","abstain_values":["unclear"],"confidence_field":"confidence","accepted_confidence":["high"]}'::jsonb;
+$$;
+
 CREATE TABLE otlet.model_selection_policies (
   task_name text PRIMARY KEY REFERENCES otlet.tasks(name) ON DELETE CASCADE,
   cheap_model_name text NOT NULL REFERENCES otlet.models(name),
   strong_model_name text NOT NULL REFERENCES otlet.models(name),
-  accept_field_checks jsonb NOT NULL DEFAULT '{"answer_field":"match","abstain_values":["unclear"],"confidence_field":"confidence","accepted_confidence":["high"]}'::jsonb CHECK (jsonb_typeof(accept_field_checks) = 'object'),
+  accept_field_checks jsonb NOT NULL DEFAULT otlet.default_accept_field_checks() CHECK (jsonb_typeof(accept_field_checks) = 'object'),
   cheap_skip_window integer NOT NULL DEFAULT 0,
   cheap_min_recent_acceptance double precision NOT NULL DEFAULT 0,
   cheap_probe_interval integer NOT NULL DEFAULT 10,

@@ -135,20 +135,99 @@ STABLE
 STRICT
 COST 1000
 AS $$
+DECLARE
+  index_row otlet.semantic_join_indexes%ROWTYPE;
+  current_contract_hash text;
+  current_input_shaping jsonb := '{}'::jsonb;
+  current_input jsonb;
+  current_source_hash text;
+  current_content_hash text;
 BEGIN
-  IF NOT EXISTS (
-    SELECT 1
-    FROM otlet.semantic_join_indexes sji
-    WHERE sji.name = semantic_join_matches.index_name
-  ) THEN
+  SELECT *
+  INTO index_row
+  FROM otlet.semantic_join_indexes sji
+  WHERE sji.name = semantic_join_matches.index_name;
+
+  IF NOT FOUND THEN
     RAISE EXCEPTION 'otlet semantic join index % does not exist', semantic_join_matches.index_name;
   END IF;
 
+  SELECT
+    otlet.task_contract_hash(
+      t.instruction,
+      t.output_schema,
+      t.model_name,
+      t.runtime_options,
+      t.input_shaping,
+      t.decision_contract
+    ),
+    t.input_shaping
+  INTO current_contract_hash, current_input_shaping
+  FROM otlet.tasks t
+  WHERE t.name = index_row.task_name;
+
+  EXECUTE format(
+    $sql$
+      SELECT input
+      FROM (
+        SELECT subject_id::text AS subject_id, input::jsonb AS input
+        FROM (%s) otlet_join_candidate
+      ) otlet_join_input
+      WHERE subject_id = $1
+      ORDER BY subject_id
+      LIMIT 1
+    $sql$,
+    index_row.candidate_query
+  )
+  INTO current_input
+  USING semantic_join_matches.subject_id;
+
+  IF current_input IS NULL THEN
+    RETURN false;
+  END IF;
+
+  current_source_hash := md5(current_input::text);
+  current_content_hash := otlet.semantic_content_hash(current_input, current_input_shaping);
+
   RETURN EXISTS (
     SELECT 1
-    FROM otlet.semantic_join_index_current_rows(index_name, true) lookup
-    WHERE lookup.subject_id = semantic_join_matches.subject_id
-      AND lookup.body @> semantic_join_matches.expected
+    FROM (
+      SELECT DISTINCT ON (sm.subject_id)
+        sm.subject_id,
+        sm.body,
+        sm.source_hash,
+        sm.content_hash,
+        sm.contract_hash,
+        sm.stale,
+        sm.stale_reason,
+        sm.freshness_basis,
+        sm.updated_at,
+        sm.id
+      FROM otlet.semantic_materializations sm
+      WHERE sm.task_name = index_row.task_name
+        AND sm.record_type = index_row.record_type
+        AND sm.subject_id = semantic_join_matches.subject_id
+      ORDER BY
+        sm.subject_id,
+        (
+          sm.content_hash IS NOT DISTINCT FROM current_content_hash
+          AND sm.contract_hash IS NOT DISTINCT FROM current_contract_hash
+        ) DESC,
+        sm.updated_at DESC,
+        sm.id DESC
+    ) latest
+    CROSS JOIN LATERAL otlet.semantic_freshness_status(
+      latest.content_hash,
+      latest.contract_hash,
+      latest.stale,
+      latest.stale_reason,
+      latest.source_hash,
+      current_content_hash,
+      current_contract_hash,
+      current_source_hash
+    ) status
+    WHERE status.is_fresh
+      AND latest.body @> semantic_join_matches.expected
   );
 END;
 $$;

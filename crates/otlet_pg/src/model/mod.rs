@@ -186,7 +186,6 @@ struct RunContext {
     input_shaping_applied: bool,
     schema_prompt: String,
     decode_constraint: String,
-    grammar_supported: bool,
     decode_constraint_reason: String,
 }
 
@@ -267,7 +266,6 @@ pub(crate) fn run_job(job: &Job) -> Result<ModelRun, ModelError> {
         input_shaping_applied: shaped_input.applied,
         schema_prompt: options.schema_prompt.clone(),
         decode_constraint: decode_constraint_name(&options, &job.output_schema).to_owned(),
-        grammar_supported: decode_constraint_has_enum_mask(&options, &job.output_schema),
         decode_constraint_reason: decode_constraint_reason(&options, &job.output_schema).to_owned(),
     };
     let content_cache_key = inference_cache_content_key(job, &context);
@@ -672,7 +670,6 @@ const PROBABILITY_TRACE_MAX_TOKENS: i64 = 64;
 const DETAILED_TRACE_CONTRACT: &str = "receipt_trace_v2_bounded_token_steps";
 const DETAILED_TRACE_STORAGE_POLICY: &str =
     "off_by_default_bounded_jsonb_in_receipt_no_unbounded_prompt_or_logit_blob_cache";
-const LINKED_CANCELLATION_CHECK_INTERVAL_TOKENS: i64 = 1;
 const LINKED_CANCELLATION_POLICY: &str =
     "cooperative_before_prompt_decode_after_prompt_decode_and_each_generated_token";
 const LINKED_PROMPT_DECODE_CANCELLATION_BOUNDARY: &str =

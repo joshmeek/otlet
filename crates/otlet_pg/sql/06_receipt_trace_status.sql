@@ -626,7 +626,6 @@ SELECT
     ELSE NULL
   END AS json_logit_mask_enum_candidates_rejected,
   r.trace_summary ->> 'decode_constraint' AS decode_constraint,
-  COALESCE(r.trace_summary ->> 'grammar_supported', 'false')::boolean AS grammar_supported,
   r.trace_summary ->> 'decode_constraint_reason' AS decode_constraint_reason,
   r.trace_summary ->> 'output_schema_hash' AS trace_output_schema_hash,
   r.output_schema_hash AS receipt_output_schema_hash,

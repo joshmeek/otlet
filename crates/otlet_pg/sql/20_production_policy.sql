@@ -17,7 +17,8 @@ SELECT
   p.trace_detail_retention,
   p.eval_label_retention,
   p.delete_stale_materialization_retention,
-  p.rejected_receipt_raw_output_retention
+  p.rejected_receipt_raw_output_retention,
+  p.failed_job_retention
 FROM otlet.production_policy p;
 
 CREATE VIEW otlet.model_queue_status AS
@@ -760,6 +761,7 @@ CREATE FUNCTION otlet.cleanup_policy_state(
   eval_labels bigint,
   delete_stale_materializations bigint,
   rejected_receipt_raw_outputs bigint,
+  failed_canceled_jobs bigint,
   dry_run boolean
 )
 LANGUAGE plpgsql
@@ -770,37 +772,104 @@ DECLARE
   eval_retention interval;
   delete_stale_retention interval;
   rejected_raw_output_retention interval;
+  failed_job_retention_interval interval;
   worker_count bigint := 0;
   token_count bigint := 0;
   alternative_count bigint := 0;
   eval_count bigint := 0;
   delete_stale_count bigint := 0;
   rejected_raw_output_count bigint := 0;
+  failed_canceled_job_count bigint := 0;
 BEGIN
   SELECT
     worker_event_retention,
     trace_detail_retention,
     eval_label_retention,
     delete_stale_materialization_retention,
-    rejected_receipt_raw_output_retention
+    rejected_receipt_raw_output_retention,
+    failed_job_retention
   INTO
     worker_retention,
     trace_retention,
     eval_retention,
     delete_stale_retention,
-    rejected_raw_output_retention
+    rejected_raw_output_retention,
+    failed_job_retention_interval
   FROM otlet.production_policy;
 
+  WITH job_candidates AS (
+    SELECT j.id
+    FROM otlet.jobs j
+    WHERE j.status IN ('failed', 'canceled')
+      AND COALESCE(j.finished_at, j.created_at) < now() - failed_job_retention_interval
+      AND NOT EXISTS (
+        SELECT 1
+        FROM otlet.outputs o
+        WHERE o.job_id = j.id
+      )
+      AND NOT EXISTS (
+        SELECT 1
+        FROM otlet.actions a
+        WHERE a.job_id = j.id
+      )
+      AND NOT EXISTS (
+        SELECT 1
+        FROM otlet.inference_receipts r
+        WHERE r.job_id = j.id
+          AND (
+            EXISTS (SELECT 1 FROM otlet.outputs o WHERE o.receipt_id = r.id)
+            OR EXISTS (SELECT 1 FROM otlet.actions a WHERE a.receipt_id = r.id)
+            OR EXISTS (SELECT 1 FROM otlet.eval_labels l WHERE l.receipt_id = r.id)
+          )
+      )
+  ),
+  event_candidates AS (
+    SELECT e.id
+    FROM otlet.worker_events e
+    WHERE (
+        e.created_at < now() - worker_retention
+        AND NOT EXISTS (
+          SELECT 1
+          FROM otlet.jobs j
+          WHERE j.id = e.job_id
+            AND j.status IN ('queued', 'running', 'cancel_requested')
+        )
+      )
+      OR e.job_id IN (SELECT id FROM job_candidates)
+  )
   SELECT count(*)
   INTO worker_count
-  FROM otlet.worker_events e
-  WHERE e.created_at < now() - worker_retention
-    AND NOT EXISTS (
-      SELECT 1
-      FROM otlet.jobs j
-      WHERE j.id = e.job_id
-        AND j.status IN ('queued', 'running', 'cancel_requested')
-    );
+  FROM event_candidates;
+
+  WITH job_candidates AS (
+    SELECT j.id
+    FROM otlet.jobs j
+    WHERE j.status IN ('failed', 'canceled')
+      AND COALESCE(j.finished_at, j.created_at) < now() - failed_job_retention_interval
+      AND NOT EXISTS (
+        SELECT 1
+        FROM otlet.outputs o
+        WHERE o.job_id = j.id
+      )
+      AND NOT EXISTS (
+        SELECT 1
+        FROM otlet.actions a
+        WHERE a.job_id = j.id
+      )
+      AND NOT EXISTS (
+        SELECT 1
+        FROM otlet.inference_receipts r
+        WHERE r.job_id = j.id
+          AND (
+            EXISTS (SELECT 1 FROM otlet.outputs o WHERE o.receipt_id = r.id)
+            OR EXISTS (SELECT 1 FROM otlet.actions a WHERE a.receipt_id = r.id)
+            OR EXISTS (SELECT 1 FROM otlet.eval_labels l WHERE l.receipt_id = r.id)
+          )
+      )
+  )
+  SELECT count(*)
+  INTO failed_canceled_job_count
+  FROM job_candidates;
 
   WITH candidates AS (
     SELECT r.trace_summary #> '{detailed_trace,steps}' AS steps
@@ -845,14 +914,139 @@ BEGIN
     AND r.finished_at < now() - rejected_raw_output_retention;
 
   IF NOT cleanup_policy_state.requested_dry_run THEN
+    WITH job_candidates AS (
+      SELECT j.id
+      FROM otlet.jobs j
+      WHERE j.status IN ('failed', 'canceled')
+        AND COALESCE(j.finished_at, j.created_at) < now() - failed_job_retention_interval
+        AND NOT EXISTS (
+          SELECT 1
+          FROM otlet.outputs o
+          WHERE o.job_id = j.id
+        )
+        AND NOT EXISTS (
+          SELECT 1
+          FROM otlet.actions a
+          WHERE a.job_id = j.id
+        )
+        AND NOT EXISTS (
+          SELECT 1
+          FROM otlet.inference_receipts r
+          WHERE r.job_id = j.id
+            AND (
+              EXISTS (SELECT 1 FROM otlet.outputs o WHERE o.receipt_id = r.id)
+              OR EXISTS (SELECT 1 FROM otlet.actions a WHERE a.receipt_id = r.id)
+              OR EXISTS (SELECT 1 FROM otlet.eval_labels l WHERE l.receipt_id = r.id)
+            )
+        )
+    ),
+    event_candidates AS (
+      SELECT e.id
+      FROM otlet.worker_events e
+      WHERE (
+          e.created_at < now() - worker_retention
+          AND NOT EXISTS (
+            SELECT 1
+            FROM otlet.jobs j
+            WHERE j.id = e.job_id
+              AND j.status IN ('queued', 'running', 'cancel_requested')
+          )
+        )
+        OR e.job_id IN (SELECT id FROM job_candidates)
+    )
     DELETE FROM otlet.worker_events e
-    WHERE e.created_at < now() - worker_retention
-      AND NOT EXISTS (
-        SELECT 1
-        FROM otlet.jobs j
-        WHERE j.id = e.job_id
-          AND j.status IN ('queued', 'running', 'cancel_requested')
-      );
+    USING event_candidates c
+    WHERE e.id = c.id;
+
+    WITH job_candidates AS (
+      SELECT j.id
+      FROM otlet.jobs j
+      WHERE j.status IN ('failed', 'canceled')
+        AND COALESCE(j.finished_at, j.created_at) < now() - failed_job_retention_interval
+        AND NOT EXISTS (
+          SELECT 1
+          FROM otlet.outputs o
+          WHERE o.job_id = j.id
+        )
+        AND NOT EXISTS (
+          SELECT 1
+          FROM otlet.actions a
+          WHERE a.job_id = j.id
+        )
+        AND NOT EXISTS (
+          SELECT 1
+          FROM otlet.inference_receipts r
+          WHERE r.job_id = j.id
+            AND (
+              EXISTS (SELECT 1 FROM otlet.outputs o WHERE o.receipt_id = r.id)
+              OR EXISTS (SELECT 1 FROM otlet.actions a WHERE a.receipt_id = r.id)
+              OR EXISTS (SELECT 1 FROM otlet.eval_labels l WHERE l.receipt_id = r.id)
+            )
+        )
+    )
+    DELETE FROM otlet.worker_events e
+    USING job_candidates c
+    WHERE e.job_id = c.id;
+
+    WITH job_candidates AS (
+      SELECT j.id
+      FROM otlet.jobs j
+      WHERE j.status IN ('failed', 'canceled')
+        AND COALESCE(j.finished_at, j.created_at) < now() - failed_job_retention_interval
+        AND NOT EXISTS (
+          SELECT 1
+          FROM otlet.outputs o
+          WHERE o.job_id = j.id
+        )
+        AND NOT EXISTS (
+          SELECT 1
+          FROM otlet.actions a
+          WHERE a.job_id = j.id
+        )
+        AND NOT EXISTS (
+          SELECT 1
+          FROM otlet.inference_receipts r
+          WHERE r.job_id = j.id
+            AND (
+              EXISTS (SELECT 1 FROM otlet.outputs o WHERE o.receipt_id = r.id)
+              OR EXISTS (SELECT 1 FROM otlet.actions a WHERE a.receipt_id = r.id)
+              OR EXISTS (SELECT 1 FROM otlet.eval_labels l WHERE l.receipt_id = r.id)
+            )
+        )
+    )
+    DELETE FROM otlet.inference_receipts r
+    USING job_candidates c
+    WHERE r.job_id = c.id;
+
+    WITH job_candidates AS (
+      SELECT j.id
+      FROM otlet.jobs j
+      WHERE j.status IN ('failed', 'canceled')
+        AND COALESCE(j.finished_at, j.created_at) < now() - failed_job_retention_interval
+        AND NOT EXISTS (
+          SELECT 1
+          FROM otlet.outputs o
+          WHERE o.job_id = j.id
+        )
+        AND NOT EXISTS (
+          SELECT 1
+          FROM otlet.actions a
+          WHERE a.job_id = j.id
+        )
+        AND NOT EXISTS (
+          SELECT 1
+          FROM otlet.inference_receipts r
+          WHERE r.job_id = j.id
+            AND (
+              EXISTS (SELECT 1 FROM otlet.outputs o WHERE o.receipt_id = r.id)
+              OR EXISTS (SELECT 1 FROM otlet.actions a WHERE a.receipt_id = r.id)
+              OR EXISTS (SELECT 1 FROM otlet.eval_labels l WHERE l.receipt_id = r.id)
+            )
+        )
+    )
+    DELETE FROM otlet.jobs j
+    USING job_candidates c
+    WHERE j.id = c.id;
 
     UPDATE otlet.inference_receipts r
     SET trace_summary = jsonb_set(
@@ -897,6 +1091,7 @@ BEGIN
     eval_count,
     delete_stale_count,
     rejected_raw_output_count,
+    failed_canceled_job_count,
     cleanup_policy_state.requested_dry_run;
 END;
 $$;

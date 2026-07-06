@@ -222,7 +222,7 @@ BEGIN
       'confidence_field', t.decision_contract ->> 'confidence_field',
       'accepted_confidence', t.decision_contract -> 'accepted_confidence'
     )), '{}'::jsonb),
-    '{"answer_field":"match","abstain_values":["unclear"],"confidence_field":"confidence","accepted_confidence":["high"]}'::jsonb
+    otlet.default_accept_field_checks()
   )
   INTO actual_accept_field_checks
   FROM otlet.tasks t

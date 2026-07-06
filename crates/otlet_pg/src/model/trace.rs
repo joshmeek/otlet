@@ -45,7 +45,6 @@ fn generation_trace_summary(
         "worker_handoff": "shared_memory_xact_commit_latch",
         "stale_policy": "fail_closed_no_silent_stale_results",
         "cancellation_check_policy": LINKED_CANCELLATION_POLICY,
-        "cancellation_check_interval_tokens": LINKED_CANCELLATION_CHECK_INTERVAL_TOKENS,
         "prompt_decode_cancellation_boundary": LINKED_PROMPT_DECODE_CANCELLATION_BOUNDARY,
         "probability_summary": metrics.probability_summary,
         "detailed_trace": metrics.detailed_trace
@@ -54,10 +53,6 @@ fn generation_trace_summary(
         object.insert(
             "decode_constraint".to_owned(),
             Value::String(context.decode_constraint.clone()),
-        );
-        object.insert(
-            "grammar_supported".to_owned(),
-            Value::Bool(context.grammar_supported),
         );
         object.insert(
             "decode_constraint_reason".to_owned(),

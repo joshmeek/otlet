@@ -62,8 +62,8 @@ pub(crate) fn parse_runtime_options(value: &Value) -> Result<RuntimeOptions, Str
         let reasoning = value
             .as_str()
             .ok_or("runtime_options.reasoning must be a string")?;
-        if !matches!(reasoning, "on" | "off" | "auto") {
-            return Err("runtime_options.reasoning must be on, off, or auto".to_owned());
+        if !matches!(reasoning, "on" | "off") {
+            return Err("runtime_options.reasoning must be on or off".to_owned());
         }
         options.reasoning = reasoning.to_owned();
     }
