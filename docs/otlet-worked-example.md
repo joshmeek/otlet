@@ -516,6 +516,8 @@ Representative output:
 (1 row)
 ```
 
+Eval label confidence is intentionally the same small vocabulary used by model outputs: `low`, `medium`, or `high`. Keep calibration notes in `reason` or task-specific fields rather than expanding `expected_confidence`
+
 Approve, dry-run, and apply one merge proposal:
 
 ```sql

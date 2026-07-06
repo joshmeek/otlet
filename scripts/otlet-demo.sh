@@ -24,6 +24,7 @@ row_triage_policy_watch="${OTLET_ROW_TRIAGE_POLICY_WATCH_NAME:-row_triage_policy
 row_triage_policy_task="${row_triage_policy_watch}_task"
 numeric_triage_watch="numeric_triage_demo"
 numeric_triage_task="${numeric_triage_watch}_task"
+no_abstain_eval_task="no_abstain_eval_demo"
 pair_strip_watch="pair_strip_demo"
 pair_strip_task="${pair_strip_watch}_task"
 skip_abstain_task="skip_abstain_vocab_demo"
@@ -300,6 +301,7 @@ cleanup_task "row_scoped_demo"
 cleanup_task "row_customscan_demo"
 cleanup_task "row_triage_policy_demo"
 cleanup_task "$numeric_triage_task"
+cleanup_task "$no_abstain_eval_task"
 cleanup_task "$pair_strip_task"
 cleanup_task "$skip_abstain_task"
 cleanup_task "$prompt_identity_preset_task"
@@ -2239,7 +2241,7 @@ echo "row_review_queue_contract=$row_review_queue_contract"
 psql_exec >/dev/null <<SQL
 SELECT * FROM otlet.correct_action(
   $row_triage_action_id,
-  '{"expected_answer":"pass","expected_confidence":"high","expected_action_type":"review_flag"}'::jsonb,
+  '{"decision":"pass","confidence":"high","action_type":"review_flag"}'::jsonb,
   'demo correction'
 );
 SQL
@@ -2366,6 +2368,132 @@ FROM status, exported;
 echo "numeric_triage_label_contract=$numeric_triage_label_contract"
 [ "$numeric_triage_label_contract" = "1|flag|flag|review_flag|positive" ] || {
   echo "Expected numeric triage label/export to round trip through non-ER action, got $numeric_triage_label_contract" >&2
+  exit 1
+}
+
+cleanup_task "$no_abstain_eval_task"
+no_abstain_eval_contract="$(
+  psql_exec -qAt -v task_name="$no_abstain_eval_task" -v model_name="$strong_model_name" <<'SQL'
+CREATE TEMP TABLE no_abstain_eval_result (
+  key text PRIMARY KEY,
+  value text NOT NULL
+);
+DO $$
+DECLARE
+  positive_job_id bigint;
+  alias_job_id bigint;
+  positive_action_id bigint;
+  alias_action_id bigint;
+BEGIN
+  PERFORM otlet.create_task(
+    :'task_name',
+    $source$
+      SELECT 'no-abstain-positive'::text AS subject_id,
+             '{"action_ids":{"left_id":"noab-left","right_id":"noab-right"}}'::jsonb AS input
+      UNION ALL
+      SELECT 'alias-match'::text AS subject_id,
+             '{"action_ids":{"left_id":"alias-left","right_id":"alias-right"}}'::jsonb AS input
+    $source$::text,
+    'Return JSON only.',
+    '{"type":"object","required":["match","confidence"],"additionalProperties":false,"properties":{"match":{"enum":["same_entity","different_entity"]},"confidence":{"enum":["high"]}}}'::jsonb,
+    :'model_name',
+    '{"max_tokens":32,"reasoning":"off","inference_cache":false}'::jsonb
+  );
+
+  INSERT INTO otlet.jobs (task_name, subject_id, input, status, attempts, started_at, leased_until)
+  VALUES (
+    :'task_name',
+    'no-abstain-positive',
+    '{"action_ids":{"left_id":"noab-left","right_id":"noab-right"}}'::jsonb,
+    'running',
+    1,
+    now(),
+    now() + interval '5 minutes'
+  )
+  RETURNING id INTO positive_job_id;
+
+  PERFORM otlet.complete_job(
+    positive_job_id,
+    '{"match":"same_entity","confidence":"high"}'::jsonb,
+    '{"output":{"match":"same_entity","confidence":"high"},"actions":[{"type":"merge_candidate","body":{"left_id":"noab-left","right_id":"noab-right","confidence":"high","reason":"same"}}]}',
+    '[{"type":"merge_candidate","body":{"left_id":"noab-left","right_id":"noab-right","confidence":"high","reason":"same"}}]'::jsonb,
+    NULL,
+    NULL,
+    NULL,
+    md5('{"output":{"match":"same_entity","confidence":"high"},"actions":[{"type":"merge_candidate","body":{"left_id":"noab-left","right_id":"noab-right","confidence":"high","reason":"same"}}]}'),
+    now(),
+    '{"schema_validation_status":"passed"}'::jsonb,
+    :'model_name'
+  );
+
+  INSERT INTO otlet.jobs (task_name, subject_id, input, status, attempts, started_at, leased_until)
+  VALUES (
+    :'task_name',
+    'alias-match',
+    '{"action_ids":{"left_id":"alias-left","right_id":"alias-right"}}'::jsonb,
+    'running',
+    1,
+    now(),
+    now() + interval '5 minutes'
+  )
+  RETURNING id INTO alias_job_id;
+
+  PERFORM otlet.complete_job(
+    alias_job_id,
+    '{"match":"same_entity","confidence":"high"}'::jsonb,
+    '{"output":{"match":"same_entity","confidence":"high"},"actions":[{"type":"merge_candidate","body":{"left_id":"alias-left","right_id":"alias-right","confidence":"high","reason":"same"}}]}',
+    '[{"type":"merge_candidate","body":{"left_id":"alias-left","right_id":"alias-right","confidence":"high","reason":"same"}}]'::jsonb,
+    NULL,
+    NULL,
+    NULL,
+    md5('{"output":{"match":"same_entity","confidence":"high"},"actions":[{"type":"merge_candidate","body":{"left_id":"alias-left","right_id":"alias-right","confidence":"high","reason":"same"}}]}'),
+    now(),
+    '{"schema_validation_status":"passed"}'::jsonb,
+    :'model_name'
+  );
+
+  SELECT a.id INTO positive_action_id
+  FROM otlet.actions a
+  WHERE a.job_id = positive_job_id
+  ORDER BY a.id DESC
+  LIMIT 1;
+  PERFORM otlet.approve_action(positive_action_id);
+  PERFORM otlet.label_action(positive_action_id, label_source => 'approved_action');
+
+  SELECT a.id INTO alias_action_id
+  FROM otlet.actions a
+  WHERE a.job_id = alias_job_id
+  ORDER BY a.id DESC
+  LIMIT 1;
+  PERFORM otlet.correct_action(
+    alias_action_id,
+    '{"match":"same_entity","confidence":"high","action_type":"merge_candidate"}'::jsonb,
+    'alias key smoke'
+  );
+
+  INSERT INTO no_abstain_eval_result
+  SELECT 'positive',
+         COALESCE(max(case_kind), '') || '|' || COALESCE(max(expected_answer), '')
+  FROM otlet.export_eval_cases(50)
+  WHERE action_id = positive_action_id;
+
+  INSERT INTO no_abstain_eval_result
+  SELECT 'alias',
+         COALESCE(max(label_source), '') || '|' ||
+         COALESCE(max(expected_answer), '') || '|' ||
+         COALESCE(max(expected_confidence), '') || '|' ||
+         COALESCE(max(expected_action_type), '')
+  FROM otlet.eval_label_status
+  WHERE action_id = alias_action_id;
+END;
+$$;
+SELECT (SELECT value FROM no_abstain_eval_result WHERE key = 'positive') || '|' ||
+       (SELECT value FROM no_abstain_eval_result WHERE key = 'alias');
+SQL
+)"
+echo "no_abstain_eval_contract=$no_abstain_eval_contract"
+[ "$no_abstain_eval_contract" = "positive|same_entity|manual_correction|same_entity|high|merge_candidate" ] || {
+  echo "Expected no-abstain eval export and match alias correction to work, got $no_abstain_eval_contract" >&2
   exit 1
 }
 
