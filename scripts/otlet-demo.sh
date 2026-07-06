@@ -1088,11 +1088,19 @@ WITH job_row AS (
 )
 SELECT (SELECT count(*) FROM otlet.outputs WHERE job_id = j.id)::text || '|' ||
        COALESCE((SELECT status || '|' || COALESCE(error, '') FROM otlet.actions WHERE job_id = j.id ORDER BY id DESC LIMIT 1), '') || '|' ||
-       (SELECT count(*) FROM otlet.records r JOIN otlet.actions a ON a.id = r.action_id WHERE a.job_id = j.id)::text
+       (SELECT count(*) FROM otlet.records r JOIN otlet.actions a ON a.id = r.action_id WHERE a.job_id = j.id)::text || '|' ||
+       COALESCE((
+         SELECT (r.raw_output = '{\"output\":{\"status\":\"ok\"},\"actions\":[{\"type\":\"invented_action\",\"body\":{\"subject_id\":\"hallucinated-action-1\",\"text\":\"no record\"}}]}' AND
+                 r.raw_output_hash = md5('{\"output\":{\"status\":\"ok\"},\"actions\":[{\"type\":\"invented_action\",\"body\":{\"subject_id\":\"hallucinated-action-1\",\"text\":\"no record\"}}]}'))::text
+         FROM otlet.inference_receipts r
+         WHERE r.job_id = j.id
+         ORDER BY r.id DESC
+         LIMIT 1
+       ), 'false')
 FROM job_row j;
 ")"
 echo "hallucinated_action_safety_contract=$hallucinated_action_contract"
-[ "$hallucinated_action_contract" = "1|rejected|unsupported action type|0" ] || {
+[ "$hallucinated_action_contract" = "1|rejected|unsupported action type|0|true" ] || {
   echo "Expected hallucinated action type to be rejected without a record, got $hallucinated_action_contract" >&2
   exit 1
 }
