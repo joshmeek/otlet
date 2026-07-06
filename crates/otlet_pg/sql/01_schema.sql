@@ -12,6 +12,7 @@ CREATE TABLE otlet.production_policy (
   semantic_auto_max_rows integer NOT NULL DEFAULT 1,
   worker_claim_batch_size integer NOT NULL DEFAULT 8,
   worker_claim_task_cursor text NOT NULL DEFAULT '',
+  selection_batch_two_pass boolean NOT NULL DEFAULT false,
   job_lease_interval interval NOT NULL DEFAULT interval '5 minutes',
   worker_event_retention interval NOT NULL DEFAULT interval '7 days',
   trace_detail_retention interval NOT NULL DEFAULT interval '7 days',

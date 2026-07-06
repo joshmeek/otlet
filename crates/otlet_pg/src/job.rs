@@ -20,6 +20,7 @@ pub(crate) struct Job {
     pub(crate) max_attempt_ms: i64,
 }
 
+#[derive(Clone)]
 pub(crate) struct JobModel {
     pub(crate) name: String,
     pub(crate) artifact_path: String,
@@ -28,6 +29,7 @@ pub(crate) struct JobModel {
     pub(crate) runtime_endpoint: String,
 }
 
+#[derive(Clone)]
 pub(crate) struct ModelSelectionPolicy {
     pub(crate) cheap: JobModel,
     pub(crate) strong: JobModel,

@@ -3931,6 +3931,181 @@ echo "model_swap_contract=$model_swap_contract"
   exit 1
 }
 
+selection_batch_single_task="selection_batch_single_pass_demo"
+selection_batch_two_pass_task="selection_batch_two_pass_demo"
+cleanup_task "$selection_batch_single_task"
+cleanup_task "$selection_batch_two_pass_task"
+psql_exec >/dev/null <<'SQL'
+UPDATE otlet.production_policy
+SET selection_batch_two_pass = false,
+    worker_claim_batch_size = 8,
+    job_lease_interval = interval '5 minutes'
+WHERE name = 'default';
+SQL
+
+psql_exec \
+  -v task_name="$selection_batch_single_task" \
+  -v cheap_model_name="$cheap_model_name" \
+  -v strong_model_name="$strong_model_name" >/dev/null <<'SQL'
+WITH params AS (
+  SELECT
+    'For every input row, output status ok, confidence high, and reason selection batch prefix reuse. Use no actions. Do not copy input fields. Return JSON only.'::text AS instruction,
+    $source$
+      SELECT 'selection-batch-' || i::text AS subject_id,
+             jsonb_build_object('row_id', i, 'signal', 'constant-selection-batch') AS input
+      FROM generate_series(1, 8) AS g(i)
+    $source$::text AS input_query,
+    '{
+      "type": "object",
+      "required": ["status", "confidence", "reason"],
+      "additionalProperties": false,
+      "properties": {
+        "status": {"enum": ["ok"]},
+        "confidence": {"enum": ["high"]},
+        "reason": {"type": "string", "maxLength": 96}
+      }
+    }'::jsonb AS schema
+)
+SELECT otlet.create_task(
+  :'task_name',
+  input_query,
+  instruction,
+  schema,
+  :'cheap_model_name',
+  '{"max_tokens":96,"reasoning":"off","inference_cache":false,"prefix_kv_reuse":true,"json_logit_mask":true}'::jsonb
+)
+FROM params;
+
+SELECT otlet.set_model_selection_policy(
+  :'task_name',
+  :'cheap_model_name',
+  :'strong_model_name',
+  '{"confidence_field":"batch_accept","accepted_confidence":["yes"]}'::jsonb
+);
+SELECT otlet.run_task(:'task_name');
+SQL
+wait_task_complete "$selection_batch_single_task" 8 1800 1
+
+psql_exec >/dev/null <<'SQL'
+UPDATE otlet.production_policy
+SET selection_batch_two_pass = true
+WHERE name = 'default';
+SQL
+
+psql_exec \
+  -v task_name="$selection_batch_two_pass_task" \
+  -v cheap_model_name="$cheap_model_name" \
+  -v strong_model_name="$strong_model_name" >/dev/null <<'SQL'
+WITH params AS (
+  SELECT
+    'For every input row, output status ok, confidence high, and reason selection batch prefix reuse. Use no actions. Do not copy input fields. Return JSON only.'::text AS instruction,
+    $source$
+      SELECT 'selection-batch-' || i::text AS subject_id,
+             jsonb_build_object('row_id', i, 'signal', 'constant-selection-batch') AS input
+      FROM generate_series(1, 8) AS g(i)
+    $source$::text AS input_query,
+    '{
+      "type": "object",
+      "required": ["status", "confidence", "reason"],
+      "additionalProperties": false,
+      "properties": {
+        "status": {"enum": ["ok"]},
+        "confidence": {"enum": ["high"]},
+        "reason": {"type": "string", "maxLength": 96}
+      }
+    }'::jsonb AS schema
+)
+SELECT otlet.create_task(
+  :'task_name',
+  input_query,
+  instruction,
+  schema,
+  :'cheap_model_name',
+  '{"max_tokens":96,"reasoning":"off","inference_cache":false,"prefix_kv_reuse":true,"json_logit_mask":true}'::jsonb
+)
+FROM params;
+
+SELECT otlet.set_model_selection_policy(
+  :'task_name',
+  :'cheap_model_name',
+  :'strong_model_name',
+  '{"confidence_field":"batch_accept","accepted_confidence":["yes"]}'::jsonb
+);
+SELECT otlet.run_task(:'task_name');
+SQL
+wait_task_complete "$selection_batch_two_pass_task" 8 1800 1
+psql_exec >/dev/null <<'SQL'
+UPDATE otlet.production_policy
+SET selection_batch_two_pass = false
+WHERE name = 'default';
+SQL
+
+selection_batch_contract="$(psql_value "
+WITH single_batch AS (
+  SELECT detail
+  FROM otlet.worker_events
+  WHERE event_type = 'worker_batch_finished'
+    AND detail ->> 'task_name' = '$selection_batch_single_task'
+  ORDER BY id DESC
+  LIMIT 1
+),
+two_batch AS (
+  SELECT detail
+  FROM otlet.worker_events
+  WHERE event_type = 'worker_batch_finished'
+    AND detail ->> 'task_name' = '$selection_batch_two_pass_task'
+  ORDER BY id DESC
+  LIMIT 1
+),
+single_receipts AS (
+  SELECT subject_id, receipt_raw_output_hash
+  FROM otlet.inference_receipt_trace_status
+  WHERE task_name = '$selection_batch_single_task'
+    AND selection_role = 'strong'
+    AND selection_status = 'accepted'
+),
+two_receipts AS (
+  SELECT
+    subject_id,
+    receipt_raw_output_hash,
+    prompt_prefix_reuse_status,
+    prompt_prefix_reused_tokens,
+    worker_process_rss_bytes,
+    worker_memory_budget_bytes
+  FROM otlet.inference_receipt_trace_status
+  WHERE task_name = '$selection_batch_two_pass_task'
+    AND selection_role = 'strong'
+    AND selection_status = 'accepted'
+),
+batch_numbers AS (
+  SELECT
+    COALESCE((SELECT (detail ->> 'model_swaps')::bigint FROM single_batch), -1) AS single_swaps,
+    COALESCE((SELECT (detail ->> 'model_swaps')::bigint FROM two_batch), -1) AS two_swaps
+)
+SELECT
+  COALESCE((SELECT (detail ->> 'selection_batch_strategy') = 'single_pass' FROM single_batch), false)::text || '|' ||
+  COALESCE((SELECT (detail ->> 'selection_batch_strategy') = 'selection_two_pass' FROM two_batch), false)::text || '|' ||
+  COALESCE((SELECT (detail ->> 'job_count')::bigint = 8 AND (detail ->> 'completed_jobs')::bigint = 8 FROM single_batch), false)::text || '|' ||
+  COALESCE((SELECT (detail ->> 'job_count')::bigint = 8 AND (detail ->> 'completed_jobs')::bigint = 8 FROM two_batch), false)::text || '|' ||
+  (SELECT single_swaps::text || '|' || two_swaps::text || '|' || (single_swaps > two_swaps)::text || '|' || (two_swaps BETWEEN 1 AND 2)::text FROM batch_numbers) || '|' ||
+  ((SELECT count(*) FROM single_receipts) = 8)::text || '|' ||
+  ((SELECT count(*) FROM two_receipts) = 8)::text || '|' ||
+  COALESCE((SELECT bool_and(s.receipt_raw_output_hash = t.receipt_raw_output_hash) FROM single_receipts s JOIN two_receipts t USING (subject_id)), false)::text || '|' ||
+  (NOT EXISTS (
+    SELECT 1
+    FROM otlet.jobs
+    WHERE task_name IN ('$selection_batch_single_task', '$selection_batch_two_pass_task')
+      AND status = 'running'
+      AND leased_until < now()
+  ))::text || '|' ||
+  ((SELECT count(*) FROM two_receipts WHERE prompt_prefix_reuse_status = 'hit' AND prompt_prefix_reused_tokens > 0) >= 7)::text || '|' ||
+  ((SELECT COALESCE(sum(prompt_prefix_reused_tokens), 0) FROM two_receipts) > 0)::text || '|' ||
+  COALESCE((SELECT bool_and(worker_process_rss_bytes > 0 AND (COALESCE(worker_memory_budget_bytes, 0) = 0 OR worker_process_rss_bytes <= worker_memory_budget_bytes)) FROM two_receipts), false)::text || '|' ||
+  (SELECT selection_batch_two_pass::text FROM otlet.production_policy_status);
+")"
+echo "selection_batch_contract=$selection_batch_contract"
+require_regex "$selection_batch_contract" '^true\|true\|true\|true\|[1-9][0-9]*\|[1-9][0-9]*\|true\|true\|true\|true\|true\|true\|true\|true\|true\|false$' "Expected two-pass selection batching to reduce swaps, preserve outputs, keep leases/RSS valid, and reset the kill-switch"
+
 accepted_output_anomalies="$(psql_value "
 SELECT count(*)
 FROM (
