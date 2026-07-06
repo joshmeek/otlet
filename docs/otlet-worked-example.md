@@ -1621,6 +1621,10 @@ The production policy row and status views are ordinary SQL state under `otlet`:
 
 Queue caps are admission-time controls. Rows should enter `otlet.jobs` through `run_task`, watch refresh, semantic refresh, or `ask`; direct inserts are internal/testing-only and can bypass admission accounting. `verify_invariants()` reports `queued_jobs_within_model_cap` if the current queued depth for any model exceeds `max_queued_jobs_per_model`
 
+Suppressed queue-admission events are debounced per task and reason for one minute, so a full queue stays visible without flooding `worker_events`. `production_status` also exposes `semantic_materialization_failed_events` and `semantic_materialization_last_failed_at`. Nonzero `max_worker_rss_bytes` budgets require Linux process-status RSS sampling; unsupported builds reject the option during runtime-option validation instead of letting jobs fail later
+
+The resident worker currently attaches to the `postgres` database. Multi-database worker registration needs separate shared-memory and latch routing work before it is a supported deployment shape
+
 Representative output from the demo contract:
 
 ```text

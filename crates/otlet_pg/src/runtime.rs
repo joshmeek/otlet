@@ -131,6 +131,12 @@ pub(crate) fn parse_runtime_options(value: &Value) -> Result<RuntimeOptions, Str
                     .to_owned(),
             );
         }
+        #[cfg(not(target_os = "linux"))]
+        if max_worker_rss_bytes > 0 {
+            return Err(
+                "runtime_options.max_worker_rss_bytes is supported only on linux; use 0".to_owned(),
+            );
+        }
         options.max_worker_rss_bytes = max_worker_rss_bytes;
     }
 

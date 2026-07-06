@@ -331,6 +331,48 @@ AS $$
   GROUP BY p.max_queued_jobs_per_model;
 $$;
 
+CREATE FUNCTION otlet.record_queue_admission_suppressed(
+  suppressed_task_name text,
+  suppressed_model_name text,
+  suppressed_subject_id text DEFAULT NULL,
+  suppressed_queued_jobs bigint DEFAULT NULL,
+  suppressed_queue_slots integer DEFAULT NULL
+) RETURNS boolean
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  inserted bigint := 0;
+  suppressed_reason text := 'queue_cap';
+  suppressed_detail jsonb;
+BEGIN
+  suppressed_detail := jsonb_strip_nulls(jsonb_build_object(
+    'task_name', suppressed_task_name,
+    'subject_id', suppressed_subject_id,
+    'model_name', suppressed_model_name,
+    'reason', suppressed_reason,
+    'queued_jobs', suppressed_queued_jobs,
+    'queue_slots', suppressed_queue_slots
+  ));
+
+  INSERT INTO otlet.worker_events (event_type, message, detail)
+  SELECT
+    'queue_admission_suppressed',
+    'otlet queue admission suppressed by model queue cap',
+    suppressed_detail
+  WHERE NOT EXISTS (
+    SELECT 1
+    FROM otlet.worker_events e
+    WHERE e.event_type = 'queue_admission_suppressed'
+      AND e.detail ->> 'task_name' = suppressed_task_name
+      AND e.detail ->> 'reason' = suppressed_reason
+      AND e.created_at > now() - interval '1 minute'
+  );
+  GET DIAGNOSTICS inserted = ROW_COUNT;
+
+  RETURN inserted > 0;
+END;
+$$;
+
 CREATE FUNCTION otlet.run_task(task_name text) RETURNS bigint
 LANGUAGE plpgsql
 AS $$
@@ -365,16 +407,7 @@ BEGIN
     INTO has_pending;
 
     IF has_pending THEN
-      INSERT INTO otlet.worker_events (event_type, message, detail)
-      VALUES (
-        'queue_admission_suppressed',
-        'otlet queue admission suppressed by model queue cap',
-        jsonb_build_object(
-          'task_name', run_task.task_name,
-          'model_name', model_name,
-          'reason', 'queue_cap'
-        )
-      );
+      PERFORM otlet.record_queue_admission_suppressed(run_task.task_name, model_name);
     END IF;
 
     RETURN 0;
@@ -427,17 +460,11 @@ BEGIN
     INTO has_overflow;
 
     IF has_overflow THEN
-      INSERT INTO otlet.worker_events (event_type, message, detail)
-      VALUES (
-        'queue_admission_suppressed',
-        'otlet queue admission suppressed by model queue cap',
-        jsonb_build_object(
-          'task_name', run_task.task_name,
-          'model_name', model_name,
-          'reason', 'queue_cap',
-          'queued_jobs', queued,
-          'queue_slots', queue_slots
-        )
+      PERFORM otlet.record_queue_admission_suppressed(
+        run_task.task_name,
+        model_name,
+        suppressed_queued_jobs => queued,
+        suppressed_queue_slots => queue_slots
       );
     END IF;
   END IF;
@@ -495,16 +522,10 @@ BEGIN
     INTO has_pending;
 
     IF has_pending THEN
-      INSERT INTO otlet.worker_events (event_type, message, detail)
-      VALUES (
-        'queue_admission_suppressed',
-        'otlet queue admission suppressed by model queue cap',
-        jsonb_build_object(
-          'task_name', run_task_subject.task_name,
-          'subject_id', run_task_subject.subject_id,
-          'model_name', model_name,
-          'reason', 'queue_cap'
-        )
+      PERFORM otlet.record_queue_admission_suppressed(
+        run_task_subject.task_name,
+        model_name,
+        run_task_subject.subject_id
       );
     END IF;
 

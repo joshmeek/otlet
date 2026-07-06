@@ -3459,8 +3459,15 @@ SELECT (
       AND status = 'queued'
   )::text || '|' ||
   (
-    SELECT (queue_admission_suppressed_events >= 2)::text || '|' ||
-           (queue_admission_last_suppressed_at IS NOT NULL)::text
+    SELECT count(*)::text || '|' ||
+           (count(*) = 1)::text || '|' ||
+           bool_or(e.created_at IS NOT NULL)::text
+    FROM otlet.worker_events e
+    WHERE e.event_type = 'queue_admission_suppressed'
+      AND e.detail ->> 'task_name' = 'row_queue_flood_demo_task'
+  ) || '|' ||
+  (
+    SELECT (queue_admission_suppressed_events >= 1)::text
     FROM otlet.model_queue_status
     WHERE model_name = '$strong_model_name'
   );
@@ -3468,8 +3475,8 @@ ROLLBACK;
 ")"
 queue_suppression_contract="$(tail -n 1 <<<"$queue_suppression_output")"
 echo "queue_suppression_contract=$queue_suppression_contract"
-[ "$queue_suppression_contract" = "1|true|true" ] || {
-  echo "Expected queue suppression contract 1|true|true, got $queue_suppression_contract" >&2
+[ "$queue_suppression_contract" = "1|1|true|true|true" ] || {
+  echo "Expected queue suppression contract 1|1|true|true|true, got $queue_suppression_contract" >&2
   exit 1
 }
 
@@ -5210,6 +5217,25 @@ FROM otlet.production_status;
 ")"
 echo "performance_ratio_contract=$performance_ratio_contract"
 require_regex "$performance_ratio_contract" '^[1-9][0-9]*\|[1-9][0-9]*\|[0-9]+(\.[0-9]+)?\|[1-9][0-9]*\|[0-9]+(\.[0-9]+)?$' "Expected production_status to expose positive model-work ratios"
+
+materialization_failure_status_contract="$(psql_value "
+BEGIN;
+INSERT INTO otlet.worker_events (event_type, message, detail)
+VALUES (
+  'semantic_materialization_failed',
+  'demo rolled-back materialization failure visibility smoke',
+  '{\"task_name\":\"materialization_failure_status_demo\",\"model_name\":\"qwen35_4b\",\"error\":\"rolled back smoke\"}'::jsonb
+);
+SELECT (semantic_materialization_failed_events >= 1)::text || '|' ||
+       (semantic_materialization_last_failed_at IS NOT NULL)::text
+FROM otlet.production_status;
+ROLLBACK;
+")"
+echo "materialization_failure_status_contract=$materialization_failure_status_contract"
+[ "$materialization_failure_status_contract" = "true|true" ] || {
+  echo "Expected materialization failure status contract true|true, got $materialization_failure_status_contract" >&2
+  exit 1
+}
 
 invariant_contract="$(psql_value "SELECT count(*) FROM otlet.verify_invariants();")"
 echo "invariant_contract=$invariant_contract"

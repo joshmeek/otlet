@@ -678,6 +678,13 @@ trace AS (
     max_detailed_trace_tokens,
     max_detailed_trace_top_k
   FROM otlet.inference_visibility_status
+),
+materialization_failures AS (
+  SELECT
+    count(*)::bigint AS semantic_materialization_failed_events,
+    max(created_at) AS semantic_materialization_last_failed_at
+  FROM otlet.worker_events
+  WHERE event_type = 'semantic_materialization_failed'
 )
 SELECT
   p.name AS policy_name,
@@ -726,6 +733,8 @@ SELECT
   trace.detailed_trace_receipts,
   trace.max_detailed_trace_tokens,
   trace.max_detailed_trace_top_k,
+  materialization_failures.semantic_materialization_failed_events,
+  materialization_failures.semantic_materialization_last_failed_at,
   (q.expired_running_jobs = 0) AS no_expired_running_jobs,
   (r.complete_without_schema_pass = 0) AS completed_jobs_are_schema_validated,
   (s.materializations_without_source_hash = 0) AS materializations_have_source_hashes,
@@ -739,7 +748,8 @@ CROSS JOIN receipts r
 CROSS JOIN trusted_output_rows trusted
 CROSS JOIN semantic_state s
 CROSS JOIN runtime
-CROSS JOIN trace;
+CROSS JOIN trace
+CROSS JOIN materialization_failures;
 
 CREATE FUNCTION otlet.cleanup_policy_state(
   requested_dry_run boolean DEFAULT true
