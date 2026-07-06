@@ -238,13 +238,19 @@ DECLARE
   v_available_queue_slots bigint := 0;
   v_wait_subjects bigint := 0;
   v_queue_subjects bigint := 0;
+  v_infer_now_subjects bigint := 0;
   v_fail_closed_subjects bigint := 0;
+  v_remaining_refresh_subjects bigint := 0;
   v_model_ms numeric := 2500;
   v_model_cost_source text := 'static_fallback';
   v_lookup_ms numeric := 1;
   v_queue_ms numeric := 1;
+  v_infer_now_ms numeric := 0;
   v_path_cost numeric := 1;
   v_stale_policy text := 'lookup_only_fail_closed';
+  v_auto_wait_ms integer := 10000;
+  v_auto_infer_ms integer := 15000;
+  v_auto_max_rows integer := 1;
   v_selected_path text;
   v_reason text;
   v_runtime_name text := 'linked_inproc';
@@ -311,41 +317,75 @@ BEGIN
     LIMIT 1
   ) model_receipt ON true;
 
-  SELECT COALESCE(policy.stale_policy, 'lookup_only_fail_closed')
-  INTO v_stale_policy
+  SELECT
+    COALESCE(policy.stale_policy, 'lookup_only_fail_closed'),
+    COALESCE(policy.semantic_auto_wait_ms, 10000),
+    COALESCE(policy.semantic_auto_infer_ms, 15000),
+    COALESCE(policy.semantic_auto_max_rows, 1)
+  INTO v_stale_policy, v_auto_wait_ms, v_auto_infer_ms, v_auto_max_rows
   FROM otlet.production_policy policy
   LIMIT 1;
+
+  IF COALESCE(v_auto_infer_ms, 0) > 0 AND COALESCE(v_auto_max_rows, 0) > 0 THEN
+    v_infer_now_subjects := LEAST(v_refresh_subjects, v_auto_max_rows::bigint);
+  END IF;
+
+  IF COALESCE(v_auto_wait_ms, 0) > 0 THEN
+    v_wait_subjects := COALESCE(v_inflight_subjects, 0);
+  END IF;
+
+  v_remaining_refresh_subjects := GREATEST(v_refresh_subjects - v_infer_now_subjects, 0);
+
+  IF v_stale_policy = 'refresh_then_fail_closed' THEN
+    v_queue_subjects := LEAST(v_remaining_refresh_subjects, COALESCE(v_available_queue_slots, 0));
+  END IF;
+
+  v_fail_closed_subjects := GREATEST(
+    v_refresh_subjects + COALESCE(v_inflight_subjects, 0) - v_wait_subjects - v_infer_now_subjects - v_queue_subjects,
+    0
+  );
 
   IF v_total_subjects = 0 THEN
     v_selected_path := p_lookup_path;
     v_reason := p_empty_reason;
-  ELSIF COALESCE(v_inflight_subjects, 0) > 0 THEN
+  ELSIF v_infer_now_subjects > 0 THEN
+    v_selected_path := 'bounded_infer_now';
+    v_reason := format(
+      'auto semantic policy: fresh=%s wait=%s infer=%s queue=%s fail_closed=%s',
+      v_fresh_subjects,
+      v_wait_subjects,
+      v_infer_now_subjects,
+      v_queue_subjects,
+      v_fail_closed_subjects
+    );
+  ELSIF v_wait_subjects > 0 THEN
     v_selected_path := 'wait_for_refresh';
     v_reason := 'refresh already active';
-    v_wait_subjects := v_inflight_subjects;
   ELSIF v_refresh_subjects = 0 THEN
     v_selected_path := p_lookup_path;
     v_reason := p_fresh_reason;
   ELSIF v_stale_policy = 'lookup_only_fail_closed' THEN
     v_selected_path := 'lookup_fail_closed';
     v_reason := p_fail_closed_reason;
-    v_fail_closed_subjects := v_refresh_subjects;
-  ELSIF v_refresh_subjects < v_total_subjects THEN
+  ELSIF v_queue_subjects > 0 AND v_refresh_subjects < v_total_subjects THEN
     v_selected_path := 'queue_refresh';
     v_reason := p_partial_refresh_reason;
-    v_queue_subjects := LEAST(v_refresh_subjects, COALESCE(v_available_queue_slots, 0));
-  ELSE
+  ELSIF v_queue_subjects > 0 THEN
     v_selected_path := p_full_refresh_path;
     v_reason := p_full_refresh_reason;
-    v_queue_subjects := LEAST(v_refresh_subjects, COALESCE(v_available_queue_slots, 0));
+  ELSE
+    v_selected_path := 'lookup_fail_closed';
+    v_reason := p_fail_closed_reason;
   END IF;
 
   v_lookup_ms := round(1 + (v_fresh_subjects::numeric * 0.05), 2);
   v_queue_ms := round(v_lookup_ms + (v_refresh_subjects::numeric * COALESCE(v_model_ms, 2500)), 2);
+  v_infer_now_ms := round(v_infer_now_subjects::numeric * COALESCE(v_model_ms, 2500), 2);
   v_path_cost := CASE v_selected_path
     WHEN p_lookup_path THEN v_lookup_ms
     WHEN 'lookup_fail_closed' THEN v_lookup_ms
     WHEN 'wait_for_refresh' THEN round(v_lookup_ms + (v_wait_subjects::numeric * 0.50), 2)
+    WHEN 'bounded_infer_now' THEN round(v_lookup_ms + v_infer_now_ms, 2)
     ELSE v_queue_ms
   END;
 
@@ -367,7 +407,7 @@ BEGIN
     v_fresh_subjects,
     v_wait_subjects,
     v_queue_subjects,
-    0::bigint,
+    v_infer_now_subjects,
     v_fail_closed_subjects,
     CASE WHEN v_total_subjects = 0 THEN 1::numeric ELSE round(v_fresh_subjects::numeric / v_total_subjects, 4) END,
     round(COALESCE(v_model_ms, 2500), 2),
@@ -375,7 +415,7 @@ BEGIN
     0.05::numeric,
     v_lookup_ms,
     v_queue_ms,
-    0::numeric,
+    v_infer_now_ms,
     v_path_cost,
     COALESCE(v_worker_queue_depth, 0),
     COALESCE(v_available_queue_slots, 0),

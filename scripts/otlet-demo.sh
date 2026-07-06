@@ -2940,7 +2940,7 @@ require_contains "$row_scoped_fdw_plan" "Selected Path: semantic_lookup" "Expect
 require_contains "$row_scoped_fdw_plan" "Reason: pushed subject rows fresh" "Expected row FDW pushed-subject reason"
 require_contains "$row_scoped_fdw_plan" "Total Subjects: 1" "Expected row FDW scoped total"
 require_contains "$row_scoped_fdw_plan" "Fresh Subjects: 1" "Expected row FDW scoped fresh count"
-require_contains "$row_scoped_fdw_plan" "Count Basis: estimated" "Expected row FDW count basis"
+require_contains "$row_scoped_fdw_plan" "Count Basis: pushdown_scoped" "Expected row FDW pushed-filter count basis"
 require_contains "$row_scoped_fdw_plan" "Model Cost Source:" "Expected row FDW model cost source"
 require_contains "$row_scoped_fdw_plan" "Path Cost:" "Expected row FDW path cost"
 require_contains "$row_scoped_fdw_plan" "Actual Rows Loaded: 1" "Expected row FDW loaded row count"
@@ -3086,6 +3086,14 @@ FROM public.otlet_demo_customscan_signal
 WHERE otlet.semantic_matches_auto('$row_customscan_watch', id, '{}'::jsonb);
 SQL
 )"
+row_customscan_sql_plan_contract="$(psql_value "
+SELECT selected_path || '|' ||
+       infer_now_subjects::text || '|' ||
+       fail_closed_subjects::text || '|' ||
+       (infer_now_ms > 0)::text || '|' ||
+       count_basis
+FROM otlet.semantic_index_plan('$row_customscan_watch', true);
+")"
 psql_exec >/dev/null <<'SQL'
 UPDATE otlet.production_policy
 SET stale_policy = 'refresh_then_fail_closed',
@@ -3095,6 +3103,11 @@ SET stale_policy = 'refresh_then_fail_closed',
 WHERE name = 'default';
 SQL
 printf '%s\n' "$row_customscan_infer_plan"
+echo "row_customscan_sql_plan_contract=$row_customscan_sql_plan_contract"
+[ "$row_customscan_sql_plan_contract" = "bounded_infer_now|1|1|true|exact" ] || {
+  echo "Expected SQL plan to predict one infer-now and one fail-closed row, got $row_customscan_sql_plan_contract" >&2
+  exit 1
+}
 require_contains "$row_customscan_infer_plan" "Planner Selected Path: bounded_infer_now" "Expected CustomScan bounded infer-now path"
 require_contains "$row_customscan_infer_plan" "Count Basis: exact" "Expected infer CustomScan exact count basis"
 require_contains "$row_customscan_infer_plan" "Model Cost Source:" "Expected infer CustomScan model cost source"
@@ -4284,7 +4297,7 @@ require_contains "$fdw_plan" "Reason: pushed subject rows fresh" "Expected join 
 require_contains "$fdw_plan" "Total Subjects: 1" "Expected join FDW scoped total"
 require_contains "$fdw_plan" "Fresh Subjects: 1" "Expected join FDW scoped fresh count"
 require_contains "$fdw_plan" "Queue Subjects: 0" "Expected FDW queue subject count"
-require_contains "$fdw_plan" "Count Basis: estimated" "Expected join FDW count basis"
+require_contains "$fdw_plan" "Count Basis: pushdown_scoped" "Expected join FDW pushed-filter count basis"
 require_contains "$fdw_plan" "Model Cost Source:" "Expected join FDW model cost source"
 require_contains "$fdw_plan" "Path Cost:" "Expected FDW path cost"
 require_contains "$fdw_plan" "Actual Rows Loaded: 1" "Expected join FDW loaded row count"

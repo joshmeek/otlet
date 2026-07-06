@@ -1242,7 +1242,7 @@ Foreign Scan on otlet.demo_semantic_vendor_idx_native
   Otlet Node: Semantic Foreign Scan
   Selected Path: semantic_lookup
   Stale Reasons: {}
-  Count Basis: estimated
+  Count Basis: pushdown_scoped
   Model Cost Source: runtime_slot
   Queue Subjects: 0
   Path Cost: 1.05
@@ -1256,15 +1256,22 @@ The FDW runs inside Postgres as a native access path over Otlet-owned semantic m
 
 The SQL plan row, FDW EXPLAIN, and CustomScan EXPLAIN use the same terms for the planner contract
 
-| Concept | SQL plan row | FDW EXPLAIN | CustomScan EXPLAIN | Notes |
+| Concept | SQL plan row | FDW EXPLAIN | CustomScan EXPLAIN | Parity |
 | --- | --- | --- | --- | --- |
-| Chosen path | `selected_path` | `Selected Path` | `Planner Selected Path` | CustomScan prefixes planner-owned decisions |
-| Reason | `reason` | `Reason` | `Planner Reason` | Human-readable reason for the chosen path |
-| Count basis | `count_basis` | `Count Basis` | `Count Basis` | `exact` means source rows were counted; `estimated` means planner estimates were used |
-| Model cost basis | `model_cost_source` | `Model Cost Source` | `Model Cost Source` | Usually `task_receipt`, `runtime_slot`, `model_receipt`, or `static_fallback` |
-| Stale reasons | `stale_reasons` | `Stale Reasons` | `Planner Stale Reasons` | JSON count by stale reason where stale subjects are counted |
-| Infer-now prediction | `infer_now_subjects`, `fail_closed_subjects` | `Infer Now Subjects`, `Fail Closed Subjects` | `Planner Infer Now Subjects`, `Planner Fail Closed Subjects` | CustomScan also reports actual executor counters |
-| Freshness basis | `semantic_index_current_rows.freshness_basis` | `freshness_basis` output column | `Preloaded Fresh Subjects / Basis`, `Emitted Freshness Basis` | Surface-specific because it describes materialized row freshness, not only path choice |
+| Chosen path | `selected_path` | `Selected Path` | `Planner Selected Path` | Same vocabulary; CustomScan prefixes planner-owned decisions |
+| Reason | `reason` | `Reason` | `Planner Reason` | Same meaning |
+| Count basis | `count_basis` | `Count Basis` | `Count Basis` | Intended gap: pushed FDW filters use `pushdown_scoped`; CustomScan source-row predicates use exact or child-plan counts |
+| Model cost basis | `model_cost_source` | `Model Cost Source` | `Model Cost Source` | Same ordered basis: task receipt, runtime slot, model receipt, static fallback |
+| Stale reasons | `stale_reasons` | `Stale Reasons` | `Planner Stale Reasons` | Same JSON shape where stale subjects are counted |
+| Infer-now prediction | `infer_now_subjects`, `fail_closed_subjects` | `Infer Now Subjects`, `Fail Closed Subjects` | `Planner Infer Now Subjects`, `Planner Fail Closed Subjects` | Intended gap: FDW has no infer-now executor; CustomScan also reports actual executor counters |
+| Freshness basis | `semantic_index_current_rows.freshness_basis` | `freshness_basis` output column | `Preloaded Fresh Subjects / Basis`, `Emitted Freshness Basis` | Intended gap: freshness basis is row output in FDW and aggregate executor evidence in CustomScan |
+
+EXPLAIN line ledger for this pass:
+
+| Surface | Added | Deleted or merged | Net |
+| --- | --- | --- | --- |
+| CustomScan | `Emitted Freshness Basis` | `Preloaded Fresh Subjects` and `Preloaded Freshness Basis` merged into `Preloaded Fresh Subjects / Basis` | 0 |
+| SQL plan row | no EXPLAIN line added; `infer_now_subjects` and `infer_now_ms` now use existing columns | none | 0 |
 
 Captured row-plan excerpt:
 
@@ -1280,7 +1287,7 @@ Captured FDW EXPLAIN excerpt:
 ```text
 Selected Path: semantic_lookup
 Stale Reasons: {}
-Count Basis: estimated
+Count Basis: pushdown_scoped
 Model Cost Source: runtime_slot
 Freshness: 1.00
 ```
