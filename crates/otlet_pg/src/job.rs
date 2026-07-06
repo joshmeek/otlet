@@ -98,7 +98,7 @@ SELECT
   t.runtime_options,
   t.input_shaping,
   t.decision_contract,
-  p.max_attempt_ms
+  otlet.effective_task_max_attempt_ms(t.runtime_options, p.max_attempt_ms)
 FROM otlet.claim_jobs() j
 JOIN otlet.tasks t ON t.name = j.task_name
 JOIN otlet.models m ON m.name = t.model_name
@@ -158,7 +158,7 @@ SELECT
   t.runtime_options,
   t.input_shaping,
   t.decision_contract,
-  p.max_attempt_ms
+  otlet.effective_task_max_attempt_ms(t.runtime_options, p.max_attempt_ms)
 FROM inserted j
 JOIN otlet.tasks t ON t.name = j.task_name
 JOIN otlet.models m ON m.name = t.model_name

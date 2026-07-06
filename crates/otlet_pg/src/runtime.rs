@@ -44,6 +44,7 @@ pub(crate) fn parse_runtime_options(value: &Value) -> Result<RuntimeOptions, Str
                 | "prefix_kv_reuse"
                 | "json_logit_mask"
                 | "max_tokens"
+                | "max_attempt_ms"
                 | "inference_cache"
                 | "max_worker_rss_bytes"
                 | "generation_trace"
@@ -94,6 +95,15 @@ pub(crate) fn parse_runtime_options(value: &Value) -> Result<RuntimeOptions, Str
             return Err("runtime_options.max_tokens must be between 1 and 4096".to_owned());
         }
         options.max_tokens = max_tokens;
+    }
+
+    if let Some(value) = object.get("max_attempt_ms") {
+        let valid_string = value
+            .as_str()
+            .is_some_and(|raw| !raw.is_empty() && raw.chars().all(|ch| ch.is_ascii_digit()));
+        if value.as_u64().is_none() && !valid_string {
+            return Err("runtime_options.max_attempt_ms must be a non-negative integer".to_owned());
+        }
     }
 
     if let Some(value) = object.get("inference_cache") {
@@ -163,6 +173,7 @@ pub(crate) fn runtime_option_status(value: &Value) -> Value {
         "prefix_kv_reuse",
         "json_logit_mask",
         "max_tokens",
+        "max_attempt_ms",
         "inference_cache",
         "max_worker_rss_bytes",
         "generation_trace",

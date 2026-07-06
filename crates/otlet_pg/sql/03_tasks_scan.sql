@@ -1,3 +1,27 @@
+CREATE FUNCTION otlet.effective_task_max_attempt_ms(
+  runtime_options jsonb,
+  policy_max_attempt_ms integer
+) RETURNS integer
+LANGUAGE sql
+IMMUTABLE
+AS $$
+  SELECT LEAST(
+    GREATEST(
+      COALESCE(
+        CASE
+          WHEN COALESCE($1, '{}'::jsonb) ? 'max_attempt_ms'
+           AND (COALESCE($1, '{}'::jsonb) ->> 'max_attempt_ms') ~ '^[0-9]+$'
+          THEN (COALESCE($1, '{}'::jsonb) ->> 'max_attempt_ms')::numeric
+          ELSE NULL
+        END,
+        COALESCE($2, 300000)::numeric
+      ),
+      1
+    ),
+    GREATEST(COALESCE($2, 300000), 1)::numeric
+  )::integer;
+$$;
+
 CREATE FUNCTION otlet.create_task(
   task_name text,
   input_query text,
@@ -11,6 +35,7 @@ CREATE FUNCTION otlet.create_task(
 LANGUAGE plpgsql
 AS $$
 DECLARE
+  actual_runtime_options jsonb := COALESCE(create_task.runtime_options, '{}'::jsonb);
   actual_input_shaping jsonb := COALESCE(create_task.input_shaping, '{}'::jsonb);
   actual_decision_contract jsonb := COALESCE(create_task.decision_contract, '{}'::jsonb);
   preset_name text;
@@ -18,11 +43,21 @@ DECLARE
   preset_contract_hash text;
   saved_task otlet.tasks%ROWTYPE;
 BEGIN
+  IF jsonb_typeof(actual_runtime_options) IS DISTINCT FROM 'object' THEN
+    RAISE EXCEPTION 'otlet runtime_options must be a JSON object';
+  END IF;
   IF jsonb_typeof(actual_input_shaping) IS DISTINCT FROM 'object' THEN
     RAISE EXCEPTION 'otlet input_shaping must be a JSON object';
   END IF;
   IF jsonb_typeof(actual_decision_contract) IS DISTINCT FROM 'object' THEN
     RAISE EXCEPTION 'otlet decision_contract must be a JSON object';
+  END IF;
+  IF actual_runtime_options ? 'max_attempt_ms'
+     AND (
+       (actual_runtime_options ->> 'max_attempt_ms') IS NULL
+       OR (actual_runtime_options ->> 'max_attempt_ms') !~ '^[0-9]+$'
+     ) THEN
+    RAISE EXCEPTION 'otlet runtime_options.max_attempt_ms must be a non-negative integer';
   END IF;
 
   preset_name := NULLIF(actual_decision_contract ->> 'preset', '');
@@ -63,7 +98,7 @@ BEGIN
     create_task.instruction,
     create_task.output_schema,
     create_task.model_name,
-    COALESCE(create_task.runtime_options, '{}'::jsonb),
+    actual_runtime_options,
     actual_input_shaping,
     actual_decision_contract
   )
@@ -198,6 +233,52 @@ BEGIN
   END IF;
   IF jsonb_typeof(actual_accept_field_checks) IS DISTINCT FROM 'object' THEN
     RAISE EXCEPTION 'otlet accept_field_checks must be a JSON object';
+  END IF;
+  IF actual_accept_field_checks ? 'answer_field'
+     AND (
+       jsonb_typeof(actual_accept_field_checks -> 'answer_field') IS DISTINCT FROM 'string'
+       OR NULLIF(actual_accept_field_checks ->> 'answer_field', '') IS NULL
+     ) THEN
+    RAISE EXCEPTION 'otlet accept_field_checks.answer_field must be a non-empty string';
+  END IF;
+  IF actual_accept_field_checks ? 'confidence_field'
+     AND (
+       jsonb_typeof(actual_accept_field_checks -> 'confidence_field') IS DISTINCT FROM 'string'
+       OR NULLIF(actual_accept_field_checks ->> 'confidence_field', '') IS NULL
+     ) THEN
+    RAISE EXCEPTION 'otlet accept_field_checks.confidence_field must be a non-empty string';
+  END IF;
+  IF actual_accept_field_checks ? 'abstain_values' THEN
+    IF NOT actual_accept_field_checks ? 'answer_field'
+       OR NULLIF(actual_accept_field_checks ->> 'answer_field', '') IS NULL THEN
+      RAISE EXCEPTION 'otlet accept_field_checks.abstain_values requires answer_field';
+    END IF;
+    IF jsonb_typeof(actual_accept_field_checks -> 'abstain_values') IS DISTINCT FROM 'array' THEN
+      RAISE EXCEPTION 'otlet accept_field_checks.abstain_values must be an array';
+    END IF;
+    IF EXISTS (
+      SELECT 1
+      FROM jsonb_array_elements(actual_accept_field_checks -> 'abstain_values') value(item)
+      WHERE jsonb_typeof(value.item) <> 'string'
+    ) THEN
+      RAISE EXCEPTION 'otlet accept_field_checks.abstain_values must contain only strings';
+    END IF;
+  END IF;
+  IF actual_accept_field_checks ? 'accepted_confidence' THEN
+    IF NOT actual_accept_field_checks ? 'confidence_field'
+       OR NULLIF(actual_accept_field_checks ->> 'confidence_field', '') IS NULL THEN
+      RAISE EXCEPTION 'otlet accept_field_checks.accepted_confidence requires confidence_field';
+    END IF;
+    IF jsonb_typeof(actual_accept_field_checks -> 'accepted_confidence') IS DISTINCT FROM 'array' THEN
+      RAISE EXCEPTION 'otlet accept_field_checks.accepted_confidence must be an array';
+    END IF;
+    IF EXISTS (
+      SELECT 1
+      FROM jsonb_array_elements(actual_accept_field_checks -> 'accepted_confidence') value(item)
+      WHERE jsonb_typeof(value.item) <> 'string'
+    ) THEN
+      RAISE EXCEPTION 'otlet accept_field_checks.accepted_confidence must contain only strings';
+    END IF;
   END IF;
 
   INSERT INTO otlet.model_selection_policies (

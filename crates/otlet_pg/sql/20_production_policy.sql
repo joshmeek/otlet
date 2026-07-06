@@ -129,12 +129,21 @@ SELECT
   p.cheap_skip_window,
   p.cheap_min_recent_acceptance,
   p.cheap_probe_interval,
+  CASE
+    WHEN (t.runtime_options ->> 'max_attempt_ms') ~ '^[0-9]+$'
+    THEN (t.runtime_options ->> 'max_attempt_ms')::integer
+    ELSE NULL
+  END AS task_max_attempt_ms,
+  policy.max_attempt_ms AS policy_max_attempt_ms,
+  otlet.effective_task_max_attempt_ms(t.runtime_options, policy.max_attempt_ms) AS effective_max_attempt_ms,
   cheap_q.queue_state AS cheap_queue_state,
   cheap_q.queued_jobs AS cheap_queued_jobs,
   cheap_q.running_jobs AS cheap_running_jobs,
   p.created_at,
   p.updated_at
 FROM otlet.model_selection_policies p
+JOIN otlet.tasks t ON t.name = p.task_name
+CROSS JOIN otlet.production_policy policy
 LEFT JOIN otlet.model_queue_status cheap_q ON cheap_q.model_name = p.cheap_model_name;
 
 CREATE FUNCTION otlet.model_selection_recent_acceptance(task_name text)

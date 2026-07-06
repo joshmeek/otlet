@@ -561,11 +561,8 @@ SELECT otlet.create_task(
   'Return JSON only: {"output":{"status":"ok"},"actions":[]}',
   '{"type":"object","required":["status"],"additionalProperties":false,"properties":{"status":{"enum":["ok"]}}}'::jsonb,
   :'model_name',
-  '{"max_tokens":256,"reasoning":"off","inference_cache":false}'::jsonb
+  '{"max_tokens":256,"reasoning":"off","inference_cache":false,"max_attempt_ms":1}'::jsonb
 );
-UPDATE otlet.production_policy
-SET max_attempt_ms = 1
-WHERE name = 'default';
 SELECT otlet.run_task(:'task_name');
 SQL
 attempt_timeout_failed="0"
@@ -610,13 +607,19 @@ ORDER BY s.receipt_id DESC
 LIMIT 1;
 ")"
 echo "attempt_timeout_contract=$attempt_timeout_contract"
-psql_exec >/dev/null <<'SQL'
-UPDATE otlet.production_policy
-SET max_attempt_ms = 300000
-WHERE name = 'default';
-SQL
 [ "$attempt_timeout_contract" = "failed|attempt_timeout|attempt_timeout|failed|ready|ready" ] || {
   echo "Expected attempt timeout to fail cleanly with healthy worker, got $attempt_timeout_contract" >&2
+  exit 1
+}
+attempt_timeout_clamp_contract="$(psql_value "
+SELECT otlet.effective_task_max_attempt_ms('{\"max_attempt_ms\":1}'::jsonb, max_attempt_ms)::text || '|' ||
+       otlet.effective_task_max_attempt_ms('{}'::jsonb, max_attempt_ms)::text || '|' ||
+       otlet.effective_task_max_attempt_ms('{\"max_attempt_ms\":999999999}'::jsonb, max_attempt_ms)::text
+FROM otlet.production_policy_status;
+")"
+echo "attempt_timeout_clamp_contract=$attempt_timeout_clamp_contract"
+[ "$attempt_timeout_clamp_contract" = "1|300000|300000" ] || {
+  echo "Expected per-task timeout clamp to leave default/global budget unaffected, got $attempt_timeout_clamp_contract" >&2
   exit 1
 }
 
@@ -3264,6 +3267,28 @@ echo "row_triage_preset_contract=$row_triage_preset_contract"
   echo "Expected triage preset to drive selection policy labels, got $row_triage_preset_contract" >&2
   exit 1
 }
+set +e
+model_selection_shape_output="$(
+  psql_exec -qAt \
+    -v task_name="$row_triage_policy_task" \
+    -v cheap_policy_model="$strong_model_name" \
+    -v strong_policy_model="$strong_alias_model_name" 2>&1 <<'SQL'
+SELECT otlet.set_model_selection_policy(
+  :'task_name',
+  :'cheap_policy_model',
+  :'strong_policy_model',
+  '{"abstain_values":["unclear"]}'::jsonb
+);
+SQL
+)"
+model_selection_shape_status=$?
+set -e
+if [ "$model_selection_shape_status" -eq 0 ]; then
+  echo "Expected orphan abstain_values policy to be rejected" >&2
+  exit 1
+fi
+require_contains "$model_selection_shape_output" "otlet accept_field_checks.abstain_values requires answer_field" "Expected orphan abstain_values rejection message"
+echo "model_selection_shape_contract=rejected"
 row_triage_preset_trace_contract="$(psql_value "
 SELECT COALESCE(s.decision_preset_name, '') || '|' ||
        (s.decision_preset_contract_hash = t.decision_contract ->> 'preset_contract_hash')::text || '|' ||
@@ -3722,12 +3747,15 @@ echo "entity_resolution_contract=$entity_contract"
 }
 
 model_selection_policy_contract="$(psql_value "
-SELECT task_name || '|' || cheap_model_name || '|' || strong_model_name
+SELECT task_name || '|' || cheap_model_name || '|' || strong_model_name || '|' ||
+       COALESCE(task_max_attempt_ms::text, '') || '|' ||
+       policy_max_attempt_ms::text || '|' ||
+       effective_max_attempt_ms::text
 FROM otlet.model_selection_policy_status
 WHERE task_name = '$entity_task';
 ")"
 echo "model_selection_policy_contract=$model_selection_policy_contract"
-[ "$model_selection_policy_contract" = "$entity_task|$cheap_model_name|$strong_model_name" ] || {
+[ "$model_selection_policy_contract" = "$entity_task|$cheap_model_name|$strong_model_name||300000|300000" ] || {
   echo "Expected model selection policy contract, got $model_selection_policy_contract" >&2
   exit 1
 }
