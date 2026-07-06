@@ -609,6 +609,22 @@ SELECT
       THEN (r.trace_summary ->> 'json_logit_mask_overhead_ms')::bigint
     ELSE NULL
   END AS json_logit_mask_overhead_ms,
+  COALESCE(r.trace_summary ->> 'json_logit_mask_enum_enabled', 'false')::boolean AS json_logit_mask_enum_enabled,
+  CASE
+    WHEN jsonb_typeof(r.trace_summary -> 'json_logit_mask_enum_fields') = 'number'
+      THEN (r.trace_summary ->> 'json_logit_mask_enum_fields')::bigint
+    ELSE NULL
+  END AS json_logit_mask_enum_fields,
+  CASE
+    WHEN jsonb_typeof(r.trace_summary -> 'json_logit_mask_enum_values') = 'number'
+      THEN (r.trace_summary ->> 'json_logit_mask_enum_values')::bigint
+    ELSE NULL
+  END AS json_logit_mask_enum_values,
+  CASE
+    WHEN jsonb_typeof(r.trace_summary -> 'json_logit_mask_enum_candidates_rejected') = 'number'
+      THEN (r.trace_summary ->> 'json_logit_mask_enum_candidates_rejected')::bigint
+    ELSE NULL
+  END AS json_logit_mask_enum_candidates_rejected,
   r.trace_summary ->> 'decode_constraint' AS decode_constraint,
   COALESCE(r.trace_summary ->> 'grammar_supported', 'false')::boolean AS grammar_supported,
   r.trace_summary ->> 'decode_constraint_reason' AS decode_constraint_reason,

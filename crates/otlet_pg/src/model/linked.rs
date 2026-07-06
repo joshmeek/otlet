@@ -200,7 +200,12 @@ fn run_linked(
     let mut generated_tokens = 0_i64;
     let mut probability_trace = ProbabilityTrace::default();
     let mut detailed_trace = DetailedGenerationTrace::new(options);
-    let mut json_logit_mask = JsonLogitMask::new(options.json_logit_mask);
+    let enum_fields = json_enum_fields_from_schema(&job.output_schema);
+    let mut json_logit_mask = JsonLogitMask::new(
+        options.json_logit_mask,
+        options.json_logit_mask_enum,
+        enum_fields,
+    );
     let mut stop_reason = "max_tokens".to_owned();
     let generate_start = Instant::now();
 
@@ -316,6 +321,10 @@ fn run_linked(
             json_logit_mask_fallbacks: json_logit_mask.fallbacks,
             json_logit_mask_uncertain_pieces: json_logit_mask.uncertain_pieces,
             json_logit_mask_overhead_ms: json_logit_mask.overhead_ms,
+            json_logit_mask_enum_enabled: json_logit_mask.enum_enabled(),
+            json_logit_mask_enum_fields: json_logit_mask.enum_fields(),
+            json_logit_mask_enum_values: json_logit_mask.enum_values(),
+            json_logit_mask_enum_candidates_rejected: json_logit_mask.enum_candidates_rejected,
             probability_summary: probability_trace.summary(),
             detailed_trace: detailed_trace.summary(&stop_reason),
             stop_reason,
@@ -375,20 +384,44 @@ struct JsonLogitMask {
     fallbacks: i64,
     uncertain_pieces: i64,
     overhead_ms: i64,
+    enum_candidates_rejected: i64,
 }
 
 impl JsonLogitMask {
-    fn new(enabled: bool) -> Self {
+    fn new(enabled: bool, enum_enabled: bool, enum_fields: JsonEnumFields) -> Self {
+        let enum_fields = if enabled && enum_enabled && enum_fields.has_fields() {
+            enum_fields
+        } else {
+            JsonEnumFields::default()
+        };
         Self {
             enabled,
-            state: JsonPrefixState::default(),
+            state: JsonPrefixState::new(enum_fields),
             sampled_tokens: 0,
             candidates_checked: 0,
             candidates_rejected: 0,
             fallbacks: 0,
             uncertain_pieces: 0,
             overhead_ms: 0,
+            enum_candidates_rejected: 0,
         }
+    }
+
+    fn enum_enabled(&self) -> bool {
+        self.enabled && self.state.enum_fields.has_fields()
+    }
+
+    fn enum_fields(&self) -> i64 {
+        self.state.enum_fields.fields.len() as i64
+    }
+
+    fn enum_values(&self) -> i64 {
+        self.state
+            .enum_fields
+            .fields
+            .iter()
+            .map(|field| field.values.len() as i64)
+            .sum()
     }
 
     fn sample(
@@ -462,7 +495,14 @@ impl JsonLogitMask {
         }
 
         let mut state = self.state.clone();
-        state.push_str(&piece).is_ok()
+        match state.push_str(&piece) {
+            Ok(()) => true,
+            Err(JsonMaskReject::Enum) => {
+                self.enum_candidates_rejected += 1;
+                false
+            }
+            Err(JsonMaskReject::Syntax) => false,
+        }
     }
 
     fn observe_chosen(&mut self, piece: &str) {
@@ -473,11 +513,110 @@ impl JsonLogitMask {
             self.uncertain_pieces += 1;
             return;
         }
-        if self.state.push_str(piece).is_err() {
-            self.enabled = false;
-            self.fallbacks += 1;
+        match self.state.push_str(piece) {
+            Ok(()) => {}
+            Err(JsonMaskReject::Enum) => {
+                self.enum_candidates_rejected += 1;
+                self.enabled = false;
+                self.fallbacks += 1;
+            }
+            Err(JsonMaskReject::Syntax) => {
+                self.enabled = false;
+                self.fallbacks += 1;
+            }
         }
     }
+}
+
+#[derive(Clone, Default)]
+struct JsonEnumFields {
+    fields: Vec<JsonEnumField>,
+}
+
+impl JsonEnumFields {
+    fn has_fields(&self) -> bool {
+        !self.fields.is_empty()
+    }
+
+    fn values_for_key(&self, key: &str) -> Option<Vec<String>> {
+        self.fields
+            .iter()
+            .find(|field| field.key == key)
+            .map(|field| field.values.clone())
+    }
+}
+
+#[derive(Clone)]
+struct JsonEnumField {
+    key: String,
+    values: Vec<String>,
+}
+
+fn json_enum_fields_from_schema(schema: &serde_json::Value) -> JsonEnumFields {
+    let Some(properties) = schema.get("properties").and_then(serde_json::Value::as_object) else {
+        return JsonEnumFields::default();
+    };
+
+    let mut fields = Vec::new();
+    for (key, property) in properties {
+        let Some(values) = property.get("enum").and_then(serde_json::Value::as_array) else {
+            continue;
+        };
+        if values.is_empty() {
+            continue;
+        }
+        let mut enum_values = Vec::new();
+        let mut supported = true;
+        for value in values {
+            let Some(value) = value.as_str() else {
+                supported = false;
+                break;
+            };
+            if !json_enum_string_supported(value) {
+                supported = false;
+                break;
+            }
+            enum_values.push(value.to_owned());
+        }
+        if !supported {
+            continue;
+        }
+        fields.push(JsonEnumField {
+            key: key.clone(),
+            values: enum_values,
+        });
+    }
+
+    JsonEnumFields { fields }
+}
+
+fn json_enum_string_supported(value: &str) -> bool {
+    value.len() <= 128
+        && !value
+            .chars()
+            .any(|ch| ch.is_control() || matches!(ch, '"' | '\\'))
+}
+
+#[derive(Clone, Copy)]
+enum JsonMaskReject {
+    Syntax,
+    Enum,
+}
+
+fn json_syntax_error() -> JsonMaskReject {
+    JsonMaskReject::Syntax
+}
+
+fn json_enum_error() -> JsonMaskReject {
+    JsonMaskReject::Enum
+}
+
+fn json_piece_allowed_by_enum(text: &str, enum_values: &[String]) -> bool {
+    enum_values.iter().any(|value| value.starts_with(text))
+}
+
+fn json_enum_value_complete(text: &str, enum_values: &[String]) -> bool {
+    enum_values.iter().any(|value| value == text)
 }
 
 fn json_piece_uncertain(piece: &str) -> bool {
@@ -488,49 +627,62 @@ fn json_piece_uncertain(piece: &str) -> bool {
 struct JsonPrefixState {
     mode: JsonMode,
     stack: Vec<JsonFrame>,
+    enum_fields: JsonEnumFields,
 }
 
 impl Default for JsonPrefixState {
     fn default() -> Self {
-        Self {
-            mode: JsonMode::Root,
-            stack: Vec::new(),
-        }
+        Self::new(JsonEnumFields::default())
     }
 }
 
 impl JsonPrefixState {
+    fn new(enum_fields: JsonEnumFields) -> Self {
+        Self {
+            mode: JsonMode::Root,
+            stack: Vec::new(),
+            enum_fields,
+        }
+    }
+
     fn is_complete(&self) -> bool {
         matches!(self.mode, JsonMode::Done)
     }
 
-    fn push_str(&mut self, text: &str) -> Result<(), ()> {
+    fn push_str(&mut self, text: &str) -> Result<(), JsonMaskReject> {
         for ch in text.chars() {
             self.push_char(ch)?;
         }
         Ok(())
     }
 
-    fn push_char(&mut self, ch: char) -> Result<(), ()> {
+    fn push_char(&mut self, ch: char) -> Result<(), JsonMaskReject> {
         match &mut self.mode {
             JsonMode::String {
                 kind,
                 escape,
                 unicode_remaining,
+                text,
+                ambiguous,
+                enum_values,
             } => {
                 if *unicode_remaining > 0 {
                     if ch.is_ascii_hexdigit() {
                         *unicode_remaining -= 1;
+                        if *unicode_remaining == 0 {
+                            *ambiguous = true;
+                        }
                         return Ok(());
                     }
-                    return Err(());
+                    return Err(json_syntax_error());
                 }
                 if *escape {
                     *escape = false;
+                    *ambiguous = true;
                     if ch == 'u' {
                         *unicode_remaining = 4;
                     } else if !matches!(ch, '"' | '\\' | '/' | 'b' | 'f' | 'n' | 'r' | 't') {
-                        return Err(());
+                        return Err(json_syntax_error());
                     }
                     return Ok(());
                 }
@@ -540,8 +692,16 @@ impl JsonPrefixState {
                 }
                 if ch == '"' {
                     let kind = *kind;
+                    let key = text.clone();
+                    let was_ambiguous = *ambiguous;
+                    if let Some(values) = enum_values.as_ref() {
+                        if !was_ambiguous && !json_enum_value_complete(text, values) {
+                            return Err(json_enum_error());
+                        }
+                    }
                     if matches!(kind, JsonStringKind::Key) {
                         self.mode = JsonMode::Normal;
+                        self.set_current_key((!was_ambiguous).then_some(key))?;
                         self.set_object_expect(JsonObjectExpect::Colon)?;
                     } else {
                         self.finish_value()?;
@@ -549,7 +709,13 @@ impl JsonPrefixState {
                     return Ok(());
                 }
                 if ch.is_control() {
-                    return Err(());
+                    return Err(json_syntax_error());
+                }
+                text.push(ch);
+                if let Some(values) = enum_values.as_ref() {
+                    if !*ambiguous && !json_piece_allowed_by_enum(text, values) {
+                        return Err(json_enum_error());
+                    }
                 }
                 Ok(())
             }
@@ -567,7 +733,7 @@ impl JsonPrefixState {
                     return self.push_char(ch);
                 };
                 if ch as u8 != expected {
-                    return Err(());
+                    return Err(json_syntax_error());
                 }
                 *index += 1;
                 if *index == target.len() {
@@ -579,22 +745,26 @@ impl JsonPrefixState {
         }
     }
 
-    fn push_normal(&mut self, ch: char) -> Result<(), ()> {
+    fn push_normal(&mut self, ch: char) -> Result<(), JsonMaskReject> {
         if ch.is_whitespace() {
             return Ok(());
         }
         if matches!(self.mode, JsonMode::Done) {
-            return Err(());
+            return Err(json_syntax_error());
         }
 
         match self.current_expect()? {
             JsonExpect::Root => {
                 if ch == '{' {
-                    self.stack.push(JsonFrame::Object(JsonObjectExpect::KeyOrEnd));
+                    self.stack.push(JsonFrame::Object {
+                        expect: JsonObjectExpect::KeyOrEnd,
+                        current_key: None,
+                        object_key: None,
+                    });
                     self.mode = JsonMode::Normal;
                     Ok(())
                 } else {
-                    Err(())
+                    Err(json_syntax_error())
                 }
             }
             JsonExpect::ObjectKeyOrEnd => match ch {
@@ -607,16 +777,19 @@ impl JsonPrefixState {
                         kind: JsonStringKind::Key,
                         escape: false,
                         unicode_remaining: 0,
+                        text: String::new(),
+                        ambiguous: false,
+                        enum_values: None,
                     };
                     Ok(())
                 }
-                _ => Err(()),
+                _ => Err(json_syntax_error()),
             },
             JsonExpect::ObjectColon => {
                 if ch == ':' {
                     self.set_object_expect(JsonObjectExpect::Value)
                 } else {
-                    Err(())
+                    Err(json_syntax_error())
                 }
             }
             JsonExpect::ObjectValue | JsonExpect::ArrayValueOrEnd => {
@@ -632,7 +805,7 @@ impl JsonPrefixState {
                     self.stack.pop();
                     self.finish_value()
                 }
-                _ => Err(()),
+                _ => Err(json_syntax_error()),
             },
             JsonExpect::ArrayCommaOrEnd => match ch {
                 ',' => self.set_array_expect(JsonArrayExpect::ValueOrEnd),
@@ -640,19 +813,29 @@ impl JsonPrefixState {
                     self.stack.pop();
                     self.finish_value()
                 }
-                _ => Err(()),
+                _ => Err(json_syntax_error()),
             },
         }
     }
 
-    fn start_value(&mut self, ch: char) -> Result<(), ()> {
+    fn start_value(&mut self, ch: char) -> Result<(), JsonMaskReject> {
+        let enum_values = self.current_enum_values();
+        if enum_values.is_some() && ch != '"' {
+            return Err(json_enum_error());
+        }
         match ch {
             '{' => {
-                self.stack.push(JsonFrame::Object(JsonObjectExpect::KeyOrEnd));
+                let object_key = self.current_object_value_key();
+                self.stack.push(JsonFrame::Object {
+                    expect: JsonObjectExpect::KeyOrEnd,
+                    current_key: None,
+                    object_key,
+                });
                 Ok(())
             }
             '[' => {
-                self.stack.push(JsonFrame::Array(JsonArrayExpect::ValueOrEnd));
+                self.stack
+                    .push(JsonFrame::Array(JsonArrayExpect::ValueOrEnd));
                 Ok(())
             }
             '"' => {
@@ -660,6 +843,9 @@ impl JsonPrefixState {
                     kind: JsonStringKind::Value,
                     escape: false,
                     unicode_remaining: 0,
+                    text: String::new(),
+                    ambiguous: false,
+                    enum_values,
                 };
                 Ok(())
             }
@@ -688,15 +874,20 @@ impl JsonPrefixState {
                 };
                 Ok(())
             }
-            _ => Err(()),
+            _ => Err(json_syntax_error()),
         }
     }
 
-    fn finish_value(&mut self) -> Result<(), ()> {
+    fn finish_value(&mut self) -> Result<(), JsonMaskReject> {
         self.mode = JsonMode::Normal;
         match self.stack.last_mut() {
-            Some(JsonFrame::Object(expect)) => {
+            Some(JsonFrame::Object {
+                expect,
+                current_key,
+                ..
+            }) => {
                 *expect = JsonObjectExpect::CommaOrEnd;
+                *current_key = None;
                 Ok(())
             }
             Some(JsonFrame::Array(expect)) => {
@@ -710,21 +901,31 @@ impl JsonPrefixState {
         }
     }
 
-    fn current_expect(&self) -> Result<JsonExpect, ()> {
+    fn current_expect(&self) -> Result<JsonExpect, JsonMaskReject> {
         match self.stack.last() {
             None => {
                 if matches!(self.mode, JsonMode::Root) {
                     Ok(JsonExpect::Root)
                 } else {
-                    Err(())
+                    Err(json_syntax_error())
                 }
             }
-            Some(JsonFrame::Object(JsonObjectExpect::KeyOrEnd)) => Ok(JsonExpect::ObjectKeyOrEnd),
-            Some(JsonFrame::Object(JsonObjectExpect::Colon)) => Ok(JsonExpect::ObjectColon),
-            Some(JsonFrame::Object(JsonObjectExpect::Value)) => Ok(JsonExpect::ObjectValue),
-            Some(JsonFrame::Object(JsonObjectExpect::CommaOrEnd)) => {
-                Ok(JsonExpect::ObjectCommaOrEnd)
-            }
+            Some(JsonFrame::Object {
+                expect: JsonObjectExpect::KeyOrEnd,
+                ..
+            }) => Ok(JsonExpect::ObjectKeyOrEnd),
+            Some(JsonFrame::Object {
+                expect: JsonObjectExpect::Colon,
+                ..
+            }) => Ok(JsonExpect::ObjectColon),
+            Some(JsonFrame::Object {
+                expect: JsonObjectExpect::Value,
+                ..
+            }) => Ok(JsonExpect::ObjectValue),
+            Some(JsonFrame::Object {
+                expect: JsonObjectExpect::CommaOrEnd,
+                ..
+            }) => Ok(JsonExpect::ObjectCommaOrEnd),
             Some(JsonFrame::Array(JsonArrayExpect::ValueOrEnd)) => {
                 Ok(JsonExpect::ArrayValueOrEnd)
             }
@@ -732,17 +933,60 @@ impl JsonPrefixState {
         }
     }
 
-    fn set_object_expect(&mut self, next: JsonObjectExpect) -> Result<(), ()> {
-        let Some(JsonFrame::Object(expect)) = self.stack.last_mut() else {
-            return Err(());
+    fn set_object_expect(&mut self, next: JsonObjectExpect) -> Result<(), JsonMaskReject> {
+        let Some(JsonFrame::Object {
+            expect,
+            current_key,
+            ..
+        }) = self.stack.last_mut()
+        else {
+            return Err(json_syntax_error());
         };
+        if matches!(next, JsonObjectExpect::KeyOrEnd) {
+            *current_key = None;
+        }
         *expect = next;
         Ok(())
     }
 
-    fn set_array_expect(&mut self, next: JsonArrayExpect) -> Result<(), ()> {
+    fn set_current_key(&mut self, key: Option<String>) -> Result<(), JsonMaskReject> {
+        let Some(JsonFrame::Object { current_key, .. }) = self.stack.last_mut() else {
+            return Err(json_syntax_error());
+        };
+        *current_key = key;
+        Ok(())
+    }
+
+    fn current_object_value_key(&self) -> Option<String> {
+        let Some(JsonFrame::Object {
+            expect: JsonObjectExpect::Value,
+            current_key: Some(key),
+            ..
+        }) = self.stack.last()
+        else {
+            return None;
+        };
+        Some(key.clone())
+    }
+
+    fn current_enum_values(&self) -> Option<Vec<String>> {
+        let Some(JsonFrame::Object {
+            expect: JsonObjectExpect::Value,
+            current_key: Some(key),
+            object_key: Some(object_key),
+        }) = self.stack.last()
+        else {
+            return None;
+        };
+        if object_key != "output" {
+            return None;
+        }
+        self.enum_fields.values_for_key(key)
+    }
+
+    fn set_array_expect(&mut self, next: JsonArrayExpect) -> Result<(), JsonMaskReject> {
         let Some(JsonFrame::Array(expect)) = self.stack.last_mut() else {
-            return Err(());
+            return Err(json_syntax_error());
         };
         *expect = next;
         Ok(())
@@ -757,6 +1001,9 @@ enum JsonMode {
         kind: JsonStringKind,
         escape: bool,
         unicode_remaining: u8,
+        text: String,
+        ambiguous: bool,
+        enum_values: Option<Vec<String>>,
     },
     Number,
     Literal {
@@ -768,7 +1015,11 @@ enum JsonMode {
 
 #[derive(Clone)]
 enum JsonFrame {
-    Object(JsonObjectExpect),
+    Object {
+        expect: JsonObjectExpect,
+        current_key: Option<String>,
+        object_key: Option<String>,
+    },
     Array(JsonArrayExpect),
 }
 
@@ -800,6 +1051,78 @@ enum JsonExpect {
     ObjectCommaOrEnd,
     ArrayValueOrEnd,
     ArrayCommaOrEnd,
+}
+
+#[cfg(test)]
+mod linked_json_mask_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn enum_fields_read_top_level_string_enums() {
+        let fields = json_enum_fields_from_schema(&json!({
+            "type": "object",
+            "properties": {
+                "status": {"enum": ["ok", "blocked"]},
+                "count": {"enum": [1, 2]},
+                "quoted": {"enum": ["needs\"escape"]}
+            }
+        }));
+
+        assert_eq!(fields.fields.len(), 1);
+        assert_eq!(fields.values_for_key("status").unwrap(), vec!["ok", "blocked"]);
+    }
+
+    #[test]
+    fn enum_mask_rejects_invalid_top_level_value_prefix() {
+        let fields = json_enum_fields_from_schema(&json!({
+            "type": "object",
+            "properties": {
+                "status": {"enum": ["ok"]}
+            }
+        }));
+        let mut state = JsonPrefixState::new(fields);
+
+        assert!(state.push_str("{\"output\":{\"status\":\"o").is_ok());
+        assert!(matches!(
+            state.push_str("b"),
+            Err(JsonMaskReject::Enum)
+        ));
+    }
+
+    #[test]
+    fn enum_mask_passes_through_nested_values() {
+        let fields = json_enum_fields_from_schema(&json!({
+            "type": "object",
+            "properties": {
+                "status": {"enum": ["ok"]}
+            }
+        }));
+        let mut state = JsonPrefixState::new(fields);
+
+        assert!(state
+            .push_str("{\"other\":{\"status\":\"blocked\"}}")
+            .is_ok());
+    }
+
+    #[test]
+    fn mask_records_uncertain_and_self_disable_paths() {
+        let fields = json_enum_fields_from_schema(&json!({
+            "type": "object",
+            "properties": {
+                "status": {"enum": ["ok"]}
+            }
+        }));
+        let mut uncertain = JsonLogitMask::new(true, true, fields.clone());
+        uncertain.observe_chosen("\u{fffd}");
+        assert!(uncertain.enabled);
+        assert_eq!(uncertain.uncertain_pieces, 1);
+
+        let mut invalid = JsonLogitMask::new(true, true, fields);
+        invalid.observe_chosen("not-json");
+        assert!(!invalid.enabled);
+        assert_eq!(invalid.fallbacks, 1);
+    }
 }
 
 fn validate_linked_token_budget(

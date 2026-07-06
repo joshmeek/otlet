@@ -140,6 +140,22 @@ fn generation_trace_summary(
             Value::Number(metrics.json_logit_mask_overhead_ms.into()),
         );
         object.insert(
+            "json_logit_mask_enum_enabled".to_owned(),
+            Value::Bool(metrics.json_logit_mask_enum_enabled),
+        );
+        object.insert(
+            "json_logit_mask_enum_fields".to_owned(),
+            Value::Number(metrics.json_logit_mask_enum_fields.into()),
+        );
+        object.insert(
+            "json_logit_mask_enum_values".to_owned(),
+            Value::Number(metrics.json_logit_mask_enum_values.into()),
+        );
+        object.insert(
+            "json_logit_mask_enum_candidates_rejected".to_owned(),
+            Value::Number(metrics.json_logit_mask_enum_candidates_rejected.into()),
+        );
+        object.insert(
             "inference_cache_key_basis".to_owned(),
             Value::String(context.inference_cache_key_basis.clone()),
         );

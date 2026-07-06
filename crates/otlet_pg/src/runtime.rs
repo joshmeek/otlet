@@ -5,6 +5,7 @@ pub(crate) struct RuntimeOptions {
     pub(crate) schema_prompt: String,
     pub(crate) prefix_kv_reuse: bool,
     pub(crate) json_logit_mask: bool,
+    pub(crate) json_logit_mask_enum: bool,
     pub(crate) max_tokens: u64,
     pub(crate) inference_cache: bool,
     pub(crate) max_worker_rss_bytes: u64,
@@ -20,6 +21,7 @@ impl Default for RuntimeOptions {
             schema_prompt: "verbatim".to_owned(),
             prefix_kv_reuse: false,
             json_logit_mask: false,
+            json_logit_mask_enum: false,
             max_tokens: 512,
             inference_cache: true,
             max_worker_rss_bytes: 0,
@@ -43,6 +45,7 @@ pub(crate) fn parse_runtime_options(value: &Value) -> Result<RuntimeOptions, Str
                 | "schema_prompt"
                 | "prefix_kv_reuse"
                 | "json_logit_mask"
+                | "json_logit_mask_enum"
                 | "max_tokens"
                 | "max_attempt_ms"
                 | "inference_cache"
@@ -85,6 +88,12 @@ pub(crate) fn parse_runtime_options(value: &Value) -> Result<RuntimeOptions, Str
         options.json_logit_mask = value
             .as_bool()
             .ok_or("runtime_options.json_logit_mask must be a boolean")?;
+    }
+
+    if let Some(value) = object.get("json_logit_mask_enum") {
+        options.json_logit_mask_enum = value
+            .as_bool()
+            .ok_or("runtime_options.json_logit_mask_enum must be a boolean")?;
     }
 
     if let Some(value) = object.get("max_tokens") {
@@ -172,6 +181,7 @@ pub(crate) fn runtime_option_status(value: &Value) -> Value {
         "schema_prompt",
         "prefix_kv_reuse",
         "json_logit_mask",
+        "json_logit_mask_enum",
         "max_tokens",
         "max_attempt_ms",
         "inference_cache",

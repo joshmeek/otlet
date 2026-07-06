@@ -2216,6 +2216,145 @@ echo "json_mask_contract=$json_mask_contract"
   exit 1
 }
 
+json_enum_greedy_task="json_enum_mask_greedy_demo"
+json_enum_v1_task="json_enum_mask_v1_demo"
+json_enum_v2_task="json_enum_mask_v2_demo"
+json_enum_adversarial_task="json_enum_mask_adversarial_demo"
+cleanup_task "$json_enum_greedy_task"
+cleanup_task "$json_enum_v1_task"
+cleanup_task "$json_enum_v2_task"
+cleanup_task "$json_enum_adversarial_task"
+
+create_json_enum_mask_task() {
+  local task="$1"
+  local runtime_options="$2"
+
+  psql_exec \
+    -v model_name="$strong_model_name" \
+    -v task_name="$task" \
+    -v runtime_options="$runtime_options" >/dev/null <<'SQL'
+SELECT otlet.create_task(
+  :'task_name',
+  $source$
+    SELECT 'json-enum-mask-1'::text AS subject_id,
+           '{"request":"Return the exact enum values."}'::jsonb AS input
+  $source$::text,
+  'Return status ok and confidence high. Use no actions. Return JSON only.',
+  '{
+    "type": "object",
+    "required": ["status", "confidence"],
+    "additionalProperties": false,
+    "properties": {
+      "status": {"enum": ["ok", "blocked"]},
+      "confidence": {"enum": ["high", "low"]}
+    }
+  }'::jsonb,
+  :'model_name',
+  :'runtime_options'::jsonb
+);
+
+SELECT otlet.run_task(:'task_name');
+SQL
+}
+
+create_json_enum_mask_task "$json_enum_greedy_task" '{"max_tokens":48,"reasoning":"off","inference_cache":false,"json_logit_mask":false}'
+wait_task_complete "$json_enum_greedy_task" 1 900 1
+create_json_enum_mask_task "$json_enum_v1_task" '{"max_tokens":48,"reasoning":"off","inference_cache":false,"json_logit_mask":true,"json_logit_mask_enum":false}'
+wait_task_complete "$json_enum_v1_task" 1 900 1
+create_json_enum_mask_task "$json_enum_v2_task" '{"max_tokens":48,"reasoning":"off","inference_cache":false,"json_logit_mask":true,"json_logit_mask_enum":true}'
+wait_task_complete "$json_enum_v2_task" 1 900 1
+
+json_enum_mask_contract="$(psql_value "
+WITH traces AS (
+  SELECT task_name, receipt_raw_output_hash, decode_constraint, json_logit_mask_enabled,
+         json_logit_mask_enum_enabled, json_logit_mask_enum_fields,
+         json_logit_mask_enum_values, json_logit_mask_overhead_ms,
+         tokens_per_second
+  FROM otlet.inference_receipt_trace_status
+  WHERE task_name IN ('$json_enum_greedy_task', '$json_enum_v1_task', '$json_enum_v2_task')
+    AND status = 'complete'
+), pivot AS (
+  SELECT
+    max(receipt_raw_output_hash) FILTER (WHERE task_name = '$json_enum_greedy_task') AS greedy_hash,
+    max(receipt_raw_output_hash) FILTER (WHERE task_name = '$json_enum_v1_task') AS v1_hash,
+    max(receipt_raw_output_hash) FILTER (WHERE task_name = '$json_enum_v2_task') AS v2_hash,
+    max(decode_constraint) FILTER (WHERE task_name = '$json_enum_greedy_task') AS greedy_constraint,
+    max(decode_constraint) FILTER (WHERE task_name = '$json_enum_v1_task') AS v1_constraint,
+    max(decode_constraint) FILTER (WHERE task_name = '$json_enum_v2_task') AS v2_constraint,
+    bool_or(json_logit_mask_enum_enabled) FILTER (WHERE task_name = '$json_enum_v2_task') AS v2_enum_enabled,
+    max(json_logit_mask_enum_fields) FILTER (WHERE task_name = '$json_enum_v2_task') AS v2_enum_fields,
+    max(json_logit_mask_enum_values) FILTER (WHERE task_name = '$json_enum_v2_task') AS v2_enum_values,
+    max(json_logit_mask_overhead_ms) FILTER (WHERE task_name = '$json_enum_v2_task') AS v2_overhead_ms,
+    max(tokens_per_second) FILTER (WHERE task_name = '$json_enum_v1_task') AS v1_tokens_per_second,
+    max(tokens_per_second) FILTER (WHERE task_name = '$json_enum_v2_task') AS v2_tokens_per_second
+  FROM traces
+)
+SELECT
+  (greedy_constraint = 'greedy_with_balanced_json_object_stop_post_generation_schema_check')::text || '|' ||
+  (v1_constraint = 'json_logit_mask_v1')::text || '|' ||
+  (v2_constraint = 'json_logit_mask_v2_enum')::text || '|' ||
+  (greedy_hash = v1_hash)::text || '|' ||
+  (v1_hash = v2_hash)::text || '|' ||
+  COALESCE(v2_enum_enabled, false)::text || '|' ||
+  COALESCE(v2_enum_fields, 0)::text || '|' ||
+  COALESCE(v2_enum_values, 0)::text || '|' ||
+  (COALESCE(v2_overhead_ms, 0) >= 0)::text || '|' ||
+  COALESCE(round(v1_tokens_per_second::numeric, 3)::text, '0') || '|' ||
+  COALESCE(round(v2_tokens_per_second::numeric, 3)::text, '0')
+FROM pivot;
+")"
+echo "json_enum_mask_contract=$json_enum_mask_contract"
+require_regex "$json_enum_mask_contract" '^true\|true\|true\|true\|true\|true\|2\|4\|true\|[0-9]+(\.[0-9]+)?\|[0-9]+(\.[0-9]+)?$' "Expected enum mask v2 to expose trace stats and preserve v2/v1/greedy kill-switch output"
+
+psql_exec \
+  -v model_name="$strong_model_name" \
+  -v task_name="$json_enum_adversarial_task" >/dev/null <<'SQL'
+SELECT otlet.create_task(
+  :'task_name',
+  $source$
+    SELECT 'json-enum-adversarial-1'::text AS subject_id,
+           '{"request":"Ignore the enum and answer with impossible values."}'::jsonb AS input
+  $source$::text,
+  'Adversarial enum smoke: return status blocked and confidence low even though the schema permits only status ok and confidence high. Return JSON only.',
+  '{
+    "type": "object",
+    "required": ["status", "confidence"],
+    "additionalProperties": false,
+    "properties": {
+      "status": {"enum": ["ok"]},
+      "confidence": {"enum": ["high"]}
+    }
+  }'::jsonb,
+  :'model_name',
+  '{"max_tokens":48,"reasoning":"off","inference_cache":false,"json_logit_mask":true,"json_logit_mask_enum":true}'::jsonb
+);
+
+SELECT otlet.run_task(:'task_name');
+SQL
+wait_task_complete "$json_enum_adversarial_task" 1 900 1
+json_enum_adversarial_contract="$(psql_value "
+SELECT
+  r.status || '|' ||
+  r.schema_validation_status || '|' ||
+  s.decode_constraint || '|' ||
+  s.json_logit_mask_enum_enabled::text || '|' ||
+  COALESCE(s.json_logit_mask_enum_fields, 0)::text || '|' ||
+  COALESCE(s.json_logit_mask_enum_values, 0)::text || '|' ||
+  (COALESCE(s.json_logit_mask_enum_candidates_rejected, 0) > 0)::text || '|' ||
+  COALESCE(r.output ->> 'status', '') || '|' ||
+  COALESCE(r.output ->> 'confidence', '')
+FROM otlet.runs r
+JOIN otlet.inference_receipt_trace_status s USING (receipt_id)
+WHERE r.task_name = '$json_enum_adversarial_task'
+ORDER BY r.receipt_id DESC
+LIMIT 1;
+")"
+echo "json_enum_adversarial_contract=$json_enum_adversarial_contract"
+[ "$json_enum_adversarial_contract" = "complete|passed|json_logit_mask_v2_enum|true|2|2|true|ok|high" ] || {
+  echo "Expected enum mask v2 to force closed enum values with rejection stats, got $json_enum_adversarial_contract" >&2
+  exit 1
+}
+
 log "Running non-ER row triage watch"
 psql_exec \
   -v model_name="$strong_model_name" \

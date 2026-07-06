@@ -44,6 +44,10 @@ pub(crate) struct ModelMetrics {
     pub(crate) json_logit_mask_fallbacks: i64,
     pub(crate) json_logit_mask_uncertain_pieces: i64,
     pub(crate) json_logit_mask_overhead_ms: i64,
+    pub(crate) json_logit_mask_enum_enabled: bool,
+    pub(crate) json_logit_mask_enum_fields: i64,
+    pub(crate) json_logit_mask_enum_values: i64,
+    pub(crate) json_logit_mask_enum_candidates_rejected: i64,
     pub(crate) generated_tokens: i64,
     pub(crate) generate_ms: i64,
     pub(crate) cache_hit: bool,
@@ -262,9 +266,9 @@ pub(crate) fn run_job(job: &Job) -> Result<ModelRun, ModelError> {
         input_truncated: shaped_input.input_truncated,
         input_shaping_applied: shaped_input.applied,
         schema_prompt: options.schema_prompt.clone(),
-        decode_constraint: decode_constraint_name(&options).to_owned(),
-        grammar_supported: false,
-        decode_constraint_reason: decode_constraint_reason(&options).to_owned(),
+        decode_constraint: decode_constraint_name(&options, &job.output_schema).to_owned(),
+        grammar_supported: decode_constraint_has_enum_mask(&options, &job.output_schema),
+        decode_constraint_reason: decode_constraint_reason(&options, &job.output_schema).to_owned(),
     };
     let content_cache_key = inference_cache_content_key(job, &context);
     let contract_cache_key = inference_cache_contract_key(&context);
@@ -339,6 +343,13 @@ pub(crate) fn run_job(job: &Job) -> Result<ModelRun, ModelError> {
                 json_logit_mask_fallbacks: 0,
                 json_logit_mask_uncertain_pieces: 0,
                 json_logit_mask_overhead_ms: 0,
+                json_logit_mask_enum_enabled: decode_constraint_has_enum_mask(
+                    &options,
+                    &job.output_schema,
+                ),
+                json_logit_mask_enum_fields: 0,
+                json_logit_mask_enum_values: 0,
+                json_logit_mask_enum_candidates_rejected: 0,
                 generated_tokens: 0,
                 generate_ms: 0,
                 cache_hit: false,
@@ -673,6 +684,8 @@ const LINKED_DECODE_CONSTRAINT_REASON: &str =
 const LINKED_JSON_LOGIT_MASK_CONSTRAINT: &str = "json_logit_mask_v1";
 const LINKED_JSON_LOGIT_MASK_CONSTRAINT_REASON: &str =
     "rust_token_piece_json_prefix_mask_before_argmax_post_generation_schema_check_unchanged";
+const LINKED_JSON_LOGIT_MASK_ENUM_CONSTRAINT: &str = "json_logit_mask_v2_enum";
+const LINKED_JSON_LOGIT_MASK_ENUM_CONSTRAINT_REASON: &str = "output_envelope_string_enum_token_piece_mask_before_argmax_post_generation_schema_check_unchanged";
 const LINKED_CONTEXT_WINDOW_TOKENS: u32 = 4096;
 const LINKED_PROMPT_BATCH_TOKENS: usize = 512;
 const LINKED_ACTIVE_SEQUENCE_ID: llama_cpp_sys_4::llama_seq_id = 0;
@@ -686,18 +699,37 @@ include!("linked.rs");
 include!("cache.rs");
 include!("output.rs");
 
-fn decode_constraint_name(options: &crate::runtime::RuntimeOptions) -> &'static str {
-    if options.json_logit_mask {
+fn decode_constraint_name(
+    options: &crate::runtime::RuntimeOptions,
+    output_schema: &Value,
+) -> &'static str {
+    if decode_constraint_has_enum_mask(options, output_schema) {
+        LINKED_JSON_LOGIT_MASK_ENUM_CONSTRAINT
+    } else if options.json_logit_mask {
         LINKED_JSON_LOGIT_MASK_CONSTRAINT
     } else {
         LINKED_DECODE_CONSTRAINT
     }
 }
 
-fn decode_constraint_reason(options: &crate::runtime::RuntimeOptions) -> &'static str {
-    if options.json_logit_mask {
+fn decode_constraint_reason(
+    options: &crate::runtime::RuntimeOptions,
+    output_schema: &Value,
+) -> &'static str {
+    if decode_constraint_has_enum_mask(options, output_schema) {
+        LINKED_JSON_LOGIT_MASK_ENUM_CONSTRAINT_REASON
+    } else if options.json_logit_mask {
         LINKED_JSON_LOGIT_MASK_CONSTRAINT_REASON
     } else {
         LINKED_DECODE_CONSTRAINT_REASON
     }
+}
+
+fn decode_constraint_has_enum_mask(
+    options: &crate::runtime::RuntimeOptions,
+    output_schema: &Value,
+) -> bool {
+    options.json_logit_mask
+        && options.json_logit_mask_enum
+        && json_enum_fields_from_schema(output_schema).has_fields()
 }
