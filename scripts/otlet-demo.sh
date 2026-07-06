@@ -33,6 +33,7 @@ output_envelope_task="output_envelope_safety_demo"
 prompt_diet_verbatim_task="prompt_diet_verbatim_demo"
 prompt_diet_compact_task="prompt_diet_compact_demo"
 custom_action_schema_task="custom_action_schema_demo"
+posthoc_output_rule_task="posthoc_output_rule_demo"
 action_allowlist_watch="action_allowlist_demo"
 action_allowlist_task="${action_allowlist_watch}_task"
 direct_gate_task="direct_decision_gate_demo"
@@ -307,6 +308,7 @@ cleanup_task "$output_envelope_task"
 cleanup_task "$prompt_diet_verbatim_task"
 cleanup_task "$prompt_diet_compact_task"
 cleanup_task "$custom_action_schema_task"
+cleanup_task "$posthoc_output_rule_task"
 cleanup_task "$action_allowlist_task"
 cleanup_task "$direct_gate_task"
 cleanup_task "input_shape_mvcc_raw_demo"
@@ -3667,20 +3669,26 @@ WITH schema_check AS (
   JOIN otlet.inference_receipts r ON r.id = a.receipt_id
   WHERE a.task_name = '$entity_task'
     AND r.selection_status <> 'accepted'
+), applyable_check AS (
+  SELECT string_agg(action_type || ':' || applyable::text, '|' ORDER BY action_type) AS value
+  FROM otlet.action_type_schemas
+  WHERE action_type IN ('create_record', 'merge_candidate', 'new_entity', 'note', 'review_flag')
 )
 SELECT concat_ws(E'\n',
   'action_schema_contract=' || schema_check.value,
   'action_type_contract=' || type_check.value,
   'action_status_contract=' || status_check.value,
-  'failed_attempt_action_contract=' || failed_check.value
+  'failed_attempt_action_contract=' || failed_check.value,
+  'action_applyable_contract=' || applyable_check.value
 )
-FROM schema_check, type_check, status_check, failed_check;
+FROM schema_check, type_check, status_check, failed_check, applyable_check;
 ")"
 printf '%s\n' "$action_contract"
 require_contains "$action_contract" "action_schema_contract=merge_candidate|new_entity|note|review_flag" "Expected built-in action schemas"
 require_contains "$action_contract" "action_type_contract=merge_candidate|new_entity" "Expected entity-resolution merge_candidate and new_entity actions"
 require_contains "$action_contract" "action_status_contract=4|4|4|0" "Expected four trusted valid entity actions"
 require_contains "$action_contract" "failed_attempt_action_contract=0" "Expected failed/rejected attempts to create no actions"
+require_contains "$action_contract" "action_applyable_contract=create_record:true|merge_candidate:false|new_entity:false|note:true|review_flag:false" "Expected applyable metadata to be schema-driven"
 
 merge_action_id="$(psql_value "
 SELECT min(action_id)
@@ -3720,11 +3728,11 @@ echo "action_dry_run_contract=$action_dry_run_contract"
 }
 
 action_apply_contract="$(psql_value "
-SELECT status || '|' || approval_status || '|' || apply_status
+SELECT status || '|' || approval_status || '|' || apply_status || '|' || COALESCE(error, '')
 FROM otlet.apply_action($merge_action_id);
 ")"
 echo "action_apply_contract=$action_apply_contract"
-[ "$action_apply_contract" = "approved|approved|not_applicable" ] || {
+[ "$action_apply_contract" = "approved|approved|not_applicable|action type has no apply path" ] || {
   echo "Expected merge_candidate apply to stay not_applicable, got $action_apply_contract" >&2
   exit 1
 }
@@ -3736,6 +3744,103 @@ FROM otlet.reject_action($new_entity_action_id, 'demo rejection');
 echo "action_reject_contract=$action_reject_contract"
 [ "$action_reject_contract" = "rejected|rejected" ] || {
   echo "Expected new_entity rejection, got $action_reject_contract" >&2
+  exit 1
+}
+
+cleanup_task "$posthoc_output_rule_task"
+posthoc_output_rule_contract="$(
+  psql_exec -qAt -v task_name="$posthoc_output_rule_task" -v model_name="$strong_model_name" <<'SQL'
+CREATE TEMP TABLE posthoc_rule_result (
+  ord int PRIMARY KEY,
+  status text NOT NULL,
+  error text NOT NULL
+);
+DO $$
+DECLARE
+  selected_job_id bigint;
+  selected_action_id bigint;
+  action_state otlet.actions%ROWTYPE;
+BEGIN
+  PERFORM otlet.create_task(
+    :'task_name',
+    $source$
+      SELECT 'posthoc-left:posthoc-right'::text AS subject_id,
+             '{"action_ids":{"left_id":"posthoc-left","right_id":"posthoc-right"}}'::jsonb AS input
+    $source$::text,
+    'Return JSON only.',
+    '{"type":"object","required":["match","confidence"],"additionalProperties":false,"properties":{"match":{"enum":["same_entity","different_entity"]},"confidence":{"enum":["high"]}}}'::jsonb,
+    :'model_name',
+    '{"max_tokens":32,"reasoning":"off","inference_cache":false}'::jsonb
+  );
+
+  INSERT INTO otlet.jobs (task_name, subject_id, input, status, attempts, started_at, leased_until)
+  VALUES (
+    :'task_name',
+    'posthoc-left:posthoc-right',
+    '{"action_ids":{"left_id":"posthoc-left","right_id":"posthoc-right"}}'::jsonb,
+    'running',
+    1,
+    now(),
+    now() + interval '5 minutes'
+  )
+  RETURNING id INTO selected_job_id;
+
+  PERFORM otlet.complete_job(
+    selected_job_id,
+    '{"match":"same_entity","confidence":"high"}'::jsonb,
+    '{"output":{"match":"same_entity","confidence":"high"},"actions":[{"type":"merge_candidate","body":{"left_id":"posthoc-left","right_id":"posthoc-right","confidence":"high","reason":"same"}}]}',
+    '[{"type":"merge_candidate","body":{"left_id":"posthoc-left","right_id":"posthoc-right","confidence":"high","reason":"same"}}]'::jsonb,
+    NULL,
+    NULL,
+    NULL,
+    md5('{"output":{"match":"same_entity","confidence":"high"},"actions":[{"type":"merge_candidate","body":{"left_id":"posthoc-left","right_id":"posthoc-right","confidence":"high","reason":"same"}}]}'),
+    now(),
+    '{"schema_validation_status":"passed"}'::jsonb,
+    :'model_name'
+  );
+
+  SELECT a.id
+  INTO selected_action_id
+  FROM otlet.actions a
+  JOIN otlet.jobs j ON j.id = a.job_id
+  WHERE j.task_name = :'task_name'
+  ORDER BY a.id DESC
+  LIMIT 1;
+
+  PERFORM otlet.approve_action(selected_action_id);
+
+  SELECT *
+  INTO action_state
+  FROM otlet.apply_action(selected_action_id);
+  INSERT INTO posthoc_rule_result
+  VALUES (1, action_state.apply_status, COALESCE(action_state.error, ''));
+
+  UPDATE otlet.outputs o
+  SET output = '{"match":"different_entity","confidence":"high"}'::jsonb
+  FROM otlet.jobs j
+  WHERE o.job_id = j.id
+    AND j.task_name = :'task_name';
+
+  SELECT *
+  INTO action_state
+  FROM otlet.dry_run_action(selected_action_id);
+  INSERT INTO posthoc_rule_result
+  VALUES (2, action_state.dry_run_status, COALESCE(action_state.error, ''));
+
+  SELECT *
+  INTO action_state
+  FROM otlet.apply_action(selected_action_id);
+  INSERT INTO posthoc_rule_result
+  VALUES (3, action_state.apply_status, COALESCE(action_state.error, ''));
+END;
+$$;
+SELECT string_agg(status || '|' || error, '|' ORDER BY ord)
+FROM posthoc_rule_result;
+SQL
+)"
+echo "posthoc_output_rule_contract=$posthoc_output_rule_contract"
+[ "$posthoc_output_rule_contract" = "not_applicable|action type has no apply path|failed|merge_candidate requires same_entity output|failed|merge_candidate requires same_entity output" ] || {
+  echo "Expected post-hoc output_equals validation to fail dry-run/apply, got $posthoc_output_rule_contract" >&2
   exit 1
 }
 
@@ -4398,7 +4503,13 @@ WITH validation AS (
       '{\"match\":\"same_entity\",\"confidence\":\"high\",\"reason\":\"same\"}'::jsonb,
       'tenant:left:1:tenant:right:2',
       '{\"action_ids\":{\"left_id\":\"tenant:left:1\",\"right_id\":\"tenant:right:2\"}}'::jsonb
-    ), 'ok') AS invalid_pair
+    ), 'ok') AS invalid_pair,
+    COALESCE(otlet.action_validation_error(
+      '{\"type\":\"merge_candidate\",\"body\":{\"left_id\":\"tenant:left:1\",\"right_id\":\"tenant:right:2\",\"confidence\":\"high\",\"reason\":\"same\"}}'::jsonb,
+      '{\"match\":\"same_entity\",\"confidence\":\"high\",\"reason\":\"same\"}'::jsonb,
+      'tenant:left:1:tenant:right:2',
+      '{}'::jsonb
+    ), 'ok') AS missing_action_ids
 )
 SELECT (SELECT value FROM colon_subject_contract_parts WHERE key = 'before_mark') || '|' ||
        (SELECT value FROM colon_subject_contract_parts WHERE key = 'fragment_mark') || '|' ||
@@ -4407,10 +4518,11 @@ SELECT (SELECT value FROM colon_subject_contract_parts WHERE key = 'before_mark'
        (SELECT value FROM colon_subject_contract_parts WHERE key = 'after_exact') || '|' ||
        (SELECT value FROM colon_subject_contract_parts WHERE key = 'lookup_after_exact') || '|' ||
        (SELECT valid_pair FROM validation) || '|' ||
-       (SELECT invalid_pair FROM validation);
+       (SELECT invalid_pair FROM validation) || '|' ||
+       (SELECT missing_action_ids FROM validation);
 ")"
 echo "colon_subject_safety_contract=$colon_subject_contract"
-[ "$colon_subject_contract" = "1|0|0|1|1|0|ok|merge_candidate subject ids must match job subject_id" ] || {
+[ "$colon_subject_contract" = "1|0|0|1|1|0|ok|merge_candidate subject ids must match job subject_id|merge_candidate requires input.action_ids left_id and right_id" ] || {
   echo "Expected colon subject IDs to validate and stale-mark only by exact subject, got $colon_subject_contract" >&2
   exit 1
 }

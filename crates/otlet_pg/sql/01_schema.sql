@@ -422,6 +422,7 @@ CREATE TABLE otlet.action_type_schemas (
   action_type text PRIMARY KEY,
   requires_approval boolean NOT NULL DEFAULT false,
   creates_record boolean NOT NULL DEFAULT false,
+  applyable boolean NOT NULL DEFAULT false,
   payload_schema jsonb NOT NULL DEFAULT '{}'::jsonb CHECK (jsonb_typeof(payload_schema) = 'object'),
   created_at timestamptz NOT NULL DEFAULT now()
 );
@@ -430,10 +431,11 @@ INSERT INTO otlet.action_type_schemas (
   action_type,
   requires_approval,
   creates_record,
+  applyable,
   payload_schema
 )
 VALUES
-  ('create_record', false, true, $schema$
+  ('create_record', false, true, true, $schema$
     {
       "payload_source": "action",
       "required": ["record_type", "subject_id", "body"],
@@ -445,7 +447,7 @@ VALUES
       }
     }
   $schema$::jsonb),
-  ('merge_candidate', true, false, $schema$
+  ('merge_candidate', true, false, false, $schema$
     {
       "required": ["left_id", "right_id", "reason"],
       "properties": {
@@ -457,12 +459,12 @@ VALUES
       },
       "rules": [
         {"kind": "output_equals", "field": "match", "value": "same_entity", "error": "merge_candidate requires same_entity output"},
-        {"kind": "subject_pair_matches", "left_field": "left_id", "right_field": "right_id", "error": "merge_candidate subject ids must match job subject_id"},
+        {"kind": "subject_pair_matches", "left_field": "left_id", "right_field": "right_id", "error": "merge_candidate subject ids must match job subject_id", "missing_error": "merge_candidate requires input.action_ids left_id and right_id"},
         {"kind": "confidence_not_above_output", "field": "confidence", "output_field": "confidence", "error": "merge_candidate confidence cannot exceed output confidence"}
       ]
     }
   $schema$::jsonb),
-  ('new_entity', false, false, $schema$
+  ('new_entity', false, false, false, $schema$
     {
       "required": ["entity_id", "reason"],
       "properties": {
@@ -472,11 +474,11 @@ VALUES
       },
       "rules": [
         {"kind": "output_equals", "field": "match", "value": "different_entity", "error": "new_entity requires different_entity output"},
-        {"kind": "field_matches_expected_right", "field": "entity_id", "error": "new_entity entity_id must match job right subject_id"}
+        {"kind": "field_matches_expected_right", "field": "entity_id", "error": "new_entity entity_id must match job right subject_id", "missing_error": "new_entity requires input.action_ids right_id"}
       ]
     }
   $schema$::jsonb),
-  ('review_flag', false, false, $schema$
+  ('review_flag', false, false, false, $schema$
     {
       "required": ["reason"],
       "properties": {
@@ -491,7 +493,7 @@ VALUES
       ]
     }
   $schema$::jsonb),
-  ('note', false, true, $schema$
+  ('note', false, true, true, $schema$
     {
       "required": ["subject_id", "text"],
       "properties": {

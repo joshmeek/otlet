@@ -616,8 +616,10 @@ BEGIN
           RETURN rule ->> 'error';
         END IF;
       ELSIF rule_kind = 'subject_pair_matches' THEN
-        IF expected_left_id IS NOT NULL
-           AND (
+        IF expected_left_id IS NULL OR expected_right_id IS NULL THEN
+          RETURN COALESCE(rule ->> 'missing_error', 'action requires input.action_ids left_id and right_id');
+        END IF;
+        IF (
              body ->> (rule ->> 'left_field') <> expected_left_id
              OR body ->> (rule ->> 'right_field') <> expected_right_id
            ) THEN
@@ -633,8 +635,10 @@ BEGIN
           RETURN rule ->> 'error';
         END IF;
       ELSIF rule_kind = 'field_matches_expected_right' THEN
-        IF expected_right_id IS NOT NULL
-           AND body ->> (rule ->> 'field') <> expected_right_id THEN
+        IF expected_right_id IS NULL THEN
+          RETURN COALESCE(rule ->> 'missing_error', 'action requires input.action_ids right_id');
+        END IF;
+        IF body ->> (rule ->> 'field') <> expected_right_id THEN
           RETURN rule ->> 'error';
         END IF;
       ELSIF rule_kind = 'confidence_not_above_output' THEN
@@ -708,14 +712,6 @@ BEGIN
 
   expected_left_id := NULLIF(job_input #>> '{action_ids,left_id}', '');
   expected_right_id := NULLIF(job_input #>> '{action_ids,right_id}', '');
-
-  IF expected_left_id IS NULL
-     AND expected_right_id IS NULL
-     AND job_subject_id LIKE '%:%'
-     AND array_length(string_to_array(job_subject_id, ':'), 1) = 2 THEN
-    expected_left_id := split_part(job_subject_id, ':', 1);
-    expected_right_id := split_part(job_subject_id, ':', 2);
-  END IF;
 
   RETURN otlet.action_payload_schema_error(
     v_action_type,
@@ -1085,6 +1081,7 @@ AS $$
 DECLARE
   action_row otlet.actions%ROWTYPE;
   job_row otlet.jobs%ROWTYPE;
+  output_body jsonb;
   current_content_hash text;
   validation_error text;
 BEGIN
@@ -1103,8 +1100,18 @@ BEGIN
   FROM otlet.jobs j
   WHERE j.id = action_row.job_id;
 
+  SELECT o.output
+  INTO output_body
+  FROM otlet.outputs o
+  WHERE o.id = action_row.output_id;
+
   current_content_hash := otlet.current_task_subject_content_hash(job_row.task_name, job_row.subject_id);
-  validation_error := otlet.action_validation_error(action_row.payload);
+  validation_error := otlet.action_validation_error(
+    action_row.payload,
+    output_body,
+    job_row.subject_id,
+    job_row.input
+  );
   IF action_row.content_hash IS NOT NULL
      AND current_content_hash IS DISTINCT FROM action_row.content_hash THEN
     validation_error := 'source identity stale';
@@ -1128,6 +1135,10 @@ LANGUAGE plpgsql
 AS $$
 DECLARE
   action_row otlet.actions%ROWTYPE;
+  schema_row otlet.action_type_schemas%ROWTYPE;
+  job_row otlet.jobs%ROWTYPE;
+  output_body jsonb;
+  current_content_hash text;
   validation_error text;
   next_status text;
   next_apply_status text;
@@ -1144,11 +1155,37 @@ BEGIN
     RETURN;
   END IF;
 
-  validation_error := otlet.action_validation_error(action_row.payload);
+  SELECT *
+  INTO schema_row
+  FROM otlet.action_type_schemas s
+  WHERE s.action_type = action_row.action_type;
+
+  SELECT *
+  INTO job_row
+  FROM otlet.jobs j
+  WHERE j.id = action_row.job_id;
+
+  SELECT o.output
+  INTO output_body
+  FROM otlet.outputs o
+  WHERE o.id = action_row.output_id;
+
+  current_content_hash := otlet.current_task_subject_content_hash(job_row.task_name, job_row.subject_id);
+  validation_error := otlet.action_validation_error(
+    action_row.payload,
+    output_body,
+    job_row.subject_id,
+    job_row.input
+  );
   next_status := action_row.status;
   next_apply_status := action_row.apply_status;
   next_error := action_row.error;
   next_applied_at := action_row.applied_at;
+
+  IF action_row.content_hash IS NOT NULL
+     AND current_content_hash IS DISTINCT FROM action_row.content_hash THEN
+    validation_error := 'source identity stale';
+  END IF;
 
   IF validation_error IS NOT NULL THEN
     next_apply_status := 'failed';
@@ -1159,7 +1196,7 @@ BEGIN
   ELSIF action_row.approval_status = 'required' THEN
     next_apply_status := 'failed';
     next_error := 'action requires approval';
-  ELSIF action_row.action_type IN ('create_record', 'note') THEN
+  ELSIF schema_row.applyable THEN
     next_status := 'applied';
     next_apply_status := 'applied';
     next_applied_at := now();
