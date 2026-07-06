@@ -86,7 +86,8 @@ unsafe extern "C-unwind" fn explain_semantic_custom_scan(
             );
             explain_runtime_trace(runtime, es);
         } else if let Some(private) = custom_private_from_plan(node) {
-            let policy = semantic_policy_for_selected_path(&private.selected_path);
+            let planner_stats = reload_private_planner_stats(&private);
+            let policy = semantic_policy_for_selected_path(&planner_stats.selected_path);
             explain_semantic_metadata(
                 SemanticExplainMetadata {
                     index_name: &private.index_name,
@@ -105,15 +106,19 @@ unsafe extern "C-unwind" fn explain_semantic_custom_scan(
                 source_tuple_provider_from_state(state),
                 es,
             );
-            explain_text("Planner Selected Path", &private.selected_path, es);
-            explain_text("Planner Reason", &private.reason, es);
-            explain_text("Planner Stale Reasons", &private.stale_reasons, es);
-            explain_text("Count Basis", &private.count_basis, es);
-            explain_text("Model Cost Source", &private.model_cost_source, es);
-            explain_counter("Planner Infer Now Subjects", private.infer_decision_rows, es);
+            explain_text("Planner Selected Path", &planner_stats.selected_path, es);
+            explain_text("Planner Reason", &planner_stats.reason, es);
+            explain_text("Planner Stale Reasons", &planner_stats.stale_reasons, es);
+            explain_text("Count Basis", &planner_stats.count_basis, es);
+            explain_text("Model Cost Source", &planner_stats.model_cost_source, es);
+            explain_counter(
+                "Planner Infer Now Subjects",
+                planner_stats.infer_decision_rows,
+                es,
+            );
             explain_counter(
                 "Planner Fail Closed Subjects",
-                private.fail_closed_decision_rows,
+                planner_stats.fail_closed_decision_rows,
                 es,
             );
             explain_pg_cstr("Source Relation", (*state).source_table, es);
@@ -149,7 +154,7 @@ unsafe extern "C-unwind" fn explain_semantic_custom_scan(
             explain_scan_counters!(
                 &*state,
                 pg_cstr_str((*state).infer_now_last_error),
-                estimated_model_cost_ms(private.model_ms, private.infer_decision_rows),
+                estimated_model_cost_ms(planner_stats.model_ms, planner_stats.infer_decision_rows),
                 es
             );
             explain_state_trace(state, es);

@@ -449,10 +449,7 @@ BEGIN
       saved.task_name,
       cheap_model_name,
       strong_model_name,
-      actual_selection_policy -> 'accept_field_checks',
-      NULLIF(actual_selection_policy ->> 'cheap_skip_window', '')::integer,
-      NULLIF(actual_selection_policy ->> 'cheap_min_recent_acceptance', '')::double precision,
-      NULLIF(actual_selection_policy ->> 'cheap_probe_interval', '')::integer
+      actual_selection_policy -> 'accept_field_checks'
     );
   ELSE
     DELETE FROM otlet.model_selection_policies p
@@ -483,27 +480,61 @@ END;
 $$;
 
 CREATE VIEW otlet.watch_status AS
-WITH watch_plans AS (
-  SELECT w.name AS watch_name, p.*
+WITH watch_sources AS (
+  SELECT
+    COALESCE(w.name, si.name) AS watch_name,
+    'row'::text AS kind,
+    si.task_name,
+    si.name AS semantic_index_name,
+    NULL::text AS semantic_join_index_name,
+    si.source_table,
+    si.subject_column,
+    si.input_columns,
+    '[]'::jsonb AS pair_sources,
+    si.record_type,
+    si.model_name,
+    COALESCE(w.stale_policy, 'refresh_then_fail_closed') AS stale_policy,
+    COALESCE(w.trigger_policy, '{"on_change":"mark_stale"}'::jsonb) AS trigger_policy,
+    COALESCE(w.selection_policy, '{}'::jsonb) AS selection_policy
+  FROM otlet.semantic_indexes si
+  LEFT JOIN otlet.watches w ON w.semantic_index_name = si.name
+  UNION ALL
+  SELECT
+    COALESCE(w.name, ji.name) AS watch_name,
+    'pair'::text AS kind,
+    ji.task_name,
+    NULL::text AS semantic_index_name,
+    ji.name AS semantic_join_index_name,
+    NULL::text AS source_table,
+    NULL::text AS subject_column,
+    NULL::text[] AS input_columns,
+    COALESCE(w.pair_sources, '[]'::jsonb) AS pair_sources,
+    ji.record_type,
+    ji.model_name,
+    COALESCE(w.stale_policy, 'refresh_then_fail_closed') AS stale_policy,
+    COALESCE(w.trigger_policy, '{"on_change":"mark_stale"}'::jsonb) AS trigger_policy,
+    COALESCE(w.selection_policy, '{}'::jsonb) AS selection_policy
+  FROM otlet.semantic_join_indexes ji
+  LEFT JOIN otlet.watches w ON w.semantic_join_index_name = ji.name
+), watch_plans AS (
+  SELECT w.watch_name, p.*
   FROM (
     SELECT *
-    FROM otlet.watches
+    FROM watch_sources
     WHERE kind = 'row'
-      AND semantic_index_name IS NOT NULL
   ) w
   JOIN LATERAL otlet.semantic_index_plan(w.semantic_index_name) p ON true
   UNION ALL
-  SELECT w.name AS watch_name, p.*
+  SELECT w.watch_name, p.*
   FROM (
     SELECT *
-    FROM otlet.watches
+    FROM watch_sources
     WHERE kind = 'pair'
-      AND semantic_join_index_name IS NOT NULL
   ) w
   JOIN LATERAL otlet.semantic_join_index_plan(w.semantic_join_index_name) p ON true
 )
 SELECT
-  w.name AS watch_name,
+  w.watch_name,
   w.kind,
   w.task_name,
   w.semantic_index_name,
@@ -546,10 +577,10 @@ SELECT
   materialized.last_materialized_at,
   COALESCE(materialized.revalidated_materializations, 0)::bigint AS revalidated_materializations,
   COALESCE(plan.checked_at, now()) AS checked_at
-FROM otlet.watches w
+FROM watch_sources w
 LEFT JOIN otlet.semantic_indexes row_index ON row_index.name = w.semantic_index_name
 LEFT JOIN otlet.semantic_join_indexes join_index ON join_index.name = w.semantic_join_index_name
-LEFT JOIN watch_plans plan ON plan.watch_name = w.name
+LEFT JOIN watch_plans plan ON plan.watch_name = w.watch_name
 LEFT JOIN LATERAL (
   SELECT
     count(*) FILTER (WHERE j.status = 'queued')::bigint AS queued_jobs,

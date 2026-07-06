@@ -924,6 +924,80 @@ run_one_model() {
     cleanup_downloaded_model "$model_name" "$base_model_key" "$external_artifact"
   }
 
+  score_current_model_run() {
+    score_model_run \
+      "$run_model_key" \
+      "$base_model_key" \
+      "$model_name" \
+      "$family" \
+      "$tier" \
+      "$quant" \
+      "$declared_params_b" \
+      "$active_params_b" \
+      "$context_tokens" \
+      "$license_note" \
+      "$source_url" \
+      "$artifact_path" \
+      "$artifact_bytes" \
+      "$external_artifact" \
+      "$direct_task" \
+      "$triage_task" \
+      "$numeric_task" \
+      "$extraction_task" \
+      "$policy_task" \
+      "$join_task" \
+      "$row_task" \
+      "$join_index" \
+      "$wall_ms" \
+      "$source_unchanged" \
+      "$stale_leak_count" \
+      "$worker_crash_count"
+  }
+
+  run_and_wait() {
+    local task="$1"
+    local label="$2"
+    if ! psql_exec -v task_name="$task" >/dev/null <<'SQL'
+SELECT otlet.run_task(:'task_name');
+SQL
+    then
+      fail_current_model "$label enqueue failed"
+      return 1
+    fi
+    if ! wait_for_task "$task"; then
+      fail_current_model "$label timed out"
+      return 1
+    fi
+  }
+
+  refresh_and_wait() {
+    local kind="$1"
+    local index_name="$2"
+    local task="$3"
+    local label="$4"
+    if [[ "$kind" = "join" ]]; then
+      if ! psql_exec -v index_name="$index_name" >/dev/null <<'SQL'
+SELECT otlet.refresh_semantic_join_index(:'index_name');
+SQL
+      then
+        fail_current_model "$label enqueue failed"
+        return 1
+      fi
+    else
+      if ! psql_exec -v index_name="$index_name" >/dev/null <<'SQL'
+SELECT otlet.refresh_semantic_index(:'index_name');
+SQL
+      then
+        fail_current_model "$label enqueue failed"
+        return 1
+      fi
+    fi
+    if ! wait_for_task "$task"; then
+      fail_current_model "$label timed out"
+      return 1
+    fi
+  }
+
   started_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   started_s="$(date +%s)"
 
@@ -945,15 +1019,7 @@ run_one_model() {
     return
   fi
 
-  if ! psql_exec -v task_name="$direct_task" >/dev/null <<'SQL'
-SELECT otlet.run_task(:'task_name');
-SQL
-  then
-    fail_current_model "direct task enqueue failed"
-    return
-  fi
-  if ! wait_for_task "$direct_task"; then
-    fail_current_model "direct task timed out"
+  if ! run_and_wait "$direct_task" "direct task"; then
     return
   fi
 
@@ -980,33 +1046,7 @@ SQL
       return
     fi
     printf 'model=%s skip_diagnostics=true direct_schema_valid_rate=%s min_direct_schema_rate=%s\n' "$run_model_key" "$direct_rate" "$min_direct_schema_rate"
-    if ! score_model_run \
-      "$run_model_key" \
-      "$base_model_key" \
-      "$model_name" \
-      "$family" \
-      "$tier" \
-      "$quant" \
-      "$declared_params_b" \
-      "$active_params_b" \
-      "$context_tokens" \
-      "$license_note" \
-      "$source_url" \
-      "$artifact_path" \
-      "$artifact_bytes" \
-      "$external_artifact" \
-      "$direct_task" \
-      "$triage_task" \
-      "$numeric_task" \
-      "$extraction_task" \
-      "$policy_task" \
-      "$join_task" \
-      "$row_task" \
-      "$join_index" \
-      "$wall_ms" \
-      "$source_unchanged" \
-      "$stale_leak_count" \
-      "$worker_crash_count"; then
+    if ! score_current_model_run; then
       fail_current_model "scoring failed after direct task"
       return
     fi
@@ -1014,51 +1054,19 @@ SQL
     return
   fi
 
-  if ! psql_exec -v task_name="$triage_task" >/dev/null <<'SQL'
-SELECT otlet.run_task(:'task_name');
-SQL
-  then
-    fail_current_model "triage task enqueue failed"
-    return
-  fi
-  if ! wait_for_task "$triage_task"; then
-    fail_current_model "triage task timed out"
+  if ! run_and_wait "$triage_task" "triage task"; then
     return
   fi
 
-  if ! psql_exec -v task_name="$numeric_task" >/dev/null <<'SQL'
-SELECT otlet.run_task(:'task_name');
-SQL
-  then
-    fail_current_model "numeric task enqueue failed"
-    return
-  fi
-  if ! wait_for_task "$numeric_task"; then
-    fail_current_model "numeric task timed out"
+  if ! run_and_wait "$numeric_task" "numeric task"; then
     return
   fi
 
-  if ! psql_exec -v task_name="$extraction_task" >/dev/null <<'SQL'
-SELECT otlet.run_task(:'task_name');
-SQL
-  then
-    fail_current_model "extraction task enqueue failed"
-    return
-  fi
-  if ! wait_for_task "$extraction_task"; then
-    fail_current_model "extraction task timed out"
+  if ! run_and_wait "$extraction_task" "extraction task"; then
     return
   fi
 
-  if ! psql_exec -v task_name="$policy_task" >/dev/null <<'SQL'
-SELECT otlet.run_task(:'task_name');
-SQL
-  then
-    fail_current_model "policy task enqueue failed"
-    return
-  fi
-  if ! wait_for_task "$policy_task"; then
-    fail_current_model "policy task timed out"
+  if ! run_and_wait "$policy_task" "policy task"; then
     return
   fi
 
@@ -1084,33 +1092,7 @@ SQL
       return
     fi
     printf 'model=%s skip_semantic=true direct_schema_valid_rate=%s min_direct_schema_rate=%s\n' "$run_model_key" "$direct_rate" "$min_direct_schema_rate"
-    if ! score_model_run \
-      "$run_model_key" \
-      "$base_model_key" \
-      "$model_name" \
-      "$family" \
-      "$tier" \
-      "$quant" \
-      "$declared_params_b" \
-      "$active_params_b" \
-      "$context_tokens" \
-      "$license_note" \
-      "$source_url" \
-      "$artifact_path" \
-      "$artifact_bytes" \
-      "$external_artifact" \
-      "$direct_task" \
-      "$triage_task" \
-      "$numeric_task" \
-      "$extraction_task" \
-      "$policy_task" \
-      "$join_task" \
-      "$row_task" \
-      "$join_index" \
-      "$wall_ms" \
-      "$source_unchanged" \
-      "$stale_leak_count" \
-      "$worker_crash_count"; then
+    if ! score_current_model_run; then
       fail_current_model "scoring failed after direct task"
       return
     fi
@@ -1118,27 +1100,11 @@ SQL
     return
   fi
 
-  if ! psql_exec -v join_index="$join_index" >/dev/null <<'SQL'
-SELECT otlet.refresh_semantic_join_index(:'join_index');
-SQL
-  then
-    fail_current_model "semantic join refresh enqueue failed"
-    return
-  fi
-  if ! wait_for_task "$join_task"; then
-    fail_current_model "semantic join refresh timed out"
+  if ! refresh_and_wait "join" "$join_index" "$join_task" "semantic join refresh"; then
     return
   fi
 
-  if ! psql_exec -v row_index="$row_index" >/dev/null <<'SQL'
-SELECT otlet.refresh_semantic_index(:'row_index');
-SQL
-  then
-    fail_current_model "semantic row refresh enqueue failed"
-    return
-  fi
-  if ! wait_for_task "$row_task"; then
-    fail_current_model "semantic row refresh timed out"
+  if ! refresh_and_wait "row" "$row_index" "$row_task" "semantic row refresh"; then
     return
   fi
 
@@ -1188,33 +1154,7 @@ SQL
     return
   fi
 
-  if ! score_model_run \
-    "$run_model_key" \
-    "$base_model_key" \
-    "$model_name" \
-    "$family" \
-    "$tier" \
-    "$quant" \
-    "$declared_params_b" \
-    "$active_params_b" \
-    "$context_tokens" \
-    "$license_note" \
-    "$source_url" \
-    "$artifact_path" \
-    "$artifact_bytes" \
-    "$external_artifact" \
-    "$direct_task" \
-    "$triage_task" \
-    "$numeric_task" \
-    "$extraction_task" \
-    "$policy_task" \
-    "$join_task" \
-    "$row_task" \
-    "$join_index" \
-    "$wall_ms" \
-    "$source_unchanged" \
-    "$stale_leak_count" \
-    "$worker_crash_count"; then
+  if ! score_current_model_run; then
     fail_current_model "scoring failed"
     return
   fi

@@ -7,10 +7,6 @@ from pathlib import Path
 
 
 SMALL_ARTIFACT_GB = 2.0
-RESIDENT_TARGET_GB = 2.5
-P95_TARGET_MS = 20000.0
-ACTIVE_PARAMS_TARGET_B = 3.0
-RESOURCE_WEIGHT = 0.25
 
 
 def read_tsv(path):
@@ -79,7 +75,6 @@ def table(headers, rows):
         "otlet_fit",
         "overall_fit",
         "production_score",
-        "overall_fit",
         "diagnostic_fit",
         "fit_min",
         "fit_max",
@@ -134,7 +129,6 @@ def table(headers, rows):
         "wrong_confidence",
         "wrong_action",
         "passed",
-        "false_merge",
         "hallucinated_action",
         "stale_leaks",
         "source_mutated",
@@ -173,43 +167,18 @@ def truthy(value):
     return str(value).lower() in ("t", "true", "1", "yes")
 
 
-def resource_component(row, key, target):
-    value = row.get(key)
-    if value in (None, ""):
-        return 0.0
-    value = num(value)
-    if value <= 0:
-        return 0.0
-    return min(1.0, target / value)
-
-
-def soft_resource_multiplier(resource_fit):
-    return (1.0 - RESOURCE_WEIGHT) + RESOURCE_WEIGHT * resource_fit
-
-
 def add_otlet_fit(row):
-    artifact_fit = resource_component(row, "artifact_gb", SMALL_ARTIFACT_GB)
-    resident_fit = resource_component(row, "resident_gb", RESIDENT_TARGET_GB)
-    latency_fit = resource_component(row, "p95_generate_ms", P95_TARGET_MS)
-    active_fit = resource_component(row, "active_params_b", ACTIVE_PARAMS_TARGET_B)
-    resource_fit = 0.40 * artifact_fit + 0.30 * resident_fit + 0.20 * latency_fit + 0.10 * active_fit
     out_of_running = row.get("run_status") not in (None, "", "complete")
     missing_required_metric = row.get("confidence_score") in (None, "")
-    trusted_quality = 0.0 if out_of_running or missing_required_metric else num(row.get("quality_score"))
-    diagnostic_quality = 0.0 if out_of_running else num(row.get("diagnostic_quality_score"))
-    otlet_fit = trusted_quality * soft_resource_multiplier(resource_fit)
-    diagnostic_fit = diagnostic_quality * soft_resource_multiplier(resource_fit)
-    row["artifact_fit"] = artifact_fit
-    row["resident_fit"] = resident_fit
-    row["latency_fit"] = latency_fit
-    row["active_param_fit"] = active_fit
-    row["resource_fit"] = resource_fit
-    row["trusted_quality"] = trusted_quality
-    row["trusted_fit_score"] = otlet_fit
-    row["overall_fit"] = otlet_fit
+    trusted_fit = 0.0 if out_of_running or missing_required_metric else num(row.get("overall_fit"))
+    diagnostic_fit = 0.0 if out_of_running else num(row.get("diagnostic_fit"))
+    row["trusted_quality"] = 0.0 if out_of_running or missing_required_metric else num(row.get("trusted_quality", row.get("quality_score")))
+    row["resource_fit"] = num(row.get("resource_fit"))
+    row["trusted_fit_score"] = trusted_fit
+    row["overall_fit"] = trusted_fit
     row["diagnostic_fit_score"] = diagnostic_fit
     row["diagnostic_fit"] = diagnostic_fit
-    row["otlet_fit_score"] = otlet_fit
+    row["otlet_fit_score"] = trusted_fit
     if out_of_running:
         row["score_status"] = "out_of_running"
     elif missing_required_metric:

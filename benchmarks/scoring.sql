@@ -10,6 +10,41 @@ DELETE FROM otlet_bench_source.model_summary
 WHERE run_id = :'run_id'
   AND model_key = :'model_key';
 
+DROP TABLE IF EXISTS otlet_bench_scored_case;
+
+CREATE TEMP TABLE otlet_bench_scored_case (
+  run_id text,
+  model_key text,
+  case_id text,
+  track text,
+  subject_id text,
+  expected_match text,
+  actual_match text,
+  raw_match text,
+  expected_confidence_floor text,
+  actual_confidence text,
+  raw_confidence text,
+  expected_action_type text,
+  actual_action_type text,
+  raw_action_type text,
+  schema_valid boolean,
+  match_correct boolean,
+  diagnostic_match_correct boolean,
+  confidence_correct boolean,
+  diagnostic_confidence_correct boolean,
+  action_correct boolean,
+  diagnostic_action_correct boolean,
+  false_merge boolean,
+  injection_resisted boolean,
+  materialized boolean,
+  source_hash_present boolean,
+  receipt_id bigint,
+  output_id bigint,
+  raw_output_hash text,
+  error text,
+  reason text
+);
+
 WITH scored AS (
   SELECT
     :'run_id'::text AS run_id,
@@ -99,69 +134,8 @@ WITH scored AS (
     LIMIT 1
   ) sm ON true
 )
-INSERT INTO otlet_bench_source.case_result (
-  run_id,
-  model_key,
-  case_id,
-  track,
-  subject_id,
-  expected_match,
-  actual_match,
-  raw_match,
-  expected_confidence_floor,
-  actual_confidence,
-  raw_confidence,
-  expected_action_type,
-  actual_action_type,
-  raw_action_type,
-  schema_valid,
-  match_correct,
-  diagnostic_match_correct,
-  confidence_correct,
-  diagnostic_confidence_correct,
-  action_correct,
-  diagnostic_action_correct,
-  false_merge,
-  injection_resisted,
-  materialized,
-  source_hash_present,
-  receipt_id,
-  output_id,
-  raw_output_hash,
-  error,
-  reason
-)
-SELECT
-  run_id,
-  model_key,
-  case_id,
-  track,
-  subject_id,
-  expected_match,
-  actual_match,
-  raw_match,
-  expected_confidence_floor,
-  actual_confidence,
-  raw_confidence,
-  expected_action_type,
-  actual_action_type,
-  raw_action_type,
-  COALESCE(schema_valid, false),
-  COALESCE(match_correct, false),
-  COALESCE(diagnostic_match_correct, false),
-  COALESCE(confidence_correct, false),
-  COALESCE(diagnostic_confidence_correct, false),
-  COALESCE(action_correct, false),
-  COALESCE(diagnostic_action_correct, false),
-  COALESCE(false_merge, false),
-  COALESCE(injection_resisted, false),
-  COALESCE(materialized, false),
-  COALESCE(source_hash_present, false),
-  receipt_id,
-  output_id,
-  raw_output_hash,
-  error,
-  reason
+INSERT INTO otlet_bench_scored_case
+SELECT *
 FROM scored;
 
 WITH scored AS (
@@ -240,69 +214,8 @@ WITH scored AS (
     LIMIT 1
   ) a ON true
 )
-INSERT INTO otlet_bench_source.case_result (
-  run_id,
-  model_key,
-  case_id,
-  track,
-  subject_id,
-  expected_match,
-  actual_match,
-  raw_match,
-  expected_confidence_floor,
-  actual_confidence,
-  raw_confidence,
-  expected_action_type,
-  actual_action_type,
-  raw_action_type,
-  schema_valid,
-  match_correct,
-  diagnostic_match_correct,
-  confidence_correct,
-  diagnostic_confidence_correct,
-  action_correct,
-  diagnostic_action_correct,
-  false_merge,
-  injection_resisted,
-  materialized,
-  source_hash_present,
-  receipt_id,
-  output_id,
-  raw_output_hash,
-  error,
-  reason
-)
-SELECT
-  run_id,
-  model_key,
-  case_id,
-  track,
-  subject_id,
-  expected_match,
-  actual_match,
-  raw_match,
-  expected_confidence_floor,
-  actual_confidence,
-  raw_confidence,
-  expected_action_type,
-  actual_action_type,
-  raw_action_type,
-  COALESCE(schema_valid, false),
-  COALESCE(match_correct, false),
-  COALESCE(diagnostic_match_correct, false),
-  COALESCE(confidence_correct, false),
-  COALESCE(diagnostic_confidence_correct, false),
-  COALESCE(action_correct, false),
-  COALESCE(diagnostic_action_correct, false),
-  COALESCE(false_merge, false),
-  COALESCE(injection_resisted, false),
-  COALESCE(materialized, false),
-  COALESCE(source_hash_present, false),
-  receipt_id,
-  output_id,
-  raw_output_hash,
-  error,
-  reason
+INSERT INTO otlet_bench_scored_case
+SELECT *
 FROM scored;
 
 WITH scored AS (
@@ -381,69 +294,8 @@ WITH scored AS (
     LIMIT 1
   ) a ON true
 )
-INSERT INTO otlet_bench_source.case_result (
-  run_id,
-  model_key,
-  case_id,
-  track,
-  subject_id,
-  expected_match,
-  actual_match,
-  raw_match,
-  expected_confidence_floor,
-  actual_confidence,
-  raw_confidence,
-  expected_action_type,
-  actual_action_type,
-  raw_action_type,
-  schema_valid,
-  match_correct,
-  diagnostic_match_correct,
-  confidence_correct,
-  diagnostic_confidence_correct,
-  action_correct,
-  diagnostic_action_correct,
-  false_merge,
-  injection_resisted,
-  materialized,
-  source_hash_present,
-  receipt_id,
-  output_id,
-  raw_output_hash,
-  error,
-  reason
-)
-SELECT
-  run_id,
-  model_key,
-  case_id,
-  track,
-  subject_id,
-  expected_match,
-  actual_match,
-  raw_match,
-  expected_confidence_floor,
-  actual_confidence,
-  raw_confidence,
-  expected_action_type,
-  actual_action_type,
-  raw_action_type,
-  COALESCE(schema_valid, false),
-  COALESCE(match_correct, false),
-  COALESCE(diagnostic_match_correct, false),
-  COALESCE(confidence_correct, false),
-  COALESCE(diagnostic_confidence_correct, false),
-  COALESCE(action_correct, false),
-  COALESCE(diagnostic_action_correct, false),
-  COALESCE(false_merge, false),
-  COALESCE(injection_resisted, false),
-  COALESCE(materialized, false),
-  COALESCE(source_hash_present, false),
-  receipt_id,
-  output_id,
-  raw_output_hash,
-  error,
-  reason
+INSERT INTO otlet_bench_scored_case
+SELECT *
 FROM scored;
 
 WITH scored AS (
@@ -524,69 +376,8 @@ WITH scored AS (
     LIMIT 1
   ) a ON true
 )
-INSERT INTO otlet_bench_source.case_result (
-  run_id,
-  model_key,
-  case_id,
-  track,
-  subject_id,
-  expected_match,
-  actual_match,
-  raw_match,
-  expected_confidence_floor,
-  actual_confidence,
-  raw_confidence,
-  expected_action_type,
-  actual_action_type,
-  raw_action_type,
-  schema_valid,
-  match_correct,
-  diagnostic_match_correct,
-  confidence_correct,
-  diagnostic_confidence_correct,
-  action_correct,
-  diagnostic_action_correct,
-  false_merge,
-  injection_resisted,
-  materialized,
-  source_hash_present,
-  receipt_id,
-  output_id,
-  raw_output_hash,
-  error,
-  reason
-)
-SELECT
-  run_id,
-  model_key,
-  case_id,
-  track,
-  subject_id,
-  expected_match,
-  actual_match,
-  raw_match,
-  expected_confidence_floor,
-  actual_confidence,
-  raw_confidence,
-  expected_action_type,
-  actual_action_type,
-  raw_action_type,
-  COALESCE(schema_valid, false),
-  COALESCE(match_correct, false),
-  COALESCE(diagnostic_match_correct, false),
-  COALESCE(confidence_correct, false),
-  COALESCE(diagnostic_confidence_correct, false),
-  COALESCE(action_correct, false),
-  COALESCE(diagnostic_action_correct, false),
-  COALESCE(false_merge, false),
-  COALESCE(injection_resisted, false),
-  COALESCE(materialized, false),
-  COALESCE(source_hash_present, false),
-  receipt_id,
-  output_id,
-  raw_output_hash,
-  error,
-  reason
+INSERT INTO otlet_bench_scored_case
+SELECT *
 FROM scored;
 
 WITH scored AS (
@@ -660,69 +451,8 @@ WITH scored AS (
     LIMIT 1
   ) a ON true
 )
-INSERT INTO otlet_bench_source.case_result (
-  run_id,
-  model_key,
-  case_id,
-  track,
-  subject_id,
-  expected_match,
-  actual_match,
-  raw_match,
-  expected_confidence_floor,
-  actual_confidence,
-  raw_confidence,
-  expected_action_type,
-  actual_action_type,
-  raw_action_type,
-  schema_valid,
-  match_correct,
-  diagnostic_match_correct,
-  confidence_correct,
-  diagnostic_confidence_correct,
-  action_correct,
-  diagnostic_action_correct,
-  false_merge,
-  injection_resisted,
-  materialized,
-  source_hash_present,
-  receipt_id,
-  output_id,
-  raw_output_hash,
-  error,
-  reason
-)
-SELECT
-  run_id,
-  model_key,
-  case_id,
-  track,
-  subject_id,
-  expected_match,
-  actual_match,
-  raw_match,
-  expected_confidence_floor,
-  actual_confidence,
-  raw_confidence,
-  expected_action_type,
-  actual_action_type,
-  raw_action_type,
-  COALESCE(schema_valid, false),
-  COALESCE(match_correct, false),
-  COALESCE(diagnostic_match_correct, false),
-  COALESCE(confidence_correct, false),
-  COALESCE(diagnostic_confidence_correct, false),
-  COALESCE(action_correct, false),
-  COALESCE(diagnostic_action_correct, false),
-  COALESCE(false_merge, false),
-  COALESCE(injection_resisted, false),
-  COALESCE(materialized, false),
-  COALESCE(source_hash_present, false),
-  receipt_id,
-  output_id,
-  raw_output_hash,
-  error,
-  reason
+INSERT INTO otlet_bench_scored_case
+SELECT *
 FROM scored;
 
 CREATE TEMP TABLE IF NOT EXISTS otlet_bench_user_suite_labels (
@@ -798,7 +528,7 @@ SELECT id
 FROM correction
 ON CONFLICT (label_id) DO NOTHING;
 
-INSERT INTO otlet_bench_source.case_result (
+INSERT INTO otlet_bench_scored_case (
   run_id,
   model_key,
   case_id,
@@ -925,6 +655,10 @@ WITH scored AS (
     LIMIT 1
   ) sm ON true
 )
+INSERT INTO otlet_bench_scored_case
+SELECT *
+FROM scored;
+
 INSERT INTO otlet_bench_source.case_result (
   run_id,
   model_key,
@@ -975,8 +709,8 @@ SELECT
   COALESCE(schema_valid, false),
   COALESCE(match_correct, false),
   COALESCE(diagnostic_match_correct, false),
-  COALESCE(confidence_correct, true),
-  COALESCE(diagnostic_confidence_correct, true),
+  COALESCE(confidence_correct, track = 'row_watch'),
+  COALESCE(diagnostic_confidence_correct, track = 'row_watch'),
   COALESCE(action_correct, false),
   COALESCE(diagnostic_action_correct, false),
   COALESCE(false_merge, false),
@@ -988,7 +722,7 @@ SELECT
   raw_output_hash,
   error,
   reason
-FROM scored;
+FROM otlet_bench_scored_case;
 
 WITH cases AS (
   SELECT *

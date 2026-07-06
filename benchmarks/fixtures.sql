@@ -954,7 +954,7 @@ $instruction$,
     }
   }'::jsonb,
   :'model_name',
-  '{"max_tokens":256,"reasoning":"off","inference_cache":false,"json_logit_mask":true,"generation_trace":true,"generation_trace_max_tokens":16,"generation_trace_top_k":3}'::jsonb
+  '{"max_tokens":256,"reasoning":"off","inference_cache":false,"generation_trace":true,"generation_trace_max_tokens":16,"generation_trace_top_k":3}'::jsonb
 );
 
 SELECT otlet.create_task(
@@ -978,7 +978,7 @@ $instruction$,
     }
   }'::jsonb,
   :'model_name',
-  '{"max_tokens":160,"reasoning":"off","inference_cache":false,"json_logit_mask":true,"generation_trace":true,"generation_trace_max_tokens":12,"generation_trace_top_k":3}'::jsonb,
+  '{"max_tokens":160,"reasoning":"off","inference_cache":false,"generation_trace":true,"generation_trace_max_tokens":12,"generation_trace_top_k":3}'::jsonb,
   '{}'::jsonb,
   '{"answer_field":"decision","abstain_values":["unclear"],"confidence_field":"confidence","accepted_confidence":["high"]}'::jsonb
 );
@@ -1004,7 +1004,7 @@ $instruction$,
     }
   }'::jsonb,
   :'model_name',
-  '{"max_tokens":160,"reasoning":"off","inference_cache":false,"json_logit_mask":true,"generation_trace":true,"generation_trace_max_tokens":12,"generation_trace_top_k":3}'::jsonb,
+  '{"max_tokens":160,"reasoning":"off","inference_cache":false,"generation_trace":true,"generation_trace_max_tokens":12,"generation_trace_top_k":3}'::jsonb,
   '{}'::jsonb,
   '{"answer_field":"decision","abstain_values":["unclear"],"confidence_field":"confidence","accepted_confidence":["high"]}'::jsonb
 );
@@ -1033,7 +1033,7 @@ $instruction$,
     }
   }'::jsonb,
   :'model_name',
-  '{"max_tokens":160,"reasoning":"off","inference_cache":false,"json_logit_mask":true,"generation_trace":true,"generation_trace_max_tokens":12,"generation_trace_top_k":3}'::jsonb,
+  '{"max_tokens":160,"reasoning":"off","inference_cache":false,"generation_trace":true,"generation_trace_max_tokens":12,"generation_trace_top_k":3}'::jsonb,
   '{}'::jsonb,
   '{"answer_field":"invoice_id","abstain_values":[],"confidence_field":"confidence","accepted_confidence":["high"]}'::jsonb
 );
@@ -1059,7 +1059,7 @@ $instruction$,
     }
   }'::jsonb,
   :'model_name',
-  '{"max_tokens":160,"reasoning":"off","inference_cache":false,"json_logit_mask":true,"generation_trace":true,"generation_trace_max_tokens":12,"generation_trace_top_k":3}'::jsonb,
+  '{"max_tokens":160,"reasoning":"off","inference_cache":false,"generation_trace":true,"generation_trace_max_tokens":12,"generation_trace_top_k":3}'::jsonb,
   '{}'::jsonb,
   '{"answer_field":"decision","abstain_values":["unclear"],"confidence_field":"confidence","accepted_confidence":["high"]}'::jsonb
 );
@@ -1087,7 +1087,7 @@ $instruction$,
     ORDER BY subject_id
   $$,
   record_type => 'entity_hypothesis',
-  runtime_options => '{"max_tokens":256,"reasoning":"off","inference_cache":false,"json_logit_mask":true,"generation_trace":true,"generation_trace_max_tokens":16,"generation_trace_top_k":3}'::jsonb,
+  runtime_options => '{"max_tokens":256,"reasoning":"off","inference_cache":false,"generation_trace":true,"generation_trace_max_tokens":16,"generation_trace_top_k":3}'::jsonb,
   trigger_policy => '{"on_change":"mark_stale"}'::jsonb,
   action_types => ARRAY['merge_candidate', 'new_entity', 'review_flag'],
   max_candidate_rows => 1000
@@ -1112,6 +1112,6 @@ $instruction$,
   table_name => 'otlet_bench_source.vendor_entity'::regclass,
   subject_column => 'id',
   record_type => 'vendor_row_signal',
-  runtime_options => '{"max_tokens":128,"reasoning":"off","inference_cache":false,"json_logit_mask":true,"generation_trace":false}'::jsonb,
+  runtime_options => '{"max_tokens":128,"reasoning":"off","inference_cache":false,"generation_trace":false}'::jsonb,
   trigger_policy => '{"on_change":"mark_stale"}'::jsonb
 );

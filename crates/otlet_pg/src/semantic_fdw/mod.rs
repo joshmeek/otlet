@@ -1,6 +1,6 @@
 use pgrx::prelude::*;
 use pgrx::{FromDatum, JsonB, pg_sys};
-use serde_json::{Value, json};
+use serde_json::Value;
 use std::collections::HashMap;
 use std::ffi::{CStr, CString};
 use std::ptr;

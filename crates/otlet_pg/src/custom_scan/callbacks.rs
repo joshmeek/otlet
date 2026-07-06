@@ -54,7 +54,8 @@ unsafe extern "C-unwind" fn begin_semantic_custom_scan(
             &private.expected_json,
         )
         .unwrap_or_else(|err| pgrx::error!("{err}"));
-        let policy = semantic_policy_for_selected_path(&private.selected_path);
+        let planner_stats = reload_private_planner_stats(&private);
+        let policy = semantic_policy_for_selected_path(&planner_stats.selected_path);
         (*state).source_table = pg_cstr(&loaded_state.source_table);
         (*state).task_name = pg_cstr(&loaded_state.task_name);
         (*state).record_type = pg_cstr(&loaded_state.record_type);
@@ -78,14 +79,14 @@ unsafe extern "C-unwind" fn begin_semantic_custom_scan(
             wait_ms: policy.wait_ms,
             infer_ms: policy.infer_ms,
             infer_max_rows: policy.infer_max_rows,
-            planner_selected_path: private.selected_path,
-            planner_reason: private.reason,
-            planner_stale_reasons: private.stale_reasons,
-            planner_model_cost_source: private.model_cost_source,
-            planner_model_ms: private.model_ms,
-            planner_count_basis: private.count_basis,
-            planner_infer_decision_rows: private.infer_decision_rows,
-            planner_fail_closed_decision_rows: private.fail_closed_decision_rows,
+            planner_selected_path: planner_stats.selected_path,
+            planner_reason: planner_stats.reason,
+            planner_stale_reasons: planner_stats.stale_reasons,
+            planner_model_cost_source: planner_stats.model_cost_source,
+            planner_model_ms: planner_stats.model_ms,
+            planner_count_basis: planner_stats.count_basis,
+            planner_infer_decision_rows: planner_stats.infer_decision_rows,
+            planner_fail_closed_decision_rows: planner_stats.fail_closed_decision_rows,
             source_table: loaded_state.source_table,
             task_name: loaded_state.task_name,
             record_type: loaded_state.record_type,

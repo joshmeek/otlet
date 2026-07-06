@@ -31,14 +31,13 @@ fn inference_cache_row_key(content_key: &str, contract_key: &str) -> String {
     )
 }
 
-fn inference_cache_contract_hash(job: &Job, instruction: &str, schema_prompt: &str) -> String {
+fn inference_cache_contract_hash(job: &Job, instruction: &str) -> String {
     hash_text(
         format!(
-            "task={}|instruction={}|schema={}|schema_prompt={}|options={}|input_shaping={}|decision_contract={}",
+            "task={}|instruction={}|schema={}|options={}|input_shaping={}|decision_contract={}",
             job.task_name,
             hash_text(instruction),
             hash_json(&job.output_schema),
-            schema_prompt,
             hash_json(&job.runtime_options),
             hash_json(&job.input_shaping),
             hash_json(&job.decision_contract)
@@ -85,78 +84,6 @@ fn model_fingerprint(job: &Job) -> String {
     }
 }
 
-fn input_content_hash(input: &Value) -> String {
-    let mut content = input.clone();
-    if let Value::Object(object) = &mut content {
-        object.remove("_otlet_mvcc");
-        object.remove("otlet_mvcc");
-    }
-    format!("{:x}", md5::compute(canonical_jsonb_text(&content)))
-}
-
-fn canonical_jsonb_text(value: &Value) -> String {
-    match value {
-        Value::Null => "null".to_owned(),
-        Value::Bool(value) => value.to_string(),
-        Value::Number(number) => canonical_number_text(number),
-        Value::String(value) => serde_json::to_string(value).unwrap_or_else(|_| "\"\"".to_owned()),
-        Value::Array(values) => {
-            let values = values
-                .iter()
-                .map(canonical_jsonb_text)
-                .collect::<Vec<_>>()
-                .join(", ");
-            format!("[{values}]")
-        }
-        Value::Object(object) => {
-            let mut keys = object.keys().collect::<Vec<_>>();
-            keys.sort();
-            let fields = keys
-                .into_iter()
-                .filter_map(|key| {
-                    object.get(key).map(|value| {
-                        let key = serde_json::to_string(key).unwrap_or_else(|_| "\"\"".to_owned());
-                        format!("{key}: {}", canonical_jsonb_text(value))
-                    })
-                })
-                .collect::<Vec<_>>()
-                .join(", ");
-            format!("{{{fields}}}")
-        }
-    }
-}
-
-fn canonical_number_text(number: &serde_json::Number) -> String {
-    if let Some(value) = number.as_i64() {
-        return value.to_string();
-    }
-    if let Some(value) = number.as_u64() {
-        return value.to_string();
-    }
-    let raw = number.to_string();
-    let mut text = if raw.contains('e') || raw.contains('E') {
-        raw.parse::<f64>()
-            .ok()
-            .filter(|value| value.is_finite())
-            .map(|value| format!("{value}"))
-            .unwrap_or(raw)
-    } else {
-        raw
-    };
-    if text.contains('.') {
-        while text.ends_with('0') {
-            text.pop();
-        }
-        if text.ends_with('.') {
-            text.pop();
-        }
-    }
-    if text == "-0" {
-        text = "0".to_owned();
-    }
-    text
-}
-
 fn input_mvcc_row_identity(input: &Value, subject_id: &str) -> String {
     let Some(Value::Object(mvcc)) = input.get("_otlet_mvcc").or_else(|| input.get("otlet_mvcc"))
     else {
@@ -175,42 +102,6 @@ fn input_mvcc_row_identity(input: &Value, subject_id: &str) -> String {
         .and_then(Value::as_str)
         .unwrap_or(subject_id);
     format!("{table}:{row}")
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn content_hash_matches_sql_sample() {
-        let input: Value = serde_json::from_str(
-            r#"{"_otlet_mvcc":{"xmin":"7","ctid":"(0,1)"},"b":1,"a":2}"#,
-        )
-        .expect("valid sample json");
-
-        assert_eq!(
-            input_content_hash(&input),
-            "5e4d14d82c320bafb2f1286fe486d1f8"
-        );
-    }
-
-    #[test]
-    fn content_hash_ignores_mvcc_key_order_and_numeric_scale() {
-        let left: Value = serde_json::from_str(
-            r#"{"_otlet_mvcc":{"xmin":"1"},"outer":{"b":1.00,"a":[{"y":1.0,"x":true}]}}"#,
-        )
-        .expect("valid left json");
-        let right: Value = serde_json::from_str(
-            r#"{"outer":{"a":[{"x":true,"y":1e0}],"b":1}}"#,
-        )
-        .expect("valid right json");
-
-        assert_eq!(input_content_hash(&left), input_content_hash(&right));
-        assert_eq!(
-            canonical_jsonb_text(&right),
-            r#"{"outer": {"a": [{"x": true, "y": 1}], "b": 1}}"#
-        );
-    }
 }
 
 fn input_mvcc_payload(input: &Value) -> Value {

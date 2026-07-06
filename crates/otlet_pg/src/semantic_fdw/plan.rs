@@ -112,24 +112,10 @@ fn load_plan(opts: &SemanticFdwOptions) -> Result<SemanticFdwPlan, String> {
     );
 
     pgrx::Spi::connect(|client| {
-        let exists_query = match opts.access_kind {
-            SemanticAccessKind::RowIndex => format!(
-                "SELECT EXISTS (SELECT 1 FROM otlet.semantic_indexes WHERE name = {}) AS found",
-                sql_literal(&opts.index_name)
-            ),
-            SemanticAccessKind::JoinIndex => format!(
-                "SELECT EXISTS (SELECT 1 FROM otlet.semantic_join_indexes WHERE name = {}) AS found",
-                sql_literal(&opts.index_name)
-            ),
-        };
-        let exists = client
-            .select(exists_query.as_str(), Some(1), &[])
-            .map_err(to_string)?
-            .first()
-            .get_by_name::<bool, _>("found")
-            .map_err(to_string)?
-            .unwrap_or(false);
-        if !exists {
+        let table = client
+            .select(query.as_str(), Some(1), &[])
+            .map_err(to_string)?;
+        if table.is_empty() {
             return Err(format!(
                 "otlet semantic {} {} does not exist",
                 match opts.access_kind {
@@ -139,10 +125,6 @@ fn load_plan(opts: &SemanticFdwOptions) -> Result<SemanticFdwPlan, String> {
                 opts.index_name
             ));
         }
-
-        let table = client
-            .select(query.as_str(), Some(1), &[])
-            .map_err(to_string)?;
         let row = table.first();
         macro_rules! text {
             ($name:literal) => {

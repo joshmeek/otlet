@@ -12,7 +12,6 @@ CREATE TABLE otlet.production_policy (
   semantic_auto_max_rows integer NOT NULL DEFAULT 1,
   worker_claim_batch_size integer NOT NULL DEFAULT 8,
   worker_claim_task_cursor text NOT NULL DEFAULT '',
-  selection_batch_two_pass boolean NOT NULL DEFAULT false,
   job_lease_interval interval NOT NULL DEFAULT interval '5 minutes',
   worker_event_retention interval NOT NULL DEFAULT interval '7 days',
   trace_detail_retention interval NOT NULL DEFAULT interval '7 days',
@@ -351,15 +350,9 @@ CREATE TABLE otlet.model_selection_policies (
   cheap_model_name text NOT NULL REFERENCES otlet.models(name),
   strong_model_name text NOT NULL REFERENCES otlet.models(name),
   accept_field_checks jsonb NOT NULL DEFAULT otlet.default_accept_field_checks() CHECK (jsonb_typeof(accept_field_checks) = 'object'),
-  cheap_skip_window integer NOT NULL DEFAULT 0,
-  cheap_min_recent_acceptance double precision NOT NULL DEFAULT 0,
-  cheap_probe_interval integer NOT NULL DEFAULT 10,
   created_at timestamptz NOT NULL DEFAULT now(),
   updated_at timestamptz NOT NULL DEFAULT now(),
-  CHECK (cheap_model_name <> strong_model_name),
-  CHECK (cheap_skip_window BETWEEN 0 AND 100000),
-  CHECK (cheap_min_recent_acceptance >= 0 AND cheap_min_recent_acceptance <= 1),
-  CHECK (cheap_probe_interval BETWEEN 0 AND 100000)
+  CHECK (cheap_model_name <> strong_model_name)
 );
 
 CREATE TABLE otlet.runtime_slots (
@@ -490,7 +483,6 @@ CREATE TABLE otlet.action_type_schemas (
   requires_approval boolean NOT NULL DEFAULT false,
   creates_record boolean NOT NULL DEFAULT false,
   applyable boolean NOT NULL DEFAULT false,
-  payload_schema jsonb NOT NULL DEFAULT '{}'::jsonb CHECK (jsonb_typeof(payload_schema) = 'object'),
   created_at timestamptz NOT NULL DEFAULT now()
 );
 
@@ -498,78 +490,14 @@ INSERT INTO otlet.action_type_schemas (
   action_type,
   requires_approval,
   creates_record,
-  applyable,
-  payload_schema
+  applyable
 )
 VALUES
-  ('create_record', false, true, true, $schema$
-    {
-      "payload_source": "action",
-      "required": ["record_type", "subject_id", "body"],
-      "additionalProperties": false,
-      "properties": {
-        "record_type": {"type": "string", "minLength": 1, "required_error": "create_record missing record_type"},
-        "subject_id": {"type": "string", "minLength": 1, "required_error": "create_record missing subject_id"},
-        "body": {"type": "object", "required_error": "create_record missing body"}
-      }
-    }
-  $schema$::jsonb),
-  ('merge_candidate', true, false, false, $schema$
-    {
-      "required": ["left_id", "right_id", "reason"],
-      "properties": {
-        "left_id": {"type": "string", "minLength": 1, "required_error": "merge_candidate missing left_id"},
-        "right_id": {"type": "string", "minLength": 1, "required_error": "merge_candidate missing right_id"},
-        "confidence": {"type": "string", "enum": ["low", "medium", "high"], "enum_error": "merge_candidate confidence must be low, medium, or high"},
-        "reason": {"type": "string", "minLength": 1, "required_error": "merge_candidate missing reason"},
-        "evidence": {"type": ["array", "string"], "nonEmpty": true, "type_error": "merge_candidate evidence must be an array or string", "empty_error": "merge_candidate missing decisive evidence"}
-      },
-      "rules": [
-        {"kind": "output_equals", "field": "match", "value": "same_entity", "error": "merge_candidate requires same_entity output"},
-        {"kind": "subject_pair_matches", "left_field": "left_id", "right_field": "right_id", "error": "merge_candidate subject ids must match job subject_id", "missing_error": "merge_candidate requires input.action_ids left_id and right_id"},
-        {"kind": "confidence_not_above_output", "field": "confidence", "output_field": "confidence", "error": "merge_candidate confidence cannot exceed output confidence"}
-      ]
-    }
-  $schema$::jsonb),
-  ('new_entity', false, false, false, $schema$
-    {
-      "required": ["entity_id", "reason"],
-      "properties": {
-        "entity_id": {"type": "string", "minLength": 1, "required_error": "new_entity missing entity_id"},
-        "reason": {"type": "string", "minLength": 1, "required_error": "new_entity missing reason"},
-        "evidence": {"type": ["array", "string"], "nonEmpty": true, "type_error": "new_entity evidence must be an array or string", "empty_error": "new_entity missing separation evidence"}
-      },
-      "rules": [
-        {"kind": "output_equals", "field": "match", "value": "different_entity", "error": "new_entity requires different_entity output"},
-        {"kind": "field_matches_expected_right", "field": "entity_id", "error": "new_entity entity_id must match job right subject_id", "missing_error": "new_entity requires input.action_ids right_id"}
-      ]
-    }
-  $schema$::jsonb),
-  ('review_flag', false, false, false, $schema$
-    {
-      "required": ["reason"],
-      "properties": {
-        "left_id": {"type": "string", "minLength": 1},
-        "right_id": {"type": "string", "minLength": 1},
-        "reason": {"type": "string", "minLength": 1, "required_error": "review_flag missing reason"},
-        "severity": {"type": "string", "enum": ["low", "medium", "high"], "enum_error": "review_flag severity must be low, medium, or high"}
-      },
-      "rules": [
-        {"kind": "output_equals", "field": "match", "value": "unclear", "error": "review_flag requires unclear output"},
-        {"kind": "subject_pair_matches_when_present", "left_field": "left_id", "right_field": "right_id", "error": "review_flag subject ids must match job subject_id"}
-      ]
-    }
-  $schema$::jsonb),
-  ('note', false, true, true, $schema$
-    {
-      "required": ["subject_id", "text"],
-      "properties": {
-        "subject_id": {"type": "string", "minLength": 1, "required_error": "note missing subject_id"},
-        "text": {"type": "string", "minLength": 1, "required_error": "note missing text"},
-        "record_type": {"type": "string", "minLength": 1}
-      }
-    }
-  $schema$::jsonb);
+  ('create_record', false, true, true),
+  ('merge_candidate', true, false, false),
+  ('new_entity', false, false, false),
+  ('review_flag', false, false, false),
+  ('note', false, true, true);
 
 CREATE TABLE otlet.actions (
   id bigserial PRIMARY KEY,

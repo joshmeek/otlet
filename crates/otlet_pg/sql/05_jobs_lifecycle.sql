@@ -463,200 +463,6 @@ BEGIN
 END;
 $$;
 
-CREATE FUNCTION otlet.action_payload_schema_error(
-  action_type text,
-  body jsonb,
-  output jsonb DEFAULT NULL,
-  expected_left_id text DEFAULT NULL,
-  expected_right_id text DEFAULT NULL,
-  payload_schema jsonb DEFAULT '{}'::jsonb
-) RETURNS text
-LANGUAGE plpgsql
-STABLE
-AS $$
-DECLARE
-  schema jsonb := COALESCE(payload_schema, '{}'::jsonb);
-  properties jsonb := COALESCE(schema -> 'properties', '{}'::jsonb);
-  required_field text;
-  property_name text;
-  property jsonb;
-  value jsonb;
-  value_type text;
-  allowed_types text[];
-  enum_values text[];
-  unsupported_key text;
-  rule jsonb;
-  rule_kind text;
-  output_value text;
-  action_value text;
-  output_confidence text := NULLIF(output ->> 'confidence', '');
-  output_rank int;
-  action_rank int;
-BEGIN
-  IF schema = '{}'::jsonb THEN
-    RETURN NULL;
-  END IF;
-
-  IF jsonb_typeof(schema) IS DISTINCT FROM 'object' THEN
-    RETURN action_type || ' payload_schema must be an object';
-  END IF;
-
-  IF jsonb_typeof(body) IS DISTINCT FROM 'object' THEN
-    RETURN 'action body must be an object';
-  END IF;
-
-  IF COALESCE(NULLIF(schema ->> 'additionalProperties', '')::boolean, true) IS FALSE THEN
-    SELECT key
-    INTO unsupported_key
-    FROM jsonb_object_keys(body) AS keys(key)
-    WHERE NOT properties ? key
-    ORDER BY key
-    LIMIT 1;
-
-    IF unsupported_key IS NOT NULL THEN
-      RETURN COALESCE(
-        NULLIF(schema ->> 'additional_properties_error', ''),
-        action_type || ' unsupported payload field: ' || unsupported_key
-      );
-    END IF;
-  END IF;
-
-  IF jsonb_typeof(schema -> 'required') = 'array' THEN
-    FOR required_field IN SELECT jsonb_array_elements_text(schema -> 'required') LOOP
-      property := COALESCE(properties -> required_field, '{}'::jsonb);
-      IF NOT body ? required_field
-         OR body -> required_field = 'null'::jsonb
-         OR (
-           jsonb_typeof(body -> required_field) = 'string'
-           AND btrim(body ->> required_field) = ''
-         ) THEN
-        RETURN COALESCE(
-          NULLIF(property ->> 'required_error', ''),
-          action_type || ' missing ' || required_field
-        );
-      END IF;
-    END LOOP;
-  END IF;
-
-  FOR property_name, property IN SELECT p.key, p.value FROM jsonb_each(properties) AS p(key, value) LOOP
-    IF NOT body ? property_name OR body -> property_name = 'null'::jsonb THEN
-      CONTINUE;
-    END IF;
-
-    value := body -> property_name;
-    value_type := jsonb_typeof(value);
-
-    IF property ? 'type' THEN
-      IF jsonb_typeof(property -> 'type') = 'array' THEN
-        SELECT array_agg(type_name)
-        INTO allowed_types
-        FROM jsonb_array_elements_text(property -> 'type') AS types(type_name);
-      ELSE
-        allowed_types := ARRAY[property ->> 'type'];
-      END IF;
-
-      IF NOT value_type = ANY(allowed_types) THEN
-        RETURN COALESCE(
-          NULLIF(property ->> 'type_error', ''),
-          action_type || ' ' || property_name || ' must be ' || array_to_string(allowed_types, ' or ')
-        );
-      END IF;
-    END IF;
-
-    IF NULLIF(property ->> 'minLength', '') IS NOT NULL
-       AND value_type = 'string'
-       AND length(btrim(value #>> '{}')) < (property ->> 'minLength')::integer THEN
-      RETURN COALESCE(
-        NULLIF(property ->> 'empty_error', ''),
-        NULLIF(property ->> 'required_error', ''),
-        action_type || ' missing ' || property_name
-      );
-    END IF;
-
-    IF jsonb_typeof(property -> 'enum') = 'array' THEN
-      SELECT array_agg(enum_value)
-      INTO enum_values
-      FROM jsonb_array_elements_text(property -> 'enum') AS values(enum_value);
-
-      IF value_type <> 'string' OR NOT value #>> '{}' = ANY(enum_values) THEN
-        RETURN COALESCE(
-          NULLIF(property ->> 'enum_error', ''),
-          action_type || ' ' || property_name || ' must be one of ' || array_to_string(enum_values, ', ')
-        );
-      END IF;
-    END IF;
-
-    IF COALESCE(NULLIF(property ->> 'nonEmpty', '')::boolean, false) THEN
-      IF (value_type = 'array' AND jsonb_array_length(value) = 0)
-         OR (value_type = 'string' AND btrim(value #>> '{}') = '') THEN
-        RETURN COALESCE(
-          NULLIF(property ->> 'empty_error', ''),
-          action_type || ' missing ' || property_name
-        );
-      END IF;
-    END IF;
-  END LOOP;
-
-  IF output_confidence IS NOT NULL THEN
-    output_rank := CASE output_confidence
-      WHEN 'low' THEN 1
-      WHEN 'medium' THEN 2
-      WHEN 'high' THEN 3
-      ELSE NULL
-    END;
-  END IF;
-
-  IF jsonb_typeof(schema -> 'rules') = 'array' THEN
-    FOR rule IN SELECT r.value FROM jsonb_array_elements(schema -> 'rules') AS r(value) LOOP
-      rule_kind := rule ->> 'kind';
-
-      IF rule_kind = 'output_equals' THEN
-        output_value := NULLIF(output ->> (rule ->> 'field'), '');
-        IF output_value IS NOT NULL AND output_value <> rule ->> 'value' THEN
-          RETURN rule ->> 'error';
-        END IF;
-      ELSIF rule_kind = 'subject_pair_matches' THEN
-        IF expected_left_id IS NULL OR expected_right_id IS NULL THEN
-          RETURN COALESCE(rule ->> 'missing_error', 'action requires input.action_ids left_id and right_id');
-        END IF;
-        IF (
-             body ->> (rule ->> 'left_field') <> expected_left_id
-             OR body ->> (rule ->> 'right_field') <> expected_right_id
-           ) THEN
-          RETURN rule ->> 'error';
-        END IF;
-      ELSIF rule_kind = 'subject_pair_matches_when_present' THEN
-        IF expected_left_id IS NOT NULL
-           AND NULLIF(body ->> (rule ->> 'left_field'), '') IS NOT NULL
-           AND (
-             body ->> (rule ->> 'left_field') <> expected_left_id
-             OR body ->> (rule ->> 'right_field') <> expected_right_id
-           ) THEN
-          RETURN rule ->> 'error';
-        END IF;
-      ELSIF rule_kind = 'field_matches_expected_right' THEN
-        IF expected_right_id IS NULL THEN
-          RETURN COALESCE(rule ->> 'missing_error', 'action requires input.action_ids right_id');
-        END IF;
-        IF body ->> (rule ->> 'field') <> expected_right_id THEN
-          RETURN rule ->> 'error';
-        END IF;
-      ELSIF rule_kind = 'confidence_not_above_output' THEN
-        action_value := NULLIF(body ->> (rule ->> 'field'), '');
-        IF output_rank IS NOT NULL AND action_value IS NOT NULL THEN
-          action_rank := CASE action_value WHEN 'low' THEN 1 WHEN 'medium' THEN 2 WHEN 'high' THEN 3 ELSE NULL END;
-          IF action_rank IS NOT NULL AND action_rank > output_rank THEN
-            RETURN rule ->> 'error';
-          END IF;
-        END IF;
-      END IF;
-    END LOOP;
-  END IF;
-
-  RETURN NULL;
-END;
-$$;
-
 CREATE FUNCTION otlet.action_validation_error(
   action jsonb,
   output jsonb DEFAULT NULL,
@@ -670,9 +476,12 @@ DECLARE
   v_action_type text := COALESCE(action ->> 'type', '');
   body jsonb;
   schema_row otlet.action_type_schemas%ROWTYPE;
-  payload_source text;
   expected_left_id text;
   expected_right_id text;
+  output_confidence text := NULLIF(output ->> 'confidence', '');
+  output_rank int;
+  action_rank int;
+  unsupported_key text;
 BEGIN
   IF jsonb_typeof(action) IS DISTINCT FROM 'object' THEN
     RETURN 'action must be an object';
@@ -691,19 +500,22 @@ BEGIN
     RETURN 'unsupported action type';
   END IF;
 
-  payload_source := COALESCE(NULLIF(schema_row.payload_schema ->> 'payload_source', ''), 'body');
   body := CASE
-    WHEN payload_source = 'action' THEN action - 'type'
+    WHEN v_action_type = 'create_record' THEN action - 'type'
     ELSE action -> 'body'
   END;
 
-  IF payload_source <> 'action'
-     AND EXISTS (
-       SELECT 1
-       FROM jsonb_object_keys(action) AS key
-       WHERE key NOT IN ('type', 'body')
-     ) THEN
-    RETURN 'action has unsupported key';
+  IF v_action_type <> 'create_record' THEN
+    SELECT key
+    INTO unsupported_key
+    FROM jsonb_object_keys(action) AS key
+    WHERE key NOT IN ('type', 'body')
+    ORDER BY key
+    LIMIT 1;
+
+    IF unsupported_key IS NOT NULL THEN
+      RETURN 'action has unsupported key';
+    END IF;
   END IF;
 
   IF jsonb_typeof(body) IS DISTINCT FROM 'object' THEN
@@ -713,14 +525,92 @@ BEGIN
   expected_left_id := NULLIF(job_input #>> '{action_ids,left_id}', '');
   expected_right_id := NULLIF(job_input #>> '{action_ids,right_id}', '');
 
-  RETURN otlet.action_payload_schema_error(
-    v_action_type,
-    body,
-    output,
-    expected_left_id,
-    expected_right_id,
-    schema_row.payload_schema
-  );
+  output_rank := CASE output_confidence WHEN 'low' THEN 1 WHEN 'medium' THEN 2 WHEN 'high' THEN 3 ELSE NULL END;
+
+  IF v_action_type = 'create_record' THEN
+    IF NULLIF(body ->> 'record_type', '') IS NULL THEN
+      RETURN 'create_record missing record_type';
+    ELSIF NULLIF(body ->> 'subject_id', '') IS NULL THEN
+      RETURN 'create_record missing subject_id';
+    ELSIF jsonb_typeof(body -> 'body') IS DISTINCT FROM 'object' THEN
+      RETURN 'create_record missing body';
+    END IF;
+    SELECT key
+    INTO unsupported_key
+    FROM jsonb_object_keys(body) AS key
+    WHERE key NOT IN ('record_type', 'subject_id', 'body')
+    ORDER BY key
+    LIMIT 1;
+    IF unsupported_key IS NOT NULL THEN
+      RETURN 'create_record unsupported payload field: ' || unsupported_key;
+    END IF;
+  ELSIF v_action_type = 'merge_candidate' THEN
+    IF NULLIF(body ->> 'left_id', '') IS NULL THEN
+      RETURN 'merge_candidate missing left_id';
+    ELSIF NULLIF(body ->> 'right_id', '') IS NULL THEN
+      RETURN 'merge_candidate missing right_id';
+    ELSIF NULLIF(body ->> 'reason', '') IS NULL THEN
+      RETURN 'merge_candidate missing reason';
+    ELSIF NULLIF(output ->> 'match', '') IS NOT NULL AND output ->> 'match' <> 'same_entity' THEN
+      RETURN 'merge_candidate requires same_entity output';
+    ELSIF expected_left_id IS NULL OR expected_right_id IS NULL THEN
+      RETURN 'merge_candidate requires input.action_ids left_id and right_id';
+    ELSIF body ->> 'left_id' <> expected_left_id OR body ->> 'right_id' <> expected_right_id THEN
+      RETURN 'merge_candidate subject ids must match job subject_id';
+    ELSIF body ? 'confidence' AND body ->> 'confidence' NOT IN ('low', 'medium', 'high') THEN
+      RETURN 'merge_candidate confidence must be low, medium, or high';
+    END IF;
+    action_rank := CASE body ->> 'confidence' WHEN 'low' THEN 1 WHEN 'medium' THEN 2 WHEN 'high' THEN 3 ELSE NULL END;
+    IF output_rank IS NOT NULL AND action_rank IS NOT NULL AND action_rank > output_rank THEN
+      RETURN 'merge_candidate confidence cannot exceed output confidence';
+    END IF;
+    IF body ? 'evidence'
+       AND NOT (
+         (jsonb_typeof(body -> 'evidence') = 'array' AND jsonb_array_length(body -> 'evidence') > 0)
+         OR (jsonb_typeof(body -> 'evidence') = 'string' AND btrim(body ->> 'evidence') <> '')
+       ) THEN
+      RETURN 'merge_candidate missing decisive evidence';
+    END IF;
+  ELSIF v_action_type = 'new_entity' THEN
+    IF NULLIF(body ->> 'entity_id', '') IS NULL THEN
+      RETURN 'new_entity missing entity_id';
+    ELSIF NULLIF(body ->> 'reason', '') IS NULL THEN
+      RETURN 'new_entity missing reason';
+    ELSIF NULLIF(output ->> 'match', '') IS NOT NULL AND output ->> 'match' <> 'different_entity' THEN
+      RETURN 'new_entity requires different_entity output';
+    ELSIF expected_right_id IS NULL THEN
+      RETURN 'new_entity requires input.action_ids right_id';
+    ELSIF body ->> 'entity_id' <> expected_right_id THEN
+      RETURN 'new_entity entity_id must match job right subject_id';
+    END IF;
+    IF body ? 'evidence'
+       AND NOT (
+         (jsonb_typeof(body -> 'evidence') = 'array' AND jsonb_array_length(body -> 'evidence') > 0)
+         OR (jsonb_typeof(body -> 'evidence') = 'string' AND btrim(body ->> 'evidence') <> '')
+       ) THEN
+      RETURN 'new_entity missing separation evidence';
+    END IF;
+  ELSIF v_action_type = 'review_flag' THEN
+    IF NULLIF(body ->> 'reason', '') IS NULL THEN
+      RETURN 'review_flag missing reason';
+    ELSIF body ? 'severity' AND body ->> 'severity' NOT IN ('low', 'medium', 'high') THEN
+      RETURN 'review_flag severity must be low, medium, or high';
+    ELSIF NULLIF(output ->> 'match', '') IS NOT NULL AND output ->> 'match' <> 'unclear' THEN
+      RETURN 'review_flag requires unclear output';
+    ELSIF expected_left_id IS NOT NULL
+       AND NULLIF(body ->> 'left_id', '') IS NOT NULL
+       AND (body ->> 'left_id' <> expected_left_id OR body ->> 'right_id' <> expected_right_id) THEN
+      RETURN 'review_flag subject ids must match job subject_id';
+    END IF;
+  ELSIF v_action_type = 'note' THEN
+    IF NULLIF(body ->> 'subject_id', '') IS NULL THEN
+      RETURN 'note missing subject_id';
+    ELSIF NULLIF(body ->> 'text', '') IS NULL THEN
+      RETURN 'note missing text';
+    END IF;
+  END IF;
+
+  RETURN NULL;
 END;
 $$;
 
@@ -1081,45 +971,55 @@ BEGIN
 END;
 $$;
 
+CREATE FUNCTION otlet.validated_action_context(action_id bigint)
+RETURNS TABLE (
+  action_row otlet.actions,
+  schema_row otlet.action_type_schemas,
+  job_row otlet.jobs,
+  output_body jsonb,
+  current_content_hash text,
+  validation_error text
+)
+LANGUAGE plpgsql
+AS $$
+BEGIN
+  RETURN QUERY
+  SELECT
+    a,
+    s,
+    j,
+    o.output,
+    otlet.current_task_subject_content_hash(j.task_name, j.subject_id),
+    otlet.action_validation_error(a.payload, o.output, j.subject_id, j.input)
+  FROM otlet.actions a
+  JOIN otlet.jobs j ON j.id = a.job_id
+  LEFT JOIN otlet.action_type_schemas s ON s.action_type = a.action_type
+  LEFT JOIN otlet.outputs o ON o.id = a.output_id
+  WHERE a.id = validated_action_context.action_id
+  FOR UPDATE OF a;
+END;
+$$;
+
 CREATE FUNCTION otlet.dry_run_action(action_id bigint) RETURNS SETOF otlet.actions
 LANGUAGE plpgsql
 AS $$
 DECLARE
-  action_row otlet.actions%ROWTYPE;
-  job_row otlet.jobs%ROWTYPE;
-  output_body jsonb;
-  current_content_hash text;
+  context_row record;
   validation_error text;
+  action_row otlet.actions%ROWTYPE;
 BEGIN
   SELECT *
-  INTO action_row
-  FROM otlet.actions
-  WHERE id = dry_run_action.action_id
-  FOR UPDATE;
+  INTO context_row
+  FROM otlet.validated_action_context(dry_run_action.action_id);
 
   IF NOT FOUND THEN
     RETURN;
   END IF;
 
-  SELECT *
-  INTO job_row
-  FROM otlet.jobs j
-  WHERE j.id = action_row.job_id;
-
-  SELECT o.output
-  INTO output_body
-  FROM otlet.outputs o
-  WHERE o.id = action_row.output_id;
-
-  current_content_hash := otlet.current_task_subject_content_hash(job_row.task_name, job_row.subject_id);
-  validation_error := otlet.action_validation_error(
-    action_row.payload,
-    output_body,
-    job_row.subject_id,
-    job_row.input
-  );
+  action_row := context_row.action_row;
+  validation_error := context_row.validation_error;
   IF action_row.content_hash IS NOT NULL
-     AND current_content_hash IS DISTINCT FROM action_row.content_hash THEN
+     AND context_row.current_content_hash IS DISTINCT FROM action_row.content_hash THEN
     validation_error := 'source identity stale';
   END IF;
   IF action_row.status = 'rejected' THEN
@@ -1140,11 +1040,9 @@ CREATE FUNCTION otlet.apply_action(action_id bigint) RETURNS SETOF otlet.actions
 LANGUAGE plpgsql
 AS $$
 DECLARE
+  context_row record;
   action_row otlet.actions%ROWTYPE;
   schema_row otlet.action_type_schemas%ROWTYPE;
-  job_row otlet.jobs%ROWTYPE;
-  output_body jsonb;
-  current_content_hash text;
   validation_error text;
   next_status text;
   next_apply_status text;
@@ -1152,44 +1050,23 @@ DECLARE
   next_applied_at timestamptz;
 BEGIN
   SELECT *
-  INTO action_row
-  FROM otlet.actions
-  WHERE id = apply_action.action_id
-  FOR UPDATE;
+  INTO context_row
+  FROM otlet.validated_action_context(apply_action.action_id);
 
   IF NOT FOUND THEN
     RETURN;
   END IF;
 
-  SELECT *
-  INTO schema_row
-  FROM otlet.action_type_schemas s
-  WHERE s.action_type = action_row.action_type;
-
-  SELECT *
-  INTO job_row
-  FROM otlet.jobs j
-  WHERE j.id = action_row.job_id;
-
-  SELECT o.output
-  INTO output_body
-  FROM otlet.outputs o
-  WHERE o.id = action_row.output_id;
-
-  current_content_hash := otlet.current_task_subject_content_hash(job_row.task_name, job_row.subject_id);
-  validation_error := otlet.action_validation_error(
-    action_row.payload,
-    output_body,
-    job_row.subject_id,
-    job_row.input
-  );
+  action_row := context_row.action_row;
+  schema_row := context_row.schema_row;
+  validation_error := context_row.validation_error;
   next_status := action_row.status;
   next_apply_status := action_row.apply_status;
   next_error := action_row.error;
   next_applied_at := action_row.applied_at;
 
   IF action_row.content_hash IS NOT NULL
-     AND current_content_hash IS DISTINCT FROM action_row.content_hash THEN
+     AND context_row.current_content_hash IS DISTINCT FROM action_row.content_hash THEN
     validation_error := 'source identity stale';
   END IF;
 
@@ -1248,14 +1125,19 @@ CREATE FUNCTION otlet.action_declared_answer(
 LANGUAGE sql
 STABLE
 AS $$
-  SELECT rule.value ->> 'value'
-  FROM otlet.action_type_schemas s
-  CROSS JOIN LATERAL jsonb_array_elements(COALESCE(s.payload_schema -> 'rules', '[]'::jsonb)) AS rule(value)
-  WHERE s.action_type = $1
-    AND rule.value ->> 'kind' = 'output_equals'
-    AND rule.value ->> 'field' = COALESCE(NULLIF($2, ''), 'match')
-  ORDER BY rule.value ->> 'value'
-  LIMIT 1;
+  SELECT CASE COALESCE(NULLIF($2, ''), 'match')
+    WHEN 'match' THEN CASE $1
+      WHEN 'merge_candidate' THEN 'same_entity'
+      WHEN 'new_entity' THEN 'different_entity'
+      WHEN 'review_flag' THEN 'unclear'
+      ELSE NULL
+    END
+    WHEN 'decision' THEN CASE $1
+      WHEN 'review_flag' THEN 'flag'
+      ELSE NULL
+    END
+    ELSE NULL
+  END;
 $$;
 
 CREATE FUNCTION otlet.label_action(

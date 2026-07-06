@@ -6,183 +6,23 @@ struct ShapedInput {
     applied: bool,
 }
 
-fn shape_model_input(input: &Value, shaping: &Value, max_bytes: u64) -> ShapedInput {
-    let mut shaped = input.clone();
-    let mut applied = false;
-
-    if let Value::Object(object) = &mut shaped {
-        applied |= object.remove("_otlet_mvcc").is_some();
-        applied |= object.remove("otlet_mvcc").is_some();
-
-        if let Some(strip_keys) = shaping.get("strip_keys").and_then(Value::as_array) {
-            for key in strip_keys.iter().filter_map(Value::as_str) {
-                applied |= object.remove(key).is_some();
-            }
-        }
-
-        if !object.contains_key("evidence_counts") {
-            if let Some(counts) = declared_evidence_counts(input, shaping) {
-                object.insert("evidence_counts".to_owned(), counts);
-                applied = true;
-            }
-        }
-
-        if !object.contains_key("action_ids") {
-            if let Some(action_ids) = declared_action_ids(input, shaping) {
-                object.insert("action_ids".to_owned(), action_ids);
-                applied = true;
-            }
-        }
-    }
-
-    let shaped_text = canonical_jsonb_text(&shaped);
-    let original_bytes = shaped_text.len().min(i64::MAX as usize) as i64;
-    let mut bytes = original_bytes;
-    let mut input_truncated = false;
-    if max_bytes > 0 && (original_bytes as u64) > max_bytes {
-        let preview_max = max_bytes.min(1024) as usize;
-        let preview = shaped_text
-            .chars()
-            .take(preview_max)
-            .collect::<String>();
-        shaped = json!({
-            "_otlet_input_truncated": true,
-            "truncation_policy": "max_shaped_input_bytes_fail_toward_abstention",
-            "original_shaped_input_bytes": original_bytes,
-            "max_shaped_input_bytes": max_bytes,
-            "truncated_input_preview": preview
-        });
-        bytes = shaped.to_string().len().min(i64::MAX as usize) as i64;
-        input_truncated = true;
-        applied = true;
-    }
+fn shaped_model_input(input: Value) -> ShapedInput {
+    let bytes = input.to_string().len().min(i64::MAX as usize) as i64;
+    let original_bytes = input
+        .get("original_shaped_input_bytes")
+        .and_then(Value::as_i64)
+        .unwrap_or(bytes);
+    let input_truncated = input
+        .get("_otlet_input_truncated")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
 
     ShapedInput {
-        input: shaped,
+        input,
         bytes,
         original_bytes,
         input_truncated,
-        applied,
-    }
-}
-
-fn declared_max_shaped_input_bytes(shaping: &Value) -> u64 {
-    shaping
-        .get("max_shaped_input_bytes")
-        .and_then(Value::as_u64)
-        .unwrap_or(0)
-        .min(1_048_576)
-}
-
-fn declared_evidence_counts(input: &Value, shaping: &Value) -> Option<Value> {
-    let fields = shaping.get("evidence_fields")?.as_array()?;
-    let mut counts = serde_json::Map::new();
-    for field in fields.iter().filter_map(Value::as_str) {
-        let Some(Value::Object(buckets)) = input.get(field) else {
-            continue;
-        };
-        for (bucket, value) in buckets {
-            let count = match value {
-                Value::Array(items) => items.len() as i64,
-                Value::String(text) if !text.trim().is_empty() => 1,
-                Value::Number(_) | Value::Bool(true) | Value::Object(_) => 1,
-                _ => 0,
-            };
-            counts.insert(bucket.clone(), Value::Number(count.into()));
-        }
-    }
-    if counts.is_empty() {
-        None
-    } else {
-        Some(Value::Object(counts))
-    }
-}
-
-fn declared_action_ids(input: &Value, shaping: &Value) -> Option<Value> {
-    let fields = shaping.get("action_id_fields")?.as_object()?;
-    let mut ids = serde_json::Map::new();
-    for (target_key, source_field) in fields {
-        let Some(source_field) = source_field.as_str() else {
-            continue;
-        };
-        if let Some(value) = input.get(source_field) {
-            ids.insert(target_key.clone(), value.clone());
-        }
-    }
-    if ids.is_empty() {
-        None
-    } else {
-        Some(Value::Object(ids))
-    }
-}
-
-#[cfg(test)]
-mod input_shaping_tests {
-    use super::*;
-
-    fn sample_input() -> Value {
-        json!({
-            "_otlet_mvcc": {"xmin": "7"},
-            "keep": "visible",
-            "strip_me": "volatile",
-            "left_id": "left-1",
-            "candidate_evidence": {
-                "shared": ["a", "b"],
-                "warning": "manual check",
-                "ignored": false
-            }
-        })
-    }
-
-    fn sample_shaping() -> Value {
-        json!({
-            "strip_keys": ["strip_me"],
-            "evidence_fields": ["candidate_evidence"],
-            "action_id_fields": {"left_id": "left_id"}
-        })
-    }
-
-    #[test]
-    fn shape_model_input_matches_sql_vector() {
-        let shaped = shape_model_input(&sample_input(), &sample_shaping(), 0);
-
-        assert_eq!(
-            shaped.input,
-            json!({
-                "keep": "visible",
-                "left_id": "left-1",
-                "candidate_evidence": {
-                    "shared": ["a", "b"],
-                    "warning": "manual check",
-                    "ignored": false
-                },
-                "evidence_counts": {
-                    "shared": 2,
-                    "warning": 1,
-                    "ignored": 0
-                },
-                "action_ids": {"left_id": "left-1"}
-            })
-        );
-        assert!(shaped.applied);
-        assert!(!shaped.input_truncated);
-    }
-
-    #[test]
-    fn shape_model_input_truncates_to_abstention_envelope() {
-        let input = json!({"row": {"payload": "x".repeat(400)}});
-        let shaped = shape_model_input(&input, &json!({}), 80);
-
-        assert!(shaped.applied);
-        assert!(shaped.input_truncated);
-        assert_eq!(shaped.input["_otlet_input_truncated"], json!(true));
-        assert_eq!(
-            shaped.input["truncation_policy"],
-            json!("max_shaped_input_bytes_fail_toward_abstention")
-        );
-        assert_eq!(shaped.input["max_shaped_input_bytes"], json!(80));
-        assert!(shaped.original_bytes > 80);
-        assert!(shaped.bytes > 0);
+        applied: true,
     }
 }
 

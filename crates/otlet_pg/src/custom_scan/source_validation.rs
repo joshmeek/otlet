@@ -122,15 +122,9 @@ fn validate_semantic_index_source(
     let metadata_query = format!(
         "SELECT \
            si.source_table, \
-           si.task_name, \
            si.subject_column, \
-           quote_nullable(si.input_columns)::text AS input_columns_sql, \
-           CASE WHEN si.input_columns IS NULL THEN NULL ELSE to_jsonb(si.input_columns)::text END AS input_columns_json, \
-           si.model_name, \
-           quote_nullable(t.input_shaping::text)::text AS input_shaping_sql, \
-           otlet.task_contract_hash(t.instruction, t.output_schema, t.model_name, t.runtime_options, t.input_shaping, t.decision_contract) AS contract_hash \
+           CASE WHEN si.input_columns IS NULL THEN NULL ELSE to_jsonb(si.input_columns)::text END AS input_columns_json \
          FROM otlet.semantic_indexes si \
-         JOIN otlet.tasks t ON t.name = si.task_name \
          WHERE si.name = {} AND si.source_table::regclass = {}::oid \
          LIMIT 1",
         sql_literal(index_name),
@@ -160,169 +154,43 @@ fn validate_semantic_index_source(
         if source_table.is_empty() || subject_column.is_empty() {
             return Ok::<Option<(SemanticPlannerStats, Option<Vec<String>>)>, String>(None);
         }
-        let Some(task_name) = row.get_by_name::<String, _>("task_name").map_err(to_string)? else {
-            return Ok::<Option<(SemanticPlannerStats, Option<Vec<String>>)>, String>(None);
-        };
-        let Some(model_name) = row
-            .get_by_name::<String, _>("model_name")
-            .map_err(to_string)?
-        else {
-            return Ok::<Option<(SemanticPlannerStats, Option<Vec<String>>)>, String>(None);
-        };
-        let input_columns_sql = row
-            .get_by_name::<String, _>("input_columns_sql")
-            .map_err(to_string)?
-            .unwrap_or_else(|| "NULL".to_owned());
         let input_columns = row
             .get_by_name::<String, _>("input_columns_json")
             .map_err(to_string)?
             .map(|json| serde_json::from_str::<Vec<String>>(&json).map_err(to_string))
             .transpose()?;
-        let input_shaping_sql = row
-            .get_by_name::<String, _>("input_shaping_sql")
-            .map_err(to_string)?
-            .unwrap_or_else(|| "'{}'".to_owned());
-        let Some(contract_hash) = row
-            .get_by_name::<String, _>("contract_hash")
-            .map_err(to_string)?
-        else {
-            return Ok::<Option<(SemanticPlannerStats, Option<Vec<String>>)>, String>(None);
-        };
         let subject_column_cstr = CString::new(subject_column.as_str()).map_err(to_string)?;
         let indexed_attno = unsafe { pg_sys::get_attnum(relid, subject_column_cstr.as_ptr()) };
         if indexed_attno != subject_attno {
             return Ok::<Option<(SemanticPlannerStats, Option<Vec<String>>)>, String>(None);
         }
 
-        let source_rows_sql = source_rows_sql(
-            &source_table,
-            &subject_column,
-            &input_columns_sql,
-            &input_shaping_sql,
-        );
-        let matches_expected_sql = row_predicate_match_sql("sm.body", expected_json);
-        let contract_hash_sql = sql_literal(&contract_hash);
-        let freshness_status_sql =
-            semantic_freshness_status_sql("l", "src.content_hash", &contract_hash_sql, "src.source_hash");
         let stats_query = format!(
-            "WITH source_rows AS ( \
-               {} \
+            "WITH plan AS ( \
+               SELECT * \
+               FROM otlet.semantic_index_plan({}, true) \
              ), \
-             latest AS ( \
-               SELECT DISTINCT ON (sm.subject_id) \
-                 sm.subject_id, sm.stale, sm.source_hash, sm.content_hash, sm.contract_hash, sm.stale_reason, {} AS matches_expected, sm.updated_at, sm.id \
-               FROM source_rows src \
-               JOIN otlet.semantic_materializations sm \
-                 ON sm.subject_id = src.subject_id \
-               JOIN otlet.semantic_indexes si \
-                 ON si.task_name = sm.task_name \
-                AND si.record_type = sm.record_type \
-               WHERE si.name = {} \
-               ORDER BY sm.subject_id, \
-                 (sm.content_hash IS NOT DISTINCT FROM src.content_hash AND sm.contract_hash IS NOT DISTINCT FROM {}) DESC, \
-                 sm.updated_at DESC, sm.id DESC \
-             ), \
-             active_jobs AS ( \
-               SELECT DISTINCT j.subject_id \
-               FROM otlet.jobs j \
-               JOIN otlet.semantic_indexes si ON si.task_name = j.task_name \
-               WHERE si.name = {} \
-                 AND j.status IN ('queued', 'running', 'cancel_requested') \
-             ), \
-             runtime_model AS ( \
-               SELECT \
-                 COALESCE(task_receipt.generate_ms, slot_cost.last_generate_ms, model_receipt.generate_ms, 2500)::float8 AS model_ms, \
-                 CASE \
-                   WHEN task_receipt.generate_ms IS NOT NULL THEN 'task_receipt' \
-                   WHEN slot_cost.last_generate_ms IS NOT NULL THEN 'runtime_slot' \
-                   WHEN model_receipt.generate_ms IS NOT NULL THEN 'model_receipt' \
-                   ELSE 'static_fallback' \
-                 END AS model_cost_source \
-               FROM (SELECT 1) one \
-               LEFT JOIN LATERAL ( \
-                 SELECT r.generate_ms::float8 AS generate_ms \
-                 FROM otlet.inference_receipts r \
-                 WHERE r.task_name = {} \
-                   AND r.model_name = {} \
-                   AND r.status = 'complete' \
-                   AND r.schema_validation_status = 'passed' \
-                   AND COALESCE(r.generate_ms, 0) > 0 \
-                 ORDER BY r.finished_at DESC \
-                 LIMIT 1 \
-               ) task_receipt ON true \
-               LEFT JOIN LATERAL ( \
-                 SELECT rs.last_generate_ms::float8 AS last_generate_ms \
-                 FROM otlet.runtime_slots rs \
-                 JOIN otlet.models m ON m.name = {} \
-                 WHERE rs.model_name = {} \
-                   AND rs.runtime_name = m.runtime_name \
-                   AND COALESCE(rs.last_generate_ms, 0) > 0 \
-                 ORDER BY rs.last_used_at DESC NULLS LAST \
-                 LIMIT 1 \
-               ) slot_cost ON true \
-               LEFT JOIN LATERAL ( \
-                 SELECT r.generate_ms::float8 AS generate_ms \
-                 FROM otlet.inference_receipts r \
-                 WHERE r.model_name = {} \
-                   AND r.status = 'complete' \
-                   AND r.schema_validation_status = 'passed' \
-                   AND COALESCE(r.generate_ms, 0) > 0 \
-                 ORDER BY r.finished_at DESC \
-                 LIMIT 1 \
-               ) model_receipt ON true \
-             ), \
-             classified AS ( \
-               SELECT \
-                 CASE \
-                   WHEN a.subject_id IS NOT NULL AND (l.subject_id IS NULL OR status.is_stale) THEN 'in_flight' \
-                   WHEN l.subject_id IS NULL THEN 'missing' \
-                   WHEN status.is_stale THEN 'stale' \
-                   WHEN l.matches_expected THEN 'fresh_match' \
-                   ELSE 'fresh_non_match' \
-                 END AS state, \
-                 COALESCE(status.stale_reason, 'content_revalidation_pending') AS stale_reason, \
-                 ( \
-                   a.subject_id IS NULL \
-                   AND l.subject_id IS NOT NULL \
-                   AND l.stale \
-                   AND status.is_fresh \
-                 ) AS cache_reusable \
-               FROM source_rows src \
-               LEFT JOIN latest l USING (subject_id) \
-               LEFT JOIN LATERAL {} status ON l.subject_id IS NOT NULL \
-               LEFT JOIN active_jobs a USING (subject_id) \
+             current_rows AS ( \
+               SELECT subject_id, body, stale \
+               FROM otlet.semantic_index_current_rows({}, false) \
              ) \
              SELECT \
-               count(*)::bigint AS source_rows, \
-               count(*) FILTER (WHERE state = 'fresh_match')::bigint AS fresh_matches, \
-               count(*) FILTER (WHERE state = 'fresh_non_match')::bigint AS fresh_non_matches, \
-               count(*) FILTER (WHERE state = 'stale')::bigint AS stale_rows, \
-               count(*) FILTER (WHERE state = 'missing')::bigint AS missing_rows, \
-               count(*) FILTER (WHERE state = 'in_flight')::bigint AS inflight_rows, \
-               count(*) FILTER (WHERE state = 'stale' AND cache_reusable)::bigint AS cache_reusable_rows, \
-               (SELECT model_ms FROM runtime_model)::float8 AS model_ms, \
-               (SELECT model_cost_source FROM runtime_model)::text AS model_cost_source, \
-               COALESCE(( \
-                 SELECT jsonb_object_agg(reason, reason_count ORDER BY reason)::text \
-                 FROM ( \
-                   SELECT stale_reason AS reason, count(*) AS reason_count \
-                   FROM classified \
-                   WHERE state = 'stale' \
-                   GROUP BY stale_reason \
-                 ) reasons \
-             ), '{{}}'::text) AS stale_reasons \
-             FROM classified",
-            source_rows_sql,
-            matches_expected_sql,
+               COALESCE((SELECT total_subjects FROM plan), 0)::bigint AS source_rows, \
+               count(*) FILTER (WHERE stale = false AND body @> {}::jsonb)::bigint AS fresh_matches, \
+               count(*) FILTER (WHERE stale = false AND NOT (body @> {}::jsonb))::bigint AS fresh_non_matches, \
+               COALESCE((SELECT stale_subjects FROM plan), 0)::bigint AS stale_rows, \
+               COALESCE((SELECT missing_subjects FROM plan), 0)::bigint AS missing_rows, \
+               COALESCE((SELECT inflight_subjects FROM plan), 0)::bigint AS inflight_rows, \
+               0::bigint AS cache_reusable_rows, \
+               COALESCE((SELECT model_ms FROM plan), 2500)::float8 AS model_ms, \
+               COALESCE((SELECT model_cost_source FROM plan), 'static_fallback')::text AS model_cost_source, \
+               COALESCE((SELECT count_basis FROM plan), 'exact')::text AS count_basis, \
+               COALESCE((SELECT stale_reasons::text FROM plan), '{{}}'::text) AS stale_reasons \
+             FROM current_rows",
             sql_literal(index_name),
-            contract_hash_sql,
             sql_literal(index_name),
-            sql_literal(&task_name),
-            sql_literal(&model_name),
-            sql_literal(&model_name),
-            sql_literal(&model_name),
-            sql_literal(&model_name),
-            freshness_status_sql
+            sql_literal(expected_json),
+            sql_literal(expected_json)
         );
         let stats_table = client
             .select(stats_query.as_str(), Some(1), &[])
@@ -382,7 +250,10 @@ fn validate_semantic_index_source(
                 .get_by_name::<String, _>("stale_reasons")
                 .map_err(to_string)?
                 .unwrap_or_else(|| "{}".to_string()),
-            count_basis: "exact".to_string(),
+            count_basis: row
+                .get_by_name::<String, _>("count_basis")
+                .map_err(to_string)?
+                .unwrap_or_else(|| "exact".to_string()),
         };
         finish_planner_stats(
             &mut stats,

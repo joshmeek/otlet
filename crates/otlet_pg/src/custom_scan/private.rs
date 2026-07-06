@@ -4,14 +4,6 @@ struct CustomScanPrivate {
     expected_json: String,
     subject_attno: i16,
     subject_typid: pg_sys::Oid,
-    selected_path: String,
-    reason: String,
-    stale_reasons: String,
-    model_cost_source: String,
-    model_ms: f64,
-    count_basis: String,
-    infer_decision_rows: u64,
-    fail_closed_decision_rows: u64,
     input_columns: Option<Vec<String>>,
 }
 
@@ -23,14 +15,6 @@ unsafe fn custom_private_from_predicate(predicate: &SemanticMatchPredicate) -> *
             "expected_json": &predicate.expected_json,
             "subject_attno": predicate.subject_attno,
             "subject_typid": predicate.subject_typid.to_u32(),
-            "selected_path": &predicate.planner_stats.selected_path,
-            "reason": &predicate.planner_stats.reason,
-            "stale_reasons": &predicate.planner_stats.stale_reasons,
-            "model_cost_source": &predicate.planner_stats.model_cost_source,
-            "model_ms": predicate.planner_stats.model_ms,
-            "count_basis": &predicate.planner_stats.count_basis,
-            "infer_decision_rows": predicate.planner_stats.infer_decision_rows,
-            "fail_closed_decision_rows": predicate.planner_stats.fail_closed_decision_rows,
             "input_columns": &predicate.input_columns
         });
         let mut list = ptr::null_mut();
@@ -74,39 +58,6 @@ unsafe fn custom_private_from_list(private: *mut pg_sys::List) -> Option<CustomS
             expected_json: payload.get("expected_json")?.as_str()?.to_string(),
             subject_attno: payload.get("subject_attno")?.as_i64()?.try_into().ok()?,
             subject_typid: pg_sys::Oid::from(payload.get("subject_typid")?.as_u64()? as u32),
-            selected_path: payload.get("selected_path")?.as_str()?.to_string(),
-            reason: payload
-                .get("reason")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string(),
-            stale_reasons: payload
-                .get("stale_reasons")
-                .and_then(Value::as_str)
-                .unwrap_or("{}")
-                .to_string(),
-            model_cost_source: payload
-                .get("model_cost_source")
-                .and_then(Value::as_str)
-                .unwrap_or("static_fallback")
-                .to_string(),
-            model_ms: payload
-                .get("model_ms")
-                .and_then(Value::as_f64)
-                .unwrap_or(2500.0),
-            count_basis: payload
-                .get("count_basis")
-                .and_then(Value::as_str)
-                .unwrap_or("unknown")
-                .to_string(),
-            infer_decision_rows: payload
-                .get("infer_decision_rows")
-                .and_then(Value::as_u64)
-                .unwrap_or(0),
-            fail_closed_decision_rows: payload
-                .get("fail_closed_decision_rows")
-                .and_then(Value::as_u64)
-                .unwrap_or(0),
             input_columns: payload
                 .get("input_columns")
                 .and_then(Value::as_array)
@@ -119,6 +70,91 @@ unsafe fn custom_private_from_list(private: *mut pg_sys::List) -> Option<CustomS
                 }),
         })
     }
+}
+
+fn reload_private_planner_stats(private: &CustomScanPrivate) -> SemanticPlannerStats {
+    let plan_function = match private.index_kind {
+        SemanticIndexKind::Row => "otlet.semantic_index_plan",
+        SemanticIndexKind::Join => "otlet.semantic_join_index_plan",
+    };
+    let query = format!(
+        "SELECT selected_path, reason, total_subjects, fresh_subjects, stale_subjects, missing_subjects, inflight_subjects, \
+         infer_now_subjects, fail_closed_subjects, model_ms::float8 AS model_ms, model_cost_source, path_cost::float8 AS path_cost, \
+         stale_reasons::text AS stale_reasons, count_basis \
+         FROM {}({})",
+        plan_function,
+        sql_literal(&private.index_name)
+    );
+
+    pgrx::Spi::connect(|client| {
+        let table = client.select(query.as_str(), Some(1), &[]).map_err(to_string)?;
+        if table.is_empty() {
+            return Err("missing semantic index plan".to_owned());
+        }
+        let row = table.first();
+        macro_rules! text {
+            ($name:literal, $default:literal) => {
+                row.get_by_name::<String, _>($name)
+                    .map_err(to_string)?
+                    .unwrap_or_else(|| $default.to_string())
+            };
+        }
+        macro_rules! count {
+            ($name:literal) => {
+                row.get_by_name::<i64, _>($name)
+                    .map_err(to_string)?
+                    .unwrap_or(0)
+                    .max(0) as u64
+            };
+        }
+        Ok::<SemanticPlannerStats, String>(SemanticPlannerStats {
+            selected_path: text!("selected_path", "semantic_lookup"),
+            reason: text!("reason", "reloaded_from_sql_plan"),
+            source_rows: count!("total_subjects"),
+            fresh_matches: count!("fresh_subjects"),
+            fresh_non_matches: 0,
+            stale_rows: count!("stale_subjects"),
+            missing_rows: count!("missing_subjects"),
+            inflight_rows: count!("inflight_subjects"),
+            cache_reusable_rows: 0,
+            infer_decision_rows: count!("infer_now_subjects"),
+            fail_closed_decision_rows: count!("fail_closed_subjects"),
+            model_ms: row
+                .get_by_name::<f64, _>("model_ms")
+                .map_err(to_string)?
+                .unwrap_or(2500.0)
+                .max(1.0),
+            model_cost_source: text!("model_cost_source", "static_fallback"),
+            path_cost: row
+                .get_by_name::<f64, _>("path_cost")
+                .map_err(to_string)?
+                .unwrap_or(1.0)
+                .max(0.0),
+            stale_reasons: text!("stale_reasons", "{}"),
+            count_basis: text!("count_basis", "estimated"),
+        })
+    })
+    .unwrap_or_else(|err| {
+        pgrx::warning!("otlet semantic CustomScan private plan reload failed: {err}");
+        SemanticPlannerStats {
+            selected_path: "semantic_lookup".to_owned(),
+            reason: "private_plan_reload_failed".to_owned(),
+            source_rows: 0,
+            fresh_matches: 0,
+            fresh_non_matches: 0,
+            stale_rows: 0,
+            missing_rows: 0,
+            inflight_rows: 0,
+            cache_reusable_rows: 0,
+            infer_decision_rows: 0,
+            fail_closed_decision_rows: 0,
+            model_ms: 2500.0,
+            model_cost_source: "static_fallback".to_owned(),
+            path_cost: 1.0,
+            stale_reasons: "{}".to_owned(),
+            count_basis: "unknown".to_owned(),
+        }
+    })
 }
 
 unsafe fn list_make1(value: *mut std::ffi::c_void) -> *mut pg_sys::List {

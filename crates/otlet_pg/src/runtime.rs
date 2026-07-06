@@ -2,10 +2,6 @@ use serde_json::{Value, json};
 
 pub(crate) struct RuntimeOptions {
     pub(crate) reasoning: String,
-    pub(crate) schema_prompt: String,
-    pub(crate) prefix_kv_reuse: bool,
-    pub(crate) json_logit_mask: bool,
-    pub(crate) json_logit_mask_enum: bool,
     pub(crate) max_tokens: u64,
     pub(crate) inference_cache: bool,
     pub(crate) max_worker_rss_bytes: u64,
@@ -18,10 +14,6 @@ impl Default for RuntimeOptions {
     fn default() -> Self {
         Self {
             reasoning: "off".to_owned(),
-            schema_prompt: "verbatim".to_owned(),
-            prefix_kv_reuse: false,
-            json_logit_mask: false,
-            json_logit_mask_enum: false,
             max_tokens: 512,
             inference_cache: true,
             max_worker_rss_bytes: 0,
@@ -42,10 +34,6 @@ pub(crate) fn parse_runtime_options(value: &Value) -> Result<RuntimeOptions, Str
         if !matches!(
             key.as_str(),
             "reasoning"
-                | "schema_prompt"
-                | "prefix_kv_reuse"
-                | "json_logit_mask"
-                | "json_logit_mask_enum"
                 | "max_tokens"
                 | "max_attempt_ms"
                 | "inference_cache"
@@ -66,34 +54,6 @@ pub(crate) fn parse_runtime_options(value: &Value) -> Result<RuntimeOptions, Str
             return Err("runtime_options.reasoning must be on or off".to_owned());
         }
         options.reasoning = reasoning.to_owned();
-    }
-
-    if let Some(value) = object.get("schema_prompt") {
-        let schema_prompt = value
-            .as_str()
-            .ok_or("runtime_options.schema_prompt must be a string")?;
-        if !matches!(schema_prompt, "compact" | "verbatim") {
-            return Err("runtime_options.schema_prompt must be compact or verbatim".to_owned());
-        }
-        options.schema_prompt = schema_prompt.to_owned();
-    }
-
-    if let Some(value) = object.get("prefix_kv_reuse") {
-        options.prefix_kv_reuse = value
-            .as_bool()
-            .ok_or("runtime_options.prefix_kv_reuse must be a boolean")?;
-    }
-
-    if let Some(value) = object.get("json_logit_mask") {
-        options.json_logit_mask = value
-            .as_bool()
-            .ok_or("runtime_options.json_logit_mask must be a boolean")?;
-    }
-
-    if let Some(value) = object.get("json_logit_mask_enum") {
-        options.json_logit_mask_enum = value
-            .as_bool()
-            .ok_or("runtime_options.json_logit_mask_enum must be a boolean")?;
     }
 
     if let Some(value) = object.get("max_tokens") {
@@ -184,10 +144,6 @@ pub(crate) fn runtime_option_status(value: &Value) -> Value {
     };
     let controls = [
         "reasoning",
-        "schema_prompt",
-        "prefix_kv_reuse",
-        "json_logit_mask",
-        "json_logit_mask_enum",
         "max_tokens",
         "max_attempt_ms",
         "inference_cache",

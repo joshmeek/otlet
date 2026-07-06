@@ -9,6 +9,7 @@ pub(crate) struct Job {
     pub(crate) instruction: String,
     pub(crate) output_schema: Value,
     pub(crate) input: Value,
+    pub(crate) input_content_hash: String,
     pub(crate) artifact_path: String,
     pub(crate) artifact_hash: Option<String>,
     pub(crate) model_name: String,
@@ -34,8 +35,6 @@ pub(crate) struct ModelSelectionPolicy {
     pub(crate) cheap: JobModel,
     pub(crate) strong: JobModel,
     pub(crate) accept_field_checks: Value,
-    pub(crate) skip_cheap: bool,
-    pub(crate) probe_due: bool,
 }
 
 impl Job {
@@ -68,15 +67,16 @@ macro_rules! job_from_row {
             instruction: required_col!($row, String, 4),
             output_schema: required_col!($row, JsonB, 5).0,
             input: required_col!($row, JsonB, 6).0,
-            artifact_path: required_col!($row, String, 7),
-            artifact_hash: $row.get::<String>(8)?,
-            model_name: required_col!($row, String, 9),
-            runtime_name: required_col!($row, String, 10),
-            runtime_endpoint: required_col!($row, String, 11),
-            runtime_options: required_col!($row, JsonB, 12).0,
-            input_shaping: required_col!($row, JsonB, 13).0,
-            decision_contract: required_col!($row, JsonB, 14).0,
-            max_attempt_ms: required_col!($row, i32, 15) as i64,
+            input_content_hash: required_col!($row, String, 7),
+            artifact_path: required_col!($row, String, 8),
+            artifact_hash: $row.get::<String>(9)?,
+            model_name: required_col!($row, String, 10),
+            runtime_name: required_col!($row, String, 11),
+            runtime_endpoint: required_col!($row, String, 12),
+            runtime_options: required_col!($row, JsonB, 13).0,
+            input_shaping: required_col!($row, JsonB, 14).0,
+            decision_contract: required_col!($row, JsonB, 15).0,
+            max_attempt_ms: required_col!($row, i32, 16) as i64,
         }
     };
 }
@@ -91,7 +91,8 @@ SELECT
   j.subject_id,
   t.instruction,
   t.output_schema,
-  j.input,
+  otlet.semantic_shaped_input(j.input, t.input_shaping),
+  otlet.semantic_content_hash(j.input, t.input_shaping),
   m.artifact_path,
   m.artifact_hash,
   m.name,
@@ -151,7 +152,8 @@ SELECT
   j.subject_id,
   t.instruction,
   t.output_schema,
-  j.input,
+  otlet.semantic_shaped_input(j.input, t.input_shaping),
+  otlet.semantic_content_hash(j.input, t.input_shaping),
   m.artifact_path,
   m.artifact_hash,
   m.name,
@@ -198,15 +200,12 @@ SELECT
   strong.artifact_hash,
   strong.runtime_name,
   strong_runtime.endpoint,
-  p.accept_field_checks,
-  COALESCE(recent.skip_cheap, false),
-  COALESCE(recent.probe_due, false)
+  p.accept_field_checks
 FROM otlet.model_selection_policies p
 JOIN otlet.models cheap ON cheap.name = p.cheap_model_name
 JOIN otlet.runtimes cheap_runtime ON cheap_runtime.name = cheap.runtime_name
 JOIN otlet.models strong ON strong.name = p.strong_model_name
 JOIN otlet.runtimes strong_runtime ON strong_runtime.name = strong.runtime_name
-LEFT JOIN LATERAL otlet.model_selection_recent_acceptance(p.task_name) recent ON true
 WHERE p.task_name = $1
 "#,
             Some(1),
@@ -234,8 +233,6 @@ WHERE p.task_name = $1
                 runtime_endpoint: required_col!(row, String, 10),
             },
             accept_field_checks: required_col!(row, JsonB, 11).0,
-            skip_cheap: required_col!(row, bool, 12),
-            probe_due: required_col!(row, bool, 13),
         }))
     })
 }
