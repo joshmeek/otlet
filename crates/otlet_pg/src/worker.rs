@@ -306,6 +306,14 @@ fn process_direct_job(job: Job) -> JobProcessResult {
     match run_job(&job) {
         Ok(run) => {
             let mut result = JobProcessResult::from_run(false, &run);
+            if let Some(accept_checks) = direct_accept_field_checks(&job) {
+                let (accepted, _) = accepted_by_policy(&run.output, &accept_checks);
+                if !accepted {
+                    result.completed =
+                        reject_direct_attempt(&job, run, "direct_rejected_by_decision_contract");
+                    return result;
+                }
+            }
             result.completed = accept_attempt(&job, run, "direct", "accepted_by_direct_task");
             result
         }
@@ -316,6 +324,40 @@ fn process_direct_job(job: Job) -> JobProcessResult {
             result
         }
     }
+}
+
+fn direct_accept_field_checks(job: &Job) -> Option<serde_json::Value> {
+    if !job
+        .decision_contract
+        .get("enforce_on_direct")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+    {
+        return None;
+    }
+
+    Some(serde_json::json!({
+        "answer_field": job
+            .decision_contract
+            .get("answer_field")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("match"),
+        "abstain_values": job
+            .decision_contract
+            .get("abstain_values")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!(["unclear"])),
+        "confidence_field": job
+            .decision_contract
+            .get("confidence_field")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("confidence"),
+        "accepted_confidence": job
+            .decision_contract
+            .get("accepted_confidence")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!([]))
+    }))
 }
 
 fn process_selected_job(job: Job, policy: ModelSelectionPolicy) -> JobProcessResult {
@@ -540,6 +582,35 @@ fn record_rejected_attempt(
         return false;
     }
     true
+}
+
+fn reject_direct_attempt(job: &Job, run: ModelRun, selection_reason: &str) -> bool {
+    record_metrics_from_run(job, &run);
+    let result: pgrx::spi::Result<()> = BackgroundWorker::transaction(|| {
+        pgrx::Spi::connect_mut(|client| {
+            let args = [
+                job.id.into(),
+                selection_reason.into(),
+                run.raw_output.as_str().into(),
+                run.prompt_hash.as_str().into(),
+                run.input_hash.as_str().into(),
+                run.output_schema_hash.as_str().into(),
+                run.raw_output_hash.as_str().into(),
+                JsonB(run.trace_summary).into(),
+                job.model_name.as_str().into(),
+            ];
+            client.update(
+                "SELECT otlet.fail_job($1, $2, $3, $4, $5, $6, $7, schema_validation_status => 'passed', trace_summary => $8, model_name => $9, selection_role => 'direct', selection_status => 'rejected', selection_reason => 'direct_rejected_by_decision_contract')",
+                Some(1),
+                &args,
+            )?;
+            Ok(())
+        })
+    });
+    if let Err(err) = result {
+        pgrx::warning!("otlet worker direct rejection failed: {err}");
+    }
+    false
 }
 
 fn record_failed_model_attempt(

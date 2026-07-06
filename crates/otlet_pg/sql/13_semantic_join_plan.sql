@@ -126,17 +126,27 @@ CREATE FUNCTION otlet.semantic_join_matches(
   subject_id text,
   expected jsonb
 ) RETURNS boolean
-LANGUAGE sql
+LANGUAGE plpgsql
 STABLE
 STRICT
 COST 1000
 AS $$
-  SELECT EXISTS (
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1
+    FROM otlet.semantic_join_indexes sji
+    WHERE sji.name = semantic_join_matches.index_name
+  ) THEN
+    RAISE EXCEPTION 'otlet semantic join index % does not exist', semantic_join_matches.index_name;
+  END IF;
+
+  RETURN EXISTS (
     SELECT 1
     FROM otlet.semantic_join_index_current_rows(index_name, true) lookup
     WHERE lookup.subject_id = semantic_join_matches.subject_id
       AND lookup.body @> semantic_join_matches.expected
   );
+END;
 $$;
 
 CREATE FUNCTION otlet.semantic_join_matches_auto(

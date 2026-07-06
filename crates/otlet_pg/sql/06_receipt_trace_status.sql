@@ -247,6 +247,41 @@ abstention_items AS (
       WHERE l.output_id = o.id
         AND l.label_source = 'manual_correction'
     )
+),
+direct_rejected_items AS (
+  SELECT
+    'direct_rejected_output'::text AS queue_kind,
+    j.task_name,
+    w.name AS watch_name,
+    j.subject_id AS job_subject_id,
+    j.subject_id AS subject_id,
+    NULL::bigint AS action_id,
+    NULL::bigint AS output_id,
+    r.id AS receipt_id,
+    NULL::text AS action_type,
+    NULL::text AS action_status,
+    NULL::text AS approval_status,
+    r.raw_output::jsonb -> 'output' AS output,
+    r.trace_summary #>> '{mvcc,table}' AS source_table,
+    COALESCE(r.trace_summary #>> '{mvcc,source_hash}', md5((r.trace_summary -> 'mvcc')::text)) AS source_hash,
+    otlet.semantic_content_hash(j.input, t.input_shaping) AS content_hash,
+    otlet.current_task_subject_content_hash(j.task_name, j.subject_id) AS current_content_hash,
+    r.finished_at AS created_at
+  FROM otlet.inference_receipts r
+  JOIN otlet.jobs j ON j.id = r.job_id
+  JOIN otlet.tasks t ON t.name = j.task_name
+  LEFT JOIN otlet.watches w ON w.task_name = j.task_name
+  WHERE r.selection_role = 'direct'
+    AND r.selection_status = 'rejected'
+    AND r.selection_reason = 'direct_rejected_by_decision_contract'
+    AND r.schema_validation_status = 'passed'
+    AND NULLIF(r.raw_output, '') IS NOT NULL
+    AND NOT EXISTS (
+      SELECT 1
+      FROM otlet.eval_labels l
+      WHERE l.receipt_id = r.id
+        AND l.label_source = 'manual_correction'
+    )
 )
 SELECT
   queue_kind,
@@ -289,6 +324,27 @@ SELECT
   (content_hash IS NOT NULL AND current_content_hash IS DISTINCT FROM content_hash) AS source_stale,
   created_at
 FROM abstention_items
+UNION ALL
+SELECT
+  queue_kind,
+  task_name,
+  watch_name,
+  job_subject_id,
+  subject_id,
+  action_id,
+  output_id,
+  receipt_id,
+  action_type,
+  action_status,
+  approval_status,
+  output,
+  source_table,
+  source_hash,
+  content_hash,
+  current_content_hash,
+  (content_hash IS NOT NULL AND current_content_hash IS DISTINCT FROM content_hash) AS source_stale,
+  created_at
+FROM direct_rejected_items
 ORDER BY created_at, task_name, job_subject_id, queue_kind;
 
 CREATE VIEW otlet.output_reliability_status AS

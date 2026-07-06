@@ -32,7 +32,7 @@ BEGIN
   WHERE si.name = semantic_matches.index_name;
 
   IF NOT FOUND THEN
-    RETURN false;
+    RAISE EXCEPTION 'otlet semantic index % does not exist', semantic_matches.index_name;
   END IF;
 
   EXECUTE format(

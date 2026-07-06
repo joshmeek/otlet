@@ -28,6 +28,9 @@ output_envelope_task="output_envelope_safety_demo"
 prompt_diet_verbatim_task="prompt_diet_verbatim_demo"
 prompt_diet_compact_task="prompt_diet_compact_demo"
 custom_action_schema_task="custom_action_schema_demo"
+action_allowlist_watch="action_allowlist_demo"
+action_allowlist_task="${action_allowlist_watch}_task"
+direct_gate_task="direct_decision_gate_demo"
 script_started="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
 entity_instruction='Never output different_entity when conflicting_stable_identifiers = 0. Never output same_entity when shared_stable_identifiers = 0. weak_matching_signals, missing_or_unknown_identifiers, and row_quality_warnings only explain unclear. Action type must be exactly merge_candidate, new_entity, or review_flag; never same_entity, different_entity, or unclear. same_entity uses merge_candidate body left_id, right_id, confidence, reason. different_entity uses new_entity body entity_id, reason, and entity_id must equal input.action_ids.right_id. unclear uses review_flag body left_id, right_id, severity, reason. Use input.action_ids.left_id and input.action_ids.right_id. Do not include an evidence field in actions. Keep output.reason and action body reason under 18 words. Quote every key and string. No markdown.'
 
@@ -270,11 +273,13 @@ psql_exec \
   -v row_triage_watch="$row_triage_watch" \
   -v row_scoped_watch="$row_scoped_watch" \
   -v row_customscan_watch="$row_customscan_watch" \
-  -v row_triage_policy_watch="$row_triage_policy_watch" >/dev/null <<'SQL'
+  -v row_triage_policy_watch="$row_triage_policy_watch" \
+  -v action_allowlist_watch="$action_allowlist_watch" >/dev/null <<'SQL'
 SELECT otlet.drop_watch(:'row_triage_watch');
 SELECT otlet.drop_watch(:'row_scoped_watch');
 SELECT otlet.drop_watch(:'row_customscan_watch');
 SELECT otlet.drop_watch(:'row_triage_policy_watch');
+SELECT otlet.drop_watch(:'action_allowlist_watch');
 SELECT otlet.drop_watch(:'join_index_name');
 SELECT format('DROP FOREIGN TABLE IF EXISTS otlet.%I', :'join_foreign_table') \gexec
 SQL
@@ -290,6 +295,8 @@ cleanup_task "$output_envelope_task"
 cleanup_task "$prompt_diet_verbatim_task"
 cleanup_task "$prompt_diet_compact_task"
 cleanup_task "$custom_action_schema_task"
+cleanup_task "$action_allowlist_task"
+cleanup_task "$direct_gate_task"
 cleanup_task "input_shape_mvcc_raw_demo"
 cleanup_task "input_shape_mvcc_hand_demo"
 cleanup_task "input_shape_truncate_demo"
@@ -1173,6 +1180,102 @@ echo "custom_action_schema_contract=$custom_action_schema_contract"
   exit 1
 }
 
+log "Checking watch action allowlist"
+psql_exec \
+  -v watch_name="$action_allowlist_watch" \
+  -v model_name="$strong_model_name" >/dev/null <<'SQL'
+DROP TABLE IF EXISTS public.otlet_demo_action_allowlist;
+CREATE TABLE public.otlet_demo_action_allowlist (
+  id text PRIMARY KEY,
+  note text NOT NULL
+);
+INSERT INTO public.otlet_demo_action_allowlist VALUES ('allow-1', 'allowlist smoke row');
+
+SELECT otlet.create_watch(
+  :'watch_name',
+  'row',
+  'Return a decision and actions.',
+  '{
+    "type": "object",
+    "required": ["decision", "confidence", "reason"],
+    "additionalProperties": false,
+    "properties": {
+      "decision": {"enum": ["flag", "pass"]},
+      "confidence": {"enum": ["low", "medium", "high"]},
+      "reason": {"type": "string", "maxLength": 80}
+    }
+  }'::jsonb,
+  :'model_name',
+  'public.otlet_demo_action_allowlist'::regclass,
+  'id',
+  NULL,
+  'action_allowlist_fact',
+  '{"max_tokens":80,"reasoning":"off"}'::jsonb,
+  '{}'::jsonb,
+  '{"on_change":"mark_stale"}'::jsonb,
+  ARRAY['review_flag'],
+  'refresh_then_fail_closed',
+  '{}'::jsonb,
+  '{"answer_field":"decision","abstain_values":[],"confidence_field":"confidence","accepted_confidence":["high"]}'::jsonb
+);
+
+WITH inserted AS (
+  INSERT INTO otlet.jobs (task_name, subject_id, input, status, attempts, started_at, leased_until)
+  SELECT
+    :'watch_name' || '_task',
+    src.id,
+    jsonb_build_object(
+      '_otlet_mvcc', jsonb_build_object(
+        'table', 'public.otlet_demo_action_allowlist',
+        'subject_id', src.id,
+        'ctid', src.ctid::text,
+        'xmin', src.xmin::text
+      ),
+      'table', 'public.otlet_demo_action_allowlist',
+      'row', to_jsonb(src)
+    ),
+    'running',
+    1,
+    now(),
+    now() + interval '5 minutes'
+  FROM public.otlet_demo_action_allowlist src
+  RETURNING id
+)
+SELECT otlet.complete_job(
+  job_id => id,
+  output => '{"decision":"flag","confidence":"high","reason":"allowlist smoke"}'::jsonb,
+  raw_output => '{"output":{"decision":"flag","confidence":"high","reason":"allowlist smoke"},"actions":[{"type":"note","body":{"subject_id":"allow-1","text":"not allowed"}}]}',
+  actions => '[{"type":"note","body":{"subject_id":"allow-1","text":"not allowed"}}]'::jsonb,
+  raw_output_hash => md5('{"output":{"decision":"flag","confidence":"high","reason":"allowlist smoke"},"actions":[{"type":"note","body":{"subject_id":"allow-1","text":"not allowed"}}]}'),
+  started_at => now(),
+  trace_summary => '{"schema_validation_status":"passed"}'::jsonb,
+  model_name => :'model_name'
+)
+FROM inserted;
+SQL
+action_allowlist_contract="$(psql_value "
+SELECT count(*) FILTER (
+         WHERE action_type = 'note'
+           AND status = 'rejected'
+           AND error = 'action type note is not allowed by watch'
+       )::text || '|' ||
+       count(*) FILTER (WHERE action_type = 'note' AND output_id IS NOT NULL AND receipt_id IS NOT NULL)::text || '|' ||
+       (
+         SELECT count(*)::text
+         FROM otlet.records r
+         JOIN otlet.actions a ON a.id = r.action_id
+         JOIN otlet.jobs j ON j.id = a.job_id
+         WHERE j.task_name = '$action_allowlist_task'
+       )
+FROM otlet.action_status
+WHERE task_name = '$action_allowlist_task';
+")"
+echo "action_allowlist_contract=$action_allowlist_contract"
+[ "$action_allowlist_contract" = "1|1|0" ] || {
+  echo "Expected watch action allowlist to reject note without creating a record, got $action_allowlist_contract" >&2
+  exit 1
+}
+
 log "Running direct ask demo"
 psql_exec >/dev/null <<'SQL'
 DROP TABLE IF EXISTS public.readme_vendor_note;
@@ -1227,6 +1330,65 @@ require_regex "$direct_ask_contract" '^review_payment\|[1-9][0-9]*\|[1-9][0-9]*$
 require_regex "$direct_ask_receipt_contract" "^$strong_model_name\\|complete\\|passed\\|[1-9][0-9]*$" "Expected direct ask receipt evidence"
 [ "$direct_ask_cache_contract" = "false|disabled_for_generation_trace|content_hash_contract_hash_model_fingerprint|true|none" ] || {
   echo "Expected direct ask trace to make cache-disabled-under-generation-trace explicit, got $direct_ask_cache_contract" >&2
+  exit 1
+}
+
+log "Checking opt-in direct decision contract gate"
+psql_exec \
+  -v task_name="$direct_gate_task" \
+  -v model_name="$strong_model_name" >/dev/null <<'SQL'
+DROP TABLE IF EXISTS public.otlet_demo_direct_gate;
+CREATE TABLE public.otlet_demo_direct_gate (
+  id text PRIMARY KEY,
+  note text NOT NULL
+);
+INSERT INTO public.otlet_demo_direct_gate VALUES ('direct-gate-1', 'No decisive signal; send to review');
+
+SELECT otlet.create_task(
+  :'task_name',
+  $query$
+    SELECT
+      src.id AS subject_id,
+      jsonb_build_object('row', to_jsonb(src)) AS input
+    FROM public.otlet_demo_direct_gate src
+  $query$,
+  'Return exactly one JSON object. output.decision must be unclear, output.confidence must be medium, output.reason must be short, and actions must be []. No markdown.',
+  '{
+    "type": "object",
+    "required": ["decision", "confidence", "reason"],
+    "additionalProperties": false,
+    "properties": {
+      "decision": {"enum": ["unclear"]},
+      "confidence": {"enum": ["medium"]},
+      "reason": {"type": "string", "maxLength": 80}
+    }
+  }'::jsonb,
+  :'model_name',
+  '{"max_tokens":96,"reasoning":"off","inference_cache":false}'::jsonb,
+  '{}'::jsonb,
+  '{"answer_field":"decision","abstain_values":["unclear"],"confidence_field":"confidence","accepted_confidence":["high"],"enforce_on_direct":true}'::jsonb
+);
+
+SELECT otlet.run_task(:'task_name');
+SQL
+wait_task_failed "$direct_gate_task" 1 900 1
+direct_gate_contract="$(psql_value "
+SELECT j.status || '|' ||
+       r.selection_status || '|' ||
+       r.selection_reason || '|' ||
+       r.schema_validation_status || '|' ||
+       (SELECT count(*) FROM otlet.outputs WHERE job_id = j.id)::text || '|' ||
+       (SELECT count(*) FROM otlet.review_queue WHERE receipt_id = r.id)::text || '|' ||
+       COALESCE((SELECT output->>'decision' FROM otlet.review_queue WHERE receipt_id = r.id LIMIT 1), '')
+FROM otlet.jobs j
+JOIN otlet.inference_receipts r ON r.job_id = j.id
+WHERE j.task_name = '$direct_gate_task'
+ORDER BY j.id DESC, r.id DESC
+LIMIT 1;
+")"
+echo "direct_gate_contract=$direct_gate_contract"
+[ "$direct_gate_contract" = "failed|rejected|direct_rejected_by_decision_contract|passed|0|1|unclear" ] || {
+  echo "Expected opt-in direct gate to reject an abstention without trusted output and expose review_queue, got $direct_gate_contract" >&2
   exit 1
 }
 

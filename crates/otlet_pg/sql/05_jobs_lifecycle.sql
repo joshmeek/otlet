@@ -664,8 +664,9 @@ STABLE
 AS $$
 DECLARE
   v_action_type text := COALESCE(action ->> 'type', '');
-  body jsonb := action -> 'body';
+  body jsonb;
   schema_row otlet.action_type_schemas%ROWTYPE;
+  payload_source text;
   expected_left_id text;
   expected_right_id text;
 BEGIN
@@ -677,14 +678,6 @@ BEGIN
     RETURN 'action missing type';
   END IF;
 
-  IF EXISTS (
-    SELECT 1
-    FROM jsonb_object_keys(action) AS key
-    WHERE key NOT IN ('type', 'body')
-  ) THEN
-    RETURN 'action has unsupported key';
-  END IF;
-
   SELECT *
   INTO schema_row
   FROM otlet.action_type_schemas s
@@ -694,15 +687,23 @@ BEGIN
     RETURN 'unsupported action type';
   END IF;
 
-  IF jsonb_typeof(body) IS DISTINCT FROM 'object' THEN
-    RETURN 'action body must be an object';
+  payload_source := COALESCE(NULLIF(schema_row.payload_schema ->> 'payload_source', ''), 'body');
+  body := CASE
+    WHEN payload_source = 'action' THEN action - 'type'
+    ELSE action -> 'body'
+  END;
+
+  IF payload_source <> 'action'
+     AND EXISTS (
+       SELECT 1
+       FROM jsonb_object_keys(action) AS key
+       WHERE key NOT IN ('type', 'body')
+     ) THEN
+    RETURN 'action has unsupported key';
   END IF;
 
-  IF v_action_type = 'create_record' THEN
-    IF NULLIF(action ->> 'record_type', '') IS NULL THEN
-      RETURN 'create_record missing record_type';
-    END IF;
-    RETURN NULL;
+  IF jsonb_typeof(body) IS DISTINCT FROM 'object' THEN
+    RETURN 'action body must be an object';
   END IF;
 
   expected_left_id := NULLIF(job_input #>> '{action_ids,left_id}', '');
@@ -864,6 +865,16 @@ BEGIN
     END;
     action_type_name := COALESCE(NULLIF(action ->> 'type', ''), 'invalid');
     action_error := otlet.action_validation_error(action, complete_job.output, job_row.subject_id, job_row.input);
+    IF action_error IS NULL
+       AND EXISTS (
+         SELECT 1
+         FROM otlet.watches w
+         WHERE w.task_name = job_row.task_name
+           AND cardinality(w.action_types) > 0
+           AND NOT action_type_name = ANY(w.action_types)
+       ) THEN
+      action_error := 'action type ' || action_type_name || ' is not allowed by watch';
+    END IF;
     action_requires_approval := false;
     action_creates_record := false;
     IF action_error IS NULL THEN
@@ -1572,7 +1583,8 @@ BEGIN
     error => fail_job.error
   );
 
-  IF fail_job.schema_validation_status = 'failed' THEN
+  IF fail_job.schema_validation_status = 'failed'
+     OR fail_job.selection_status = 'rejected' THEN
     PERFORM otlet.mark_runtime_health(runtime_row.name, 'ready', NULL);
     PERFORM otlet.touch_runtime_slot(runtime_row.name, model_row.name, 'ready', 0, NULL);
   ELSE

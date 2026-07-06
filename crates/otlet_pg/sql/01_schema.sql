@@ -421,7 +421,18 @@ INSERT INTO otlet.action_type_schemas (
   payload_schema
 )
 VALUES
-  ('create_record', false, true, '{}'::jsonb),
+  ('create_record', false, true, $schema$
+    {
+      "payload_source": "action",
+      "required": ["record_type", "subject_id", "body"],
+      "additionalProperties": false,
+      "properties": {
+        "record_type": {"type": "string", "minLength": 1, "required_error": "create_record missing record_type"},
+        "subject_id": {"type": "string", "minLength": 1, "required_error": "create_record missing subject_id"},
+        "body": {"type": "object", "required_error": "create_record missing body"}
+      }
+    }
+  $schema$::jsonb),
   ('merge_candidate', true, false, $schema$
     {
       "required": ["left_id", "right_id", "reason"],
