@@ -43,23 +43,10 @@ CREATE TABLE otlet.production_policy (
 INSERT INTO otlet.production_policy (name)
 VALUES ('default');
 
-CREATE TABLE otlet.runtimes (
-  name text PRIMARY KEY CHECK (name ~ '^[a-z0-9][a-z0-9_-]*$'),
-  endpoint text NOT NULL DEFAULT 'linked',
-  status text NOT NULL DEFAULT 'unknown',
-  last_error text,
-  checked_at timestamptz,
-  created_at timestamptz NOT NULL DEFAULT now()
-);
-
-INSERT INTO otlet.runtimes (name, endpoint, status)
-VALUES ('linked_inproc', 'linked', 'unknown');
-
 CREATE TABLE otlet.models (
   name text PRIMARY KEY,
   artifact_path text NOT NULL,
   artifact_hash text,
-  runtime_name text NOT NULL DEFAULT 'linked_inproc' REFERENCES otlet.runtimes(name),
   max_active_jobs int NOT NULL DEFAULT 1 CHECK (max_active_jobs BETWEEN 1 AND 1024),
   last_used_at timestamptz,
   created_at timestamptz NOT NULL DEFAULT now()
@@ -356,8 +343,7 @@ CREATE TABLE otlet.model_selection_policies (
 );
 
 CREATE TABLE otlet.runtime_slots (
-  runtime_name text NOT NULL REFERENCES otlet.runtimes(name),
-  model_name text NOT NULL REFERENCES otlet.models(name),
+  model_name text PRIMARY KEY REFERENCES otlet.models(name),
   artifact_path text,
   status text NOT NULL DEFAULT 'cold',
   active_jobs int NOT NULL DEFAULT 0,
@@ -391,8 +377,7 @@ CREATE TABLE otlet.runtime_slots (
   inference_cache_max_bytes bigint NOT NULL DEFAULT 0,
   inference_cache_evictions bigint NOT NULL DEFAULT 0,
   inference_cache_last_eviction_reason text,
-  inference_cache_last_reason text,
-  PRIMARY KEY (runtime_name, model_name)
+  inference_cache_last_reason text
 );
 
 CREATE TABLE otlet.jobs (
@@ -460,7 +445,7 @@ CREATE TABLE otlet.worker_events (
   id bigserial PRIMARY KEY,
   event_type text NOT NULL,
   job_id bigint REFERENCES otlet.jobs(id),
-  runtime_name text REFERENCES otlet.runtimes(name),
+  runtime_name text,
   message text,
   detail jsonb NOT NULL DEFAULT '{}'::jsonb,
   created_at timestamptz NOT NULL DEFAULT now()

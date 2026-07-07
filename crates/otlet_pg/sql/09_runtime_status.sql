@@ -3,14 +3,14 @@ WITH infer_state AS (
   SELECT otlet.worker_infer_now_state() AS s
 )
 SELECT
-  r.name AS runtime_name,
-  r.endpoint,
-  r.status AS runtime_status,
-  r.last_error,
-  r.checked_at,
-  s.model_name,
+  'linked_inproc'::text AS runtime_name,
+  'linked'::text AS endpoint,
+  COALESCE(s.status, 'cold') AS runtime_status,
+  s.last_error,
+  s.last_used_at AS checked_at,
+  m.name AS model_name,
   s.status AS slot_state,
-  s.artifact_path,
+  COALESCE(s.artifact_path, m.artifact_path) AS artifact_path,
   artifact_file.artifact_bytes,
   CASE
     WHEN s.artifact_path IS NOT NULL THEN 'resident_worker_loaded_model_context'
@@ -66,10 +66,10 @@ SELECT
   length(COALESCE(infer.s ->> 'error', ''))::bigint AS infer_now_error_bytes,
   COALESCE((infer.s ->> 'max_wait_ms')::bigint, 0) AS infer_now_max_wait_ms,
   COALESCE((infer.s ->> 'last_elapsed_ms')::bigint, 0) AS infer_now_last_elapsed_ms
-FROM otlet.runtimes r
-LEFT JOIN otlet.runtime_slots s ON s.runtime_name = r.name
+FROM otlet.models m
+LEFT JOIN otlet.runtime_slots s ON s.model_name = m.name
 LEFT JOIN infer_state infer ON true
 LEFT JOIN LATERAL (
-  SELECT (pg_stat_file(s.artifact_path, true)).size::bigint AS artifact_bytes
-  WHERE s.artifact_path IS NOT NULL AND s.artifact_path <> ''
+  SELECT (pg_stat_file(COALESCE(s.artifact_path, m.artifact_path), true)).size::bigint AS artifact_bytes
+  WHERE COALESCE(s.artifact_path, m.artifact_path) <> ''
 ) artifact_file ON true;

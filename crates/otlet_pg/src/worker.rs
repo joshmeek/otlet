@@ -57,7 +57,6 @@ pub extern "C-unwind" fn otlet_worker_main(_arg: pgrx::pg_sys::Datum) {
 
             let batch = jobs.first().filter(|_| jobs.len() > 1).map(|job| {
                 (
-                    job.runtime_name.clone(),
                     job.task_name.clone(),
                     job.model_name.clone(),
                     jobs.len() as i64,
@@ -68,9 +67,8 @@ pub extern "C-unwind" fn otlet_worker_main(_arg: pgrx::pg_sys::Datum) {
             let batch_result = process_job_batch(jobs);
             let batch_ms = millis_since(batch_start);
 
-            if let Some((runtime_name, task_name, model_name, job_count)) = batch {
+            if let Some((task_name, model_name, job_count)) = batch {
                 record_worker_batch_finished(
-                    &runtime_name,
                     &task_name,
                     &model_name,
                     job_count,
@@ -736,7 +734,6 @@ fn record_metrics(job: &Job, metrics: &ModelMetrics) {
     let metric_result: pgrx::spi::Result<()> = BackgroundWorker::transaction(|| {
         pgrx::Spi::connect_mut(|client| {
             let args = [
-                job.runtime_name.as_str().into(),
                 job.model_name.as_str().into(),
                 metrics.artifact_path.as_str().into(),
                 metrics.load_ms.into(),
@@ -763,7 +760,7 @@ fn record_metrics(job: &Job, metrics: &ModelMetrics) {
                 metrics.inference_cache_eviction_reason.as_str().into(),
             ];
             client.update(
-                "SELECT otlet.record_runtime_slot_metrics($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25)",
+                "SELECT otlet.record_runtime_slot_metrics($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24)",
                 Some(1),
                 &args,
             )?;
@@ -771,7 +768,7 @@ fn record_metrics(job: &Job, metrics: &ModelMetrics) {
             {
                 let event_args = [
                     job.id.into(),
-                    job.runtime_name.as_str().into(),
+                    "linked_inproc".into(),
                     job.task_name.as_str().into(),
                     job.model_name.as_str().into(),
                     metrics.artifact_path.as_str().into(),
@@ -795,7 +792,6 @@ fn record_metrics(job: &Job, metrics: &ModelMetrics) {
 }
 
 fn record_worker_batch_finished(
-    runtime_name: &str,
     task_name: &str,
     model_name: &str,
     job_count: i64,
@@ -808,7 +804,7 @@ fn record_worker_batch_finished(
         pgrx::Spi::connect_mut(|client| {
             let args = [
                 Option::<i64>::None.into(),
-                runtime_name.into(),
+                "linked_inproc".into(),
                 task_name.into(),
                 model_name.into(),
                 job_count.into(),
@@ -856,7 +852,7 @@ fn record_semantic_materialization_failed(job: &Job, error: &str) {
         pgrx::Spi::connect_mut(|client| {
             let args = [
                 job.id.into(),
-                job.runtime_name.as_str().into(),
+                "linked_inproc".into(),
                 job.task_name.as_str().into(),
                 job.subject_id.as_str().into(),
                 job.model_name.as_str().into(),

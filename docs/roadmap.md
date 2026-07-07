@@ -16,7 +16,7 @@ Otlet has three public surfaces today:
 
 Otlet keeps source rows in user tables. Users choose rows with SQL. `otlet.ask(...)` handles one-off row questions through the resident worker, while named tasks handle repeatable watches, queues, semantic refresh, and model selection. Otlet passes compact JSON to resident local models, runs cheap-first model selection when a task has a policy, drains bounded compatible queue batches, and stores derived outputs, attempts, actions, traces, receipts, eval labels, and semantic materializations under the `otlet` schema. The model harness uses a strict `output` plus `actions` envelope, stores invalid output as receipt evidence, and exposes decode mode through SQL
 
-The planner contract covers semantic lookup, fail-closed stale reads, queue refresh, wait, fresh inference, bounded CustomScan infer-now, FDW subject pushdown, cache decisions, and live EXPLAIN vocabulary. Cache keys, invalidation reasons, hit/miss counters, size bounds, runtime status, and demo checks are SQL-visible. Semantic row and join state tracks source updates, deletes, schema drift, contract changes, and candidate-set changes without stale reuse. Queue admission, fair claims, attempt bounds, cancellation, RSS budget failures, malformed-schema failures, and cleanup of unreferenced failed/canceled jobs produce SQL receipts, status, or dry-run evidence
+The planner contract covers semantic lookup, fail-closed stale reads, queue refresh, wait, fresh inference, bounded CustomScan infer-now, current-row SQL lookup, cache decisions, and live EXPLAIN vocabulary. Cache keys, invalidation reasons, hit/miss counters, size bounds, runtime status, and demo checks are SQL-visible. Semantic row and join state tracks source updates, deletes, schema drift, contract changes, and candidate-set changes without stale reuse. Queue admission, fair claims, attempt bounds, cancellation, RSS budget failures, malformed-schema failures, and cleanup of unreferenced failed/canceled jobs produce SQL receipts, status, or dry-run evidence
 
 Reproduce the contract with `./scripts/otlet-demo.sh` after `./scripts/otlet-setup.sh`
 
@@ -73,7 +73,7 @@ Benchmark follow-up objective:
 
 ## Planner, Executor, And Cache
 
-Use one inspectable decision vocabulary for semantic lookup, queue refresh, wait, fail-closed, fresh inference, bounded infer-now, and cache reuse. Keep SQL plan functions, semantic status views, FDW EXPLAIN, CustomScan EXPLAIN, receipts, and demo output aligned on that vocabulary
+Use one inspectable decision vocabulary for semantic lookup, queue refresh, wait, fail-closed, fresh inference, bounded infer-now, and cache reuse. Keep SQL plan functions, semantic status views, CustomScan EXPLAIN, receipts, current-row SQL, and demo output aligned on that vocabulary
 
 `EXPLAIN (ANALYZE, VERBOSE)` shows selected model, resident state, source identity, source hash, stale policy, cache decision, worker handoff, token counts, schema validation, trace policy, receipt IDs, provenance links, estimated model time, and model runtime
 

@@ -161,7 +161,12 @@ Source rows stayed in `public.otlet_demo_vendor_entity`. Otlet stored jobs, acce
 
 Start with [the worked example](docs/otlet-worked-example.md)
 
-You run the extension with SQL commands and real output. The worked example starts with entity resolution, then covers semantic indexes, automatic semantic materialization, stale rows, FDW, CustomScan, cancellation, retries, worker batches, traces, and production policy
+You run the extension with SQL commands and real output. The worked example keeps the setup path and full demo command short; the long chapters live in focused docs:
+
+- [Entity resolution walkthrough](docs/entity-resolution-walkthrough.md)
+- [Runtime and traces](docs/runtime-and-traces.md)
+- [Semantic watches](docs/semantic-watches.md)
+- [Production contract](docs/production-contract.md)
 
 Use [benchmarks/README.md](benchmarks/README.md) to compare local GGUF models on Otlet’s row-pair, receipt, action, stale-state, and resource-fit contracts
 

@@ -22,7 +22,7 @@ FROM otlet.production_policy p;
 
 CREATE VIEW otlet.model_queue_status AS
 SELECT
-  m.runtime_name,
+  'linked_inproc'::text AS runtime_name,
   m.name AS model_name,
   m.max_active_jobs,
   p.max_queued_jobs_per_model,
@@ -50,7 +50,6 @@ LEFT JOIN LATERAL (
     AND e.detail ->> 'model_name' = m.name
 ) suppressed ON true
 GROUP BY
-  m.runtime_name,
   m.name,
   m.max_active_jobs,
   p.max_queued_jobs_per_model,
@@ -59,7 +58,7 @@ GROUP BY
 
 CREATE VIEW otlet.worker_throughput_status AS
 SELECT
-  m.runtime_name,
+  'linked_inproc'::text AS runtime_name,
   m.name AS model_name,
   p.worker_claim_batch_size,
   COALESCE(q.queued_jobs, 0) AS queued_jobs,
@@ -79,7 +78,6 @@ LEFT JOIN LATERAL (
   SELECT e.detail, e.created_at
   FROM otlet.worker_events e
   WHERE e.event_type = 'worker_batch_finished'
-    AND e.runtime_name = m.runtime_name
     AND e.detail ->> 'model_name' = m.name
   ORDER BY e.created_at DESC, e.id DESC
   LIMIT 1
@@ -104,14 +102,12 @@ LEFT JOIN LATERAL (
       COALESCE((e.detail ->> 'failed_jobs')::bigint, 0) AS failed_jobs
     FROM otlet.worker_events e
     WHERE e.event_type = 'worker_batch_finished'
-      AND e.runtime_name = m.runtime_name
       AND e.detail ->> 'model_name' = m.name
     ORDER BY e.created_at DESC, e.id DESC
     LIMIT 16
   ) recent
 ) recent_batches ON true
 GROUP BY
-  m.runtime_name,
   m.name,
   p.worker_claim_batch_size,
   q.queued_jobs,

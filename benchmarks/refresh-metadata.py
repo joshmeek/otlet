@@ -92,12 +92,13 @@ def metadata(row, checked_at):
 def main():
     root = Path(__file__).resolve().parent
     models_path = Path(sys.argv[1]) if len(sys.argv) > 1 else root / "models.tsv"
-    out_path = Path(sys.argv[2]) if len(sys.argv) > 2 else root / "models_metadata.tsv"
+    out_path = Path(sys.argv[2]) if len(sys.argv) > 2 else root / "report" / "latest" / "models_metadata.tsv"
     checked_at = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
     with models_path.open(newline="") as f:
         rows = list(csv.DictReader(f, delimiter="\t"))
 
+    out_path.parent.mkdir(parents=True, exist_ok=True)
     with out_path.open("w", newline="") as f:
         writer = csv.DictWriter(f, FIELDS, delimiter="\t", lineterminator="\n")
         writer.writeheader()

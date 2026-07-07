@@ -5,7 +5,6 @@ mod infer_now;
 mod job;
 mod model;
 mod runtime;
-mod semantic_fdw;
 mod wake;
 mod worker;
 
@@ -31,9 +30,19 @@ pgrx::extension_sql_file!(
     requires = ["runtime_health"]
 );
 pgrx::extension_sql_file!(
+    "../sql/05_actions_review.sql",
+    name = "actions_review",
+    requires = ["jobs_lifecycle"]
+);
+pgrx::extension_sql_file!(
+    "../sql/05_eval_labels.sql",
+    name = "eval_labels",
+    requires = ["actions_review"]
+);
+pgrx::extension_sql_file!(
     "../sql/06_receipt_trace_status.sql",
     name = "receipt_trace_status",
-    requires = ["jobs_lifecycle"]
+    requires = ["eval_labels"]
 );
 pgrx::extension_sql_file!(
     "../sql/07_trace_tokens.sql",
@@ -81,14 +90,9 @@ pgrx::extension_sql_file!(
     requires = ["semantic_predicates"]
 );
 pgrx::extension_sql_file!(
-    "../sql/19_semantic_fdw.sql",
-    name = "semantic_fdw",
-    requires = ["semantic_status_plan"]
-);
-pgrx::extension_sql_file!(
     "../sql/20_production_policy.sql",
     name = "production_policy",
-    requires = ["semantic_fdw"]
+    requires = ["semantic_status_plan"]
 );
 pgrx::extension_sql_file!(
     "../sql/21_watches.sql",

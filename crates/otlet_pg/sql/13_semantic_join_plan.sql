@@ -350,11 +350,6 @@ BEGIN
   LEFT JOIN otlet.jobs j ON j.task_name = t.name
   WHERE t.model_name = p_model_name;
 
-  SELECT COALESCE(m.runtime_name, 'linked_inproc')
-  INTO v_runtime_name
-  FROM otlet.models m
-  WHERE m.name = p_model_name;
-
   SELECT
     COALESCE(task_receipt.generate_ms, slot_cost.last_generate_ms, model_receipt.generate_ms, 2500)::numeric,
     CASE
@@ -380,7 +375,6 @@ BEGIN
     SELECT rs.last_generate_ms::numeric AS last_generate_ms
     FROM otlet.runtime_slots rs
     WHERE rs.model_name = p_model_name
-      AND rs.runtime_name = v_runtime_name
       AND COALESCE(rs.last_generate_ms, 0) > 0
     ORDER BY rs.last_used_at DESC NULLS LAST
     LIMIT 1
