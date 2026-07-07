@@ -8,86 +8,53 @@ Otlet uses a `pgrx` extension and a Postgres background worker loaded through `s
 
 ## Quick Example
 
-Ask one local model to read one source row and return a structured triage answer. The row stays in `public`; the model output, receipt, trace, and hashes stay under `otlet`
+Ask one local model to summarize ordinary row-shaped data. This is the small path: one prompt, one JSON input, one trusted output
 
-After setup creates the in-process llama.cpp worker runtime, register the model:
+```sh
+./scripts/otlet-setup.sh
+```
 
 ```sql
-SELECT name AS model_name FROM otlet.register_model('qwen35_4b', '<Qwen3.5-4B-Q4_K_M.gguf>');
+SELECT name AS model
+FROM otlet.register_model('qwen3_1_7b', '/var/lib/postgresql/otlet-models/Qwen3-1.7B-Q8_0.gguf');
 ```
 
 ```text
-  model_name
--------------
- qwen35_4b
++------------+
+|   model    |
++------------+
+| qwen3_1_7b |
++------------+
 (1 row)
 ```
 
-Assume this source row already exists. A string or threshold rule would miss the payment risk:
-
 ```sql
-SELECT id, vendor_name, left(note, 92) || '...' AS note
-FROM public.readme_vendor_note
-WHERE id = 'note-1';
-```
-
-```text
-+--------+-------------------------+-------------------------------------------------------------------------------------------------+
-|   id   |       vendor_name       |                                              note                                               |
-+--------+-------------------------+-------------------------------------------------------------------------------------------------+
-| note-1 | Northstar Logistics LLC | AP says the bank account changed two days after a domain change. The request came from a new... |
-+--------+-------------------------+-------------------------------------------------------------------------------------------------+
-(1 row)
-```
-
-Call the model from SQL. `otlet.ask` creates Otlet-owned task, job, output, and receipt rows:
-
-```sql
-SELECT a.output->>'route' AS route,
-       a.output->>'summary' AS summary,
-       a.job_id,
-       a.receipt_id
+SELECT output, receipt_id IS NOT NULL AS receipt_recorded
 FROM otlet.ask(
-  'qwen35_4b',
-  'Read one vendor note. Return one JSON object with exactly two top-level keys: "output" then "actions". output has summary under 12 words, route, and reason under 10 words. route must be approve, review_payment, or block_payment. actions must be the empty array []. Do not close the outer object until after "actions":[] has been written. No markdown.',
-  (SELECT jsonb_build_object('vendor_name', vendor_name, 'note', note)
-   FROM public.readme_vendor_note
-   WHERE id = 'note-1'),
-  '{"type":"object","required":["summary","route","reason"],"additionalProperties":false,"properties":{"summary":{"type":"string"},"route":{"enum":["approve","review_payment","block_payment"]},"reason":{"type":"string"}}}'::jsonb,
-  '{"max_tokens":128,"reasoning":"off","inference_cache":true,"generation_trace":true,"generation_trace_max_tokens":16,"generation_trace_top_k":3}'::jsonb
-) a;
-```
-
-The local LLM inference runs inside the `otlet worker`: Postgres hands the row JSON to the resident worker, the worker loads `qwen35_4b` through llama.cpp, validates the JSON, and stores the trusted `output`
-
-```text
-+----------------+------------------------------------------------------------------------------------------+--------+------------+
-|     route      |                                         summary                                          | job_id | receipt_id |
-+----------------+------------------------------------------------------------------------------------------+--------+------------+
-| review_payment | AP flagged bank account change after domain change with urgent request from new contact. |      2 |          2 |
-+----------------+------------------------------------------------------------------------------------------+--------+------------+
-(1 row)
-```
-
-The returned `receipt_id` opens the audit trail:
-
-```sql
-SELECT model_name, status, schema_validation_status AS schema,
-       prompt_tokens AS prompt, generated_tokens AS output,
-       detailed_trace_captured_tokens AS traced,
-       left(receipt_raw_output_hash, 8) AS hash
-FROM otlet.inference_receipt_trace_status
-WHERE receipt_id = 2;
+  'qwen3_1_7b',
+  'Summarize these customer notes in one sentence and choose the next step.',
+  '{
+    "customer": "Riverline Labs",
+    "notes": [
+      "Trial team likes row-level receipts and wants CSV export.",
+      "Security asked whether Otlet changes source tables.",
+      "Procurement needs a one-paragraph summary by Friday."
+    ]
+  }'::jsonb,
+  '{"type":"object","required":["summary","next_step"],"properties":{"summary":{"type":"string"},"next_step":{"enum":["ship","hold","ask_followup"]}}}'::jsonb
+);
 ```
 
 ```text
-+------------+----------+--------+--------+--------+--------+----------+
-| model_name |  status  | schema | prompt | output | traced |   hash   |
-+------------+----------+--------+--------+--------+--------+----------+
-| qwen35_4b  | complete | passed |    394 |     46 |     16 | 91d7ca21 |
-+------------+----------+--------+--------+--------+--------+----------+
++-----------------------------------------------------------------------------------------------------------------------------+------------------+
+|                                                           output                                                            | receipt_recorded |
++-----------------------------------------------------------------------------------------------------------------------------+------------------+
+| {"summary": "Riverline Labs customers want a CSV export and need a summary of Otlet changes.", "next_step": "ask_followup"} | t                |
++-----------------------------------------------------------------------------------------------------------------------------+------------------+
 (1 row)
 ```
+
+Otlet ran the local model inside Postgres, validated the JSON, and stored the receipt under the `otlet` schema
 
 ## Longer Example
 
@@ -149,7 +116,7 @@ ORDER BY subject_id;
 Otlet also records model-selection attempts, typed actions, receipts, traces, and source-write proof under SQL-visible state. The demo emits compact contract lines for those paths:
 
 ```text
-model_selection_status_contract=true|true|true|4|3
+model_selection_status_contract=true|true|true|4|4
 action_type_contract=merge_candidate|new_entity
 receipt_trace_contract=8|8|8|8
 source_write_contract=5|...|5|...
