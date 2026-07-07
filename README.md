@@ -8,7 +8,7 @@ Otlet uses a `pgrx` extension and a Postgres background worker loaded through `s
 
 ## Quick Example
 
-Ask one local model to summarize ordinary row-shaped data. This is the small path: one prompt, one JSON input, one trusted output
+Use `otlet.ask` for one-off questions over row-shaped JSON. This example summarizes customer notes and chooses a next step
 
 ```sh
 ./scripts/otlet-setup.sh
