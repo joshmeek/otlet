@@ -1,8 +1,8 @@
 # Production Contract
 
-Use this to inspect cross-system trace visibility, runtime status, production policy, and remaining production boundaries
+Use this after the entity-resolution and semantic-watch transfer steps. This is the final transfer task: inspect the production surfaces that prove Otlet kept model work bounded, visible, and database-owned
 
-## Inspect Trace Visibility Across The System
+## Transfer Step 1 - Inspect Trace Visibility Across The System
 
 The trace visibility view reports links from receipts to outputs, actions, token steps, top-k alternatives, provenance, stale policy, and CustomScan infer-now
 
@@ -24,7 +24,7 @@ inference_visibility_status=true|true|true|true|true
 
 Those booleans prove receipts, token steps, top-k alternatives, bounded trace tokens, and top-k width were present
 
-## Inspect Runtime Status After Advanced Runs
+## Transfer Step 2 - Inspect Runtime Status After Advanced Runs
 
 Runtime status shows the resident model slot, cache bounds, memory samples, and last run metrics
 
@@ -42,12 +42,12 @@ LIMIT 1;
 Representative output from the demo run:
 
 ```text
-runtime_status_contract=ready|ready|60.34|true|linux_proc_self_status_vmrss_vmsize_sampled_after_worker_run
+runtime_status_contract=ready|ready|35.71|true|linux_proc_self_status_vmrss_vmsize_sampled_after_worker_run
 ```
 
 The value reports a ready runtime, a ready model slot, bounded cache entries, and Linux process-status memory sampling after a worker run
 
-## Inspect Production Policy
+## Transfer Step 3 - Inspect Production Policy
 
 The production policy row and status views are ordinary SQL state under `otlet`: `production_policy_status`, `production_status`, `model_queue_status`, `worker_throughput_status`, and `cleanup_policy_state(true)`
 
@@ -79,14 +79,14 @@ ffi_sweep_safety_contract=1|failed|job lease expired after max attempts|failed|f
 Representative output from the demo contract:
 
 ```text
-production_policy_contract=default|refresh_then_fail_closed|3|8
+production_policy_contract=default|refresh_then_fail_closed|3|300000|8
 production_status_contract=true|true|true|true
 model_queue_status_contract=queue_accepting|0|0
 throughput_status_contract=queue_accepting|0|0|4|4|0
 cleanup_policy_dry_run=0|0|0|0|0|0|0|true
 ```
 
-## Know The Remaining Production Boundaries
+## Transfer Step 4 - Know The Remaining Production Boundaries
 
 Otlet installs internal production policy, bounded queues, leases, sweeps, validation evidence, action approval state, status views, and cleanup dry-run/apply functions. Your application owns tenant access, app roles, and who may approve or apply actions
 

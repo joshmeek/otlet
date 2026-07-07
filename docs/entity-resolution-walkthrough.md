@@ -1,8 +1,10 @@
 # Entity Resolution Walkthrough
 
-Use this long SQL walkthrough for the entity-resolution path from `docs/otlet-worked-example.md`. Start with `./scripts/otlet-setup.sh`, then paste these sections into the `psql` session described there
+Use this long SQL walkthrough for the solved entity-resolution path from `docs/otlet-worked-example.md`. Start with `./scripts/otlet-setup.sh`, then paste these sections into the `psql` session described there
 
-## Register The Models
+The walkthrough follows a worked-example sequence: each section gives a solved command, the state it creates, and the next output to inspect. Read it once in order before adapting it. The transfer steps live in [runtime-and-traces.md](runtime-and-traces.md), [semantic-watches.md](semantic-watches.md), and [production-contract.md](production-contract.md)
+
+## Step 1 - Register The Models
 
 ```sql
 CREATE EXTENSION IF NOT EXISTS otlet;
@@ -24,7 +26,7 @@ The worker loads a local GGUF through in-process llama.cpp and keeps the model r
 
 Postgres can query the queue, source row identity, output validation, receipts, traces, and runtime state
 
-## Create The Source Tables
+## Step 2 - Create The Source Tables
 
 ```sql
 DROP TABLE IF EXISTS public.otlet_demo_vendor_pair;
@@ -64,7 +66,7 @@ VALUES
 Your application owns these tables
 
 SQL selects candidate pairs first, then Otlet judges those pairs. Merge vendors later through an explicit application workflow outside this model pass
-## Clear Old Demo State
+## Step 3 - Clear Old Demo State
 
 ```sql
 DELETE FROM otlet.worker_events e
@@ -111,7 +113,7 @@ The product flow does not need this cleanup
 
 It makes the example rerunnable
 
-## Create The Task
+## Step 4 - Create The Task
 
 ```sql
 SELECT name, model_name
@@ -288,7 +290,7 @@ preset_immutability_contract=raised
 
 If the model returns malformed JSON, missing fields, unknown fields, or values outside the enum, Otlet marks the job failed and keeps the raw evidence. Otlet stores no trusted output or records
 
-## Enqueue The Jobs
+## Step 5 - Enqueue The Jobs
 
 ```sql
 SELECT otlet.run_task('entity_resolution_demo') AS queued_jobs;
@@ -309,7 +311,7 @@ The user transaction creates durable database work. The resident worker claims i
 
 The queue keeps model work out of the client request. SQL shows each job at any status: queued, running, complete, failed, or canceled
 
-## Watch The Worker
+## Step 6 - Watch The Worker
 
 ```sql
 SELECT
@@ -332,17 +334,19 @@ If it is still running, wait a moment and run the query again
 Representative output:
 
 ```text
- id |       task_name        |      subject_id       |  status  | attempts |          created_at           |          started_at           |          finished_at          | error
-----+------------------------+-----------------------+----------+----------+-------------------------------+-------------------------------+-------------------------------+-------
-  1 | entity_resolution_demo | vendor-1001:vendor-313 | complete |        1 | 2026-06-26 15:30:50.122119+00 | 2026-06-26 15:30:50.126401+00 | 2026-06-26 15:31:02.446731+00 |
-  2 | entity_resolution_demo | vendor-1001:vendor-314 | complete |        1 | 2026-06-26 15:30:50.122119+00 | 2026-06-26 15:30:50.126401+00 | 2026-06-26 15:31:04.009343+00 |
-  3 | entity_resolution_demo | vendor-1001:vendor-42  | complete |        1 | 2026-06-26 15:30:50.122119+00 | 2026-06-26 15:30:50.126401+00 | 2026-06-26 15:31:04.826055+00 |
-  4 | entity_resolution_demo | vendor-1001:vendor-77  | complete |        1 | 2026-06-26 15:30:50.122119+00 | 2026-06-26 15:30:50.126401+00 | 2026-06-26 15:31:05.731144+00 |
++------+------------------------+------------------------+----------+----------+-------------------------------+-------------------------------+-------------------------------+-------+
+|  id  |       task_name        |       subject_id       |  status  | attempts |          created_at           |          started_at           |          finished_at          | error |
++------+------------------------+------------------------+----------+----------+-------------------------------+-------------------------------+-------------------------------+-------+
+| 2104 | entity_resolution_demo | vendor-1001:vendor-313 | complete |        1 | 2026-07-07 14:01:06.063557+00 | 2026-07-07 14:01:06.075946+00 | 2026-07-07 14:02:39.745305+00 |       |
+| 2105 | entity_resolution_demo | vendor-1001:vendor-314 | complete |        1 | 2026-07-07 14:01:06.063557+00 | 2026-07-07 14:01:06.075946+00 | 2026-07-07 14:03:23.793005+00 |       |
+| 2106 | entity_resolution_demo | vendor-1001:vendor-42  | complete |        1 | 2026-07-07 14:01:06.063557+00 | 2026-07-07 14:01:06.075946+00 | 2026-07-07 14:04:10.308073+00 |       |
+| 2107 | entity_resolution_demo | vendor-1001:vendor-77  | complete |        1 | 2026-07-07 14:01:06.063557+00 | 2026-07-07 14:01:06.075946+00 | 2026-07-07 14:04:50.716933+00 |       |
++------+------------------------+------------------------+----------+----------+-------------------------------+-------------------------------+-------------------------------+-------+
 (4 rows)
 ```
 
 The worker coordinates through normal database state. It claims jobs from `otlet.jobs`, writes outputs to Otlet tables, and records worker events in `otlet.worker_events`
-## Read The Model Output
+## Step 7 - Read The Model Output
 
 ```sql
 SELECT
@@ -358,12 +362,14 @@ ORDER BY r.subject_id;
 Representative output:
 
 ```text
-      subject_id       |      match       | confidence |                    reason
------------------------+------------------+------------+----------------------------------------------
- vendor-1001:vendor-313 | different_entity | high       | no shared identifiers
- vendor-1001:vendor-314 | different_entity | high       | no shared identifiers
- vendor-1001:vendor-42  | same_entity      | high       | shared remittance or rebrand
- vendor-1001:vendor-77  | different_entity | high       | no shared identifiers
++------------------------+------------------+------------+-------------------------------------------------------------+
+|       subject_id       |      match       | confidence |                           reason                            |
++------------------------+------------------+------------+-------------------------------------------------------------+
+| vendor-1001:vendor-313 | different_entity | high       | Conflicting stable identifiers found.                       |
+| vendor-1001:vendor-314 | different_entity | high       | 4 conflicting stable identifiers found                      |
+| vendor-1001:vendor-42  | same_entity      | high       | Same remittance account and tax ID match                    |
+| vendor-1001:vendor-77  | different_entity | high       | Conflicting stable identifiers indicate different entities. |
++------------------------+------------------+------------+-------------------------------------------------------------+
 (4 rows)
 ```
 
@@ -373,7 +379,7 @@ Otlet stores the result as database state. You do not have to scrape a terminal 
 
 Direct entity-resolution tasks ask the model for one typed action. Otlet stores actions when they attach to an accepted, schema-valid output receipt
 
-## Inspect Typed Actions
+## Step 8 - Inspect Typed Actions
 
 ```sql
 SELECT
@@ -419,7 +425,7 @@ Representative output:
                       0
 (1 row)
 ```
-## Review The Queue
+## Step 9 - Review The Queue
 
 `otlet.review_queue` gathers actions that need attention, abstention outputs, and review flags with receipt and source-freshness context:
 
@@ -550,7 +556,7 @@ Semantic refresh jobs create typed `create_record` actions, `otlet.records` rows
 Semantic materializations keep two row identities. `source_hash` is MVCC-coupled provenance for the exact row version that produced a job. `content_hash` is the model-input identity used for freshness, excluding Otlet's MVCC envelope so benign row churn can revalidate without rerunning the model
 
 Input shaping fields are top-level in the task input. Row watches wrap source rows under `row`, so `evidence_fields` does not traverse `row.evidence`; project evidence to a top-level object in the input or pair candidate query. Pair watches treat the candidate query as the shaping declaration, with `strip_keys` available for top-level volatile fields
-## Learn The Action Boundary
+## Step 10 - Learn The Action Boundary
 
 Otlet keeps the action vocabulary fixed and typed. The built-in action catalog says which actions need approval and which ones can create Otlet-owned records:
 

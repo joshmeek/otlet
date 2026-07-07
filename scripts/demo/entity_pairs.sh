@@ -1,4 +1,10 @@
 log "Running entity-resolution demo"
+psql_exec -v join_index_name="$join_index_name" >/dev/null <<'SQL'
+SELECT otlet.drop_watch(:'join_index_name');
+SQL
+cleanup_task "$entity_task"
+cleanup_task "$join_task"
+
 psql_exec >/dev/null <<'SQL'
 DROP VIEW IF EXISTS public.otlet_demo_vendor_pair_input;
 DROP TABLE IF EXISTS public.otlet_demo_vendor_pair;

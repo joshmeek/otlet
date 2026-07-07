@@ -58,7 +58,7 @@ Otlet ran the local model inside Postgres, validated the JSON, and stored the re
 
 ## Longer Example
 
-Entity resolution uses the same SQL and receipt path, but adds candidate pairs, model selection, typed actions, and semantic materialization. The demo registers `qwen3_1_7b` as the cheap model and `qwen35_4b` as the stronger model. On this run, the cheap model fails the strict output envelope on hard rows, so Otlet records failed receipts and escalates to the stronger model
+Entity resolution uses the same SQL and receipt path, but adds candidate pairs, model selection, typed actions, and semantic materialization. The demo registers `qwen3_1_7b` as the cheap model and `qwen35_4b` as the stronger model. On this run, the cheap model is rejected by the strict output envelope on hard rows, so Otlet records rejected receipts and escalates to the stronger model
 
 The task reads candidate vendor pairs, joins source rows, and gives the model compact evidence buckets:
 

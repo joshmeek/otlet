@@ -1,8 +1,8 @@
 # Runtime And Traces
 
-Use this after the entity-resolution walkthrough queues work to inspect model selection, receipts, runtime status, trace visibility, retries, cancellation, and failed-run evidence
+Use this after the entity-resolution walkthrough queues work. This is the first transfer task: take the solved entity-resolution path and inspect model selection, receipts, runtime status, trace visibility, retries, cancellation, and failed-run evidence
 
-## Inspect Model Selection Attempts
+## Transfer Step 1 - Inspect Model Selection Attempts
 
 ```sql
 SELECT
@@ -23,27 +23,27 @@ Representative output from the demo run:
 ```text
       subject_id       | attempt_index | selection_role | selection_status |    model_name    |      match       | confidence
 -----------------------+---------------+----------------+------------------+------------------+------------------+------------
- vendor-1001:vendor-313 |             1 | cheap          | failed           | qwen3_1_7b |                  |
+ vendor-1001:vendor-313 |             1 | cheap          | rejected         | qwen3_1_7b       |                  |
  vendor-1001:vendor-313 |             2 | strong         | accepted         | qwen35_4b        | different_entity | high
- vendor-1001:vendor-314 |             1 | cheap          | failed           | qwen3_1_7b |                  |
+ vendor-1001:vendor-314 |             1 | cheap          | rejected         | qwen3_1_7b       |                  |
  vendor-1001:vendor-314 |             2 | strong         | accepted         | qwen35_4b        | different_entity | high
- vendor-1001:vendor-42  |             1 | cheap          | failed           | qwen3_1_7b |                  |
+ vendor-1001:vendor-42  |             1 | cheap          | rejected         | qwen3_1_7b       |                  |
  vendor-1001:vendor-42  |             2 | strong         | accepted         | qwen35_4b        | same_entity      | high
- vendor-1001:vendor-77  |             1 | cheap          | failed           | qwen3_1_7b |                  |
+ vendor-1001:vendor-77  |             1 | cheap          | rejected         | qwen3_1_7b       |                  |
  vendor-1001:vendor-77  |             2 | strong         | accepted         | qwen35_4b        | different_entity | high
 (8 rows)
 ```
 
-The cheap model fails the stricter output/action envelope in this run. Failed attempts stay visible as receipts, every row escalates to `qwen35_4b`, and Otlet materializes the accepted output for each job
+The cheap model is rejected by the stricter output/action envelope in this run. Rejected attempts stay visible as receipts, every row escalates to `qwen35_4b`, and Otlet materializes the accepted output for each job
 
-## Read The Receipt
+## Transfer Step 2 - Read The Receipt
 
 ```sql
 SELECT 'receipt_attempt_contract=' ||
        count(*)::text || '|' ||
        count(*) FILTER (WHERE selection_role = 'cheap')::text || '|' ||
        count(*) FILTER (WHERE selection_role = 'strong')::text || '|' ||
-       count(*) FILTER (WHERE status = 'failed')::text AS receipt_attempt_contract
+       count(*) FILTER (WHERE status = 'rejected')::text AS receipt_attempt_contract
 FROM otlet.inference_receipt_trace_status
 WHERE task_name = 'entity_resolution_demo';
 ```
@@ -60,7 +60,7 @@ It links the model, artifact, runtime options, prompt hash, input hash, output s
 
 Otlet stores receipts when jobs fail because failures produce evidence too
 
-## Inspect Runtime Residency
+## Transfer Step 3 - Inspect Runtime Residency
 
 ```sql
 SELECT 'runtime_residency_contract=' ||
@@ -96,7 +96,7 @@ SELECT task_name,
 FROM otlet.task_inference_cache_status
 WHERE task_name = 'entity_resolution_demo';
 ```
-## Inspect Token Traces
+## Transfer Step 4 - Inspect Token Traces
 
 The task enabled bounded generation tracing:
 
@@ -123,7 +123,7 @@ SELECT 'token_trace_contract=' ||
 Representative output:
 
 ```text
-token_trace_contract=112|336|true|true
+token_trace_contract=128|384|true|true
 ```
 
 Trace data records:
@@ -137,7 +137,7 @@ Trace data records:
 
 Otlet bounds tracing so prompt, token, and logits storage does not turn observability into a data retention problem
 
-## Check The Whole Chain
+## Transfer Step 5 - Check The Whole Chain
 
 ```sql
 SELECT
@@ -152,7 +152,7 @@ Representative output:
 ```text
  outputs | actions | records | receipts
 ---------+---------+---------+----------
-       4 |       4 |       0 |        7
+       4 |       4 |       0 |        8
 (1 row)
 ```
 
@@ -163,11 +163,11 @@ four source candidate pairs
 four jobs
 four accepted outputs
 four typed action proposals
-seven model-attempt receipts
+eight model-attempt receipts
 bounded trace state
 SQL-visible runtime state
 ```
-## Bad Output
+## Transfer Step 6 - Bad Output
 
 If the model returns invalid JSON or a value outside the schema, Otlet fails closed
 
@@ -183,7 +183,7 @@ Check these rows:
 
 The task schema and action rules decide whether model output can become database truth. If output passes and a proposed action fails, Otlet keeps the rejected action as evidence and creates no record
 
-## Create A Retry Task
+## Transfer Step 7 - Create A Retry Task
 
 The next examples reuse this task to show terminal failure evidence and safe requeueing
 
@@ -220,7 +220,7 @@ Representative output:
  learning_retry_task | t               | qwen3_1_7b
 (1 row)
 ```
-## Cancel Queued Work
+## Transfer Step 8 - Cancel Queued Work
 
 Cancellation changes job lifecycle state
 
@@ -280,7 +280,7 @@ Representative output:
 
 Canceled work still gets a receipt. A canceled model run still leaves evidence
 
-## Understand Retry And Failed-Run Evidence
+## Transfer Step 9 - Understand Retry And Failed-Run Evidence
 
 Otlet leaves failed jobs visible. A failed job is terminal, so you can queue the same task and subject again
 
@@ -325,7 +325,7 @@ Representative output:
 ```
 
 Failure keeps the raw output, stores the error, and records the attempt in a receipt
-## Check Worker Events And Receipt Statuses
+## Transfer Step 10 - Check Worker Events And Receipt Statuses
 
 Events show worker behavior. Receipts show model behavior
 
