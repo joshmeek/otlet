@@ -1,8 +1,8 @@
 # Entity Resolution Walkthrough
 
-Use this long SQL walkthrough for the solved entity-resolution path from `docs/otlet-worked-example.md`. Start with `./scripts/otlet-setup.sh`, then paste these sections into the `psql` session described there
+Use this long SQL walkthrough for the entity-resolution path from `docs/otlet-worked-example.md`. Start with `./scripts/otlet-setup.sh`, then paste these sections into the `psql` session described there
 
-The walkthrough follows a worked-example sequence: each section gives a solved command, the state it creates, and the next output to inspect. Read it once in order before adapting it. The transfer steps live in [runtime-and-traces.md](runtime-and-traces.md), [semantic-watches.md](semantic-watches.md), and [production-contract.md](production-contract.md)
+Each section gives a command, the state it creates, and the next output to inspect. Read it once in order before adapting it. The follow-up checks live in [runtime-and-traces.md](runtime-and-traces.md), [semantic-watches.md](semantic-watches.md), and [production-contract.md](production-contract.md)
 
 ## Step 1 - Register The Models
 

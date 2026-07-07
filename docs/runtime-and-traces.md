@@ -1,8 +1,8 @@
 # Runtime And Traces
 
-Use this after the entity-resolution walkthrough queues work. This is the first transfer task: take the solved entity-resolution path and inspect model selection, receipts, runtime status, trace visibility, retries, cancellation, and failed-run evidence
+Use this after the entity-resolution walkthrough queues work. It inspects model selection, receipts, runtime status, trace visibility, retries, cancellation, and failed-run evidence
 
-## Transfer Step 1 - Inspect Model Selection Attempts
+## Step 1 - Inspect Model Selection Attempts
 
 ```sql
 SELECT
@@ -36,7 +36,7 @@ Representative output from the demo run:
 
 The cheap model is rejected by the stricter output/action envelope in this run. Rejected attempts stay visible as receipts, every row escalates to `qwen35_4b`, and Otlet materializes the accepted output for each job
 
-## Transfer Step 2 - Read The Receipt
+## Step 2 - Read The Receipt
 
 ```sql
 SELECT 'receipt_attempt_contract=' ||
@@ -60,7 +60,7 @@ It links the model, artifact, runtime options, prompt hash, input hash, output s
 
 Otlet stores receipts when jobs fail because failures produce evidence too
 
-## Transfer Step 3 - Inspect Runtime Residency
+## Step 3 - Inspect Runtime Residency
 
 ```sql
 SELECT 'runtime_residency_contract=' ||
@@ -96,7 +96,7 @@ SELECT task_name,
 FROM otlet.task_inference_cache_status
 WHERE task_name = 'entity_resolution_demo';
 ```
-## Transfer Step 4 - Inspect Token Traces
+## Step 4 - Inspect Token Traces
 
 The task enabled bounded generation tracing:
 
@@ -137,7 +137,7 @@ Trace data records:
 
 Otlet bounds tracing so prompt, token, and logits storage does not turn observability into a data retention problem
 
-## Transfer Step 5 - Check The Whole Chain
+## Step 5 - Check The Whole Chain
 
 ```sql
 SELECT
@@ -167,7 +167,7 @@ eight model-attempt receipts
 bounded trace state
 SQL-visible runtime state
 ```
-## Transfer Step 6 - Bad Output
+## Step 6 - Bad Output
 
 If the model returns invalid JSON or a value outside the schema, Otlet fails closed
 
@@ -183,7 +183,7 @@ Check these rows:
 
 The task schema and action rules decide whether model output can become database truth. If output passes and a proposed action fails, Otlet keeps the rejected action as evidence and creates no record
 
-## Transfer Step 7 - Create A Retry Task
+## Step 7 - Create A Retry Task
 
 The next examples reuse this task to show terminal failure evidence and safe requeueing
 
@@ -220,7 +220,7 @@ Representative output:
  learning_retry_task | t               | qwen3_1_7b
 (1 row)
 ```
-## Transfer Step 8 - Cancel Queued Work
+## Step 8 - Cancel Queued Work
 
 Cancellation changes job lifecycle state
 
@@ -280,7 +280,7 @@ Representative output:
 
 Canceled work still gets a receipt. A canceled model run still leaves evidence
 
-## Transfer Step 9 - Understand Retry And Failed-Run Evidence
+## Step 9 - Understand Retry And Failed-Run Evidence
 
 Otlet leaves failed jobs visible. A failed job is terminal, so you can queue the same task and subject again
 
@@ -325,7 +325,7 @@ Representative output:
 ```
 
 Failure keeps the raw output, stores the error, and records the attempt in a receipt
-## Transfer Step 10 - Check Worker Events And Receipt Statuses
+## Step 10 - Check Worker Events And Receipt Statuses
 
 Events show worker behavior. Receipts show model behavior
 

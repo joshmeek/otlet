@@ -1,10 +1,10 @@
 # Semantic Watches
 
-Use this after the direct entity-resolution walkthrough. This is the second transfer task: take the solved task, then apply the same job, receipt, output, action, materialization, and freshness pattern to reusable semantic state
+Use this after the direct entity-resolution walkthrough. It applies the same job, receipt, output, action, materialization, and freshness path to reusable semantic state
 
 Some sections use the full vendor-pair demo. Others use smaller learning tables so the transfer pattern stays visible
 
-## Transfer Step 1 - Choose Direct Task Or Semantic Index
+## Step 1 - Choose Direct Task Or Semantic Index
 
 The direct task path gives you the shortest way to learn Otlet
 
@@ -25,7 +25,7 @@ Use a semantic index when:
 
 The direct task path teaches the Otlet contract. The semantic path adds query ergonomics and freshness policy
 
-## Transfer Step 2 - Map The Otlet Schema
+## Step 2 - Map The Otlet Schema
 
 The direct task path gives you the smallest loop. The rest of Otlet uses the same tables
 
@@ -58,7 +58,7 @@ The base tables split into a few jobs:
 
 Use `otlet.runs` for application reads. Use trace and status views for debugging, proof, and learning
 
-## Transfer Step 3 - Materialize Records Into Semantic State
+## Step 3 - Materialize Records Into Semantic State
 
 Actions and records form one layer. Semantic materializations make those records reusable from queries
 
@@ -121,7 +121,7 @@ FROM otlet.semantic_index_plan('demo_semantic_vendor_idx', true);
 
 Use `{"on_change":"mark_stale_and_enqueue"}` when inserts need immediate enqueue
 
-## Transfer Step 4 - Build A Row Watch
+## Step 4 - Build A Row Watch
 
 A row watch wraps a source table with an Otlet task, materialized records, stale tracking, trigger policy, and current-row SQL reads
 
@@ -225,7 +225,7 @@ semantic_index_plan_contract=semantic_lookup|3|3|0|0|1.0000
 
 `semantic_index_plan` shows whether Otlet can reuse materialized state, refresh, wait, or run fresh inference
 
-## Transfer Step 5 - Read Current Semantic Rows
+## Step 5 - Read Current Semantic Rows
 
 `semantic_index_current_rows` returns materialized semantic state without adding another public access path:
 
@@ -250,7 +250,7 @@ SELECT *
 FROM otlet.semantic_index_current_rows('demo_semantic_vendor_idx', true)
 WHERE subject_id = '2';
 ```
-## Transfer Step 6 - Read EXPLAIN Field Vocabulary
+## Step 6 - Read EXPLAIN Field Vocabulary
 
 The SQL plan row and CustomScan EXPLAIN use the same terms for the planner contract
 
@@ -290,7 +290,7 @@ Model Cost Source: task_receipt
 Preloaded Fresh Subjects / Basis: 3 {"mvcc_match": 3}
 Emitted Freshness Basis: {"mvcc_match": 3}
 ```
-## Transfer Step 7 - Use CustomScan For Source-Row Predicates
+## Step 7 - Use CustomScan For Source-Row Predicates
 
 Otlet can own a semantic predicate against the source table through a CustomScan
 
@@ -321,7 +321,7 @@ The child scan reads the source table. Otlet strips the semantic predicate from 
 
 CustomScan uses statement preload semantics. Row-marked queries such as `FOR UPDATE` stay on the ordinary Postgres plan because Otlet blocks the CustomScan planner path when queries include rowmarks; Postgres still owns locking and row recheck behavior. For non-rowmark CustomScan, stale triggers and the next statement pick up concurrent source changes instead of a per-tuple recheck inside the same scan
 
-## Transfer Step 8 - Fail Closed On Stale Rows
+## Step 8 - Fail Closed On Stale Rows
 
 Changing a source row makes its materialized semantic state stale
 
@@ -357,7 +357,7 @@ semantic_stale_status_contract=2|1|0
 ```
 
 Fail closed means stale facts do not match because old model output looked right
-## Transfer Step 9 - Let CustomScan Refresh A Stale Row With Infer-Now
+## Step 9 - Let CustomScan Refresh A Stale Row With Infer-Now
 
 `semantic_matches_auto` lets a source-table query use policy-owned bounded infer-now for stale or missing rows
 
@@ -432,7 +432,7 @@ Representative output:
 
 Receipts carry executor provenance because the same model task can run from the worker queue or from CustomScan infer-now
 
-## Transfer Step 10 - Build A Pair Watch
+## Step 10 - Build A Pair Watch
 
 Row watches are source-table-oriented. Pair watches are candidate-query-oriented
 
@@ -538,7 +538,7 @@ semantic_join_lookup_contract=1|1|0
 ```
 
 A semantic join index uses the same contract: jobs, outputs, actions, records, materializations, receipts
-## Transfer Step 11 - Query A Semantic Join Predicate
+## Step 11 - Query A Semantic Join Predicate
 
 ```sql
 SELECT 'semantic_join_match_contract=' ||

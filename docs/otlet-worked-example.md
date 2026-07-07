@@ -1,14 +1,14 @@
 # Otlet Worked Example
 
-Use this as a learning file, not a test harness. The format follows Chen, Retnowati, Chan, and Kalyuga's worked-example research on [solution steps and knowledge transfer](https://www.tandfonline.com/doi/full/10.1080/01443410.2023.2273762): show the solved step first, keep each step's state visible, reduce search work for novices, then ask the learner to transfer the pattern to a nearby Otlet surface
+Use this as a learning file, not a test harness. It is inspired by worked-example research from [this study](https://www.tandfonline.com/doi/full/10.1080/01443410.2023.2273762)
 
-The example teaches one high-interactivity Otlet task: entity resolution. You keep vendor rows in ordinary Postgres tables, select hard candidate pairs in SQL, enqueue durable model work, let the resident worker try a cheap local model and escalate hard rows to a stronger local model, validate `same_entity` / `different_entity` / `unclear`, record typed actions, and keep receipts
+You start with one real Otlet entity-resolution loop: keep vendor rows in ordinary Postgres tables, select hard candidate pairs in SQL, enqueue durable model work, let the resident worker try a cheap local model and escalate hard rows to a stronger local model, validate `same_entity` / `different_entity` / `unclear`, record typed actions, and keep receipts
 
 Output blocks below come from a real Docker-backed run on July 7, 2026 with `./scripts/otlet-setup.sh` and `./scripts/otlet-demo.sh`. Job IDs, receipt IDs, timestamps, token counts, timings, and token rates vary by machine and cache state
 
-## Worked-Example Shape
+## Example Path
 
-Read the steps in order once before changing anything:
+Read once, then run it:
 
 1. Start a local Otlet runtime
 2. Inspect the source pairs
@@ -16,9 +16,9 @@ Read the steps in order once before changing anything:
 4. Read the accepted model outputs
 5. Inspect cheap-to-strong model selection
 6. Inspect typed actions and review state
-7. Transfer the pattern to semantic joins, stale rows, traces, and production checks
+7. Check the same path through semantic joins, stale rows, traces, and production checks
 
-The first six steps are retention checks: they teach the entity-resolution solution path. Step seven is the transfer check: the same contracts reappear in watches, CustomScan refresh, traces, and production status
+Steps 1-6 teach the direct task. Step 7 shows the same contract in watches, CustomScan refresh, traces, and production status
 
 ## Step 1 - Start Local Otlet
 
@@ -49,7 +49,7 @@ docker exec -it otlet-postgres sh -lc '
 '
 ```
 
-This is the solved starting state: Postgres is running, the Otlet worker exists, and both local GGUF artifacts are visible inside the container
+At this point Postgres is running, the Otlet worker exists, and both local GGUF artifacts are visible inside the container
 
 ## Step 2 - Inspect The Source Pairs
 
@@ -79,7 +79,7 @@ Observed output:
 (4 rows)
 ```
 
-The solved idea: SQL narrows the work to four candidate pairs before the model sees anything
+SQL narrows the work to four candidate pairs before the model sees anything
 
 ## Step 3 - Queue Durable Model Work
 
@@ -130,7 +130,7 @@ Observed output:
 (4 rows)
 ```
 
-The solved idea: `otlet.runs` is the learning surface for accepted outputs. You do not scrape model text from logs
+`otlet.runs` is the read surface for accepted outputs. You do not scrape model text from logs
 
 ## Step 5 - Inspect Model Selection
 
@@ -160,7 +160,7 @@ Observed output:
 (8 rows)
 ```
 
-The solved idea: a rejected cheap attempt is still evidence. The accepted strong attempt becomes trusted output
+A rejected cheap attempt is still evidence. The accepted strong attempt becomes trusted output
 
 ## Step 6 - Inspect Typed Actions
 
@@ -183,11 +183,11 @@ action_reject_contract=rejected|rejected
 source_write_contract=5|fa7672627cd7ab2a22aba2d9d7035815|5|fa7672627cd7ab2a22aba2d9d7035815
 ```
 
-The solved idea: Otlet stores trusted actions, but the application still owns merge authority
+Otlet stores trusted actions. The application still owns merge authority
 
-## Step 7 - Transfer The Pattern
+## Step 7 - Check The Wider Path
 
-After the direct task works, transfer the same idea to semantic joins, stale rows, receipts, and production checks:
+After the direct task works, check semantic joins, stale rows, receipts, and production status:
 
 ```text
 semantic_join_auto_records=4|4
@@ -202,7 +202,7 @@ planner_1m_contract=estimated|1000000|4.404|true
 docker_crash_log_scan=ok
 ```
 
-The transfer idea: the direct task, semantic join, CustomScan refresh, trace views, and production policy all expose the same database-owned proof chain: source row identity, job, receipt, output, action, materialization, freshness, and status
+Check these fields in each path: source row identity, job, receipt, output, action, materialization, freshness, and status
 
 ## Detailed Walkthroughs
 
