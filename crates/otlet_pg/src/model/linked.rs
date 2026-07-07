@@ -30,7 +30,10 @@ fn run_linked(
             .map_err(|_| ModelError::new("linked llama.cpp model path is invalid".to_owned()))?;
         let mut model_params = unsafe { llama_cpp_sys_4::llama_model_default_params() };
         model_params.n_gpu_layers = 0;
-        let decode_threads = linked_decode_threads();
+        model_params.use_mmap = linked_env_bool("OTLET_LLAMA_MMAP", model_params.use_mmap);
+        model_params.use_mlock = linked_env_bool("OTLET_LLAMA_MLOCK", model_params.use_mlock);
+        let decode_threads = linked_decode_threads(options);
+        let prompt_batch_tokens = linked_prompt_batch_tokens();
 
         let load_start = Instant::now();
         let model_ptr = unsafe {
@@ -46,7 +49,10 @@ fn run_linked(
 
         let mut ctx_params = unsafe { llama_cpp_sys_4::llama_context_default_params() };
         ctx_params.n_ctx = LINKED_CONTEXT_WINDOW_TOKENS;
-        ctx_params.n_batch = LINKED_PROMPT_BATCH_TOKENS as u32;
+        ctx_params.n_batch = prompt_batch_tokens as u32;
+        ctx_params.n_ubatch = prompt_batch_tokens as u32;
+        ctx_params.no_perf = true;
+        linked_apply_flash_attn_type(&mut ctx_params);
         // llama.cpp defaults to GGML_DEFAULT_N_THREADS (4); use the cores this
         // host actually has for both single-token generation and batch decode.
         ctx_params.n_threads = decode_threads;
@@ -94,7 +100,7 @@ fn run_linked(
     let cache = cache
         .as_mut()
         .ok_or_else(|| ModelError::new("linked llama.cpp cache did not initialize".to_owned()))?;
-    let decode_threads = linked_decode_threads();
+    let decode_threads = linked_decode_threads(options);
     unsafe {
         llama_cpp_sys_4::llama_set_n_threads(
             cache.context.ptr,
@@ -124,13 +130,15 @@ fn run_linked(
     let common_prefix =
         linked_reuse_prompt_prefix(cache.context.ptr, &mut cache.kv_tokens, &tokens);
 
-    let mut batch = LinkedBatch::new(LINKED_PROMPT_BATCH_TOKENS)?;
+    let prompt_batch_tokens = linked_prompt_batch_tokens();
+    let mut batch = LinkedBatch::new(prompt_batch_tokens)?;
     linked_decode_prompt_tokens(
         job,
         cache.context.ptr,
         &mut batch,
         &tokens[common_prefix..],
         common_prefix,
+        prompt_batch_tokens,
         &mut cache.kv_tokens,
         &mut cancel_probe,
     )?;
@@ -262,13 +270,64 @@ fn linked_attempt_timed_out(start: Instant, max_attempt_ms: i64) -> bool {
     max_attempt_ms > 0 && start.elapsed().as_millis() >= max_attempt_ms as u128
 }
 
-fn linked_decode_threads() -> i32 {
+fn linked_decode_threads(options: &crate::runtime::RuntimeOptions) -> i32 {
+    if options.llama_threads > 0 {
+        return options.llama_threads.min(i32::MAX as u64) as i32;
+    }
+    linked_default_decode_threads()
+}
+
+fn linked_default_decode_threads() -> i32 {
     static DECODE_THREADS: OnceLock<i32> = OnceLock::new();
     *DECODE_THREADS.get_or_init(|| {
+        if let Ok(value) = std::env::var("OTLET_LLAMA_THREADS") {
+            if let Ok(threads) = value.parse::<usize>() {
+                if threads > 0 {
+                    return threads.min(i32::MAX as usize) as i32;
+                }
+            }
+        }
         std::thread::available_parallelism()
             .map(|threads| threads.get())
             .unwrap_or(4)
+            .min(LINKED_DEFAULT_MAX_DECODE_THREADS)
             .min(i32::MAX as usize) as i32
+    })
+}
+
+fn linked_env_bool(name: &str, default: bool) -> bool {
+    match std::env::var(name) {
+        Ok(value) if matches!(value.as_str(), "1" | "true" | "on" | "yes") => true,
+        Ok(value) if matches!(value.as_str(), "0" | "false" | "off" | "no") => false,
+        _ => default,
+    }
+}
+
+fn linked_apply_flash_attn_type(params: &mut llama_cpp_sys_4::llama_context_params) {
+    let Ok(value) = std::env::var("OTLET_LLAMA_FLASH_ATTN") else {
+        return;
+    };
+    params.flash_attn_type = match value.as_str() {
+        "1" | "true" | "on" | "yes" | "enabled" => llama_cpp_sys_4::LLAMA_FLASH_ATTN_TYPE_ENABLED,
+        "0" | "false" | "off" | "no" | "disabled" => {
+            llama_cpp_sys_4::LLAMA_FLASH_ATTN_TYPE_DISABLED
+        }
+        "auto" => llama_cpp_sys_4::LLAMA_FLASH_ATTN_TYPE_AUTO,
+        _ => params.flash_attn_type,
+    };
+}
+
+fn linked_prompt_batch_tokens() -> usize {
+    static PROMPT_BATCH_TOKENS: OnceLock<usize> = OnceLock::new();
+    *PROMPT_BATCH_TOKENS.get_or_init(|| {
+        if let Ok(value) = std::env::var("OTLET_LLAMA_BATCH_TOKENS") {
+            if let Ok(tokens) = value.parse::<usize>() {
+                if tokens > 0 {
+                    return tokens.min(LINKED_CONTEXT_WINDOW_TOKENS as usize);
+                }
+            }
+        }
+        LINKED_PROMPT_BATCH_TOKENS
     })
 }
 
@@ -284,11 +343,12 @@ fn linked_decode_prompt_tokens(
     batch: &mut LinkedBatch,
     tokens: &[llama_cpp_sys_4::llama_token],
     start_position: usize,
+    prompt_batch_tokens: usize,
     kv_tokens: &mut Vec<llama_cpp_sys_4::llama_token>,
     cancel_probe: &mut CancelProbe,
 ) -> Result<(), ModelError> {
     let mut decoded_tokens = 0;
-    for chunk in tokens.chunks(LINKED_PROMPT_BATCH_TOKENS) {
+    for chunk in tokens.chunks(prompt_batch_tokens) {
         batch.reset();
         for (chunk_index, token) in chunk.iter().enumerate() {
             let position = start_position + decoded_tokens + chunk_index;

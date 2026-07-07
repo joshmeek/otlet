@@ -47,7 +47,7 @@ Run `./scripts/otlet-setup.sh`, then `./scripts/otlet-demo.sh` to prove the cont
 | Semantic freshness | Implemented, harden | Source updates, deletes, schema drift, contract changes, and candidate changes fail closed; add dependency audit export |
 | Watch definitions | Implemented, extend | Row and pair watches carry source, candidate, schema, stale, model, and runtime policy; add import/export |
 | Explain and trace | Implemented, harden | Bounded token traces and EXPLAIN vocabulary exist; add audit export views and redaction policy |
-| Model residency and timing | Open | Add SQL-visible timing splits and test multi-resident model contexts before changing slot policy |
+| Model residency and timing | Open | Add SQL-visible timing splits, CPU knob sweeps, and multi-resident model tests before changing slot policy |
 | User-labeled eval loop | Implemented | Accepted, rejected, and corrected actions export local eval cases; feed more labels into benchmark gates |
 | Single-worker admission | Implemented | Queue caps, fair claims, cancellation, leases, RSS budgets, and cleanup checks exist; extend after multi-worker support lands |
 | SQL proposal actions | Open | Define bounded SQL action schemas, dry-run plans, approvals, receipts, and source-table write checks |
@@ -65,15 +65,17 @@ Keep open tracks contract-first. Name the SQL-visible state, the closed failure 
 
 Otlet treats output reliability as part of the database contract. Trusted output uses a fixed top-level `output` plus `actions` envelope. Invalid JSON, schema failures, bad action envelopes, false merges, and failed model attempts stay in receipts and diagnostic benchmark data, outside trusted output
 
-The Qwen3.5 4B benchmark pass leads the calibrated fixture today. Repeat runs and small-model comparisons come next
+Qwen3.5 4B stays the default stable model under the 4B and 4 GB project cap. The fast probe filters smaller candidates before a full benchmark run. MiniStral 3B, Phi-4 mini, SmolLM3 3B, and GLM Edge 4B are faster on CPU in quick probes, but each failed adversarial row-text, numeric-threshold, markdown-fence, or schema gates
 
 Next benchmark work:
 
 - Run comparable model sweeps after harness changes so public charts show workload roles, trusted quality, resource fit, and out-of-running reasons across small, medium, and ceiling local models
 - Keep routine benchmark runs on `include_by_default=true`; keep candidate, diagnostic, historical, heavy, and blocked rows manual
+- Use `benchmarks/quick_probe.sh` to reject weak candidates before running the full suite
+- Use `benchmarks/thread_sweep.sh` to find the host-specific `llama_threads` setting before treating CPU token rates as fixed
 - Revisit grammar-constrained JSON after linked llama exposes a hook that cannot abort the resident worker
 - Keep prompt and schema changes on the same benchmark fixture
-- Test larger local models to find the quality/resource knee before defaulting to bigger models
+- Test larger local models only as ceiling checks; keep Otlet defaults under 4B active parameters and about 4 GB on disk
 
 ## Planner, Executor, And Cache
 
@@ -88,6 +90,8 @@ Use measured runtime history for costing: load time, warm generation time, token
 Add a timing split before the next executor rewrite: `tokenize_ms`, `prompt_decode_ms`, `generate_ms`, `finish_sql_ms`, and `materialize_ms`. Use those fields to decide whether prompt decode, SQL finish work, or materialization owns warm-job latency
 
 Keep cache-hit paths easy to preserve. A live smoke run completed cached jobs in milliseconds with no generation, so future watch and demo work keeps trace mode off for cacheable production paths and keeps stable content, contract, and model keys
+
+Keep CPU tuning measurable. Current controls cover release builds, native CPU code, OpenMP, a six-thread default cap, per-job `llama_threads`, startup `OTLET_LLAMA_BATCH_TOKENS`, `OTLET_LLAMA_MMAP`, `OTLET_LLAMA_MLOCK`, and `OTLET_LLAMA_FLASH_ATTN`. Add BLAS, KV-cache quantization, context-window policy, grammar decoding, or device offload only after a probe shows better Otlet pass rate or latency on the SQL path
 
 Test multi-resident model contexts before changing slot policy. Alternating cheap and strong models pays model-load time on each swap; a keyed model cache can remove that cost when the memory budget allows both artifacts
 

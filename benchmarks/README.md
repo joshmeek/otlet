@@ -9,6 +9,38 @@ Start with the normal Otlet proof path:
 ./scripts/otlet-demo.sh
 ```
 
+Run the fast probe before spending time on a full benchmark. It uses the real Otlet worker on five row-shaped JSON cases and reports viability, pass count, schema passes, token rate, and p95 generation time:
+
+```sh
+OTLET_PROBE_LIMIT_MODELS=ministral3_3b,qwen35_4b,qwen3_1_7b ./benchmarks/quick_probe.sh
+```
+
+Set `OTLET_PROBE_DOWNLOAD=1` when you want the probe to fetch a missing GGUF. Downloads go under `/var/lib/postgresql/otlet-probe-models` and the script removes them on exit unless `OTLET_PROBE_KEEP_MODELS=1`
+
+Find current Hugging Face GGUF candidates before adding a model row:
+
+```sh
+python3 benchmarks/find_candidates.py
+```
+
+Sweep CPU thread counts through the same probe:
+
+```sh
+OTLET_SWEEP_MODELS=qwen3_1_7b,qwen35_4b OTLET_SWEEP_THREADS=1,2,4,6,8,12 ./benchmarks/thread_sweep.sh
+```
+
+The probe accepts `OTLET_PROBE_LLAMA_THREADS=<n>` for one run. The setup path accepts deployment-level llama.cpp knobs before `./scripts/otlet-setup.sh`:
+
+| knob | scope | default |
+| --- | --- | --- |
+| `OTLET_LLAMA_THREADS` | decode and prompt-decode threads | visible cores capped at `6` |
+| `OTLET_LLAMA_BATCH_TOKENS` | prompt batch and ubatch tokens | `512` |
+| `OTLET_LLAMA_MMAP` | model mmap toggle | llama.cpp default |
+| `OTLET_LLAMA_MLOCK` | lock model pages in memory | llama.cpp default |
+| `OTLET_LLAMA_FLASH_ATTN` | `auto`, `on`, or `off` flash attention | llama.cpp default |
+
+Treat those as host-specific controls. Re-run `./scripts/otlet-setup.sh` after changing startup knobs so the worker process starts with the new environment
+
 Run the default-included benchmark model:
 
 ```sh
@@ -24,8 +56,32 @@ OTLET_BENCH_LIMIT_MODELS=phi4_mini OTLET_BENCH_RUNS=1 OTLET_BENCH_PUBLISH_REPORT
 Run the current scored comparison set after a prompt, schema, scoring, or runtime change:
 
 ```sh
-OTLET_BENCH_LIMIT_MODELS=qwen35_4b,ministral3_3b,gemma4_e2b,glm_edge_4b,gemma4_e4b,phi4_mini OTLET_BENCH_RUNS=1 OTLET_BENCH_PUBLISH_REPORT=1 ./benchmarks/run.sh
+OTLET_BENCH_LIMIT_MODELS=ministral3_3b,qwen35_4b,gemma4_e2b,glm_edge_4b,gemma4_e4b,phi4_mini OTLET_BENCH_RUNS=1 OTLET_BENCH_PUBLISH_REPORT=1 ./benchmarks/run.sh
 ```
+
+Keep routine model search under 4B active parameters and about 4 GB of local artifact size. Qwen3.5 4B stays the stable default until a smaller model passes the fast probe and the full benchmark. MiniStral, Gemma, GLM Edge, Phi mini, and SmolLM stay in comparison lanes
+
+Recent quick-probe findings:
+
+| model | viable | mean tok/s | result |
+| --- | --- | ---: | --- |
+| `qwen35_4b` | yes | `34.15` | passed all five row-shaped cases with the 6-thread CPU default |
+| `qwen3_1_7b` | no | `68.79` | fast cheap model, failed three correctness cases |
+| `ministral3_3b` | no | `10.48` | failed markdown-fence, adversarial row-text, and numeric-threshold cases |
+| `phi4_mini` | no | `10.69` | schema-valid, failed adversarial row-text and numeric-threshold cases |
+| `smollm3_3b` | no | `8.71` | schema-valid, failed adversarial row-text and numeric-threshold cases |
+| `glm_edge_4b` | no | `6.68` | produced fenced JSON and failed the same hard decisions |
+
+Thread sweep on the current Docker CPU showed the best stable setting at 6 threads:
+
+| model | threads | viable | mean tok/s |
+| --- | ---: | --- | ---: |
+| `qwen35_4b` | `4` | yes | `24.67` |
+| `qwen35_4b` | `6` | yes | `28.03` |
+| `qwen35_4b` | `8` | yes | `26.65` |
+| `qwen35_4b` | `12` | yes | `5.37` |
+| `qwen3_1_7b` | `6` | no | `71.91` |
+| `qwen3_1_7b` | `12` | no | `10.63` |
 
 Run the default-included set after a harness improvement when you want the shortest publishable check:
 
@@ -41,7 +97,7 @@ models="$(awk -F '\t' 'NR > 1 && ($6 == "candidate" || $6 == "diagnostic") {prin
 OTLET_BENCH_LIMIT_MODELS="$models" OTLET_BENCH_RUNS=1 OTLET_BENCH_MAX_ARTIFACT_GB=6 OTLET_BENCH_PUBLISH_REPORT=1 ./benchmarks/run.sh
 ```
 
-Run a one-model Qwen smoke without publishing a local report:
+Run a one-model default smoke without publishing a local report:
 
 ```sh
 OTLET_BENCH_LIMIT_MODELS=qwen35_4b OTLET_BENCH_RUNS=1 ./benchmarks/run.sh

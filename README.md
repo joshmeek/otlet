@@ -16,22 +16,22 @@ Use `otlet.ask` for one-off questions over row-shaped JSON. This example summari
 
 ```sql
 SELECT name AS model
-FROM otlet.register_model('qwen3_1_7b', '/var/lib/postgresql/otlet-models/Qwen3-1.7B-Q8_0.gguf');
+FROM otlet.register_model('qwen35_4b', '/var/lib/postgresql/otlet-models/Qwen3.5-4B-Q4_K_M.gguf');
 ```
 
 ```text
-+------------+
-|   model    |
-+------------+
-| qwen3_1_7b |
-+------------+
++-----------+
+|   model   |
++-----------+
+| qwen35_4b |
++-----------+
 (1 row)
 ```
 
 ```sql
 SELECT output, receipt_id IS NOT NULL AS receipt_recorded
 FROM otlet.ask(
-  'qwen3_1_7b',
+  'qwen35_4b',
   'Summarize these customer notes in one sentence and choose the next step.',
   '{
     "customer": "Riverline Labs",

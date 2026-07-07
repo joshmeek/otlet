@@ -494,6 +494,7 @@ const LINKED_DECODE_CONSTRAINT_REASON: &str =
     "balanced_json_stop_prevents_trailing_prose_schema_failures_stay_receipts_only";
 const LINKED_CONTEXT_WINDOW_TOKENS: u32 = 4096;
 const LINKED_PROMPT_BATCH_TOKENS: usize = 512;
+const LINKED_DEFAULT_MAX_DECODE_THREADS: usize = 6;
 const LINKED_MAX_TOKEN_PIECE_BYTES: usize = 16 * 1024;
 const LINKED_MODEL_DEVICE_POLICY: &str = "cpu_only_n_gpu_layers_0";
 const LINKED_MEMORY_ACCOUNTING_POLICY: &str = "llama_model_size_measured_context_window_measured_inference_cache_bytes_measured_no_prompt_token_blob_storage";
