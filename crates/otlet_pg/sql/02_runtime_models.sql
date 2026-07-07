@@ -1,23 +1,6 @@
-CREATE FUNCTION otlet.register_runtime(
-  runtime_name text,
-  endpoint text DEFAULT 'linked'
-) RETURNS otlet.runtimes
-LANGUAGE sql
-AS $$
-  INSERT INTO otlet.runtimes (name, endpoint, status, last_error, checked_at)
-  VALUES ($1, $2, 'unknown', NULL, NULL)
-  ON CONFLICT (name) DO UPDATE
-    SET endpoint = EXCLUDED.endpoint,
-        status = 'unknown',
-        last_error = NULL,
-        checked_at = NULL
-  RETURNING *;
-$$;
-
 CREATE FUNCTION otlet.register_model(
   model_name text,
   artifact_path text,
-  runtime_name text DEFAULT 'linked_inproc',
   artifact_hash text DEFAULT NULL,
   max_active_jobs int DEFAULT 1
 ) RETURNS otlet.models
@@ -26,24 +9,22 @@ AS $$
 DECLARE
   saved otlet.models%ROWTYPE;
 BEGIN
-  IF NOT EXISTS (SELECT 1 FROM otlet.runtimes WHERE name = register_model.runtime_name) THEN
-    RAISE EXCEPTION 'otlet runtime % does not exist', register_model.runtime_name;
-  END IF;
-
-  INSERT INTO otlet.models (name, artifact_path, artifact_hash, runtime_name, max_active_jobs)
+  INSERT INTO otlet.models (name, artifact_path, artifact_hash, max_active_jobs)
   VALUES (
     register_model.model_name,
     register_model.artifact_path,
     register_model.artifact_hash,
-    register_model.runtime_name,
     GREATEST(1, LEAST(COALESCE(register_model.max_active_jobs, 1), 1024))
   )
   ON CONFLICT (name) DO UPDATE
     SET artifact_path = EXCLUDED.artifact_path,
         artifact_hash = EXCLUDED.artifact_hash,
-        runtime_name = EXCLUDED.runtime_name,
         max_active_jobs = EXCLUDED.max_active_jobs
   RETURNING * INTO saved;
+
+  DELETE FROM otlet.runtime_slots s
+  WHERE s.model_name = saved.name
+    AND s.artifact_path IS DISTINCT FROM saved.artifact_path;
 
   RETURN saved;
 END;

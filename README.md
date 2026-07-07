@@ -8,7 +8,7 @@ Otlet uses a `pgrx` extension and a Postgres background worker loaded through `s
 
 ## Quick Example
 
-This asks one local model to read one source row and return a structured triage answer. The row stays in `public`; the model output, receipt, trace, and hashes stay under `otlet`
+Ask one local model to read one source row and return a structured triage answer. The row stays in `public`; the model output, receipt, trace, and hashes stay under `otlet`
 
 After setup creates the in-process llama.cpp worker runtime, register the model:
 
@@ -23,7 +23,7 @@ SELECT name AS model_name FROM otlet.register_model('qwen35_4b', '<Qwen3.5-4B-Q4
 (1 row)
 ```
 
-Assume this source row already exists. It has enough ambiguity that a simple string or threshold rule is not the point:
+Assume this source row already exists. A string or threshold rule would miss the payment risk:
 
 ```sql
 SELECT id, vendor_name, left(note, 92) || '...' AS note
@@ -58,7 +58,7 @@ FROM otlet.ask(
 ) a;
 ```
 
-The local LLM inference happens inside the `otlet worker`: Postgres hands the row JSON to the resident worker, the worker loads `qwen35_4b` through llama.cpp, validates the JSON, and stores only the trusted `output`
+The local LLM inference runs inside the `otlet worker`: Postgres hands the row JSON to the resident worker, the worker loads `qwen35_4b` through llama.cpp, validates the JSON, and stores the trusted `output`
 
 ```text
 +----------------+------------------------------------------------------------------------------------------+--------+------------+
@@ -161,7 +161,12 @@ Source rows stayed in `public.otlet_demo_vendor_entity`. Otlet stored jobs, acce
 
 Start with [the worked example](docs/otlet-worked-example.md)
 
-You run the extension with SQL commands and real output. The worked example starts with entity resolution, then covers semantic indexes, automatic semantic materialization, stale rows, FDW, CustomScan, cancellation, retries, worker batches, traces, and production policy
+You run the extension with SQL commands and real output. The worked example keeps the setup path and full demo command short; the long chapters live in focused docs:
+
+- [Entity resolution walkthrough](docs/entity-resolution-walkthrough.md)
+- [Runtime and traces](docs/runtime-and-traces.md)
+- [Semantic watches](docs/semantic-watches.md)
+- [Production contract](docs/production-contract.md)
 
 Use [benchmarks/README.md](benchmarks/README.md) to compare local GGUF models on Otlet’s row-pair, receipt, action, stale-state, and resource-fit contracts
 

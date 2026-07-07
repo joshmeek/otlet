@@ -1,16 +1,3 @@
-CREATE FUNCTION otlet.semantic_native_table_name(
-  index_name text
-) RETURNS text
-LANGUAGE sql
-IMMUTABLE
-STRICT
-AS $$
-  SELECT CASE
-    WHEN ($1 || '_native') ~ '^[a-z][a-z0-9_]*$' AND length($1 || '_native') <= 63 THEN $1 || '_native'
-    ELSE 'semantic_' || substr(regexp_replace($1, '[^a-z0-9_]', '_', 'g'), 1, 44) || '_' || substr(md5($1), 1, 8)
-  END;
-$$;
-
 CREATE FUNCTION otlet.create_watch_row_index(
   index_name text,
   table_name regclass,
@@ -161,10 +148,6 @@ BEGIN
   RETURNING * INTO saved;
 
   PERFORM otlet.watch_semantic_stale(table_name, subject_column);
-  PERFORM otlet.create_semantic_foreign_table(
-    otlet.semantic_native_table_name(index_name),
-    index_name
-  );
 
   RETURN saved;
 END;
@@ -177,7 +160,6 @@ LANGUAGE plpgsql
 AS $$
 DECLARE
   index_row otlet.semantic_indexes%ROWTYPE;
-  native_table text;
   stale_trigger_name text;
 BEGIN
   SELECT *
@@ -188,16 +170,6 @@ BEGIN
   IF NOT FOUND THEN
     RETURN false;
   END IF;
-
-  FOR native_table IN
-    SELECT format('%I.%I', ns.nspname, c.relname)
-    FROM pg_foreign_table ft
-    JOIN pg_class c ON c.oid = ft.ftrelid
-    JOIN pg_namespace ns ON ns.oid = c.relnamespace
-    WHERE ft.ftoptions @> ARRAY['index_name=' || index_row.name]
-  LOOP
-    EXECUTE format('DROP FOREIGN TABLE IF EXISTS %s', native_table);
-  END LOOP;
 
   DELETE FROM otlet.semantic_materializations sm
   WHERE sm.task_name = index_row.task_name

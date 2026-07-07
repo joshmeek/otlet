@@ -16,7 +16,7 @@ Otlet has three public surfaces today:
 
 Otlet keeps source rows in user tables. Users choose rows with SQL. `otlet.ask(...)` handles one-off row questions through the resident worker, while named tasks handle repeatable watches, queues, semantic refresh, and model selection. Otlet passes compact JSON to resident local models, runs cheap-first model selection when a task has a policy, drains bounded compatible queue batches, and stores derived outputs, attempts, actions, traces, receipts, eval labels, and semantic materializations under the `otlet` schema. The model harness uses a strict `output` plus `actions` envelope, stores invalid output as receipt evidence, and exposes decode mode through SQL
 
-The planner contract covers semantic lookup, fail-closed stale reads, queue refresh, wait, fresh inference, bounded CustomScan infer-now, FDW subject pushdown, cache decisions, and live EXPLAIN vocabulary. Cache keys, invalidation reasons, hit/miss counters, size bounds, runtime status, and demo checks are SQL-visible. Semantic row and join state tracks source updates, deletes, schema drift, contract changes, and candidate-set changes without stale reuse. Queue admission, fair claims, attempt bounds, cancellation, RSS budget failures, malformed-schema failures, and cleanup of unreferenced failed/canceled jobs produce SQL receipts, status, or dry-run evidence
+The planner contract covers semantic lookup, fail-closed stale reads, queue refresh, wait, fresh inference, bounded CustomScan infer-now, current-row SQL lookup, cache decisions, and live EXPLAIN vocabulary. Cache keys, invalidation reasons, hit/miss counters, size bounds, runtime status, and demo checks are SQL-visible. Semantic row and join state tracks source updates, deletes, schema drift, contract changes, and candidate-set changes without stale reuse. Queue admission, fair claims, attempt bounds, cancellation, RSS budget failures, malformed-schema failures, and cleanup of unreferenced failed/canceled jobs produce SQL receipts, status, or dry-run evidence
 
 Reproduce the contract with `./scripts/otlet-demo.sh` after `./scripts/otlet-setup.sh`
 
@@ -42,8 +42,8 @@ The benchmark lives under `benchmarks/` and reports SQL-scored evidence for Otle
 | SQL proposal actions | Let models propose bounded SQL through typed, inspectable actions with dry-run, approval, receipts, and no silent user-table writes |
 | Review queue contract | Expose pending review, approval, rejection, correction, unclear state, reviewer reasons, and eval labels through SQL |
 | Watch definition import/export | Make named source queries, candidate queries, stale policy, output schema, action schema, and runtime policy portable across installs |
-| Persisted cache storage | Add disk-backed cache only after the bounded in-process cache misses a proven workload |
-| Grammar-constrained decode | Retry grammar or JSON-schema decoding only behind a reliable linked llama hook; reject the exposed sampler path while it can abort the resident worker |
+| Persisted cache storage | Add disk-backed cache after the bounded in-process cache misses a proven workload |
+| Grammar-constrained decode | Retry grammar or JSON-schema decoding behind a reliable linked llama hook; reject the exposed sampler path while it can abort the resident worker |
 | Semantic dependency audit export | Export the source rows, joins, deletes, candidate-query changes, and schema-drift decisions that already drive stale/fresh state |
 | Action execution sandbox | Prove dry-run, target allowlists, idempotency, approval, replay, failure receipts, and source-table write checks |
 | Multi-worker admission policy | Extend queue, fairness, cancellation, RSS, and fail-closed policy when multiple workers share the same database |
@@ -67,13 +67,13 @@ Otlet treats output reliability as part of the database contract. Trusted entity
 Benchmark follow-up objective:
 
 - Run comparable model sweeps after harness changes so the public charts show workload roles, trusted quality, resource fit, and out-of-running reasons across small, medium, and ceiling local models. Routine benchmark runs use `include_by_default=true`; candidate, diagnostic, historical, heavy, and blocked rows stay explicit/manual
-- Revisit grammar-constrained JSON only if the linked llama path exposes a hook that cannot abort the resident worker
+- Revisit grammar-constrained JSON if the linked llama path exposes a hook that cannot abort the resident worker
 - Keep improving prompt and schema wording against the same benchmark fixture
 - Test a few larger local models to find the quality/resource knee before defaulting to bigger models
 
 ## Planner, Executor, And Cache
 
-Use one inspectable decision vocabulary for semantic lookup, queue refresh, wait, fail-closed, fresh inference, bounded infer-now, and cache reuse. Keep SQL plan functions, semantic status views, FDW EXPLAIN, CustomScan EXPLAIN, receipts, and demo output aligned on that vocabulary
+Use one inspectable decision vocabulary for semantic lookup, queue refresh, wait, fail-closed, fresh inference, bounded infer-now, and cache reuse. Keep SQL plan functions, semantic status views, CustomScan EXPLAIN, receipts, current-row SQL, and demo output aligned on that vocabulary
 
 `EXPLAIN (ANALYZE, VERBOSE)` shows selected model, resident state, source identity, source hash, stale policy, cache decision, worker handoff, token counts, schema validation, trace policy, receipt IDs, provenance links, estimated model time, and model runtime
 
@@ -99,7 +99,7 @@ For each answer, record the source rows read, trusted hash or MVCC identity, can
 
 Ship MIT packs for vendor, customer, and product resolution. Each pack carries candidate SQL, input shape, output schema, action schema, prompt text, fixture rows, eval labels, and benchmark gates
 
-Keep packs small enough to audit. A pack can depend on SQL candidate generation, schema validation, receipts, review queues, and eval labels. Packs expose source writes only through typed actions
+Keep packs small enough to audit. A pack can depend on SQL candidate generation, schema validation, receipts, review queues, and eval labels. Packs expose source writes through typed actions
 
 ## Explain And Trace
 

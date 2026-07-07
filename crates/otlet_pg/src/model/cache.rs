@@ -49,8 +49,8 @@ fn inference_cache_contract_hash(job: &Job, instruction: &str) -> String {
 fn inference_cache_model_key(job: &Job, context: &RunContext) -> String {
     hash_text(
         format!(
-            "model={}|runtime={}|fingerprint={}",
-            job.model_name, job.runtime_name, context.model_fingerprint_hash
+            "model={}|fingerprint={}",
+            job.model_name, context.model_fingerprint_hash
         )
         .as_str(),
     )

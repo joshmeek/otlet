@@ -241,13 +241,6 @@ pub(crate) fn run_job(job: &Job) -> Result<ModelRun, ModelError> {
         ..context
     };
 
-    if job.runtime_endpoint != "linked" {
-        return Err(ModelError::new(format!(
-            "otlet only supports linked in-process inference; runtime endpoint {} is not supported",
-            job.runtime_endpoint
-        )));
-    }
-
     let cache_lookup = if options.inference_cache && !options.generation_trace {
         inference_cache_get(
             &context.cache_key,
