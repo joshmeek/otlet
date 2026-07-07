@@ -1,13 +1,14 @@
 struct ShapedInput {
-    input: Value,
+    serialized: String,
     bytes: i64,
     original_bytes: i64,
     input_truncated: bool,
     applied: bool,
 }
 
-fn shaped_model_input(input: Value) -> ShapedInput {
-    let bytes = input.to_string().len().min(i64::MAX as usize) as i64;
+fn shaped_model_input(input: &Value) -> ShapedInput {
+    let serialized = input.to_string();
+    let bytes = serialized.len().min(i64::MAX as usize) as i64;
     let original_bytes = input
         .get("original_shaped_input_bytes")
         .and_then(Value::as_i64)
@@ -18,7 +19,7 @@ fn shaped_model_input(input: Value) -> ShapedInput {
         .unwrap_or(false);
 
     ShapedInput {
-        input,
+        serialized,
         bytes,
         original_bytes,
         input_truncated,
@@ -38,18 +39,45 @@ fn effective_instruction(instruction: &str, decision_contract: &Value) -> String
     }
 }
 
+const SCHEMA_VALIDATOR_CACHE_MAX_ENTRIES: usize = 16;
+
 fn validate_output(schema: &Value, output: &Value) -> Result<(), String> {
-    let validator =
-        jsonschema::validator_for(schema).map_err(|err| format!("invalid output schema: {err}"))?;
+    let validator = cached_schema_validator(schema)?;
     validator
         .validate(output)
         .map_err(|err| format!("output schema validation failed: {err}"))
 }
 
 fn validate_output_schema(schema: &Value) -> Result<(), String> {
-    jsonschema::validator_for(schema)
-        .map(|_| ())
-        .map_err(|err| format!("invalid output schema: {err}"))
+    cached_schema_validator(schema).map(|_| ())
+}
+
+/// Task schemas repeat across jobs; compiling a jsonschema validator per run
+/// is wasted work, so keep a small LRU keyed by the serialized schema.
+fn cached_schema_validator(schema: &Value) -> Result<std::sync::Arc<jsonschema::Validator>, String> {
+    static CACHE: OnceLock<Mutex<Vec<(String, std::sync::Arc<jsonschema::Validator>)>>> =
+        OnceLock::new();
+
+    let key = schema.to_string();
+    let cache = CACHE.get_or_init(|| Mutex::new(Vec::new()));
+    let mut cache = cache
+        .lock()
+        .map_err(|_| "schema validator cache lock poisoned".to_owned())?;
+    if let Some(index) = cache.iter().position(|(cached, _)| *cached == key) {
+        let entry = cache.remove(index);
+        let validator = entry.1.clone();
+        cache.push(entry);
+        return Ok(validator);
+    }
+
+    let validator = std::sync::Arc::new(
+        jsonschema::validator_for(schema).map_err(|err| format!("invalid output schema: {err}"))?,
+    );
+    cache.push((key, validator.clone()));
+    if cache.len() > SCHEMA_VALIDATOR_CACHE_MAX_ENTRIES {
+        cache.remove(0);
+    }
+    Ok(validator)
 }
 
 fn trim_error(text: &str) -> String {

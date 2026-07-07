@@ -6,7 +6,7 @@ container="${OTLET_PG_CONTAINER:-otlet-postgres}"
 volume="${OTLET_PG_VOLUME:-otlet-postgres-data}"
 port="${OTLET_PG_PORT:-55432}"
 password="${POSTGRES_PASSWORD:-postgres}"
-pgrx_features="${OTLET_PGRX_FEATURES:-pg18}"
+pgrx_features="${OTLET_PGRX_FEATURES:-pg18,native,openmp}"
 model_dir="${OTLET_MODEL_DIR:-/var/lib/postgresql/otlet-models}"
 cheap_model_file="${OTLET_CHEAP_MODEL_FILE:-Qwen3-1.7B-Q8_0.gguf}"
 cheap_model_url="${OTLET_CHEAP_MODEL_URL:-https://huggingface.co/Qwen/Qwen3-1.7B-GGUF/resolve/main/Qwen3-1.7B-Q8_0.gguf}"
@@ -113,6 +113,10 @@ wait_ready
 psql_exec -c "ALTER DATABASE postgres REFRESH COLLATION VERSION;" >/dev/null
 
 log "Installing Otlet extension with features: $pgrx_features"
+if docker exec "$container" sh -lc 'test -d /target/llama-cmake-cache && grep -q "GGML_OPENMP:BOOL=OFF" /target/llama-cmake-cache/*/build/CMakeCache.txt 2>/dev/null'; then
+  log "Clearing stale llama.cpp build so OpenMP/native flags take effect"
+  docker exec "$container" rm -rf /target/llama-cmake-cache
+fi
 docker exec "$container" psql -U postgres -d postgres \
   -c "ALTER SYSTEM RESET shared_preload_libraries;" >/dev/null 2>&1 || true
 docker restart "$container" >/dev/null
@@ -121,6 +125,7 @@ wait_ready
 docker exec "$container" cargo pgrx install \
   -p otlet_pg \
   --pg-config /usr/bin/pg_config \
+  --release \
   --no-default-features \
   --features "$pgrx_features"
 

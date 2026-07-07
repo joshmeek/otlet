@@ -47,6 +47,7 @@ Run `./scripts/otlet-setup.sh`, then `./scripts/otlet-demo.sh` to prove the cont
 | Semantic freshness | Implemented, harden | Source updates, deletes, schema drift, contract changes, and candidate changes fail closed; add dependency audit export |
 | Watch definitions | Implemented, extend | Row and pair watches carry source, candidate, schema, stale, model, and runtime policy; add import/export |
 | Explain and trace | Implemented, harden | Bounded token traces and EXPLAIN vocabulary exist; add audit export views and redaction policy |
+| Model residency and timing | Open | Add SQL-visible timing splits and test multi-resident model contexts before changing slot policy |
 | User-labeled eval loop | Implemented | Accepted, rejected, and corrected actions export local eval cases; feed more labels into benchmark gates |
 | Single-worker admission | Implemented | Queue caps, fair claims, cancellation, leases, RSS budgets, and cleanup checks exist; extend after multi-worker support lands |
 | SQL proposal actions | Open | Define bounded SQL action schemas, dry-run plans, approvals, receipts, and source-table write checks |
@@ -84,6 +85,12 @@ Keep cache work inside the runtime contract. Cache keys, invalidation reasons, h
 
 Use measured runtime history for costing: load time, warm generation time, token counts, schema failures, cache hits, cache invalidation reasons, stale refresh rate, worker queue depth, model-selection attempts, and materialization coverage. Postgres chooses the cheap fresh lookup path when it can and shows the reason when it cannot
 
+Add a timing split before the next executor rewrite: `tokenize_ms`, `prompt_decode_ms`, `generate_ms`, `finish_sql_ms`, and `materialize_ms`. Use those fields to decide whether prompt decode, SQL finish work, or materialization owns warm-job latency
+
+Keep cache-hit paths easy to preserve. A live smoke run completed cached jobs in milliseconds with no generation, so future watch and demo work keeps trace mode off for cacheable production paths and keeps stable content, contract, and model keys
+
+Test multi-resident model contexts before changing slot policy. Alternating cheap and strong models pays model-load time on each swap; a keyed model cache can remove that cost when the memory budget allows both artifacts
+
 ## Watch And Review Contracts
 
 Named watch definitions carry source queries, candidate queries, output schemas, action schemas, stale policies, model policies, and trigger or schedule policy. The watch record owns the durable contract. Source tables stay under application control
@@ -115,6 +122,8 @@ Use verbose EXPLAIN to inspect model work from Postgres. Users see why Otlet reu
 Keep token-level tracing optional and bounded. Debug mode shows chosen token IDs, token text, probabilities or logprobs when llama.cpp exposes them, top-k alternatives, partial generated text, stop reason, schema validation, and trace storage policy
 
 Production defaults keep tracing low-detail or off. SQL explains disabled tracing without storing unbounded token streams
+
+Use `generation_trace_top_k=0` when token alternatives are not part of the question. In a smoke probe, Otlet kept probability and chosen-token trace while avoiding the top-alternative scan cost
 
 Add audit export views for decisions, receipts, source hashes, approvals, corrections, eval labels, and trace summaries. Add redaction policy before exporting prompt, source, or token detail
 

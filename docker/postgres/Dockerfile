@@ -8,6 +8,7 @@ RUN apt-get update \
     cmake \
     curl \
     libclang-dev \
+    libgomp1 \
     pkg-config \
     postgresql-server-dev-18 \
   && rm -rf /var/lib/apt/lists/*

@@ -2,6 +2,7 @@ fn run_linked(
     job: &Job,
     prompt: &str,
     options: &crate::runtime::RuntimeOptions,
+    model_fingerprint_hash: &str,
 ) -> Result<LinkedRun, ModelError> {
     use std::ffi::CString;
 
@@ -15,7 +16,6 @@ fn run_linked(
         llama_cpp_sys_4::llama_backend_init();
     });
 
-    let model_fingerprint_hash = hash_text(&model_fingerprint(job));
     let cache = LINKED_CACHE.get_or_init(|| Mutex::new(None));
     let mut cache = cache
         .lock()
@@ -30,6 +30,7 @@ fn run_linked(
             .map_err(|_| ModelError::new("linked llama.cpp model path is invalid".to_owned()))?;
         let mut model_params = unsafe { llama_cpp_sys_4::llama_model_default_params() };
         model_params.n_gpu_layers = 0;
+        let decode_threads = linked_decode_threads();
 
         let load_start = Instant::now();
         let model_ptr = unsafe {
@@ -46,6 +47,10 @@ fn run_linked(
         let mut ctx_params = unsafe { llama_cpp_sys_4::llama_context_default_params() };
         ctx_params.n_ctx = LINKED_CONTEXT_WINDOW_TOKENS;
         ctx_params.n_batch = LINKED_PROMPT_BATCH_TOKENS as u32;
+        // llama.cpp defaults to GGML_DEFAULT_N_THREADS (4); use the cores this
+        // host actually has for both single-token generation and batch decode.
+        ctx_params.n_threads = decode_threads;
+        ctx_params.n_threads_batch = decode_threads;
         let ctx_start = Instant::now();
         let context_ptr = unsafe { llama_cpp_sys_4::llama_init_from_model(model.ptr, ctx_params) };
         let ctx_ms = elapsed_ms(ctx_start);
@@ -71,10 +76,11 @@ fn run_linked(
 
         *cache = Some(LinkedCache {
             artifact_path: job.artifact_path.clone(),
-            model_fingerprint_hash,
+            model_fingerprint_hash: model_fingerprint_hash.to_owned(),
             _model: model,
             context,
             vocab,
+            kv_tokens: Vec::new(),
             load_ms,
             ctx_ms,
             model_memory_bytes,
@@ -88,6 +94,14 @@ fn run_linked(
     let cache = cache
         .as_mut()
         .ok_or_else(|| ModelError::new("linked llama.cpp cache did not initialize".to_owned()))?;
+    let decode_threads = linked_decode_threads();
+    unsafe {
+        llama_cpp_sys_4::llama_set_n_threads(
+            cache.context.ptr,
+            decode_threads,
+            decode_threads,
+        );
+    }
     let tokens = tokenize_linked(cache.vocab, prompt)?;
     if tokens.is_empty() {
         return Err(ModelError::new(
@@ -96,13 +110,30 @@ fn run_linked(
     }
 
     validate_linked_token_budget(tokens.len(), options.max_tokens, cache.context_window_tokens)?;
-    linked_clear_context(cache.context.ptr);
 
     let resident_memory = process_memory_sample();
     enforce_worker_rss_budget(&resident_memory, options.max_worker_rss_bytes)?;
 
+    if linked_cancel_requested(job.id)? {
+        return Err(ModelError::new("canceled".to_owned()));
+    }
+    let mut cancel_probe = CancelProbe::new();
+
+    // Reuse the KV cache for the shared prompt prefix (same instruction/schema
+    // across a task's jobs) so only the diverging suffix is re-decoded.
+    let common_prefix =
+        linked_reuse_prompt_prefix(cache.context.ptr, &mut cache.kv_tokens, &tokens);
+
     let mut batch = LinkedBatch::new(LINKED_PROMPT_BATCH_TOKENS)?;
-    linked_decode_prompt_tokens(job, cache.context.ptr, &mut batch, &tokens, 0)?;
+    linked_decode_prompt_tokens(
+        job,
+        cache.context.ptr,
+        &mut batch,
+        &tokens[common_prefix..],
+        common_prefix,
+        &mut cache.kv_tokens,
+        &mut cancel_probe,
+    )?;
 
     let sampler_ptr = unsafe { llama_cpp_sys_4::llama_sampler_init_greedy() };
     if sampler_ptr.is_null() {
@@ -111,30 +142,41 @@ fn run_linked(
         ));
     }
     let sampler = LinkedSampler { ptr: sampler_ptr };
-    let mut output = String::new();
+    let mut output = String::with_capacity(linked_output_capacity(options.max_tokens));
     let mut position = tokens.len();
     let mut generated_tokens = 0_i64;
-    let mut probability_trace = ProbabilityTrace::default();
+    let mut probability_trace = ProbabilityTrace::new(options);
     let mut detailed_trace = DetailedGenerationTrace::new(options);
     let mut stop_reason = "max_tokens".to_owned();
+    let mut token_piece_buf = vec![0_u8; 128];
     let generate_start = Instant::now();
 
     for _ in 0..options.max_tokens {
         if linked_attempt_timed_out(attempt_start, job.max_attempt_ms) {
             return Err(ModelError::attempt_timeout());
         }
-        if linked_cancel_requested(job.id)? {
+        if cancel_probe.due() && linked_cancel_requested(job.id)? {
             return Err(ModelError::new("canceled".to_owned()));
         }
         let token =
             unsafe { llama_cpp_sys_4::llama_sampler_sample(sampler.ptr, cache.context.ptr, -1) };
-        let sample = unsafe {
-            probability_sample(
-                cache.context.ptr,
-                cache.vocab,
-                token,
-                options.generation_trace_top_k,
-            )
+        let wants_detail = detailed_trace.wants_sample();
+        let sample = if wants_detail || probability_trace.wants_sample() {
+            unsafe {
+                probability_sample(
+                    cache.context.ptr,
+                    cache.vocab,
+                    token,
+                    // top alternatives are only surfaced by the detailed trace
+                    if wants_detail {
+                        options.generation_trace_top_k
+                    } else {
+                        0
+                    },
+                )
+            }
+        } else {
+            None
         };
         probability_trace.observe(sample.as_ref());
         if unsafe { llama_cpp_sys_4::llama_vocab_is_eog(cache.vocab, token) } {
@@ -146,9 +188,9 @@ fn run_linked(
             llama_cpp_sys_4::llama_sampler_accept(sampler.ptr, token);
         }
         generated_tokens += 1;
-        let token_text = linked_token_to_piece(cache.vocab, token);
-        output.push_str(&token_text);
-        detailed_trace.observe(token, token_text, sample);
+        let piece_start = output.len();
+        linked_token_to_piece_into(cache.vocab, token, &mut token_piece_buf, &mut output);
+        detailed_trace.observe(token, &output[piece_start..], sample);
         if let Some(end) = linked_output_complete_end(&output) {
             output.truncate(end);
             stop_reason = "json_complete".to_owned();
@@ -170,9 +212,7 @@ fn run_linked(
                 "linked llama.cpp generation decode failed: {decode_status}"
             )));
         }
-        if linked_cancel_requested(job.id)? {
-            return Err(ModelError::new("canceled".to_owned()));
-        }
+        cache.kv_tokens.push(token);
         if linked_attempt_timed_out(attempt_start, job.max_attempt_ms) {
             return Err(ModelError::attempt_timeout());
         }
@@ -222,12 +262,30 @@ fn linked_attempt_timed_out(start: Instant, max_attempt_ms: i64) -> bool {
     max_attempt_ms > 0 && start.elapsed().as_millis() >= max_attempt_ms as u128
 }
 
+fn linked_decode_threads() -> i32 {
+    static DECODE_THREADS: OnceLock<i32> = OnceLock::new();
+    *DECODE_THREADS.get_or_init(|| {
+        std::thread::available_parallelism()
+            .map(|threads| threads.get())
+            .unwrap_or(4)
+            .min(i32::MAX as usize) as i32
+    })
+}
+
+fn linked_output_capacity(max_tokens: u64) -> usize {
+    let token_budget = usize::try_from(max_tokens).unwrap_or(usize::MAX / 8);
+    token_budget.saturating_mul(8).min(16 * 1024)
+}
+
+#[allow(clippy::too_many_arguments)]
 fn linked_decode_prompt_tokens(
     job: &Job,
     context: *mut llama_cpp_sys_4::llama_context,
     batch: &mut LinkedBatch,
     tokens: &[llama_cpp_sys_4::llama_token],
     start_position: usize,
+    kv_tokens: &mut Vec<llama_cpp_sys_4::llama_token>,
+    cancel_probe: &mut CancelProbe,
 ) -> Result<(), ModelError> {
     let mut decoded_tokens = 0;
     for chunk in tokens.chunks(LINKED_PROMPT_BATCH_TOKENS) {
@@ -242,7 +300,7 @@ fn linked_decode_prompt_tokens(
                 decoded_tokens + chunk_index + 1 == tokens.len(),
             )?;
         }
-        if linked_cancel_requested(job.id)? {
+        if cancel_probe.due() && linked_cancel_requested(job.id)? {
             return Err(ModelError::new("canceled".to_owned()));
         }
         let decode_status = unsafe { llama_cpp_sys_4::llama_decode(context, batch.value) };
@@ -251,13 +309,80 @@ fn linked_decode_prompt_tokens(
                 "linked llama.cpp prompt decode failed: {decode_status}"
             )));
         }
-        if linked_cancel_requested(job.id)? {
-            return Err(ModelError::new("canceled".to_owned()));
-        }
+        kv_tokens.extend_from_slice(chunk);
         decoded_tokens += chunk.len();
     }
 
     Ok(())
+}
+
+/// Cooperative cancellation is checked on a time slice instead of around every
+/// llama.cpp call, so the SPI round-trip does not tax each generated token.
+struct CancelProbe {
+    last_check: Instant,
+}
+
+impl CancelProbe {
+    fn new() -> Self {
+        Self {
+            last_check: Instant::now(),
+        }
+    }
+
+    fn due(&mut self) -> bool {
+        if self.last_check.elapsed().as_millis() >= u128::from(LINKED_CANCELLATION_SLICE_MS) {
+            self.last_check = Instant::now();
+            true
+        } else {
+            false
+        }
+    }
+}
+
+/// Keeps the longest common prefix between the tokens already decoded into the
+/// context memory and the new prompt, removes everything past it, and returns
+/// how many prompt tokens can be skipped. At least one prompt token is always
+/// re-decoded so generation has fresh logits. `kv_tokens` is truncated to the
+/// retained prefix before any new decode happens, so a failed decode later can
+/// never leave it claiming tokens the memory does not hold.
+fn linked_reuse_prompt_prefix(
+    context: *mut llama_cpp_sys_4::llama_context,
+    kv_tokens: &mut Vec<llama_cpp_sys_4::llama_token>,
+    tokens: &[llama_cpp_sys_4::llama_token],
+) -> usize {
+    let mut common = kv_tokens
+        .iter()
+        .zip(tokens.iter())
+        .take_while(|(kept, new)| kept == new)
+        .count();
+    if common >= tokens.len() {
+        common = tokens.len().saturating_sub(1);
+    }
+
+    if common == 0 {
+        linked_clear_context(context);
+        kv_tokens.clear();
+        return 0;
+    }
+
+    let removed = unsafe {
+        let memory = llama_cpp_sys_4::llama_get_memory(context);
+        if memory.is_null() {
+            false
+        } else {
+            // Remove from the divergence point onward; this also clears any
+            // stale generated tokens from the previous run.
+            llama_cpp_sys_4::llama_memory_seq_rm(memory, 0, common as i32, -1)
+        }
+    };
+    if !removed {
+        linked_clear_context(context);
+        kv_tokens.clear();
+        return 0;
+    }
+
+    kv_tokens.truncate(common);
+    common
 }
 
 fn validate_linked_token_budget(
@@ -307,6 +432,9 @@ struct LinkedCache {
     context: LinkedContext,
     _model: LinkedModel,
     vocab: *const llama_cpp_sys_4::llama_vocab,
+    /// Tokens known to occupy positions `0..len` of the context memory; used
+    /// to reuse the KV cache for shared prompt prefixes across jobs.
+    kv_tokens: Vec<llama_cpp_sys_4::llama_token>,
     load_ms: i64,
     ctx_ms: i64,
     model_memory_bytes: i64,
@@ -516,11 +644,13 @@ fn token_capacity_from_probe(size: i32) -> Result<i32, ModelError> {
     Ok(size.abs())
 }
 
-fn linked_token_to_piece(
+fn linked_token_to_piece_into(
     vocab: *const llama_cpp_sys_4::llama_vocab,
     token: llama_cpp_sys_4::llama_token,
-) -> String {
-    let mut buffer = vec![0_u8; 128];
+    buffer: &mut Vec<u8>,
+    output: &mut String,
+) {
+    buffer.resize(128, 0);
     let mut size = unsafe {
         llama_cpp_sys_4::llama_token_to_piece(
             vocab,
@@ -534,10 +664,10 @@ fn linked_token_to_piece(
     if size < 0 {
         let Some(required) = size.checked_neg().and_then(|value| usize::try_from(value).ok())
         else {
-            return String::new();
+            return;
         };
         if required > LINKED_MAX_TOKEN_PIECE_BYTES {
-            return String::new();
+            return;
         }
         buffer.resize(required, 0);
         size = unsafe {
@@ -551,13 +681,21 @@ fn linked_token_to_piece(
             )
         };
     }
-    if size < 0 {
-        return String::new();
+    if size <= 0 {
+        return;
     }
-    if size > 0 {
-        buffer.truncate(size as usize);
-    }
-    String::from_utf8_lossy(&buffer).to_string()
+    buffer.truncate(size as usize);
+    output.push_str(&String::from_utf8_lossy(buffer));
+}
+
+fn linked_token_to_piece(
+    vocab: *const llama_cpp_sys_4::llama_vocab,
+    token: llama_cpp_sys_4::llama_token,
+) -> String {
+    let mut output = String::new();
+    let mut buffer = vec![0_u8; 128];
+    linked_token_to_piece_into(vocab, token, &mut buffer, &mut output);
+    output
 }
 
 fn linked_clear_context(context: *mut llama_cpp_sys_4::llama_context) {
