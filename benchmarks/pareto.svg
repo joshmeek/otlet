@@ -19,33 +19,36 @@ text { font: 12px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; fill
 <text text-anchor="end" x="64" y="60.0">1</text>
 <line class="grid" x1="272.0" y1="56" x2="272.0" y2="416"/>
 <line class="grid" x1="72" y1="146.0" x2="872" y2="146.0"/>
-<text text-anchor="middle" x="272.0" y="434.0">2.5</text>
+<text text-anchor="middle" x="272.0" y="434.0">1.25</text>
 <text text-anchor="end" x="64" y="150.0">0.75</text>
 <line class="grid" x1="472.0" y1="56" x2="472.0" y2="416"/>
 <line class="grid" x1="72" y1="236.0" x2="872" y2="236.0"/>
-<text text-anchor="middle" x="472.0" y="434.0">5</text>
+<text text-anchor="middle" x="472.0" y="434.0">2.5</text>
 <text text-anchor="end" x="64" y="240.0">0.5</text>
 <line class="grid" x1="672.0" y1="56" x2="672.0" y2="416"/>
 <line class="grid" x1="72" y1="326.0" x2="872" y2="326.0"/>
-<text text-anchor="middle" x="672.0" y="434.0">7.5</text>
+<text text-anchor="middle" x="672.0" y="434.0">3.75</text>
 <text text-anchor="end" x="64" y="330.0">0.25</text>
 <line class="grid" x1="872.0" y1="56" x2="872.0" y2="416"/>
 <line class="grid" x1="72" y1="416.0" x2="872" y2="416.0"/>
-<text text-anchor="middle" x="872.0" y="434.0">10</text>
+<text text-anchor="middle" x="872.0" y="434.0">5</text>
 <text text-anchor="end" x="64" y="420.0">0</text>
-<circle class="point" cx="330.2" cy="74.6" r="12.4"/>
-<text style="fill:#ffffff" text-anchor="middle" x="330.2" y="78.6">1</text>
-<text x="72" y="506">1. qwen35_4b 0.948</text>
-<circle class="point" cx="357.4" cy="147.7" r="12.9"/>
-<text style="fill:#ffffff" text-anchor="middle" x="357.4" y="151.7">2</text>
-<text x="72" y="525">2. gemma4_e2b 0.745</text>
-<circle class="point" cx="525.2" cy="173.1" r="15.0"/>
-<text style="fill:#ffffff" text-anchor="middle" x="525.2" y="177.1">3</text>
-<text x="72" y="544">3. gemma4_e4b 0.675</text>
-<circle class="point" cx="342.3" cy="175.4" r="12.1"/>
-<text style="fill:#ffffff" text-anchor="middle" x="342.3" y="179.4">4</text>
-<text x="502" y="506">4. phi4_mini 0.668</text>
-<circle class="point" cx="307.6" cy="201.0" r="11.6"/>
-<text style="fill:#ffffff" text-anchor="middle" x="307.6" y="205.0">5</text>
-<text x="502" y="525">5. ministral3_3b 0.597</text>
+<circle class="point" cx="591.0" cy="74.4" r="12.4"/>
+<text style="fill:#ffffff" text-anchor="middle" x="591.0" y="78.4">1</text>
+<text x="72" y="506">1. qwen35_4b 0.949</text>
+<circle class="point" cx="544.5" cy="79.9" r="11.6"/>
+<text style="fill:#ffffff" text-anchor="middle" x="544.5" y="83.9">2</text>
+<text x="72" y="525">2. ministral3_3b 0.934</text>
+<circle class="point" cx="639.8" cy="92.6" r="12.9"/>
+<text style="fill:#ffffff" text-anchor="middle" x="639.8" y="96.6">3</text>
+<text x="72" y="544">3. gemma4_e2b 0.898</text>
+<circle class="point" cx="616.9" cy="104.0" r="12.3"/>
+<text style="fill:#ffffff" text-anchor="middle" x="616.9" y="108.0">4</text>
+<text x="502" y="506">4. glm_edge_4b 0.867</text>
+<circle class="point" cx="865.8" cy="135.5" r="15.0"/>
+<text style="fill:#ffffff" text-anchor="middle" x="865.8" y="139.5">5</text>
+<text x="502" y="525">5. gemma4_e4b 0.779</text>
+<circle class="point" cx="614.9" cy="269.2" r="12.1"/>
+<text style="fill:#ffffff" text-anchor="middle" x="614.9" y="273.2">6</text>
+<text x="502" y="544">6. phi4_mini 0.408</text>
 </svg>

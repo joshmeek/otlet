@@ -30,6 +30,20 @@ unsafe extern "C-unwind" fn explain_semantic_custom_scan(
                 es,
             );
             explain_text("Planner Selected Path", &runtime.planner_selected_path, es);
+            explain_text("Planner Reason", &runtime.planner_reason, es);
+            explain_text("Planner Stale Reasons", &runtime.planner_stale_reasons, es);
+            explain_text("Count Basis", &runtime.planner_count_basis, es);
+            explain_text("Model Cost Source", &runtime.planner_model_cost_source, es);
+            explain_counter(
+                "Planner Infer Now Subjects",
+                runtime.planner_infer_decision_rows,
+                es,
+            );
+            explain_counter(
+                "Planner Fail Closed Subjects",
+                runtime.planner_fail_closed_decision_rows,
+                es,
+            );
             explain_text("Source Relation", &runtime.source_table, es);
             explain_text("Task", &runtime.task_name, es);
             explain_text("Record Type", &runtime.record_type, es);
@@ -38,14 +52,17 @@ unsafe extern "C-unwind" fn explain_semantic_custom_scan(
                 runtime.semantic_states.len() as u64,
                 es,
             );
-            explain_counter(
-                "Preloaded Fresh Match Subjects",
-                runtime_state_count(runtime, SubjectSemanticState::FreshMatch),
+            explain_text(
+                "Preloaded Fresh Subjects / Basis",
+                &fresh_subject_basis_line(
+                    runtime_preloaded_fresh_count(runtime),
+                    &runtime.preloaded_freshness_basis,
+                ),
                 es,
             );
-            explain_counter(
-                "Preloaded Fresh Non Match Subjects",
-                runtime_state_count(runtime, SubjectSemanticState::FreshNonMatch),
+            explain_optional_text(
+                "Emitted Freshness Basis",
+                nonempty_str(&freshness_basis_counts_json(&runtime.emitted_freshness_basis)),
                 es,
             );
             explain_counter(
@@ -61,12 +78,20 @@ unsafe extern "C-unwind" fn explain_semantic_custom_scan(
             explain_scan_counters!(
                 runtime,
                 nonempty_str(&runtime.infer_now_last_error),
-                estimated_model_cost_ms(runtime.infer_ms, runtime.infer_max_rows),
+                estimated_model_cost_ms(
+                    runtime.planner_model_ms,
+                    runtime.planner_infer_decision_rows,
+                ),
                 es
             );
             explain_runtime_trace(runtime, es);
         } else if let Some(private) = custom_private_from_plan(node) {
-            let policy = semantic_policy_for_selected_path(&private.selected_path);
+            let (planner_stats, policy) =
+                planner_snapshot_from_state(state).unwrap_or_else(|| {
+                    let planner_stats = reload_private_planner_stats(&private);
+                    let policy = semantic_policy_for_selected_path(&planner_stats.selected_path);
+                    (planner_stats, policy)
+                });
             explain_semantic_metadata(
                 SemanticExplainMetadata {
                     index_name: &private.index_name,
@@ -85,19 +110,39 @@ unsafe extern "C-unwind" fn explain_semantic_custom_scan(
                 source_tuple_provider_from_state(state),
                 es,
             );
-            explain_text("Planner Selected Path", &private.selected_path, es);
+            explain_text("Planner Selected Path", &planner_stats.selected_path, es);
+            explain_text("Planner Reason", &planner_stats.reason, es);
+            explain_text("Planner Stale Reasons", &planner_stats.stale_reasons, es);
+            explain_text("Count Basis", &planner_stats.count_basis, es);
+            explain_text("Model Cost Source", &planner_stats.model_cost_source, es);
+            explain_counter(
+                "Planner Infer Now Subjects",
+                planner_stats.infer_decision_rows,
+                es,
+            );
+            explain_counter(
+                "Planner Fail Closed Subjects",
+                planner_stats.fail_closed_decision_rows,
+                es,
+            );
             explain_pg_cstr("Source Relation", (*state).source_table, es);
             explain_pg_cstr("Task", (*state).task_name, es);
             explain_pg_cstr("Record Type", (*state).record_type, es);
             explain_counter("Known Semantic Subjects", (*state).known_subjects, es);
-            explain_counter(
-                "Preloaded Fresh Match Subjects",
-                (*state).preloaded_fresh_matches,
+            let preloaded_fresh = (*state)
+                .preloaded_fresh_matches
+                .saturating_add((*state).preloaded_fresh_non_matches);
+            explain_text(
+                "Preloaded Fresh Subjects / Basis",
+                &fresh_subject_basis_line(
+                    preloaded_fresh,
+                    pg_cstr_str((*state).preloaded_freshness_basis).unwrap_or(""),
+                ),
                 es,
             );
-            explain_counter(
-                "Preloaded Fresh Non Match Subjects",
-                (*state).preloaded_fresh_non_matches,
+            explain_optional_text(
+                "Emitted Freshness Basis",
+                pg_cstr_str((*state).emitted_freshness_basis),
                 es,
             );
             explain_counter(
@@ -113,13 +158,63 @@ unsafe extern "C-unwind" fn explain_semantic_custom_scan(
             explain_scan_counters!(
                 &*state,
                 pg_cstr_str((*state).infer_now_last_error),
-                estimated_model_cost_ms(policy.infer_ms, policy.infer_max_rows),
+                estimated_model_cost_ms(planner_stats.model_ms, planner_stats.infer_decision_rows),
                 es
             );
             explain_state_trace(state, es);
         }
     }
 }
+
+unsafe fn planner_snapshot_from_state(
+    state: *mut OtletSemanticCustomScanState,
+) -> Option<(SemanticPlannerStats, SemanticAutoPolicy)> {
+    unsafe {
+        let selected_path = pg_cstr_str((*state).planner_selected_path)?.to_string();
+        Some((
+            SemanticPlannerStats {
+                selected_path,
+                reason: pg_cstr_str((*state).planner_reason)
+                    .unwrap_or("planner snapshot")
+                    .to_string(),
+                source_rows: (*state).known_subjects,
+                fresh_matches: (*state).preloaded_fresh_matches,
+                fresh_non_matches: (*state).preloaded_fresh_non_matches,
+                stale_rows: (*state).preloaded_stale_subjects,
+                missing_rows: 0,
+                inflight_rows: (*state).preloaded_inflight_subjects,
+                cache_reusable_rows: 0,
+                infer_decision_rows: (*state).planner_infer_decision_rows,
+                fail_closed_decision_rows: (*state).planner_fail_closed_decision_rows,
+                model_ms: if (*state).planner_model_ms.is_finite()
+                    && (*state).planner_model_ms > 0.0
+                {
+                    (*state).planner_model_ms
+                } else {
+                    2500.0
+                },
+                model_cost_source: pg_cstr_str((*state).planner_model_cost_source)
+                    .unwrap_or("static_fallback")
+                    .to_string(),
+                path_cost: 0.0,
+                stale_reasons: pg_cstr_str((*state).planner_stale_reasons)
+                    .unwrap_or("{}")
+                    .to_string(),
+                count_basis: pg_cstr_str((*state).planner_count_basis)
+                    .unwrap_or("unknown")
+                    .to_string(),
+            },
+            SemanticAutoPolicy {
+                auto_policy: (*state).auto_policy,
+                allow_refresh: (*state).allow_refresh,
+                wait_ms: (*state).wait_ms,
+                infer_ms: (*state).infer_ms,
+                infer_max_rows: (*state).infer_max_rows,
+            },
+        ))
+    }
+}
+
 fn free_buffered_rows(runtime: &mut RuntimeState) {
     while let Some(slot) = runtime.pending_output_rows.pop_front() {
         unsafe {
@@ -232,6 +327,16 @@ fn runtime_state_count(runtime: &RuntimeState, state: SubjectSemanticState) -> u
         .values()
         .filter(|value| **value == state)
         .count() as u64
+}
+
+fn fresh_subject_basis_line(count: u64, basis: &str) -> String {
+    let basis = if basis.trim().is_empty() { "{}" } else { basis };
+    format!("{count} {basis}")
+}
+
+fn runtime_preloaded_fresh_count(runtime: &RuntimeState) -> u64 {
+    runtime_state_count(runtime, SubjectSemanticState::FreshMatch)
+        .saturating_add(runtime_state_count(runtime, SubjectSemanticState::FreshNonMatch))
 }
 
 unsafe fn explain_runtime_trace(runtime: &RuntimeState, es: *mut pg_sys::ExplainState) {

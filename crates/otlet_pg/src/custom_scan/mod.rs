@@ -1,6 +1,6 @@
 use pgrx::{FromDatum, JsonB, direct_function_call, pg_sys};
 use serde_json::{Value, json};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::ffi::{CStr, CString, c_char};
 use std::ptr;
 
@@ -52,7 +52,7 @@ macro_rules! explain_scan_counters {
         );
         explain_counter("Child Plan Source Rows", source.child_plan_rows, $es);
         explain_counter("Estimated Model Cost Ms", $estimated_model_cost_ms, $es);
-        explain_counter("Actual Model Cost Ms", source.infer_now_ms, $es);
+        explain_counter("Actual Model Cost Ms", source.infer_trace_generate_ms, $es);
     }};
 }
 
@@ -93,6 +93,143 @@ pub fn init() {
             PREV_SET_REL_PATHLIST_HOOK = pg_sys::set_rel_pathlist_hook;
             pg_sys::set_rel_pathlist_hook = Some(otlet_set_rel_pathlist);
             HOOK_INSTALLED = true;
+        }
+    }
+}
+
+fn semantic_freshness_status_sql(
+    material_alias: &str,
+    current_content_hash_sql: &str,
+    current_contract_hash_sql: &str,
+    current_source_hash_sql: &str,
+) -> String {
+    format!(
+        "otlet.semantic_freshness_status(\
+         {material_alias}.content_hash, \
+         {material_alias}.contract_hash, \
+         {material_alias}.stale, \
+         {material_alias}.stale_reason, \
+         {material_alias}.source_hash, \
+         {current_content_hash_sql}, \
+         {current_contract_hash_sql}, \
+         {current_source_hash_sql})"
+    )
+}
+
+#[cfg(test)]
+#[derive(Debug, PartialEq, Eq)]
+struct SemanticFreshnessStatus {
+    is_fresh: bool,
+    stale_reason: Option<&'static str>,
+    freshness_basis: Option<&'static str>,
+}
+
+#[cfg(test)]
+fn semantic_freshness_status_for_test(
+    content_matches: bool,
+    contract_matches: bool,
+    material_stale: bool,
+    material_stale_reason: Option<&'static str>,
+    source_matches: bool,
+) -> SemanticFreshnessStatus {
+    let is_fresh = content_matches
+        && contract_matches
+        && (!material_stale || material_stale_reason == Some("source_update"));
+    SemanticFreshnessStatus {
+        is_fresh,
+        stale_reason: if is_fresh {
+            None
+        } else if !contract_matches {
+            Some("contract_changed")
+        } else {
+            Some(material_stale_reason.unwrap_or("content_revalidation_pending"))
+        },
+        freshness_basis: if !is_fresh {
+            None
+        } else if material_stale {
+            Some("revalidated_after_benign_update")
+        } else if source_matches {
+            Some("mvcc_match")
+        } else {
+            Some("content_hash_match")
+        },
+    }
+}
+
+#[cfg(test)]
+mod freshness_tests {
+    use super::*;
+
+    #[test]
+    fn semantic_freshness_matrix_matches_sql_contract() {
+        let cases = [
+            (
+                true,
+                true,
+                false,
+                None,
+                true,
+                SemanticFreshnessStatus {
+                    is_fresh: true,
+                    stale_reason: None,
+                    freshness_basis: Some("mvcc_match"),
+                },
+            ),
+            (
+                true,
+                true,
+                true,
+                Some("source_update"),
+                false,
+                SemanticFreshnessStatus {
+                    is_fresh: true,
+                    stale_reason: None,
+                    freshness_basis: Some("revalidated_after_benign_update"),
+                },
+            ),
+            (
+                true,
+                true,
+                true,
+                Some("manual"),
+                false,
+                SemanticFreshnessStatus {
+                    is_fresh: false,
+                    stale_reason: Some("manual"),
+                    freshness_basis: None,
+                },
+            ),
+            (
+                false,
+                true,
+                false,
+                None,
+                false,
+                SemanticFreshnessStatus {
+                    is_fresh: false,
+                    stale_reason: Some("content_revalidation_pending"),
+                    freshness_basis: None,
+                },
+            ),
+            (
+                true,
+                false,
+                false,
+                None,
+                false,
+                SemanticFreshnessStatus {
+                    is_fresh: false,
+                    stale_reason: Some("contract_changed"),
+                    freshness_basis: None,
+                },
+            ),
+        ];
+
+        for (content, contract, stale, reason, source, expected) in cases {
+            assert_eq!(
+                semantic_freshness_status_for_test(content, contract, stale, reason, source),
+                expected
+            );
         }
     }
 }

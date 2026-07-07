@@ -198,13 +198,13 @@ fn planner_stats_unknown() -> SemanticPlannerStats {
         missing_rows: 0,
         inflight_rows: 0,
         cache_reusable_rows: 0,
-        lookup_decision_rows: 0,
-        wait_decision_rows: 0,
         infer_decision_rows: 0,
-        queue_decision_rows: 0,
         fail_closed_decision_rows: 0,
         model_ms: 2500.0,
+        model_cost_source: "static_fallback".to_string(),
         path_cost: 1.0,
+        stale_reasons: "{}".to_string(),
+        count_basis: "unknown".to_string(),
     }
 }
 
@@ -223,10 +223,7 @@ fn finish_planner_stats(
     let base_scan = stats.source_rows.max(1) as f64 * 0.02 + 1.0;
     let lookup_cost = stats.fresh_matches.saturating_add(stats.fresh_non_matches) as f64 * 0.05;
     let model_cost = planner_model_cost_unit(stats.model_ms, infer_ms);
-    stats.lookup_decision_rows = stats.fresh_matches.saturating_add(stats.fresh_non_matches);
-    stats.wait_decision_rows = 0;
     stats.infer_decision_rows = 0;
-    stats.queue_decision_rows = 0;
     stats.fail_closed_decision_rows = 0;
     if auto_policy {
         let inferable_rows = stats.stale_rows.saturating_add(stats.missing_rows);
@@ -246,9 +243,7 @@ fn finish_planner_stats(
             .saturating_sub(waited_rows)
             .saturating_sub(bounded_infer_rows)
             .saturating_sub(queued_rows);
-        stats.wait_decision_rows = waited_rows;
         stats.infer_decision_rows = bounded_infer_rows;
-        stats.queue_decision_rows = queued_rows;
         stats.fail_closed_decision_rows = fail_closed_rows;
         stats.path_cost = base_scan
             + lookup_cost
@@ -288,7 +283,6 @@ fn finish_planner_stats(
             stats.fresh_matches, stats.stale_rows, stats.missing_rows, stats.inflight_rows
         );
     } else if wait_ms > 0 && stats.inflight_rows > 0 {
-        stats.wait_decision_rows = stats.inflight_rows;
         stats.fail_closed_decision_rows = unresolved.saturating_sub(stats.inflight_rows);
         stats.path_cost =
             base_scan + lookup_cost + (stats.inflight_rows as f64 * wait_ms as f64 / 100.0);
@@ -298,7 +292,6 @@ fn finish_planner_stats(
             stats.inflight_rows, stats.fresh_matches, stats.stale_rows, stats.missing_rows
         );
     } else if allow_refresh && unresolved > 0 {
-        stats.queue_decision_rows = unresolved;
         stats.path_cost = base_scan + lookup_cost + unresolved as f64 * 0.50;
         stats.selected_path = "queue_refresh".to_string();
         stats.reason = format!(

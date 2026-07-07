@@ -8,7 +8,7 @@ fn generation_trace_summary(
     } else {
         None
     };
-    let mut summary = json!({
+    let summary = json!({
         "trace_version": "otlet_generation_trace_v1",
         "prompt_hash": context.prompt_hash,
         "input_hash": context.input_hash,
@@ -26,44 +26,53 @@ fn generation_trace_summary(
         "model_memory_bytes": metrics.model_memory_bytes,
         "model_parameters": metrics.model_parameters,
         "context_window_tokens": metrics.context_window_tokens,
-        "model_device_policy": metrics.model_device_policy,
-        "memory_accounting_policy": metrics.memory_accounting_policy,
         "worker_process_rss_bytes": metrics.worker_process_rss_bytes,
         "worker_process_virtual_bytes": metrics.worker_process_virtual_bytes,
-        "worker_memory_sample_policy": metrics.worker_memory_sample_policy,
-        "worker_memory_budget_bytes": metrics.worker_memory_budget_bytes,
-        "worker_memory_budget_policy": metrics.worker_memory_budget_policy,
         "model_cache_hit": metrics.cache_hit,
         "inference_cache_hit": metrics.inference_cache_hit,
-        "inference_cache_entries": metrics.inference_cache_entries,
-        "inference_cache_bytes": metrics.inference_cache_bytes,
-        "inference_cache_evictions": metrics.inference_cache_evictions,
-        "inference_cache_invalidation_reason": metrics.inference_cache_invalidation_reason,
         "schema_validation_status": "passed",
         "schema_force": "post_generation_json_schema_validation",
         "stop_reason": metrics.stop_reason,
-        "worker_handoff": "shared_memory_xact_commit_latch",
-        "stale_policy": "fail_closed_no_silent_stale_results",
-        "cancellation_check_policy": LINKED_CANCELLATION_POLICY,
-        "cancellation_check_interval_tokens": LINKED_CANCELLATION_CHECK_INTERVAL_TOKENS,
-        "prompt_decode_cancellation_boundary": LINKED_PROMPT_DECODE_CANCELLATION_BOUNDARY,
+        "decode_constraint": LINKED_DECODE_CONSTRAINT,
+        "decode_constraint_reason": LINKED_DECODE_CONSTRAINT_REASON,
         "probability_summary": metrics.probability_summary,
-        "detailed_trace": metrics.detailed_trace
+        "detailed_trace": metrics.detailed_trace,
+        "decision": {
+            "contract_hash": context.decision_contract_hash,
+            "preset_name": context.decision_preset_name,
+            "preset_contract_hash": context.decision_preset_contract_hash
+        },
+        "cache": {
+            "key_basis": context.inference_cache_key_basis,
+            "entries": metrics.inference_cache_entries,
+            "bytes": metrics.inference_cache_bytes,
+            "max_entries": metrics.inference_cache_max_entries,
+            "max_bytes": metrics.inference_cache_max_bytes,
+            "evictions": metrics.inference_cache_evictions,
+            "eviction_reason": metrics.inference_cache_eviction_reason,
+            "invalidation_reason": metrics.inference_cache_invalidation_reason
+        },
+        "memory": {
+            "model_device_policy": metrics.model_device_policy,
+            "memory_accounting_policy": metrics.memory_accounting_policy,
+            "worker_memory_sample_policy": metrics.worker_memory_sample_policy,
+            "worker_memory_budget_bytes": metrics.worker_memory_budget_bytes,
+            "worker_memory_budget_policy": metrics.worker_memory_budget_policy
+        },
+        "input_shaping": {
+            "shaped_input_bytes": context.shaped_input_bytes,
+            "original_shaped_input_bytes": context.original_shaped_input_bytes,
+            "max_shaped_input_bytes": context.max_shaped_input_bytes,
+            "input_truncated": context.input_truncated,
+            "applied": context.input_shaping_applied
+        },
+        "policies": {
+            "worker_handoff": "shared_memory_xact_commit_latch",
+            "stale_policy": "fail_closed_no_silent_stale_results",
+            "cancellation_check_policy": LINKED_CANCELLATION_POLICY,
+            "prompt_decode_cancellation_boundary": LINKED_PROMPT_DECODE_CANCELLATION_BOUNDARY
+        }
     });
-    if let Value::Object(object) = &mut summary {
-        object.insert(
-            "decode_constraint".to_owned(),
-            Value::String(context.decode_constraint.clone()),
-        );
-        object.insert(
-            "grammar_supported".to_owned(),
-            Value::Bool(context.grammar_supported),
-        );
-        object.insert(
-            "decode_constraint_reason".to_owned(),
-            Value::String(context.decode_constraint_reason.clone()),
-        );
-    }
     summary
 }
 

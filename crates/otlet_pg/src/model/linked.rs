@@ -5,6 +5,7 @@ fn run_linked(
 ) -> Result<LinkedRun, ModelError> {
     use std::ffi::CString;
 
+    let attempt_start = Instant::now();
     if job.artifact_path.starts_with("hf:") {
         return Err(ModelError::new(
             "linked llama.cpp runtime requires a local GGUF artifact path".to_owned(),
@@ -87,48 +88,21 @@ fn run_linked(
     let cache = cache
         .as_mut()
         .ok_or_else(|| ModelError::new("linked llama.cpp cache did not initialize".to_owned()))?;
-    linked_clear_context(cache.context.ptr);
-    let resident_memory = process_memory_sample();
-    enforce_worker_rss_budget(&resident_memory, options.max_worker_rss_bytes)?;
-
     let tokens = tokenize_linked(cache.vocab, prompt)?;
     if tokens.is_empty() {
         return Err(ModelError::new(
             "linked llama.cpp prompt produced no tokens".to_owned(),
         ));
     }
+
     validate_linked_token_budget(tokens.len(), options.max_tokens, cache.context_window_tokens)?;
+    linked_clear_context(cache.context.ptr);
+
+    let resident_memory = process_memory_sample();
+    enforce_worker_rss_budget(&resident_memory, options.max_worker_rss_bytes)?;
 
     let mut batch = LinkedBatch::new(LINKED_PROMPT_BATCH_TOKENS)?;
-
-    let mut decoded_tokens = 0;
-    for chunk in tokens.chunks(LINKED_PROMPT_BATCH_TOKENS) {
-        batch.reset();
-        for (chunk_index, token) in chunk.iter().enumerate() {
-            let position = decoded_tokens + chunk_index;
-            batch.add(
-                *token,
-                i32::try_from(position).map_err(|_| {
-                    ModelError::new("linked llama.cpp prompt position overflowed i32".to_owned())
-                })?,
-                position + 1 == tokens.len(),
-            )?;
-        }
-        if linked_cancel_requested(job.id)? {
-            return Err(ModelError::new("canceled".to_owned()));
-        }
-        let decode_status =
-            unsafe { llama_cpp_sys_4::llama_decode(cache.context.ptr, batch.value) };
-        if decode_status != 0 {
-            return Err(ModelError::new(format!(
-                "linked llama.cpp prompt decode failed: {decode_status}"
-            )));
-        }
-        if linked_cancel_requested(job.id)? {
-            return Err(ModelError::new("canceled".to_owned()));
-        }
-        decoded_tokens += chunk.len();
-    }
+    linked_decode_prompt_tokens(job, cache.context.ptr, &mut batch, &tokens, 0)?;
 
     let sampler_ptr = unsafe { llama_cpp_sys_4::llama_sampler_init_greedy() };
     if sampler_ptr.is_null() {
@@ -146,6 +120,9 @@ fn run_linked(
     let generate_start = Instant::now();
 
     for _ in 0..options.max_tokens {
+        if linked_attempt_timed_out(attempt_start, job.max_attempt_ms) {
+            return Err(ModelError::attempt_timeout());
+        }
         if linked_cancel_requested(job.id)? {
             return Err(ModelError::new("canceled".to_owned()));
         }
@@ -196,6 +173,9 @@ fn run_linked(
         if linked_cancel_requested(job.id)? {
             return Err(ModelError::new("canceled".to_owned()));
         }
+        if linked_attempt_timed_out(attempt_start, job.max_attempt_ms) {
+            return Err(ModelError::attempt_timeout());
+        }
         position += 1;
     }
     let generate_ms = elapsed_ms(generate_start);
@@ -226,7 +206,10 @@ fn run_linked(
             inference_cache_hit: false,
             inference_cache_entries: 0,
             inference_cache_bytes: 0,
+            inference_cache_max_entries: inference_cache_max_entries(),
+            inference_cache_max_bytes: inference_cache_max_bytes(),
             inference_cache_evictions: 0,
+            inference_cache_eviction_reason: "none".to_owned(),
             inference_cache_invalidation_reason: "miss".to_owned(),
             probability_summary: probability_trace.summary(),
             detailed_trace: detailed_trace.summary(&stop_reason),
@@ -235,27 +218,79 @@ fn run_linked(
     })
 }
 
+fn linked_attempt_timed_out(start: Instant, max_attempt_ms: i64) -> bool {
+    max_attempt_ms > 0 && start.elapsed().as_millis() >= max_attempt_ms as u128
+}
+
+fn linked_decode_prompt_tokens(
+    job: &Job,
+    context: *mut llama_cpp_sys_4::llama_context,
+    batch: &mut LinkedBatch,
+    tokens: &[llama_cpp_sys_4::llama_token],
+    start_position: usize,
+) -> Result<(), ModelError> {
+    let mut decoded_tokens = 0;
+    for chunk in tokens.chunks(LINKED_PROMPT_BATCH_TOKENS) {
+        batch.reset();
+        for (chunk_index, token) in chunk.iter().enumerate() {
+            let position = start_position + decoded_tokens + chunk_index;
+            batch.add(
+                *token,
+                i32::try_from(position).map_err(|_| {
+                    ModelError::new("linked llama.cpp prompt position overflowed i32".to_owned())
+                })?,
+                decoded_tokens + chunk_index + 1 == tokens.len(),
+            )?;
+        }
+        if linked_cancel_requested(job.id)? {
+            return Err(ModelError::new("canceled".to_owned()));
+        }
+        let decode_status = unsafe { llama_cpp_sys_4::llama_decode(context, batch.value) };
+        if decode_status != 0 {
+            return Err(ModelError::new(format!(
+                "linked llama.cpp prompt decode failed: {decode_status}"
+            )));
+        }
+        if linked_cancel_requested(job.id)? {
+            return Err(ModelError::new("canceled".to_owned()));
+        }
+        decoded_tokens += chunk.len();
+    }
+
+    Ok(())
+}
+
 fn validate_linked_token_budget(
     prompt_tokens: usize,
     max_tokens: u64,
     context_window_tokens: i64,
 ) -> Result<(), ModelError> {
     let Ok(context_window_tokens) = usize::try_from(context_window_tokens) else {
-        return Err(ModelError::new(
+        return Err(ModelError::clean_failure(
             "linked llama.cpp context window is invalid".to_owned(),
+            "prompt_token_budget_before_generation",
+            "invalid_context_window",
         ));
     };
     if prompt_tokens >= context_window_tokens {
-        return Err(ModelError::new(format!(
-            "linked llama.cpp prompt has {prompt_tokens} tokens, exceeds context window {context_window_tokens}"
-        )));
+        return Err(ModelError::clean_failure(
+            format!(
+                "linked llama.cpp prompt has {prompt_tokens} tokens, exceeds context window {context_window_tokens}"
+            ),
+            "prompt_token_budget_before_generation",
+            "prompt_exceeds_context_window",
+        ));
     }
 
     let max_tokens = usize::try_from(max_tokens).unwrap_or(usize::MAX);
     if prompt_tokens.saturating_add(max_tokens) > context_window_tokens {
-        return Err(ModelError::new(format!(
-            "linked llama.cpp prompt has {prompt_tokens} tokens plus max_tokens {max_tokens}, exceeds context window {context_window_tokens}"
-        )));
+        return Err(ModelError::clean_failure(
+            format!(
+                "linked llama.cpp prompt has {prompt_tokens} tokens plus max_tokens {max_tokens}, exceeds context window {context_window_tokens}"
+            ),
+            "prompt_token_budget_before_generation",
+            "prompt_and_generation_exceed_context_window",
+        ));
     }
 
     Ok(())
@@ -413,7 +448,11 @@ fn tokenize_linked(
     let text = std::ffi::CString::new(text)
         .map_err(|_| ModelError::new("linked llama.cpp prompt contains null byte".to_owned()))?;
     let text_len = i32::try_from(text.as_bytes().len()).map_err(|_| {
-        ModelError::new("linked llama.cpp prompt is too large to tokenize".to_owned())
+        ModelError::clean_failure(
+            "linked llama.cpp prompt is too large to tokenize".to_owned(),
+            "prompt_token_budget_before_generation",
+            "prompt_exceeds_context_window",
+        )
     })?;
     let size = unsafe {
         llama_cpp_sys_4::llama_tokenize(
@@ -431,9 +470,13 @@ fn tokenize_linked(
         return Ok(Vec::new());
     }
     if capacity as u32 > LINKED_CONTEXT_WINDOW_TOKENS {
-        return Err(ModelError::new(format!(
-            "linked llama.cpp prompt has at least {capacity} tokens, exceeds context window {LINKED_CONTEXT_WINDOW_TOKENS}"
-        )));
+        return Err(ModelError::clean_failure(
+            format!(
+                "linked llama.cpp prompt has at least {capacity} tokens, exceeds context window {LINKED_CONTEXT_WINDOW_TOKENS}"
+            ),
+            "prompt_token_budget_before_generation",
+            "prompt_exceeds_context_window",
+        ));
     }
 
     let mut tokens = vec![0; capacity as usize];

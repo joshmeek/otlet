@@ -1,4 +1,4 @@
-CREATE FUNCTION otlet.create_semantic_join_index(
+CREATE FUNCTION otlet.create_watch_pair_index(
   index_name text,
   candidate_query text,
   instruction text,
@@ -6,7 +6,9 @@ CREATE FUNCTION otlet.create_semantic_join_index(
   model_name text,
   record_type text DEFAULT NULL,
   runtime_options jsonb DEFAULT '{}'::jsonb,
-  max_candidate_rows integer DEFAULT 1000
+  max_candidate_rows integer DEFAULT 1000,
+  input_shaping jsonb DEFAULT '{}'::jsonb,
+  decision_contract jsonb DEFAULT '{}'::jsonb
 ) RETURNS otlet.semantic_join_indexes
 LANGUAGE plpgsql
 AS $$
@@ -15,6 +17,7 @@ DECLARE
   semantic_record_type text := COALESCE(record_type, index_name);
   semantic_task_name text := index_name || '_task';
   bounded_rows integer := GREATEST(1, LEAST(COALESCE(max_candidate_rows, 1000), 100000));
+  current_contract_hash text := otlet.task_contract_hash(instruction, output_schema, model_name, runtime_options, input_shaping, decision_contract);
   wrapped_query text;
 BEGIN
   IF index_name !~ '^[a-z0-9][a-z0-9_-]*$' THEN
@@ -45,14 +48,16 @@ BEGIN
         WHERE sm.task_name = %3$L
           AND sm.record_type = %4$L
           AND sm.subject_id = otlet_join_input.subject_id
-          AND sm.stale = false
-          AND sm.source_hash = md5(otlet_join_input.input::text)
+          AND sm.content_hash = otlet.semantic_content_hash(otlet_join_input.input, %6$L::jsonb)
+          AND sm.contract_hash = %5$L
       )
     $query$,
     candidate_query,
     bounded_rows,
     semantic_task_name,
-    semantic_record_type
+    semantic_record_type,
+    current_contract_hash,
+    input_shaping
   );
 
   PERFORM otlet.create_task(
@@ -61,7 +66,9 @@ BEGIN
     instruction,
     output_schema,
     model_name,
-    runtime_options
+    runtime_options,
+    input_shaping,
+    decision_contract
   );
 
   INSERT INTO otlet.semantic_join_indexes (
@@ -91,11 +98,16 @@ BEGIN
         updated_at = now()
   RETURNING * INTO saved;
 
+  PERFORM otlet.create_semantic_join_foreign_table(
+    otlet.semantic_native_table_name(index_name),
+    index_name
+  );
+
   RETURN saved;
 END;
 $$;
 
-CREATE FUNCTION otlet.drop_semantic_join_index(
+CREATE FUNCTION otlet.drop_watch_pair_index(
   index_name text
 ) RETURNS boolean
 LANGUAGE plpgsql
@@ -106,7 +118,7 @@ BEGIN
   SELECT *
   INTO index_row
   FROM otlet.semantic_join_indexes sji
-  WHERE sji.name = drop_semantic_join_index.index_name;
+  WHERE sji.name = drop_watch_pair_index.index_name;
 
   IF NOT FOUND THEN
     RETURN false;
@@ -118,6 +130,11 @@ BEGIN
 
   DELETE FROM otlet.semantic_join_indexes sji
   WHERE sji.name = index_row.name;
+
+  EXECUTE format(
+    'DROP FOREIGN TABLE IF EXISTS otlet.%I',
+    otlet.semantic_native_table_name(index_row.name)
+  );
 
   DELETE FROM otlet.tasks t
   WHERE t.name = index_row.task_name
@@ -167,6 +184,7 @@ LANGUAGE plpgsql
 AS $$
 DECLARE
   index_row otlet.semantic_join_indexes%ROWTYPE;
+  input_query text;
   refreshed bigint;
 BEGIN
   SELECT *
@@ -178,9 +196,8 @@ BEGIN
     RAISE EXCEPTION 'otlet semantic join index % does not exist', materialize_semantic_join_index.index_name;
   END IF;
 
-  EXECUTE format(
+  input_query := format(
     $sql$
-      WITH current_inputs AS (
         SELECT subject_id, input
         FROM (
           SELECT subject_id::text AS subject_id, input::jsonb AS input
@@ -188,69 +205,17 @@ BEGIN
           ORDER BY subject_id
           LIMIT %2$s
         ) otlet_join_input
-      ),
-      latest_jobs AS (
-        SELECT DISTINCT ON (j.subject_id)
-          j.id,
-          j.subject_id,
-          j.task_name,
-          j.input
-        FROM otlet.jobs j
-        JOIN current_inputs ci
-          ON ci.subject_id = j.subject_id
-         AND md5(ci.input::text) = md5(j.input::text)
-        WHERE j.task_name = %3$L
-          AND j.status = 'complete'
-        ORDER BY j.subject_id, j.finished_at DESC NULLS LAST, j.id DESC
-      )
-      INSERT INTO otlet.semantic_materializations (
-        record_id,
-        record_type,
-        source_table,
-        subject_id,
-        task_name,
-        model_name,
-        body,
-        stale,
-        source_hash,
-        updated_at
-      )
-      SELECT
-        r.id,
-        r.record_type,
-        %4$L,
-        j.subject_id,
-        j.task_name,
-        ar.model_name,
-        r.body,
-        false,
-        md5(j.input::text),
-        now()
-      FROM otlet.records r
-      JOIN otlet.actions a ON a.id = r.action_id
-      JOIN latest_jobs j ON j.id = a.job_id
-      JOIN otlet.outputs o ON o.id = a.output_id
-      JOIN otlet.inference_receipts ar ON ar.id = o.receipt_id
-      WHERE r.record_type = %5$L
-      ON CONFLICT (record_id) DO UPDATE
-        SET record_type = EXCLUDED.record_type,
-            source_table = EXCLUDED.source_table,
-            subject_id = EXCLUDED.subject_id,
-            task_name = EXCLUDED.task_name,
-            model_name = EXCLUDED.model_name,
-            body = EXCLUDED.body,
-            stale = false,
-            source_hash = EXCLUDED.source_hash,
-            updated_at = now()
     $sql$,
     index_row.candidate_query,
-    index_row.max_candidate_rows,
-    index_row.task_name,
-    'otlet.semantic_join:' || index_row.name,
-    index_row.record_type
+    index_row.max_candidate_rows
   );
 
-  GET DIAGNOSTICS refreshed = ROW_COUNT;
+  refreshed := otlet.materialize_semantic_records(
+    index_row.task_name,
+    index_row.record_type,
+    'otlet.semantic_join:' || index_row.name,
+    input_query
+  );
 
   UPDATE otlet.semantic_join_indexes
   SET last_materialized_at = now(),
@@ -269,6 +234,7 @@ LANGUAGE plpgsql
 AS $$
 DECLARE
   index_row otlet.semantic_join_indexes%ROWTYPE;
+  input_query text;
   refreshed bigint;
 BEGIN
   SELECT *
@@ -280,9 +246,8 @@ BEGIN
     RAISE EXCEPTION 'otlet semantic join index % does not exist', materialize_semantic_join_index_subject.index_name;
   END IF;
 
-  EXECUTE format(
+  input_query := format(
     $sql$
-      WITH current_inputs AS (
         SELECT subject_id, input
         FROM (
           SELECT subject_id::text AS subject_id, input::jsonb AS input
@@ -291,70 +256,18 @@ BEGIN
           LIMIT %2$s
         ) otlet_join_input
         WHERE subject_id = %3$L
-      ),
-      latest_jobs AS (
-        SELECT DISTINCT ON (j.subject_id)
-          j.id,
-          j.subject_id,
-          j.task_name,
-          j.input
-        FROM otlet.jobs j
-        JOIN current_inputs ci
-          ON ci.subject_id = j.subject_id
-         AND md5(ci.input::text) = md5(j.input::text)
-        WHERE j.task_name = %4$L
-          AND j.status = 'complete'
-        ORDER BY j.subject_id, j.finished_at DESC NULLS LAST, j.id DESC
-      )
-      INSERT INTO otlet.semantic_materializations (
-        record_id,
-        record_type,
-        source_table,
-        subject_id,
-        task_name,
-        model_name,
-        body,
-        stale,
-        source_hash,
-        updated_at
-      )
-      SELECT
-        r.id,
-        r.record_type,
-        %5$L,
-        j.subject_id,
-        j.task_name,
-        ar.model_name,
-        r.body,
-        false,
-        md5(j.input::text),
-        now()
-      FROM otlet.records r
-      JOIN otlet.actions a ON a.id = r.action_id
-      JOIN latest_jobs j ON j.id = a.job_id
-      JOIN otlet.outputs o ON o.id = a.output_id
-      JOIN otlet.inference_receipts ar ON ar.id = o.receipt_id
-      WHERE r.record_type = %6$L
-      ON CONFLICT (record_id) DO UPDATE
-        SET record_type = EXCLUDED.record_type,
-            source_table = EXCLUDED.source_table,
-            subject_id = EXCLUDED.subject_id,
-            task_name = EXCLUDED.task_name,
-            model_name = EXCLUDED.model_name,
-            body = EXCLUDED.body,
-            stale = false,
-            source_hash = EXCLUDED.source_hash,
-            updated_at = now()
     $sql$,
     index_row.candidate_query,
     index_row.max_candidate_rows,
-    materialize_semantic_join_index_subject.subject_id,
-    index_row.task_name,
-    'otlet.semantic_join:' || index_row.name,
-    index_row.record_type
+    materialize_semantic_join_index_subject.subject_id
   );
 
-  GET DIAGNOSTICS refreshed = ROW_COUNT;
+  refreshed := otlet.materialize_semantic_records(
+    index_row.task_name,
+    index_row.record_type,
+    'otlet.semantic_join:' || index_row.name,
+    input_query
+  );
 
   IF refreshed > 0 THEN
     UPDATE otlet.semantic_join_indexes

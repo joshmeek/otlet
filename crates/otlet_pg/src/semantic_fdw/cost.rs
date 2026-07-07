@@ -3,12 +3,11 @@ fn load_effective_plan(
     pushdown: &SemanticPushdown,
 ) -> Result<SemanticFdwPlan, String> {
     let mut plan = load_plan(opts)?;
-    if opts.access_kind == SemanticAccessKind::RowIndex
-        && let Some(pushed_subject_ids) = pushdown.subjects()
-    {
+    if let Some(pushed_subject_ids) = pushdown.subjects() {
+        plan.count_basis = "pushdown_scoped".to_string();
         let subjects = unique_subject_ids(pushed_subject_ids);
         if subjects.is_empty() {
-            plan.selected_path = "semantic_lookup".to_string();
+            plan.selected_path = lookup_path(opts).to_string();
             plan.reason = "pushed subject filter empty".to_string();
             clear_subject_counts(&mut plan);
             return Ok(plan);
@@ -26,20 +25,21 @@ fn load_effective_plan(
         plan.queue_subjects = 0;
         plan.infer_now_subjects = 0;
         plan.fail_closed_subjects = 0;
+        plan.stale_reasons = "{}".to_string();
         plan.freshness = scoped_freshness(stats.source_rows, unresolved_subjects);
         plan.lookup_ms = scoped_lookup_ms(stats.fresh_rows);
         plan.queue_ms = plan.lookup_ms + unresolved_subjects as f64 * plan.model_ms.max(1.0);
         plan.infer_now_ms = 0.0;
 
         if stats.source_rows == 0 {
-            plan.selected_path = "semantic_lookup".to_string();
+            plan.selected_path = lookup_path(opts).to_string();
             plan.reason = "pushed subject rows absent from source".to_string();
             finish_path_cost(&mut plan);
             return Ok(plan);
         }
 
         if unresolved_subjects == 0 {
-            plan.selected_path = "semantic_lookup".to_string();
+            plan.selected_path = lookup_path(opts).to_string();
             plan.reason = "pushed subject rows fresh".to_string();
             finish_path_cost(&mut plan);
             return Ok(plan);
@@ -71,6 +71,24 @@ fn subject_scope_stats(
     subjects: &[String],
 ) -> Result<SubjectScopeStats, String> {
     let subject_array = sql_text_array(subjects);
+    let (source_query, materialized_query) = match opts.access_kind {
+        SemanticAccessKind::RowIndex => row_subject_scope_queries(opts, &subject_array)?,
+        SemanticAccessKind::JoinIndex => join_subject_scope_queries(opts, &subject_array)?,
+    };
+    pgrx::Spi::connect(|client| {
+        let source_rows = scalar_select_i64(client, &source_query)?;
+        let fresh_rows = scalar_select_i64(client, &materialized_query)?;
+        Ok::<SubjectScopeStats, String>(SubjectScopeStats {
+            source_rows,
+            fresh_rows: fresh_rows.min(source_rows),
+        })
+    })
+}
+
+fn row_subject_scope_queries(
+    opts: &SemanticFdwOptions,
+    subject_array: &str,
+) -> Result<(String, String), String> {
     let query = format!(
         "SELECT source_table, subject_column \
          FROM otlet.semantic_indexes \
@@ -93,30 +111,82 @@ fn subject_scope_stats(
         Ok::<(String, String), String>((source_table, subject_column))
     })?;
 
-    let source_query = format!(
-        "SELECT count(DISTINCT ({})::text)::bigint \
-         FROM {} \
-         WHERE ({})::text = ANY ({}::text[])",
-        sql_identifier(&subject_column),
-        source_table,
-        sql_identifier(&subject_column),
-        subject_array
+    Ok((
+        format!(
+            "SELECT count(DISTINCT ({})::text)::bigint \
+             FROM {} \
+             WHERE ({})::text = ANY ({}::text[])",
+            sql_identifier(&subject_column),
+            source_table,
+            sql_identifier(&subject_column),
+            subject_array
+        ),
+        format!(
+            "SELECT count(DISTINCT sm.subject_id)::bigint \
+             FROM otlet.semantic_index_current_rows({}, true) sm \
+             WHERE sm.subject_id = ANY ({}::text[])",
+            sql_literal(&opts.index_name),
+            subject_array
+        ),
+    ))
+}
+
+fn join_subject_scope_queries(
+    opts: &SemanticFdwOptions,
+    subject_array: &str,
+) -> Result<(String, String), String> {
+    let query = format!(
+        "SELECT candidate_query, max_candidate_rows \
+         FROM otlet.semantic_join_indexes \
+         WHERE name = {}",
+        sql_literal(&opts.index_name)
     );
-    let materialized_query = format!(
-        "SELECT count(DISTINCT sm.subject_id)::bigint \
-         FROM otlet.semantic_index_current_rows({}, true) sm \
-         WHERE sm.subject_id = ANY ({}::text[])",
-        sql_literal(&opts.index_name),
-        subject_array
-    );
-    pgrx::Spi::connect(|client| {
-        let source_rows = scalar_select_i64(client, &source_query)?;
-        let fresh_rows = scalar_select_i64(client, &materialized_query)?;
-        Ok::<SubjectScopeStats, String>(SubjectScopeStats {
-            source_rows,
-            fresh_rows: fresh_rows.min(source_rows),
-        })
-    })
+    let (candidate_query, max_candidate_rows) = pgrx::Spi::connect(|client| {
+        let table = client
+            .select(query.as_str(), Some(1), &[])
+            .map_err(to_string)?;
+        let row = table.first();
+        let candidate_query = row
+            .get_by_name::<String, _>("candidate_query")
+            .map_err(to_string)?
+            .ok_or_else(|| "semantic join index candidate_query returned null".to_string())?;
+        let max_candidate_rows = row
+            .get_by_name::<i32, _>("max_candidate_rows")
+            .map_err(to_string)?
+            .unwrap_or(1000)
+            .max(1);
+        Ok::<(String, i32), String>((candidate_query, max_candidate_rows))
+    })?;
+
+    Ok((
+        format!(
+            "SELECT count(DISTINCT subject_id)::bigint \
+             FROM ( \
+               SELECT subject_id::text AS subject_id \
+               FROM ({}) otlet_join_candidate \
+               ORDER BY subject_id \
+               LIMIT {} \
+             ) scoped_candidates \
+             WHERE subject_id = ANY ({}::text[])",
+            candidate_query,
+            max_candidate_rows,
+            subject_array
+        ),
+        format!(
+            "SELECT count(DISTINCT sm.subject_id)::bigint \
+             FROM otlet.semantic_join_index_current_rows({}, true) sm \
+             WHERE sm.subject_id = ANY ({}::text[])",
+            sql_literal(&opts.index_name),
+            subject_array
+        ),
+    ))
+}
+
+fn lookup_path(opts: &SemanticFdwOptions) -> &'static str {
+    match opts.access_kind {
+        SemanticAccessKind::RowIndex => "semantic_lookup",
+        SemanticAccessKind::JoinIndex => "semantic_join_lookup",
+    }
 }
 
 fn scoped_lookup_ms(rows: i64) -> f64 {
@@ -142,6 +212,7 @@ fn clear_subject_counts(plan: &mut SemanticFdwPlan) {
     plan.queue_subjects = 0;
     plan.infer_now_subjects = 0;
     plan.fail_closed_subjects = 0;
+    plan.stale_reasons = "{}".to_string();
     plan.freshness = 1.0;
     plan.lookup_ms = scoped_lookup_ms(0);
     plan.queue_ms = plan.lookup_ms;

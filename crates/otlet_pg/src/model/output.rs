@@ -1,3 +1,43 @@
+struct ShapedInput {
+    input: Value,
+    bytes: i64,
+    original_bytes: i64,
+    input_truncated: bool,
+    applied: bool,
+}
+
+fn shaped_model_input(input: Value) -> ShapedInput {
+    let bytes = input.to_string().len().min(i64::MAX as usize) as i64;
+    let original_bytes = input
+        .get("original_shaped_input_bytes")
+        .and_then(Value::as_i64)
+        .unwrap_or(bytes);
+    let input_truncated = input
+        .get("_otlet_input_truncated")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+
+    ShapedInput {
+        input,
+        bytes,
+        original_bytes,
+        input_truncated,
+        applied: true,
+    }
+}
+
+fn effective_instruction(instruction: &str, decision_contract: &Value) -> String {
+    let prefix = decision_contract
+        .get("prompt_prefix")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if prefix.is_empty() {
+        instruction.to_owned()
+    } else {
+        format!("{prefix}{instruction}")
+    }
+}
+
 fn validate_output(schema: &Value, output: &Value) -> Result<(), String> {
     let validator =
         jsonschema::validator_for(schema).map_err(|err| format!("invalid output schema: {err}"))?;
@@ -40,18 +80,26 @@ fn enforce_worker_rss_budget(
         return Ok(());
     }
     if sample.rss_bytes <= 0 {
-        return Err(ModelError::new(format!(
-            "linked worker RSS budget could not be enforced: rss sample unavailable policy={} max_worker_rss_bytes={}",
-            sample.policy, max_worker_rss_bytes
-        )));
+        return Err(ModelError::clean_failure(
+            format!(
+                "linked worker RSS budget could not be enforced: rss sample unavailable policy={} max_worker_rss_bytes={}",
+                sample.policy, max_worker_rss_bytes
+            ),
+            "worker_rss_budget_before_generation",
+            "worker_rss_sample_unavailable",
+        ));
     }
     if sample.rss_bytes as u64 > max_worker_rss_bytes {
-        return Err(ModelError::new(format!(
-            "linked worker RSS budget exceeded: rss_bytes={} max_worker_rss_bytes={} policy={}",
-            sample.rss_bytes,
-            max_worker_rss_bytes,
-            worker_memory_budget_policy(max_worker_rss_bytes)
-        )));
+        return Err(ModelError::clean_failure(
+            format!(
+                "linked worker RSS budget exceeded: rss_bytes={} max_worker_rss_bytes={} policy={}",
+                sample.rss_bytes,
+                max_worker_rss_bytes,
+                worker_memory_budget_policy(max_worker_rss_bytes)
+            ),
+            "worker_rss_budget_before_generation",
+            "worker_rss_budget_exceeded",
+        ));
     }
     Ok(())
 }
@@ -176,4 +224,52 @@ fn parse_model_json(raw_output: &str) -> Result<(Value, String), String> {
     }
 
     Ok((value, trimmed.to_owned()))
+}
+
+#[cfg(test)]
+mod output_envelope_tests {
+    use super::*;
+
+    #[test]
+    fn parse_model_json_rejects_markdown_fences() {
+        let raw = "```json\n{\"output\":{\"status\":\"ok\"},\"actions\":[]}\n```";
+
+        assert_eq!(
+            parse_model_json(raw).unwrap_err(),
+            format!("invalid model JSON: markdown fences are not allowed: {raw}")
+        );
+    }
+
+    #[test]
+    fn parse_model_json_rejects_nested_actions() {
+        let raw = "{\"output\":{\"status\":\"ok\",\"actions\":[]},\"actions\":[]}";
+
+        assert_eq!(
+            parse_model_json(raw).unwrap_err(),
+            "model JSON output must not contain actions"
+        );
+    }
+
+    #[test]
+    fn model_actions_rejects_extra_top_level_keys() {
+        let (json, _) =
+            parse_model_json("{\"output\":{\"status\":\"ok\"},\"actions\":[],\"extra\":true}")
+                .unwrap();
+
+        assert_eq!(
+            model_actions(&json).unwrap_err(),
+            "model JSON unsupported top-level key: extra"
+        );
+    }
+
+    #[test]
+    fn model_actions_rejects_non_object_entries() {
+        let (json, _) =
+            parse_model_json("{\"output\":{\"status\":\"ok\"},\"actions\":[\"bad\"]}").unwrap();
+
+        assert_eq!(
+            model_actions(&json).unwrap_err(),
+            "model JSON actions must contain objects"
+        );
+    }
 }

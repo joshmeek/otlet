@@ -3,14 +3,15 @@ unsafe fn fdw_private_from_pushdown(pushdown: &SemanticPushdown) -> *mut pg_sys:
         if !pushdown.has_filters() {
             return ptr::null_mut();
         }
-        let subjects = match &pushdown.subjects {
-            SubjectPushdown::None => Value::Null,
-            SubjectPushdown::Subjects(subject_ids) => json!(subject_ids),
-        };
-        let payload = json!({ "subjects": subjects });
         let mut list = ptr::null_mut();
         list = append_string_node(list, FDW_PRIVATE_MARKER);
-        append_string_node(list, &payload.to_string())
+        if let SubjectPushdown::Subjects(subject_ids) = &pushdown.subjects {
+            list = append_string_node(list, FDW_PRIVATE_SUBJECTS_MARKER);
+            for subject_id in subject_ids {
+                list = append_string_node(list, subject_id);
+            }
+        }
+        list
     }
 }
 
@@ -23,7 +24,7 @@ unsafe fn semantic_pushdown_from_fdw_private(
         }
         let scan = (*node).ss.ps.plan as *mut pg_sys::ForeignScan;
         let private = (*scan).fdw_private;
-        if private.is_null() || pg_sys::list_length(private) < 2 {
+        if private.is_null() || pg_sys::list_length(private) < 1 {
             return SemanticPushdown::none();
         }
         let Some(marker) = string_node_value(pg_sys::list_nth(private, 0) as *mut pg_sys::String)
@@ -33,29 +34,29 @@ unsafe fn semantic_pushdown_from_fdw_private(
         if marker != FDW_PRIVATE_MARKER {
             return SemanticPushdown::none();
         }
-        let Some(payload_text) =
+        if pg_sys::list_length(private) < 2 {
+            return SemanticPushdown::none();
+        }
+        let Some(subjects_marker) =
             string_node_value(pg_sys::list_nth(private, 1) as *mut pg_sys::String)
         else {
             return SemanticPushdown::none();
         };
-        let Ok(payload) = serde_json::from_str::<Value>(&payload_text) else {
+        if subjects_marker != FDW_PRIVATE_SUBJECTS_MARKER {
             return SemanticPushdown::none();
-        };
-        let subjects = payload
-            .get("subjects")
-            .and_then(Value::as_array)
-            .map(|values| {
-                values
-                    .iter()
-                    .filter_map(Value::as_str)
-                    .map(str::to_string)
-                    .collect::<Vec<_>>()
-            });
+        }
+
+        let mut subjects = Vec::new();
+        for idx in 2..pg_sys::list_length(private) {
+            if let Some(subject_id) =
+                string_node_value(pg_sys::list_nth(private, idx) as *mut pg_sys::String)
+            {
+                subjects.push(subject_id);
+            }
+        }
 
         SemanticPushdown {
-            subjects: subjects
-                .map(SubjectPushdown::Subjects)
-                .unwrap_or(SubjectPushdown::None),
+            subjects: SubjectPushdown::Subjects(subjects),
         }
     }
 }

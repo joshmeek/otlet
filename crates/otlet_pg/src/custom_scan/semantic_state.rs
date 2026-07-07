@@ -8,9 +8,17 @@ fn load_semantic_states(
     }
     pgrx::Spi::connect(|client| {
         let metadata_query = format!(
-            "SELECT source_table, subject_column, task_name, record_type \
-             FROM otlet.semantic_indexes \
-             WHERE name = {} \
+            "SELECT \
+               si.source_table, \
+               si.subject_column, \
+               quote_nullable(si.input_columns)::text AS input_columns_sql, \
+               quote_nullable(t.input_shaping::text)::text AS input_shaping_sql, \
+               si.task_name, \
+               si.record_type, \
+               otlet.task_contract_hash(t.instruction, t.output_schema, t.model_name, t.runtime_options, t.input_shaping, t.decision_contract) AS contract_hash \
+             FROM otlet.semantic_indexes si \
+             JOIN otlet.tasks t ON t.name = si.task_name \
+             WHERE si.name = {} \
              LIMIT 1",
             sql_literal(index_name)
         );
@@ -33,27 +41,34 @@ fn load_semantic_states(
             .get_by_name::<String, _>("task_name")
             .map_err(to_string)?
             .ok_or_else(|| format!("otlet semantic index {index_name} has no task"))?;
+        let input_columns_sql = row
+            .get_by_name::<String, _>("input_columns_sql")
+            .map_err(to_string)?
+            .unwrap_or_else(|| "NULL".to_owned());
+        let input_shaping_sql = row
+            .get_by_name::<String, _>("input_shaping_sql")
+            .map_err(to_string)?
+            .unwrap_or_else(|| "'{}'".to_owned());
         let record_type = row
             .get_by_name::<String, _>("record_type")
             .map_err(to_string)?
             .ok_or_else(|| format!("otlet semantic index {index_name} has no record type"))?;
-        let source_rows_sql = source_rows_sql(&source_table, &subject_column);
+        let contract_hash = row
+            .get_by_name::<String, _>("contract_hash")
+            .map_err(to_string)?
+            .ok_or_else(|| format!("otlet semantic index {index_name} has no contract hash"))?;
+        let source_rows_sql = source_rows_sql(
+            &source_table,
+            &subject_column,
+            &input_columns_sql,
+            &input_shaping_sql,
+        );
         let matches_expected_sql = row_predicate_match_sql("sm.body", expected_json);
+        let contract_hash_sql = sql_literal(&contract_hash);
+        let freshness_status_sql =
+            semantic_freshness_status_sql("l", "src.content_hash", &contract_hash_sql, "src.source_hash");
         let query = format!(
-            "WITH latest_materializations AS ( \
-           SELECT DISTINCT ON (sm.subject_id) \
-             sm.subject_id, \
-             sm.stale, \
-             sm.source_hash, \
-             {} AS matches_expected, \
-             sm.updated_at, \
-             sm.id \
-           FROM otlet.semantic_materializations sm \
-           WHERE sm.task_name = {} \
-             AND sm.record_type = {} \
-           ORDER BY sm.subject_id, sm.updated_at DESC, sm.id DESC \
-         ), \
-         active_jobs AS ( \
+            "WITH active_jobs AS ( \
            SELECT DISTINCT j.subject_id \
            FROM otlet.jobs j \
            WHERE j.task_name = {} \
@@ -62,33 +77,63 @@ fn load_semantic_states(
          source_rows AS ( \
            {} \
          ), \
+         latest_materializations AS ( \
+           SELECT DISTINCT ON (sm.subject_id) \
+             sm.subject_id, \
+             sm.stale, \
+             sm.source_hash, \
+             sm.content_hash, \
+	             sm.contract_hash, \
+	             sm.stale_reason, \
+	             sm.freshness_basis, \
+	             {} AS matches_expected, \
+             sm.updated_at, \
+             sm.id \
+           FROM source_rows src \
+           JOIN otlet.semantic_materializations sm \
+             ON sm.subject_id = src.subject_id \
+           WHERE sm.task_name = {} \
+             AND sm.record_type = {} \
+           ORDER BY sm.subject_id, \
+             (sm.content_hash IS NOT DISTINCT FROM src.content_hash AND sm.contract_hash IS NOT DISTINCT FROM {}) DESC, \
+             sm.updated_at DESC, sm.id DESC \
+         ), \
          semantic_state AS ( \
            SELECT \
              src.subject_id, \
-             CASE \
-               WHEN a.subject_id IS NOT NULL AND (l.subject_id IS NULL OR l.stale OR l.source_hash IS DISTINCT FROM src.source_hash) THEN 'in_flight' \
-               WHEN l.subject_id IS NULL THEN 'missing' \
-               WHEN l.stale OR l.source_hash IS DISTINCT FROM src.source_hash THEN 'stale' \
-               WHEN l.matches_expected THEN 'fresh_match' \
-               ELSE 'fresh_non_match' \
-             END AS semantic_state \
+	             CASE \
+	               WHEN a.subject_id IS NOT NULL AND (l.subject_id IS NULL OR status.is_stale) THEN 'in_flight' \
+	               WHEN l.subject_id IS NULL THEN 'missing' \
+	               WHEN status.is_stale THEN 'stale' \
+	               WHEN l.matches_expected THEN 'fresh_match' \
+	               ELSE 'fresh_non_match' \
+	             END AS semantic_state, \
+	             CASE \
+	               WHEN status.freshness_basis = 'content_hash_match' THEN COALESCE(l.freshness_basis, status.freshness_basis) \
+	               ELSE status.freshness_basis \
+	             END AS freshness_basis \
            FROM source_rows src \
            LEFT JOIN latest_materializations l USING (subject_id) \
+           LEFT JOIN LATERAL {} status ON l.subject_id IS NOT NULL \
            LEFT JOIN active_jobs a USING (subject_id) \
          ) \
-         SELECT subject_id, semantic_state \
-         FROM semantic_state \
+	         SELECT subject_id, semantic_state, freshness_basis \
+	         FROM semantic_state \
          ORDER BY subject_id NULLS LAST",
+            sql_literal(&task_name),
+            source_rows_sql,
             matches_expected_sql,
             sql_literal(&task_name),
             sql_literal(&record_type),
-            sql_literal(&task_name),
-            source_rows_sql
+            contract_hash_sql,
+            freshness_status_sql
         );
         let table = client
             .select(query.as_str(), None, &[])
             .map_err(to_string)?;
         let mut subjects = HashMap::new();
+        let mut freshness_basis_counts = BTreeMap::new();
+        let mut freshness_basis_by_subject = HashMap::new();
         for row in table {
             if let Some(subject_id) = row
                 .get_by_name::<String, _>("subject_id")
@@ -99,6 +144,18 @@ fn load_semantic_states(
                     .map_err(to_string)?
                     .and_then(|state| SubjectSemanticState::from_label(&state))
                 {
+                    if matches!(
+                        state,
+                        SubjectSemanticState::FreshMatch | SubjectSemanticState::FreshNonMatch
+                    ) && let Some(freshness_basis) = row
+                        .get_by_name::<String, _>("freshness_basis")
+                        .map_err(to_string)?
+                    {
+                        *freshness_basis_counts
+                            .entry(freshness_basis.clone())
+                            .or_insert(0) += 1;
+                        freshness_basis_by_subject.insert(subject_id.clone(), freshness_basis);
+                    }
                     subjects.insert(subject_id, state);
                 }
             }
@@ -107,6 +164,8 @@ fn load_semantic_states(
             source_table,
             task_name,
             record_type,
+            freshness_basis_counts: freshness_basis_counts_json(&freshness_basis_counts),
+            freshness_basis_by_subject,
             subjects,
         })
     })
@@ -143,8 +202,8 @@ fn load_semantic_join_states(
             .ok_or_else(|| format!("otlet semantic join index {index_name} has no record type"))?;
         let query = format!(
             "WITH current_rows AS ( \
-               SELECT subject_id, body, stale \
-               FROM otlet.semantic_join_index_current_rows({}, false) \
+	               SELECT subject_id, body, stale, freshness_basis \
+	               FROM otlet.semantic_join_index_current_rows({}, false) \
              ), \
              active_jobs AS ( \
                SELECT DISTINCT subject_id \
@@ -154,14 +213,15 @@ fn load_semantic_join_states(
              ) \
              SELECT \
                COALESCE(c.subject_id, a.subject_id) AS subject_id, \
-               CASE \
-                 WHEN a.subject_id IS NOT NULL AND (c.subject_id IS NULL OR c.stale) THEN 'in_flight' \
-                 WHEN c.subject_id IS NULL THEN 'missing' \
-                 WHEN c.stale THEN 'stale' \
-                 WHEN c.body @> {}::jsonb THEN 'fresh_match' \
-                 ELSE 'fresh_non_match' \
-               END AS semantic_state \
-             FROM current_rows c \
+	               CASE \
+	                 WHEN a.subject_id IS NOT NULL AND (c.subject_id IS NULL OR c.stale) THEN 'in_flight' \
+	                 WHEN c.subject_id IS NULL THEN 'missing' \
+	                 WHEN c.stale THEN 'stale' \
+	                 WHEN c.body @> {}::jsonb THEN 'fresh_match' \
+	                 ELSE 'fresh_non_match' \
+	               END AS semantic_state, \
+	               c.freshness_basis \
+	             FROM current_rows c \
              FULL JOIN active_jobs a USING (subject_id) \
              ORDER BY subject_id NULLS LAST",
             sql_literal(index_name),
@@ -172,6 +232,8 @@ fn load_semantic_join_states(
             .select(query.as_str(), None, &[])
             .map_err(to_string)?;
         let mut subjects = HashMap::new();
+        let mut freshness_basis_counts = BTreeMap::new();
+        let mut freshness_basis_by_subject = HashMap::new();
         for row in table {
             if let Some(subject_id) = row
                 .get_by_name::<String, _>("subject_id")
@@ -182,6 +244,18 @@ fn load_semantic_join_states(
                     .map_err(to_string)?
                     .and_then(|state| SubjectSemanticState::from_label(&state))
                 {
+                    if matches!(
+                        state,
+                        SubjectSemanticState::FreshMatch | SubjectSemanticState::FreshNonMatch
+                    ) && let Some(freshness_basis) = row
+                        .get_by_name::<String, _>("freshness_basis")
+                        .map_err(to_string)?
+                    {
+                        *freshness_basis_counts
+                            .entry(freshness_basis.clone())
+                            .or_insert(0) += 1;
+                        freshness_basis_by_subject.insert(subject_id.clone(), freshness_basis);
+                    }
                     subjects.insert(subject_id, state);
                 }
             }
@@ -190,7 +264,13 @@ fn load_semantic_join_states(
             source_table: format!("otlet.semantic_join:{index_name}"),
             task_name,
             record_type,
+            freshness_basis_counts: freshness_basis_counts_json(&freshness_basis_counts),
+            freshness_basis_by_subject,
             subjects,
         })
     })
+}
+
+fn freshness_basis_counts_json(counts: &BTreeMap<String, u64>) -> String {
+    serde_json::to_string(counts).unwrap_or_else(|_| "{}".to_string())
 }

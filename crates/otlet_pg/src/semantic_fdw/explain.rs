@@ -27,6 +27,7 @@ unsafe extern "C-unwind" fn otlet_semantic_explain_foreign_scan(
                 },
                 es,
             );
+            explain_text("Plan Source", &snapshot.plan.plan_source, es);
             explain_text("Selected Path", &snapshot.plan.selected_path, es);
             explain_text("Reason", &snapshot.plan.reason, es);
             explain_text("Task Name", &snapshot.plan.task_name, es);
@@ -44,6 +45,8 @@ unsafe extern "C-unwind" fn otlet_semantic_explain_foreign_scan(
             explain_integer("Queue Subjects", snapshot.plan.queue_subjects, es);
             explain_integer("Infer Now Subjects", snapshot.plan.infer_now_subjects, es);
             explain_integer("Fail Closed Subjects", snapshot.plan.fail_closed_subjects, es);
+            explain_text("Stale Reasons", &snapshot.plan.stale_reasons, es);
+            explain_text("Count Basis", &snapshot.plan.count_basis, es);
             explain_float("Freshness", snapshot.plan.freshness, "", es);
             explain_float("Model Cost", snapshot.plan.model_ms, "ms", es);
             explain_text("Model Cost Source", &snapshot.plan.model_cost_source, es);

@@ -20,7 +20,7 @@ unsafe fn find_semantic_match_predicate(
                     if rte_kind != pg_sys::RTEKind::RTE_RELATION {
                         continue;
                     }
-                    validate_semantic_index_source(
+                    let (stats, input_columns) = validate_semantic_index_source(
                         &predicate.index_name,
                         relid,
                         predicate.subject_attno,
@@ -30,7 +30,9 @@ unsafe fn find_semantic_match_predicate(
                         predicate.infer_ms,
                         predicate.infer_max_rows,
                         predicate.auto_policy,
-                    )
+                    )?;
+                    predicate.input_columns = input_columns;
+                    Some(stats)
                 }
                 SemanticIndexKind::Join => {
                     if rte_kind != pg_sys::RTEKind::RTE_SUBQUERY {
@@ -83,6 +85,7 @@ unsafe fn semantic_match_from_clause(
             subject_typid: parts.subject.typid,
             restrict_info: ptr::null_mut(),
             estimated_rows: 1.0,
+            input_columns: None,
             planner_stats: planner_stats_unknown(),
         })
     }

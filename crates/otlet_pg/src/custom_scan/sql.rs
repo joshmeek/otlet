@@ -26,7 +26,12 @@ fn sql_identifier(value: &str) -> String {
     format!("\"{}\"", value.replace('"', "\"\""))
 }
 
-fn source_rows_sql(source_table: &str, subject_column: &str) -> String {
+fn source_rows_sql(
+    source_table: &str,
+    subject_column: &str,
+    input_columns_sql: &str,
+    input_shaping_sql: &str,
+) -> String {
     let subject_identifier = sql_identifier(subject_column);
     let source_table_literal = sql_literal(source_table);
     format!(
@@ -39,8 +44,18 @@ fn source_rows_sql(source_table: &str, subject_column: &str) -> String {
                     'xmin', src.xmin::text \
                   ), \
                   'table', {source_table_literal}, \
-                  'row', to_jsonb(src) \
-                )::text) AS source_hash \
+                  'row', otlet.semantic_project_row(to_jsonb(src), {input_columns_sql}::text[]) \
+                )::text) AS source_hash, \
+                otlet.semantic_content_hash(jsonb_build_object( \
+                  '_otlet_mvcc', jsonb_build_object( \
+                    'table', {source_table_literal}, \
+                    'subject_id', (src.{subject_identifier})::text, \
+                    'ctid', src.ctid::text, \
+                    'xmin', src.xmin::text \
+                  ), \
+                  'table', {source_table_literal}, \
+                  'row', otlet.semantic_project_row(to_jsonb(src), {input_columns_sql}::text[]) \
+                ), {input_shaping_sql}::jsonb) AS content_hash \
          FROM {source_table} AS src"
     )
 }

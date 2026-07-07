@@ -5,9 +5,12 @@ AS $$
   WITH policy AS (
     SELECT
       worker_claim_batch_size AS batch_size,
+      worker_claim_task_cursor AS task_cursor,
       max_attempts,
       job_lease_interval
     FROM otlet.production_policy
+    WHERE name = 'default'
+    FOR UPDATE
   ),
   active_model AS (
     SELECT
@@ -24,13 +27,16 @@ AS $$
     JOIN otlet.tasks t ON t.name = j.task_name
     GROUP BY t.model_name
   ),
-  first_job AS (
+  eligible_tasks AS (
     SELECT
-      j.id,
       j.task_name,
       m.name AS model_name,
       m.runtime_name,
-      m.artifact_path
+      m.artifact_path,
+      bool_or(s.status = 'ready' AND s.artifact_path IS NOT DISTINCT FROM m.artifact_path) AS warm_model,
+      min(CASE WHEN j.status IN ('running', 'cancel_requested') AND (j.leased_until IS NULL OR j.leased_until < now()) THEN 0 ELSE 1 END) AS retry_rank,
+      min(j.created_at) AS first_created_at,
+      min(j.id) AS first_job_id
     FROM otlet.jobs j
     JOIN otlet.tasks t ON t.name = j.task_name
     JOIN otlet.models m ON m.name = t.model_name
@@ -55,12 +61,27 @@ AS $$
         COALESCE(active_model.running_jobs, 0)
         + COALESCE(active_model.cancel_requested_jobs, 0)
       ) < m.max_active_jobs
+    GROUP BY
+      j.task_name,
+      m.name,
+      m.runtime_name,
+      m.artifact_path
+  ),
+  selected_task AS (
+    SELECT e.*
+    FROM eligible_tasks e
+    CROSS JOIN policy p
     ORDER BY
-      CASE WHEN s.status = 'ready' AND s.artifact_path IS NOT DISTINCT FROM m.artifact_path THEN 0 ELSE 1 END,
-      CASE WHEN j.status IN ('running', 'cancel_requested') AND (j.leased_until IS NULL OR j.leased_until < now()) THEN 0 ELSE 1 END,
-      j.created_at,
-      j.id
-    FOR UPDATE OF j SKIP LOCKED
+      CASE
+        WHEN COALESCE(p.task_cursor, '') = '' THEN 0
+        WHEN e.task_name > p.task_cursor THEN 0
+        ELSE 1
+      END,
+      e.retry_rank,
+      CASE WHEN e.warm_model THEN 0 ELSE 1 END,
+      e.task_name,
+      e.first_created_at,
+      e.first_job_id
     LIMIT 1
   ),
   claimable AS (
@@ -68,7 +89,7 @@ AS $$
     FROM otlet.jobs j
     JOIN otlet.tasks t ON t.name = j.task_name
     JOIN otlet.models m ON m.name = t.model_name
-    JOIN first_job f
+    JOIN selected_task f
       ON f.task_name = j.task_name
      AND f.model_name = m.name
      AND f.runtime_name = m.runtime_name
@@ -87,12 +108,19 @@ AS $$
         )
       )
     ORDER BY
-      CASE WHEN j.id = f.id THEN 0 ELSE 1 END,
+      CASE WHEN j.id = f.first_job_id THEN 0 ELSE 1 END,
       CASE WHEN j.status IN ('running', 'cancel_requested') AND (j.leased_until IS NULL OR j.leased_until < now()) THEN 0 ELSE 1 END,
       j.created_at,
       j.id
     FOR UPDATE OF j SKIP LOCKED
     LIMIT (SELECT batch_size FROM policy)
+  ),
+  advance_cursor AS (
+    UPDATE otlet.production_policy p
+    SET worker_claim_task_cursor = (SELECT task_name FROM selected_task)
+    WHERE p.name = 'default'
+      AND EXISTS (SELECT 1 FROM claimable)
+    RETURNING p.worker_claim_task_cursor
   ),
   updated AS (
     UPDATE otlet.jobs j
@@ -105,6 +133,7 @@ AS $$
         finished_at = NULL
     FROM claimable
     CROSS JOIN policy p
+    CROSS JOIN advance_cursor
     WHERE j.id = claimable.id
     RETURNING j.*
   )
@@ -437,21 +466,22 @@ $$;
 CREATE FUNCTION otlet.action_validation_error(
   action jsonb,
   output jsonb DEFAULT NULL,
-  job_subject_id text DEFAULT NULL
+  job_subject_id text DEFAULT NULL,
+  job_input jsonb DEFAULT NULL
 ) RETURNS text
 LANGUAGE plpgsql
 STABLE
 AS $$
 DECLARE
   v_action_type text := COALESCE(action ->> 'type', '');
-  body jsonb := action -> 'body';
-  output_match text := NULLIF(output ->> 'match', '');
-  output_confidence text := NULLIF(output ->> 'confidence', '');
-  action_confidence text;
-  output_rank int;
-  action_rank int;
+  body jsonb;
+  schema_row otlet.action_type_schemas%ROWTYPE;
   expected_left_id text;
   expected_right_id text;
+  output_confidence text := NULLIF(output ->> 'confidence', '');
+  output_rank int;
+  action_rank int;
+  unsupported_key text;
 BEGIN
   IF jsonb_typeof(action) IS DISTINCT FROM 'object' THEN
     RETURN 'action must be an object';
@@ -461,151 +491,126 @@ BEGIN
     RETURN 'action missing type';
   END IF;
 
-  IF EXISTS (
-    SELECT 1
-    FROM jsonb_object_keys(action) AS key
-    WHERE key NOT IN ('type', 'body')
-  ) THEN
-    RETURN 'action has unsupported key';
+  SELECT *
+  INTO schema_row
+  FROM otlet.action_type_schemas s
+  WHERE s.action_type = v_action_type;
+
+  IF NOT FOUND THEN
+    RETURN 'unsupported action type';
   END IF;
 
-  IF NOT EXISTS (
-    SELECT 1
-    FROM otlet.action_type_schemas s
-    WHERE s.action_type = v_action_type
-  ) THEN
-    RETURN 'unsupported action type';
+  body := CASE
+    WHEN v_action_type = 'create_record' THEN action - 'type'
+    ELSE action -> 'body'
+  END;
+
+  IF v_action_type <> 'create_record' THEN
+    SELECT key
+    INTO unsupported_key
+    FROM jsonb_object_keys(action) AS key
+    WHERE key NOT IN ('type', 'body')
+    ORDER BY key
+    LIMIT 1;
+
+    IF unsupported_key IS NOT NULL THEN
+      RETURN 'action has unsupported key';
+    END IF;
   END IF;
 
   IF jsonb_typeof(body) IS DISTINCT FROM 'object' THEN
     RETURN 'action body must be an object';
   END IF;
 
-  IF job_subject_id LIKE '%:%' THEN
-    expected_left_id := split_part(job_subject_id, ':', 1);
-    expected_right_id := split_part(job_subject_id, ':', 2);
-  END IF;
+  expected_left_id := NULLIF(job_input #>> '{action_ids,left_id}', '');
+  expected_right_id := NULLIF(job_input #>> '{action_ids,right_id}', '');
 
-  IF output_confidence IS NOT NULL THEN
-    output_rank := CASE output_confidence
-      WHEN 'low' THEN 1
-      WHEN 'medium' THEN 2
-      WHEN 'high' THEN 3
-      ELSE NULL
-    END;
-  END IF;
+  output_rank := CASE output_confidence WHEN 'low' THEN 1 WHEN 'medium' THEN 2 WHEN 'high' THEN 3 ELSE NULL END;
 
   IF v_action_type = 'create_record' THEN
-    IF NULLIF(action ->> 'record_type', '') IS NULL THEN
+    IF NULLIF(body ->> 'record_type', '') IS NULL THEN
       RETURN 'create_record missing record_type';
+    ELSIF NULLIF(body ->> 'subject_id', '') IS NULL THEN
+      RETURN 'create_record missing subject_id';
+    ELSIF jsonb_typeof(body -> 'body') IS DISTINCT FROM 'object' THEN
+      RETURN 'create_record missing body';
     END IF;
-    RETURN NULL;
-  END IF;
-
-  IF v_action_type = 'merge_candidate' THEN
-    IF output_match IS NOT NULL AND output_match <> 'same_entity' THEN
-      RETURN 'merge_candidate requires same_entity output';
+    SELECT key
+    INTO unsupported_key
+    FROM jsonb_object_keys(body) AS key
+    WHERE key NOT IN ('record_type', 'subject_id', 'body')
+    ORDER BY key
+    LIMIT 1;
+    IF unsupported_key IS NOT NULL THEN
+      RETURN 'create_record unsupported payload field: ' || unsupported_key;
     END IF;
+  ELSIF v_action_type = 'merge_candidate' THEN
     IF NULLIF(body ->> 'left_id', '') IS NULL THEN
       RETURN 'merge_candidate missing left_id';
-    END IF;
-    IF NULLIF(body ->> 'right_id', '') IS NULL THEN
+    ELSIF NULLIF(body ->> 'right_id', '') IS NULL THEN
       RETURN 'merge_candidate missing right_id';
-    END IF;
-    IF expected_left_id IS NOT NULL
-       AND (body ->> 'left_id' <> expected_left_id OR body ->> 'right_id' <> expected_right_id) THEN
+    ELSIF NULLIF(body ->> 'reason', '') IS NULL THEN
+      RETURN 'merge_candidate missing reason';
+    ELSIF NULLIF(output ->> 'match', '') IS NOT NULL AND output ->> 'match' <> 'same_entity' THEN
+      RETURN 'merge_candidate requires same_entity output';
+    ELSIF expected_left_id IS NULL OR expected_right_id IS NULL THEN
+      RETURN 'merge_candidate requires input.action_ids left_id and right_id';
+    ELSIF body ->> 'left_id' <> expected_left_id OR body ->> 'right_id' <> expected_right_id THEN
       RETURN 'merge_candidate subject ids must match job subject_id';
-    END IF;
-    action_confidence := body ->> 'confidence';
-    IF action_confidence NOT IN ('low', 'medium', 'high') THEN
+    ELSIF body ? 'confidence' AND body ->> 'confidence' NOT IN ('low', 'medium', 'high') THEN
       RETURN 'merge_candidate confidence must be low, medium, or high';
     END IF;
-    action_rank := CASE action_confidence WHEN 'low' THEN 1 WHEN 'medium' THEN 2 WHEN 'high' THEN 3 END;
-    IF output_rank IS NOT NULL AND action_rank > output_rank THEN
+    action_rank := CASE body ->> 'confidence' WHEN 'low' THEN 1 WHEN 'medium' THEN 2 WHEN 'high' THEN 3 ELSE NULL END;
+    IF output_rank IS NOT NULL AND action_rank IS NOT NULL AND action_rank > output_rank THEN
       RETURN 'merge_candidate confidence cannot exceed output confidence';
     END IF;
-    IF NULLIF(body ->> 'reason', '') IS NULL THEN
-      RETURN 'merge_candidate missing reason';
-    END IF;
     IF body ? 'evidence'
-       AND COALESCE(jsonb_typeof(body -> 'evidence'), '') NOT IN ('array', 'string') THEN
-      RETURN 'merge_candidate evidence must be an array or string';
-    END IF;
-    IF body ? 'evidence'
-       AND ((jsonb_typeof(body -> 'evidence') = 'array' AND jsonb_array_length(body -> 'evidence') = 0)
-       OR (jsonb_typeof(body -> 'evidence') = 'string' AND btrim(body ->> 'evidence') = '')) THEN
+       AND NOT (
+         (jsonb_typeof(body -> 'evidence') = 'array' AND jsonb_array_length(body -> 'evidence') > 0)
+         OR (jsonb_typeof(body -> 'evidence') = 'string' AND btrim(body ->> 'evidence') <> '')
+       ) THEN
       RETURN 'merge_candidate missing decisive evidence';
     END IF;
-    RETURN NULL;
-  END IF;
-
-  IF v_action_type = 'new_entity' THEN
-    IF output_match IS NOT NULL AND output_match <> 'different_entity' THEN
-      RETURN 'new_entity requires different_entity output';
-    END IF;
+  ELSIF v_action_type = 'new_entity' THEN
     IF NULLIF(body ->> 'entity_id', '') IS NULL THEN
       RETURN 'new_entity missing entity_id';
-    END IF;
-    IF expected_right_id IS NOT NULL AND body ->> 'entity_id' <> expected_right_id THEN
+    ELSIF NULLIF(body ->> 'reason', '') IS NULL THEN
+      RETURN 'new_entity missing reason';
+    ELSIF NULLIF(output ->> 'match', '') IS NOT NULL AND output ->> 'match' <> 'different_entity' THEN
+      RETURN 'new_entity requires different_entity output';
+    ELSIF expected_right_id IS NULL THEN
+      RETURN 'new_entity requires input.action_ids right_id';
+    ELSIF body ->> 'entity_id' <> expected_right_id THEN
       RETURN 'new_entity entity_id must match job right subject_id';
     END IF;
-    IF NULLIF(body ->> 'reason', '') IS NULL THEN
-      RETURN 'new_entity missing reason';
-    END IF;
     IF body ? 'evidence'
-       AND COALESCE(jsonb_typeof(body -> 'evidence'), '') NOT IN ('array', 'string') THEN
-      RETURN 'new_entity evidence must be an array or string';
-    END IF;
-    IF body ? 'evidence'
-       AND ((jsonb_typeof(body -> 'evidence') = 'array' AND jsonb_array_length(body -> 'evidence') = 0)
-       OR (jsonb_typeof(body -> 'evidence') = 'string' AND btrim(body ->> 'evidence') = '')) THEN
+       AND NOT (
+         (jsonb_typeof(body -> 'evidence') = 'array' AND jsonb_array_length(body -> 'evidence') > 0)
+         OR (jsonb_typeof(body -> 'evidence') = 'string' AND btrim(body ->> 'evidence') <> '')
+       ) THEN
       RETURN 'new_entity missing separation evidence';
     END IF;
-    RETURN NULL;
-  END IF;
-
-  IF v_action_type = 'review_flag' THEN
-    IF output_match IS NOT NULL AND output_match <> 'unclear' THEN
+  ELSIF v_action_type = 'review_flag' THEN
+    IF NULLIF(body ->> 'reason', '') IS NULL THEN
+      RETURN 'review_flag missing reason';
+    ELSIF body ? 'severity' AND body ->> 'severity' NOT IN ('low', 'medium', 'high') THEN
+      RETURN 'review_flag severity must be low, medium, or high';
+    ELSIF NULLIF(output ->> 'match', '') IS NOT NULL AND output ->> 'match' <> 'unclear' THEN
       RETURN 'review_flag requires unclear output';
-    END IF;
-    IF expected_left_id IS NOT NULL
+    ELSIF expected_left_id IS NOT NULL
        AND NULLIF(body ->> 'left_id', '') IS NOT NULL
        AND (body ->> 'left_id' <> expected_left_id OR body ->> 'right_id' <> expected_right_id) THEN
       RETURN 'review_flag subject ids must match job subject_id';
     END IF;
-    IF NULLIF(body ->> 'reason', '') IS NULL THEN
-      RETURN 'review_flag missing reason';
-    END IF;
-    IF body ->> 'severity' NOT IN ('low', 'medium', 'high') THEN
-      RETURN 'review_flag severity must be low, medium, or high';
-    END IF;
-    RETURN NULL;
-  END IF;
-
-  IF v_action_type = 'note' THEN
+  ELSIF v_action_type = 'note' THEN
     IF NULLIF(body ->> 'subject_id', '') IS NULL THEN
       RETURN 'note missing subject_id';
-    END IF;
-    IF NULLIF(body ->> 'text', '') IS NULL THEN
+    ELSIF NULLIF(body ->> 'text', '') IS NULL THEN
       RETURN 'note missing text';
     END IF;
-    RETURN NULL;
   END IF;
 
-  IF v_action_type = 'follow_up_job' THEN
-    IF NULLIF(body ->> 'task_name', '') IS NULL THEN
-      RETURN 'follow_up_job missing task_name';
-    END IF;
-    IF NULLIF(body ->> 'subject_id', '') IS NULL THEN
-      RETURN 'follow_up_job missing subject_id';
-    END IF;
-    IF NULLIF(body ->> 'reason', '') IS NULL THEN
-      RETURN 'follow_up_job missing reason';
-    END IF;
-    RETURN NULL;
-  END IF;
-
-  RETURN 'unsupported action type';
+  RETURN NULL;
 END;
 $$;
 
@@ -745,7 +750,17 @@ BEGIN
       ELSE '{}'::jsonb
     END;
     action_type_name := COALESCE(NULLIF(action ->> 'type', ''), 'invalid');
-    action_error := otlet.action_validation_error(action, complete_job.output, job_row.subject_id);
+    action_error := otlet.action_validation_error(action, complete_job.output, job_row.subject_id, job_row.input);
+    IF action_error IS NULL
+       AND EXISTS (
+         SELECT 1
+         FROM otlet.watches w
+         WHERE w.task_name = job_row.task_name
+           AND cardinality(w.action_types) > 0
+           AND NOT action_type_name = ANY(w.action_types)
+       ) THEN
+      action_error := 'action type ' || action_type_name || ' is not allowed by watch';
+    END IF;
     action_requires_approval := false;
     action_creates_record := false;
     IF action_error IS NULL THEN
@@ -785,6 +800,7 @@ BEGIN
       subject_id,
       source_table,
       source_hash,
+      content_hash,
       error
     )
     VALUES (
@@ -801,6 +817,7 @@ BEGIN
         complete_job.trace_summary #>> '{mvcc,source_hash}',
         md5((complete_job.trace_summary -> 'mvcc')::text)
       ),
+      otlet.semantic_content_hash(job_row.input, task_row.input_shaping),
       action_error
     )
     RETURNING id INTO saved_action_id;
@@ -826,7 +843,10 @@ BEGIN
 END;
 $$;
 
-CREATE FUNCTION otlet.approve_action(action_id bigint) RETURNS SETOF otlet.actions
+CREATE FUNCTION otlet.approve_action(
+  action_id bigint,
+  review_reason text DEFAULT NULL
+) RETURNS SETOF otlet.actions
 LANGUAGE plpgsql
 AS $$
 DECLARE
@@ -836,7 +856,8 @@ BEGIN
   SET status = 'approved',
       approval_status = 'approved',
       approved_at = now(),
-      error = NULL
+      error = NULL,
+      review_reason = NULLIF(approve_action.review_reason, '')
   WHERE id = approve_action.action_id
     AND status = 'proposed'
     AND approval_status = 'required'
@@ -850,7 +871,8 @@ $$;
 
 CREATE FUNCTION otlet.reject_action(
   action_id bigint,
-  reason text DEFAULT 'rejected'
+  reason text DEFAULT 'rejected',
+  review_reason text DEFAULT NULL
 ) RETURNS SETOF otlet.actions
 LANGUAGE plpgsql
 AS $$
@@ -860,7 +882,8 @@ BEGIN
   UPDATE otlet.actions
   SET status = 'rejected',
       approval_status = 'rejected',
-      error = reject_action.reason
+      error = reject_action.reason,
+      review_reason = COALESCE(NULLIF(reject_action.review_reason, ''), NULLIF(reject_action.reason, ''))
   WHERE id = reject_action.action_id
     AND status <> 'applied'
   RETURNING * INTO action_row;
@@ -871,31 +894,141 @@ BEGIN
 END;
 $$;
 
+CREATE FUNCTION otlet.current_task_subject_content_hash(
+  task_name text,
+  subject_id text
+) RETURNS text
+LANGUAGE plpgsql
+VOLATILE
+AS $$
+DECLARE
+  task_row otlet.tasks%ROWTYPE;
+  index_row otlet.semantic_indexes%ROWTYPE;
+  current_input jsonb;
+BEGIN
+  SELECT *
+  INTO task_row
+  FROM otlet.tasks t
+  WHERE t.name = current_task_subject_content_hash.task_name;
+
+  IF NOT FOUND THEN
+    RETURN NULL;
+  END IF;
+
+  SELECT *
+  INTO index_row
+  FROM otlet.semantic_indexes si
+  WHERE si.task_name = task_row.name;
+
+  IF FOUND THEN
+    EXECUTE format(
+      $sql$
+        SELECT jsonb_build_object(
+          '_otlet_mvcc', jsonb_build_object(
+            'table', %2$L,
+            'subject_id', (src.%1$I)::text,
+            'ctid', src.ctid::text,
+            'xmin', src.xmin::text
+          ),
+          'table', %2$L,
+          'row', otlet.semantic_project_row(to_jsonb(src), %4$L::text[])
+        )
+        FROM %3$s AS src
+        WHERE (src.%1$I)::text = $1
+        LIMIT 1
+      $sql$,
+      index_row.subject_column,
+      index_row.source_table,
+      index_row.source_table,
+      index_row.input_columns
+    )
+    INTO current_input
+    USING current_task_subject_content_hash.subject_id;
+
+    IF current_input IS NULL THEN
+      RETURN NULL;
+    END IF;
+
+    RETURN otlet.semantic_content_hash(current_input, task_row.input_shaping);
+  END IF;
+
+  IF NULLIF(task_row.input_query, '') IS NULL THEN
+    RETURN NULL;
+  END IF;
+
+  EXECUTE format(
+    'SELECT q.input FROM (%s) AS q WHERE q.subject_id = $1 LIMIT 1',
+    task_row.input_query
+  )
+  INTO current_input
+  USING current_task_subject_content_hash.subject_id;
+
+  IF current_input IS NULL THEN
+    RETURN NULL;
+  END IF;
+
+  RETURN otlet.semantic_content_hash(current_input, task_row.input_shaping);
+END;
+$$;
+
+CREATE FUNCTION otlet.validated_action_context(action_id bigint)
+RETURNS TABLE (
+  action_row otlet.actions,
+  schema_row otlet.action_type_schemas,
+  job_row otlet.jobs,
+  output_body jsonb,
+  current_content_hash text,
+  validation_error text
+)
+LANGUAGE plpgsql
+AS $$
+BEGIN
+  RETURN QUERY
+  SELECT
+    a,
+    s,
+    j,
+    o.output,
+    otlet.current_task_subject_content_hash(j.task_name, j.subject_id),
+    otlet.action_validation_error(a.payload, o.output, j.subject_id, j.input)
+  FROM otlet.actions a
+  JOIN otlet.jobs j ON j.id = a.job_id
+  LEFT JOIN otlet.action_type_schemas s ON s.action_type = a.action_type
+  LEFT JOIN otlet.outputs o ON o.id = a.output_id
+  WHERE a.id = validated_action_context.action_id
+  FOR UPDATE OF a;
+END;
+$$;
+
 CREATE FUNCTION otlet.dry_run_action(action_id bigint) RETURNS SETOF otlet.actions
 LANGUAGE plpgsql
 AS $$
 DECLARE
-  action_row otlet.actions%ROWTYPE;
+  context_row record;
   validation_error text;
+  action_row otlet.actions%ROWTYPE;
 BEGIN
   SELECT *
-  INTO action_row
-  FROM otlet.actions
-  WHERE id = dry_run_action.action_id
-  FOR UPDATE;
+  INTO context_row
+  FROM otlet.validated_action_context(dry_run_action.action_id);
 
   IF NOT FOUND THEN
     RETURN;
   END IF;
 
-  validation_error := otlet.action_validation_error(action_row.payload);
+  action_row := context_row.action_row;
+  validation_error := context_row.validation_error;
+  IF action_row.content_hash IS NOT NULL
+     AND context_row.current_content_hash IS DISTINCT FROM action_row.content_hash THEN
+    validation_error := 'source identity stale';
+  END IF;
   IF action_row.status = 'rejected' THEN
     validation_error := COALESCE(action_row.error, validation_error, 'rejected action cannot be dry-run');
   END IF;
 
   UPDATE otlet.actions
   SET dry_run_status = CASE WHEN validation_error IS NULL THEN 'passed' ELSE 'failed' END,
-      error = COALESCE(validation_error, error)
+      error = validation_error
   WHERE id = action_row.id
   RETURNING * INTO action_row;
 
@@ -907,7 +1040,9 @@ CREATE FUNCTION otlet.apply_action(action_id bigint) RETURNS SETOF otlet.actions
 LANGUAGE plpgsql
 AS $$
 DECLARE
+  context_row record;
   action_row otlet.actions%ROWTYPE;
+  schema_row otlet.action_type_schemas%ROWTYPE;
   validation_error text;
   next_status text;
   next_apply_status text;
@@ -915,20 +1050,25 @@ DECLARE
   next_applied_at timestamptz;
 BEGIN
   SELECT *
-  INTO action_row
-  FROM otlet.actions
-  WHERE id = apply_action.action_id
-  FOR UPDATE;
+  INTO context_row
+  FROM otlet.validated_action_context(apply_action.action_id);
 
   IF NOT FOUND THEN
     RETURN;
   END IF;
 
-  validation_error := otlet.action_validation_error(action_row.payload);
+  action_row := context_row.action_row;
+  schema_row := context_row.schema_row;
+  validation_error := context_row.validation_error;
   next_status := action_row.status;
   next_apply_status := action_row.apply_status;
   next_error := action_row.error;
   next_applied_at := action_row.applied_at;
+
+  IF action_row.content_hash IS NOT NULL
+     AND context_row.current_content_hash IS DISTINCT FROM action_row.content_hash THEN
+    validation_error := 'source identity stale';
+  END IF;
 
   IF validation_error IS NOT NULL THEN
     next_apply_status := 'failed';
@@ -939,7 +1079,7 @@ BEGIN
   ELSIF action_row.approval_status = 'required' THEN
     next_apply_status := 'failed';
     next_error := 'action requires approval';
-  ELSIF action_row.action_type IN ('create_record', 'note') THEN
+  ELSIF schema_row.applyable THEN
     next_status := 'applied';
     next_apply_status := 'applied';
     next_applied_at := now();
@@ -961,9 +1101,48 @@ BEGIN
 END;
 $$;
 
+CREATE FUNCTION otlet.output_schema_enum_values(
+  output_schema jsonb,
+  field_name text
+) RETURNS text[]
+LANGUAGE sql
+IMMUTABLE
+AS $$
+  SELECT CASE
+    WHEN jsonb_typeof(COALESCE($1, '{}'::jsonb) #> ARRAY['properties', COALESCE(NULLIF($2, ''), 'match'), 'enum']) = 'array'
+      THEN ARRAY(
+        SELECT value
+        FROM jsonb_array_elements_text(COALESCE($1, '{}'::jsonb) #> ARRAY['properties', COALESCE(NULLIF($2, ''), 'match'), 'enum']) AS enum_value(value)
+      )
+    ELSE NULL
+  END;
+$$;
+
+CREATE FUNCTION otlet.action_declared_answer(
+  action_type text,
+  answer_field text
+) RETURNS text
+LANGUAGE sql
+STABLE
+AS $$
+  SELECT CASE COALESCE(NULLIF($2, ''), 'match')
+    WHEN 'match' THEN CASE $1
+      WHEN 'merge_candidate' THEN 'same_entity'
+      WHEN 'new_entity' THEN 'different_entity'
+      WHEN 'review_flag' THEN 'unclear'
+      ELSE NULL
+    END
+    WHEN 'decision' THEN CASE $1
+      WHEN 'review_flag' THEN 'flag'
+      ELSE NULL
+    END
+    ELSE NULL
+  END;
+$$;
+
 CREATE FUNCTION otlet.label_action(
   action_id bigint,
-  expected_match text DEFAULT NULL,
+  expected_answer text DEFAULT NULL,
   expected_confidence text DEFAULT NULL,
   expected_action_type text DEFAULT NULL,
   reason text DEFAULT NULL,
@@ -973,11 +1152,20 @@ LANGUAGE plpgsql
 AS $$
 DECLARE
   action_row otlet.actions%ROWTYPE;
+  schema_row otlet.action_type_schemas%ROWTYPE;
+  task_row otlet.tasks%ROWTYPE;
   output_body jsonb;
   receipt_trace jsonb;
   saved_label otlet.eval_labels%ROWTYPE;
+  answer_field text;
+  confidence_field text;
+  answer_values text[];
+  abstain_values text[] := ARRAY[]::text[];
+  output_answer text;
+  action_answer text;
+  fallback_rejected_answer text;
   final_source text;
-  final_match text;
+  final_answer text;
   final_confidence text;
   final_action_type text;
 BEGIN
@@ -990,6 +1178,21 @@ BEGIN
     RETURN;
   END IF;
 
+  SELECT t.*
+  INTO task_row
+  FROM otlet.jobs j
+  JOIN otlet.tasks t ON t.name = j.task_name
+  WHERE j.id = action_row.job_id;
+
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'otlet label_action could not find task for action %', action_row.id;
+  END IF;
+
+  SELECT *
+  INTO schema_row
+  FROM otlet.action_type_schemas s
+  WHERE s.action_type = action_row.action_type;
+
   SELECT o.output
   INTO output_body
   FROM otlet.outputs o
@@ -1000,6 +1203,31 @@ BEGIN
   FROM otlet.inference_receipts r
   WHERE r.id = action_row.receipt_id;
 
+  answer_field := COALESCE(NULLIF(task_row.decision_contract ->> 'answer_field', ''), 'match');
+  confidence_field := COALESCE(NULLIF(task_row.decision_contract ->> 'confidence_field', ''), 'confidence');
+  answer_values := otlet.output_schema_enum_values(task_row.output_schema, answer_field);
+  output_answer := NULLIF(output_body ->> answer_field, '');
+  action_answer := otlet.action_declared_answer(action_row.action_type, answer_field);
+
+  IF jsonb_typeof(task_row.decision_contract -> 'abstain_values') = 'array' THEN
+    SELECT COALESCE(array_agg(value), ARRAY[]::text[])
+    INTO abstain_values
+    FROM jsonb_array_elements_text(task_row.decision_contract -> 'abstain_values') AS abstain(value);
+  END IF;
+
+  IF schema_row.requires_approval
+     AND action_answer IS NOT NULL
+     AND NOT action_answer = ANY(abstain_values)
+     AND answer_values IS NOT NULL THEN
+    SELECT value
+    INTO fallback_rejected_answer
+    FROM unnest(answer_values) WITH ORDINALITY AS answer(value, ord)
+    WHERE value <> action_answer
+      AND NOT value = ANY(abstain_values)
+    ORDER BY ord
+    LIMIT 1;
+  END IF;
+
   final_source := COALESCE(
     NULLIF(label_action.label_source, ''),
     CASE
@@ -1009,20 +1237,27 @@ BEGIN
     END
   );
 
-  final_match := COALESCE(
-    NULLIF(label_action.expected_match, ''),
+  final_answer := COALESCE(
+    NULLIF(label_action.expected_answer, ''),
     CASE
-      WHEN action_row.action_type = 'merge_candidate' AND final_source = 'approved_action' THEN 'same_entity'
-      WHEN action_row.action_type = 'merge_candidate' AND final_source = 'rejected_action' THEN 'different_entity'
-      WHEN action_row.action_type = 'new_entity' AND final_source = 'approved_action' THEN 'different_entity'
-      WHEN action_row.action_type = 'review_flag' AND final_source = 'approved_action' THEN 'unclear'
-      ELSE output_body ->> 'match'
+      WHEN final_source = 'approved_action' THEN COALESCE(action_answer, output_answer)
+      WHEN final_source = 'rejected_action' THEN COALESCE(fallback_rejected_answer, output_answer)
+      ELSE output_answer
     END
   );
+
+  IF NULLIF(final_answer, '') IS NULL THEN
+    RAISE EXCEPTION 'otlet expected_answer is required for task % field %', task_row.name, answer_field;
+  END IF;
+
+  IF answer_values IS NOT NULL AND NOT final_answer = ANY(answer_values) THEN
+    RAISE EXCEPTION 'otlet expected_answer % is not valid for task % field %', final_answer, task_row.name, answer_field;
+  END IF;
+
   final_confidence := COALESCE(
     NULLIF(label_action.expected_confidence, ''),
-    output_body ->> 'confidence',
-    CASE WHEN final_match = 'unclear' THEN 'medium' ELSE 'high' END
+    output_body ->> confidence_field,
+    CASE WHEN final_answer = ANY(abstain_values) THEN 'medium' ELSE 'high' END
   );
   final_action_type := COALESCE(NULLIF(label_action.expected_action_type, ''), action_row.action_type);
 
@@ -1033,7 +1268,7 @@ BEGIN
     source_table,
     subject_id,
     source_hash,
-    expected_match,
+    expected_answer,
     expected_confidence,
     expected_action_type,
     label_source,
@@ -1050,7 +1285,7 @@ BEGIN
       receipt_trace #>> '{mvcc,source_hash}',
       md5((receipt_trace -> 'mvcc')::text)
     ),
-    final_match,
+    final_answer,
     final_confidence,
     final_action_type,
     final_source,
@@ -1059,6 +1294,52 @@ BEGIN
   RETURNING * INTO saved_label;
 
   RETURN NEXT saved_label;
+END;
+$$;
+
+CREATE FUNCTION otlet.correct_action(
+  action_id bigint,
+  corrected jsonb DEFAULT '{}'::jsonb,
+  reason text DEFAULT NULL
+) RETURNS SETOF otlet.eval_labels
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  rejected_action otlet.actions%ROWTYPE;
+  correction jsonb := COALESCE(correct_action.corrected, '{}'::jsonb);
+BEGIN
+  SELECT *
+  INTO rejected_action
+  FROM otlet.reject_action(
+    correct_action.action_id,
+    COALESCE(NULLIF(correct_action.reason, ''), 'manual correction')
+  );
+
+  IF NOT FOUND THEN
+    RETURN;
+  END IF;
+
+  RETURN QUERY
+  SELECT *
+  FROM otlet.label_action(
+    rejected_action.id,
+    expected_answer => COALESCE(
+      NULLIF(correction ->> 'expected_answer', ''),
+      NULLIF(correction ->> 'answer', ''),
+      NULLIF(correction ->> 'decision', ''),
+      NULLIF(correction ->> 'match', '')
+    ),
+    expected_confidence => COALESCE(
+      NULLIF(correction ->> 'expected_confidence', ''),
+      NULLIF(correction ->> 'confidence', '')
+    ),
+    expected_action_type => COALESCE(
+      NULLIF(correction ->> 'expected_action_type', ''),
+      NULLIF(correction ->> 'action_type', '')
+    ),
+    reason => correct_action.reason,
+    label_source => 'manual_correction'
+  );
 END;
 $$;
 
@@ -1071,7 +1352,7 @@ RETURNS TABLE (
   source_table text,
   subject_id text,
   source_hash text,
-  expected_match text,
+  expected_answer text,
   expected_confidence text,
   expected_action_type text,
   label_source text,
@@ -1088,21 +1369,19 @@ AS $$
     l.id,
     'otlet_eval_labels_generated'::text,
     CASE
-      WHEN l.expected_action_type = 'merge_candidate'
-        AND l.expected_match = 'same_entity' THEN 'positive_duplicate'
-      WHEN a.action_type = 'merge_candidate'
-        AND l.expected_match = 'different_entity' THEN 'false_merge'
-      WHEN l.expected_action_type = 'new_entity'
-        AND l.expected_match = 'different_entity' THEN 'hard_negative'
-      WHEN l.expected_action_type = 'review_flag'
-        OR l.expected_match = 'unclear' THEN 'abstention'
-      ELSE 'entity_resolution'
+      WHEN l.label_source = 'manual_correction' THEN 'gold'
+      WHEN declared.action_answer IS NOT NULL
+        AND l.expected_answer <> declared.action_answer THEN 'false_trusted'
+      WHEN l.expected_answer = ANY(contract.abstain_values) THEN 'abstention'
+      WHEN l.expected_answer = contract.primary_answer THEN 'positive'
+      WHEN contract.primary_answer IS NOT NULL THEN 'hard_negative'
+      ELSE 'gold'
     END,
     l.label_source = 'manual_correction',
     l.source_table,
     l.subject_id,
     l.source_hash,
-    l.expected_match,
+    l.expected_answer,
     l.expected_confidence,
     l.expected_action_type,
     l.label_source,
@@ -1113,6 +1392,37 @@ AS $$
     l.created_at
   FROM otlet.eval_labels l
   LEFT JOIN otlet.actions a ON a.id = l.action_id
+  LEFT JOIN otlet.jobs j ON j.id = a.job_id
+  LEFT JOIN otlet.tasks t ON t.name = j.task_name
+  LEFT JOIN LATERAL (
+    SELECT
+      COALESCE(NULLIF(t.decision_contract ->> 'answer_field', ''), 'match') AS answer_field,
+      COALESCE(
+        (
+          SELECT array_agg(value)
+          FROM jsonb_array_elements_text(COALESCE(t.decision_contract -> 'abstain_values', '[]'::jsonb)) AS abstain(value)
+        ),
+        ARRAY[]::text[]
+      ) AS abstain_values,
+      (
+        SELECT value
+        FROM unnest(otlet.output_schema_enum_values(t.output_schema, COALESCE(NULLIF(t.decision_contract ->> 'answer_field', ''), 'match'))) WITH ORDINALITY AS answer(value, ord)
+        WHERE NOT value = ANY(
+          COALESCE(
+            (
+              SELECT array_agg(abstain_value)
+              FROM jsonb_array_elements_text(COALESCE(t.decision_contract -> 'abstain_values', '[]'::jsonb)) AS abstain(abstain_value)
+            ),
+            ARRAY[]::text[]
+          )
+        )
+        ORDER BY ord
+        LIMIT 1
+      ) AS primary_answer
+  ) contract ON true
+  LEFT JOIN LATERAL (
+    SELECT otlet.action_declared_answer(COALESCE(NULLIF(l.expected_action_type, ''), a.action_type), contract.answer_field) AS action_answer
+  ) declared ON true
   ORDER BY l.created_at DESC, l.id DESC
   LIMIT GREATEST(0, LEAST(COALESCE(max_rows, 1000), 100000));
 $$;
@@ -1198,7 +1508,8 @@ BEGIN
     error => fail_job.error
   );
 
-  IF fail_job.schema_validation_status = 'failed' THEN
+  IF fail_job.schema_validation_status = 'failed'
+     OR fail_job.selection_status = 'rejected' THEN
     PERFORM otlet.mark_runtime_health(runtime_row.name, 'ready', NULL);
     PERFORM otlet.touch_runtime_slot(runtime_row.name, model_row.name, 'ready', 0, NULL);
   ELSE

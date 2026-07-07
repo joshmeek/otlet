@@ -35,6 +35,7 @@ pub(crate) fn parse_runtime_options(value: &Value) -> Result<RuntimeOptions, Str
             key.as_str(),
             "reasoning"
                 | "max_tokens"
+                | "max_attempt_ms"
                 | "inference_cache"
                 | "max_worker_rss_bytes"
                 | "generation_trace"
@@ -49,8 +50,8 @@ pub(crate) fn parse_runtime_options(value: &Value) -> Result<RuntimeOptions, Str
         let reasoning = value
             .as_str()
             .ok_or("runtime_options.reasoning must be a string")?;
-        if !matches!(reasoning, "on" | "off" | "auto") {
-            return Err("runtime_options.reasoning must be on, off, or auto".to_owned());
+        if !matches!(reasoning, "on" | "off") {
+            return Err("runtime_options.reasoning must be on or off".to_owned());
         }
         options.reasoning = reasoning.to_owned();
     }
@@ -63,6 +64,15 @@ pub(crate) fn parse_runtime_options(value: &Value) -> Result<RuntimeOptions, Str
             return Err("runtime_options.max_tokens must be between 1 and 4096".to_owned());
         }
         options.max_tokens = max_tokens;
+    }
+
+    if let Some(value) = object.get("max_attempt_ms") {
+        let valid_string = value
+            .as_str()
+            .is_some_and(|raw| !raw.is_empty() && raw.chars().all(|ch| ch.is_ascii_digit()));
+        if value.as_u64().is_none() && !valid_string {
+            return Err("runtime_options.max_attempt_ms must be a non-negative integer".to_owned());
+        }
     }
 
     if let Some(value) = object.get("inference_cache") {
@@ -79,6 +89,12 @@ pub(crate) fn parse_runtime_options(value: &Value) -> Result<RuntimeOptions, Str
             return Err(
                 "runtime_options.max_worker_rss_bytes must be between 0 and 70368744177664"
                     .to_owned(),
+            );
+        }
+        #[cfg(not(target_os = "linux"))]
+        if max_worker_rss_bytes > 0 {
+            return Err(
+                "runtime_options.max_worker_rss_bytes is supported only on linux; use 0".to_owned(),
             );
         }
         options.max_worker_rss_bytes = max_worker_rss_bytes;
@@ -129,6 +145,7 @@ pub(crate) fn runtime_option_status(value: &Value) -> Value {
     let controls = [
         "reasoning",
         "max_tokens",
+        "max_attempt_ms",
         "inference_cache",
         "max_worker_rss_bytes",
         "generation_trace",

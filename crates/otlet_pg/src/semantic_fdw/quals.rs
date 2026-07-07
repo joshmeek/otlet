@@ -9,10 +9,10 @@ unsafe fn semantic_pushdown_from_restrictinfos(
             if rinfo.is_null() {
                 continue;
             }
-            if let Some(subject_id) = subject_const_filter((*rinfo).clause, foreign_varno) {
+            if let Some(subject_ids) = subject_const_filters((*rinfo).clause, foreign_varno) {
                 subjects = Some(match subjects.take() {
-                    Some(existing) => intersect_subject_ids(&existing, &[subject_id]),
-                    None => vec![subject_id],
+                    Some(existing) => intersect_subject_ids(&existing, &subject_ids),
+                    None => subject_ids,
                 });
             }
         }
@@ -20,6 +20,25 @@ unsafe fn semantic_pushdown_from_restrictinfos(
             subjects: subjects
                 .map(SubjectPushdown::Subjects)
                 .unwrap_or(SubjectPushdown::None),
+        }
+    }
+}
+
+unsafe fn subject_const_filters(
+    clause: *mut pg_sys::Expr,
+    foreign_varno: pg_sys::Index,
+) -> Option<Vec<String>> {
+    unsafe {
+        let clause = strip_relabel(clause);
+        if clause.is_null() {
+            return None;
+        }
+        match (*clause).type_ {
+            pg_sys::NodeTag::T_OpExpr => subject_const_filter(clause, foreign_varno).map(|s| vec![s]),
+            pg_sys::NodeTag::T_ScalarArrayOpExpr => {
+                subject_const_array_filter(clause, foreign_varno)
+            }
+            _ => None,
         }
     }
 }
@@ -50,6 +69,29 @@ unsafe fn subject_const_filter(
     }
 }
 
+unsafe fn subject_const_array_filter(
+    clause: *mut pg_sys::Expr,
+    foreign_varno: pg_sys::Index,
+) -> Option<Vec<String>> {
+    unsafe {
+        let op = clause as *mut pg_sys::ScalarArrayOpExpr;
+        if !(*op).useOr
+            || !is_text_equality_operator((*op).opno)
+            || pg_sys::list_length((*op).args) != 2
+        {
+            return None;
+        }
+
+        let left = pg_sys::list_nth((*op).args, 0) as *mut pg_sys::Expr;
+        let right = pg_sys::list_nth((*op).args, 1) as *mut pg_sys::Expr;
+        if is_subject_id_var(left, foreign_varno) {
+            text_array_const_values(right)
+        } else {
+            None
+        }
+    }
+}
+
 unsafe fn is_subject_id_var(node: *mut pg_sys::Expr, foreign_varno: pg_sys::Index) -> bool {
     unsafe {
         let node = strip_relabel(node);
@@ -65,6 +107,25 @@ unsafe fn is_subject_id_var(node: *mut pg_sys::Expr, foreign_varno: pg_sys::Inde
 
 fn varno_matches(varno: i32, foreign_varno: pg_sys::Index) -> bool {
     varno >= 0 && u32::try_from(varno).ok() == Some(foreign_varno)
+}
+
+unsafe fn text_array_const_values(node: *mut pg_sys::Expr) -> Option<Vec<String>> {
+    unsafe {
+        let node = strip_relabel(node);
+        if node.is_null() || (*node).type_ != pg_sys::NodeTag::T_Const {
+            return None;
+        }
+        let value = node as *mut pg_sys::Const;
+        if (*value).constisnull || (*value).consttype != pg_sys::TEXTARRAYOID {
+            return None;
+        }
+        <Vec<Option<String>> as FromDatum>::from_polymorphic_datum(
+            (*value).constvalue,
+            false,
+            (*value).consttype,
+        )
+        .map(|values| values.into_iter().flatten().collect())
+    }
 }
 
 unsafe fn text_const_value(node: *mut pg_sys::Expr) -> Option<String> {

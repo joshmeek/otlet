@@ -9,14 +9,19 @@ pub(crate) struct Job {
     pub(crate) instruction: String,
     pub(crate) output_schema: Value,
     pub(crate) input: Value,
+    pub(crate) input_content_hash: String,
     pub(crate) artifact_path: String,
     pub(crate) artifact_hash: Option<String>,
     pub(crate) model_name: String,
     pub(crate) runtime_name: String,
     pub(crate) runtime_endpoint: String,
     pub(crate) runtime_options: Value,
+    pub(crate) input_shaping: Value,
+    pub(crate) decision_contract: Value,
+    pub(crate) max_attempt_ms: i64,
 }
 
+#[derive(Clone)]
 pub(crate) struct JobModel {
     pub(crate) name: String,
     pub(crate) artifact_path: String,
@@ -25,9 +30,11 @@ pub(crate) struct JobModel {
     pub(crate) runtime_endpoint: String,
 }
 
+#[derive(Clone)]
 pub(crate) struct ModelSelectionPolicy {
     pub(crate) cheap: JobModel,
     pub(crate) strong: JobModel,
+    pub(crate) accept_field_checks: Value,
 }
 
 impl Job {
@@ -60,12 +67,16 @@ macro_rules! job_from_row {
             instruction: required_col!($row, String, 4),
             output_schema: required_col!($row, JsonB, 5).0,
             input: required_col!($row, JsonB, 6).0,
-            artifact_path: required_col!($row, String, 7),
-            artifact_hash: $row.get::<String>(8)?,
-            model_name: required_col!($row, String, 9),
-            runtime_name: required_col!($row, String, 10),
-            runtime_endpoint: required_col!($row, String, 11),
-            runtime_options: required_col!($row, JsonB, 12).0,
+            input_content_hash: required_col!($row, String, 7),
+            artifact_path: required_col!($row, String, 8),
+            artifact_hash: $row.get::<String>(9)?,
+            model_name: required_col!($row, String, 10),
+            runtime_name: required_col!($row, String, 11),
+            runtime_endpoint: required_col!($row, String, 12),
+            runtime_options: required_col!($row, JsonB, 13).0,
+            input_shaping: required_col!($row, JsonB, 14).0,
+            decision_contract: required_col!($row, JsonB, 15).0,
+            max_attempt_ms: required_col!($row, i32, 16) as i64,
         }
     };
 }
@@ -80,17 +91,22 @@ SELECT
   j.subject_id,
   t.instruction,
   t.output_schema,
-  j.input,
+  otlet.semantic_shaped_input(j.input, t.input_shaping),
+  otlet.semantic_content_hash(j.input, t.input_shaping),
   m.artifact_path,
   m.artifact_hash,
   m.name,
   r.name,
   r.endpoint,
-  t.runtime_options
+  p.default_runtime_options || t.runtime_options,
+  t.input_shaping,
+  t.decision_contract,
+  otlet.effective_task_max_attempt_ms(p.default_runtime_options || t.runtime_options, p.max_attempt_ms)
 FROM otlet.claim_jobs() j
 JOIN otlet.tasks t ON t.name = j.task_name
 JOIN otlet.models m ON m.name = t.model_name
 JOIN otlet.runtimes r ON r.name = m.runtime_name
+CROSS JOIN otlet.production_policy p
 "#,
             None,
             &[],
@@ -136,17 +152,22 @@ SELECT
   j.subject_id,
   t.instruction,
   t.output_schema,
-  j.input,
+  otlet.semantic_shaped_input(j.input, t.input_shaping),
+  otlet.semantic_content_hash(j.input, t.input_shaping),
   m.artifact_path,
   m.artifact_hash,
   m.name,
   r.name,
   r.endpoint,
-  t.runtime_options
+  p.default_runtime_options || t.runtime_options,
+  t.input_shaping,
+  t.decision_contract,
+  otlet.effective_task_max_attempt_ms(p.default_runtime_options || t.runtime_options, p.max_attempt_ms)
 FROM inserted j
 JOIN otlet.tasks t ON t.name = j.task_name
 JOIN otlet.models m ON m.name = t.model_name
 JOIN otlet.runtimes r ON r.name = m.runtime_name
+CROSS JOIN otlet.production_policy p
 "#,
             Some(1),
             &args,
@@ -178,7 +199,8 @@ SELECT
   strong.artifact_path,
   strong.artifact_hash,
   strong.runtime_name,
-  strong_runtime.endpoint
+  strong_runtime.endpoint,
+  p.accept_field_checks
 FROM otlet.model_selection_policies p
 JOIN otlet.models cheap ON cheap.name = p.cheap_model_name
 JOIN otlet.runtimes cheap_runtime ON cheap_runtime.name = cheap.runtime_name
@@ -210,6 +232,7 @@ WHERE p.task_name = $1
                 runtime_name: required_col!(row, String, 9),
                 runtime_endpoint: required_col!(row, String, 10),
             },
+            accept_field_checks: required_col!(row, JsonB, 11).0,
         }))
     })
 }

@@ -1,5 +1,5 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="1040" height="330" viewBox="0 0 1040 330">
-<rect x="0" y="0" width="1040" height="330" fill="#ffffff"/>
+<svg xmlns="http://www.w3.org/2000/svg" width="1040" height="374" viewBox="0 0 1040 374">
+<rect x="0" y="0" width="1040" height="374" fill="#ffffff"/>
 <style>
 text { font: 12px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; fill: #20242a; }
 .axis { stroke: #4b5563; stroke-width: 1; }
@@ -8,30 +8,33 @@ text { font: 12px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; fill
 .point { fill: #dc2626; stroke: #7f1d1d; stroke-width: 1; opacity: 0.85; }
 </style>
 <text x="24" y="26">p95 generation latency ms, higher is slower</text>
-<line class="axis" x1="220" y1="292" x2="904" y2="292"/>
-<line class="grid" x1="220.0" y1="54" x2="220.0" y2="292"/>
-<text text-anchor="middle" x="220.0" y="310">0</text>
-<line class="grid" x1="391.0" y1="54" x2="391.0" y2="292"/>
-<text text-anchor="middle" x="391.0" y="310">5000</text>
-<line class="grid" x1="562.0" y1="54" x2="562.0" y2="292"/>
-<text text-anchor="middle" x="562.0" y="310">10000</text>
-<line class="grid" x1="733.0" y1="54" x2="733.0" y2="292"/>
-<text text-anchor="middle" x="733.0" y="310">15000</text>
-<line class="grid" x1="904.0" y1="54" x2="904.0" y2="292"/>
-<text text-anchor="middle" x="904.0" y="310">20000</text>
-<text x="24" y="80">gemma4_e4b</text>
-<rect class="bar" x="220" y="62" width="356.8" height="20" rx="2"/>
-<text x="582.8" y="77">10432</text>
-<text x="24" y="124">phi4_mini</text>
-<rect class="bar" x="220" y="106" width="313.8" height="20" rx="2"/>
-<text x="539.8" y="121">9174</text>
-<text x="24" y="168">qwen35_4b</text>
-<rect class="bar" x="220" y="150" width="307.8" height="20" rx="2"/>
-<text x="533.8" y="165">9000</text>
-<text x="24" y="212">ministral3_3b</text>
-<rect class="bar" x="220" y="194" width="228.0" height="20" rx="2"/>
-<text x="454.0" y="209">6666</text>
+<line class="axis" x1="220" y1="336" x2="904" y2="336"/>
+<line class="grid" x1="220.0" y1="54" x2="220.0" y2="336"/>
+<text text-anchor="middle" x="220.0" y="354">0</text>
+<line class="grid" x1="391.0" y1="54" x2="391.0" y2="336"/>
+<text text-anchor="middle" x="391.0" y="354">5000</text>
+<line class="grid" x1="562.0" y1="54" x2="562.0" y2="336"/>
+<text text-anchor="middle" x="562.0" y="354">10000</text>
+<line class="grid" x1="733.0" y1="54" x2="733.0" y2="336"/>
+<text text-anchor="middle" x="733.0" y="354">15000</text>
+<line class="grid" x1="904.0" y1="54" x2="904.0" y2="336"/>
+<text text-anchor="middle" x="904.0" y="354">20000</text>
+<text x="24" y="80">qwen35_4b</text>
+<rect class="bar" x="220" y="62" width="423.3" height="20" rx="2"/>
+<text x="649.3" y="77">12377</text>
+<text x="24" y="124">glm_edge_4b</text>
+<rect class="bar" x="220" y="106" width="399.6" height="20" rx="2"/>
+<text x="625.6" y="121">11685</text>
+<text x="24" y="168">gemma4_e4b</text>
+<rect class="bar" x="220" y="150" width="307.0" height="20" rx="2"/>
+<text x="533.0" y="165">8976</text>
+<text x="24" y="212">phi4_mini</text>
+<rect class="bar" x="220" y="194" width="228.7" height="20" rx="2"/>
+<text x="454.7" y="209">6686</text>
 <text x="24" y="256">gemma4_e2b</text>
-<rect class="bar" x="220" y="238" width="109.4" height="20" rx="2"/>
-<text x="335.4" y="253">3197</text>
+<rect class="bar" x="220" y="238" width="148.7" height="20" rx="2"/>
+<text x="374.7" y="253">4349</text>
+<text x="24" y="300">ministral3_3b</text>
+<rect class="bar" x="220" y="282" width="124.5" height="20" rx="2"/>
+<text x="350.5" y="297">3641</text>
 </svg>

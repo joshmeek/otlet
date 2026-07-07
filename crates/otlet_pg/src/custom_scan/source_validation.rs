@@ -118,11 +118,14 @@ fn validate_semantic_index_source(
     infer_ms: u32,
     infer_max_rows: u32,
     auto_policy: bool,
-) -> Option<SemanticPlannerStats> {
+) -> Option<(SemanticPlannerStats, Option<Vec<String>>)> {
     let metadata_query = format!(
-        "SELECT source_table, subject_column, model_name \
-         FROM otlet.semantic_indexes \
-         WHERE name = {} AND source_table::regclass = {}::oid \
+        "SELECT \
+           si.source_table, \
+           si.subject_column, \
+           CASE WHEN si.input_columns IS NULL THEN NULL ELSE to_jsonb(si.input_columns)::text END AS input_columns_json \
+         FROM otlet.semantic_indexes si \
+         WHERE si.name = {} AND si.source_table::regclass = {}::oid \
          LIMIT 1",
         sql_literal(index_name),
         relid.to_u32()
@@ -133,105 +136,61 @@ fn validate_semantic_index_source(
             .select(metadata_query.as_str(), Some(1), &[])
             .map_err(to_string)?;
         if metadata.is_empty() {
-            return Ok::<Option<SemanticPlannerStats>, String>(None);
+            return Ok::<Option<(SemanticPlannerStats, Option<Vec<String>>)>, String>(None);
         }
         let row = metadata.first();
         let Some(source_table) = row
             .get_by_name::<String, _>("source_table")
             .map_err(to_string)?
         else {
-            return Ok::<Option<SemanticPlannerStats>, String>(None);
+            return Ok::<Option<(SemanticPlannerStats, Option<Vec<String>>)>, String>(None);
         };
         let Some(subject_column) = row
             .get_by_name::<String, _>("subject_column")
             .map_err(to_string)?
         else {
-            return Ok::<Option<SemanticPlannerStats>, String>(None);
+            return Ok::<Option<(SemanticPlannerStats, Option<Vec<String>>)>, String>(None);
         };
         if source_table.is_empty() || subject_column.is_empty() {
-            return Ok::<Option<SemanticPlannerStats>, String>(None);
+            return Ok::<Option<(SemanticPlannerStats, Option<Vec<String>>)>, String>(None);
         }
-        let Some(model_name) = row
-            .get_by_name::<String, _>("model_name")
+        let input_columns = row
+            .get_by_name::<String, _>("input_columns_json")
             .map_err(to_string)?
-        else {
-            return Ok::<Option<SemanticPlannerStats>, String>(None);
-        };
+            .map(|json| serde_json::from_str::<Vec<String>>(&json).map_err(to_string))
+            .transpose()?;
         let subject_column_cstr = CString::new(subject_column.as_str()).map_err(to_string)?;
         let indexed_attno = unsafe { pg_sys::get_attnum(relid, subject_column_cstr.as_ptr()) };
         if indexed_attno != subject_attno {
-            return Ok::<Option<SemanticPlannerStats>, String>(None);
+            return Ok::<Option<(SemanticPlannerStats, Option<Vec<String>>)>, String>(None);
         }
 
-        let source_rows_sql = source_rows_sql(&source_table, &subject_column);
-        let matches_expected_sql = row_predicate_match_sql("sm.body", expected_json);
         let stats_query = format!(
-            "WITH latest AS ( \
-               SELECT DISTINCT ON (sm.subject_id) \
-                 sm.subject_id, sm.stale, sm.source_hash, {} AS matches_expected, sm.updated_at, sm.id \
-               FROM otlet.semantic_materializations sm \
-               JOIN otlet.semantic_indexes si \
-                 ON si.task_name = sm.task_name \
-                AND si.record_type = sm.record_type \
-               WHERE si.name = {} \
-               ORDER BY sm.subject_id, sm.updated_at DESC, sm.id DESC \
+            "WITH plan AS ( \
+               SELECT * \
+               FROM otlet.semantic_index_plan({}, true) \
              ), \
-             active_jobs AS ( \
-               SELECT DISTINCT j.subject_id \
-               FROM otlet.jobs j \
-               JOIN otlet.semantic_indexes si ON si.task_name = j.task_name \
-               WHERE si.name = {} \
-                 AND j.status IN ('queued', 'running', 'cancel_requested') \
-             ), \
-             source_rows AS ( \
-               {} \
-             ), \
-             runtime_model AS ( \
-               SELECT COALESCE(( \
-                 SELECT NULLIF(rs.last_generate_ms, 0)::float8 \
-                 FROM otlet.runtime_slots rs \
-                 JOIN otlet.models m ON m.name = {} \
-                 WHERE rs.model_name = {} \
-                   AND rs.runtime_name = m.runtime_name \
-                 ORDER BY rs.last_used_at DESC NULLS LAST \
-                 LIMIT 1 \
-               ), 2500)::float8 AS model_ms \
-             ), \
-             classified AS ( \
-               SELECT \
-                 CASE \
-                   WHEN a.subject_id IS NOT NULL AND (l.subject_id IS NULL OR l.stale OR l.source_hash IS DISTINCT FROM src.source_hash) THEN 'in_flight' \
-                   WHEN l.subject_id IS NULL THEN 'missing' \
-                   WHEN l.stale OR l.source_hash IS DISTINCT FROM src.source_hash THEN 'stale' \
-                   WHEN l.matches_expected THEN 'fresh_match' \
-                   ELSE 'fresh_non_match' \
-                 END AS state, \
-                 ( \
-                   a.subject_id IS NULL \
-                   AND l.subject_id IS NOT NULL \
-                   AND l.stale \
-                   AND l.source_hash IS NOT DISTINCT FROM src.source_hash \
-                 ) AS cache_reusable \
-               FROM source_rows src \
-               LEFT JOIN latest l USING (subject_id) \
-               LEFT JOIN active_jobs a USING (subject_id) \
+             current_rows AS ( \
+               SELECT subject_id, body, stale \
+               FROM otlet.semantic_index_current_rows({}, false) \
              ) \
              SELECT \
-               count(*)::bigint AS source_rows, \
-               count(*) FILTER (WHERE state = 'fresh_match')::bigint AS fresh_matches, \
-               count(*) FILTER (WHERE state = 'fresh_non_match')::bigint AS fresh_non_matches, \
-               count(*) FILTER (WHERE state = 'stale')::bigint AS stale_rows, \
-               count(*) FILTER (WHERE state = 'missing')::bigint AS missing_rows, \
-               count(*) FILTER (WHERE state = 'in_flight')::bigint AS inflight_rows, \
-               count(*) FILTER (WHERE state = 'stale' AND cache_reusable)::bigint AS cache_reusable_rows, \
-               (SELECT model_ms FROM runtime_model)::float8 AS model_ms \
-             FROM classified",
-            matches_expected_sql,
+               COALESCE((SELECT total_subjects FROM plan), 0)::bigint AS source_rows, \
+               count(*) FILTER (WHERE stale = false AND body @> {}::jsonb)::bigint AS fresh_matches, \
+               count(*) FILTER (WHERE stale = false AND NOT (body @> {}::jsonb))::bigint AS fresh_non_matches, \
+               COALESCE((SELECT stale_subjects FROM plan), 0)::bigint AS stale_rows, \
+               COALESCE((SELECT missing_subjects FROM plan), 0)::bigint AS missing_rows, \
+               COALESCE((SELECT inflight_subjects FROM plan), 0)::bigint AS inflight_rows, \
+               0::bigint AS cache_reusable_rows, \
+               COALESCE((SELECT model_ms FROM plan), 2500)::float8 AS model_ms, \
+               COALESCE((SELECT model_cost_source FROM plan), 'static_fallback')::text AS model_cost_source, \
+               COALESCE((SELECT count_basis FROM plan), 'exact')::text AS count_basis, \
+               COALESCE((SELECT stale_reasons::text FROM plan), '{{}}'::text) AS stale_reasons \
+             FROM current_rows",
             sql_literal(index_name),
             sql_literal(index_name),
-            source_rows_sql,
-            sql_literal(&model_name),
-            sql_literal(&model_name)
+            sql_literal(expected_json),
+            sql_literal(expected_json)
         );
         let stats_table = client
             .select(stats_query.as_str(), Some(1), &[])
@@ -275,17 +234,26 @@ fn validate_semantic_index_source(
                 .map_err(to_string)?
                 .unwrap_or(0)
                 .max(0) as u64,
-            lookup_decision_rows: 0,
-            wait_decision_rows: 0,
             infer_decision_rows: 0,
-            queue_decision_rows: 0,
             fail_closed_decision_rows: 0,
             model_ms: row
                 .get_by_name::<f64, _>("model_ms")
                 .map_err(to_string)?
                 .unwrap_or(2500.0)
                 .max(1.0),
+            model_cost_source: row
+                .get_by_name::<String, _>("model_cost_source")
+                .map_err(to_string)?
+                .unwrap_or_else(|| "static_fallback".to_string()),
             path_cost: 0.0,
+            stale_reasons: row
+                .get_by_name::<String, _>("stale_reasons")
+                .map_err(to_string)?
+                .unwrap_or_else(|| "{}".to_string()),
+            count_basis: row
+                .get_by_name::<String, _>("count_basis")
+                .map_err(to_string)?
+                .unwrap_or_else(|| "exact".to_string()),
         };
         finish_planner_stats(
             &mut stats,
@@ -295,7 +263,10 @@ fn validate_semantic_index_source(
             infer_max_rows,
             auto_policy,
         );
-        Ok::<Option<SemanticPlannerStats>, String>(Some(stats))
+        Ok::<Option<(SemanticPlannerStats, Option<Vec<String>>)>, String>(Some((
+            stats,
+            input_columns,
+        )))
     }) {
         Ok(stats) => stats,
         Err(err) => {
@@ -315,24 +286,27 @@ fn validate_semantic_join_index_source(
     auto_policy: bool,
 ) -> Option<SemanticPlannerStats> {
     let stats_query = format!(
-            "WITH plan AS ( \
-	           SELECT * \
-	           FROM otlet.semantic_join_index_plan({}) \
-	         ), \
-	         current_rows AS ( \
-	           SELECT subject_id, body, stale \
-	           FROM otlet.semantic_join_index_current_rows({}, false) \
-	         ) \
-	         SELECT \
-	           COALESCE((SELECT total_subjects FROM plan), 0)::bigint AS source_rows, \
-	           count(*) FILTER (WHERE stale = false AND body @> {}::jsonb)::bigint AS fresh_matches, \
-	           count(*) FILTER (WHERE stale = false AND NOT (body @> {}::jsonb))::bigint AS fresh_non_matches, \
-	           COALESCE((SELECT stale_subjects FROM plan), 0)::bigint AS stale_rows, \
-	           COALESCE((SELECT missing_subjects FROM plan), 0)::bigint AS missing_rows, \
-	           COALESCE((SELECT inflight_subjects FROM plan), 0)::bigint AS inflight_rows, \
-	           0::bigint AS cache_reusable_rows, \
-	           COALESCE((SELECT model_ms FROM plan), 2500)::float8 AS model_ms \
-	         FROM current_rows",
+        "WITH plan AS ( \
+           SELECT * \
+           FROM otlet.semantic_join_index_plan({}) \
+         ), \
+         current_rows AS ( \
+           SELECT subject_id, body, stale \
+           FROM otlet.semantic_join_index_current_rows({}, false) \
+         ) \
+         SELECT \
+           COALESCE((SELECT total_subjects FROM plan), 0)::bigint AS source_rows, \
+           count(*) FILTER (WHERE stale = false AND body @> {}::jsonb)::bigint AS fresh_matches, \
+           count(*) FILTER (WHERE stale = false AND NOT (body @> {}::jsonb))::bigint AS fresh_non_matches, \
+           COALESCE((SELECT stale_subjects FROM plan), 0)::bigint AS stale_rows, \
+           COALESCE((SELECT missing_subjects FROM plan), 0)::bigint AS missing_rows, \
+           COALESCE((SELECT inflight_subjects FROM plan), 0)::bigint AS inflight_rows, \
+           0::bigint AS cache_reusable_rows, \
+           COALESCE((SELECT model_ms FROM plan), 2500)::float8 AS model_ms, \
+           COALESCE((SELECT model_cost_source FROM plan), 'static_fallback')::text AS model_cost_source, \
+           COALESCE((SELECT count_basis FROM plan), 'estimated')::text AS count_basis, \
+           COALESCE((SELECT stale_reasons::text FROM plan), '{{}}'::text) AS stale_reasons \
+         FROM current_rows",
         sql_literal(index_name),
         sql_literal(index_name),
         sql_literal(expected_json),
@@ -384,17 +358,26 @@ fn validate_semantic_join_index_source(
                 .map_err(to_string)?
                 .unwrap_or(0)
                 .max(0) as u64,
-            lookup_decision_rows: 0,
-            wait_decision_rows: 0,
             infer_decision_rows: 0,
-            queue_decision_rows: 0,
             fail_closed_decision_rows: 0,
             model_ms: row
                 .get_by_name::<f64, _>("model_ms")
                 .map_err(to_string)?
                 .unwrap_or(2500.0)
                 .max(1.0),
+            model_cost_source: row
+                .get_by_name::<String, _>("model_cost_source")
+                .map_err(to_string)?
+                .unwrap_or_else(|| "static_fallback".to_string()),
             path_cost: 0.0,
+            stale_reasons: row
+                .get_by_name::<String, _>("stale_reasons")
+                .map_err(to_string)?
+                .unwrap_or_else(|| "{}".to_string()),
+            count_basis: row
+                .get_by_name::<String, _>("count_basis")
+                .map_err(to_string)?
+                .unwrap_or_else(|| "estimated".to_string()),
         };
         finish_planner_stats(
             &mut stats,

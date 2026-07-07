@@ -227,11 +227,19 @@ CREATE TABLE IF NOT EXISTS otlet_bench_source.model_summary (
   entity_resolution_score numeric NOT NULL DEFAULT 0,
   abstention_score numeric NOT NULL DEFAULT 0,
   dirty_data_score numeric NOT NULL DEFAULT 0,
+  triage_score numeric NOT NULL DEFAULT 0,
+  triage_abstention_score numeric NOT NULL DEFAULT 0,
+  numeric_evidence_score numeric NOT NULL DEFAULT 0,
+  extraction_score numeric NOT NULL DEFAULT 0,
+  policy_check_score numeric NOT NULL DEFAULT 0,
+  user_suite_score numeric NOT NULL DEFAULT 0,
   row_watch_score numeric NOT NULL DEFAULT 0,
   typed_action_score numeric NOT NULL DEFAULT 0,
   semantic_materialization_score numeric NOT NULL DEFAULT 0,
   confidence_score numeric NOT NULL DEFAULT 0,
   diagnostic_entity_accuracy numeric NOT NULL DEFAULT 0,
+  diagnostic_triage_accuracy numeric NOT NULL DEFAULT 0,
+  diagnostic_numeric_accuracy numeric NOT NULL DEFAULT 0,
   diagnostic_action_accuracy numeric NOT NULL DEFAULT 0,
   diagnostic_confidence_accuracy numeric NOT NULL DEFAULT 0,
   diagnostic_quality_score numeric NOT NULL DEFAULT 0,
@@ -240,17 +248,46 @@ CREATE TABLE IF NOT EXISTS otlet_bench_source.model_summary (
   resource_fit numeric NOT NULL DEFAULT 0,
   overall_fit numeric NOT NULL DEFAULT 0,
   diagnostic_fit numeric NOT NULL DEFAULT 0,
-  verdict text NOT NULL,
+  single_run_verdict text NOT NULL,
   cleanup_policy text NOT NULL,
   created_at timestamptz NOT NULL DEFAULT now(),
   PRIMARY KEY (run_id, model_key)
 );
 
+DO $$
+BEGIN
+  IF EXISTS (
+    SELECT 1
+    FROM information_schema.columns
+    WHERE table_schema = 'otlet_bench_source'
+      AND table_name = 'model_summary'
+      AND column_name = 'verdict'
+  ) AND NOT EXISTS (
+    SELECT 1
+    FROM information_schema.columns
+    WHERE table_schema = 'otlet_bench_source'
+      AND table_name = 'model_summary'
+      AND column_name = 'single_run_verdict'
+  ) THEN
+    ALTER TABLE otlet_bench_source.model_summary
+      RENAME COLUMN verdict TO single_run_verdict;
+  END IF;
+END $$;
+
 ALTER TABLE otlet_bench_source.model_summary
   ADD COLUMN IF NOT EXISTS trusted_quality numeric NOT NULL DEFAULT 0,
   ADD COLUMN IF NOT EXISTS resource_fit numeric NOT NULL DEFAULT 0,
   ADD COLUMN IF NOT EXISTS overall_fit numeric NOT NULL DEFAULT 0,
-  ADD COLUMN IF NOT EXISTS diagnostic_fit numeric NOT NULL DEFAULT 0;
+  ADD COLUMN IF NOT EXISTS diagnostic_fit numeric NOT NULL DEFAULT 0,
+  ADD COLUMN IF NOT EXISTS triage_score numeric NOT NULL DEFAULT 0,
+  ADD COLUMN IF NOT EXISTS triage_abstention_score numeric NOT NULL DEFAULT 0,
+  ADD COLUMN IF NOT EXISTS numeric_evidence_score numeric NOT NULL DEFAULT 0,
+  ADD COLUMN IF NOT EXISTS extraction_score numeric NOT NULL DEFAULT 0,
+  ADD COLUMN IF NOT EXISTS policy_check_score numeric NOT NULL DEFAULT 0,
+  ADD COLUMN IF NOT EXISTS user_suite_score numeric NOT NULL DEFAULT 0,
+  ADD COLUMN IF NOT EXISTS diagnostic_triage_accuracy numeric NOT NULL DEFAULT 0,
+  ADD COLUMN IF NOT EXISTS diagnostic_numeric_accuracy numeric NOT NULL DEFAULT 0,
+  ADD COLUMN IF NOT EXISTS single_run_verdict text NOT NULL DEFAULT 'unusable';
 SQL
 }
 
@@ -307,7 +344,7 @@ INSERT INTO otlet_bench_source.model_summary (
   external_artifact,
   run_status,
   unsupported_reason,
-  verdict,
+  single_run_verdict,
   cleanup_policy
 )
 VALUES (
@@ -333,7 +370,7 @@ VALUES (
 ON CONFLICT (run_id, model_key) DO UPDATE
   SET run_status = EXCLUDED.run_status,
       unsupported_reason = EXCLUDED.unsupported_reason,
-      verdict = EXCLUDED.verdict,
+      single_run_verdict = EXCLUDED.single_run_verdict,
       cleanup_policy = EXCLUDED.cleanup_policy;
 SQL
 }
@@ -367,6 +404,43 @@ WHERE c.relkind = 'f'
 \gexec
 SQL
   psql_exec -v prefix="$prefix" >/dev/null <<'SQL' || true
+WITH bench_jobs AS (
+  SELECT id
+  FROM otlet.jobs
+  WHERE task_name LIKE :'prefix' ESCAPE '\'
+),
+bench_actions AS (
+  SELECT a.id
+  FROM otlet.actions a
+  JOIN bench_jobs bj ON bj.id = a.job_id
+),
+bench_outputs AS (
+  SELECT o.id
+  FROM otlet.outputs o
+  JOIN bench_jobs bj ON bj.id = o.job_id
+),
+bench_receipts AS (
+  SELECT r.id
+  FROM otlet.inference_receipts r
+  JOIN bench_jobs bj ON bj.id = r.job_id
+)
+DELETE FROM otlet.eval_labels l
+WHERE EXISTS (
+    SELECT 1
+    FROM bench_actions a
+    WHERE a.id = l.action_id
+  )
+  OR EXISTS (
+    SELECT 1
+    FROM bench_outputs o
+    WHERE o.id = l.output_id
+  )
+  OR EXISTS (
+    SELECT 1
+    FROM bench_receipts r
+    WHERE r.id = l.receipt_id
+  );
+
 WITH bench_jobs AS (
   SELECT id
   FROM otlet.jobs
@@ -430,6 +504,9 @@ WHERE j.task_name LIKE :'prefix' ESCAPE '\';
 DELETE FROM otlet.model_selection_policies p
 WHERE p.task_name LIKE :'prefix' ESCAPE '\';
 
+DELETE FROM otlet.watches w
+WHERE w.name LIKE :'prefix' ESCAPE '\';
+
 DELETE FROM otlet.semantic_join_indexes sji
 WHERE sji.name LIKE :'prefix' ESCAPE '\';
 
@@ -458,12 +535,6 @@ deleted_slots AS (
   USING names
   WHERE s.model_name = names.model_name
   RETURNING s.model_name
-),
-deleted_versions AS (
-  DELETE FROM otlet.model_versions v
-  USING names
-  WHERE v.model_name = names.model_name
-  RETURNING v.id
 )
 DELETE FROM otlet.models m
 USING names
@@ -484,7 +555,6 @@ WITH names AS (
 )
 SELECT
   (SELECT count(*) FROM otlet.models m JOIN names ON names.model_name = m.name)
-  + (SELECT count(*) FROM otlet.model_versions v JOIN names ON names.model_name = v.model_name)
   + (SELECT count(*) FROM otlet.runtime_slots s JOIN names ON names.model_name = s.model_name);
 SQL
 }
@@ -685,13 +755,17 @@ score_model_run() {
   local artifact_bytes="${13}"
   local external_artifact="${14}"
   local direct_task="${15}"
-  local join_task="${16}"
-  local row_task="${17}"
-  local join_index="${18}"
-  local wall_ms="${19}"
-  local source_unchanged="${20}"
-  local stale_leak_count="${21}"
-  local worker_crash_count="${22}"
+  local triage_task="${16}"
+  local numeric_task="${17}"
+  local extraction_task="${18}"
+  local policy_task="${19}"
+  local join_task="${20}"
+  local row_task="${21}"
+  local join_index="${22}"
+  local wall_ms="${23}"
+  local source_unchanged="${24}"
+  local stale_leak_count="${25}"
+  local worker_crash_count="${26}"
 
   psql_file "$script_dir/scoring.sql" \
     -v run_id="$run_id" \
@@ -709,6 +783,10 @@ score_model_run() {
     -v artifact_bytes="$artifact_bytes" \
     -v external_artifact="$external_artifact" \
     -v direct_task="$direct_task" \
+    -v triage_task="$triage_task" \
+    -v numeric_task="$numeric_task" \
+    -v extraction_task="$extraction_task" \
+    -v policy_task="$policy_task" \
     -v join_task="$join_task" \
     -v row_task="$row_task" \
     -v join_index="$join_index" \
@@ -818,6 +896,10 @@ run_one_model() {
   fi
 
   local direct_task="${run_id}_${run_model_key}_direct"
+  local triage_task="${run_id}_${run_model_key}_triage"
+  local numeric_task="${run_id}_${run_model_key}_numeric"
+  local extraction_task="${run_id}_${run_model_key}_extract"
+  local policy_task="${run_id}_${run_model_key}_policy"
   local join_index="${run_id}_${run_model_key}_join"
   local join_task="${join_index}_task"
   local row_index="${run_id}_${run_model_key}_row"
@@ -842,12 +924,90 @@ run_one_model() {
     cleanup_downloaded_model "$model_name" "$base_model_key" "$external_artifact"
   }
 
+  score_current_model_run() {
+    score_model_run \
+      "$run_model_key" \
+      "$base_model_key" \
+      "$model_name" \
+      "$family" \
+      "$tier" \
+      "$quant" \
+      "$declared_params_b" \
+      "$active_params_b" \
+      "$context_tokens" \
+      "$license_note" \
+      "$source_url" \
+      "$artifact_path" \
+      "$artifact_bytes" \
+      "$external_artifact" \
+      "$direct_task" \
+      "$triage_task" \
+      "$numeric_task" \
+      "$extraction_task" \
+      "$policy_task" \
+      "$join_task" \
+      "$row_task" \
+      "$join_index" \
+      "$wall_ms" \
+      "$source_unchanged" \
+      "$stale_leak_count" \
+      "$worker_crash_count"
+  }
+
+  run_and_wait() {
+    local task="$1"
+    local label="$2"
+    if ! psql_exec -v task_name="$task" >/dev/null <<'SQL'
+SELECT otlet.run_task(:'task_name');
+SQL
+    then
+      fail_current_model "$label enqueue failed"
+      return 1
+    fi
+    if ! wait_for_task "$task"; then
+      fail_current_model "$label timed out"
+      return 1
+    fi
+  }
+
+  refresh_and_wait() {
+    local kind="$1"
+    local index_name="$2"
+    local task="$3"
+    local label="$4"
+    if [[ "$kind" = "join" ]]; then
+      if ! psql_exec -v index_name="$index_name" >/dev/null <<'SQL'
+SELECT otlet.refresh_semantic_join_index(:'index_name');
+SQL
+      then
+        fail_current_model "$label enqueue failed"
+        return 1
+      fi
+    else
+      if ! psql_exec -v index_name="$index_name" >/dev/null <<'SQL'
+SELECT otlet.refresh_semantic_index(:'index_name');
+SQL
+      then
+        fail_current_model "$label enqueue failed"
+        return 1
+      fi
+    fi
+    if ! wait_for_task "$task"; then
+      fail_current_model "$label timed out"
+      return 1
+    fi
+  }
+
   started_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   started_s="$(date +%s)"
 
   if ! psql_file "$script_dir/fixtures.sql" \
     -v model_name="$model_name" \
     -v direct_task="$direct_task" \
+    -v triage_task="$triage_task" \
+    -v numeric_task="$numeric_task" \
+    -v extraction_task="$extraction_task" \
+    -v policy_task="$policy_task" \
     -v join_index="$join_index" \
     -v row_index="$row_index" >/dev/null; then
     fail_current_model "fixture setup failed"
@@ -859,15 +1019,7 @@ run_one_model() {
     return
   fi
 
-  if ! psql_exec -v task_name="$direct_task" >/dev/null <<'SQL'
-SELECT otlet.run_task(:'task_name');
-SQL
-  then
-    fail_current_model "direct task enqueue failed"
-    return
-  fi
-  if ! wait_for_task "$direct_task"; then
-    fail_current_model "direct task timed out"
+  if ! run_and_wait "$direct_task" "direct task"; then
     return
   fi
 
@@ -893,30 +1045,8 @@ SQL
       fail_current_model "worker crash query failed"
       return
     fi
-    printf 'model=%s skip_semantic=true direct_schema_valid_rate=%s min_direct_schema_rate=%s\n' "$run_model_key" "$direct_rate" "$min_direct_schema_rate"
-    if ! score_model_run \
-      "$run_model_key" \
-      "$base_model_key" \
-      "$model_name" \
-      "$family" \
-      "$tier" \
-      "$quant" \
-      "$declared_params_b" \
-      "$active_params_b" \
-      "$context_tokens" \
-      "$license_note" \
-      "$source_url" \
-      "$artifact_path" \
-      "$artifact_bytes" \
-      "$external_artifact" \
-      "$direct_task" \
-      "$join_task" \
-      "$row_task" \
-      "$join_index" \
-      "$wall_ms" \
-      "$source_unchanged" \
-      "$stale_leak_count" \
-      "$worker_crash_count"; then
+    printf 'model=%s skip_diagnostics=true direct_schema_valid_rate=%s min_direct_schema_rate=%s\n' "$run_model_key" "$direct_rate" "$min_direct_schema_rate"
+    if ! score_current_model_run; then
       fail_current_model "scoring failed after direct task"
       return
     fi
@@ -924,27 +1054,57 @@ SQL
     return
   fi
 
-  if ! psql_exec -v join_index="$join_index" >/dev/null <<'SQL'
-SELECT otlet.refresh_semantic_join_index(:'join_index');
-SQL
-  then
-    fail_current_model "semantic join refresh enqueue failed"
-    return
-  fi
-  if ! wait_for_task "$join_task"; then
-    fail_current_model "semantic join refresh timed out"
+  if ! run_and_wait "$triage_task" "triage task"; then
     return
   fi
 
-  if ! psql_exec -v row_index="$row_index" >/dev/null <<'SQL'
-SELECT otlet.refresh_semantic_index(:'row_index');
-SQL
-  then
-    fail_current_model "semantic row refresh enqueue failed"
+  if ! run_and_wait "$numeric_task" "numeric task"; then
     return
   fi
-  if ! wait_for_task "$row_task"; then
-    fail_current_model "semantic row refresh timed out"
+
+  if ! run_and_wait "$extraction_task" "extraction task"; then
+    return
+  fi
+
+  if ! run_and_wait "$policy_task" "policy task"; then
+    return
+  fi
+
+  if ! direct_rate="$(direct_schema_rate "$direct_task")"; then
+    fail_current_model "direct schema-rate query failed"
+    return
+  fi
+  if awk "BEGIN { exit !($direct_rate < $min_direct_schema_rate) }"; then
+    if ! after_hash="$(source_hash)"; then
+      fail_current_model "source hash after direct task failed"
+      return
+    fi
+    if [[ "$before_hash" = "$after_hash" ]]; then
+      source_unchanged=true
+    else
+      source_unchanged=false
+    fi
+    ended_s="$(date +%s)"
+    wall_ms="$(( (ended_s - started_s) * 1000 ))"
+    stale_leak_count=0
+    if ! worker_crash_count="$(count_worker_crashes "$started_at")"; then
+      fail_current_model "worker crash query failed"
+      return
+    fi
+    printf 'model=%s skip_semantic=true direct_schema_valid_rate=%s min_direct_schema_rate=%s\n' "$run_model_key" "$direct_rate" "$min_direct_schema_rate"
+    if ! score_current_model_run; then
+      fail_current_model "scoring failed after direct task"
+      return
+    fi
+    cleanup_downloaded_model "$model_name" "$base_model_key" "$external_artifact"
+    return
+  fi
+
+  if ! refresh_and_wait "join" "$join_index" "$join_task" "semantic join refresh"; then
+    return
+  fi
+
+  if ! refresh_and_wait "row" "$row_index" "$row_task" "semantic row refresh"; then
     return
   fi
 
@@ -968,6 +1128,9 @@ SELECT otlet.watch_semantic_stale('otlet_bench_source.vendor_entity'::regclass, 
 UPDATE otlet_bench_source.vendor_entity
 SET notes = notes || ' benchmark stale proof mutation'
 WHERE id = 'bench-1001';
+UPDATE otlet_bench_source.vendor_entity
+SET notes = notes || ' benchmark stale proof right-side mutation'
+WHERE id = 'bench-42';
 SQL
   then
     fail_current_model "stale proof mutation failed"
@@ -991,29 +1154,7 @@ SQL
     return
   fi
 
-  if ! score_model_run \
-    "$run_model_key" \
-    "$base_model_key" \
-    "$model_name" \
-    "$family" \
-    "$tier" \
-    "$quant" \
-    "$declared_params_b" \
-    "$active_params_b" \
-    "$context_tokens" \
-    "$license_note" \
-    "$source_url" \
-    "$artifact_path" \
-    "$artifact_bytes" \
-    "$external_artifact" \
-    "$direct_task" \
-    "$join_task" \
-    "$row_task" \
-    "$join_index" \
-    "$wall_ms" \
-    "$source_unchanged" \
-    "$stale_leak_count" \
-    "$worker_crash_count"; then
+  if ! score_current_model_run; then
     fail_current_model "scoring failed"
     return
   fi

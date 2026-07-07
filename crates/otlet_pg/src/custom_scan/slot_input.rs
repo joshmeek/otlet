@@ -27,7 +27,10 @@ fn semantic_slot_input(
     if slot.is_null() || runtime.source_reltype == pg_sys::InvalidOid {
         return Ok(None);
     }
-    let row = unsafe { slot_row_json(slot, runtime.source_reltype)? };
+    let row = project_row_json(
+        unsafe { slot_row_json(slot, runtime.source_reltype)? },
+        runtime.input_columns.as_deref(),
+    );
     let ctid = unsafe { slot_tid_text(slot)? };
     let xmin = unsafe { slot_xmin_text(slot)? };
     Ok(Some(serde_json::json!({
@@ -40,6 +43,22 @@ fn semantic_slot_input(
         "table": runtime.source_table,
         "row": row
     })))
+}
+
+fn project_row_json(row: Value, input_columns: Option<&[String]>) -> Value {
+    let Some(input_columns) = input_columns else {
+        return row;
+    };
+    let Value::Object(object) = row else {
+        return json!({});
+    };
+    let mut projected = serde_json::Map::new();
+    for column in input_columns {
+        if let Some(value) = object.get(column) {
+            projected.insert(column.clone(), value.clone());
+        }
+    }
+    Value::Object(projected)
 }
 
 unsafe fn semantic_join_slot_input(

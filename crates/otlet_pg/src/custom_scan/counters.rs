@@ -8,6 +8,18 @@ fn subject_state_count(
         .count() as u64
 }
 
+fn record_emitted_freshness_basis(runtime: &mut RuntimeState, subject_id: &str) {
+    let basis = runtime
+        .subject_freshness_basis
+        .get(subject_id)
+        .map(String::as_str)
+        .unwrap_or("runtime_refresh");
+    *runtime
+        .emitted_freshness_basis
+        .entry(basis.to_string())
+        .or_insert(0) += 1;
+}
+
 unsafe fn snapshot_runtime_counters(
     state: *mut OtletSemanticCustomScanState,
     runtime: &RuntimeState,
@@ -45,5 +57,7 @@ unsafe fn snapshot_runtime_counters(
             runtime.infer_trace_detailed_captured_tokens;
         (*state).infer_trace_detailed_top_k = runtime.infer_trace_detailed_top_k;
         (*state).child_plan_rows = runtime.child_plan_rows;
+        (*state).emitted_freshness_basis =
+            pg_cstr(&freshness_basis_counts_json(&runtime.emitted_freshness_basis));
     }
 }

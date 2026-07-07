@@ -1,74 +1,96 @@
-CREATE FUNCTION otlet.refresh_semantic_materializations(
-  record_type text DEFAULT NULL
-) RETURNS bigint
-LANGUAGE plpgsql
+CREATE FUNCTION otlet.semantic_input_dependencies(
+  input jsonb
+) RETURNS jsonb
+LANGUAGE sql
+IMMUTABLE
+STRICT
 AS $$
-DECLARE
-  refreshed bigint;
-BEGIN
-  INSERT INTO otlet.semantic_materializations (
-    record_id,
-    record_type,
-    source_table,
-    subject_id,
-    task_name,
-    model_name,
-    body,
-    stale,
-    source_hash,
-    updated_at
+  WITH mvcc AS (
+    SELECT CASE
+      WHEN jsonb_typeof($1 -> '_otlet_mvcc') = 'object' THEN $1 -> '_otlet_mvcc'
+      ELSE '{}'::jsonb
+    END AS doc
+  ),
+  source AS (
+    SELECT NULLIF(doc ->> 'table', '') AS source_table, doc
+    FROM mvcc
+  ),
+  dependencies AS (
+    SELECT DISTINCT
+      source_table,
+      entry.value AS subject_id,
+      entry.key AS field_name
+    FROM source
+    CROSS JOIN LATERAL jsonb_each_text(source.doc) AS entry(key, value)
+    WHERE source_table IS NOT NULL
+      AND NULLIF(entry.value, '') IS NOT NULL
+      AND (entry.key = 'subject_id' OR entry.key ~ '(^|_)id$')
   )
-  SELECT
-    r.id,
-    r.record_type,
-    j.input ->> 'table',
-    r.subject_id,
-    j.task_name,
-    t.model_name,
-    r.body,
-    false,
-    md5(j.input::text),
-    now()
-  FROM otlet.records r
-  JOIN otlet.actions a ON a.id = r.action_id
-  JOIN otlet.jobs j ON j.id = a.job_id
-  JOIN otlet.tasks t ON t.name = j.task_name
-  WHERE refresh_semantic_materializations.record_type IS NULL
-     OR r.record_type = refresh_semantic_materializations.record_type
-  ON CONFLICT (record_id) DO UPDATE
-    SET record_type = EXCLUDED.record_type,
-        source_table = EXCLUDED.source_table,
-        subject_id = EXCLUDED.subject_id,
-        task_name = EXCLUDED.task_name,
-        model_name = EXCLUDED.model_name,
-        body = EXCLUDED.body,
-        stale = false,
-        source_hash = EXCLUDED.source_hash,
-        updated_at = now();
-
-  GET DIAGNOSTICS refreshed = ROW_COUNT;
-  RETURN refreshed;
-END;
+  SELECT COALESCE(
+    jsonb_agg(
+      jsonb_build_object(
+        'table', source_table,
+        'subject_id', subject_id,
+        'field', field_name
+      )
+      ORDER BY source_table, subject_id, field_name
+    ),
+    '[]'::jsonb
+  )
+  FROM dependencies;
 $$;
 
 CREATE FUNCTION otlet.mark_semantic_stale(
   source_table text DEFAULT NULL,
-  subject_id text DEFAULT NULL
+  subject_id text DEFAULT NULL,
+  stale_reason text DEFAULT 'manual'
 ) RETURNS bigint
 LANGUAGE plpgsql
 AS $$
 DECLARE
   marked bigint;
 BEGIN
+  WITH targets AS (
+    SELECT
+      sm.id,
+      (
+        (mark_semantic_stale.source_table IS NULL OR sm.source_table = mark_semantic_stale.source_table)
+        AND (
+          mark_semantic_stale.subject_id IS NULL
+          OR sm.subject_id = mark_semantic_stale.subject_id
+        )
+      ) AS exact_match,
+      (
+        mark_semantic_stale.source_table IS NOT NULL
+        AND (
+          (
+            mark_semantic_stale.subject_id IS NULL
+            AND sm.source_dependencies @> jsonb_build_array(jsonb_build_object(
+              'table', mark_semantic_stale.source_table
+            ))
+          )
+          OR (
+            mark_semantic_stale.subject_id IS NOT NULL
+            AND sm.source_dependencies @> jsonb_build_array(jsonb_build_object(
+              'table', mark_semantic_stale.source_table,
+              'subject_id', mark_semantic_stale.subject_id
+            ))
+          )
+        )
+      ) AS dependency_match
+    FROM otlet.semantic_materializations sm
+  )
   UPDATE otlet.semantic_materializations sm
   SET stale = true,
+      stale_reason = CASE
+        WHEN targets.exact_match THEN COALESCE(mark_semantic_stale.stale_reason, 'manual')
+        WHEN COALESCE(mark_semantic_stale.stale_reason, 'manual') = 'source_update' THEN 'content_revalidation_pending'
+        ELSE COALESCE(mark_semantic_stale.stale_reason, 'manual')
+      END,
       updated_at = now()
-  WHERE (mark_semantic_stale.source_table IS NULL OR sm.source_table = mark_semantic_stale.source_table)
-    AND (
-      mark_semantic_stale.subject_id IS NULL
-      OR sm.subject_id = mark_semantic_stale.subject_id
-      OR mark_semantic_stale.subject_id = ANY(string_to_array(sm.subject_id, ':'))
-    );
+  FROM targets
+  WHERE sm.id = targets.id
+    AND (targets.exact_match OR targets.dependency_match);
 
   GET DIAGNOSTICS marked = ROW_COUNT;
   RETURN marked;
@@ -89,7 +111,11 @@ BEGIN
   END IF;
 
   subject_id := row_input ->> TG_ARGV[0];
-  PERFORM otlet.mark_semantic_stale(format('%I.%I', TG_TABLE_SCHEMA, TG_TABLE_NAME), subject_id);
+  PERFORM otlet.mark_semantic_stale(
+    format('%I.%I', TG_TABLE_SCHEMA, TG_TABLE_NAME),
+    subject_id,
+    CASE WHEN TG_OP = 'DELETE' THEN 'source_delete' ELSE 'source_update' END
+  );
 
   IF TG_OP = 'DELETE' THEN
     RETURN OLD;

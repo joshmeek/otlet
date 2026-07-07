@@ -1,6 +1,6 @@
 use pgrx::prelude::*;
 use pgrx::{FromDatum, JsonB, pg_sys};
-use serde_json::{Value, json};
+use serde_json::Value;
 use std::collections::HashMap;
 use std::ffi::{CStr, CString};
 use std::ptr;
@@ -20,6 +20,7 @@ enum SemanticAccessKind {
 
 #[derive(Clone)]
 struct SemanticFdwPlan {
+    plan_source: String,
     selected_path: String,
     reason: String,
     task_name: String,
@@ -47,6 +48,8 @@ struct SemanticFdwPlan {
     path_cost: f64,
     worker_queue_depth: i64,
     available_queue_slots: i64,
+    stale_reasons: String,
+    count_basis: String,
 }
 
 struct SemanticFdwRow {
@@ -54,7 +57,8 @@ struct SemanticFdwRow {
     body: Option<Value>,
     stale: Option<bool>,
     source_hash: Option<String>,
-    updated_at: Option<String>,
+    freshness_basis: Option<String>,
+    updated_at: Option<TimestampWithTimeZone>,
 }
 
 struct SubjectScopeStats {
@@ -136,6 +140,7 @@ impl SemanticFdwState {
 }
 
 const FDW_PRIVATE_MARKER: &str = "__otlet_semantic_fdw_json_v1__";
+const FDW_PRIVATE_SUBJECTS_MARKER: &str = "__otlet_semantic_fdw_subjects_v1__";
 
 static OTLET_SEMANTIC_FDW_FINFO: pg_sys::Pg_finfo_record =
     pg_sys::Pg_finfo_record { api_version: 1 };

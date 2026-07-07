@@ -145,6 +145,7 @@ SELECT
   s.semantic_index_name,
   s.row_identity,
   s.mvcc,
+  s.freshness_basis,
   s.worker_handoff,
   s.stale_policy,
   s.stop_reason,
@@ -160,6 +161,8 @@ SELECT
   s.detailed_trace_skipped_tokens,
   s.model_cache_hit,
   s.inference_cache_hit,
+  s.inference_cache_key_basis,
+  s.inference_cache_eviction_reason,
   s.inference_cache_reason,
   pg_column_size(r.trace_summary)::bigint AS trace_summary_bytes,
   COALESCE((

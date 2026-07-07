@@ -315,6 +315,32 @@ The task has seven parts:
 
 The schema separates model judgment from database state Otlet stores
 
+Decision-rule presets are immutable. Edit behavior by creating a new preset name, not by rewriting the shipped preset row:
+
+```sql
+DO $$
+BEGIN
+  UPDATE otlet.decision_rule_presets
+  SET decision_contract = decision_contract || '{"demo_edit":true}'::jsonb
+  WHERE name = 'row_triage_decision_v1';
+  RAISE EXCEPTION 'expected preset update to be rejected';
+EXCEPTION
+  WHEN OTHERS THEN
+    IF SQLERRM NOT LIKE 'otlet decision rule preset row_triage_decision_v1 is immutable%' THEN
+      RAISE;
+    END IF;
+END;
+$$;
+
+SELECT 'preset_immutability_contract=raised' AS preset_immutability_contract;
+```
+
+Representative output:
+
+```text
+preset_immutability_contract=raised
+```
+
 If the model returns malformed JSON, missing fields, unknown fields, or values outside the enum, Otlet marks the job failed and keeps the raw evidence. Otlet stores no trusted output or records
 
 ## Enqueue The Jobs
@@ -450,6 +476,93 @@ Representative output:
 (1 row)
 ```
 
+## Review The Queue
+
+`otlet.review_queue` gathers actions that need attention, abstention outputs, and review flags with receipt and source-freshness context:
+
+```sql
+SELECT queue_kind, task_name, watch_name, subject_id, action_id, receipt_id, source_stale
+FROM otlet.review_queue
+WHERE task_name IN ('entity_resolution_demo', 'demo_entity_resolution_idx_task')
+ORDER BY created_at, task_name
+LIMIT 5;
+```
+
+Representative output:
+
+```text
+    queue_kind    |            task_name            |         watch_name         | subject_id | action_id | receipt_id | source_stale
+------------------+---------------------------------+----------------------------+------------+-----------+------------+--------------
+ pending_approval | demo_entity_resolution_idx_task | demo_entity_resolution_idx | vendor-42  |        35 |         85 | f
+(1 row)
+```
+
+Manual correction is one atomic call: reject the action and write a gold `manual_correction` eval label. This example rolls back so the later approval flow can still run:
+
+```sql
+BEGIN;
+
+WITH target AS (
+  SELECT
+    q.action_id,
+    q.action_type,
+    q.output ->> COALESCE(NULLIF(t.decision_contract ->> 'answer_field', ''), 'match') AS expected_answer,
+    COALESCE(q.output ->> 'confidence', 'high') AS expected_confidence
+  FROM otlet.review_queue q
+  JOIN otlet.tasks t ON t.name = q.task_name
+  WHERE q.action_id IS NOT NULL
+    AND q.task_name IN ('entity_resolution_demo', 'demo_entity_resolution_idx_task')
+  ORDER BY q.created_at, q.task_name
+  LIMIT 1
+), correction AS (
+  SELECT l.*
+  FROM target t,
+  LATERAL otlet.correct_action(
+    t.action_id,
+    jsonb_build_object(
+      'expected_answer', t.expected_answer,
+      'expected_confidence', t.expected_confidence,
+      'expected_action_type', t.action_type
+    ),
+    'worked example correction'
+  ) l
+)
+SELECT action_id, expected_answer, expected_confidence, expected_action_type, label_source
+FROM correction;
+
+ROLLBACK;
+```
+
+Representative output:
+
+```text
+ action_id | expected_answer | expected_confidence | expected_action_type |   label_source
+-----------+-----------------+---------------------+----------------------+-------------------
+        35 | same_entity     | high                | merge_candidate      | manual_correction
+(1 row)
+```
+
+The same correction is immediately available as local eval data:
+
+```sql
+SELECT action_id, case_kind, expected_answer, expected_action_type, manual_gold
+FROM otlet.export_eval_cases(5)
+WHERE label_source = 'manual_correction'
+ORDER BY created_at DESC
+LIMIT 1;
+```
+
+Representative output:
+
+```text
+ action_id | case_kind | expected_answer | expected_action_type | manual_gold
+-----------+-----------+-----------------+----------------------+-------------
+        35 | gold      | same_entity     | merge_candidate      | t
+(1 row)
+```
+
+Eval label confidence is intentionally the same small vocabulary used by model outputs: `low`, `medium`, or `high`. Keep calibration notes in `reason` or task-specific fields rather than expanding `expected_confidence`
+
 Approve, dry-run, and apply one merge proposal:
 
 ```sql
@@ -490,6 +603,10 @@ Representative output:
 ```
 
 Semantic refresh jobs create typed `create_record` actions, `otlet.records` rows, and semantic materializations after schema validation passes
+
+Semantic materializations keep two row identities. `source_hash` is MVCC-coupled provenance for the exact row version that produced a job. `content_hash` is the model-input identity used for freshness, excluding Otlet's MVCC envelope so benign row churn can revalidate without rerunning the model
+
+Input shaping fields are top-level in the task input. Row watches wrap source rows under `row`, so `evidence_fields` does not traverse `row.evidence`; project evidence to a top-level object in the input or pair candidate query. Pair watches treat the candidate query as the shaping declaration, with `strip_keys` available for top-level volatile fields
 
 ## Inspect Model Selection Attempts
 
@@ -573,6 +690,18 @@ Otlet exposes model residency here
 The worker keeps the local model/context warm across jobs. SQL can see the slot state, memory sample, context window, cache entries, cache bounds, and the last cache reason
 
 SQL shows whether the model loaded, is busy, failed, cached, or went over budget
+
+The inference-output cache stores schema-valid raw model output before selection trust is applied. Accepted abstentions and rejected-but-valid attempts may reuse cached bytes; invalid JSON/schema failures stay out of the cache. The receipt still records accepted/rejected/failed status, and the cache key basis stays content hash + contract hash + model fingerprint
+
+```sql
+SELECT task_name,
+       cache_enabled_receipts,
+       inference_cache_hits,
+       inference_cache_hit_rate,
+       inference_cache_key_bases
+FROM otlet.task_inference_cache_status
+WHERE task_name = 'entity_resolution_demo';
+```
 
 ## Inspect Token Traces
 
@@ -701,18 +830,18 @@ Representative output:
 ```text
  otlet_base_tables
 -------------------
-                17
+                19
 (1 row)
 ```
 
 The base tables split into a few jobs:
 
-- `runtimes`, `models`, `model_versions`, and `runtime_slots` describe the local model runtime
+- `runtimes`, `models`, and `runtime_slots` describe the local model runtime
 - `tasks`, `model_selection_policies`, and `jobs` describe durable work and cheap-first escalation policy
 - `outputs`, `action_type_schemas`, `actions`, `records`, `inference_receipts`, and `worker_events` describe what happened
 - `production_policy` defines queue admission, leases, invalid output handling, stale-result behavior, and cleanup windows
-- `semantic_indexes` and `semantic_materializations` make model-derived state queryable
-- `semantic_join_indexes` do the same for pairwise candidate rows
+- `watches`, `semantic_indexes`, and `semantic_materializations` make row-derived model state queryable
+- `watches` and `semantic_join_indexes` do the same for pairwise candidate rows
 
 Use `otlet.runs` for application reads. Use trace and status views for debugging, proof, and learning
 
@@ -918,12 +1047,11 @@ Representative output:
    action_type   | requires_approval | creates_record
 -----------------+-------------------+----------------
  create_record   | f                 | t
- follow_up_job   | f                 | f
  merge_candidate | t                 | f
  new_entity      | f                 | f
  note            | f                 | t
  review_flag     | f                 | f
-(6 rows)
+(5 rows)
 
  rejected_action_error
 -----------------------
@@ -945,7 +1073,7 @@ FROM otlet.semantic_materializations
 WHERE record_type = 'entity_hypothesis'
 ORDER BY id;
 
-SELECT otlet.refresh_semantic_materializations('entity_hypothesis') AS refreshed_materializations;
+SELECT otlet.materialize_semantic_index('demo_semantic_vendor_idx') AS refreshed_materializations;
 
 SELECT otlet.watch_semantic_stale('public.otlet_entity_vendor'::regclass, 'id') AS stale_trigger_name;
 
@@ -987,18 +1115,26 @@ UPDATE 1
 
 The trigger does not rerun the model. It marks the previous derived fact stale so reads can fail closed or request refresh
 
-## Build A Semantic Index
+Plain `mark_stale` row watches treat INSERT as missing semantic state rather than stale semantic state. Exact planning shows the new row as unresolved until refresh or infer-now:
 
-A semantic index wraps a source table with an Otlet task, materialized records, stale tracking, and a native FDW table
+```sql
+SELECT missing_subjects, queue_subjects, count_basis
+FROM otlet.semantic_index_plan('demo_semantic_vendor_idx', true);
+```
+
+Use `{"on_change":"mark_stale_and_enqueue"}` when inserts need immediate enqueue
+
+## Build A Row Watch
+
+A row watch wraps a source table with an Otlet task, materialized records, stale tracking, trigger policy, and a native FDW table
 
 The creation shape is:
 
 ```sql
-SELECT otlet.create_semantic_index(
+SELECT otlet.create_watch(
   'demo_semantic_vendor_idx',
-  'public.otlet_demo_semantic_vendor'::regclass,
-  'id',
-  'Otlet demo semantic index. Return exactly this JSON object for every input row: {"output":{"status":"needs_review","needs_review":true,"issues":["demo semantic index"]},"actions":[{"type":"create_record","record_type":"demo_semantic_fact","subject_id":"db-owned","body":{"status":"needs_review","needs_review":true,"semantic":"indexed row"}}]}',
+  'row',
+  'Otlet demo row watch. Return exactly this JSON object for every input row: {"output":{"status":"needs_review","needs_review":true,"issues":["demo semantic index"]},"actions":[{"type":"create_record","record_type":"demo_semantic_fact","subject_id":"db-owned","body":{"status":"needs_review","needs_review":true,"semantic":"indexed row"}}]}',
   '{
     "type": "object",
     "required": ["status", "needs_review", "issues"],
@@ -1010,8 +1146,14 @@ SELECT otlet.create_semantic_index(
     }
   }'::jsonb,
   'qwen3_1_7b',
+  'public.otlet_demo_semantic_vendor'::regclass,
+  'id',
+  NULL,
+  'demo_semantic_fact',
   '{"max_tokens":256,"reasoning":"off","inference_cache":true,"generation_trace":true,"generation_trace_max_tokens":12,"generation_trace_top_k":3}'::jsonb,
-  'demo_semantic_fact'
+  '{}'::jsonb,
+  '{"on_change":"mark_stale"}'::jsonb,
+  ARRAY['create_record']
 );
 
 SELECT otlet.refresh_semantic_index('demo_semantic_vendor_idx') AS queued;
@@ -1088,7 +1230,7 @@ semantic_index_plan_contract=semantic_lookup|3|3|0|0|1.0000
 
 ## Read Through FDW
 
-`create_semantic_index` also creates a native foreign table
+`create_watch` also creates an underlying native foreign table for row watches
 
 The FDW table holds materialized semantic state:
 
@@ -1125,6 +1267,9 @@ Representative output excerpt:
 Foreign Scan on otlet.demo_semantic_vendor_idx_native
   Otlet Node: Semantic Foreign Scan
   Selected Path: semantic_lookup
+  Stale Reasons: {}
+  Count Basis: pushdown_scoped
+  Model Cost Source: runtime_slot
   Queue Subjects: 0
   Path Cost: 1.05
   Freshness: 1.00
@@ -1132,6 +1277,57 @@ Foreign Scan on otlet.demo_semantic_vendor_idx_native
 ```
 
 The FDW runs inside Postgres as a native access path over Otlet-owned semantic materializations
+
+## EXPLAIN Field Vocabulary
+
+The SQL plan row, FDW EXPLAIN, and CustomScan EXPLAIN use the same terms for the planner contract
+
+| Concept | SQL plan row | FDW EXPLAIN | CustomScan EXPLAIN | Parity |
+| --- | --- | --- | --- | --- |
+| Chosen path | `selected_path` | `Selected Path` | `Planner Selected Path` | Same vocabulary; CustomScan prefixes planner-owned decisions |
+| Reason | `reason` | `Reason` | `Planner Reason` | Same meaning |
+| Count basis | `count_basis` | `Count Basis` | `Count Basis` | Intended gap: pushed FDW filters use `pushdown_scoped`; CustomScan source-row predicates use exact or child-plan counts |
+| Model cost basis | `model_cost_source` | `Model Cost Source` | `Model Cost Source` | Same ordered basis: task receipt, runtime slot, model receipt, static fallback |
+| Stale reasons | `stale_reasons` | `Stale Reasons` | `Planner Stale Reasons` | Same JSON shape where stale subjects are counted |
+| Infer-now prediction | `infer_now_subjects`, `fail_closed_subjects` | `Infer Now Subjects`, `Fail Closed Subjects` | `Planner Infer Now Subjects`, `Planner Fail Closed Subjects` | Intended gap: FDW has no infer-now executor; CustomScan also reports actual executor counters |
+| Freshness basis | `semantic_index_current_rows.freshness_basis` | `freshness_basis` output column | `Preloaded Fresh Subjects / Basis`, `Emitted Freshness Basis` | Intended gap: freshness basis is row output in FDW and aggregate executor evidence in CustomScan |
+
+EXPLAIN line ledger for this pass:
+
+| Surface | Added | Deleted or merged | Net |
+| --- | --- | --- | --- |
+| CustomScan | `Emitted Freshness Basis` | `Preloaded Fresh Subjects` and `Preloaded Freshness Basis` merged into `Preloaded Fresh Subjects / Basis` | 0 |
+| SQL plan row | no EXPLAIN line added; `infer_now_subjects` and `infer_now_ms` now use existing columns | none | 0 |
+
+Captured row-plan excerpt:
+
+```text
+selected_path | semantic_lookup
+stale_reasons | {}
+model_cost_source | task_receipt
+count_basis | exact
+```
+
+Captured FDW EXPLAIN excerpt:
+
+```text
+Selected Path: semantic_lookup
+Stale Reasons: {}
+Count Basis: pushdown_scoped
+Model Cost Source: runtime_slot
+Freshness: 1.00
+```
+
+Captured CustomScan EXPLAIN excerpt:
+
+```text
+Planner Selected Path: semantic_lookup
+Planner Stale Reasons: {}
+Count Basis: exact
+Model Cost Source: task_receipt
+Preloaded Fresh Subjects / Basis: 3 {"mvcc_match": 3}
+Emitted Freshness Basis: {"mvcc_match": 3}
+```
 
 ## Use CustomScan For Source-Row Predicates
 
@@ -1152,11 +1348,17 @@ Custom Scan (Otlet Semantic Source CustomScan) on public.otlet_demo_semantic_ven
   Child Semantic Filter: stripped_before_child_plan
   Semantic Index: demo_semantic_vendor_idx
   Planner Selected Path: semantic_lookup
-  Planner Fresh Rows: 3
+  Count Basis: exact
+  Model Cost Source: task_receipt
+  Planner Stale Reasons: {}
+  Preloaded Fresh Subjects / Basis: 3 {"mvcc_match": 3}
+  Emitted Freshness Basis: {"mvcc_match": 3}
   Actual Fresh Subjects: 3
 ```
 
 The child scan reads the source table. Otlet strips the semantic predicate from the child plan and evaluates it against preloaded semantic state
+
+CustomScan uses statement preload semantics. Row-marked queries such as `FOR UPDATE` stay on the ordinary Postgres plan because the CustomScan planner path is blocked when rowmarks are present; locking and row recheck behavior remain owned by Postgres. For non-rowmark CustomScan, concurrent source changes are picked up by stale triggers and the next statement rather than by a per-tuple recheck inside the same scan
 
 ## Fail Closed On Stale Rows
 
@@ -1232,9 +1434,14 @@ Custom Scan (Otlet Semantic Source CustomScan) on public.otlet_demo_semantic_ven
   Infer Now Timeout Ms: 15000
   Infer Now Max Rows: 1
   Planner Selected Path: bounded_infer_now
-  Planner Stale Rows: 1
+  Count Basis: exact
+  Model Cost Source: task_receipt
+  Planner Infer Now Subjects: 1
+  Planner Fail Closed Subjects: 0
+  Preloaded Stale Subjects: 1
   Actual Infer Resolved Rows: 1
   Infer Now Receipts: 1
+  Infer Now Trace Receipt Id: 42
 ```
 
 The executor refreshed the stale row with a bounded infer-now budget and a receipt
@@ -1265,14 +1472,14 @@ Representative output:
 
 Receipts carry executor provenance because the same model task can run from the worker queue or from CustomScan infer-now
 
-## Build A Semantic Join Index
+## Build A Pair Watch
 
-Semantic indexes are row-oriented. Semantic join indexes are pair-oriented
+Row watches are source-table-oriented. Pair watches are candidate-query-oriented
 
 The candidate query supplies `subject_id` and `input` for candidate pairs:
 
 ```sql
-SELECT otlet.drop_semantic_join_index('learning_entity_pair_idx');
+SELECT otlet.drop_watch('learning_entity_pair_idx');
 
 DROP TABLE IF EXISTS public.learning_entity;
 
@@ -1292,21 +1499,32 @@ SELECT 'semantic_join_create_contract=' ||
        task_name || '|' ||
        record_type || '|' ||
        max_candidate_rows::text
-FROM otlet.create_semantic_join_index(
-  'learning_entity_pair_idx',
-  $$
+FROM otlet.create_watch(
+  watch_name => 'learning_entity_pair_idx',
+  kind => 'pair',
+  instruction => 'The two input entities are the same company. Return exactly this JSON object: {"output":{"match":"yes","confidence":0.95,"needs_review":false},"actions":[]}',
+  output_schema => '{"type":"object","required":["match","confidence","needs_review"],"additionalProperties":false,"properties":{"match":{"enum":["yes"]},"confidence":{"type":"number"},"needs_review":{"type":"boolean"}}}'::jsonb,
+  model_name => 'qwen3_1_7b',
+  candidate_query => $$
     SELECT
       a.id::text || ':' || b.id::text AS subject_id,
-      jsonb_build_object('left', to_jsonb(a), 'right', to_jsonb(b)) AS input
+      jsonb_build_object(
+        '_otlet_mvcc', jsonb_build_object(
+          'table', 'public.learning_entity',
+          'subject_id', a.id::text,
+          'right_id', b.id::text
+        ),
+        'left', to_jsonb(a),
+        'right', to_jsonb(b)
+      ) AS input
     FROM public.learning_entity a
     JOIN public.learning_entity b ON a.id < b.id
   $$,
-  'The two input entities are the same company. Return exactly this JSON object: {"output":{"match":"yes","confidence":0.95,"needs_review":false},"actions":[]}',
-  '{"type":"object","required":["match","confidence","needs_review"],"additionalProperties":false,"properties":{"match":{"enum":["yes"]},"confidence":{"type":"number"},"needs_review":{"type":"boolean"}}}'::jsonb,
-  'qwen3_1_7b',
-  'learning_entity_pair',
-  '{"max_tokens":160,"reasoning":"off"}'::jsonb,
-  10
+  record_type => 'learning_entity_pair',
+  runtime_options => '{"max_tokens":160,"reasoning":"off"}'::jsonb,
+  trigger_policy => '{"on_change":"mark_stale"}'::jsonb,
+  max_candidate_rows => 10,
+  pair_sources => '[{"table":"public.learning_entity","subject_column":"id"}]'::jsonb
 );
 
 SELECT 'semantic_join_refresh_queued=' ||
@@ -1331,6 +1549,8 @@ semantic_join_create_contract=learning_entity_pair_idx|learning_entity_pair_idx_
 semantic_join_refresh_queued=1
 semantic_join_auto_materialized=1
 ```
+
+`pair_sources` installs the same stale trigger used by row indexes. Updates to declared source rows mark matching pair materializations through `_otlet_mvcc` dependencies, and `drop_watch` removes the trigger when no row index or pair watch still needs it
 
 Now inspect the join index:
 
@@ -1425,6 +1645,31 @@ The value reports a ready runtime, a ready model slot, bounded cache entries, an
 
 The production policy row and status views are ordinary SQL state under `otlet`: `production_policy_status`, `production_status`, `model_queue_status`, `worker_throughput_status`, and `cleanup_policy_state(true)`
 
+Queue caps are admission-time controls. Rows enter `otlet.jobs` through `run_task`, watch refresh, semantic refresh, or `ask`; direct inserts are internal/testing-only and can bypass admission accounting. `verify_invariants()` reports `queued_jobs_within_model_cap` if queued depth for any model exceeds `max_queued_jobs_per_model`
+
+Suppressed queue-admission events are debounced per task and reason for one minute, so a full queue stays visible without flooding `worker_events`. `production_status` also exposes `semantic_materialization_failed_events` and `semantic_materialization_last_failed_at`. Nonzero `max_worker_rss_bytes` budgets require Linux process-status RSS sampling; unsupported builds reject the option during runtime-option validation instead of letting jobs fail later. Cleanup can prune old failed/canceled jobs only when outputs, actions, eval labels, and receipt references no longer keep them alive
+
+The resident worker attaches to the `postgres` database. Multi-database worker registration needs separate shared-memory and latch routing work before it is a supported deployment shape
+
+Native llama.cpp faults happen below Rust's normal error boundary. Otlet's containment contract is Postgres worker restart plus lease recovery: no partial model output is trusted, and `otlet.sweep_expired_jobs()` fails expired running jobs that reached the attempt limit with a receipt. The full demo also scans container logs and prints `docker_crash_log_scan=ok` when no worker crash, panic, assertion, or terminated server process appears during the run
+
+```sql
+SELECT otlet.sweep_expired_jobs();
+
+SELECT j.status, j.error, r.status AS receipt_status, r.selection_reason
+FROM otlet.jobs j
+JOIN otlet.inference_receipts r ON r.job_id = j.id
+WHERE r.selection_reason = 'job_lease_expired_after_max_attempts'
+ORDER BY r.id DESC
+LIMIT 1;
+```
+
+Representative targeted smoke output:
+
+```text
+ffi_sweep_safety_contract=1|failed|job lease expired after max attempts|failed|failed|job_lease_expired_after_max_attempts
+```
+
 Representative output from the demo contract:
 
 ```text
@@ -1432,7 +1677,7 @@ production_policy_contract=default|refresh_then_fail_closed|3|8
 production_status_contract=true|true|true|true
 model_queue_status_contract=queue_accepting|0|0
 throughput_status_contract=queue_accepting|0|0|4|4|0
-cleanup_policy_dry_run=0|0|0|true
+cleanup_policy_dry_run=0|0|0|0|0|0|0|true
 ```
 
 ## Know The Remaining Production Boundaries
@@ -1458,7 +1703,7 @@ WHERE schemaname = 'otlet';
 Representative output:
 
 ```text
-rls_contract=15|0
+rls_contract=19|0
 installed_policies=0
 ```
 
@@ -1478,14 +1723,14 @@ FROM (
 Representative output:
 
 ```text
-grant_contract=DELETE:34|INSERT:34|REFERENCES:34|SELECT:34|TRIGGER:34|TRUNCATE:34|UPDATE:34
+grant_contract=DELETE:44|INSERT:44|REFERENCES:44|SELECT:44|TRIGGER:44|TRUNCATE:44|UPDATE:44
 ```
 
 Your application owns these production boundaries:
 
 - create app roles that expose only the views and functions you want
 - add RLS or schema isolation if multiple tenants share the database
-- schedule `otlet.cleanup_policy_state(false)` if your deployment wants periodic worker-event and trace pruning
+- schedule `otlet.cleanup_policy_state(false)` if your deployment wants periodic worker-event, trace, stale materialization, rejected raw-output, and unreferenced failed/canceled job pruning
 - expose `otlet.approve_action`, `otlet.reject_action`, `otlet.dry_run_action`, and `otlet.apply_action` only to roles that can operate actions
 - allow only the action types your application can safely interpret
 
