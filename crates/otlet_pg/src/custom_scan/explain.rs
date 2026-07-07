@@ -86,8 +86,12 @@ unsafe extern "C-unwind" fn explain_semantic_custom_scan(
             );
             explain_runtime_trace(runtime, es);
         } else if let Some(private) = custom_private_from_plan(node) {
-            let planner_stats = reload_private_planner_stats(&private);
-            let policy = semantic_policy_for_selected_path(&planner_stats.selected_path);
+            let (planner_stats, policy) =
+                planner_snapshot_from_state(state).unwrap_or_else(|| {
+                    let planner_stats = reload_private_planner_stats(&private);
+                    let policy = semantic_policy_for_selected_path(&planner_stats.selected_path);
+                    (planner_stats, policy)
+                });
             explain_semantic_metadata(
                 SemanticExplainMetadata {
                     index_name: &private.index_name,
@@ -161,6 +165,56 @@ unsafe extern "C-unwind" fn explain_semantic_custom_scan(
         }
     }
 }
+
+unsafe fn planner_snapshot_from_state(
+    state: *mut OtletSemanticCustomScanState,
+) -> Option<(SemanticPlannerStats, SemanticAutoPolicy)> {
+    unsafe {
+        let selected_path = pg_cstr_str((*state).planner_selected_path)?.to_string();
+        Some((
+            SemanticPlannerStats {
+                selected_path,
+                reason: pg_cstr_str((*state).planner_reason)
+                    .unwrap_or("planner snapshot")
+                    .to_string(),
+                source_rows: (*state).known_subjects,
+                fresh_matches: (*state).preloaded_fresh_matches,
+                fresh_non_matches: (*state).preloaded_fresh_non_matches,
+                stale_rows: (*state).preloaded_stale_subjects,
+                missing_rows: 0,
+                inflight_rows: (*state).preloaded_inflight_subjects,
+                cache_reusable_rows: 0,
+                infer_decision_rows: (*state).planner_infer_decision_rows,
+                fail_closed_decision_rows: (*state).planner_fail_closed_decision_rows,
+                model_ms: if (*state).planner_model_ms.is_finite()
+                    && (*state).planner_model_ms > 0.0
+                {
+                    (*state).planner_model_ms
+                } else {
+                    2500.0
+                },
+                model_cost_source: pg_cstr_str((*state).planner_model_cost_source)
+                    .unwrap_or("static_fallback")
+                    .to_string(),
+                path_cost: 0.0,
+                stale_reasons: pg_cstr_str((*state).planner_stale_reasons)
+                    .unwrap_or("{}")
+                    .to_string(),
+                count_basis: pg_cstr_str((*state).planner_count_basis)
+                    .unwrap_or("unknown")
+                    .to_string(),
+            },
+            SemanticAutoPolicy {
+                auto_policy: (*state).auto_policy,
+                allow_refresh: (*state).allow_refresh,
+                wait_ms: (*state).wait_ms,
+                infer_ms: (*state).infer_ms,
+                infer_max_rows: (*state).infer_max_rows,
+            },
+        ))
+    }
+}
+
 fn free_buffered_rows(runtime: &mut RuntimeState) {
     while let Some(slot) = runtime.pending_output_rows.pop_front() {
         unsafe {

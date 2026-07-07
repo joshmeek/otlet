@@ -274,14 +274,18 @@ fn process_job_batch(jobs: Vec<Job>) -> BatchProcessResult {
     let mut strong_jobs = Vec::new();
     for job in jobs {
         let mut result = process_job_deferred(job);
-        if let Some(strong_job) = result.strong_fallback.take() {
-            strong_jobs.push(strong_job);
+        if let Some((strong_job, reason)) = result.strong_fallback.take() {
+            strong_jobs.push((result, strong_job, reason));
+        } else {
+            batch.add_finished(result);
         }
-        batch.add_finished(result);
     }
 
-    for (job, reason) in strong_jobs {
-        batch.add_finished(run_strong_attempt_result(job, reason));
+    for (mut result, job, reason) in strong_jobs {
+        let strong_result = run_strong_attempt_result(job, reason);
+        result.completed = strong_result.completed;
+        result.add_result_metrics(&strong_result);
+        batch.add_finished(result);
     }
 
     batch

@@ -2,6 +2,11 @@ struct CustomScanPrivate {
     index_kind: SemanticIndexKind,
     index_name: String,
     expected_json: String,
+    auto_policy: bool,
+    allow_refresh: bool,
+    wait_ms: u32,
+    infer_ms: u32,
+    infer_max_rows: u32,
     subject_attno: i16,
     subject_typid: pg_sys::Oid,
     input_columns: Option<Vec<String>>,
@@ -13,6 +18,11 @@ unsafe fn custom_private_from_predicate(predicate: &SemanticMatchPredicate) -> *
             "index_kind": predicate.index_kind.as_str(),
             "index_name": &predicate.index_name,
             "expected_json": &predicate.expected_json,
+            "auto_policy": predicate.auto_policy,
+            "allow_refresh": predicate.allow_refresh,
+            "wait_ms": predicate.wait_ms,
+            "infer_ms": predicate.infer_ms,
+            "infer_max_rows": predicate.infer_max_rows,
             "subject_attno": predicate.subject_attno,
             "subject_typid": predicate.subject_typid.to_u32(),
             "input_columns": &predicate.input_columns
@@ -56,6 +66,29 @@ unsafe fn custom_private_from_list(private: *mut pg_sys::List) -> Option<CustomS
                 .unwrap_or(SemanticIndexKind::Row),
             index_name: payload.get("index_name")?.as_str()?.to_string(),
             expected_json: payload.get("expected_json")?.as_str()?.to_string(),
+            auto_policy: payload
+                .get("auto_policy")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            allow_refresh: payload
+                .get("allow_refresh")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            wait_ms: payload
+                .get("wait_ms")
+                .and_then(Value::as_u64)
+                .unwrap_or(0)
+                .min(u32::MAX as u64) as u32,
+            infer_ms: payload
+                .get("infer_ms")
+                .and_then(Value::as_u64)
+                .unwrap_or(0)
+                .min(u32::MAX as u64) as u32,
+            infer_max_rows: payload
+                .get("infer_max_rows")
+                .and_then(Value::as_u64)
+                .unwrap_or(0)
+                .min(u32::MAX as u64) as u32,
             subject_attno: payload.get("subject_attno")?.as_i64()?.try_into().ok()?,
             subject_typid: pg_sys::Oid::from(payload.get("subject_typid")?.as_u64()? as u32),
             input_columns: payload
@@ -77,13 +110,48 @@ fn reload_private_planner_stats(private: &CustomScanPrivate) -> SemanticPlannerS
         SemanticIndexKind::Row => "otlet.semantic_index_plan",
         SemanticIndexKind::Join => "otlet.semantic_join_index_plan",
     };
+    let current_rows_function = match private.index_kind {
+        SemanticIndexKind::Row => "otlet.semantic_index_current_rows",
+        SemanticIndexKind::Join => "otlet.semantic_join_index_current_rows",
+    };
+    let exact_plan = if private.index_kind == SemanticIndexKind::Row {
+        "true"
+    } else {
+        "false"
+    };
     let query = format!(
-        "SELECT selected_path, reason, total_subjects, fresh_subjects, stale_subjects, missing_subjects, inflight_subjects, \
-         infer_now_subjects, fail_closed_subjects, model_ms::float8 AS model_ms, model_cost_source, path_cost::float8 AS path_cost, \
-         stale_reasons::text AS stale_reasons, count_basis \
-         FROM {}({})",
+        "WITH plan AS ( \
+           SELECT * \
+           FROM {}({}, {}) \
+         ), \
+         current_rows AS ( \
+           SELECT body, stale \
+           FROM {}({}, false) \
+         ) \
+         SELECT \
+           COALESCE((SELECT selected_path FROM plan), 'semantic_lookup')::text AS selected_path, \
+           COALESCE((SELECT reason FROM plan), 'reloaded_from_sql_plan')::text AS reason, \
+           COALESCE((SELECT total_subjects FROM plan), 0)::bigint AS total_subjects, \
+           count(*) FILTER (WHERE stale = false AND body @> {}::jsonb)::bigint AS fresh_matches, \
+           count(*) FILTER (WHERE stale = false AND NOT (body @> {}::jsonb))::bigint AS fresh_non_matches, \
+           COALESCE((SELECT stale_subjects FROM plan), 0)::bigint AS stale_subjects, \
+           COALESCE((SELECT missing_subjects FROM plan), 0)::bigint AS missing_subjects, \
+           COALESCE((SELECT inflight_subjects FROM plan), 0)::bigint AS inflight_subjects, \
+           COALESCE((SELECT infer_now_subjects FROM plan), 0)::bigint AS infer_now_subjects, \
+           COALESCE((SELECT fail_closed_subjects FROM plan), 0)::bigint AS fail_closed_subjects, \
+           COALESCE((SELECT model_ms FROM plan), 2500)::float8 AS model_ms, \
+           COALESCE((SELECT model_cost_source FROM plan), 'static_fallback')::text AS model_cost_source, \
+           COALESCE((SELECT path_cost FROM plan), 1)::float8 AS path_cost, \
+           COALESCE((SELECT stale_reasons::text FROM plan), '{{}}')::text AS stale_reasons, \
+           COALESCE((SELECT count_basis FROM plan), 'exact')::text AS count_basis \
+         FROM current_rows",
         plan_function,
-        sql_literal(&private.index_name)
+        sql_literal(&private.index_name),
+        exact_plan,
+        current_rows_function,
+        sql_literal(&private.index_name),
+        sql_literal(&private.expected_json),
+        sql_literal(&private.expected_json)
     );
 
     pgrx::Spi::connect(|client| {
@@ -107,12 +175,12 @@ fn reload_private_planner_stats(private: &CustomScanPrivate) -> SemanticPlannerS
                     .max(0) as u64
             };
         }
-        Ok::<SemanticPlannerStats, String>(SemanticPlannerStats {
+        let mut stats = SemanticPlannerStats {
             selected_path: text!("selected_path", "semantic_lookup"),
             reason: text!("reason", "reloaded_from_sql_plan"),
             source_rows: count!("total_subjects"),
-            fresh_matches: count!("fresh_subjects"),
-            fresh_non_matches: 0,
+            fresh_matches: count!("fresh_matches"),
+            fresh_non_matches: count!("fresh_non_matches"),
             stale_rows: count!("stale_subjects"),
             missing_rows: count!("missing_subjects"),
             inflight_rows: count!("inflight_subjects"),
@@ -132,7 +200,20 @@ fn reload_private_planner_stats(private: &CustomScanPrivate) -> SemanticPlannerS
                 .max(0.0),
             stale_reasons: text!("stale_reasons", "{}"),
             count_basis: text!("count_basis", "estimated"),
-        })
+        };
+        finish_planner_stats(
+            &mut stats,
+            private.allow_refresh,
+            private.wait_ms,
+            private.infer_ms,
+            private.infer_max_rows,
+            private.auto_policy,
+        );
+        if private.index_kind == SemanticIndexKind::Join && stats.selected_path == "semantic_lookup"
+        {
+            stats.selected_path = "semantic_join_lookup".to_owned();
+        }
+        Ok::<SemanticPlannerStats, String>(stats)
     })
     .unwrap_or_else(|err| {
         pgrx::warning!("otlet semantic CustomScan private plan reload failed: {err}");

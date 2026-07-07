@@ -691,7 +691,7 @@ The worker keeps the local model/context warm across jobs. SQL can see the slot 
 
 SQL shows whether the model loaded, is busy, failed, cached, or went over budget
 
-The inference-output cache stores schema-valid raw model output before selection trust is applied. Accepted abstentions and rejected-but-valid attempts may reuse cached bytes, while invalid JSON/schema failures are never cached. The receipt still records accepted/rejected/failed status, and the cache key basis stays content hash + contract hash + model fingerprint
+The inference-output cache stores schema-valid raw model output before selection trust is applied. Accepted abstentions and rejected-but-valid attempts may reuse cached bytes; invalid JSON/schema failures stay out of the cache. The receipt still records accepted/rejected/failed status, and the cache key basis stays content hash + contract hash + model fingerprint
 
 ```sql
 SELECT task_name,
@@ -1122,7 +1122,7 @@ SELECT missing_subjects, queue_subjects, count_basis
 FROM otlet.semantic_index_plan('demo_semantic_vendor_idx', true);
 ```
 
-Use `{"on_change":"mark_stale_and_enqueue"}` when inserts should enqueue immediately
+Use `{"on_change":"mark_stale_and_enqueue"}` when inserts need immediate enqueue
 
 ## Build A Row Watch
 
@@ -1645,11 +1645,11 @@ The value reports a ready runtime, a ready model slot, bounded cache entries, an
 
 The production policy row and status views are ordinary SQL state under `otlet`: `production_policy_status`, `production_status`, `model_queue_status`, `worker_throughput_status`, and `cleanup_policy_state(true)`
 
-Queue caps are admission-time controls. Rows should enter `otlet.jobs` through `run_task`, watch refresh, semantic refresh, or `ask`; direct inserts are internal/testing-only and can bypass admission accounting. `verify_invariants()` reports `queued_jobs_within_model_cap` if the current queued depth for any model exceeds `max_queued_jobs_per_model`
+Queue caps are admission-time controls. Rows enter `otlet.jobs` through `run_task`, watch refresh, semantic refresh, or `ask`; direct inserts are internal/testing-only and can bypass admission accounting. `verify_invariants()` reports `queued_jobs_within_model_cap` if queued depth for any model exceeds `max_queued_jobs_per_model`
 
 Suppressed queue-admission events are debounced per task and reason for one minute, so a full queue stays visible without flooding `worker_events`. `production_status` also exposes `semantic_materialization_failed_events` and `semantic_materialization_last_failed_at`. Nonzero `max_worker_rss_bytes` budgets require Linux process-status RSS sampling; unsupported builds reject the option during runtime-option validation instead of letting jobs fail later. Cleanup can prune old failed/canceled jobs only when outputs, actions, eval labels, and receipt references no longer keep them alive
 
-The resident worker currently attaches to the `postgres` database. Multi-database worker registration needs separate shared-memory and latch routing work before it is a supported deployment shape
+The resident worker attaches to the `postgres` database. Multi-database worker registration needs separate shared-memory and latch routing work before it is a supported deployment shape
 
 Native llama.cpp faults happen below Rust's normal error boundary. Otlet's containment contract is Postgres worker restart plus lease recovery: no partial model output is trusted, and `otlet.sweep_expired_jobs()` fails expired running jobs that reached the attempt limit with a receipt. The full demo also scans container logs and prints `docker_crash_log_scan=ok` when no worker crash, panic, assertion, or terminated server process appears during the run
 

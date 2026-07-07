@@ -6,6 +6,7 @@ unsafe fn fdw_private_from_pushdown(pushdown: &SemanticPushdown) -> *mut pg_sys:
         let mut list = ptr::null_mut();
         list = append_string_node(list, FDW_PRIVATE_MARKER);
         if let SubjectPushdown::Subjects(subject_ids) = &pushdown.subjects {
+            list = append_string_node(list, FDW_PRIVATE_SUBJECTS_MARKER);
             for subject_id in subject_ids {
                 list = append_string_node(list, subject_id);
             }
@@ -33,8 +34,20 @@ unsafe fn semantic_pushdown_from_fdw_private(
         if marker != FDW_PRIVATE_MARKER {
             return SemanticPushdown::none();
         }
+        if pg_sys::list_length(private) < 2 {
+            return SemanticPushdown::none();
+        }
+        let Some(subjects_marker) =
+            string_node_value(pg_sys::list_nth(private, 1) as *mut pg_sys::String)
+        else {
+            return SemanticPushdown::none();
+        };
+        if subjects_marker != FDW_PRIVATE_SUBJECTS_MARKER {
+            return SemanticPushdown::none();
+        }
+
         let mut subjects = Vec::new();
-        for idx in 1..pg_sys::list_length(private) {
+        for idx in 2..pg_sys::list_length(private) {
             if let Some(subject_id) =
                 string_node_value(pg_sys::list_nth(private, idx) as *mut pg_sys::String)
             {
@@ -43,11 +56,7 @@ unsafe fn semantic_pushdown_from_fdw_private(
         }
 
         SemanticPushdown {
-            subjects: if subjects.is_empty() {
-                SubjectPushdown::None
-            } else {
-                SubjectPushdown::Subjects(subjects)
-            },
+            subjects: SubjectPushdown::Subjects(subjects),
         }
     }
 }

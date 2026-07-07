@@ -140,6 +140,7 @@ impl SemanticFdwState {
 }
 
 const FDW_PRIVATE_MARKER: &str = "__otlet_semantic_fdw_json_v1__";
+const FDW_PRIVATE_SUBJECTS_MARKER: &str = "__otlet_semantic_fdw_subjects_v1__";
 
 static OTLET_SEMANTIC_FDW_FINFO: pg_sys::Pg_finfo_record =
     pg_sys::Pg_finfo_record { api_version: 1 };

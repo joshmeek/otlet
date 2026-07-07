@@ -2,7 +2,7 @@
 
 ## Overall Fit
 
-Read this ranking first. `overall_fit` is trusted Otlet quality with a soft resource adjustment. Resource fit still matters, but it does not veto a slightly larger model that does the work well
+Read this ranking first. `overall_fit` is trusted Otlet quality with a soft resource adjustment. Resource fit still matters, but it does not veto a larger model that does the work well
 
 | rank | model | role | overall_fit | trusted_quality | diagnostic_fit | resource_fit | first_blocker |
 | ---: | --- | --- | ---: | ---: | ---: | ---: | --- |
@@ -17,21 +17,21 @@ Read this ranking first. `overall_fit` is trusted Otlet quality with a soft reso
 
 ## Latest Result
 
-Run `b1783256415,b1783336647`: this is a merged current scored report. It ranks 6 current scored models through the benchmark harness
+Run `b1783256415,b1783336647`: merged scored report for 6 models through the benchmark harness
 
 Benchmark confidence: `merged_provisional`. Next proof: Run the same selected model set in one OTLET_BENCH_RUNS=3 publish run
 
-All scored models are currently single-run rows; rerun key candidates with `OTLET_BENCH_RUNS=3` before treating stability as proven
+All scored models have one run; rerun key candidates with `OTLET_BENCH_RUNS=3` before treating stability as proven
 
-A model that completes a current-format run gets an overall fit score and a role. The harness marks load failures, timeouts, manifest blocks, and missing summaries as out of running instead of assigning a fake zero
+A model that completes the harness gets an overall fit score and a role. The harness marks load failures, timeouts, manifest blocks, and missing summaries as out of running instead of assigning a fake zero
 
-Score fields are 0.000-1.000. `trusted_quality` is the accepted-output score before resource adjustment. `resource_fit` is a soft footprint and latency score, not a veto. `overall_fit` is trusted quality times the soft resource adjustment. `diagnostic_fit` reads partial signal from rejected or invalid attempts, but it never becomes trusted Otlet state
+Score fields are 0.000-1.000. `trusted_quality` is the accepted-output score before resource adjustment. `resource_fit` is a soft footprint and latency score, not a veto. `overall_fit` is trusted quality times the soft resource adjustment. `diagnostic_fit` reads partial signal from rejected or invalid attempts; Otlet keeps that signal outside trusted state
 
 A model can show `overall_fit=0.000` when it produced no trusted schema-valid output. The run still keeps failure examples, diagnostic fit, and first blockers
 
-The public ranking keeps the newest scored row per current family/size lane. Superseded rows, unscored candidates, and models with no useful Otlet signal stay out of the README ranking
+The public ranking keeps the newest scored row per family/size lane. Superseded rows, unscored candidates, and models with no trusted Otlet signal stay out of the README ranking
 
-The harness now emits up to 340 scored cases per full model run: 112 deterministic pair cases, 30 triage cases, 20 numeric-evidence cases, 30 extraction cases, 30 policy-check cases, at least 5 exported user-suite corrections when trusted actions exist, 113 row-watch case rows, plus semantic stale-safety checks. The latest published tables above still show the pre-expansion 159-case report until the next benchmark run
+The harness emits up to 340 scored cases per full model run: 112 deterministic pair cases, 30 triage cases, 20 numeric-evidence cases, 30 extraction cases, 30 policy-check cases, at least 5 exported user-suite corrections when trusted actions exist, 113 row-watch case rows, plus semantic stale-safety checks. The published tables above show the pre-expansion 159-case report until the next benchmark run
 
 ## Columns And Roles
 
@@ -39,13 +39,13 @@ The harness now emits up to 340 scored cases per full model run: 112 determinist
 | --- | --- |
 | overall_fit | trusted_quality with a soft resource adjustment; higher is better |
 | trusted_quality | schema-valid accepted output quality before resource adjustment |
-| diagnostic_fit | partial signal from rejected or invalid attempts; never trusted state |
+| diagnostic_fit | partial signal from rejected or invalid attempts; outside trusted state |
 | resource_fit | soft score for artifact size, resident RSS, latency, and active params |
 | first_blocker | first production gate that kept a model from default readiness |
 | default_candidate | passed the production gate with at least 3 same-run repeats |
-| triage_candidate | useful trusted output, but not default-ready |
-| row_watch_candidate | useful for watch-style row judgment, but not default-ready |
-| workload_candidate | production-readiness label for a useful non-default model |
+| triage_candidate | trusted output exists, but the model is not default-ready |
+| row_watch_candidate | watch-style row judgment works, but the model is not default-ready |
+| workload_candidate | production-readiness label for a non-default model |
 
 The SQL summary column is `single_run_verdict`; report tables still display it as `verdict`
 
@@ -57,12 +57,12 @@ The SQL summary column is `single_run_verdict`; report tables still display it a
 | hard entity resolution | qwen35_4b | 1.000 | fail | not a default model unless gate passes |
 | row watching | qwen35_4b | 0.991 | fail | not a default model unless gate passes |
 | triage | qwen35_4b | 1.000 | fail | not a default model unless gate passes |
-| <=2.0 GB artifact |  |  |  | no current overall-fit row |
+| <=2.0 GB artifact |  |  |  | no overall-fit row |
 | correct jobs/sec/GB | ministral3_3b | 0.015 | fail | compare timing after one same-run sweep |
 
 ## Production Readiness
 
-The repeat-aware default-model gate keeps non-passing models out of production rank. Useful partial models keep role labels and diagnostic evidence, but their production score is zero
+The repeat-aware default-model gate keeps non-passing models out of production rank. Partial models keep role labels and diagnostic evidence, but their production score is zero
 
 | rank | model | readiness | production_score | overall_fit | gate | first_blocker |
 | ---: | --- | --- | ---: | ---: | --- | --- |
@@ -100,7 +100,7 @@ No ranked models were out of running
 
 ## Drilldown Charts
 
-The headline chart ranks overall fit. The charts below explain whether that fit is quality-limited, memory-limited, latency-limited, or parameter-limited. Treat latency and throughput as useful only after checking `trusted_quality`; instant invalid output is not useful work
+The headline chart ranks overall fit. The charts below show whether quality, memory, latency, or parameter count limits that fit. Check `trusted_quality` before latency and throughput; instant invalid output is not work
 
 ![Resident memory versus overall fit](pareto.svg)
 
@@ -120,7 +120,7 @@ The score covers:
 - explicit production gates and repeat proof before any default-model claim
 - non-ER triage decisions across flag, pass, abstain, and adversarial row-text cases
 - numeric-evidence decisions across threshold pass, threshold breach, incomplete evidence, and adversarial row-text cases
-- extraction and policy-check phases with roughly 30 cases each and production gates at 0.80
+- extraction and policy-check phases with 30 cases each and production gates at 0.80
 - entity-resolution decisions across duplicates, hard negatives, sparse rows, dirty rows, and abstention cases
 - exact confidence targets, so overconfident or underconfident outputs do not get silent credit
 - typed actions with no source-table writes
@@ -150,7 +150,7 @@ Run a single named model when debugging a candidate:
 OTLET_BENCH_LIMIT_MODELS=phi4_mini OTLET_BENCH_RUNS=1 OTLET_BENCH_PUBLISH_REPORT=1 ./benchmarks/run.sh
 ```
 
-Run the current scored comparison set only after a meaningful prompt/schema/scoring/runtime change:
+Run the scored comparison set after a prompt/schema/scoring/runtime change:
 
 ```sh
 OTLET_BENCH_LIMIT_MODELS=qwen35_4b,ministral3_3b,gemma4_e2b,glm_edge_4b,gemma4_e4b,phi4_mini OTLET_BENCH_RUNS=1 OTLET_BENCH_PUBLISH_REPORT=1 ./benchmarks/run.sh
@@ -163,9 +163,9 @@ models="$(awk -F '\t' 'NR > 1 && $9 == "true" {print $1}' benchmarks/models.tsv 
 OTLET_BENCH_LIMIT_MODELS="$models" OTLET_BENCH_RUNS=1 OTLET_BENCH_PUBLISH_REPORT=1 ./benchmarks/run.sh
 ```
 
-The benchmark default timeout is two hours per task phase because the current fixture loads 112 row-pair cases per model and larger local models can cross one hour before semantic refresh starts
+The benchmark default timeout is two hours per task phase because the fixture loads 112 row-pair cases per model and larger local models can cross one hour before semantic refresh starts
 
-Run manual candidates only when you have a reason to spend the time. Rows marked `candidate`, `diagnostic`, `historical`, or `heavy` are never part of the default run:
+Run manual candidates only when you have a reason to spend the time. Rows marked `candidate`, `diagnostic`, `historical`, or `heavy` stay outside the default run:
 
 ```sh
 models="$(awk -F '\t' 'NR > 1 && ($6 == "candidate" || $6 == "diagnostic") {print $1}' benchmarks/models.tsv | paste -sd, -)"

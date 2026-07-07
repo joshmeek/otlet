@@ -56,6 +56,7 @@ unsafe extern "C-unwind" fn begin_semantic_custom_scan(
         .unwrap_or_else(|err| pgrx::error!("{err}"));
         let planner_stats = reload_private_planner_stats(&private);
         let policy = semantic_policy_for_selected_path(&planner_stats.selected_path);
+        snapshot_planner_state(state, &planner_stats, &policy);
         (*state).source_table = pg_cstr(&loaded_state.source_table);
         (*state).task_name = pg_cstr(&loaded_state.task_name);
         (*state).record_type = pg_cstr(&loaded_state.record_type);
@@ -138,6 +139,28 @@ unsafe extern "C-unwind" fn begin_semantic_custom_scan(
             queued_refresh_subjects: HashSet::new(),
             pending_output_rows: VecDeque::new(),
         }));
+    }
+}
+
+unsafe fn snapshot_planner_state(
+    state: *mut OtletSemanticCustomScanState,
+    planner_stats: &SemanticPlannerStats,
+    policy: &SemanticAutoPolicy,
+) {
+    unsafe {
+        (*state).auto_policy = policy.auto_policy;
+        (*state).allow_refresh = policy.allow_refresh;
+        (*state).wait_ms = policy.wait_ms;
+        (*state).infer_ms = policy.infer_ms;
+        (*state).infer_max_rows = policy.infer_max_rows;
+        (*state).planner_selected_path = pg_cstr(&planner_stats.selected_path);
+        (*state).planner_reason = pg_cstr(&planner_stats.reason);
+        (*state).planner_stale_reasons = pg_cstr(&planner_stats.stale_reasons);
+        (*state).planner_model_cost_source = pg_cstr(&planner_stats.model_cost_source);
+        (*state).planner_model_ms = planner_stats.model_ms;
+        (*state).planner_count_basis = pg_cstr(&planner_stats.count_basis);
+        (*state).planner_infer_decision_rows = planner_stats.infer_decision_rows;
+        (*state).planner_fail_closed_decision_rows = planner_stats.fail_closed_decision_rows;
     }
 }
 
