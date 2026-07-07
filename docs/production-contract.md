@@ -1,6 +1,6 @@
 # Production Contract
 
-This covers cross-system trace visibility, runtime status, production policy, and remaining production boundaries
+Use this to inspect cross-system trace visibility, runtime status, production policy, and remaining production boundaries
 
 ## Inspect Trace Visibility Across The System
 
@@ -23,6 +23,7 @@ inference_visibility_status=true|true|true|true|true
 ```
 
 Those booleans prove receipts, token steps, top-k alternatives, bounded trace tokens, and top-k width were present
+
 ## Inspect Runtime Status After Advanced Runs
 
 Runtime status shows the resident model slot, cache bounds, memory samples, and last run metrics
@@ -45,17 +46,18 @@ runtime_status_contract=ready|ready|60.34|true|linux_proc_self_status_vmrss_vmsi
 ```
 
 The value reports a ready runtime, a ready model slot, bounded cache entries, and Linux process-status memory sampling after a worker run
+
 ## Inspect Production Policy
 
 The production policy row and status views are ordinary SQL state under `otlet`: `production_policy_status`, `production_status`, `model_queue_status`, `worker_throughput_status`, and `cleanup_policy_state(true)`
 
 Queue caps are admission-time controls. Rows enter `otlet.jobs` through `run_task`, watch refresh, semantic refresh, or `ask`; direct inserts are internal/testing-only and can bypass admission accounting. `verify_invariants()` reports `queued_jobs_within_model_cap` if queued depth for any model exceeds `max_queued_jobs_per_model`
 
-Suppressed queue-admission events are debounced per task and reason for one minute, so a full queue stays visible without flooding `worker_events`. `production_status` also exposes `semantic_materialization_failed_events` and `semantic_materialization_last_failed_at`. Nonzero `max_worker_rss_bytes` budgets require Linux process-status RSS sampling; unsupported builds reject the option during runtime-option validation instead of letting jobs fail later. Cleanup can prune old failed/canceled jobs only when outputs, actions, eval labels, and receipt references no longer keep them alive
+Otlet debounces suppressed queue-admission events per task and reason for one minute, so a full queue stays visible without flooding `worker_events`. `production_status` also exposes `semantic_materialization_failed_events` and `semantic_materialization_last_failed_at`. Nonzero `max_worker_rss_bytes` budgets require Linux process-status RSS sampling; unsupported builds reject the option during runtime-option validation instead of letting jobs fail later. Cleanup can prune old failed/canceled jobs only when outputs, actions, eval labels, and receipt references no longer keep them alive
 
 The resident worker attaches to the `postgres` database. Multi-database worker registration needs separate shared-memory and latch routing work before it is a supported deployment shape
 
-Native llama.cpp faults happen below Rust's normal error boundary. Otlet's containment contract is Postgres worker restart plus lease recovery: no partial model output is trusted, and `otlet.sweep_expired_jobs()` fails expired running jobs that reached the attempt limit with a receipt. The full demo also scans container logs and prints `docker_crash_log_scan=ok` when no worker crash, panic, assertion, or terminated server process appears during the run
+Native llama.cpp faults happen below Rust's normal error boundary. Otlet's containment contract is Postgres worker restart plus lease recovery: Otlet trusts no partial model output, and `otlet.sweep_expired_jobs()` fails expired running jobs that reached the attempt limit with a receipt. The full demo also scans container logs and prints `docker_crash_log_scan=ok` when no worker crash, panic, assertion, or terminated server process appears during the run
 
 ```sql
 SELECT otlet.sweep_expired_jobs();
@@ -83,6 +85,7 @@ model_queue_status_contract=queue_accepting|0|0
 throughput_status_contract=queue_accepting|0|0|4|4|0
 cleanup_policy_dry_run=0|0|0|0|0|0|0|true
 ```
+
 ## Know The Remaining Production Boundaries
 
 Otlet installs internal production policy, bounded queues, leases, sweeps, validation evidence, action approval state, status views, and cleanup dry-run/apply functions. Your application owns tenant access, app roles, and who may approve or apply actions
@@ -131,8 +134,8 @@ grant_contract=DELETE:44|INSERT:44|REFERENCES:44|SELECT:44|TRIGGER:44|TRUNCATE:4
 
 Your application owns these production boundaries:
 
-- create app roles that expose only the views and functions you want
+- create app roles with the views and functions you want
 - add RLS or schema isolation if multiple tenants share the database
 - schedule `otlet.cleanup_policy_state(false)` if your deployment wants periodic worker-event, trace, stale materialization, rejected raw-output, and unreferenced failed/canceled job pruning
-- expose `otlet.approve_action`, `otlet.reject_action`, `otlet.dry_run_action`, and `otlet.apply_action` only to roles that can operate actions
-- allow only the action types your application can safely interpret
+- expose `otlet.approve_action`, `otlet.reject_action`, `otlet.dry_run_action`, and `otlet.apply_action` to action-operator roles
+- allow action types your application has code to interpret

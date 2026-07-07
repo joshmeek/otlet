@@ -1,6 +1,6 @@
 # Entity Resolution Walkthrough
 
-This is the long SQL walkthrough for the entity-resolution path from `docs/otlet-worked-example.md`. Start with `./scripts/otlet-setup.sh`, then paste these sections into the `psql` session described there
+Use this long SQL walkthrough for the entity-resolution path from `docs/otlet-worked-example.md`. Start with `./scripts/otlet-setup.sh`, then paste these sections into the `psql` session described there
 
 ## Register The Models
 
@@ -23,6 +23,7 @@ SELECT otlet.register_model(
 The worker loads a local GGUF through in-process llama.cpp and keeps the model resident across jobs
 
 Postgres can query the queue, source row identity, output validation, receipts, traces, and runtime state
+
 ## Create The Source Tables
 
 ```sql
@@ -108,7 +109,8 @@ WHERE name = 'entity_resolution_demo';
 
 The product flow does not need this cleanup
 
-It only makes the example rerunnable
+It makes the example rerunnable
+
 ## Create The Task
 
 ```sql
@@ -285,6 +287,7 @@ preset_immutability_contract=raised
 ```
 
 If the model returns malformed JSON, missing fields, unknown fields, or values outside the enum, Otlet marks the job failed and keeps the raw evidence. Otlet stores no trusted output or records
+
 ## Enqueue The Jobs
 
 ```sql
@@ -305,6 +308,7 @@ Representative output:
 The user transaction creates durable database work. The resident worker claims it
 
 The queue keeps model work out of the client request. SQL shows each job at any status: queued, running, complete, failed, or canceled
+
 ## Watch The Worker
 
 ```sql
@@ -367,7 +371,8 @@ Representative output:
 
 Otlet stores the result as database state. You do not have to scrape a terminal response
 
-Direct entity-resolution tasks ask the model for one typed action. Otlet stores actions only when they attach to an accepted, schema-valid output receipt
+Direct entity-resolution tasks ask the model for one typed action. Otlet stores actions when they attach to an accepted, schema-valid output receipt
+
 ## Inspect Typed Actions
 
 ```sql
@@ -480,7 +485,7 @@ Representative output:
 (1 row)
 ```
 
-The same correction is immediately available as local eval data:
+Otlet exports the same correction as local eval data:
 
 ```sql
 SELECT action_id, case_kind, expected_answer, expected_action_type, manual_gold
@@ -499,7 +504,7 @@ Representative output:
 (1 row)
 ```
 
-Eval label confidence is intentionally the same small vocabulary used by model outputs: `low`, `medium`, or `high`. Keep calibration notes in `reason` or task-specific fields rather than expanding `expected_confidence`
+Eval label confidence uses the same small vocabulary as model outputs: `low`, `medium`, or `high`. Keep calibration notes in `reason` or task-specific fields rather than expanding `expected_confidence`
 
 Approve, dry-run, and apply one merge proposal:
 

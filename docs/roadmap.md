@@ -42,8 +42,8 @@ The benchmark lives under `benchmarks/` and reports SQL-scored evidence for Otle
 | SQL proposal actions | Let models propose bounded SQL through typed, inspectable actions with dry-run, approval, receipts, and no silent user-table writes |
 | Review queue contract | Expose pending review, approval, rejection, correction, unclear state, reviewer reasons, and eval labels through SQL |
 | Watch definition import/export | Make named source queries, candidate queries, stale policy, output schema, action schema, and runtime policy portable across installs |
-| Persisted cache storage | Add disk-backed cache only after the bounded in-process cache misses a proven workload |
-| Grammar-constrained decode | Retry grammar or JSON-schema decoding only behind a reliable linked llama hook; reject the exposed sampler path while it can abort the resident worker |
+| Persisted cache storage | Add disk-backed cache after the bounded in-process cache misses a proven workload |
+| Grammar-constrained decode | Retry grammar or JSON-schema decoding behind a reliable linked llama hook; reject the exposed sampler path while it can abort the resident worker |
 | Semantic dependency audit export | Export the source rows, joins, deletes, candidate-query changes, and schema-drift decisions that already drive stale/fresh state |
 | Action execution sandbox | Prove dry-run, target allowlists, idempotency, approval, replay, failure receipts, and source-table write checks |
 | Multi-worker admission policy | Extend queue, fairness, cancellation, RSS, and fail-closed policy when multiple workers share the same database |
@@ -67,7 +67,7 @@ Otlet treats output reliability as part of the database contract. Trusted entity
 Benchmark follow-up objective:
 
 - Run comparable model sweeps after harness changes so the public charts show workload roles, trusted quality, resource fit, and out-of-running reasons across small, medium, and ceiling local models. Routine benchmark runs use `include_by_default=true`; candidate, diagnostic, historical, heavy, and blocked rows stay explicit/manual
-- Revisit grammar-constrained JSON only if the linked llama path exposes a hook that cannot abort the resident worker
+- Revisit grammar-constrained JSON if the linked llama path exposes a hook that cannot abort the resident worker
 - Keep improving prompt and schema wording against the same benchmark fixture
 - Test a few larger local models to find the quality/resource knee before defaulting to bigger models
 
@@ -99,7 +99,7 @@ For each answer, record the source rows read, trusted hash or MVCC identity, can
 
 Ship MIT packs for vendor, customer, and product resolution. Each pack carries candidate SQL, input shape, output schema, action schema, prompt text, fixture rows, eval labels, and benchmark gates
 
-Keep packs small enough to audit. A pack can depend on SQL candidate generation, schema validation, receipts, review queues, and eval labels. Packs expose source writes only through typed actions
+Keep packs small enough to audit. A pack can depend on SQL candidate generation, schema validation, receipts, review queues, and eval labels. Packs expose source writes through typed actions
 
 ## Explain And Trace
 

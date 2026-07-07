@@ -1,6 +1,6 @@
 # Semantic Watches
 
-This covers semantic indexes, row watches, current-row SQL, CustomScan predicates, stale-state behavior, infer-now refresh, and pair watches
+Use this to inspect semantic indexes, row watches, current-row SQL, CustomScan predicates, stale-state behavior, infer-now refresh, and pair watches
 
 ## Semantic Indexes
 
@@ -11,7 +11,7 @@ Semantic indexes add repeated lookup over source rows, stale-row tracking, refre
 Use a direct task when:
 
 - you want to review or transform a known batch of rows
-- you want to inspect jobs, outputs, actions, records, receipts, and traces directly
+- you want to inspect jobs, outputs, actions, records, receipts, and traces from SQL
 - you are still designing the model contract
 
 Use a semantic index when:
@@ -22,6 +22,7 @@ Use a semantic index when:
 - you want reusable semantic rows and executor-visible CustomScan predicates
 
 The direct task path teaches the Otlet contract. The semantic path adds query ergonomics and freshness policy
+
 ## Map The Otlet Schema
 
 The direct task path gives you the smallest loop. The rest of Otlet uses the same tables
@@ -54,6 +55,7 @@ The base tables split into a few jobs:
 - `watches` and `semantic_join_indexes` do the same for pairwise candidate rows
 
 Use `otlet.runs` for application reads. Use trace and status views for debugging, proof, and learning
+
 ## Materialize Records Into Semantic State
 
 Actions and records form one layer. Semantic materializations make those records reusable from queries
@@ -116,6 +118,7 @@ FROM otlet.semantic_index_plan('demo_semantic_vendor_idx', true);
 ```
 
 Use `{"on_change":"mark_stale_and_enqueue"}` when inserts need immediate enqueue
+
 ## Build A Row Watch
 
 A row watch wraps a source table with an Otlet task, materialized records, stale tracking, trigger policy, and current-row SQL reads
@@ -219,6 +222,7 @@ semantic_index_plan_contract=semantic_lookup|3|3|0|0|1.0000
 ```
 
 `semantic_index_plan` shows whether Otlet can reuse materialized state, refresh, wait, or run fresh inference
+
 ## Read Current Semantic Rows
 
 `semantic_index_current_rows` returns materialized semantic state without adding another public access path:
@@ -254,7 +258,7 @@ The SQL plan row and CustomScan EXPLAIN use the same terms for the planner contr
 | Reason | `reason` | `Planner Reason` | Same meaning |
 | Count basis | `count_basis` | `Count Basis` | SQL plan rows describe index state; CustomScan source-row predicates use exact or child-plan counts |
 | Model cost basis | `model_cost_source` | `Model Cost Source` | Same ordered basis: task receipt, runtime slot, model receipt, static fallback |
-| Stale reasons | `stale_reasons` | `Planner Stale Reasons` | Same JSON shape where stale subjects are counted |
+| Stale reasons | `stale_reasons` | `Planner Stale Reasons` | Same JSON shape for stale subject counts |
 | Infer-now prediction | `infer_now_subjects`, `fail_closed_subjects` | `Planner Infer Now Subjects`, `Planner Fail Closed Subjects` | CustomScan also reports actual executor counters |
 | Freshness basis | `semantic_index_current_rows.freshness_basis` | `Preloaded Fresh Subjects / Basis`, `Emitted Freshness Basis` | Current-row SQL reports row freshness; CustomScan reports aggregate executor evidence |
 
@@ -313,7 +317,8 @@ Custom Scan (Otlet Semantic Source CustomScan) on public.otlet_demo_semantic_ven
 
 The child scan reads the source table. Otlet strips the semantic predicate from the child plan and evaluates it against preloaded semantic state
 
-CustomScan uses statement preload semantics. Row-marked queries such as `FOR UPDATE` stay on the ordinary Postgres plan because the CustomScan planner path is blocked when rowmarks are present; locking and row recheck behavior remain owned by Postgres. For non-rowmark CustomScan, concurrent source changes are picked up by stale triggers and the next statement rather than by a per-tuple recheck inside the same scan
+CustomScan uses statement preload semantics. Row-marked queries such as `FOR UPDATE` stay on the ordinary Postgres plan because Otlet blocks the CustomScan planner path when queries include rowmarks; Postgres still owns locking and row recheck behavior. For non-rowmark CustomScan, stale triggers and the next statement pick up concurrent source changes instead of a per-tuple recheck inside the same scan
+
 ## Fail Closed On Stale Rows
 
 Changing a source row makes its materialized semantic state stale
@@ -424,6 +429,7 @@ Representative output:
 ```
 
 Receipts carry executor provenance because the same model task can run from the worker queue or from CustomScan infer-now
+
 ## Build A Pair Watch
 
 Row watches are source-table-oriented. Pair watches are candidate-query-oriented

@@ -1,6 +1,6 @@
 # Runtime And Traces
 
-This covers model selection, receipts, runtime status, trace visibility, retries, cancellation, and failed-run evidence after the entity-resolution walkthrough has queued work
+Use this after the entity-resolution walkthrough queues work to inspect model selection, receipts, runtime status, trace visibility, retries, cancellation, and failed-run evidence
 
 ## Inspect Model Selection Attempts
 
@@ -34,7 +34,8 @@ Representative output from the demo run:
 (8 rows)
 ```
 
-The cheap model fails the stricter output/action envelope in this run. Failed attempts stay visible as receipts, every row escalates to `qwen35_4b`, and Otlet materializes only the accepted output for each job
+The cheap model fails the stricter output/action envelope in this run. Failed attempts stay visible as receipts, every row escalates to `qwen35_4b`, and Otlet materializes the accepted output for each job
+
 ## Read The Receipt
 
 ```sql
@@ -58,6 +59,7 @@ A receipt records evidence for one model run. A selected job can have multiple r
 It links the model, artifact, runtime options, prompt hash, input hash, output schema hash, raw output hash, validation status, timing, token counts, memory summary, and trace summary
 
 Otlet stores receipts when jobs fail because failures produce evidence too
+
 ## Inspect Runtime Residency
 
 ```sql
@@ -83,7 +85,7 @@ The worker keeps the local model/context warm across jobs. SQL can see the slot 
 
 SQL shows whether the model loaded, is busy, failed, cached, or went over budget
 
-The inference-output cache stores schema-valid raw model output before selection trust is applied. Accepted abstentions and rejected-but-valid attempts may reuse cached bytes; invalid JSON/schema failures stay out of the cache. The receipt still records accepted/rejected/failed status, and the cache key basis stays content hash + contract hash + model fingerprint
+The inference-output cache stores schema-valid raw model output before Otlet applies selection trust. Accepted abstentions and rejected-but-valid attempts may reuse cached bytes; invalid JSON/schema failures stay out of the cache. The receipt still records accepted/rejected/failed status, and the cache key basis stays content hash + contract hash + model fingerprint
 
 ```sql
 SELECT task_name,
@@ -134,6 +136,7 @@ Trace data records:
 - Resident model cache and inference-output cache use
 
 Otlet bounds tracing so prompt, token, and logits storage does not turn observability into a data retention problem
+
 ## Check The Whole Chain
 
 ```sql
@@ -179,6 +182,7 @@ Check these rows:
 - an error receipt preserves the model/runtime evidence when available
 
 The task schema and action rules decide whether model output can become database truth. If output passes and a proposed action fails, Otlet keeps the rejected action as evidence and creates no record
+
 ## Create A Retry Task
 
 The next examples reuse this task to show terminal failure evidence and safe requeueing
@@ -275,11 +279,12 @@ Representative output:
 ```
 
 Canceled work still gets a receipt. A canceled model run still leaves evidence
+
 ## Understand Retry And Failed-Run Evidence
 
 Otlet leaves failed jobs visible. A failed job is terminal, so you can queue the same task and subject again
 
-The partial unique index only blocks duplicate active work:
+The partial unique index blocks duplicate active work and leaves terminal history reusable:
 
 ```sql
 CREATE UNIQUE INDEX jobs_active_subject_idx
