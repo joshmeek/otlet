@@ -13,6 +13,7 @@ download_enabled="${OTLET_PROBE_DOWNLOAD:-0}"
 model_dir="${OTLET_MODEL_DIR:-/var/lib/postgresql/otlet-models}"
 timeout_ms="${OTLET_PROBE_TIMEOUT_MS:-30000}"
 probe_llama_threads="${OTLET_PROBE_LLAMA_THREADS:-0}"
+probe_llama_batch_threads="${OTLET_PROBE_LLAMA_BATCH_THREADS:-0}"
 keep_models="${OTLET_PROBE_KEEP_MODELS:-0}"
 scratch_root="${OTLET_PROBE_MODEL_DIR:-/var/lib/postgresql/otlet-probe-models}"
 run_id="probe-$(date -u +%Y%m%dT%H%M%SZ)-$$"
@@ -72,13 +73,19 @@ SQL
 run_model_probe() {
   local model_key="$1"
   local probe_verbose="${OTLET_PROBE_VERBOSE:-false}"
-  psql_exec -qAt -v model_key="$model_key" -v timeout_ms="$timeout_ms" -v probe_llama_threads="$probe_llama_threads" -v probe_verbose="$probe_verbose" <<'SQL'
+  psql_exec -qAt \
+    -v model_key="$model_key" \
+    -v timeout_ms="$timeout_ms" \
+    -v probe_llama_threads="$probe_llama_threads" \
+    -v probe_llama_batch_threads="$probe_llama_batch_threads" \
+    -v probe_verbose="$probe_verbose" <<'SQL'
 \pset footer off
 \pset fieldsep '\t'
 CREATE TEMP TABLE quick_probe_config AS
 SELECT :'model_key'::text AS model_key,
        :'timeout_ms'::integer AS timeout_ms,
-       :'probe_llama_threads'::integer AS llama_threads;
+       :'probe_llama_threads'::integer AS llama_threads,
+       :'probe_llama_batch_threads'::integer AS llama_batch_threads;
 
 CREATE TEMP TABLE quick_probe_results (
   case_id text,
@@ -184,7 +191,8 @@ BEGIN
             'reasoning', 'off',
             'inference_cache', false,
             'generation_trace', false,
-            'llama_threads', NULLIF(cfg.llama_threads, 0)
+            'llama_threads', NULLIF(cfg.llama_threads, 0),
+            'llama_batch_threads', NULLIF(cfg.llama_batch_threads, 0)
           )
         )
       );

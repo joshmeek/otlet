@@ -29,15 +29,22 @@ Sweep CPU thread counts through the same probe:
 OTLET_SWEEP_MODELS=qwen3_1_7b,qwen35_4b OTLET_SWEEP_THREADS=1,2,4,6,8,12 ./benchmarks/thread_sweep.sh
 ```
 
-The probe accepts `OTLET_PROBE_LLAMA_THREADS=<n>` for one run. The setup path accepts deployment-level llama.cpp knobs before `./scripts/otlet-setup.sh`:
+The probe accepts `OTLET_PROBE_LLAMA_THREADS=<n>` and `OTLET_PROBE_LLAMA_BATCH_THREADS=<n>` for one run. The setup path accepts deployment-level llama.cpp knobs before `./scripts/otlet-setup.sh`:
 
 | knob | scope | default |
 | --- | --- | --- |
-| `OTLET_LLAMA_THREADS` | decode and prompt-decode threads | visible cores capped at `6` |
-| `OTLET_LLAMA_BATCH_TOKENS` | prompt batch and ubatch tokens | `512` |
+| `OTLET_LLAMA_THREADS` | decode threads | visible cores capped at `6` |
+| `OTLET_LLAMA_BATCH_THREADS` | prompt-decode thread pool | same as decode threads |
+| `OTLET_LLAMA_BATCH_TOKENS` | logical prompt batch tokens | `512` |
+| `OTLET_LLAMA_UBATCH_TOKENS` | physical prompt ubatch tokens | `512` |
 | `OTLET_LLAMA_MMAP` | model mmap toggle | llama.cpp default |
 | `OTLET_LLAMA_MLOCK` | lock model pages in memory | llama.cpp default |
 | `OTLET_LLAMA_FLASH_ATTN` | `auto`, `on`, or `off` flash attention | llama.cpp default |
+| `OTLET_LLAMA_NO_PERF` | skip llama.cpp perf counters | `true` |
+| `OTLET_LLAMA_KV_TYPE` | set both KV cache types: `f16`, `q8_0`, `q4_0` | llama.cpp default |
+| `OTLET_LLAMA_KV_TYPE_K` | set K cache type only | llama.cpp default |
+| `OTLET_LLAMA_KV_TYPE_V` | set V cache type only | llama.cpp default |
+| `OMP_PROC_BIND`, `OMP_PLACES`, `GOMP_CPU_AFFINITY` | OpenMP CPU placement | unset |
 
 Treat those as host-specific controls. Re-run `./scripts/otlet-setup.sh` after changing startup knobs so the worker process starts with the new environment
 
@@ -82,6 +89,22 @@ Thread sweep on the current Docker CPU showed the best stable setting at 6 threa
 | `qwen35_4b` | `12` | yes | `5.37` |
 | `qwen3_1_7b` | `6` | no | `71.91` |
 | `qwen3_1_7b` | `12` | no | `10.63` |
+
+Recent CPU tuning sweep on `qwen35_4b` kept the old default at `41.89 tok/s` as the before sample. The control-only build stayed neutral at `41.44 tok/s`; every default change below either failed correctness or lost throughput:
+
+| control | tested setting | viable | mean tok/s | result |
+| --- | --- | --- | ---: | --- |
+| decode threads | `6` | yes | `37.76` | still best in sweep; `8`, `10`, and `12` were slower |
+| batch threads | `12` | yes | `41.21` | repeated A/B was neutral versus default `41.31` |
+| logical batch | `2048` | yes | `39.80` | slower than `512` |
+| physical ubatch | `2048/256` | yes | `33.66` | slower |
+| mmap | `false` | yes | `25.78` | slower |
+| mlock | `true` | yes | `24.09` | slower |
+| flash attention | `on` | yes | `31.48` | slower on CPU |
+| perf counters | `OTLET_LLAMA_NO_PERF=false` | yes | `28.33` | slower |
+| KV cache type | `q8_0` | yes | `30.22` | slower; possible memory-only lever |
+| KV cache type | `q4_0` | no | `25.16` | failed one decision |
+| OpenMP placement | `PROC_BIND=spread`, `PLACES=cores` | no | `9.95` | timed out one smoke case |
 
 Run the default-included set after a harness improvement when you want the shortest publishable check:
 

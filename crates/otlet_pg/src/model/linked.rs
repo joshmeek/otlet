@@ -32,8 +32,10 @@ fn run_linked(
         model_params.n_gpu_layers = 0;
         model_params.use_mmap = linked_env_bool("OTLET_LLAMA_MMAP", model_params.use_mmap);
         model_params.use_mlock = linked_env_bool("OTLET_LLAMA_MLOCK", model_params.use_mlock);
-        let decode_threads = linked_decode_threads(options);
         let prompt_batch_tokens = linked_prompt_batch_tokens();
+        let prompt_ubatch_tokens = linked_prompt_ubatch_tokens(prompt_batch_tokens);
+        let decode_threads = linked_decode_threads(options);
+        let batch_threads = linked_batch_threads(options, decode_threads);
 
         let load_start = Instant::now();
         let model_ptr = unsafe {
@@ -50,13 +52,14 @@ fn run_linked(
         let mut ctx_params = unsafe { llama_cpp_sys_4::llama_context_default_params() };
         ctx_params.n_ctx = LINKED_CONTEXT_WINDOW_TOKENS;
         ctx_params.n_batch = prompt_batch_tokens as u32;
-        ctx_params.n_ubatch = prompt_batch_tokens as u32;
-        ctx_params.no_perf = true;
+        ctx_params.n_ubatch = prompt_ubatch_tokens as u32;
+        ctx_params.no_perf = linked_env_bool("OTLET_LLAMA_NO_PERF", true);
         linked_apply_flash_attn_type(&mut ctx_params);
-        // llama.cpp defaults to GGML_DEFAULT_N_THREADS (4); use the cores this
-        // host actually has for both single-token generation and batch decode.
+        linked_apply_kv_cache_type(&mut ctx_params);
+        // llama.cpp defaults to GGML_DEFAULT_N_THREADS (4); use measured host
+        // defaults unless a probe pins generation or prompt-decode threads.
         ctx_params.n_threads = decode_threads;
-        ctx_params.n_threads_batch = decode_threads;
+        ctx_params.n_threads_batch = batch_threads;
         let ctx_start = Instant::now();
         let context_ptr = unsafe { llama_cpp_sys_4::llama_init_from_model(model.ptr, ctx_params) };
         let ctx_ms = elapsed_ms(ctx_start);
@@ -101,12 +104,9 @@ fn run_linked(
         .as_mut()
         .ok_or_else(|| ModelError::new("linked llama.cpp cache did not initialize".to_owned()))?;
     let decode_threads = linked_decode_threads(options);
+    let batch_threads = linked_batch_threads(options, decode_threads);
     unsafe {
-        llama_cpp_sys_4::llama_set_n_threads(
-            cache.context.ptr,
-            decode_threads,
-            decode_threads,
-        );
+        llama_cpp_sys_4::llama_set_n_threads(cache.context.ptr, decode_threads, batch_threads);
     }
     let tokens = tokenize_linked(cache.vocab, prompt)?;
     if tokens.is_empty() {
@@ -277,15 +277,18 @@ fn linked_decode_threads(options: &crate::runtime::RuntimeOptions) -> i32 {
     linked_default_decode_threads()
 }
 
+fn linked_batch_threads(options: &crate::runtime::RuntimeOptions, decode_threads: i32) -> i32 {
+    if options.llama_batch_threads > 0 {
+        return options.llama_batch_threads.min(i32::MAX as u64) as i32;
+    }
+    linked_env_i32("OTLET_LLAMA_BATCH_THREADS").unwrap_or(decode_threads)
+}
+
 fn linked_default_decode_threads() -> i32 {
     static DECODE_THREADS: OnceLock<i32> = OnceLock::new();
     *DECODE_THREADS.get_or_init(|| {
-        if let Ok(value) = std::env::var("OTLET_LLAMA_THREADS") {
-            if let Ok(threads) = value.parse::<usize>() {
-                if threads > 0 {
-                    return threads.min(i32::MAX as usize) as i32;
-                }
-            }
+        if let Some(threads) = linked_env_usize("OTLET_LLAMA_THREADS") {
+            return threads.min(i32::MAX as usize) as i32;
         }
         std::thread::available_parallelism()
             .map(|threads| threads.get())
@@ -293,6 +296,16 @@ fn linked_default_decode_threads() -> i32 {
             .min(LINKED_DEFAULT_MAX_DECODE_THREADS)
             .min(i32::MAX as usize) as i32
     })
+}
+
+fn linked_env_i32(name: &str) -> Option<i32> {
+    linked_env_usize(name).map(|value| value.min(i32::MAX as usize) as i32)
+}
+
+fn linked_env_usize(name: &str) -> Option<usize> {
+    let value = std::env::var(name).ok()?;
+    let parsed = value.parse::<usize>().ok()?;
+    (parsed > 0).then_some(parsed)
 }
 
 fn linked_env_bool(name: &str, default: bool) -> bool {
@@ -317,18 +330,51 @@ fn linked_apply_flash_attn_type(params: &mut llama_cpp_sys_4::llama_context_para
     };
 }
 
+fn linked_apply_kv_cache_type(params: &mut llama_cpp_sys_4::llama_context_params) {
+    if let Ok(value) = std::env::var("OTLET_LLAMA_KV_TYPE") {
+        if let Some(cache_type) = linked_ggml_type(&value) {
+            params.type_k = cache_type;
+            params.type_v = cache_type;
+        }
+    }
+    if let Ok(value) = std::env::var("OTLET_LLAMA_KV_TYPE_K") {
+        if let Some(cache_type) = linked_ggml_type(&value) {
+            params.type_k = cache_type;
+        }
+    }
+    if let Ok(value) = std::env::var("OTLET_LLAMA_KV_TYPE_V") {
+        if let Some(cache_type) = linked_ggml_type(&value) {
+            params.type_v = cache_type;
+        }
+    }
+}
+
+fn linked_ggml_type(value: &str) -> Option<llama_cpp_sys_4::ggml_type> {
+    match value.to_ascii_lowercase().as_str() {
+        "f16" => Some(llama_cpp_sys_4::GGML_TYPE_F16),
+        "q8" | "q8_0" => Some(llama_cpp_sys_4::GGML_TYPE_Q8_0),
+        "q4" | "q4_0" => Some(llama_cpp_sys_4::GGML_TYPE_Q4_0),
+        _ => None,
+    }
+}
+
 fn linked_prompt_batch_tokens() -> usize {
     static PROMPT_BATCH_TOKENS: OnceLock<usize> = OnceLock::new();
     *PROMPT_BATCH_TOKENS.get_or_init(|| {
-        if let Ok(value) = std::env::var("OTLET_LLAMA_BATCH_TOKENS") {
-            if let Ok(tokens) = value.parse::<usize>() {
-                if tokens > 0 {
-                    return tokens.min(LINKED_CONTEXT_WINDOW_TOKENS as usize);
-                }
-            }
+        if let Some(tokens) = linked_env_usize("OTLET_LLAMA_BATCH_TOKENS") {
+            return tokens.min(LINKED_CONTEXT_WINDOW_TOKENS as usize);
         }
         LINKED_PROMPT_BATCH_TOKENS
     })
+}
+
+fn linked_prompt_ubatch_tokens(prompt_batch_tokens: usize) -> usize {
+    static PROMPT_UBATCH_TOKENS: OnceLock<usize> = OnceLock::new();
+    (*PROMPT_UBATCH_TOKENS.get_or_init(|| {
+        linked_env_usize("OTLET_LLAMA_UBATCH_TOKENS").unwrap_or(LINKED_PROMPT_UBATCH_TOKENS)
+    }))
+    .min(prompt_batch_tokens)
+    .min(LINKED_CONTEXT_WINDOW_TOKENS as usize)
 }
 
 fn linked_output_capacity(max_tokens: u64) -> usize {

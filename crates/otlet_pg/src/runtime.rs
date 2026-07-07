@@ -9,6 +9,7 @@ pub(crate) struct RuntimeOptions {
     pub(crate) generation_trace_max_tokens: u64,
     pub(crate) generation_trace_top_k: u64,
     pub(crate) llama_threads: u64,
+    pub(crate) llama_batch_threads: u64,
 }
 
 impl Default for RuntimeOptions {
@@ -22,6 +23,7 @@ impl Default for RuntimeOptions {
             generation_trace_max_tokens: 64,
             generation_trace_top_k: 5,
             llama_threads: 0,
+            llama_batch_threads: 0,
         }
     }
 }
@@ -44,6 +46,7 @@ pub(crate) fn parse_runtime_options(value: &Value) -> Result<RuntimeOptions, Str
                 | "generation_trace_max_tokens"
                 | "generation_trace_top_k"
                 | "llama_threads"
+                | "llama_batch_threads"
         ) {
             return Err(format!("unsupported runtime option: {key}"));
         }
@@ -143,6 +146,18 @@ pub(crate) fn parse_runtime_options(value: &Value) -> Result<RuntimeOptions, Str
         options.llama_threads = threads;
     }
 
+    if let Some(value) = object.get("llama_batch_threads") {
+        let threads = value
+            .as_u64()
+            .ok_or("runtime_options.llama_batch_threads must be an integer")?;
+        if threads > 1024 {
+            return Err(
+                "runtime_options.llama_batch_threads must be between 0 and 1024".to_owned(),
+            );
+        }
+        options.llama_batch_threads = threads;
+    }
+
     Ok(options)
 }
 
@@ -165,6 +180,7 @@ pub(crate) fn runtime_option_status(value: &Value) -> Value {
         "generation_trace_max_tokens",
         "generation_trace_top_k",
         "llama_threads",
+        "llama_batch_threads",
     ];
     let defaulted = controls
         .iter()
