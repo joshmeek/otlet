@@ -8,6 +8,13 @@ fn generation_trace_summary(
     } else {
         None
     };
+    let steady_decode_ms = metrics.generate_ms.saturating_sub(metrics.first_token_ms);
+    let steady_tokens = metrics.generated_tokens.saturating_sub(1);
+    let steady_tokens_per_second = if steady_decode_ms > 0 && steady_tokens > 0 {
+        Some((steady_tokens as f64 * 1000.0) / steady_decode_ms as f64)
+    } else {
+        None
+    };
     let summary = json!({
         "trace_version": "otlet_generation_trace_v1",
         "prompt_hash": context.prompt_hash,
@@ -20,9 +27,24 @@ fn generation_trace_summary(
         "model_fingerprint_hash": context.model_fingerprint_hash,
         "raw_output_hash": raw_output_hash,
         "prompt_tokens": metrics.prompt_tokens,
+        "prompt_cached_tokens_before": metrics.prompt_cached_tokens_before,
+        "prompt_reused_tokens": metrics.prompt_reused_tokens,
+        "prompt_decoded_tokens": metrics.prompt_decoded_tokens,
+        "prompt_reuse_strategy": metrics.prompt_reuse_strategy,
+        "prompt_prefix_state_bytes": metrics.prompt_prefix_state_bytes,
+        "prompt_prefix_cache_entries": metrics.prompt_prefix_cache_entries,
+        "prompt_prefix_cache_bytes": metrics.prompt_prefix_cache_bytes,
+        "effective_llama_threads": metrics.effective_llama_threads,
+        "effective_llama_batch_threads": metrics.effective_llama_batch_threads,
         "generated_tokens": metrics.generated_tokens,
+        "tokenize_ms": metrics.tokenize_ms,
+        "prompt_decode_ms": metrics.prompt_decode_ms,
+        "first_token_ms": metrics.first_token_ms,
+        "ttft_ms": metrics.ttft_ms,
+        "steady_decode_ms": steady_decode_ms,
         "generate_ms": metrics.generate_ms,
         "tokens_per_second": tokens_per_second,
+        "steady_tokens_per_second": steady_tokens_per_second,
         "model_memory_bytes": metrics.model_memory_bytes,
         "model_parameters": metrics.model_parameters,
         "context_window_tokens": metrics.context_window_tokens,
@@ -78,6 +100,7 @@ fn generation_trace_summary(
 
 #[derive(Default)]
 struct ProbabilityTrace {
+    max_tokens: i64,
     sampled_tokens: i64,
     skipped_tokens: i64,
     chosen_probability_sum: f64,
@@ -89,8 +112,24 @@ struct ProbabilityTrace {
 }
 
 impl ProbabilityTrace {
+    fn new(options: &crate::runtime::RuntimeOptions) -> Self {
+        let max_tokens = if options.generation_trace {
+            PROBABILITY_TRACE_MAX_TOKENS.min(options.generation_trace_max_tokens as i64)
+        } else {
+            0
+        };
+        Self {
+            max_tokens,
+            ..Self::default()
+        }
+    }
+
+    fn wants_sample(&self) -> bool {
+        self.max_tokens > 0 && self.sampled_tokens + self.skipped_tokens < self.max_tokens
+    }
+
     fn observe(&mut self, sample: Option<&ProbabilitySample>) {
-        if self.sampled_tokens >= PROBABILITY_TRACE_MAX_TOKENS {
+        if self.max_tokens > 0 && self.sampled_tokens + self.skipped_tokens >= self.max_tokens {
             self.skipped_tokens += 1;
             return;
         }
@@ -114,6 +153,9 @@ impl ProbabilityTrace {
     }
 
     fn summary(&self) -> Value {
+        if self.max_tokens == 0 {
+            return probability_unavailable("probability_trace_disabled_unless_generation_trace");
+        }
         if self.sampled_tokens == 0 {
             return probability_unavailable("llama_logits_unavailable");
         }
@@ -121,7 +163,7 @@ impl ProbabilityTrace {
             "status": "available",
             "method": "chosen_token_softmax_from_llama_logits",
             "sampled_tokens": self.sampled_tokens,
-            "max_sampled_tokens": PROBABILITY_TRACE_MAX_TOKENS,
+            "max_sampled_tokens": self.max_tokens,
             "skipped_tokens": self.skipped_tokens,
             "avg_chosen_probability": rounded_probability(
                 self.chosen_probability_sum / self.sampled_tokens as f64
@@ -183,19 +225,10 @@ unsafe fn probability_sample(
         }
 
         let mut top_logit = f64::NEG_INFINITY;
-        for index in 0..vocab_tokens as usize {
-            let logit = *logits.add(index) as f64;
-            if logit.is_finite() && logit > top_logit {
-                top_logit = logit;
-            }
-        }
-        if !top_logit.is_finite() {
-            return None;
-        }
-
         let mut denominator = 0.0_f64;
         let mut rank = 1_i64;
         let mut top: Vec<(i64, f64)> = Vec::new();
+        let track_top = top_k > 0;
         for index in 0..vocab_tokens as usize {
             let logit = *logits.add(index) as f64;
             if !logit.is_finite() {
@@ -204,36 +237,46 @@ unsafe fn probability_sample(
             if logit > chosen_logit {
                 rank += 1;
             }
-            denominator += (logit - top_logit).exp();
-            push_top_logit(&mut top, top_k as usize, index as i64, logit);
+            if logit > top_logit {
+                denominator = denominator * (top_logit - logit).exp() + 1.0;
+                top_logit = logit;
+            } else {
+                denominator += (logit - top_logit).exp();
+            }
+            if track_top {
+                push_top_logit(&mut top, top_k as usize, index as i64, logit);
+            }
         }
-        if denominator <= 0.0 || !denominator.is_finite() {
+        if !top_logit.is_finite() || denominator <= 0.0 || !denominator.is_finite() {
             return None;
         }
 
         let chosen_probability = ((chosen_logit - top_logit).exp() / denominator).max(0.0);
-        let top_alternatives = top
-            .into_iter()
-            .enumerate()
-            .map(|(index, (token_id, logit))| {
-                let probability = ((logit - top_logit).exp() / denominator).max(0.0);
-                TokenAlternative {
-                    token_id,
-                    token_text: linked_token_to_piece(
-                        vocab,
-                        token_id as llama_cpp_sys_4::llama_token,
-                    ),
-                    logit: rounded_probability(logit),
-                    probability: rounded_probability(probability),
-                    logprob: rounded_probability(if probability > 0.0 {
-                        probability.ln()
-                    } else {
-                        f64::NEG_INFINITY
-                    }),
-                    rank: index as i64 + 1,
-                }
-            })
-            .collect();
+        let top_alternatives = if track_top {
+            top.into_iter()
+                .enumerate()
+                .map(|(index, (token_id, logit))| {
+                    let probability = ((logit - top_logit).exp() / denominator).max(0.0);
+                    TokenAlternative {
+                        token_id,
+                        token_text: linked_token_to_piece(
+                            vocab,
+                            token_id as llama_cpp_sys_4::llama_token,
+                        ),
+                        logit: rounded_probability(logit),
+                        probability: rounded_probability(probability),
+                        logprob: rounded_probability(if probability > 0.0 {
+                            probability.ln()
+                        } else {
+                            f64::NEG_INFINITY
+                        }),
+                        rank: index as i64 + 1,
+                    }
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
 
         Some(ProbabilitySample {
             chosen_probability,
@@ -287,10 +330,14 @@ impl DetailedGenerationTrace {
         }
     }
 
+    fn wants_sample(&self) -> bool {
+        self.enabled && (self.steps.len() as u64) < self.max_tokens
+    }
+
     fn observe(
         &mut self,
         token: llama_cpp_sys_4::llama_token,
-        token_text: String,
+        token_text: &str,
         sample: Option<ProbabilitySample>,
     ) {
         if !self.enabled {
@@ -301,7 +348,7 @@ impl DetailedGenerationTrace {
             return;
         }
         self.chosen_token_ids.push(token as i64);
-        self.chosen_text.push_str(&token_text);
+        self.chosen_text.push_str(token_text);
         let step = self.steps.len() as i64 + 1;
         let trace = match sample {
             Some(sample) => json!({

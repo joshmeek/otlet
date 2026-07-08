@@ -563,6 +563,8 @@ SQL
   printf 'benchmark_report=%s\n' "$report_path"
   printf 'benchmark_pareto_chart=%s\n' "$run_dir/pareto.svg"
   printf 'benchmark_latency_chart=%s\n' "$run_dir/latency.svg"
+  printf 'benchmark_ttft_chart=%s\n' "$run_dir/ttft.svg"
+  printf 'benchmark_prompt_decode_chart=%s\n' "$run_dir/prompt_decode.svg"
   printf 'benchmark_efficiency_chart=%s\n' "$run_dir/efficiency.svg"
   printf 'benchmark_case_results=%s\n' "$case_results_tsv"
   printf 'benchmark_model_summary=%s\n' "$model_summary_tsv"

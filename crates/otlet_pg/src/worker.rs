@@ -143,7 +143,7 @@ fn process_infer_now_request(request: crate::infer_now::InferNowRequest) {
     crate::infer_now::finish_request(request.id, job_id, None);
 }
 
-fn ensure_inline_task(request: &crate::infer_now::InferNowRequest) -> pgrx::spi::Result<()> {
+fn ensure_inline_task(request: &crate::infer_now::InferNowRequest) -> Result<(), String> {
     let Some(inline_task) = request.inline_task.as_ref() else {
         return Ok(());
     };
@@ -164,8 +164,19 @@ fn ensure_inline_task(request: &crate::infer_now::InferNowRequest) -> pgrx::spi:
         .cloned()
         .unwrap_or_else(|| serde_json::json!({}));
 
-    BackgroundWorker::transaction(|| {
+    let setup_result: pgrx::spi::Result<Result<(), String>> = BackgroundWorker::transaction(|| {
         pgrx::Spi::connect_mut(|client| {
+            let model_args = [model_name.into()];
+            let model_rows = client.select(
+                "SELECT EXISTS (SELECT 1 FROM otlet.models WHERE name = $1)",
+                Some(1),
+                &model_args,
+            )?;
+            let model_exists = model_rows.first().get::<bool>(1)?.unwrap_or(false);
+            if !model_exists {
+                return Ok(Err(format!("model is not registered: {model_name}")));
+            }
+
             let args = [
                 request.task_name.as_str().into(),
                 instruction.into(),
@@ -178,9 +189,13 @@ fn ensure_inline_task(request: &crate::infer_now::InferNowRequest) -> pgrx::spi:
                 Some(5),
                 &args,
             )?;
-            Ok(())
+            Ok(Ok(()))
         })
-    })
+    });
+    match setup_result {
+        Ok(result) => result,
+        Err(err) => Err(err.to_string()),
+    }
 }
 
 fn infer_now_job_error(job_id: i64) -> String {

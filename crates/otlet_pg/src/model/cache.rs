@@ -31,16 +31,23 @@ fn inference_cache_row_key(content_key: &str, contract_key: &str) -> String {
     )
 }
 
-fn inference_cache_contract_hash(job: &Job, instruction: &str) -> String {
+fn inference_cache_contract_hash(
+    job: &Job,
+    instruction_hash: &str,
+    output_schema_hash: &str,
+    runtime_options_hash: &str,
+    input_shaping_hash: &str,
+    decision_contract_hash: &str,
+) -> String {
     hash_text(
         format!(
             "task={}|instruction={}|schema={}|options={}|input_shaping={}|decision_contract={}",
             job.task_name,
-            hash_text(instruction),
-            hash_json(&job.output_schema),
-            hash_json(&job.runtime_options),
-            hash_json(&job.input_shaping),
-            hash_json(&job.decision_contract)
+            instruction_hash,
+            output_schema_hash,
+            runtime_options_hash,
+            input_shaping_hash,
+            decision_contract_hash
         )
         .as_str(),
     )
@@ -203,19 +210,26 @@ fn inference_cache_get(
     }
 
     cache.misses += 1;
-    let reason = if cache
-        .entries
-        .iter()
-        .any(|entry| entry.content_key == content_key && entry.contract_key != contract_key)
-    {
+    let mut content_contract_changed = false;
+    let mut row_model_changed = false;
+    let mut row_seen = false;
+    for entry in &cache.entries {
+        if entry.content_key == content_key && entry.contract_key != contract_key {
+            content_contract_changed = true;
+        }
+        if entry.row_key == row_key {
+            row_seen = true;
+            if entry.model_key != model_key {
+                row_model_changed = true;
+            }
+        }
+    }
+
+    let reason = if content_contract_changed {
         "contract_changed"
-    } else if cache
-        .entries
-        .iter()
-        .any(|entry| entry.row_key == row_key && entry.model_key != model_key)
-    {
+    } else if row_model_changed {
         "model_fingerprint_changed"
-    } else if cache.entries.iter().any(|entry| entry.row_key == row_key) {
+    } else if row_seen {
         "row_version_changed"
     } else {
         "not_found"

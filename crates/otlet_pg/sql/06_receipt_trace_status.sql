@@ -461,9 +461,75 @@ SELECT
   r.runtime_name,
   r.prompt_hash,
   r.prompt_tokens,
+  CASE
+    WHEN jsonb_typeof(r.trace_summary -> 'prompt_cached_tokens_before') = 'number'
+      THEN (r.trace_summary ->> 'prompt_cached_tokens_before')::bigint
+    ELSE NULL
+  END AS prompt_cached_tokens_before,
+  CASE
+    WHEN jsonb_typeof(r.trace_summary -> 'prompt_reused_tokens') = 'number'
+      THEN (r.trace_summary ->> 'prompt_reused_tokens')::bigint
+    ELSE NULL
+  END AS prompt_reused_tokens,
+  CASE
+    WHEN jsonb_typeof(r.trace_summary -> 'prompt_decoded_tokens') = 'number'
+      THEN (r.trace_summary ->> 'prompt_decoded_tokens')::bigint
+    ELSE NULL
+  END AS prompt_decoded_tokens,
+  r.trace_summary ->> 'prompt_reuse_strategy' AS prompt_reuse_strategy,
+  CASE
+    WHEN jsonb_typeof(r.trace_summary -> 'prompt_prefix_state_bytes') = 'number'
+      THEN (r.trace_summary ->> 'prompt_prefix_state_bytes')::bigint
+    ELSE NULL
+  END AS prompt_prefix_state_bytes,
+  CASE
+    WHEN jsonb_typeof(r.trace_summary -> 'prompt_prefix_cache_entries') = 'number'
+      THEN (r.trace_summary ->> 'prompt_prefix_cache_entries')::bigint
+    ELSE NULL
+  END AS prompt_prefix_cache_entries,
+  CASE
+    WHEN jsonb_typeof(r.trace_summary -> 'prompt_prefix_cache_bytes') = 'number'
+      THEN (r.trace_summary ->> 'prompt_prefix_cache_bytes')::bigint
+    ELSE NULL
+  END AS prompt_prefix_cache_bytes,
+  CASE
+    WHEN jsonb_typeof(r.trace_summary -> 'effective_llama_threads') = 'number'
+      THEN (r.trace_summary ->> 'effective_llama_threads')::bigint
+    ELSE NULL
+  END AS effective_llama_threads,
+  CASE
+    WHEN jsonb_typeof(r.trace_summary -> 'effective_llama_batch_threads') = 'number'
+      THEN (r.trace_summary ->> 'effective_llama_batch_threads')::bigint
+    ELSE NULL
+  END AS effective_llama_batch_threads,
   r.generated_tokens,
   r.generate_ms,
   r.tokens_per_second,
+  CASE
+    WHEN jsonb_typeof(r.trace_summary -> 'tokenize_ms') = 'number'
+      THEN (r.trace_summary ->> 'tokenize_ms')::bigint
+    ELSE NULL
+  END AS tokenize_ms,
+  CASE
+    WHEN jsonb_typeof(r.trace_summary -> 'prompt_decode_ms') = 'number'
+      THEN (r.trace_summary ->> 'prompt_decode_ms')::bigint
+    ELSE NULL
+  END AS prompt_decode_ms,
+  CASE
+    WHEN jsonb_typeof(r.trace_summary -> 'first_token_ms') = 'number'
+      THEN (r.trace_summary ->> 'first_token_ms')::bigint
+    ELSE NULL
+  END AS first_token_ms,
+  CASE
+    WHEN jsonb_typeof(r.trace_summary -> 'ttft_ms') = 'number'
+      THEN (r.trace_summary ->> 'ttft_ms')::bigint
+    ELSE NULL
+  END AS ttft_ms,
+  CASE
+    WHEN jsonb_typeof(r.trace_summary -> 'steady_tokens_per_second') = 'number'
+      THEN (r.trace_summary ->> 'steady_tokens_per_second')::numeric
+    ELSE NULL
+  END AS steady_tokens_per_second,
   r.schema_validation_status,
   r.trace_summary ->> 'trace_version' AS trace_version,
   r.trace_summary,

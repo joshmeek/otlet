@@ -84,7 +84,10 @@ def table(headers, rows):
         "likes",
         "hint_gb",
         "p95_ms",
+        "ttft_ms",
+        "prompt_ms",
         "tok_s",
+        "steady_tok_s",
         "rss_gb",
         "artifact_gb",
         "resource_fit",
@@ -138,6 +141,9 @@ def table(headers, rows):
         "semantic_delta",
         "row_watch_delta",
         "p95_ms_delta",
+        "ttft_ms_delta",
+        "prompt_ms_delta",
+        "steady_tok_s_delta",
         "rss_gb_delta",
     }
     separator = [("---:" if header in numeric else "---") for header in headers]

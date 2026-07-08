@@ -70,10 +70,7 @@ fn wait_for_refresh_if_allowed(
 }
 
 fn should_prefetch_infer_now(runtime: &RuntimeState) -> bool {
-    runtime.infer_ms > 0
-        && runtime.infer_max_rows > 1
-        && !runtime.auto_policy
-        && !runtime.allow_refresh
+    runtime.infer_ms > 0 && runtime.infer_max_rows > 1 && !runtime.allow_refresh
 }
 
 unsafe fn prefetch_infer_now_batch(
@@ -82,6 +79,12 @@ unsafe fn prefetch_infer_now_batch(
     current_subject_id: &str,
     current_slot: *mut pg_sys::TupleTableSlot,
 ) -> Result<(), String> {
+    let target_infer_count = remaining_infer_capacity(runtime);
+    if target_infer_count == 0 {
+        runtime.fail_closed_rows = runtime.fail_closed_rows.saturating_add(1);
+        return Ok(());
+    }
+
     let mut rows = Vec::new();
     if !submit_prefetched_infer_row(runtime, current_subject_id, current_slot, &mut rows)? {
         runtime.fail_closed_rows = runtime.fail_closed_rows.saturating_add(1);
@@ -90,7 +93,7 @@ unsafe fn prefetch_infer_now_batch(
 
     let mut prefetched_source_rows = 1usize;
     loop {
-        if prefetched_infer_count(&rows) >= remaining_infer_capacity(runtime) {
+        if prefetched_infer_count(&rows) >= target_infer_count {
             break;
         }
         if prefetched_source_rows >= runtime.infer_max_rows as usize {
@@ -139,7 +142,7 @@ unsafe fn prefetch_infer_now_batch(
                 } else {
                     runtime.missing_rows = runtime.missing_rows.saturating_add(1);
                 }
-                if prefetched_infer_count(&rows) < remaining_infer_capacity(runtime)
+                if prefetched_infer_count(&rows) < target_infer_count
                     && submit_prefetched_infer_row(runtime, &subject_id, slot, &mut rows)?
                 {
                     continue;
@@ -153,12 +156,16 @@ unsafe fn prefetch_infer_now_batch(
         }
     }
 
+    crate::infer_now::signal_infer_now_worker();
     resolve_prefetched_rows(runtime, rows);
     Ok(())
 }
 
 fn remaining_infer_capacity(runtime: &RuntimeState) -> usize {
-    (runtime.infer_max_rows as usize).saturating_sub(runtime.infer_now_batches as usize)
+    let policy_remaining = (runtime.infer_max_rows as usize)
+        .saturating_sub(runtime.infer_now_batches as usize);
+    let queue_remaining = crate::infer_now::queue_snapshot().available_slots;
+    policy_remaining.min(queue_remaining)
 }
 
 fn prefetched_infer_count(rows: &[PrefetchedRow]) -> usize {
@@ -187,7 +194,6 @@ fn submit_prefetched_infer_row(
         return Ok(false);
     };
     let buffered_slot = unsafe { copy_slot_buffer(slot)? };
-    crate::infer_now::signal_infer_now_worker();
     rows.push(PrefetchedRow::Infer(PendingInferNowRow {
         subject_id: subject_id.to_string(),
         slot: buffered_slot,
@@ -397,7 +403,8 @@ fn finish_infer_now_success(
     }
     runtime.infer_now_batches += 1;
     record_infer_now_executor_context(runtime, job_id)?;
-    with_latest_snapshot(|| materialize_semantic_subject(runtime, subject_id))?;
+    // Worker materializes semantic state before finishing infer-now; refresh
+    // local scan state instead of repeating materialization SPI here.
     let provenance = with_latest_snapshot(|| infer_now_provenance_counts(job_id))?;
     runtime.infer_receipts = runtime.infer_receipts.saturating_add(provenance.receipts);
     runtime.infer_trace_receipt_id = provenance.receipt_id;

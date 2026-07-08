@@ -36,27 +36,24 @@ Run `./scripts/otlet-setup.sh`, then `./scripts/otlet-demo.sh` to prove the cont
 | 8 | GPU acceleration | Open | Add device policy after the CPU resident-worker path has measured proof |
 | 9 | Core limits | Open research | Test Access Method and Postgres-fork paths for missing planner or executor contracts |
 
-## Track Status
+## Open Tracks
 
-| Track | Status | Next contract |
-| --- | --- | --- |
-| Output reliability | Implemented, harden | Fixed `output` plus `actions` envelope, receipt evidence, benchmark gates, and repeat model sweeps |
-| Planner, executor, and cache | Implemented, harden | SQL plan rows, semantic status views, CustomScan EXPLAIN, receipts, runtime/cache views, and demo output must agree |
-| Review queue contract | Implemented | SQL exposes approval, rejection, correction, abstention, reviewer reason, stale state, receipts, and eval labels |
-| Action lifecycle | Implemented, extend | Approval, rejection, dry-run, and apply paths work for typed actions; add bounded SQL proposal actions |
-| Semantic freshness | Implemented, harden | Source updates, deletes, schema drift, contract changes, and candidate changes fail closed; add dependency audit export |
-| Watch definitions | Implemented, extend | Row and pair watches carry source, candidate, schema, stale, model, and runtime policy; add import/export |
-| Explain and trace | Implemented, harden | Bounded token traces and EXPLAIN vocabulary exist; add audit export views and redaction policy |
-| User-labeled eval loop | Implemented | Accepted, rejected, and corrected actions export local eval cases; feed more labels into benchmark gates |
-| Single-worker admission | Implemented | Queue caps, fair claims, cancellation, leases, RSS budgets, and cleanup checks exist; extend after multi-worker support lands |
-| SQL proposal actions | Open | Define bounded SQL action schemas, dry-run plans, approvals, receipts, and source-table write checks |
-| Grammar-constrained decode | Open | Add grammar or JSON-schema decode after linked llama exposes a worker-safe hook |
-| Persisted cache storage | Open | Add disk-backed cache after a measured workload proves in-process cache misses hurt |
-| Managed Postgres external worker | Open | Build a trusted SQL-bound worker that claims jobs, heartbeats, writes receipts, and fails closed |
-| GPU acceleration | Open | Report device policy, memory accounting, throughput, crash behavior, and EXPLAIN-visible device state |
-| Core limits | Open research | Test Access Method and fork paths when CustomScan cannot expose a required contract |
-| Entity resolution packs | Open | Ship vendor, customer, and product packs with candidate SQL, prompts, schemas, actions, fixtures, and gates |
-| Audit export and redaction | Open | Add views and policies for decisions, receipts, source hashes, approvals, corrections, eval labels, and trace summaries |
+| Track | Next contract |
+| --- | --- |
+| Output reliability hardening | Repeat model sweeps and keep prompt/schema changes on the same fixture |
+| Planner, executor, and cache hardening | Keep SQL plan rows, semantic status views, CustomScan EXPLAIN, receipts, runtime/cache views, and demo output aligned |
+| Action lifecycle extension | Add bounded SQL proposal actions, dry-run plans, approvals, receipts, and source-table write checks |
+| Semantic freshness hardening | Add dependency audit export for source updates, deletes, schema drift, contract changes, and candidate changes |
+| Watch definition export | Add import/export for row and pair watches |
+| Explain and trace hardening | Add audit export views and redaction policy |
+| Model residency and timing | Keep one-worker default; add per-worker RSS totals, model-slot admission, and worker-count probes before changing slot policy |
+| Grammar-constrained decode | Add grammar or JSON-schema decode after linked llama exposes a worker-safe hook |
+| Persisted cache storage | Add disk-backed cache after a measured workload proves in-process cache misses hurt |
+| Managed Postgres external worker | Build a trusted SQL-bound worker that claims jobs, heartbeats, writes receipts, and fails closed |
+| GPU acceleration | Report device policy, memory accounting, throughput, crash behavior, and EXPLAIN-visible device state |
+| Core limits research | Test Access Method and fork paths when CustomScan cannot expose a required contract |
+| Entity resolution packs | Ship vendor, customer, and product packs with candidate SQL, prompts, schemas, actions, fixtures, and gates |
+| Audit export and redaction | Add views and policies for decisions, receipts, source hashes, approvals, corrections, eval labels, and trace summaries |
 
 Keep open tracks contract-first. Name the SQL-visible state, the closed failure mode, and the demo or benchmark proof before adding code
 
@@ -64,15 +61,17 @@ Keep open tracks contract-first. Name the SQL-visible state, the closed failure 
 
 Otlet treats output reliability as part of the database contract. Trusted output uses a fixed top-level `output` plus `actions` envelope. Invalid JSON, schema failures, bad action envelopes, false merges, and failed model attempts stay in receipts and diagnostic benchmark data, outside trusted output
 
-The Qwen3.5 4B benchmark pass leads the calibrated fixture today. Repeat runs and small-model comparisons come next
+Qwen3.5 4B stays the default stable model under the 4B and 4 GB project cap. The fast probe filters smaller candidates before a full benchmark run. MiniStral 3B, Phi-4 mini, SmolLM3 3B, and GLM Edge 4B are faster on CPU in quick probes, but each failed adversarial row-text, numeric-threshold, markdown-fence, or schema gates
 
 Next benchmark work:
 
 - Run comparable model sweeps after harness changes so public charts show workload roles, trusted quality, resource fit, and out-of-running reasons across small, medium, and ceiling local models
 - Keep routine benchmark runs on `include_by_default=true`; keep candidate, diagnostic, historical, heavy, and blocked rows manual
+- Use `benchmarks/quick_probe.sh` to reject weak candidates before running the full suite
+- Use `benchmarks/thread_sweep.sh` to find the host-specific `llama_threads` setting before treating CPU token rates as fixed
 - Revisit grammar-constrained JSON after linked llama exposes a hook that cannot abort the resident worker
 - Keep prompt and schema changes on the same benchmark fixture
-- Test larger local models to find the quality/resource knee before defaulting to bigger models
+- Test larger local models only as ceiling checks; keep Otlet defaults under 4B active parameters and about 4 GB on disk
 
 ## Planner, Executor, And Cache
 
@@ -83,6 +82,16 @@ Use one decision vocabulary for semantic lookup, queue refresh, wait, fail-close
 Keep cache work inside the runtime contract. Cache keys, invalidation reasons, hit and miss counters, size bounds, EXPLAIN output, runtime status, and benchmark gates must agree. Add persisted cache storage after a measured workload proves the bounded in-process cache misses hurt
 
 Use measured runtime history for costing: load time, warm generation time, token counts, schema failures, cache hits, cache invalidation reasons, stale refresh rate, worker queue depth, model-selection attempts, and materialization coverage. Postgres chooses the cheap fresh lookup path when it can and shows the reason when it cannot
+
+Add a timing split before the next executor rewrite: `tokenize_ms`, `prompt_decode_ms`, `generate_ms`, `finish_sql_ms`, and `materialize_ms`. Use those fields to decide whether prompt decode, SQL finish work, or materialization owns warm-job latency
+
+Keep cache-hit paths easy to preserve. A live smoke run completed cached jobs in milliseconds with no generation, so future watch and demo work keeps trace mode off for cacheable production paths and keeps stable content, contract, and model keys
+
+Keep CPU tuning measurable. Current controls cover release builds, native CPU code, OpenMP, a six-thread default cap, per-job `llama_threads`, startup `OTLET_LLAMA_BATCH_TOKENS`, `OTLET_LLAMA_MMAP`, `OTLET_LLAMA_MLOCK`, and `OTLET_LLAMA_FLASH_ATTN`. Add BLAS, KV-cache quantization, context-window policy, grammar decoding, or device offload only after a probe shows better Otlet pass rate or latency on the SQL path
+
+Keep resident-worker parallelism gated. A qwen35_4b probe on the current Docker CPU measured four warm concurrent infer-now callers at `11.22s` with one worker and six threads, `13.02s` with two workers and six threads each, and `11.51s` with two workers and three threads each. Extra workers created overlapping llama.cpp generation, doubled resident model contexts, and failed to beat the one-worker default. Before changing the default, add per-worker RSS totals, model-specific admission caps, queue fairness proof, and database responsiveness checks
+
+Test multi-resident model contexts before changing slot policy. Alternating cheap and strong models pays model-load time on each swap; a keyed model cache can remove that cost when the memory budget allows both artifacts
 
 ## Watch And Review Contracts
 
@@ -115,6 +124,8 @@ Use verbose EXPLAIN to inspect model work from Postgres. Users see why Otlet reu
 Keep token-level tracing optional and bounded. Debug mode shows chosen token IDs, token text, probabilities or logprobs when llama.cpp exposes them, top-k alternatives, partial generated text, stop reason, schema validation, and trace storage policy
 
 Production defaults keep tracing low-detail or off. SQL explains disabled tracing without storing unbounded token streams
+
+Use `generation_trace_top_k=0` when token alternatives are not part of the question. In a smoke probe, Otlet kept probability and chosen-token trace while avoiding the top-alternative scan cost
 
 Add audit export views for decisions, receipts, source hashes, approvals, corrections, eval labels, and trace summaries. Add redaction policy before exporting prompt, source, or token detail
 

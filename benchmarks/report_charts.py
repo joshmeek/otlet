@@ -231,7 +231,10 @@ def write_scorecard(path, rows):
         "diag_confidence",
         "semantic",
         "p95_ms",
+        "ttft_ms",
+        "prompt_ms",
         "tok_s",
+        "steady_tok_s",
         "rss_gb",
         "artifact_gb",
     ]
@@ -288,7 +291,10 @@ def write_scorecard(path, rows):
                     "diag_confidence": f'{num(row.get("diagnostic_confidence_accuracy")):.6f}' if row.get("diagnostic_confidence_accuracy") not in (None, "") else "",
                     "semantic": f'{num(row.get("semantic_materialization_score")):.6f}',
                     "p95_ms": f'{num(row.get("p95_generate_ms")):.3f}',
+                    "ttft_ms": f'{num(row.get("p95_ttft_ms")):.3f}',
+                    "prompt_ms": f'{num(row.get("p95_prompt_decode_ms")):.3f}',
                     "tok_s": f'{num(row.get("mean_tokens_per_second")):.6f}',
+                    "steady_tok_s": f'{num(row.get("mean_steady_tokens_per_second")):.6f}',
                     "rss_gb": f'{num(row.get("resident_gb")):.6f}',
                     "artifact_gb": f'{num(row.get("artifact_gb")):.6f}',
                 }
@@ -321,6 +327,7 @@ def write_score_audit(path, rows):
         "stale_leaks",
         "source_mutated",
         "p95_ms",
+        "ttft_ms",
         "rss_gb",
         "artifact_gb",
     ]

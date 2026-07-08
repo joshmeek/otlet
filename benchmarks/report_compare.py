@@ -64,6 +64,14 @@ def compare_runs(baseline_dir, candidate_dir):
                 ),
                 "row_watch_delta": score_label(num(after.get("row_watch_score")) - num(before.get("row_watch_score"))),
                 "p95_ms_delta": score_label(num(after.get("p95_generate_ms")) - num(before.get("p95_generate_ms"))),
+                "ttft_ms_delta": score_label(num(after.get("p95_ttft_ms")) - num(before.get("p95_ttft_ms"))),
+                "prompt_ms_delta": score_label(
+                    num(after.get("p95_prompt_decode_ms")) - num(before.get("p95_prompt_decode_ms"))
+                ),
+                "steady_tok_s_delta": score_label(
+                    num(after.get("mean_steady_tokens_per_second"))
+                    - num(before.get("mean_steady_tokens_per_second"))
+                ),
                 "rss_gb_delta": score_label(num(after.get("resident_gb")) - num(before.get("resident_gb"))),
                 "blocker_before": first_blocker(before),
                 "blocker_after": first_blocker(after),
@@ -77,8 +85,8 @@ def compare_runs(baseline_dir, candidate_dir):
         f"- Baseline: `{baseline_dir}`",
         f"- Candidate: `{candidate_dir}`",
         "- Basis: exported benchmark TSVs; no case rows are dropped by the comparison",
-        "- Good deltas are positive for schema, confidence, trusted action, semantic, row-watch, and overall fit",
-        "- Good deltas are negative for parse failures, false merges, hallucinated actions, p95 latency, and resident RSS",
+        "- Good deltas are positive for schema, confidence, trusted action, semantic, row-watch, overall fit, and steady tok/s",
+        "- Good deltas are negative for parse failures, false merges, hallucinated actions, p95 latency, TTFT, prompt decode, and resident RSS",
         "",
         table(
             [
@@ -97,6 +105,9 @@ def compare_runs(baseline_dir, candidate_dir):
                 "semantic_delta",
                 "row_watch_delta",
                 "p95_ms_delta",
+                "ttft_ms_delta",
+                "prompt_ms_delta",
+                "steady_tok_s_delta",
                 "rss_gb_delta",
                 "blocker_before",
                 "blocker_after",

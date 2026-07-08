@@ -9,6 +9,58 @@ Start with the normal Otlet proof path:
 ./scripts/otlet-demo.sh
 ```
 
+Run the fast probe before spending time on a full benchmark. It uses the real Otlet worker on five row-shaped JSON cases and reports viability, pass count, schema passes, token rate, steady decode rate, p95 generation time, p95 TTFT, p95 prompt decode time, and effective llama.cpp decode/batch thread counts:
+
+```sh
+OTLET_PROBE_LIMIT_MODELS=ministral3_3b,qwen35_4b,qwen3_1_7b ./benchmarks/quick_probe.sh
+```
+
+Set `OTLET_PROBE_DOWNLOAD=1` when you want the probe to fetch a missing GGUF. Downloads go under `/var/lib/postgresql/otlet-probe-models` and the script removes them on exit unless `OTLET_PROBE_KEEP_MODELS=1`
+
+Find current Hugging Face GGUF candidates before adding a model row:
+
+```sh
+python3 benchmarks/find_candidates.py
+```
+
+Sweep CPU thread counts through the same probe:
+
+```sh
+OTLET_SWEEP_MODELS=qwen3_1_7b,qwen35_4b OTLET_SWEEP_THREADS=1,2,4,6,8,12 ./benchmarks/thread_sweep.sh
+```
+
+Use thread sweeps as host evidence, not a global truth. The default setup starts one resident worker, so concurrent infer-now callers keep the bounded shared-memory queue fed but do not create parallel llama.cpp generation
+
+The probe accepts `OTLET_PROBE_LLAMA_THREADS=<n>`, `OTLET_PROBE_LLAMA_BATCH_THREADS=<n>`, and `OTLET_PROBE_RUNTIME_OPTIONS='{"max_tokens":64}'` for one run. The setup path accepts deployment-level llama.cpp knobs before `./scripts/otlet-setup.sh`:
+
+| knob | scope | default |
+| --- | --- | --- |
+| `OTLET_WORKER_COUNT` | resident Postgres workers | `1`, capped at `4`, research only |
+| `OTLET_LLAMA_THREADS` | decode threads | visible cores capped at `6` |
+| `OTLET_LLAMA_BATCH_THREADS` | prompt-decode thread pool | same as decode threads |
+| `OTLET_LLAMA_BATCH_TOKENS` | logical prompt batch tokens | `512` |
+| `OTLET_LLAMA_UBATCH_TOKENS` | physical prompt ubatch tokens | `512` |
+| `OTLET_LLAMA_MMAP` | model mmap toggle | llama.cpp default |
+| `OTLET_LLAMA_MLOCK` | lock model pages in memory | llama.cpp default |
+| `OTLET_LLAMA_FLASH_ATTN` | `auto`, `on`, or `off` flash attention | llama.cpp default |
+| `OTLET_LLAMA_NO_PERF` | skip llama.cpp perf counters | `true` |
+| `OTLET_LLAMA_KV_TYPE` | set both KV cache types: `f16`, `q8_0`, `q4_0` | llama.cpp default |
+| `OTLET_LLAMA_KV_TYPE_K` | set K cache type only | llama.cpp default |
+| `OTLET_LLAMA_KV_TYPE_V` | set V cache type only | llama.cpp default |
+| `OMP_PROC_BIND`, `OMP_PLACES`, `GOMP_CPU_AFFINITY` | OpenMP CPU placement | unset |
+
+Treat those as host-specific controls. Re-run `./scripts/otlet-setup.sh` after changing startup knobs so the worker process starts with the new environment
+
+Keep `OTLET_WORKER_COUNT=1` unless a local probe shows a wall-clock win and acceptable RSS. A qwen35_4b infer-now probe on the current Docker CPU measured four warm concurrent callers like this:
+
+| setup | wall time | shape | result |
+| --- | ---: | --- | --- |
+| `1` worker, `6` threads | `11.22s` | serialized jobs | best wall time, about `25-30 tok/s` |
+| `2` workers, `6` threads each | `13.02s` | two overlapping jobs | slower from CPU oversubscription |
+| `2` workers, `3` threads each | `11.51s` | two overlapping jobs | near baseline, with about double resident model memory |
+
+The two-worker probes proved real overlapping llama.cpp generation from separate Postgres workers, but they lost wall time or memory on qwen35_4b. Treat worker count as a research control until Otlet has per-worker RSS totals, model-specific admission caps, queue fairness proof, and database responsiveness checks
+
 Run the default-included benchmark model:
 
 ```sh
@@ -24,8 +76,52 @@ OTLET_BENCH_LIMIT_MODELS=phi4_mini OTLET_BENCH_RUNS=1 OTLET_BENCH_PUBLISH_REPORT
 Run the current scored comparison set after a prompt, schema, scoring, or runtime change:
 
 ```sh
-OTLET_BENCH_LIMIT_MODELS=qwen35_4b,ministral3_3b,gemma4_e2b,glm_edge_4b,gemma4_e4b,phi4_mini OTLET_BENCH_RUNS=1 OTLET_BENCH_PUBLISH_REPORT=1 ./benchmarks/run.sh
+OTLET_BENCH_LIMIT_MODELS=ministral3_3b,qwen35_4b,gemma4_e2b,glm_edge_4b,gemma4_e4b,phi4_mini OTLET_BENCH_RUNS=1 OTLET_BENCH_PUBLISH_REPORT=1 ./benchmarks/run.sh
 ```
+
+Keep routine model search under 4B active parameters and about 4 GB of local artifact size. Qwen3.5 4B stays the stable default until a smaller model passes the fast probe and the full benchmark. MiniStral, Gemma, GLM Edge, Phi mini, and SmolLM stay in comparison lanes
+
+Recent quick-probe findings:
+
+| model | viable | mean tok/s | result |
+| --- | --- | ---: | --- |
+| `qwen35_4b` | yes | `34.15` | passed all five row-shaped cases with the 6-thread CPU default |
+| `qwen3_1_7b` | no | `68.79` | fast cheap model, failed three correctness cases |
+| `ministral3_3b` | no | `10.48` | failed markdown-fence, adversarial row-text, and numeric-threshold cases |
+| `phi4_mini` | no | `10.69` | schema-valid, failed adversarial row-text and numeric-threshold cases |
+| `smollm3_3b` | no | `8.71` | schema-valid, failed adversarial row-text and numeric-threshold cases |
+| `glm_edge_4b` | no | `6.68` | produced fenced JSON and failed the same hard decisions |
+
+Thread sweep on the current Docker CPU showed the best stable qwen35 setting at 6 threads:
+
+| model | threads | viable | mean tok/s |
+| --- | ---: | --- | ---: |
+| `qwen35_4b` | `1` | no | `7.90` |
+| `qwen35_4b` | `2` | yes | `16.91` |
+| `qwen35_4b` | `4` | yes | `29.35` |
+| `qwen35_4b` | `6` | yes | `38.51` |
+| `qwen35_4b` | `8` | yes | `37.28` |
+| `qwen35_4b` | `12` | yes | `6.68` |
+| `qwen3_1_7b` | `6` | no | `71.91` |
+| `qwen3_1_7b` | `12` | no | `10.63` |
+
+Recent CPU tuning sweep on `qwen35_4b` kept the old default at `41.89 tok/s` as the before sample. The control-only build stayed neutral at `41.44 tok/s`; every default change below either failed correctness or lost throughput:
+
+| control | tested setting | viable | mean tok/s | result |
+| --- | --- | --- | ---: | --- |
+| decode threads | `6` | yes | `37.76` | still best in sweep; `8`, `10`, and `12` were slower |
+| batch threads | `12` | yes | `41.21` | repeated A/B was neutral versus default `41.31` |
+| logical batch | `2048` | yes | `39.80` | slower than `512` |
+| physical ubatch | `2048/256` | yes | `33.66` | slower |
+| mmap | `false` | yes | `25.78` | slower |
+| mlock | `true` | yes | `24.09` | slower |
+| flash attention | `on` | yes | `31.48` | slower on CPU |
+| perf counters | `OTLET_LLAMA_NO_PERF=false` | yes | `28.33` | slower |
+| KV cache type | `q8_0` | yes | `30.22` | slower; possible memory-only lever |
+| KV cache type | `q4_0` | no | `25.16` | failed one decision |
+| OpenMP placement | `PROC_BIND=spread`, `PLACES=cores` | no | `9.95` | timed out one smoke case |
+
+Interleaved prompt-prefix probe on `qwen35_4b` now keeps multiple task prefixes in the resident worker. The A/B/A probe used two different inline tasks. Before the bounded multi-prefix cache, the second A decoded the full 424-token prompt again at about `6.7s` prompt decode. After the change, the second A restored 386 prefix tokens, decoded 38 tail tokens, and prompt decode was `1.143s`. The resident worker kept two prefix states using about `130.6 MiB`
 
 Run the default-included set after a harness improvement when you want the shortest publishable check:
 
@@ -41,7 +137,7 @@ models="$(awk -F '\t' 'NR > 1 && ($6 == "candidate" || $6 == "diagnostic") {prin
 OTLET_BENCH_LIMIT_MODELS="$models" OTLET_BENCH_RUNS=1 OTLET_BENCH_MAX_ARTIFACT_GB=6 OTLET_BENCH_PUBLISH_REPORT=1 ./benchmarks/run.sh
 ```
 
-Run a one-model Qwen smoke without publishing a local report:
+Run a one-model default smoke without publishing a local report:
 
 ```sh
 OTLET_BENCH_LIMIT_MODELS=qwen35_4b OTLET_BENCH_RUNS=1 ./benchmarks/run.sh
@@ -58,6 +154,8 @@ Key files:
 - `benchmarks/report/latest/pareto.svg`
 - `benchmarks/report/latest/params.svg`
 - `benchmarks/report/latest/latency.svg`
+- `benchmarks/report/latest/ttft.svg`
+- `benchmarks/report/latest/prompt_decode.svg`
 - `benchmarks/report/latest/efficiency.svg`
 - `benchmarks/report/latest/scorecard.tsv`
 - `benchmarks/report/latest/model_summary.tsv`

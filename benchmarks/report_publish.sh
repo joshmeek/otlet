@@ -39,6 +39,8 @@ publish_report_artifacts() {
     "$run_dir/pareto.svg" \
     "$run_dir/params.svg" \
     "$run_dir/latency.svg" \
+    "$run_dir/ttft.svg" \
+    "$run_dir/prompt_decode.svg" \
     "$run_dir/efficiency.svg" \
     "$run_dir/scorecard.tsv" \
     "$metadata_tsv" \
