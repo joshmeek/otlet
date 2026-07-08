@@ -107,6 +107,8 @@ CREATE TEMP TABLE quick_probe_results (
   ttft_ms bigint,
   prompt_decode_ms bigint,
   steady_tokens_per_second numeric,
+  effective_llama_threads bigint,
+  effective_llama_batch_threads bigint,
   error text
 );
 
@@ -127,6 +129,8 @@ DECLARE
   receipt_ttft_ms bigint;
   receipt_prompt_decode_ms bigint;
   receipt_steady_tokens_per_second numeric;
+  receipt_effective_llama_threads bigint;
+  receipt_effective_llama_batch_threads bigint;
   receipt_error text;
   observed text;
 BEGIN
@@ -189,6 +193,8 @@ BEGIN
     receipt_ttft_ms := NULL;
     receipt_prompt_decode_ms := NULL;
     receipt_steady_tokens_per_second := NULL;
+    receipt_effective_llama_threads := NULL;
+    receipt_effective_llama_batch_threads := NULL;
     receipt_error := NULL;
 
     BEGIN
@@ -233,6 +239,8 @@ BEGIN
         s.ttft_ms,
         s.prompt_decode_ms,
         s.steady_tokens_per_second,
+        s.effective_llama_threads,
+        s.effective_llama_batch_threads,
         s.error
       INTO
         receipt_status,
@@ -244,6 +252,8 @@ BEGIN
         receipt_ttft_ms,
         receipt_prompt_decode_ms,
         receipt_steady_tokens_per_second,
+        receipt_effective_llama_threads,
+        receipt_effective_llama_batch_threads,
         receipt_error
       FROM otlet.inference_trace_summary s
       WHERE s.job_id = current_job_id
@@ -276,6 +286,8 @@ BEGIN
       receipt_ttft_ms,
       receipt_prompt_decode_ms,
       receipt_steady_tokens_per_second,
+      receipt_effective_llama_threads,
+      receipt_effective_llama_batch_threads,
       COALESCE(receipt_error, current_error)
     );
   END LOOP;
@@ -293,7 +305,9 @@ WITH summary AS (
     round(percentile_cont(0.95) WITHIN GROUP (ORDER BY ttft_ms)::numeric, 0) AS p95_ttft_ms,
     round(percentile_cont(0.95) WITHIN GROUP (ORDER BY prompt_decode_ms)::numeric, 0) AS p95_prompt_decode_ms,
     round(avg(prompt_tokens), 1) AS mean_prompt_tokens,
-    round(avg(generated_tokens), 1) AS mean_generated_tokens
+    round(avg(generated_tokens), 1) AS mean_generated_tokens,
+    round(avg(effective_llama_threads), 1) AS mean_effective_llama_threads,
+    round(avg(effective_llama_batch_threads), 1) AS mean_effective_llama_batch_threads
   FROM quick_probe_results
 )
 SELECT
@@ -308,7 +322,9 @@ SELECT
   p95_ttft_ms,
   p95_prompt_decode_ms,
   mean_prompt_tokens,
-  mean_generated_tokens
+  mean_generated_tokens,
+  mean_effective_llama_threads,
+  mean_effective_llama_batch_threads
 FROM summary;
 
 \if :probe_verbose
@@ -325,6 +341,8 @@ SELECT
   generate_ms,
   ttft_ms,
   prompt_decode_ms,
+  effective_llama_threads,
+  effective_llama_batch_threads,
   COALESCE(error, '')
 FROM quick_probe_results
 ORDER BY case_id;
@@ -332,7 +350,7 @@ ORDER BY case_id;
 SQL
 }
 
-printf 'model_key\tviable\tpassed_cases\ttotal_cases\tschema_passed\tmean_tok_s\tmean_steady_tok_s\tp95_generate_ms\tp95_ttft_ms\tp95_prompt_decode_ms\tmean_prompt_tokens\tmean_generated_tokens\n'
+printf 'model_key\tviable\tpassed_cases\ttotal_cases\tschema_passed\tmean_tok_s\tmean_steady_tok_s\tp95_generate_ms\tp95_ttft_ms\tp95_prompt_decode_ms\tmean_prompt_tokens\tmean_generated_tokens\tmean_effective_llama_threads\tmean_effective_llama_batch_threads\n'
 
 while IFS=$'\t' read -r model_key hf_repo filename _quant _family tier _license _source _include _max_gb requires_split _declared _active _context _notes; do
   if [[ "$tier" == "blocked" || "$tier" == "heavy" ]]; then

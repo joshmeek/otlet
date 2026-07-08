@@ -91,9 +91,7 @@ fn run_linked(
             context,
             vocab,
             kv_tokens: Vec::new(),
-            prompt_prefix_hash: String::new(),
-            prompt_prefix_tokens: Vec::new(),
-            prompt_prefix_state: Vec::new(),
+            prompt_prefix_states: Vec::new(),
             load_ms,
             ctx_ms,
             model_memory_bytes,
@@ -143,13 +141,17 @@ fn run_linked(
     let mut prompt_reused_tokens = 0;
     let mut prompt_decoded_tokens = tokens.len();
     let mut prompt_reuse_strategy = "full_prompt_decode".to_owned();
+    let mut prompt_prefix_state_bytes = 0_i64;
     let prefix_reusable = linked_prompt_prefix_reusable(&tokens, &prompt_prefix_tokens);
     if prefix_reusable {
         let prompt_prefix_hash = hash_text(prompt_prefix);
-        if linked_restore_prompt_prefix_state(cache, &prompt_prefix_hash, &prompt_prefix_tokens) {
+        if let Some(state_bytes) =
+            linked_restore_prompt_prefix_state(cache, &prompt_prefix_hash, &prompt_prefix_tokens)
+        {
             prompt_reused_tokens = prompt_prefix_tokens.len();
             prompt_decoded_tokens = tokens.len().saturating_sub(prompt_reused_tokens);
             prompt_reuse_strategy = "prefix_state_restored".to_owned();
+            prompt_prefix_state_bytes = state_bytes.min(i64::MAX as usize) as i64;
             linked_decode_prompt_tokens(
                 job,
                 cache.context.ptr,
@@ -175,11 +177,13 @@ fn run_linked(
                 &mut cancel_probe,
                 false,
             )?;
-            prompt_reuse_strategy = linked_save_prompt_prefix_state(
+            let saved_prefix = linked_save_prompt_prefix_state(
                 cache,
                 &prompt_prefix_hash,
                 &prompt_prefix_tokens,
             );
+            prompt_reuse_strategy = saved_prefix.strategy;
+            prompt_prefix_state_bytes = saved_prefix.state_bytes.min(i64::MAX as usize) as i64;
             linked_decode_prompt_tokens(
                 job,
                 cache.context.ptr,
@@ -339,7 +343,13 @@ fn run_linked(
             prompt_reused_tokens: prompt_reused_tokens as i64,
             prompt_decoded_tokens: prompt_decoded_tokens as i64,
             prompt_reuse_strategy,
-            prompt_prefix_state_bytes: cache.prompt_prefix_state.len() as i64,
+            prompt_prefix_state_bytes,
+            prompt_prefix_cache_entries: cache.prompt_prefix_states.len().min(i64::MAX as usize)
+                as i64,
+            prompt_prefix_cache_bytes: linked_prompt_prefix_cache_bytes(cache)
+                .min(i64::MAX as usize) as i64,
+            effective_llama_threads: decode_threads as i64,
+            effective_llama_batch_threads: batch_threads as i64,
             generated_tokens,
             tokenize_ms,
             prompt_decode_ms,
@@ -553,55 +563,68 @@ fn linked_restore_prompt_prefix_state(
     cache: &mut LinkedCache,
     prompt_prefix_hash: &str,
     prompt_prefix_tokens: &[llama_cpp_sys_4::llama_token],
-) -> bool {
-    if cache.prompt_prefix_hash != prompt_prefix_hash
-        || cache.prompt_prefix_tokens != prompt_prefix_tokens
-        || cache.prompt_prefix_state.is_empty()
-    {
-        return false;
-    }
+) -> Option<usize> {
+    let index = cache
+        .prompt_prefix_states
+        .iter()
+        .position(|entry| {
+            entry.hash == prompt_prefix_hash
+                && entry.tokens == prompt_prefix_tokens
+                && !entry.state.is_empty()
+        })?;
 
     linked_clear_context(cache.context.ptr);
+    let state_len = cache.prompt_prefix_states[index].state.len();
     let restored = unsafe {
         llama_cpp_sys_4::llama_state_seq_set_data(
             cache.context.ptr,
-            cache.prompt_prefix_state.as_ptr(),
-            cache.prompt_prefix_state.len(),
+            cache.prompt_prefix_states[index].state.as_ptr(),
+            state_len,
             0,
         )
     };
-    if restored != cache.prompt_prefix_state.len() {
-        cache.prompt_prefix_hash.clear();
-        cache.prompt_prefix_tokens.clear();
-        cache.prompt_prefix_state.clear();
+    if restored != state_len {
+        cache.prompt_prefix_states.remove(index);
         cache.kv_tokens.clear();
         linked_clear_context(cache.context.ptr);
-        return false;
+        return None;
+    }
+
+    if index != 0 {
+        let entry = cache.prompt_prefix_states.remove(index);
+        cache.prompt_prefix_states.insert(0, entry);
     }
 
     cache.kv_tokens.clear();
     cache.kv_tokens.extend_from_slice(prompt_prefix_tokens);
-    true
+    Some(state_len)
+}
+
+struct SavedPromptPrefix {
+    strategy: String,
+    state_bytes: usize,
 }
 
 fn linked_save_prompt_prefix_state(
     cache: &mut LinkedCache,
     prompt_prefix_hash: &str,
     prompt_prefix_tokens: &[llama_cpp_sys_4::llama_token],
-) -> String {
+) -> SavedPromptPrefix {
     let state_size =
         unsafe { llama_cpp_sys_4::llama_state_seq_get_size(cache.context.ptr, 0) };
     if state_size == 0 {
-        cache.prompt_prefix_hash.clear();
-        cache.prompt_prefix_tokens.clear();
-        cache.prompt_prefix_state.clear();
-        return "prefix_state_unavailable".to_owned();
+        linked_remove_prompt_prefix_state(cache, prompt_prefix_hash);
+        return SavedPromptPrefix {
+            strategy: "prefix_state_unavailable".to_owned(),
+            state_bytes: 0,
+        };
     }
     if state_size > LINKED_PROMPT_PREFIX_STATE_MAX_BYTES {
-        cache.prompt_prefix_hash.clear();
-        cache.prompt_prefix_tokens.clear();
-        cache.prompt_prefix_state.clear();
-        return "prefix_state_too_large".to_owned();
+        linked_remove_prompt_prefix_state(cache, prompt_prefix_hash);
+        return SavedPromptPrefix {
+            strategy: "prefix_state_too_large".to_owned(),
+            state_bytes: 0,
+        };
     }
 
     let mut state = vec![0_u8; state_size];
@@ -614,19 +637,51 @@ fn linked_save_prompt_prefix_state(
         )
     };
     if written != state.len() {
-        cache.prompt_prefix_hash.clear();
-        cache.prompt_prefix_tokens.clear();
-        cache.prompt_prefix_state.clear();
-        return "prefix_state_save_failed".to_owned();
+        linked_remove_prompt_prefix_state(cache, prompt_prefix_hash);
+        return SavedPromptPrefix {
+            strategy: "prefix_state_save_failed".to_owned(),
+            state_bytes: 0,
+        };
     }
 
-    cache.prompt_prefix_hash = prompt_prefix_hash.to_owned();
-    cache.prompt_prefix_tokens.clear();
+    linked_remove_prompt_prefix_state(cache, prompt_prefix_hash);
+    cache.prompt_prefix_states.insert(
+        0,
+        PromptPrefixState {
+            hash: prompt_prefix_hash.to_owned(),
+            tokens: prompt_prefix_tokens.to_vec(),
+            state,
+        },
+    );
+    linked_evict_prompt_prefix_states(cache);
+    SavedPromptPrefix {
+        strategy: "prefix_state_saved".to_owned(),
+        state_bytes: state_size,
+    }
+}
+
+fn linked_remove_prompt_prefix_state(cache: &mut LinkedCache, prompt_prefix_hash: &str) {
     cache
-        .prompt_prefix_tokens
-        .extend_from_slice(prompt_prefix_tokens);
-    cache.prompt_prefix_state = state;
-    "prefix_state_saved".to_owned()
+        .prompt_prefix_states
+        .retain(|entry| entry.hash != prompt_prefix_hash);
+}
+
+fn linked_evict_prompt_prefix_states(cache: &mut LinkedCache) {
+    while cache.prompt_prefix_states.len() > LINKED_PROMPT_PREFIX_STATE_MAX_ENTRIES
+        || linked_prompt_prefix_cache_bytes(cache) > LINKED_PROMPT_PREFIX_STATE_MAX_BYTES
+    {
+        if cache.prompt_prefix_states.pop().is_none() {
+            break;
+        }
+    }
+}
+
+fn linked_prompt_prefix_cache_bytes(cache: &LinkedCache) -> usize {
+    cache
+        .prompt_prefix_states
+        .iter()
+        .map(|entry| entry.state.len())
+        .sum()
 }
 
 /// Keeps the longest common prefix between the tokens already decoded into the
@@ -725,9 +780,7 @@ struct LinkedCache {
     /// Tokens known to occupy positions `0..len` of the context memory; used
     /// to reuse the KV cache for shared prompt prefixes across jobs.
     kv_tokens: Vec<llama_cpp_sys_4::llama_token>,
-    prompt_prefix_hash: String,
-    prompt_prefix_tokens: Vec<llama_cpp_sys_4::llama_token>,
-    prompt_prefix_state: Vec<u8>,
+    prompt_prefix_states: Vec<PromptPrefixState>,
     load_ms: i64,
     ctx_ms: i64,
     model_memory_bytes: i64,
@@ -738,6 +791,12 @@ struct LinkedCache {
 }
 
 unsafe impl Send for LinkedCache {}
+
+struct PromptPrefixState {
+    hash: String,
+    tokens: Vec<llama_cpp_sys_4::llama_token>,
+    state: Vec<u8>,
+}
 
 struct ProcessMemorySample {
     rss_bytes: i64,

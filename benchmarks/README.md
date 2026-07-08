@@ -9,7 +9,7 @@ Start with the normal Otlet proof path:
 ./scripts/otlet-demo.sh
 ```
 
-Run the fast probe before spending time on a full benchmark. It uses the real Otlet worker on five row-shaped JSON cases and reports viability, pass count, schema passes, token rate, steady decode rate, p95 generation time, p95 TTFT, and p95 prompt decode time:
+Run the fast probe before spending time on a full benchmark. It uses the real Otlet worker on five row-shaped JSON cases and reports viability, pass count, schema passes, token rate, steady decode rate, p95 generation time, p95 TTFT, p95 prompt decode time, and effective llama.cpp decode/batch thread counts:
 
 ```sh
 OTLET_PROBE_LIMIT_MODELS=ministral3_3b,qwen35_4b,qwen3_1_7b ./benchmarks/quick_probe.sh
@@ -28,6 +28,8 @@ Sweep CPU thread counts through the same probe:
 ```sh
 OTLET_SWEEP_MODELS=qwen3_1_7b,qwen35_4b OTLET_SWEEP_THREADS=1,2,4,6,8,12 ./benchmarks/thread_sweep.sh
 ```
+
+Use thread sweeps as host evidence, not a global truth. Otlet accepts async infer-now callers through a bounded shared-memory queue, but the current resident worker executes one model job at a time. Concurrent callers can keep the worker fed; they do not create parallel llama.cpp generation
 
 The probe accepts `OTLET_PROBE_LLAMA_THREADS=<n>`, `OTLET_PROBE_LLAMA_BATCH_THREADS=<n>`, and `OTLET_PROBE_RUNTIME_OPTIONS='{"max_tokens":64}'` for one run. The setup path accepts deployment-level llama.cpp knobs before `./scripts/otlet-setup.sh`:
 
@@ -79,14 +81,16 @@ Recent quick-probe findings:
 | `smollm3_3b` | no | `8.71` | schema-valid, failed adversarial row-text and numeric-threshold cases |
 | `glm_edge_4b` | no | `6.68` | produced fenced JSON and failed the same hard decisions |
 
-Thread sweep on the current Docker CPU showed the best stable setting at 6 threads:
+Thread sweep on the current Docker CPU showed the best stable qwen35 setting at 6 threads:
 
 | model | threads | viable | mean tok/s |
 | --- | ---: | --- | ---: |
-| `qwen35_4b` | `4` | yes | `24.67` |
-| `qwen35_4b` | `6` | yes | `28.03` |
-| `qwen35_4b` | `8` | yes | `26.65` |
-| `qwen35_4b` | `12` | yes | `5.37` |
+| `qwen35_4b` | `1` | no | `7.90` |
+| `qwen35_4b` | `2` | yes | `16.91` |
+| `qwen35_4b` | `4` | yes | `29.35` |
+| `qwen35_4b` | `6` | yes | `38.51` |
+| `qwen35_4b` | `8` | yes | `37.28` |
+| `qwen35_4b` | `12` | yes | `6.68` |
 | `qwen3_1_7b` | `6` | no | `71.91` |
 | `qwen3_1_7b` | `12` | no | `10.63` |
 
@@ -105,6 +109,8 @@ Recent CPU tuning sweep on `qwen35_4b` kept the old default at `41.89 tok/s` as 
 | KV cache type | `q8_0` | yes | `30.22` | slower; possible memory-only lever |
 | KV cache type | `q4_0` | no | `25.16` | failed one decision |
 | OpenMP placement | `PROC_BIND=spread`, `PLACES=cores` | no | `9.95` | timed out one smoke case |
+
+Interleaved prompt-prefix probe on `qwen35_4b` now keeps multiple task prefixes in the resident worker. The A/B/A probe used two different inline tasks. Before the bounded multi-prefix cache, the second A decoded the full 424-token prompt again at about `6.7s` prompt decode. After the change, the second A restored 386 prefix tokens, decoded 38 tail tokens, and prompt decode was `1.143s`. The resident worker kept two prefix states using about `130.6 MiB`
 
 Run the default-included set after a harness improvement when you want the shortest publishable check:
 

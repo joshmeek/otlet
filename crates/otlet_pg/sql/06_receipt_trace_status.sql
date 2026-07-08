@@ -476,6 +476,32 @@ SELECT
       THEN (r.trace_summary ->> 'prompt_decoded_tokens')::bigint
     ELSE NULL
   END AS prompt_decoded_tokens,
+  r.trace_summary ->> 'prompt_reuse_strategy' AS prompt_reuse_strategy,
+  CASE
+    WHEN jsonb_typeof(r.trace_summary -> 'prompt_prefix_state_bytes') = 'number'
+      THEN (r.trace_summary ->> 'prompt_prefix_state_bytes')::bigint
+    ELSE NULL
+  END AS prompt_prefix_state_bytes,
+  CASE
+    WHEN jsonb_typeof(r.trace_summary -> 'prompt_prefix_cache_entries') = 'number'
+      THEN (r.trace_summary ->> 'prompt_prefix_cache_entries')::bigint
+    ELSE NULL
+  END AS prompt_prefix_cache_entries,
+  CASE
+    WHEN jsonb_typeof(r.trace_summary -> 'prompt_prefix_cache_bytes') = 'number'
+      THEN (r.trace_summary ->> 'prompt_prefix_cache_bytes')::bigint
+    ELSE NULL
+  END AS prompt_prefix_cache_bytes,
+  CASE
+    WHEN jsonb_typeof(r.trace_summary -> 'effective_llama_threads') = 'number'
+      THEN (r.trace_summary ->> 'effective_llama_threads')::bigint
+    ELSE NULL
+  END AS effective_llama_threads,
+  CASE
+    WHEN jsonb_typeof(r.trace_summary -> 'effective_llama_batch_threads') = 'number'
+      THEN (r.trace_summary ->> 'effective_llama_batch_threads')::bigint
+    ELSE NULL
+  END AS effective_llama_batch_threads,
   r.generated_tokens,
   r.generate_ms,
   r.tokens_per_second,

@@ -37,6 +37,10 @@ pub(crate) struct ModelMetrics {
     pub(crate) prompt_decoded_tokens: i64,
     pub(crate) prompt_reuse_strategy: String,
     pub(crate) prompt_prefix_state_bytes: i64,
+    pub(crate) prompt_prefix_cache_entries: i64,
+    pub(crate) prompt_prefix_cache_bytes: i64,
+    pub(crate) effective_llama_threads: i64,
+    pub(crate) effective_llama_batch_threads: i64,
     pub(crate) generated_tokens: i64,
     pub(crate) tokenize_ms: i64,
     pub(crate) prompt_decode_ms: i64,
@@ -308,6 +312,10 @@ pub(crate) fn run_job(job: &Job) -> Result<ModelRun, ModelError> {
                 prompt_decoded_tokens: 0,
                 prompt_reuse_strategy: "inference_cache_hit".to_owned(),
                 prompt_prefix_state_bytes: 0,
+                prompt_prefix_cache_entries: 0,
+                prompt_prefix_cache_bytes: 0,
+                effective_llama_threads: 0,
+                effective_llama_batch_threads: 0,
                 generated_tokens: 0,
                 tokenize_ms: 0,
                 prompt_decode_ms: 0,
@@ -502,6 +510,7 @@ const LINKED_PROMPT_BATCH_TOKENS: usize = 512;
 const LINKED_PROMPT_UBATCH_TOKENS: usize = 512;
 const LINKED_DEFAULT_MAX_DECODE_THREADS: usize = 6;
 const LINKED_MAX_TOKEN_PIECE_BYTES: usize = 16 * 1024;
+const LINKED_PROMPT_PREFIX_STATE_MAX_ENTRIES: usize = 4;
 const LINKED_PROMPT_PREFIX_STATE_MAX_BYTES: usize = 512 * 1024 * 1024;
 const LINKED_MODEL_DEVICE_POLICY: &str = "cpu_only_n_gpu_layers_0";
 const LINKED_MEMORY_ACCOUNTING_POLICY: &str = "llama_model_size_measured_context_window_measured_inference_cache_bytes_measured_no_prompt_token_blob_storage";
