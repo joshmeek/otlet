@@ -1,5 +1,18 @@
 use serde_json::{Value, json};
 
+const SUPPORTED_RUNTIME_OPTIONS: &[&str] = &[
+    "reasoning",
+    "max_tokens",
+    "max_attempt_ms",
+    "inference_cache",
+    "max_worker_rss_bytes",
+    "generation_trace",
+    "generation_trace_max_tokens",
+    "generation_trace_top_k",
+    "llama_threads",
+    "llama_batch_threads",
+];
+
 pub(crate) struct RuntimeOptions {
     pub(crate) reasoning: String,
     pub(crate) max_tokens: u64,
@@ -35,19 +48,7 @@ pub(crate) fn parse_runtime_options(value: &Value) -> Result<RuntimeOptions, Str
     let mut options = RuntimeOptions::default();
 
     for key in object.keys() {
-        if !matches!(
-            key.as_str(),
-            "reasoning"
-                | "max_tokens"
-                | "max_attempt_ms"
-                | "inference_cache"
-                | "max_worker_rss_bytes"
-                | "generation_trace"
-                | "generation_trace_max_tokens"
-                | "generation_trace_top_k"
-                | "llama_threads"
-                | "llama_batch_threads"
-        ) {
+        if !SUPPORTED_RUNTIME_OPTIONS.contains(&key.as_str()) {
             return Err(format!("unsupported runtime option: {key}"));
         }
     }
@@ -170,24 +171,12 @@ pub(crate) fn runtime_option_status(value: &Value) -> Value {
             "rejected": ["runtime_options"]
         });
     };
-    let controls = [
-        "reasoning",
-        "max_tokens",
-        "max_attempt_ms",
-        "inference_cache",
-        "max_worker_rss_bytes",
-        "generation_trace",
-        "generation_trace_max_tokens",
-        "generation_trace_top_k",
-        "llama_threads",
-        "llama_batch_threads",
-    ];
-    let defaulted = controls
+    let defaulted = SUPPORTED_RUNTIME_OPTIONS
         .iter()
         .filter(|key| !object.contains_key(**key))
         .copied()
         .collect::<Vec<_>>();
-    let honored = controls
+    let honored = SUPPORTED_RUNTIME_OPTIONS
         .iter()
         .filter(|key| object.contains_key(**key))
         .copied()

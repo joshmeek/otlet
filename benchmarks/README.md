@@ -26,7 +26,12 @@ python3 benchmarks/find_candidates.py
 Sweep CPU thread counts through the same probe:
 
 ```sh
-OTLET_SWEEP_MODELS=qwen3_1_7b,qwen35_4b OTLET_SWEEP_THREADS=1,2,4,6,8,12 ./benchmarks/thread_sweep.sh
+for threads in 1 2 4 6 8 12; do
+  OTLET_PROBE_LIMIT_MODELS=qwen3_1_7b,qwen35_4b \
+    OTLET_PROBE_LLAMA_THREADS="$threads" \
+    ./benchmarks/quick_probe.sh |
+    awk -v threads="$threads" 'NR == 1 && threads == 1 { print "threads\t" $0 } NR > 1 { print threads "\t" $0 }'
+done
 ```
 
 Use thread sweeps as host evidence, not a global truth. The default setup starts one resident worker, so concurrent infer-now callers keep the bounded shared-memory queue fed but do not create parallel llama.cpp generation

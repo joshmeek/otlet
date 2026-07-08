@@ -586,28 +586,39 @@ fn accept_attempt(job: &Job, run: ModelRun, selection_role: &str, selection_reas
     }
 }
 
-fn record_rejected_attempt(
+fn record_model_attempt_receipt(
     job: &Job,
-    run: ModelRun,
+    raw_output: Option<&str>,
+    prompt_hash: Option<&str>,
+    input_hash: Option<&str>,
+    output_schema_hash: Option<&str>,
+    raw_output_hash: Option<&str>,
+    trace_summary: serde_json::Value,
+    schema_validation_status: Option<&str>,
     selection_role: &str,
+    selection_status: &str,
     selection_reason: &str,
+    error: Option<&str>,
 ) -> bool {
     let result: pgrx::spi::Result<()> = BackgroundWorker::transaction(|| {
         pgrx::Spi::connect_mut(|client| {
             let args = [
                 job.id.into(),
                 job.model_name.as_str().into(),
-                run.raw_output.as_str().into(),
-                run.prompt_hash.as_str().into(),
-                run.input_hash.as_str().into(),
-                run.output_schema_hash.as_str().into(),
-                run.raw_output_hash.as_str().into(),
-                JsonB(run.trace_summary).into(),
+                raw_output.into(),
+                prompt_hash.into(),
+                input_hash.into(),
+                output_schema_hash.into(),
+                raw_output_hash.into(),
+                JsonB(trace_summary).into(),
+                schema_validation_status.into(),
                 selection_role.into(),
+                selection_status.into(),
                 selection_reason.into(),
+                error.into(),
             ];
             client.update(
-                "SELECT otlet.record_model_attempt($1, $2, raw_output => $3, prompt_hash => $4, input_hash => $5, output_schema_hash => $6, raw_output_hash => $7, trace_summary => $8, selection_role => $9, selection_status => 'rejected', selection_reason => $10)",
+                "SELECT otlet.record_model_attempt($1, $2, raw_output => $3, prompt_hash => $4, input_hash => $5, output_schema_hash => $6, raw_output_hash => $7, trace_summary => $8, schema_validation_status => $9, selection_role => $10, selection_status => $11, selection_reason => $12, error => $13)",
                 Some(1),
                 &args,
             )?;
@@ -615,10 +626,41 @@ fn record_rejected_attempt(
         })
     });
     if let Err(err) = result {
-        pgrx::warning!("otlet worker rejected-attempt receipt failed: {err}");
+        pgrx::warning!("otlet worker model-attempt receipt failed: {err}");
         return false;
     }
     true
+}
+
+fn record_rejected_attempt(
+    job: &Job,
+    run: ModelRun,
+    selection_role: &str,
+    selection_reason: &str,
+) -> bool {
+    let ModelRun {
+        raw_output,
+        prompt_hash,
+        input_hash,
+        output_schema_hash,
+        raw_output_hash,
+        trace_summary,
+        ..
+    } = run;
+    record_model_attempt_receipt(
+        job,
+        Some(&raw_output),
+        Some(&prompt_hash),
+        Some(&input_hash),
+        Some(&output_schema_hash),
+        Some(&raw_output_hash),
+        trace_summary,
+        None,
+        selection_role,
+        "rejected",
+        selection_reason,
+        None,
+    )
 }
 
 fn reject_direct_attempt(job: &Job, run: ModelRun, selection_reason: &str) -> bool {
@@ -656,39 +698,22 @@ fn record_failed_model_attempt(
     selection_role: &str,
     selection_reason: &str,
 ) -> bool {
-    let result: pgrx::spi::Result<()> = BackgroundWorker::transaction(|| {
-        pgrx::Spi::connect_mut(|client| {
-            let trace_summary = err
-                .trace_summary
-                .clone()
-                .unwrap_or_else(|| serde_json::json!({}));
-            let args = [
-                job.id.into(),
-                job.model_name.as_str().into(),
-                err.raw_output.as_deref().into(),
-                err.prompt_hash.as_deref().into(),
-                err.input_hash.as_deref().into(),
-                err.output_schema_hash.as_deref().into(),
-                err.raw_output_hash.as_deref().into(),
-                JsonB(trace_summary).into(),
-                err.schema_validation_status.as_deref().into(),
-                selection_role.into(),
-                selection_reason.into(),
-                err.message.as_str().into(),
-            ];
-            client.update(
-                "SELECT otlet.record_model_attempt($1, $2, raw_output => $3, prompt_hash => $4, input_hash => $5, output_schema_hash => $6, raw_output_hash => $7, trace_summary => $8, schema_validation_status => $9, selection_role => $10, selection_status => 'failed', selection_reason => $11, error => $12)",
-                Some(1),
-                &args,
-            )?;
-            Ok(())
-        })
-    });
-    if let Err(receipt_err) = result {
-        pgrx::warning!("otlet worker failed-attempt receipt failed: {receipt_err}");
-        return false;
-    }
-    true
+    record_model_attempt_receipt(
+        job,
+        err.raw_output.as_deref(),
+        err.prompt_hash.as_deref(),
+        err.input_hash.as_deref(),
+        err.output_schema_hash.as_deref(),
+        err.raw_output_hash.as_deref(),
+        err.trace_summary
+            .clone()
+            .unwrap_or_else(|| serde_json::json!({})),
+        err.schema_validation_status.as_deref(),
+        selection_role,
+        "failed",
+        selection_reason,
+        Some(&err.message),
+    )
 }
 
 fn fail_attempt(job: &Job, err: ModelError, selection_role: &str, selection_reason: &str) -> bool {

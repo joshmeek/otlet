@@ -59,95 +59,26 @@ def cell(value):
     return " ".join(("" if value is None else str(value)).replace("|", "\\|").split())
 
 
+def numeric_column(values):
+    seen = False
+    for value in values:
+        if value == "":
+            continue
+        try:
+            float(value)
+        except ValueError:
+            return False
+        seen = True
+    return seen
+
+
 def table(headers, rows):
-    numeric = {
-        "rank",
-        "runs",
-        "repeat_count",
-        "otlet_fit",
-        "overall_fit",
-        "production_score",
-        "diagnostic_fit",
-        "fit_min",
-        "fit_max",
-        "fit_sd",
-        "trusted_quality",
-        "schema",
-        "diag_decision",
-        "trusted_decision",
-        "confidence",
-        "diag_confidence",
-        "row_watch",
-        "params_b",
-        "active_b",
-        "downloads",
-        "likes",
-        "hint_gb",
-        "p95_ms",
-        "ttft_ms",
-        "prompt_ms",
-        "tok_s",
-        "steady_tok_s",
-        "rss_gb",
-        "artifact_gb",
-        "resource_fit",
-        "artifact_fit",
-        "resident_fit",
-        "latency_fit",
-        "active_param_fit",
-        "correct_jobs_s_gb",
-        "overall_fit_jobs_s_gb",
-        "quality_per_active_b",
-        "contract",
-        "entity",
-        "abstain",
-        "dirty",
-        "triage",
-        "triage_abstain",
-        "numeric",
-        "extraction",
-        "policy",
-        "user_suite",
-        "actions",
-        "diag_actions",
-        "diag_triage",
-        "diag_numeric",
-        "semantic",
-        "count",
-        "passed_cases",
-        "invalid_json",
-        "bad_output_envelope",
-        "schema_invalid",
-        "schema_missing",
-        "false_merge",
-        "wrong_match",
-        "wrong_confidence",
-        "wrong_action",
-        "passed",
-        "hallucinated_action",
-        "stale_leaks",
-        "source_mutated",
-        "cases_before",
-        "cases_after",
-        "overall_before",
-        "overall_after",
-        "overall_delta",
-        "schema_delta",
-        "parse_fail_delta",
-        "false_merge_delta",
-        "confidence_delta",
-        "halluc_action_delta",
-        "trusted_action_delta",
-        "semantic_delta",
-        "row_watch_delta",
-        "p95_ms_delta",
-        "ttft_ms_delta",
-        "prompt_ms_delta",
-        "steady_tok_s_delta",
-        "rss_gb_delta",
-    }
-    separator = [("---:" if header in numeric else "---") for header in headers]
+    rendered = [[cell(row.get(header, "")) for header in headers] for row in rows]
+    separator = [
+        "---:" if numeric_column(row[i] for row in rendered) else "---"
+        for i, _ in enumerate(headers)
+    ]
     out = ["| " + " | ".join(headers) + " |", "| " + " | ".join(separator) + " |"]
-    for row in rows:
-        out.append("| " + " | ".join(cell(row.get(h, "")) for h in headers) + " |")
+    for row in rendered:
+        out.append("| " + " | ".join(row) + " |")
     return "\n".join(out)

@@ -21,8 +21,10 @@ keep_models="${OTLET_PROBE_KEEP_MODELS:-0}"
 scratch_root="${OTLET_PROBE_MODEL_DIR:-/var/lib/postgresql/otlet-probe-models}"
 run_id="probe-$(date -u +%Y%m%dT%H%M%SZ)-$$"
 scratch_dir="$scratch_root/$run_id"
+downloaded_paths="$scratch_dir/downloaded.tsv"
 
 source "$script_dir/lib.sh"
+source "$script_dir/model_artifacts.sh"
 
 selected_models() {
   if [[ -n "$limit_models" ]]; then
@@ -30,28 +32,6 @@ selected_models() {
   else
     awk -F '\t' 'NR > 1 && $9 == "true" {print}' "$models_file"
   fi
-}
-
-find_artifact() {
-  local hf_repo="$1"
-  local filename="$2"
-  local basename
-  local repo_cache
-  basename="$(basename "$filename")"
-  repo_cache="models--${hf_repo//\//--}"
-  docker exec "$container" sh -lc "find $(sh_quote "$model_dir") /var/lib/postgresql/.cache/huggingface/hub/$(sh_quote "$repo_cache")/snapshots -name $(sh_quote "$basename") -print -quit 2>/dev/null" | head -n 1 || true
-}
-
-download_artifact() {
-  local hf_repo="$1"
-  local filename="$2"
-  local model_key="$3"
-  local dest_dir="$scratch_dir/$model_key"
-  local dest="$dest_dir/$(basename "$filename")"
-  local tmp="$dest.part"
-  local url="https://huggingface.co/$hf_repo/resolve/main/$filename"
-  docker exec "$container" sh -lc "mkdir -p $(sh_quote "$dest_dir") && rm -f $(sh_quote "$tmp") && curl -fL --retry 3 --connect-timeout 20 $(sh_quote "$url") -o $(sh_quote "$tmp") && mv $(sh_quote "$tmp") $(sh_quote "$dest")"
-  printf '%s\n' "$dest"
 }
 
 cleanup_downloads() {
@@ -62,16 +42,6 @@ cleanup_downloads() {
 }
 
 trap cleanup_downloads EXIT
-
-register_model() {
-  local model_key="$1"
-  local artifact_path="$2"
-  psql_exec -v model_key="$model_key" -v artifact_path="$artifact_path" >/dev/null <<'SQL'
-SET client_min_messages TO warning;
-CREATE EXTENSION IF NOT EXISTS otlet;
-SELECT otlet.register_model(:'model_key', :'artifact_path');
-SQL
-}
 
 run_model_probe() {
   local model_key="$1"
@@ -360,7 +330,7 @@ while IFS=$'\t' read -r model_key hf_repo filename _quant _family tier _license 
     continue
   fi
 
-  artifact_path="$(find_artifact "$hf_repo" "$filename")"
+  artifact_path="$(find_existing_artifact "$hf_repo" "$filename")"
   if [[ -z "$artifact_path" && "$download_enabled" == "1" ]]; then
     artifact_path="$(download_artifact "$hf_repo" "$filename" "$model_key")"
   fi
@@ -369,6 +339,7 @@ while IFS=$'\t' read -r model_key hf_repo filename _quant _family tier _license 
     continue
   fi
 
+  ensure_extension
   register_model "$model_key" "$artifact_path"
   run_model_probe "$model_key"
 done < <(selected_models)

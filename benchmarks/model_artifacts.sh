@@ -13,9 +13,10 @@ find_existing_artifact() {
   local filename="$2"
   local basename
   local repo_cache
+  local search_model_dir="${model_dir:-/var/lib/postgresql/otlet-models}"
   basename="$(basename "$filename")"
   repo_cache="models--${hf_repo//\//--}"
-  docker exec "$container" sh -lc "find /var/lib/postgresql/otlet-models /var/lib/postgresql/.cache/huggingface/hub/$(sh_quote "$repo_cache")/snapshots -name $(sh_quote "$basename") -print -quit 2>/dev/null" | head -n 1 || true
+  docker exec "$container" sh -lc "find $(sh_quote "$search_model_dir") /var/lib/postgresql/.cache/huggingface/hub/$(sh_quote "$repo_cache")/snapshots -name $(sh_quote "$basename") -print -quit 2>/dev/null" | head -n 1 || true
 }
 
 download_artifact() {

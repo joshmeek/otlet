@@ -68,7 +68,7 @@ Next benchmark work:
 - Run comparable model sweeps after harness changes so public charts show workload roles, trusted quality, resource fit, and out-of-running reasons across small, medium, and ceiling local models
 - Keep routine benchmark runs on `include_by_default=true`; keep candidate, diagnostic, historical, heavy, and blocked rows manual
 - Use `benchmarks/quick_probe.sh` to reject weak candidates before running the full suite
-- Use `benchmarks/thread_sweep.sh` to find the host-specific `llama_threads` setting before treating CPU token rates as fixed
+- Sweep `OTLET_PROBE_LLAMA_THREADS` through `benchmarks/quick_probe.sh` before treating CPU token rates as fixed
 - Revisit grammar-constrained JSON after linked llama exposes a hook that cannot abort the resident worker
 - Keep prompt and schema changes on the same benchmark fixture
 - Test larger local models only as ceiling checks; keep Otlet defaults under 4B active parameters and about 4 GB on disk

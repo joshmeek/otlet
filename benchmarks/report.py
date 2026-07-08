@@ -10,7 +10,6 @@ from report_charts import (
     write_score_audit,
     write_scorecard,
 )
-from report_compare import compare_runs
 from report_io import clean_lines, compact_count, plural, read_kv, read_tsv, short, table
 from report_scoring import (
     add_missing_model_rows,
@@ -38,11 +37,8 @@ SMALL_ARTIFACT_GB = 2.0
 
 
 def main():
-    if len(sys.argv) == 4 and sys.argv[1] == "--compare":
-        compare_runs(Path(sys.argv[2]), Path(sys.argv[3]))
-        return
     if len(sys.argv) != 2:
-        raise SystemExit("usage: report.py RUN_DIR | report.py --compare BASELINE_RUN_DIR CANDIDATE_RUN_DIR")
+        raise SystemExit("usage: report.py RUN_DIR")
     run_dir = Path(sys.argv[1])
     models = read_tsv(run_dir / "models.tsv")
     model_metadata = {row.get("model_key", ""): row for row in read_tsv(run_dir / "models_metadata.tsv")}
