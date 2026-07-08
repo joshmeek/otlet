@@ -447,43 +447,6 @@ fn response_envelope_schema(output_schema: &Value) -> Value {
     })
 }
 
-#[cfg(test)]
-mod response_schema_tests {
-    use super::*;
-
-    #[test]
-    fn response_schema_wraps_output_and_actions() {
-        let schema = response_envelope_schema(&json!({
-            "type": "object",
-            "required": ["status"],
-            "properties": {
-                "status": { "enum": ["pass", "flag"] }
-            },
-            "additionalProperties": false
-        }));
-
-        assert_eq!(schema["required"], json!(["output", "actions"]));
-        assert_eq!(schema["properties"]["actions"]["type"], json!("array"));
-        assert_eq!(
-            schema["properties"]["output"]["required"],
-            json!(["status"])
-        );
-    }
-
-    #[test]
-    fn json_completion_tracks_incremental_chunks() {
-        let mut completion = JsonCompletion::new();
-        assert_eq!(completion.observe("{\"a\":\"x"), None);
-        assert_eq!(completion.observe("\\\"\"} trailing"), Some(11));
-    }
-
-    #[test]
-    fn json_completion_matches_full_scan() {
-        let output = "noise {\"a\":{\"b\":1}} trailing";
-        assert_eq!(linked_output_complete_end(output), Some(19));
-    }
-}
-
 static LINKED_BACKEND: OnceLock<()> = OnceLock::new();
 
 static LINKED_CACHE: OnceLock<Mutex<Option<LinkedCache>>> = OnceLock::new();

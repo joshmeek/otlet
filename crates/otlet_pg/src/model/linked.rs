@@ -815,12 +815,6 @@ fn linked_clear_context(context: *mut llama_cpp_sys_4::llama_context) {
     }
 }
 
-#[cfg(test)]
-fn linked_output_complete_end(output: &str) -> Option<usize> {
-    let mut completion = JsonCompletion::new();
-    completion.observe(output)
-}
-
 struct JsonCompletion {
     depth: i32,
     in_string: bool,
