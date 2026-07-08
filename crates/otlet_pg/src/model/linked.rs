@@ -119,8 +119,10 @@ fn run_linked(
 
     validate_linked_token_budget(tokens.len(), options.max_tokens, cache.context_window_tokens)?;
 
-    let resident_memory = process_memory_sample();
-    enforce_worker_rss_budget(&resident_memory, options.max_worker_rss_bytes)?;
+    if options.max_worker_rss_bytes > 0 {
+        let resident_memory = process_memory_sample();
+        enforce_worker_rss_budget(&resident_memory, options.max_worker_rss_bytes)?;
+    }
 
     if linked_cancel_requested(job.id)? {
         return Err(ModelError::new("canceled".to_owned()));
@@ -130,8 +132,10 @@ fn run_linked(
     // Reuse the KV cache for the shared prompt prefix (same instruction/schema
     // across a task's jobs) so only the diverging suffix is re-decoded.
     let prompt_decode_start = Instant::now();
+    let prompt_cached_tokens_before = cache.kv_tokens.len();
     let common_prefix =
         linked_reuse_prompt_prefix(cache.context.ptr, &mut cache.kv_tokens, &tokens);
+    let prompt_decoded_tokens = tokens.len().saturating_sub(common_prefix);
 
     let prompt_batch_tokens = linked_prompt_batch_tokens();
     let mut batch = LinkedBatch::new(prompt_batch_tokens)?;
@@ -266,6 +270,9 @@ fn run_linked(
             worker_memory_budget_policy: worker_memory_budget_policy(options.max_worker_rss_bytes)
                 .to_owned(),
             prompt_tokens: tokens.len() as i64,
+            prompt_cached_tokens_before: prompt_cached_tokens_before as i64,
+            prompt_reused_tokens: common_prefix as i64,
+            prompt_decoded_tokens: prompt_decoded_tokens as i64,
             generated_tokens,
             tokenize_ms,
             prompt_decode_ms,

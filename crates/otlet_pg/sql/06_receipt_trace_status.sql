@@ -461,6 +461,21 @@ SELECT
   r.runtime_name,
   r.prompt_hash,
   r.prompt_tokens,
+  CASE
+    WHEN jsonb_typeof(r.trace_summary -> 'prompt_cached_tokens_before') = 'number'
+      THEN (r.trace_summary ->> 'prompt_cached_tokens_before')::bigint
+    ELSE NULL
+  END AS prompt_cached_tokens_before,
+  CASE
+    WHEN jsonb_typeof(r.trace_summary -> 'prompt_reused_tokens') = 'number'
+      THEN (r.trace_summary ->> 'prompt_reused_tokens')::bigint
+    ELSE NULL
+  END AS prompt_reused_tokens,
+  CASE
+    WHEN jsonb_typeof(r.trace_summary -> 'prompt_decoded_tokens') = 'number'
+      THEN (r.trace_summary ->> 'prompt_decoded_tokens')::bigint
+    ELSE NULL
+  END AS prompt_decoded_tokens,
   r.generated_tokens,
   r.generate_ms,
   r.tokens_per_second,
