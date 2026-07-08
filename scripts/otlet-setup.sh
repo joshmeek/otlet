@@ -7,6 +7,7 @@ volume="${OTLET_PG_VOLUME:-otlet-postgres-data}"
 port="${OTLET_PG_PORT:-55432}"
 password="${POSTGRES_PASSWORD:-postgres}"
 pgrx_features="${OTLET_PGRX_FEATURES:-pg18,native,openmp}"
+worker_count="${OTLET_WORKER_COUNT:-1}"
 llama_threads="${OTLET_LLAMA_THREADS:-}"
 llama_batch_threads="${OTLET_LLAMA_BATCH_THREADS:-}"
 llama_batch_tokens="${OTLET_LLAMA_BATCH_TOKENS:-}"
@@ -29,6 +30,12 @@ strong_model_file="${OTLET_STRONG_MODEL_FILE:-Qwen3.5-4B-Q4_K_M.gguf}"
 strong_model_url="${OTLET_STRONG_MODEL_URL:-https://huggingface.co/unsloth/Qwen3.5-4B-GGUF/resolve/main/Qwen3.5-4B-Q4_K_M.gguf}"
 strong_model_repo_cache="${OTLET_STRONG_MODEL_REPO_CACHE:-models--unsloth--Qwen3.5-4B-GGUF}"
 
+if ! [[ "$worker_count" =~ ^[0-9]+$ ]] || [ "$worker_count" -lt 1 ]; then
+  worker_count=1
+elif [ "$worker_count" -gt 4 ]; then
+  worker_count=4
+fi
+
 log() {
   printf '[%s] %s\n' "$(date '+%H:%M:%S')" "$*"
 }
@@ -48,14 +55,14 @@ wait_ready() {
 }
 
 wait_worker() {
-  local worker_count
+  local active_workers
 
   for _ in {1..60}; do
-    worker_count="$(
+    active_workers="$(
       docker exec "$container" psql -U postgres -d postgres -qAt \
         -c "select count(*) from pg_stat_activity where backend_type = 'otlet worker';"
     )"
-    if [ "$worker_count" = "1" ]; then
+    if [ "$active_workers" = "$worker_count" ]; then
       return
     fi
     sleep 1
@@ -96,6 +103,7 @@ image_id="$(docker image inspect -f '{{.Id}}' "$image")"
 
 if docker ps -a --format '{{.Names}}' | grep -qx "$container"; then
   container_image_id="$(docker inspect -f '{{.Image}}' "$container")"
+  container_worker_count="$(docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$container" | sed -n 's/^OTLET_WORKER_COUNT=//p' | tail -n 1)"
   container_llama_threads="$(docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$container" | sed -n 's/^OTLET_LLAMA_THREADS=//p' | tail -n 1)"
   container_llama_batch_threads="$(docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$container" | sed -n 's/^OTLET_LLAMA_BATCH_THREADS=//p' | tail -n 1)"
   container_llama_batch_tokens="$(docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$container" | sed -n 's/^OTLET_LLAMA_BATCH_TOKENS=//p' | tail -n 1)"
@@ -110,7 +118,7 @@ if docker ps -a --format '{{.Names}}' | grep -qx "$container"; then
   container_omp_proc_bind="$(docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$container" | sed -n 's/^OMP_PROC_BIND=//p' | tail -n 1)"
   container_omp_places="$(docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$container" | sed -n 's/^OMP_PLACES=//p' | tail -n 1)"
   container_gomp_cpu_affinity="$(docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$container" | sed -n 's/^GOMP_CPU_AFFINITY=//p' | tail -n 1)"
-  if [ "$container_image_id" != "$image_id" ] || [ "$container_llama_threads" != "$llama_threads" ] || [ "$container_llama_batch_threads" != "$llama_batch_threads" ] || [ "$container_llama_batch_tokens" != "$llama_batch_tokens" ] || [ "$container_llama_ubatch_tokens" != "$llama_ubatch_tokens" ] || [ "$container_llama_mmap" != "$llama_mmap" ] || [ "$container_llama_mlock" != "$llama_mlock" ] || [ "$container_llama_flash_attn" != "$llama_flash_attn" ] || [ "$container_llama_no_perf" != "$llama_no_perf" ] || [ "$container_llama_kv_type" != "$llama_kv_type" ] || [ "$container_llama_kv_type_k" != "$llama_kv_type_k" ] || [ "$container_llama_kv_type_v" != "$llama_kv_type_v" ] || [ "$container_omp_proc_bind" != "$omp_proc_bind" ] || [ "$container_omp_places" != "$omp_places" ] || [ "$container_gomp_cpu_affinity" != "$gomp_cpu_affinity" ]; then
+  if [ "$container_image_id" != "$image_id" ] || [ "$container_worker_count" != "$worker_count" ] || [ "$container_llama_threads" != "$llama_threads" ] || [ "$container_llama_batch_threads" != "$llama_batch_threads" ] || [ "$container_llama_batch_tokens" != "$llama_batch_tokens" ] || [ "$container_llama_ubatch_tokens" != "$llama_ubatch_tokens" ] || [ "$container_llama_mmap" != "$llama_mmap" ] || [ "$container_llama_mlock" != "$llama_mlock" ] || [ "$container_llama_flash_attn" != "$llama_flash_attn" ] || [ "$container_llama_no_perf" != "$llama_no_perf" ] || [ "$container_llama_kv_type" != "$llama_kv_type" ] || [ "$container_llama_kv_type_k" != "$llama_kv_type_k" ] || [ "$container_llama_kv_type_v" != "$llama_kv_type_v" ] || [ "$container_omp_proc_bind" != "$omp_proc_bind" ] || [ "$container_omp_places" != "$omp_places" ] || [ "$container_gomp_cpu_affinity" != "$gomp_cpu_affinity" ]; then
     log "Replacing stale container image or llama.cpp setting"
     docker start "$container" >/dev/null 2>&1 || true
     docker exec "$container" psql -U postgres -d postgres \
@@ -125,6 +133,7 @@ if ! docker ps -a --format '{{.Names}}' | grep -qx "$container"; then
     --name "$container" \
     -e POSTGRES_PASSWORD="$password" \
     -e CARGO_TARGET_DIR=/target \
+    -e OTLET_WORKER_COUNT="$worker_count" \
     -e OTLET_LLAMA_THREADS="$llama_threads" \
     -e OTLET_LLAMA_BATCH_THREADS="$llama_batch_threads" \
     -e OTLET_LLAMA_BATCH_TOKENS="$llama_batch_tokens" \

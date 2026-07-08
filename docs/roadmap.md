@@ -36,28 +36,24 @@ Run `./scripts/otlet-setup.sh`, then `./scripts/otlet-demo.sh` to prove the cont
 | 8 | GPU acceleration | Open | Add device policy after the CPU resident-worker path has measured proof |
 | 9 | Core limits | Open research | Test Access Method and Postgres-fork paths for missing planner or executor contracts |
 
-## Track Status
+## Open Tracks
 
-| Track | Status | Next contract |
-| --- | --- | --- |
-| Output reliability | Implemented, harden | Fixed `output` plus `actions` envelope, receipt evidence, benchmark gates, and repeat model sweeps |
-| Planner, executor, and cache | Implemented, harden | SQL plan rows, semantic status views, CustomScan EXPLAIN, receipts, runtime/cache views, and demo output must agree |
-| Review queue contract | Implemented | SQL exposes approval, rejection, correction, abstention, reviewer reason, stale state, receipts, and eval labels |
-| Action lifecycle | Implemented, extend | Approval, rejection, dry-run, and apply paths work for typed actions; add bounded SQL proposal actions |
-| Semantic freshness | Implemented, harden | Source updates, deletes, schema drift, contract changes, and candidate changes fail closed; add dependency audit export |
-| Watch definitions | Implemented, extend | Row and pair watches carry source, candidate, schema, stale, model, and runtime policy; add import/export |
-| Explain and trace | Implemented, harden | Bounded token traces and EXPLAIN vocabulary exist; add audit export views and redaction policy |
-| Model residency and timing | Open | Add SQL-visible timing splits, CPU knob sweeps, and multi-resident model tests before changing slot policy |
-| User-labeled eval loop | Implemented | Accepted, rejected, and corrected actions export local eval cases; feed more labels into benchmark gates |
-| Single-worker admission | Implemented | Queue caps, fair claims, cancellation, leases, RSS budgets, and cleanup checks exist; extend after multi-worker support lands |
-| SQL proposal actions | Open | Define bounded SQL action schemas, dry-run plans, approvals, receipts, and source-table write checks |
-| Grammar-constrained decode | Open | Add grammar or JSON-schema decode after linked llama exposes a worker-safe hook |
-| Persisted cache storage | Open | Add disk-backed cache after a measured workload proves in-process cache misses hurt |
-| Managed Postgres external worker | Open | Build a trusted SQL-bound worker that claims jobs, heartbeats, writes receipts, and fails closed |
-| GPU acceleration | Open | Report device policy, memory accounting, throughput, crash behavior, and EXPLAIN-visible device state |
-| Core limits | Open research | Test Access Method and fork paths when CustomScan cannot expose a required contract |
-| Entity resolution packs | Open | Ship vendor, customer, and product packs with candidate SQL, prompts, schemas, actions, fixtures, and gates |
-| Audit export and redaction | Open | Add views and policies for decisions, receipts, source hashes, approvals, corrections, eval labels, and trace summaries |
+| Track | Next contract |
+| --- | --- |
+| Output reliability hardening | Repeat model sweeps and keep prompt/schema changes on the same fixture |
+| Planner, executor, and cache hardening | Keep SQL plan rows, semantic status views, CustomScan EXPLAIN, receipts, runtime/cache views, and demo output aligned |
+| Action lifecycle extension | Add bounded SQL proposal actions, dry-run plans, approvals, receipts, and source-table write checks |
+| Semantic freshness hardening | Add dependency audit export for source updates, deletes, schema drift, contract changes, and candidate changes |
+| Watch definition export | Add import/export for row and pair watches |
+| Explain and trace hardening | Add audit export views and redaction policy |
+| Model residency and timing | Keep one-worker default; add per-worker RSS totals, model-slot admission, and worker-count probes before changing slot policy |
+| Grammar-constrained decode | Add grammar or JSON-schema decode after linked llama exposes a worker-safe hook |
+| Persisted cache storage | Add disk-backed cache after a measured workload proves in-process cache misses hurt |
+| Managed Postgres external worker | Build a trusted SQL-bound worker that claims jobs, heartbeats, writes receipts, and fails closed |
+| GPU acceleration | Report device policy, memory accounting, throughput, crash behavior, and EXPLAIN-visible device state |
+| Core limits research | Test Access Method and fork paths when CustomScan cannot expose a required contract |
+| Entity resolution packs | Ship vendor, customer, and product packs with candidate SQL, prompts, schemas, actions, fixtures, and gates |
+| Audit export and redaction | Add views and policies for decisions, receipts, source hashes, approvals, corrections, eval labels, and trace summaries |
 
 Keep open tracks contract-first. Name the SQL-visible state, the closed failure mode, and the demo or benchmark proof before adding code
 
@@ -92,6 +88,8 @@ Add a timing split before the next executor rewrite: `tokenize_ms`, `prompt_deco
 Keep cache-hit paths easy to preserve. A live smoke run completed cached jobs in milliseconds with no generation, so future watch and demo work keeps trace mode off for cacheable production paths and keeps stable content, contract, and model keys
 
 Keep CPU tuning measurable. Current controls cover release builds, native CPU code, OpenMP, a six-thread default cap, per-job `llama_threads`, startup `OTLET_LLAMA_BATCH_TOKENS`, `OTLET_LLAMA_MMAP`, `OTLET_LLAMA_MLOCK`, and `OTLET_LLAMA_FLASH_ATTN`. Add BLAS, KV-cache quantization, context-window policy, grammar decoding, or device offload only after a probe shows better Otlet pass rate or latency on the SQL path
+
+Keep resident-worker parallelism gated. A qwen35_4b probe on the current Docker CPU measured four warm concurrent infer-now callers at `11.22s` with one worker and six threads, `13.02s` with two workers and six threads each, and `11.51s` with two workers and three threads each. Extra workers created overlapping llama.cpp generation, doubled resident model contexts, and failed to beat the one-worker default. Before changing the default, add per-worker RSS totals, model-specific admission caps, queue fairness proof, and database responsiveness checks
 
 Test multi-resident model contexts before changing slot policy. Alternating cheap and strong models pays model-load time on each swap; a keyed model cache can remove that cost when the memory budget allows both artifacts
 

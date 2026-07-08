@@ -1,6 +1,11 @@
 CREATE VIEW otlet.runtime_status AS
 WITH infer_state AS (
   SELECT otlet.worker_infer_now_state() AS s
+),
+worker_state AS (
+  SELECT count(*)::bigint AS resident_worker_count
+  FROM pg_stat_activity
+  WHERE backend_type = 'otlet worker'
 )
 SELECT
   'linked_inproc'::text AS runtime_name,
@@ -54,6 +59,7 @@ SELECT
   COALESCE((infer.s ->> 'queue_depth')::bigint, 0) AS infer_now_queue_depth,
   COALESCE((infer.s ->> 'requested_slots')::bigint, 0) AS infer_now_requested_slots,
   COALESCE((infer.s ->> 'running_slots')::bigint, 0) AS infer_now_running_slots,
+  COALESCE(worker_state.resident_worker_count, 0) AS resident_worker_count,
   COALESCE((infer.s ->> 'busy_rejections')::bigint, 0) AS infer_now_busy_rejections,
   COALESCE((infer.s ->> 'timeouts')::bigint, 0) AS infer_now_timeouts,
   COALESCE((infer.s ->> 'task_cap')::bigint, 0) AS infer_now_task_cap_bytes,
@@ -69,6 +75,7 @@ SELECT
 FROM otlet.models m
 LEFT JOIN otlet.runtime_slots s ON s.model_name = m.name
 LEFT JOIN infer_state infer ON true
+LEFT JOIN worker_state ON true
 LEFT JOIN LATERAL (
   SELECT (pg_stat_file(COALESCE(s.artifact_path, m.artifact_path), true)).size::bigint AS artifact_bytes
   WHERE COALESCE(s.artifact_path, m.artifact_path) <> ''

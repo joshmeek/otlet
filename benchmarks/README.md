@@ -29,12 +29,13 @@ Sweep CPU thread counts through the same probe:
 OTLET_SWEEP_MODELS=qwen3_1_7b,qwen35_4b OTLET_SWEEP_THREADS=1,2,4,6,8,12 ./benchmarks/thread_sweep.sh
 ```
 
-Use thread sweeps as host evidence, not a global truth. Otlet accepts async infer-now callers through a bounded shared-memory queue, but the current resident worker executes one model job at a time. Concurrent callers can keep the worker fed; they do not create parallel llama.cpp generation
+Use thread sweeps as host evidence, not a global truth. The default setup starts one resident worker, so concurrent infer-now callers keep the bounded shared-memory queue fed but do not create parallel llama.cpp generation
 
 The probe accepts `OTLET_PROBE_LLAMA_THREADS=<n>`, `OTLET_PROBE_LLAMA_BATCH_THREADS=<n>`, and `OTLET_PROBE_RUNTIME_OPTIONS='{"max_tokens":64}'` for one run. The setup path accepts deployment-level llama.cpp knobs before `./scripts/otlet-setup.sh`:
 
 | knob | scope | default |
 | --- | --- | --- |
+| `OTLET_WORKER_COUNT` | resident Postgres workers | `1`, capped at `4`, research only |
 | `OTLET_LLAMA_THREADS` | decode threads | visible cores capped at `6` |
 | `OTLET_LLAMA_BATCH_THREADS` | prompt-decode thread pool | same as decode threads |
 | `OTLET_LLAMA_BATCH_TOKENS` | logical prompt batch tokens | `512` |
@@ -49,6 +50,16 @@ The probe accepts `OTLET_PROBE_LLAMA_THREADS=<n>`, `OTLET_PROBE_LLAMA_BATCH_THRE
 | `OMP_PROC_BIND`, `OMP_PLACES`, `GOMP_CPU_AFFINITY` | OpenMP CPU placement | unset |
 
 Treat those as host-specific controls. Re-run `./scripts/otlet-setup.sh` after changing startup knobs so the worker process starts with the new environment
+
+Keep `OTLET_WORKER_COUNT=1` unless a local probe shows a wall-clock win and acceptable RSS. A qwen35_4b infer-now probe on the current Docker CPU measured four warm concurrent callers like this:
+
+| setup | wall time | shape | result |
+| --- | ---: | --- | --- |
+| `1` worker, `6` threads | `11.22s` | serialized jobs | best wall time, about `25-30 tok/s` |
+| `2` workers, `6` threads each | `13.02s` | two overlapping jobs | slower from CPU oversubscription |
+| `2` workers, `3` threads each | `11.51s` | two overlapping jobs | near baseline, with about double resident model memory |
+
+The two-worker probes proved real overlapping llama.cpp generation from separate Postgres workers, but they lost wall time or memory on qwen35_4b. Treat worker count as a research control until Otlet has per-worker RSS totals, model-specific admission caps, queue fairness proof, and database responsiveness checks
 
 Run the default-included benchmark model:
 

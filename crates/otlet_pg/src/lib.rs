@@ -115,10 +115,21 @@ pub extern "C-unwind" fn _PG_init() {
     wake::init_shared_memory();
     infer_now::init_shared_memory();
 
-    pgrx::bgworkers::BackgroundWorkerBuilder::new("otlet worker")
-        .set_function("otlet_worker_main")
-        .set_library("otlet")
-        .set_restart_time(Some(std::time::Duration::from_secs(2)))
-        .enable_spi_access()
-        .load();
+    for _ in 0..otlet_worker_count() {
+        pgrx::bgworkers::BackgroundWorkerBuilder::new("otlet worker")
+            .set_function("otlet_worker_main")
+            .set_library("otlet")
+            .set_restart_time(Some(std::time::Duration::from_secs(2)))
+            .enable_spi_access()
+            .load();
+    }
+}
+
+fn otlet_worker_count() -> usize {
+    std::env::var("OTLET_WORKER_COUNT")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|count| *count > 0)
+        .unwrap_or(1)
+        .min(4)
 }
