@@ -9,7 +9,7 @@ Start with the normal Otlet proof path:
 ./scripts/otlet-demo.sh
 ```
 
-Run the fast probe before spending time on a full benchmark. It uses the real Otlet worker on five row-shaped JSON cases and reports viability, pass count, schema passes, token rate, and p95 generation time:
+Run the fast probe before spending time on a full benchmark. It uses the real Otlet worker on five row-shaped JSON cases and reports viability, pass count, schema passes, token rate, steady decode rate, p95 generation time, p95 TTFT, and p95 prompt decode time:
 
 ```sh
 OTLET_PROBE_LIMIT_MODELS=ministral3_3b,qwen35_4b,qwen3_1_7b ./benchmarks/quick_probe.sh
@@ -137,6 +137,8 @@ Key files:
 - `benchmarks/report/latest/pareto.svg`
 - `benchmarks/report/latest/params.svg`
 - `benchmarks/report/latest/latency.svg`
+- `benchmarks/report/latest/ttft.svg`
+- `benchmarks/report/latest/prompt_decode.svg`
 - `benchmarks/report/latest/efficiency.svg`
 - `benchmarks/report/latest/scorecard.tsv`
 - `benchmarks/report/latest/model_summary.tsv`

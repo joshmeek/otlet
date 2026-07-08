@@ -104,6 +104,9 @@ CREATE TEMP TABLE quick_probe_results (
   generated_tokens bigint,
   generate_ms bigint,
   tokens_per_second numeric,
+  ttft_ms bigint,
+  prompt_decode_ms bigint,
+  steady_tokens_per_second numeric,
   error text
 );
 
@@ -121,6 +124,9 @@ DECLARE
   receipt_generated_tokens bigint;
   receipt_generate_ms bigint;
   receipt_tokens_per_second numeric;
+  receipt_ttft_ms bigint;
+  receipt_prompt_decode_ms bigint;
+  receipt_steady_tokens_per_second numeric;
   receipt_error text;
   observed text;
 BEGIN
@@ -180,6 +186,9 @@ BEGIN
     receipt_generated_tokens := NULL;
     receipt_generate_ms := NULL;
     receipt_tokens_per_second := NULL;
+    receipt_ttft_ms := NULL;
+    receipt_prompt_decode_ms := NULL;
+    receipt_steady_tokens_per_second := NULL;
     receipt_error := NULL;
 
     BEGIN
@@ -221,6 +230,9 @@ BEGIN
         s.generated_tokens,
         s.generate_ms,
         s.tokens_per_second,
+        s.ttft_ms,
+        s.prompt_decode_ms,
+        s.steady_tokens_per_second,
         s.error
       INTO
         receipt_status,
@@ -229,6 +241,9 @@ BEGIN
         receipt_generated_tokens,
         receipt_generate_ms,
         receipt_tokens_per_second,
+        receipt_ttft_ms,
+        receipt_prompt_decode_ms,
+        receipt_steady_tokens_per_second,
         receipt_error
       FROM otlet.inference_trace_summary s
       WHERE s.job_id = current_job_id
@@ -258,6 +273,9 @@ BEGIN
       receipt_generated_tokens,
       receipt_generate_ms,
       receipt_tokens_per_second,
+      receipt_ttft_ms,
+      receipt_prompt_decode_ms,
+      receipt_steady_tokens_per_second,
       COALESCE(receipt_error, current_error)
     );
   END LOOP;
@@ -270,7 +288,10 @@ WITH summary AS (
     count(*) AS total_cases,
     count(*) FILTER (WHERE schema_validation_status = 'passed') AS schema_passed,
     round(avg(tokens_per_second), 2) AS mean_tok_s,
+    round(avg(steady_tokens_per_second), 2) AS mean_steady_tok_s,
     round(percentile_cont(0.95) WITHIN GROUP (ORDER BY generate_ms)::numeric, 0) AS p95_generate_ms,
+    round(percentile_cont(0.95) WITHIN GROUP (ORDER BY ttft_ms)::numeric, 0) AS p95_ttft_ms,
+    round(percentile_cont(0.95) WITHIN GROUP (ORDER BY prompt_decode_ms)::numeric, 0) AS p95_prompt_decode_ms,
     round(avg(prompt_tokens), 1) AS mean_prompt_tokens,
     round(avg(generated_tokens), 1) AS mean_generated_tokens
   FROM quick_probe_results
@@ -282,7 +303,10 @@ SELECT
   total_cases,
   schema_passed,
   mean_tok_s,
+  mean_steady_tok_s,
   p95_generate_ms,
+  p95_ttft_ms,
+  p95_prompt_decode_ms,
   mean_prompt_tokens,
   mean_generated_tokens
 FROM summary;
@@ -297,7 +321,10 @@ SELECT
   status,
   schema_validation_status,
   round(tokens_per_second, 2),
+  round(steady_tokens_per_second, 2),
   generate_ms,
+  ttft_ms,
+  prompt_decode_ms,
   COALESCE(error, '')
 FROM quick_probe_results
 ORDER BY case_id;
@@ -305,7 +332,7 @@ ORDER BY case_id;
 SQL
 }
 
-printf 'model_key\tviable\tpassed_cases\ttotal_cases\tschema_passed\tmean_tok_s\tp95_generate_ms\tmean_prompt_tokens\tmean_generated_tokens\n'
+printf 'model_key\tviable\tpassed_cases\ttotal_cases\tschema_passed\tmean_tok_s\tmean_steady_tok_s\tp95_generate_ms\tp95_ttft_ms\tp95_prompt_decode_ms\tmean_prompt_tokens\tmean_generated_tokens\n'
 
 while IFS=$'\t' read -r model_key hf_repo filename _quant _family tier _license _source _include _max_gb requires_split _declared _active _context _notes; do
   if [[ "$tier" == "blocked" || "$tier" == "heavy" ]]; then

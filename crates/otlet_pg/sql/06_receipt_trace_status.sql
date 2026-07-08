@@ -464,6 +464,31 @@ SELECT
   r.generated_tokens,
   r.generate_ms,
   r.tokens_per_second,
+  CASE
+    WHEN jsonb_typeof(r.trace_summary -> 'tokenize_ms') = 'number'
+      THEN (r.trace_summary ->> 'tokenize_ms')::bigint
+    ELSE NULL
+  END AS tokenize_ms,
+  CASE
+    WHEN jsonb_typeof(r.trace_summary -> 'prompt_decode_ms') = 'number'
+      THEN (r.trace_summary ->> 'prompt_decode_ms')::bigint
+    ELSE NULL
+  END AS prompt_decode_ms,
+  CASE
+    WHEN jsonb_typeof(r.trace_summary -> 'first_token_ms') = 'number'
+      THEN (r.trace_summary ->> 'first_token_ms')::bigint
+    ELSE NULL
+  END AS first_token_ms,
+  CASE
+    WHEN jsonb_typeof(r.trace_summary -> 'ttft_ms') = 'number'
+      THEN (r.trace_summary ->> 'ttft_ms')::bigint
+    ELSE NULL
+  END AS ttft_ms,
+  CASE
+    WHEN jsonb_typeof(r.trace_summary -> 'steady_tokens_per_second') = 'number'
+      THEN (r.trace_summary ->> 'steady_tokens_per_second')::numeric
+    ELSE NULL
+  END AS steady_tokens_per_second,
   r.schema_validation_status,
   r.trace_summary ->> 'trace_version' AS trace_version,
   r.trace_summary,

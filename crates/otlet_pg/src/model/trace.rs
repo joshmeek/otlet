@@ -8,6 +8,13 @@ fn generation_trace_summary(
     } else {
         None
     };
+    let steady_decode_ms = metrics.generate_ms.saturating_sub(metrics.first_token_ms);
+    let steady_tokens = metrics.generated_tokens.saturating_sub(1);
+    let steady_tokens_per_second = if steady_decode_ms > 0 && steady_tokens > 0 {
+        Some((steady_tokens as f64 * 1000.0) / steady_decode_ms as f64)
+    } else {
+        None
+    };
     let summary = json!({
         "trace_version": "otlet_generation_trace_v1",
         "prompt_hash": context.prompt_hash,
@@ -21,8 +28,14 @@ fn generation_trace_summary(
         "raw_output_hash": raw_output_hash,
         "prompt_tokens": metrics.prompt_tokens,
         "generated_tokens": metrics.generated_tokens,
+        "tokenize_ms": metrics.tokenize_ms,
+        "prompt_decode_ms": metrics.prompt_decode_ms,
+        "first_token_ms": metrics.first_token_ms,
+        "ttft_ms": metrics.ttft_ms,
+        "steady_decode_ms": steady_decode_ms,
         "generate_ms": metrics.generate_ms,
         "tokens_per_second": tokens_per_second,
+        "steady_tokens_per_second": steady_tokens_per_second,
         "model_memory_bytes": metrics.model_memory_bytes,
         "model_parameters": metrics.model_parameters,
         "context_window_tokens": metrics.context_window_tokens,

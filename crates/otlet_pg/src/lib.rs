@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 pgrx::pg_module_magic!();
 
 mod custom_scan;

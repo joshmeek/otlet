@@ -164,6 +164,12 @@ docker exec "$container" psql -U postgres -d postgres \
 docker restart "$container" >/dev/null
 wait_ready
 
+docker exec "$container" sh -lc "rm -rf \
+  /target/release/.fingerprint/otlet_pg-* \
+  /target/release/build/otlet_pg-* \
+  /target/release/deps/libotlet_pg* \
+  /target/release/deps/otlet_pg* \
+  /target/release/libotlet_pg*"
 docker exec "$container" cargo pgrx install \
   -p otlet_pg \
   --pg-config /usr/bin/pg_config \

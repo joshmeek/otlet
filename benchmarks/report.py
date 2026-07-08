@@ -86,6 +86,8 @@ def main():
     pareto = run_dir / "pareto.svg"
     params = run_dir / "params.svg"
     latency = run_dir / "latency.svg"
+    ttft = run_dir / "ttft.svg"
+    prompt_decode = run_dir / "prompt_decode.svg"
     efficiency = run_dir / "efficiency.svg"
     overall = run_dir / "overall.svg"
     scorecard = run_dir / "scorecard.tsv"
@@ -94,6 +96,8 @@ def main():
     write_pareto(pareto, runnable_summaries)
     write_param_fit(params, runnable_summaries)
     write_bar(latency, runnable_summaries, "p95_generate_ms", "p95 generation latency ms, higher is slower")
+    write_bar(ttft, runnable_summaries, "p95_ttft_ms", "p95 TTFT ms, higher is slower")
+    write_bar(prompt_decode, runnable_summaries, "p95_prompt_decode_ms", "p95 prompt decode ms, higher is slower")
     write_bar(efficiency, runnable_summaries, "correct_jobs_per_second_per_gb", "correct jobs/sec per resident GB")
     write_scorecard(scorecard, report_summaries)
     write_score_audit(score_audit, report_summaries)
@@ -145,7 +149,10 @@ def main():
                 "params_b": f'{num(row.get("declared_params_b")):.2f}' if row.get("declared_params_b") else "",
                 "active_b": f'{num(row.get("active_params_b")):.2f}' if row.get("active_params_b") else "",
                 "p95_ms": f'{num(row.get("p95_generate_ms")):.0f}',
+                "ttft_ms": f'{num(row.get("p95_ttft_ms")):.0f}',
+                "prompt_ms": f'{num(row.get("p95_prompt_decode_ms")):.0f}',
                 "tok_s": f'{num(row.get("mean_tokens_per_second")):.2f}',
+                "steady_tok_s": f'{num(row.get("mean_steady_tokens_per_second")):.2f}',
                 "rss_gb": f'{num(row.get("resident_gb")):.3f}',
                 "artifact_gb": f'{num(row.get("artifact_gb")):.3f}',
                 "correct_jobs_s_gb": f'{num(row.get("correct_jobs_per_second_per_gb")):.3f}',
@@ -379,6 +386,7 @@ def main():
                 "resource_fit": f'{num(row.get("resource_fit")):.3f}',
                 "schema": f'{num(row.get("schema_valid_rate")):.3f}',
                 "p95_ms": f'{num(row.get("p95_generate_ms")):.0f}',
+                "ttft_ms": f'{num(row.get("p95_ttft_ms")):.0f}',
                 "rss_gb": f'{num(row.get("resident_gb")):.3f}',
                 "artifact_gb": f'{num(row.get("artifact_gb")):.3f}',
             }
@@ -559,7 +567,7 @@ def main():
     lines = [
         "# Otlet Model-Fit Benchmark Report",
         "",
-        "This benchmark scores current local GGUF models as Otlet workers inside Postgres. Each case provides the evidence in source rows. The score measures strict JSON, trusted actions, row watching, receipts, semantic materialization, stale safety, EXPLAIN visibility, latency, memory, and artifact size",
+        "This benchmark scores current local GGUF models as Otlet workers inside Postgres. Each case provides the evidence in source rows. The score measures strict JSON, trusted actions, row watching, receipts, semantic materialization, stale safety, EXPLAIN visibility, TTFT, decode throughput, memory, and artifact size",
         "",
         "`production_score` is zero until a model passes every production gate with at least 3 same-run repeats. `overall_fit` is the broad Otlet research score: trusted output quality with a soft resource adjustment for artifact GB, resident RSS, p95 latency, and active params. `diagnostic_fit` is separate and can read compact fields from rejected attempts. Invalid JSON never becomes trusted Otlet state",
         "",
@@ -636,7 +644,7 @@ def main():
         "",
         "The Otlet-small track includes models whose measured artifact in the run is at or below 2.0 GB",
         "",
-        table(["rank", "model", "overall_fit", "trusted_quality", "resource_fit", "schema", "p95_ms", "rss_gb", "artifact_gb"], small_candidate_rows)
+        table(["rank", "model", "overall_fit", "trusted_quality", "resource_fit", "schema", "p95_ms", "ttft_ms", "rss_gb", "artifact_gb"], small_candidate_rows)
         if small_candidate_rows
         else "The run measured no <=2.0 GB artifact candidates",
         "",
@@ -693,7 +701,10 @@ def main():
                 "params_b",
                 "active_b",
                 "p95_ms",
+                "ttft_ms",
+                "prompt_ms",
                 "tok_s",
+                "steady_tok_s",
                 "rss_gb",
                 "artifact_gb",
                 "correct_jobs_s_gb",
@@ -724,6 +735,8 @@ def main():
         f"- Pareto: `{pareto.name}`",
         f"- Params: `{params.name}`",
         f"- Latency: `{latency.name}`",
+        f"- TTFT: `{ttft.name}`",
+        f"- Prompt decode: `{prompt_decode.name}`",
         f"- Efficiency: `{efficiency.name}`",
         f"- Score audit TSV: `{score_audit.name}`",
         f"- Scorecard TSV: `{scorecard.name}`",

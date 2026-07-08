@@ -108,7 +108,9 @@ fn run_linked(
     unsafe {
         llama_cpp_sys_4::llama_set_n_threads(cache.context.ptr, decode_threads, batch_threads);
     }
+    let tokenize_start = Instant::now();
     let tokens = tokenize_linked(cache.vocab, prompt)?;
+    let tokenize_ms = elapsed_ms(tokenize_start);
     if tokens.is_empty() {
         return Err(ModelError::new(
             "linked llama.cpp prompt produced no tokens".to_owned(),
@@ -127,6 +129,7 @@ fn run_linked(
 
     // Reuse the KV cache for the shared prompt prefix (same instruction/schema
     // across a task's jobs) so only the diverging suffix is re-decoded.
+    let prompt_decode_start = Instant::now();
     let common_prefix =
         linked_reuse_prompt_prefix(cache.context.ptr, &mut cache.kv_tokens, &tokens);
 
@@ -142,6 +145,7 @@ fn run_linked(
         &mut cache.kv_tokens,
         &mut cancel_probe,
     )?;
+    let prompt_decode_ms = elapsed_ms(prompt_decode_start);
 
     let sampler_ptr = unsafe { llama_cpp_sys_4::llama_sampler_init_greedy() };
     if sampler_ptr.is_null() {
@@ -158,6 +162,8 @@ fn run_linked(
     let mut detailed_trace = DetailedGenerationTrace::new(options);
     let mut stop_reason = "max_tokens".to_owned();
     let mut token_piece_buf = vec![0_u8; 128];
+    let mut first_token_ms = 0_i64;
+    let mut first_token_seen = false;
     let generate_start = Instant::now();
 
     for _ in 0..options.max_tokens {
@@ -197,6 +203,10 @@ fn run_linked(
             llama_cpp_sys_4::llama_sampler_accept(sampler.ptr, token);
         }
         generated_tokens += 1;
+        if !first_token_seen {
+            first_token_ms = elapsed_ms(generate_start);
+            first_token_seen = true;
+        }
         let piece_start = output.len();
         linked_token_to_piece_into(cache.vocab, token, &mut token_piece_buf, &mut output);
         detailed_trace.observe(token, &output[piece_start..], sample);
@@ -228,6 +238,13 @@ fn run_linked(
         position += 1;
     }
     let generate_ms = elapsed_ms(generate_start);
+    let ttft_ms = if first_token_seen {
+        tokenize_ms
+            .saturating_add(prompt_decode_ms)
+            .saturating_add(first_token_ms)
+    } else {
+        0
+    };
     let worker_memory = process_memory_sample();
     enforce_worker_rss_budget(&worker_memory, options.max_worker_rss_bytes)?;
 
@@ -250,6 +267,10 @@ fn run_linked(
                 .to_owned(),
             prompt_tokens: tokens.len() as i64,
             generated_tokens,
+            tokenize_ms,
+            prompt_decode_ms,
+            first_token_ms,
+            ttft_ms,
             generate_ms,
             cache_hit,
             inference_cache_hit: false,
