@@ -469,6 +469,19 @@ mod response_schema_tests {
             json!(["status"])
         );
     }
+
+    #[test]
+    fn json_completion_tracks_incremental_chunks() {
+        let mut completion = JsonCompletion::new();
+        assert_eq!(completion.observe("{\"a\":\"x"), None);
+        assert_eq!(completion.observe("\\\"\"} trailing"), Some(11));
+    }
+
+    #[test]
+    fn json_completion_matches_full_scan() {
+        let output = "noise {\"a\":{\"b\":1}} trailing";
+        assert_eq!(linked_output_complete_end(output), Some(19));
+    }
 }
 
 static LINKED_BACKEND: OnceLock<()> = OnceLock::new();

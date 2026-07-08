@@ -29,7 +29,7 @@ Sweep CPU thread counts through the same probe:
 OTLET_SWEEP_MODELS=qwen3_1_7b,qwen35_4b OTLET_SWEEP_THREADS=1,2,4,6,8,12 ./benchmarks/thread_sweep.sh
 ```
 
-The probe accepts `OTLET_PROBE_LLAMA_THREADS=<n>` and `OTLET_PROBE_LLAMA_BATCH_THREADS=<n>` for one run. The setup path accepts deployment-level llama.cpp knobs before `./scripts/otlet-setup.sh`:
+The probe accepts `OTLET_PROBE_LLAMA_THREADS=<n>`, `OTLET_PROBE_LLAMA_BATCH_THREADS=<n>`, and `OTLET_PROBE_RUNTIME_OPTIONS='{"max_tokens":64}'` for one run. The setup path accepts deployment-level llama.cpp knobs before `./scripts/otlet-setup.sh`:
 
 | knob | scope | default |
 | --- | --- | --- |

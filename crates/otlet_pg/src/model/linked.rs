@@ -151,6 +151,7 @@ fn run_linked(
     }
     let sampler = LinkedSampler { ptr: sampler_ptr };
     let mut output = String::with_capacity(linked_output_capacity(options.max_tokens));
+    let mut json_completion = JsonCompletion::new();
     let mut position = tokens.len();
     let mut generated_tokens = 0_i64;
     let mut probability_trace = ProbabilityTrace::new(options);
@@ -199,7 +200,7 @@ fn run_linked(
         let piece_start = output.len();
         linked_token_to_piece_into(cache.vocab, token, &mut token_piece_buf, &mut output);
         detailed_trace.observe(token, &output[piece_start..], sample);
-        if let Some(end) = linked_output_complete_end(&output) {
+        if let Some(end) = json_completion.observe(&output[piece_start..]) {
             output.truncate(end);
             stop_reason = "json_complete".to_owned();
             break;
@@ -756,7 +757,9 @@ fn linked_token_to_piece_into(
     buffer: &mut Vec<u8>,
     output: &mut String,
 ) {
-    buffer.resize(128, 0);
+    if buffer.len() < 128 {
+        buffer.resize(128, 0);
+    }
     let mut size = unsafe {
         llama_cpp_sys_4::llama_token_to_piece(
             vocab,
@@ -790,8 +793,7 @@ fn linked_token_to_piece_into(
     if size <= 0 {
         return;
     }
-    buffer.truncate(size as usize);
-    output.push_str(&String::from_utf8_lossy(buffer));
+    output.push_str(&String::from_utf8_lossy(&buffer[..size as usize]));
 }
 
 fn linked_token_to_piece(
@@ -813,44 +815,74 @@ fn linked_clear_context(context: *mut llama_cpp_sys_4::llama_context) {
     }
 }
 
+#[cfg(test)]
 fn linked_output_complete_end(output: &str) -> Option<usize> {
-    let mut depth = 0_i32;
-    let mut in_string = false;
-    let mut escape = false;
-    let mut seen_open = false;
+    let mut completion = JsonCompletion::new();
+    completion.observe(output)
+}
 
-    for (index, ch) in output.char_indices() {
-        if in_string {
-            if escape {
-                escape = false;
-            } else if ch == '\\' {
-                escape = true;
-            } else if ch == '"' {
-                in_string = false;
-            }
-            continue;
-        }
+struct JsonCompletion {
+    depth: i32,
+    in_string: bool,
+    escape: bool,
+    seen_open: bool,
+    bytes_seen: usize,
+    complete_end: Option<usize>,
+}
 
-        match ch {
-            '"' => in_string = true,
-            '{' => {
-                depth += 1;
-                seen_open = true;
-            }
-            '}' => {
-                depth -= 1;
-                if seen_open && depth == 0 {
-                    return Some(index + ch.len_utf8());
-                }
-                if depth < 0 {
-                    return Some(index);
-                }
-            }
-            _ => {}
+impl JsonCompletion {
+    fn new() -> Self {
+        Self {
+            depth: 0,
+            in_string: false,
+            escape: false,
+            seen_open: false,
+            bytes_seen: 0,
+            complete_end: None,
         }
     }
 
-    None
+    fn observe(&mut self, text: &str) -> Option<usize> {
+        if self.complete_end.is_some() {
+            return self.complete_end;
+        }
+
+        for (index, ch) in text.char_indices() {
+            if self.in_string {
+                if self.escape {
+                    self.escape = false;
+                } else if ch == '\\' {
+                    self.escape = true;
+                } else if ch == '"' {
+                    self.in_string = false;
+                }
+                continue;
+            }
+
+            match ch {
+                '"' => self.in_string = true,
+                '{' => {
+                    self.depth += 1;
+                    self.seen_open = true;
+                }
+                '}' => {
+                    self.depth -= 1;
+                    if self.seen_open && self.depth == 0 {
+                        self.complete_end = Some(self.bytes_seen + index + ch.len_utf8());
+                        return self.complete_end;
+                    }
+                    if self.depth < 0 {
+                        self.complete_end = Some(self.bytes_seen + index);
+                        return self.complete_end;
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        self.bytes_seen += text.len();
+        None
+    }
 }
 
 fn linked_cancel_requested(job_id: i64) -> Result<bool, ModelError> {

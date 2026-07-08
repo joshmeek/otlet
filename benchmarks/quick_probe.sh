@@ -14,6 +14,10 @@ model_dir="${OTLET_MODEL_DIR:-/var/lib/postgresql/otlet-models}"
 timeout_ms="${OTLET_PROBE_TIMEOUT_MS:-30000}"
 probe_llama_threads="${OTLET_PROBE_LLAMA_THREADS:-0}"
 probe_llama_batch_threads="${OTLET_PROBE_LLAMA_BATCH_THREADS:-0}"
+probe_runtime_options="${OTLET_PROBE_RUNTIME_OPTIONS:-}"
+if [[ -z "$probe_runtime_options" ]]; then
+  probe_runtime_options="{}"
+fi
 keep_models="${OTLET_PROBE_KEEP_MODELS:-0}"
 scratch_root="${OTLET_PROBE_MODEL_DIR:-/var/lib/postgresql/otlet-probe-models}"
 run_id="probe-$(date -u +%Y%m%dT%H%M%SZ)-$$"
@@ -78,6 +82,7 @@ run_model_probe() {
     -v timeout_ms="$timeout_ms" \
     -v probe_llama_threads="$probe_llama_threads" \
     -v probe_llama_batch_threads="$probe_llama_batch_threads" \
+    -v probe_runtime_options="$probe_runtime_options" \
     -v probe_verbose="$probe_verbose" <<'SQL'
 \pset footer off
 \pset fieldsep '\t'
@@ -85,7 +90,8 @@ CREATE TEMP TABLE quick_probe_config AS
 SELECT :'model_key'::text AS model_key,
        :'timeout_ms'::integer AS timeout_ms,
        :'probe_llama_threads'::integer AS llama_threads,
-       :'probe_llama_batch_threads'::integer AS llama_batch_threads;
+       :'probe_llama_batch_threads'::integer AS llama_batch_threads,
+       :'probe_runtime_options'::jsonb AS runtime_options;
 
 CREATE TEMP TABLE quick_probe_results (
   case_id text,
@@ -194,7 +200,7 @@ BEGIN
             'llama_threads', NULLIF(cfg.llama_threads, 0),
             'llama_batch_threads', NULLIF(cfg.llama_batch_threads, 0)
           )
-        )
+        ) || cfg.runtime_options
       );
     EXCEPTION WHEN OTHERS THEN
       current_error := SQLERRM;
