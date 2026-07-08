@@ -131,5 +131,5 @@ fn otlet_worker_count() -> usize {
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|count| *count > 0)
         .unwrap_or(1)
-        .min(4)
+        .min(wake::WORKER_LATCH_SLOTS)
 }

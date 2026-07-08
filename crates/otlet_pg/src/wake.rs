@@ -3,13 +3,11 @@ use serde_json::json;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 pub(crate) const MISSED_WAKE_RECOVERY_MS: u64 = 5_000;
-const WORKER_LATCH_SLOTS: usize = 4;
+pub(crate) const WORKER_LATCH_SLOTS: usize = 4;
 
 #[derive(Copy, Clone, Default)]
 #[repr(C)]
 pub(crate) struct WakeState {
-    worker_latch: usize,
-    worker_pid: i32,
     worker_latches: [usize; WORKER_LATCH_SLOTS],
     worker_pids: [i32; WORKER_LATCH_SLOTS],
     worker_registrations: u64,
@@ -43,16 +41,16 @@ pub(crate) fn init_shared_memory() {
 
 pub(crate) fn register_worker_latch() {
     let mut state = WAKE_STATE.exclusive();
-    state.worker_latch = unsafe { pg_sys::MyLatch as usize };
-    state.worker_pid = unsafe { pg_sys::MyProcPid };
+    let worker_latch = unsafe { pg_sys::MyLatch as usize };
+    let worker_pid = unsafe { pg_sys::MyProcPid };
     if let Some(index) = state
         .worker_pids
         .iter()
-        .position(|pid| *pid == state.worker_pid)
+        .position(|pid| *pid == worker_pid)
         .or_else(|| state.worker_latches.iter().position(|latch| *latch == 0))
     {
-        state.worker_latches[index] = state.worker_latch;
-        state.worker_pids[index] = state.worker_pid;
+        state.worker_latches[index] = worker_latch;
+        state.worker_pids[index] = worker_pid;
     }
     state.worker_registrations = state.worker_registrations.saturating_add(1);
 }
@@ -66,18 +64,6 @@ pub(crate) fn unregister_worker_latch() {
             state.worker_pids[index] = 0;
         }
     }
-    state.worker_latch = state
-        .worker_latches
-        .iter()
-        .copied()
-        .find(|latch| *latch != 0)
-        .unwrap_or(0);
-    state.worker_pid = state
-        .worker_pids
-        .iter()
-        .copied()
-        .find(|worker_pid| *worker_pid != 0)
-        .unwrap_or(0);
 }
 
 pub(crate) fn record_worker_drain(drained: u64) {
@@ -125,12 +111,23 @@ pub extern "C-unwind" fn otlet_worker_wake_state(
     _fcinfo: pg_sys::FunctionCallInfo,
 ) -> pg_sys::Datum {
     let state = WAKE_STATE.share();
+    let worker_pid = state
+        .worker_pids
+        .iter()
+        .copied()
+        .find(|pid| *pid != 0)
+        .unwrap_or(0);
+    let registered_workers = state
+        .worker_latches
+        .iter()
+        .filter(|latch| **latch != 0)
+        .count();
     JsonB(json!({
         "handoff": "shared_memory_xact_commit_latch",
-        "worker_latch_registered": state.worker_latch != 0,
-        "worker_pid": state.worker_pid,
+        "worker_latch_registered": registered_workers > 0,
+        "worker_pid": worker_pid,
         "worker_pids": state.worker_pids.iter().copied().filter(|pid| *pid != 0).collect::<Vec<_>>(),
-        "registered_workers": state.worker_latches.iter().filter(|latch| **latch != 0).count(),
+        "registered_workers": registered_workers,
         "worker_registrations": state.worker_registrations,
         "worker_lifecycle_policy": "clear_latch_on_clean_stop_and_reregister_on_postmaster_restart",
         "wake_requests": state.wake_requests,
