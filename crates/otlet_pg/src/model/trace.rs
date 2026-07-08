@@ -30,6 +30,8 @@ fn generation_trace_summary(
         "prompt_cached_tokens_before": metrics.prompt_cached_tokens_before,
         "prompt_reused_tokens": metrics.prompt_reused_tokens,
         "prompt_decoded_tokens": metrics.prompt_decoded_tokens,
+        "prompt_reuse_strategy": metrics.prompt_reuse_strategy,
+        "prompt_prefix_state_bytes": metrics.prompt_prefix_state_bytes,
         "generated_tokens": metrics.generated_tokens,
         "tokenize_ms": metrics.tokenize_ms,
         "prompt_decode_ms": metrics.prompt_decode_ms,

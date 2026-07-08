@@ -1,6 +1,7 @@
 fn run_linked(
     job: &Job,
     prompt: &str,
+    prompt_prefix: &str,
     options: &crate::runtime::RuntimeOptions,
     model_fingerprint_hash: &str,
 ) -> Result<LinkedRun, ModelError> {
@@ -90,6 +91,9 @@ fn run_linked(
             context,
             vocab,
             kv_tokens: Vec::new(),
+            prompt_prefix_hash: String::new(),
+            prompt_prefix_tokens: Vec::new(),
+            prompt_prefix_state: Vec::new(),
             load_ms,
             ctx_ms,
             model_memory_bytes,
@@ -110,6 +114,7 @@ fn run_linked(
     }
     let tokenize_start = Instant::now();
     let tokens = tokenize_linked(cache.vocab, prompt)?;
+    let prompt_prefix_tokens = tokenize_linked(cache.vocab, prompt_prefix)?;
     let tokenize_ms = elapsed_ms(tokenize_start);
     if tokens.is_empty() {
         return Err(ModelError::new(
@@ -133,22 +138,82 @@ fn run_linked(
     // across a task's jobs) so only the diverging suffix is re-decoded.
     let prompt_decode_start = Instant::now();
     let prompt_cached_tokens_before = cache.kv_tokens.len();
-    let common_prefix =
-        linked_reuse_prompt_prefix(cache.context.ptr, &mut cache.kv_tokens, &tokens);
-    let prompt_decoded_tokens = tokens.len().saturating_sub(common_prefix);
-
     let prompt_batch_tokens = linked_prompt_batch_tokens();
     let mut batch = LinkedBatch::new(prompt_batch_tokens)?;
-    linked_decode_prompt_tokens(
-        job,
-        cache.context.ptr,
-        &mut batch,
-        &tokens[common_prefix..],
-        common_prefix,
-        prompt_batch_tokens,
-        &mut cache.kv_tokens,
-        &mut cancel_probe,
-    )?;
+    let mut prompt_reused_tokens = 0;
+    let mut prompt_decoded_tokens = tokens.len();
+    let mut prompt_reuse_strategy = "full_prompt_decode".to_owned();
+    let prefix_reusable = linked_prompt_prefix_reusable(&tokens, &prompt_prefix_tokens);
+    if prefix_reusable {
+        let prompt_prefix_hash = hash_text(prompt_prefix);
+        if linked_restore_prompt_prefix_state(cache, &prompt_prefix_hash, &prompt_prefix_tokens) {
+            prompt_reused_tokens = prompt_prefix_tokens.len();
+            prompt_decoded_tokens = tokens.len().saturating_sub(prompt_reused_tokens);
+            prompt_reuse_strategy = "prefix_state_restored".to_owned();
+            linked_decode_prompt_tokens(
+                job,
+                cache.context.ptr,
+                &mut batch,
+                &tokens[prompt_reused_tokens..],
+                prompt_reused_tokens,
+                prompt_batch_tokens,
+                &mut cache.kv_tokens,
+                &mut cancel_probe,
+                true,
+            )?;
+        } else {
+            linked_clear_context(cache.context.ptr);
+            cache.kv_tokens.clear();
+            linked_decode_prompt_tokens(
+                job,
+                cache.context.ptr,
+                &mut batch,
+                &prompt_prefix_tokens,
+                0,
+                prompt_batch_tokens,
+                &mut cache.kv_tokens,
+                &mut cancel_probe,
+                false,
+            )?;
+            prompt_reuse_strategy = linked_save_prompt_prefix_state(
+                cache,
+                &prompt_prefix_hash,
+                &prompt_prefix_tokens,
+            );
+            linked_decode_prompt_tokens(
+                job,
+                cache.context.ptr,
+                &mut batch,
+                &tokens[prompt_prefix_tokens.len()..],
+                prompt_prefix_tokens.len(),
+                prompt_batch_tokens,
+                &mut cache.kv_tokens,
+                &mut cancel_probe,
+                true,
+            )?;
+        }
+    } else {
+        let common_prefix =
+            linked_reuse_prompt_prefix(cache.context.ptr, &mut cache.kv_tokens, &tokens);
+        prompt_reused_tokens = common_prefix;
+        prompt_decoded_tokens = tokens.len().saturating_sub(common_prefix);
+        if common_prefix > 0 {
+            prompt_reuse_strategy = "kv_prefix_reused".to_owned();
+        } else if !prompt_prefix_tokens.is_empty() {
+            prompt_reuse_strategy = "prefix_token_mismatch".to_owned();
+        }
+        linked_decode_prompt_tokens(
+            job,
+            cache.context.ptr,
+            &mut batch,
+            &tokens[common_prefix..],
+            common_prefix,
+            prompt_batch_tokens,
+            &mut cache.kv_tokens,
+            &mut cancel_probe,
+            true,
+        )?;
+    }
     let prompt_decode_ms = elapsed_ms(prompt_decode_start);
 
     let sampler_ptr = unsafe { llama_cpp_sys_4::llama_sampler_init_greedy() };
@@ -271,8 +336,10 @@ fn run_linked(
                 .to_owned(),
             prompt_tokens: tokens.len() as i64,
             prompt_cached_tokens_before: prompt_cached_tokens_before as i64,
-            prompt_reused_tokens: common_prefix as i64,
+            prompt_reused_tokens: prompt_reused_tokens as i64,
             prompt_decoded_tokens: prompt_decoded_tokens as i64,
+            prompt_reuse_strategy,
+            prompt_prefix_state_bytes: cache.prompt_prefix_state.len() as i64,
             generated_tokens,
             tokenize_ms,
             prompt_decode_ms,
@@ -421,6 +488,7 @@ fn linked_decode_prompt_tokens(
     prompt_batch_tokens: usize,
     kv_tokens: &mut Vec<llama_cpp_sys_4::llama_token>,
     cancel_probe: &mut CancelProbe,
+    final_logits: bool,
 ) -> Result<(), ModelError> {
     let mut decoded_tokens = 0;
     for chunk in tokens.chunks(prompt_batch_tokens) {
@@ -432,7 +500,7 @@ fn linked_decode_prompt_tokens(
                 i32::try_from(position).map_err(|_| {
                     ModelError::new("linked llama.cpp prompt position overflowed i32".to_owned())
                 })?,
-                decoded_tokens + chunk_index + 1 == tokens.len(),
+                final_logits && decoded_tokens + chunk_index + 1 == tokens.len(),
             )?;
         }
         if cancel_probe.due() && linked_cancel_requested(job.id)? {
@@ -472,6 +540,93 @@ impl CancelProbe {
             false
         }
     }
+}
+
+fn linked_prompt_prefix_reusable(
+    tokens: &[llama_cpp_sys_4::llama_token],
+    prefix_tokens: &[llama_cpp_sys_4::llama_token],
+) -> bool {
+    !prefix_tokens.is_empty() && prefix_tokens.len() < tokens.len() && tokens.starts_with(prefix_tokens)
+}
+
+fn linked_restore_prompt_prefix_state(
+    cache: &mut LinkedCache,
+    prompt_prefix_hash: &str,
+    prompt_prefix_tokens: &[llama_cpp_sys_4::llama_token],
+) -> bool {
+    if cache.prompt_prefix_hash != prompt_prefix_hash
+        || cache.prompt_prefix_tokens != prompt_prefix_tokens
+        || cache.prompt_prefix_state.is_empty()
+    {
+        return false;
+    }
+
+    linked_clear_context(cache.context.ptr);
+    let restored = unsafe {
+        llama_cpp_sys_4::llama_state_seq_set_data(
+            cache.context.ptr,
+            cache.prompt_prefix_state.as_ptr(),
+            cache.prompt_prefix_state.len(),
+            0,
+        )
+    };
+    if restored != cache.prompt_prefix_state.len() {
+        cache.prompt_prefix_hash.clear();
+        cache.prompt_prefix_tokens.clear();
+        cache.prompt_prefix_state.clear();
+        cache.kv_tokens.clear();
+        linked_clear_context(cache.context.ptr);
+        return false;
+    }
+
+    cache.kv_tokens.clear();
+    cache.kv_tokens.extend_from_slice(prompt_prefix_tokens);
+    true
+}
+
+fn linked_save_prompt_prefix_state(
+    cache: &mut LinkedCache,
+    prompt_prefix_hash: &str,
+    prompt_prefix_tokens: &[llama_cpp_sys_4::llama_token],
+) -> String {
+    let state_size =
+        unsafe { llama_cpp_sys_4::llama_state_seq_get_size(cache.context.ptr, 0) };
+    if state_size == 0 {
+        cache.prompt_prefix_hash.clear();
+        cache.prompt_prefix_tokens.clear();
+        cache.prompt_prefix_state.clear();
+        return "prefix_state_unavailable".to_owned();
+    }
+    if state_size > LINKED_PROMPT_PREFIX_STATE_MAX_BYTES {
+        cache.prompt_prefix_hash.clear();
+        cache.prompt_prefix_tokens.clear();
+        cache.prompt_prefix_state.clear();
+        return "prefix_state_too_large".to_owned();
+    }
+
+    let mut state = vec![0_u8; state_size];
+    let written = unsafe {
+        llama_cpp_sys_4::llama_state_seq_get_data(
+            cache.context.ptr,
+            state.as_mut_ptr(),
+            state.len(),
+            0,
+        )
+    };
+    if written != state.len() {
+        cache.prompt_prefix_hash.clear();
+        cache.prompt_prefix_tokens.clear();
+        cache.prompt_prefix_state.clear();
+        return "prefix_state_save_failed".to_owned();
+    }
+
+    cache.prompt_prefix_hash = prompt_prefix_hash.to_owned();
+    cache.prompt_prefix_tokens.clear();
+    cache
+        .prompt_prefix_tokens
+        .extend_from_slice(prompt_prefix_tokens);
+    cache.prompt_prefix_state = state;
+    "prefix_state_saved".to_owned()
 }
 
 /// Keeps the longest common prefix between the tokens already decoded into the
@@ -570,6 +725,9 @@ struct LinkedCache {
     /// Tokens known to occupy positions `0..len` of the context memory; used
     /// to reuse the KV cache for shared prompt prefixes across jobs.
     kv_tokens: Vec<llama_cpp_sys_4::llama_token>,
+    prompt_prefix_hash: String,
+    prompt_prefix_tokens: Vec<llama_cpp_sys_4::llama_token>,
+    prompt_prefix_state: Vec<u8>,
     load_ms: i64,
     ctx_ms: i64,
     model_memory_bytes: i64,
