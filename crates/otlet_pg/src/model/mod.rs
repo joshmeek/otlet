@@ -1,3 +1,5 @@
+#![allow(clippy::result_large_err)]
+
 use crate::job::Job;
 use crate::runtime::{parse_runtime_options, runtime_option_status};
 use serde_json::{Value, json};
@@ -70,11 +72,11 @@ pub(crate) struct ModelError {
     pub(crate) raw_output_hash: Option<String>,
     pub(crate) schema_validation_status: Option<String>,
     pub(crate) trace_summary: Option<Value>,
-    pub(crate) metrics: Option<ModelMetrics>,
+    pub(crate) metrics: Option<Box<ModelMetrics>>,
 }
 
 impl ModelError {
-    fn new(message: String) -> Self {
+    const fn new(message: String) -> Self {
         Self {
             message,
             raw_output: None,
@@ -148,7 +150,7 @@ impl ModelError {
     }
 
     fn with_metrics(mut self, metrics: ModelMetrics) -> Self {
-        self.metrics = Some(metrics);
+        self.metrics = Some(Box::new(metrics));
         self
     }
 }
@@ -197,7 +199,7 @@ pub(crate) fn run_job(job: &Job) -> Result<ModelRun, ModelError> {
     let runtime_options_hash = hash_json(&job.runtime_options);
     let input_shaping_hash = hash_json(&job.input_shaping);
     let decision_contract_hash = hash_json(&job.decision_contract);
-    let model_fingerprint_hash = hash_text(&model_fingerprint(job));
+    let model_fingerprint_hash = model_fingerprint_hash(job);
     let inference_cache_contract_hash = inference_cache_contract_hash(
         job,
         &instruction_hash,
@@ -367,47 +369,35 @@ pub(crate) fn run_job(job: &Job) -> Result<ModelRun, ModelError> {
     let (json, raw_json) = match parse_model_json(raw_output.as_str()) {
         Ok(parsed) => parsed,
         Err(err) => {
-            return Err(ModelError::with_context(
-                err,
-                raw_output.clone(),
-                &context,
-                trace_summary.clone(),
-            )
-            .with_metrics(metrics));
+            return Err(
+                ModelError::with_context(err, raw_output.clone(), &context, trace_summary)
+                    .with_metrics(metrics),
+            );
         }
     };
-    let output = match json.get("output").cloned() {
-        Some(output) => output,
-        None => {
-            return Err(ModelError::with_context(
-                "model JSON missing output".to_owned(),
-                raw_output.clone(),
-                &context,
-                trace_summary.clone(),
-            )
-            .with_metrics(metrics));
-        }
+    let Some(output) = json.get("output").cloned() else {
+        return Err(ModelError::with_context(
+            "model JSON missing output".to_owned(),
+            raw_output,
+            &context,
+            trace_summary,
+        )
+        .with_metrics(metrics));
     };
     let actions = match model_actions(&json) {
         Ok(actions) => actions,
         Err(err) => {
-            return Err(ModelError::with_context(
-                err,
-                raw_output.clone(),
-                &context,
-                trace_summary.clone(),
-            )
-            .with_metrics(metrics));
+            return Err(
+                ModelError::with_context(err, raw_output, &context, trace_summary)
+                    .with_metrics(metrics),
+            );
         }
     };
     if let Err(err) = validate_output(&job.output_schema, &output) {
-        return Err(ModelError::with_context(
-            err,
-            raw_output.clone(),
-            &context,
-            trace_summary.clone(),
-        )
-        .with_metrics(metrics));
+        return Err(
+            ModelError::with_context(err, raw_output, &context, trace_summary)
+                .with_metrics(metrics),
+        );
     }
     if cache_enabled && !metrics.inference_cache_hit {
         let stats = inference_cache_put(
@@ -416,7 +406,7 @@ pub(crate) fn run_job(job: &Job) -> Result<ModelRun, ModelError> {
             context.content_cache_key.clone(),
             context.contract_cache_key.clone(),
             context.model_cache_key.clone(),
-            raw_output.clone(),
+            raw_output,
         );
         metrics.inference_cache_entries = stats.entries;
         metrics.inference_cache_bytes = stats.bytes;

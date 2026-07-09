@@ -1,8 +1,8 @@
-fn nonempty_str(value: &str) -> Option<&str> {
+const fn nonempty_str(value: &str) -> Option<&str> {
     if value.is_empty() { None } else { Some(value) }
 }
 
-unsafe fn pg_cstr_str<'a>(value: *const c_char) -> Option<&'a str> {
+unsafe fn pg_cstr_str<'pg>(value: *const c_char) -> Option<&'pg str> {
     if value.is_null() {
         return None;
     }
@@ -10,7 +10,7 @@ unsafe fn pg_cstr_str<'a>(value: *const c_char) -> Option<&'a str> {
 }
 
 fn cstr(value: &str) -> CString {
-    CString::new(value).unwrap_or_else(|_| CString::new("").expect("empty CString is valid"))
+    CString::new(value).unwrap_or_default()
 }
 
 fn pg_cstr(value: &str) -> *mut c_char {

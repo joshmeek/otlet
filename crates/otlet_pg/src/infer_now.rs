@@ -309,6 +309,7 @@ pub(crate) fn request_infer_now(
     Ok(wait_for_submitted_infer_now(&submitted, timeout_ms)?.map(|completed| completed.job_id))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn request_infer_now_with_inline_task(
     task_name: &str,
     subject_id: &str,
@@ -404,12 +405,12 @@ fn submit_infer_now_text(
         slot.error_len = 0;
         slot.task_len = write_buf(&mut slot.task, task_name.as_bytes());
         slot.subject_len = write_buf(&mut slot.subject, subject_id.as_bytes());
-        slot.inline_task_len = inline_task_text
-            .map(|text| write_buf(&mut slot.inline_task, text.as_bytes()))
-            .unwrap_or_else(|| {
-                slot.inline_task.fill(0);
-                0
-            });
+        slot.inline_task_len = if let Some(text) = inline_task_text {
+            write_buf(&mut slot.inline_task, text.as_bytes())
+        } else {
+            slot.inline_task.fill(0);
+            0
+        };
         slot.input_len = write_buf(&mut slot.input, input_text.as_bytes());
         request_id
     };
@@ -454,8 +455,7 @@ pub(crate) fn status_json() -> JsonB {
         .slots
         .iter()
         .position(|slot| matches!(slot.state, STATE_RUNNING | STATE_REQUESTED))
-        .map(|slot| slot as i32)
-        .unwrap_or(-1);
+        .map_or(-1, |slot| i32::try_from(slot).unwrap_or(-1));
     let last_slot = state
         .slots
         .iter()
@@ -507,7 +507,7 @@ pub(crate) fn status_json() -> JsonB {
 
 #[unsafe(no_mangle)]
 pub extern "C-unwind" fn pg_finfo_otlet_worker_infer_now() -> *const pg_sys::Pg_finfo_record {
-    &OTLET_WORKER_INFER_NOW_FINFO
+    &raw const OTLET_WORKER_INFER_NOW_FINFO
 }
 
 #[pg_guard]
@@ -515,20 +515,18 @@ pub extern "C-unwind" fn pg_finfo_otlet_worker_infer_now() -> *const pg_sys::Pg_
 pub extern "C-unwind" fn otlet_worker_infer_now(fcinfo: pg_sys::FunctionCallInfo) -> pg_sys::Datum {
     let task_name = unsafe { pgrx::pg_getarg::<String>(fcinfo, 0) }.unwrap_or_default();
     let subject_id = unsafe { pgrx::pg_getarg::<String>(fcinfo, 1) }.unwrap_or_default();
-    let input = unsafe { pgrx::pg_getarg::<JsonB>(fcinfo, 2) }
-        .map(|json| json.0)
-        .unwrap_or_else(|| json!({}));
+    let input =
+        unsafe { pgrx::pg_getarg::<JsonB>(fcinfo, 2) }.map_or_else(|| json!({}), |json| json.0);
     let timeout_ms = unsafe { pgrx::pg_getarg::<i32>(fcinfo, 3) }
         .unwrap_or(10_000)
-        .clamp(0, MAX_WAIT_MS as i32) as u32;
+        .clamp(0, i32::try_from(MAX_WAIT_MS).unwrap_or(i32::MAX))
+        .cast_unsigned();
     let model_name = unsafe { pgrx::pg_getarg::<String>(fcinfo, 4) };
     let instruction = unsafe { pgrx::pg_getarg::<String>(fcinfo, 5) }.unwrap_or_default();
     let output_schema = unsafe { pgrx::pg_getarg::<JsonB>(fcinfo, 6) }
-        .map(|json| json.0)
-        .unwrap_or_else(|| json!({"type":"object"}));
-    let runtime_options = unsafe { pgrx::pg_getarg::<JsonB>(fcinfo, 7) }
-        .map(|json| json.0)
-        .unwrap_or_else(|| json!({}));
+        .map_or_else(|| json!({"type":"object"}), |json| json.0);
+    let runtime_options =
+        unsafe { pgrx::pg_getarg::<JsonB>(fcinfo, 7) }.map_or_else(|| json!({}), |json| json.0);
 
     let job = match model_name.as_deref().filter(|name| !name.is_empty()) {
         Some(model_name) => request_infer_now_with_inline_task(
@@ -555,7 +553,7 @@ pub extern "C-unwind" fn otlet_worker_infer_now(fcinfo: pg_sys::FunctionCallInfo
 
 #[unsafe(no_mangle)]
 pub extern "C-unwind" fn pg_finfo_otlet_worker_infer_now_state() -> *const pg_sys::Pg_finfo_record {
-    &OTLET_WORKER_INFER_NOW_STATE_FINFO
+    &raw const OTLET_WORKER_INFER_NOW_STATE_FINFO
 }
 
 #[pg_guard]
@@ -618,7 +616,7 @@ fn wait_for_request(request_id: u64, timeout_ms: u32) -> Result<Option<Completed
             pg_sys::TimestampDifferenceExceeds(
                 start,
                 pg_sys::GetCurrentTimestamp(),
-                timeout_ms as std::ffi::c_int,
+                std::ffi::c_int::try_from(timeout_ms).unwrap_or(std::ffi::c_int::MAX),
             )
         } {
             let mut cancel_job_id = 0;
@@ -652,10 +650,10 @@ fn wait_for_request(request_id: u64, timeout_ms: u32) -> Result<Option<Completed
                     }
                 }
             }
-            if cancel_job_id > 0 {
-                if let Err(err) = cancel_job(cancel_job_id) {
-                    pgrx::warning!("otlet infer-now timeout cancel failed: {err}");
-                }
+            if cancel_job_id > 0
+                && let Err(err) = cancel_job(cancel_job_id)
+            {
+                pgrx::warning!("otlet infer-now timeout cancel failed: {err}");
             }
             return Ok(None);
         }
@@ -663,7 +661,10 @@ fn wait_for_request(request_id: u64, timeout_ms: u32) -> Result<Option<Completed
         unsafe {
             pg_sys::WaitLatch(
                 pg_sys::MyLatch,
-                (pg_sys::WL_LATCH_SET | pg_sys::WL_TIMEOUT | pg_sys::WL_POSTMASTER_DEATH) as i32,
+                i32::try_from(
+                    pg_sys::WL_LATCH_SET | pg_sys::WL_TIMEOUT | pg_sys::WL_POSTMASTER_DEATH,
+                )
+                .unwrap_or(i32::MAX),
                 50,
                 pg_sys::PG_WAIT_EXTENSION,
             );
@@ -700,7 +701,7 @@ fn signal_requester_latch(slot: &InferNowSlot) {
 fn write_buf(target: &mut [u8], value: &[u8]) -> u32 {
     target.fill(0);
     target[..value.len()].copy_from_slice(value);
-    value.len() as u32
+    u32::try_from(value.len()).unwrap_or(u32::MAX)
 }
 
 fn read_buf(source: &[u8], len: usize) -> String {
@@ -725,7 +726,7 @@ fn write_error(slot: &mut InferNowSlot, error: &str) {
     let len = bytes.len().min(ERROR_CAP);
     slot.error.fill(0);
     slot.error[..len].copy_from_slice(&bytes[..len]);
-    slot.error_len = len as u32;
+    slot.error_len = u32::try_from(len).unwrap_or(u32::MAX);
 }
 
 fn check_len(label: &str, len: usize, cap: usize) -> Result<(), String> {
@@ -745,10 +746,12 @@ fn elapsed_between_ms(start: pg_sys::TimestampTz, end: pg_sys::TimestampTz) -> u
     if start == 0 || end == 0 {
         return 0;
     }
-    unsafe { pg_sys::TimestampDifferenceMilliseconds(start, end) }.max(0) as u64
+    unsafe { pg_sys::TimestampDifferenceMilliseconds(start, end) }
+        .max(0)
+        .cast_unsigned()
 }
 
-fn infer_queue_state_label(
+const fn infer_queue_state_label(
     requested_slots: usize,
     running_slots: usize,
     completed_slots: usize,

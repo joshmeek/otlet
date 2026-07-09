@@ -2,6 +2,7 @@ use pgrx::{FromDatum, JsonB, direct_function_call, pg_sys};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::ffi::{CStr, CString, c_char};
+use std::mem::size_of;
 use std::ptr;
 
 const CUSTOM_SCAN_NAME: &[u8] = b"Otlet Semantic Source CustomScan\0";

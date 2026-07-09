@@ -34,7 +34,7 @@ fn run_linked(
         model_params.use_mmap = linked_env_bool("OTLET_LLAMA_MMAP", model_params.use_mmap);
         model_params.use_mlock = linked_env_bool("OTLET_LLAMA_MLOCK", model_params.use_mlock);
         let prompt_batch_tokens = linked_prompt_batch_tokens();
-        let prompt_ubatch_tokens = linked_prompt_ubatch_tokens(prompt_batch_tokens);
+        let prompt_micro_batch_tokens = linked_prompt_ubatch_tokens(prompt_batch_tokens);
         let decode_threads = linked_decode_threads(options);
         let batch_threads = linked_batch_threads(options, decode_threads);
 
@@ -52,8 +52,8 @@ fn run_linked(
 
         let mut ctx_params = unsafe { llama_cpp_sys_4::llama_context_default_params() };
         ctx_params.n_ctx = LINKED_CONTEXT_WINDOW_TOKENS;
-        ctx_params.n_batch = prompt_batch_tokens as u32;
-        ctx_params.n_ubatch = prompt_ubatch_tokens as u32;
+        ctx_params.n_batch = usize_to_u32_saturating(prompt_batch_tokens);
+        ctx_params.n_ubatch = usize_to_u32_saturating(prompt_micro_batch_tokens);
         ctx_params.no_perf = linked_env_bool("OTLET_LLAMA_NO_PERF", true);
         linked_apply_flash_attn_type(&mut ctx_params);
         linked_apply_kv_cache_type(&mut ctx_params);
@@ -75,7 +75,7 @@ fn run_linked(
         let model_parameters =
             u64_to_i64_saturating(unsafe { llama_cpp_sys_4::llama_model_n_params(model.ptr) });
         let context_window_tokens =
-            u64_to_i64_saturating(unsafe { llama_cpp_sys_4::llama_n_ctx(context.ptr) } as u64);
+            u64_to_i64_saturating(u64::from(unsafe { llama_cpp_sys_4::llama_n_ctx(context.ptr) }));
 
         let vocab = unsafe { llama_cpp_sys_4::llama_model_get_vocab(model.ptr) };
         if vocab.is_null() {
@@ -150,8 +150,8 @@ fn run_linked(
         {
             prompt_reused_tokens = prompt_prefix_tokens.len();
             prompt_decoded_tokens = tokens.len().saturating_sub(prompt_reused_tokens);
-            prompt_reuse_strategy = "prefix_state_restored".to_owned();
-            prompt_prefix_state_bytes = state_bytes.min(i64::MAX as usize) as i64;
+            "prefix_state_restored".clone_into(&mut prompt_reuse_strategy);
+            prompt_prefix_state_bytes = usize_to_i64_saturating(state_bytes);
             linked_decode_prompt_tokens(
                 job,
                 cache.context.ptr,
@@ -183,7 +183,7 @@ fn run_linked(
                 &prompt_prefix_tokens,
             );
             prompt_reuse_strategy = saved_prefix.strategy;
-            prompt_prefix_state_bytes = saved_prefix.state_bytes.min(i64::MAX as usize) as i64;
+            prompt_prefix_state_bytes = usize_to_i64_saturating(saved_prefix.state_bytes);
             linked_decode_prompt_tokens(
                 job,
                 cache.context.ptr,
@@ -202,9 +202,9 @@ fn run_linked(
         prompt_reused_tokens = common_prefix;
         prompt_decoded_tokens = tokens.len().saturating_sub(common_prefix);
         if common_prefix > 0 {
-            prompt_reuse_strategy = "kv_prefix_reused".to_owned();
+            "kv_prefix_reused".clone_into(&mut prompt_reuse_strategy);
         } else if !prompt_prefix_tokens.is_empty() {
-            prompt_reuse_strategy = "prefix_token_mismatch".to_owned();
+            "prefix_token_mismatch".clone_into(&mut prompt_reuse_strategy);
         }
         linked_decode_prompt_tokens(
             job,
@@ -268,7 +268,7 @@ fn run_linked(
         };
         probability_trace.observe(sample.as_ref());
         if unsafe { llama_cpp_sys_4::llama_vocab_is_eog(cache.vocab, token) } {
-            stop_reason = "eog_token".to_owned();
+            "eog_token".clone_into(&mut stop_reason);
             break;
         }
 
@@ -285,7 +285,7 @@ fn run_linked(
         detailed_trace.observe(token, &output[piece_start..], sample);
         if let Some(end) = json_completion.observe(&output[piece_start..]) {
             output.truncate(end);
-            stop_reason = "json_complete".to_owned();
+            "json_complete".clone_into(&mut stop_reason);
             break;
         }
 
@@ -338,18 +338,16 @@ fn run_linked(
             worker_memory_budget_bytes: u64_to_i64_saturating(options.max_worker_rss_bytes),
             worker_memory_budget_policy: worker_memory_budget_policy(options.max_worker_rss_bytes)
                 .to_owned(),
-            prompt_tokens: tokens.len() as i64,
-            prompt_cached_tokens_before: prompt_cached_tokens_before as i64,
-            prompt_reused_tokens: prompt_reused_tokens as i64,
-            prompt_decoded_tokens: prompt_decoded_tokens as i64,
+            prompt_tokens: usize_to_i64_saturating(tokens.len()),
+            prompt_cached_tokens_before: usize_to_i64_saturating(prompt_cached_tokens_before),
+            prompt_reused_tokens: usize_to_i64_saturating(prompt_reused_tokens),
+            prompt_decoded_tokens: usize_to_i64_saturating(prompt_decoded_tokens),
             prompt_reuse_strategy,
             prompt_prefix_state_bytes,
-            prompt_prefix_cache_entries: cache.prompt_prefix_states.len().min(i64::MAX as usize)
-                as i64,
-            prompt_prefix_cache_bytes: linked_prompt_prefix_cache_bytes(cache)
-                .min(i64::MAX as usize) as i64,
-            effective_llama_threads: decode_threads as i64,
-            effective_llama_batch_threads: batch_threads as i64,
+            prompt_prefix_cache_entries: usize_to_i64_saturating(cache.prompt_prefix_states.len()),
+            prompt_prefix_cache_bytes: usize_to_i64_saturating(linked_prompt_prefix_cache_bytes(cache)),
+            effective_llama_threads: i64::from(decode_threads),
+            effective_llama_batch_threads: i64::from(batch_threads),
             generated_tokens,
             tokenize_ms,
             prompt_decode_ms,
@@ -373,19 +371,20 @@ fn run_linked(
 }
 
 fn linked_attempt_timed_out(start: Instant, max_attempt_ms: i64) -> bool {
-    max_attempt_ms > 0 && start.elapsed().as_millis() >= max_attempt_ms as u128
+    max_attempt_ms > 0
+        && start.elapsed().as_millis() >= u128::try_from(max_attempt_ms).unwrap_or(u128::MAX)
 }
 
 fn linked_decode_threads(options: &crate::runtime::RuntimeOptions) -> i32 {
     if options.llama_threads > 0 {
-        return options.llama_threads.min(i32::MAX as u64) as i32;
+        return u64_to_i32_saturating(options.llama_threads);
     }
     linked_default_decode_threads()
 }
 
 fn linked_batch_threads(options: &crate::runtime::RuntimeOptions, decode_threads: i32) -> i32 {
     if options.llama_batch_threads > 0 {
-        return options.llama_batch_threads.min(i32::MAX as u64) as i32;
+        return u64_to_i32_saturating(options.llama_batch_threads);
     }
     linked_env_i32("OTLET_LLAMA_BATCH_THREADS").unwrap_or(decode_threads)
 }
@@ -394,18 +393,19 @@ fn linked_default_decode_threads() -> i32 {
     static DECODE_THREADS: OnceLock<i32> = OnceLock::new();
     *DECODE_THREADS.get_or_init(|| {
         if let Some(threads) = linked_env_usize("OTLET_LLAMA_THREADS") {
-            return threads.min(i32::MAX as usize) as i32;
+            return usize_to_i32_saturating(threads);
         }
-        std::thread::available_parallelism()
-            .map(|threads| threads.get())
-            .unwrap_or(4)
-            .min(LINKED_DEFAULT_MAX_DECODE_THREADS)
-            .min(i32::MAX as usize) as i32
+        usize_to_i32_saturating(
+            std::thread::available_parallelism()
+                .map(std::num::NonZero::get)
+                .unwrap_or(4)
+                .min(LINKED_DEFAULT_MAX_DECODE_THREADS),
+        )
     })
 }
 
 fn linked_env_i32(name: &str) -> Option<i32> {
-    linked_env_usize(name).map(|value| value.min(i32::MAX as usize) as i32)
+    linked_env_usize(name).map(usize_to_i32_saturating)
 }
 
 fn linked_env_usize(name: &str) -> Option<usize> {
@@ -437,21 +437,21 @@ fn linked_apply_flash_attn_type(params: &mut llama_cpp_sys_4::llama_context_para
 }
 
 fn linked_apply_kv_cache_type(params: &mut llama_cpp_sys_4::llama_context_params) {
-    if let Ok(value) = std::env::var("OTLET_LLAMA_KV_TYPE") {
-        if let Some(cache_type) = linked_ggml_type(&value) {
-            params.type_k = cache_type;
-            params.type_v = cache_type;
-        }
+    if let Ok(value) = std::env::var("OTLET_LLAMA_KV_TYPE")
+        && let Some(cache_type) = linked_ggml_type(&value)
+    {
+        params.type_k = cache_type;
+        params.type_v = cache_type;
     }
-    if let Ok(value) = std::env::var("OTLET_LLAMA_KV_TYPE_K") {
-        if let Some(cache_type) = linked_ggml_type(&value) {
-            params.type_k = cache_type;
-        }
+    if let Ok(value) = std::env::var("OTLET_LLAMA_KV_TYPE_K")
+        && let Some(cache_type) = linked_ggml_type(&value)
+    {
+        params.type_k = cache_type;
     }
-    if let Ok(value) = std::env::var("OTLET_LLAMA_KV_TYPE_V") {
-        if let Some(cache_type) = linked_ggml_type(&value) {
-            params.type_v = cache_type;
-        }
+    if let Ok(value) = std::env::var("OTLET_LLAMA_KV_TYPE_V")
+        && let Some(cache_type) = linked_ggml_type(&value)
+    {
+        params.type_v = cache_type;
     }
 }
 
@@ -717,7 +717,7 @@ fn linked_reuse_prompt_prefix(
         } else {
             // Remove from the divergence point onward; this also clears any
             // stale generated tokens from the previous run.
-            llama_cpp_sys_4::llama_memory_seq_rm(memory, 0, common as i32, -1)
+            llama_cpp_sys_4::llama_memory_seq_rm(memory, 0, usize_to_i32_saturating(common), -1)
         }
     };
     if !removed {
@@ -858,7 +858,7 @@ impl LinkedBatch {
         Ok(batch)
     }
 
-    fn reset(&mut self) {
+    const fn reset(&mut self) {
         self.value.n_tokens = 0;
     }
 
@@ -874,7 +874,9 @@ impl LinkedBatch {
             ));
         }
 
-        let index = self.value.n_tokens as usize;
+        let index = usize::try_from(self.value.n_tokens).map_err(|_| {
+            ModelError::new("linked llama.cpp batch token count overflowed usize".to_owned())
+        })?;
         if index >= self.capacity {
             return Err(ModelError::new(format!(
                 "linked llama.cpp batch capacity exceeded: index {index} capacity {}",
@@ -949,7 +951,7 @@ fn tokenize_linked(
     if capacity <= 0 {
         return Ok(Vec::new());
     }
-    if capacity as u32 > LINKED_CONTEXT_WINDOW_TOKENS {
+    if u32::try_from(capacity).unwrap_or(u32::MAX) > LINKED_CONTEXT_WINDOW_TOKENS {
         return Err(ModelError::clean_failure(
             format!(
                 "linked llama.cpp prompt has at least {capacity} tokens, exceeds context window {LINKED_CONTEXT_WINDOW_TOKENS}"
@@ -959,14 +961,20 @@ fn tokenize_linked(
         ));
     }
 
-    let mut tokens = vec![0; capacity as usize];
+    let capacity_usize = usize::try_from(capacity).map_err(|_| {
+        ModelError::new("linked llama.cpp prompt capacity overflowed usize".to_owned())
+    })?;
+    let mut tokens = vec![0; capacity_usize];
+    let tokens_len = i32::try_from(tokens.len()).map_err(|_| {
+        ModelError::new("linked llama.cpp token buffer length overflowed i32".to_owned())
+    })?;
     let actual = unsafe {
         llama_cpp_sys_4::llama_tokenize(
             vocab,
             text.as_ptr(),
             text_len,
             tokens.as_mut_ptr(),
-            tokens.len() as i32,
+            tokens_len,
             true,
             true,
         )
@@ -976,13 +984,16 @@ fn tokenize_linked(
             "linked llama.cpp tokenize failed: {actual}"
         )));
     }
-    if actual as usize > tokens.len() {
+    let actual_usize = usize::try_from(actual).map_err(|_| {
+        ModelError::new("linked llama.cpp tokenize result overflowed usize".to_owned())
+    })?;
+    if actual_usize > tokens.len() {
         return Err(ModelError::new(format!(
             "linked llama.cpp tokenize wrote more tokens than allocated: {actual} > {}",
             tokens.len()
         )));
     }
-    tokens.truncate(actual as usize);
+    tokens.truncate(actual_usize);
     Ok(tokens)
 }
 
@@ -1005,12 +1016,15 @@ fn linked_token_to_piece_into(
     if buffer.len() < 128 {
         buffer.resize(128, 0);
     }
+    let Ok(buffer_len) = i32::try_from(buffer.len()) else {
+        return;
+    };
     let mut size = unsafe {
         llama_cpp_sys_4::llama_token_to_piece(
             vocab,
             token,
             buffer.as_mut_ptr().cast(),
-            buffer.len() as i32,
+            buffer_len,
             0,
             true,
         )
@@ -1024,12 +1038,15 @@ fn linked_token_to_piece_into(
             return;
         }
         buffer.resize(required, 0);
+        let Ok(buffer_len) = i32::try_from(buffer.len()) else {
+            return;
+        };
         size = unsafe {
             llama_cpp_sys_4::llama_token_to_piece(
                 vocab,
                 token,
                 buffer.as_mut_ptr().cast(),
-                buffer.len() as i32,
+                buffer_len,
                 0,
                 true,
             )
@@ -1038,7 +1055,13 @@ fn linked_token_to_piece_into(
     if size <= 0 {
         return;
     }
-    output.push_str(&String::from_utf8_lossy(&buffer[..size as usize]));
+    let Ok(size) = usize::try_from(size) else {
+        return;
+    };
+    if size > buffer.len() {
+        return;
+    }
+    output.push_str(&String::from_utf8_lossy(&buffer[..size]));
 }
 
 fn linked_token_to_piece(
@@ -1070,7 +1093,7 @@ struct JsonCompletion {
 }
 
 impl JsonCompletion {
-    fn new() -> Self {
+    const fn new() -> Self {
         Self {
             depth: 0,
             in_string: false,

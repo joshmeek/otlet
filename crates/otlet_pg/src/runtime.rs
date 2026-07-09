@@ -60,7 +60,7 @@ pub(crate) fn parse_runtime_options(value: &Value) -> Result<RuntimeOptions, Str
         if !matches!(reasoning, "on" | "off") {
             return Err("runtime_options.reasoning must be on or off".to_owned());
         }
-        options.reasoning = reasoning.to_owned();
+        reasoning.clone_into(&mut options.reasoning);
     }
 
     if let Some(value) = object.get("max_tokens") {

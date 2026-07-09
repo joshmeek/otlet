@@ -138,26 +138,24 @@ fn load_semantic_states(
             if let Some(subject_id) = row
                 .get_by_name::<String, _>("subject_id")
                 .map_err(to_string)?
-            {
-                if let Some(state) = row
+                && let Some(state) = row
                     .get_by_name::<String, _>("semantic_state")
                     .map_err(to_string)?
                     .and_then(|state| SubjectSemanticState::from_label(&state))
+            {
+                if matches!(
+                    state,
+                    SubjectSemanticState::FreshMatch | SubjectSemanticState::FreshNonMatch
+                ) && let Some(freshness_basis) = row
+                    .get_by_name::<String, _>("freshness_basis")
+                    .map_err(to_string)?
                 {
-                    if matches!(
-                        state,
-                        SubjectSemanticState::FreshMatch | SubjectSemanticState::FreshNonMatch
-                    ) && let Some(freshness_basis) = row
-                        .get_by_name::<String, _>("freshness_basis")
-                        .map_err(to_string)?
-                    {
-                        *freshness_basis_counts
-                            .entry(freshness_basis.clone())
-                            .or_insert(0) += 1;
-                        freshness_basis_by_subject.insert(subject_id.clone(), freshness_basis);
-                    }
-                    subjects.insert(subject_id, state);
+                    *freshness_basis_counts
+                        .entry(freshness_basis.clone())
+                        .or_insert(0) += 1;
+                    freshness_basis_by_subject.insert(subject_id.clone(), freshness_basis);
                 }
+                subjects.insert(subject_id, state);
             }
         }
         Ok(LoadedSemanticState {
@@ -238,26 +236,24 @@ fn load_semantic_join_states(
             if let Some(subject_id) = row
                 .get_by_name::<String, _>("subject_id")
                 .map_err(to_string)?
-            {
-                if let Some(state) = row
+                && let Some(state) = row
                     .get_by_name::<String, _>("semantic_state")
                     .map_err(to_string)?
                     .and_then(|state| SubjectSemanticState::from_label(&state))
+            {
+                if matches!(
+                    state,
+                    SubjectSemanticState::FreshMatch | SubjectSemanticState::FreshNonMatch
+                ) && let Some(freshness_basis) = row
+                    .get_by_name::<String, _>("freshness_basis")
+                    .map_err(to_string)?
                 {
-                    if matches!(
-                        state,
-                        SubjectSemanticState::FreshMatch | SubjectSemanticState::FreshNonMatch
-                    ) && let Some(freshness_basis) = row
-                        .get_by_name::<String, _>("freshness_basis")
-                        .map_err(to_string)?
-                    {
-                        *freshness_basis_counts
-                            .entry(freshness_basis.clone())
-                            .or_insert(0) += 1;
-                        freshness_basis_by_subject.insert(subject_id.clone(), freshness_basis);
-                    }
-                    subjects.insert(subject_id, state);
+                    *freshness_basis_counts
+                        .entry(freshness_basis.clone())
+                        .or_insert(0) += 1;
+                    freshness_basis_by_subject.insert(subject_id.clone(), freshness_basis);
                 }
+                subjects.insert(subject_id, state);
             }
         }
         Ok(LoadedSemanticState {
@@ -272,5 +268,5 @@ fn load_semantic_join_states(
 }
 
 fn freshness_basis_counts_json(counts: &BTreeMap<String, u64>) -> String {
-    serde_json::to_string(counts).unwrap_or_else(|_| "{}".to_string())
+    serde_json::to_string(counts).unwrap_or_else(|_| "{}".to_owned())
 }

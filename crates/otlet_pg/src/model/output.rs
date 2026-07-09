@@ -8,7 +8,7 @@ struct ShapedInput {
 
 fn shaped_model_input(input: &Value) -> ShapedInput {
     let serialized = input.to_string();
-    let bytes = serialized.len().min(i64::MAX as usize) as i64;
+    let bytes = usize_to_i64_saturating(serialized.len());
     let original_bytes = input
         .get("original_shaped_input_bytes")
         .and_then(Value::as_i64)
@@ -40,6 +40,8 @@ fn effective_instruction(instruction: &str, decision_contract: &Value) -> String
 }
 
 const SCHEMA_VALIDATOR_CACHE_MAX_ENTRIES: usize = 16;
+type SchemaValidator = std::sync::Arc<jsonschema::Validator>;
+type SchemaValidatorCache = Vec<(String, SchemaValidator)>;
 
 fn validate_output(schema: &Value, output: &Value) -> Result<(), String> {
     let validator = cached_schema_validator(schema)?;
@@ -54,9 +56,8 @@ fn validate_output_schema(schema: &Value) -> Result<(), String> {
 
 /// Task schemas repeat across jobs; compiling a jsonschema validator per run
 /// is wasted work, so keep a small LRU keyed by the serialized schema.
-fn cached_schema_validator(schema: &Value) -> Result<std::sync::Arc<jsonschema::Validator>, String> {
-    static CACHE: OnceLock<Mutex<Vec<(String, std::sync::Arc<jsonschema::Validator>)>>> =
-        OnceLock::new();
+fn cached_schema_validator(schema: &Value) -> Result<SchemaValidator, String> {
+    static CACHE: OnceLock<Mutex<SchemaValidatorCache>> = OnceLock::new();
 
     let key = schema.to_string();
     let cache = CACHE.get_or_init(|| Mutex::new(Vec::new()));
@@ -64,19 +65,23 @@ fn cached_schema_validator(schema: &Value) -> Result<std::sync::Arc<jsonschema::
         .lock()
         .map_err(|_| "schema validator cache lock poisoned".to_owned())?;
     if let Some(index) = cache.iter().position(|(cached, _)| *cached == key) {
-        let entry = cache.remove(index);
-        let validator = entry.1.clone();
-        cache.push(entry);
+        let validator = std::sync::Arc::clone(&cache[index].1);
+        if index + 1 < cache.len() {
+            let entry = cache.remove(index);
+            cache.push(entry);
+        }
+        drop(cache);
         return Ok(validator);
     }
 
-    let validator = std::sync::Arc::new(
+    let validator = SchemaValidator::new(
         jsonschema::validator_for(schema).map_err(|err| format!("invalid output schema: {err}"))?,
     );
-    cache.push((key, validator.clone()));
+    cache.push((key, std::sync::Arc::clone(&validator)));
     if cache.len() > SCHEMA_VALIDATOR_CACHE_MAX_ENTRIES {
         cache.remove(0);
     }
+    drop(cache);
     Ok(validator)
 }
 
@@ -85,14 +90,30 @@ fn trim_error(text: &str) -> String {
 }
 
 fn elapsed_ms(start: Instant) -> i64 {
-    start.elapsed().as_millis().min(i64::MAX as u128) as i64
+    i64::try_from(start.elapsed().as_millis()).unwrap_or(i64::MAX)
 }
 
 fn u64_to_i64_saturating(value: u64) -> i64 {
-    value.min(i64::MAX as u64) as i64
+    i64::try_from(value).unwrap_or(i64::MAX)
 }
 
-fn worker_memory_budget_policy(max_worker_rss_bytes: u64) -> &'static str {
+fn usize_to_i64_saturating(value: usize) -> i64 {
+    i64::try_from(value).unwrap_or(i64::MAX)
+}
+
+fn u64_to_i32_saturating(value: u64) -> i32 {
+    i32::try_from(value).unwrap_or(i32::MAX)
+}
+
+fn usize_to_i32_saturating(value: usize) -> i32 {
+    i32::try_from(value).unwrap_or(i32::MAX)
+}
+
+fn usize_to_u32_saturating(value: usize) -> u32 {
+    u32::try_from(value).unwrap_or(u32::MAX)
+}
+
+const fn worker_memory_budget_policy(max_worker_rss_bytes: u64) -> &'static str {
     if max_worker_rss_bytes > 0 {
         "max_worker_rss_bytes_fail_closed_no_late_materialization"
     } else {
@@ -117,7 +138,7 @@ fn enforce_worker_rss_budget(
             "worker_rss_sample_unavailable",
         ));
     }
-    if sample.rss_bytes as u64 > max_worker_rss_bytes {
+    if u64::try_from(sample.rss_bytes).unwrap_or(0) > max_worker_rss_bytes {
         return Err(ModelError::clean_failure(
             format!(
                 "linked worker RSS budget exceeded: rss_bytes={} max_worker_rss_bytes={} policy={}",
@@ -133,8 +154,13 @@ fn enforce_worker_rss_budget(
 }
 
 fn process_memory_sample() -> ProcessMemorySample {
-    match fs::read_to_string("/proc/self/status") {
-        Ok(status) => {
+    fs::read_to_string("/proc/self/status").map_or_else(
+        |_| ProcessMemorySample {
+            rss_bytes: 0,
+            virtual_bytes: 0,
+            policy: "proc_self_status_unavailable_non_linux_or_permission_denied".to_owned(),
+        },
+        |status| {
             let rss_bytes = proc_status_kib(&status, "VmRSS:").unwrap_or(0);
             let virtual_bytes = proc_status_kib(&status, "VmSize:").unwrap_or(0);
             let policy = if rss_bytes > 0 || virtual_bytes > 0 {
@@ -147,13 +173,8 @@ fn process_memory_sample() -> ProcessMemorySample {
                 virtual_bytes,
                 policy: policy.to_owned(),
             }
-        }
-        Err(_) => ProcessMemorySample {
-            rss_bytes: 0,
-            virtual_bytes: 0,
-            policy: "proc_self_status_unavailable_non_linux_or_permission_denied".to_owned(),
         },
-    }
+    )
 }
 
 fn proc_status_kib(status: &str, label: &str) -> Option<i64> {
@@ -167,10 +188,16 @@ fn hash_json(value: &Value) -> String {
 }
 
 fn hash_text(text: &str) -> String {
-    let mut hash = 0xcbf29ce484222325_u64;
-    for byte in text.as_bytes() {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x100000001b3);
+    hash_text_parts(&[text])
+}
+
+fn hash_text_parts(parts: &[&str]) -> String {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for part in parts {
+        for byte in part.as_bytes() {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x0100_0000_01b3);
+        }
     }
     format!("{hash:016x}")
 }

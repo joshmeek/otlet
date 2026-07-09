@@ -67,8 +67,7 @@ fn infer_now_failed_provenance_counts(
         "SELECT count(*)::bigint AS receipts, \
                 COALESCE(max(id), 0)::bigint AS receipt_id \
          FROM otlet.inference_receipts \
-         WHERE job_id = {} AND status = 'failed'",
-        job_id
+         WHERE job_id = {job_id} AND status = 'failed'"
     );
     pgrx::Spi::connect(|client| {
         let table = client
@@ -79,13 +78,11 @@ fn infer_now_failed_provenance_counts(
             receipts: row
                 .get_by_name::<i64, _>("receipts")
                 .map_err(to_string)?
-                .unwrap_or(0)
-                .max(0) as u64,
+                .map_or(0, nonnegative_count),
             receipt_id: row
                 .get_by_name::<i64, _>("receipt_id")
                 .map_err(to_string)?
-                .unwrap_or(0)
-                .max(0) as u64,
+                .map_or(0, nonnegative_count),
         })
     })
 }
@@ -95,12 +92,12 @@ fn infer_now_provenance_counts(job_id: i64) -> Result<InferNowProvenanceCounts, 
         "WITH receipt AS ( \
            SELECT * \
            FROM otlet.inference_receipts \
-           WHERE job_id = {} AND status = 'complete' \
+           WHERE job_id = {job_id} AND status = 'complete' \
            ORDER BY id DESC \
            LIMIT 1 \
          ) \
          SELECT \
-           (SELECT count(*)::bigint FROM otlet.inference_receipts WHERE job_id = {} AND status = 'complete') AS receipts, \
+           (SELECT count(*)::bigint FROM otlet.inference_receipts WHERE job_id = {job_id} AND status = 'complete') AS receipts, \
            COALESCE((SELECT id FROM receipt), 0)::bigint AS receipt_id, \
            COALESCE((SELECT prompt_tokens FROM receipt), 0)::bigint AS prompt_tokens, \
            COALESCE((SELECT generated_tokens FROM receipt), 0)::bigint AS generated_tokens, \
@@ -110,8 +107,7 @@ fn infer_now_provenance_counts(job_id: i64) -> Result<InferNowProvenanceCounts, 
            COALESCE((SELECT trace_summary ->> 'schema_force' FROM receipt), '') AS schema_force, \
            COALESCE((SELECT trace_summary -> 'detailed_trace' ->> 'status' FROM receipt), '') AS detailed_trace_status, \
            COALESCE(NULLIF((SELECT trace_summary #>> '{{detailed_trace,captured_tokens}}' FROM receipt), '')::bigint, 0)::bigint AS detailed_trace_captured_tokens, \
-           COALESCE(NULLIF((SELECT trace_summary #>> '{{detailed_trace,top_k}}' FROM receipt), '')::bigint, 0)::bigint AS detailed_trace_top_k",
-        job_id, job_id
+           COALESCE(NULLIF((SELECT trace_summary #>> '{{detailed_trace,top_k}}' FROM receipt), '')::bigint, 0)::bigint AS detailed_trace_top_k"
     );
     pgrx::Spi::connect(|client| {
         let table = client
@@ -122,28 +118,23 @@ fn infer_now_provenance_counts(job_id: i64) -> Result<InferNowProvenanceCounts, 
             receipts: row
                 .get_by_name::<i64, _>("receipts")
                 .map_err(to_string)?
-                .unwrap_or(0)
-                .max(0) as u64,
+                .map_or(0, nonnegative_count),
             receipt_id: row
                 .get_by_name::<i64, _>("receipt_id")
                 .map_err(to_string)?
-                .unwrap_or(0)
-                .max(0) as u64,
+                .map_or(0, nonnegative_count),
             prompt_tokens: row
                 .get_by_name::<i64, _>("prompt_tokens")
                 .map_err(to_string)?
-                .unwrap_or(0)
-                .max(0) as u64,
+                .map_or(0, nonnegative_count),
             generated_tokens: row
                 .get_by_name::<i64, _>("generated_tokens")
                 .map_err(to_string)?
-                .unwrap_or(0)
-                .max(0) as u64,
+                .map_or(0, nonnegative_count),
             generate_ms: row
                 .get_by_name::<i64, _>("generate_ms")
                 .map_err(to_string)?
-                .unwrap_or(0)
-                .max(0) as u64,
+                .map_or(0, nonnegative_count),
             trace_version: row
                 .get_by_name::<String, _>("trace_version")
                 .map_err(to_string)?
@@ -163,13 +154,11 @@ fn infer_now_provenance_counts(job_id: i64) -> Result<InferNowProvenanceCounts, 
             detailed_trace_captured_tokens: row
                 .get_by_name::<i64, _>("detailed_trace_captured_tokens")
                 .map_err(to_string)?
-                .unwrap_or(0)
-                .max(0) as u64,
+                .map_or(0, nonnegative_count),
             detailed_trace_top_k: row
                 .get_by_name::<i64, _>("detailed_trace_top_k")
                 .map_err(to_string)?
-                .unwrap_or(0)
-                .max(0) as u64,
+                .map_or(0, nonnegative_count),
         })
     })
 }

@@ -4,8 +4,12 @@ enum SemanticIndexKind {
     Join,
 }
 
+fn u64_to_u32_saturating(value: u64) -> u32 {
+    u32::try_from(value).unwrap_or(u32::MAX)
+}
+
 impl SemanticIndexKind {
-    fn as_str(self) -> &'static str {
+    const fn as_str(self) -> &'static str {
         match self {
             Self::Row => "row",
             Self::Join => "join",
@@ -146,15 +150,15 @@ struct RuntimeState {
     pending_output_rows: VecDeque<*mut pg_sys::TupleTableSlot>,
 }
 
-struct InferNowTraceExplain<'a> {
+struct InferNowTraceExplain<'trace> {
     receipt_id: u64,
     prompt_tokens: u64,
     generated_tokens: u64,
     generate_ms: u64,
-    version: Option<&'a str>,
-    probability_status: Option<&'a str>,
-    schema_force: Option<&'a str>,
-    detailed_status: Option<&'a str>,
+    version: Option<&'trace str>,
+    probability_status: Option<&'trace str>,
+    schema_force: Option<&'trace str>,
+    detailed_status: Option<&'trace str>,
     detailed_captured_tokens: u64,
     detailed_top_k: u64,
 }

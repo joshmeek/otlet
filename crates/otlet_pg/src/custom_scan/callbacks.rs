@@ -3,8 +3,8 @@ unsafe extern "C-unwind" fn create_semantic_custom_scan_state(
     _cscan: *mut pg_sys::CustomScan,
 ) -> *mut pg_sys::Node {
     unsafe {
-        let state = pg_sys::palloc0(std::mem::size_of::<OtletSemanticCustomScanState>())
-            as *mut OtletSemanticCustomScanState;
+        let state = pg_sys::palloc0(size_of::<OtletSemanticCustomScanState>())
+            .cast::<OtletSemanticCustomScanState>();
         (*state).css.ss.ps.type_ = pg_sys::NodeTag::T_CustomScanState;
         (*state).css.methods = &raw const CUSTOM_EXEC_METHODS;
         (*state).runtime = ptr::null_mut();
@@ -19,7 +19,7 @@ unsafe extern "C-unwind" fn begin_semantic_custom_scan(
     eflags: std::ffi::c_int,
 ) {
     unsafe {
-        let state = node as *mut OtletSemanticCustomScanState;
+        let state = node.cast::<OtletSemanticCustomScanState>();
         let Some(private) = custom_private_from_plan(node) else {
             return;
         };
@@ -31,16 +31,16 @@ unsafe extern "C-unwind" fn begin_semantic_custom_scan(
         if !relation.is_null() && !(*node).ss.ps.state.is_null() {
             pg_sys::ExecInitScanTupleSlot(
                 (*node).ss.ps.state,
-                &mut (*node).ss,
+                &raw mut (*node).ss,
                 (*relation).rd_att,
                 pg_sys::table_slot_callbacks(relation),
             );
         } else if relation.is_null() && !child_plan.is_null() && !(*node).ss.ps.state.is_null() {
             let mut ops_fixed = false;
-            let child_ops = pg_sys::ExecGetResultSlotOps(child_plan, &mut ops_fixed);
+            let child_ops = pg_sys::ExecGetResultSlotOps(child_plan, &raw mut ops_fixed);
             pg_sys::ExecInitScanTupleSlot(
                 (*node).ss.ps.state,
-                &mut (*node).ss,
+                &raw mut (*node).ss,
                 pg_sys::ExecGetResultType(child_plan),
                 child_ops,
             );
@@ -170,7 +170,7 @@ unsafe extern "C-unwind" fn exec_semantic_custom_scan(
 ) -> *mut pg_sys::TupleTableSlot {
     unsafe {
         pg_sys::ExecScan(
-            &mut (*node).ss,
+            &raw mut (*node).ss,
             Some(semantic_custom_scan_access),
             Some(semantic_custom_scan_recheck),
         )
@@ -182,8 +182,8 @@ unsafe extern "C-unwind" fn semantic_custom_scan_access(
     scan_state: *mut pg_sys::ScanState,
 ) -> *mut pg_sys::TupleTableSlot {
     unsafe {
-        let node = scan_state as *mut pg_sys::CustomScanState;
-        let state = node as *mut OtletSemanticCustomScanState;
+        let node = scan_state.cast::<pg_sys::CustomScanState>();
+        let state = node.cast::<OtletSemanticCustomScanState>();
         if (*state).runtime.is_null() {
             return clear_slot((*node).ss.ss_ScanTupleSlot);
         }
@@ -199,8 +199,11 @@ unsafe extern "C-unwind" fn semantic_custom_scan_access(
             runtime.rows_seen += 1;
 
             let mut isnull = false;
-            let value =
-                pg_sys::slot_getattr(slot, runtime.subject_attno as std::ffi::c_int, &mut isnull);
+            let value = pg_sys::slot_getattr(
+                slot,
+                std::ffi::c_int::from(runtime.subject_attno),
+                &raw mut isnull,
+            );
             if isnull {
                 continue;
             }
@@ -335,18 +338,18 @@ unsafe fn init_custom_child_plan(
         }
         if !(*node).custom_ps.is_null() && pg_sys::list_length((*node).custom_ps) > 0 {
             return (
-                pg_sys::list_nth((*node).custom_ps, 0) as *mut pg_sys::PlanState,
+                pg_sys::list_nth((*node).custom_ps, 0).cast::<pg_sys::PlanState>(),
                 false,
             );
         }
         if (*node).ss.ps.plan.is_null() {
             return (ptr::null_mut(), false);
         }
-        let scan = (*node).ss.ps.plan as *mut pg_sys::CustomScan;
+        let scan = (*node).ss.ps.plan.cast::<pg_sys::CustomScan>();
         if (*scan).custom_plans.is_null() || pg_sys::list_length((*scan).custom_plans) == 0 {
             return (ptr::null_mut(), false);
         }
-        let child_plan = pg_sys::list_nth((*scan).custom_plans, 0) as *mut pg_sys::Plan;
+        let child_plan = pg_sys::list_nth((*scan).custom_plans, 0).cast::<pg_sys::Plan>();
         if child_plan.is_null() {
             return (ptr::null_mut(), false);
         }
@@ -373,7 +376,7 @@ unsafe fn next_source_slot(
                 runtime.child_plan_rows += 1;
                 return Some(result_slot);
             }
-            let child_scan_state = runtime.child_plan as *mut pg_sys::ScanState;
+            let child_scan_state = runtime.child_plan.cast::<pg_sys::ScanState>();
             let slot = if child_scan_state.is_null()
                 || slot_is_empty((*child_scan_state).ss_ScanTupleSlot)
             {
@@ -390,7 +393,8 @@ unsafe fn next_source_slot(
 }
 
 unsafe fn slot_is_empty(slot: *mut pg_sys::TupleTableSlot) -> bool {
-    unsafe { slot.is_null() || ((*slot).tts_flags & pg_sys::TTS_FLAG_EMPTY as u16) != 0 }
+    let empty_flag = u16::try_from(pg_sys::TTS_FLAG_EMPTY).unwrap_or(u16::MAX);
+    unsafe { slot.is_null() || ((*slot).tts_flags & empty_flag) != 0 }
 }
 
 #[pgrx::pg_guard]
@@ -404,7 +408,7 @@ unsafe extern "C-unwind" fn semantic_custom_scan_recheck(
 #[pgrx::pg_guard]
 unsafe extern "C-unwind" fn rescan_semantic_custom_scan(node: *mut pg_sys::CustomScanState) {
     unsafe {
-        let state = node as *mut OtletSemanticCustomScanState;
+        let state = node.cast::<OtletSemanticCustomScanState>();
         if !(*state).runtime.is_null() {
             let runtime = &mut *(*state).runtime;
             free_buffered_rows(runtime);
@@ -452,7 +456,7 @@ unsafe extern "C-unwind" fn rescan_semantic_custom_scan(node: *mut pg_sys::Custo
 #[pgrx::pg_guard]
 unsafe extern "C-unwind" fn end_semantic_custom_scan(node: *mut pg_sys::CustomScanState) {
     unsafe {
-        let state = node as *mut OtletSemanticCustomScanState;
+        let state = node.cast::<OtletSemanticCustomScanState>();
         if !(*state).runtime.is_null() {
             let runtime = &mut *(*state).runtime;
             free_buffered_rows(runtime);

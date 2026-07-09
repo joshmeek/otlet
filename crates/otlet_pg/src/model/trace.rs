@@ -3,18 +3,13 @@ fn generation_trace_summary(
     metrics: &ModelMetrics,
     raw_output_hash: &str,
 ) -> Value {
-    let tokens_per_second = if metrics.generate_ms > 0 {
-        Some((metrics.generated_tokens as f64 * 1000.0) / metrics.generate_ms as f64)
-    } else {
-        None
-    };
+    let tokens_per_second = (metrics.generate_ms > 0)
+        .then(|| (metrics.generated_tokens as f64 * 1000.0) / metrics.generate_ms as f64);
     let steady_decode_ms = metrics.generate_ms.saturating_sub(metrics.first_token_ms);
     let steady_tokens = metrics.generated_tokens.saturating_sub(1);
-    let steady_tokens_per_second = if steady_decode_ms > 0 && steady_tokens > 0 {
-        Some((steady_tokens as f64 * 1000.0) / steady_decode_ms as f64)
-    } else {
-        None
-    };
+    let steady_tokens_per_second =
+        (steady_decode_ms > 0 && steady_tokens > 0)
+            .then(|| (steady_tokens as f64 * 1000.0) / steady_decode_ms as f64);
     let summary = json!({
         "trace_version": "otlet_generation_trace_v1",
         "prompt_hash": context.prompt_hash,
@@ -114,7 +109,9 @@ struct ProbabilityTrace {
 impl ProbabilityTrace {
     fn new(options: &crate::runtime::RuntimeOptions) -> Self {
         let max_tokens = if options.generation_trace {
-            PROBABILITY_TRACE_MAX_TOKENS.min(options.generation_trace_max_tokens as i64)
+            PROBABILITY_TRACE_MAX_TOKENS.min(u64_to_i64_saturating(
+                options.generation_trace_max_tokens,
+            ))
         } else {
             0
         };
@@ -124,7 +121,7 @@ impl ProbabilityTrace {
         }
     }
 
-    fn wants_sample(&self) -> bool {
+    const fn wants_sample(&self) -> bool {
         self.max_tokens > 0 && self.sampled_tokens + self.skipped_tokens < self.max_tokens
     }
 
@@ -219,7 +216,8 @@ unsafe fn probability_sample(
         if logits.is_null() {
             return None;
         }
-        let chosen_logit = *logits.add(token as usize) as f64;
+        let token_index = usize::try_from(token).ok()?;
+        let chosen_logit = f64::from(*logits.add(token_index));
         if !chosen_logit.is_finite() {
             return None;
         }
@@ -229,8 +227,9 @@ unsafe fn probability_sample(
         let mut rank = 1_i64;
         let mut top: Vec<(i64, f64)> = Vec::new();
         let track_top = top_k > 0;
-        for index in 0..vocab_tokens as usize {
-            let logit = *logits.add(index) as f64;
+        let top_limit = usize::try_from(top_k).unwrap_or(usize::MAX);
+        for index in 0..usize::try_from(vocab_tokens).ok()? {
+            let logit = f64::from(*logits.add(index));
             if !logit.is_finite() {
                 continue;
             }
@@ -244,7 +243,7 @@ unsafe fn probability_sample(
                 denominator += (logit - top_logit).exp();
             }
             if track_top {
-                push_top_logit(&mut top, top_k as usize, index as i64, logit);
+                push_top_logit(&mut top, top_limit, usize_to_i64_saturating(index), logit);
             }
         }
         if !top_logit.is_finite() || denominator <= 0.0 || !denominator.is_finite() {
@@ -261,7 +260,7 @@ unsafe fn probability_sample(
                         token_id,
                         token_text: linked_token_to_piece(
                             vocab,
-                            token_id as llama_cpp_sys_4::llama_token,
+                            llama_cpp_sys_4::llama_token::try_from(token_id).unwrap_or_default(),
                         ),
                         logit: rounded_probability(logit),
                         probability: rounded_probability(probability),
@@ -270,7 +269,7 @@ unsafe fn probability_sample(
                         } else {
                             f64::NEG_INFINITY
                         }),
-                        rank: index as i64 + 1,
+                        rank: usize_to_i64_saturating(index).saturating_add(1),
                     }
                 })
                 .collect()
@@ -318,7 +317,7 @@ struct DetailedGenerationTrace {
 }
 
 impl DetailedGenerationTrace {
-    fn new(options: &crate::runtime::RuntimeOptions) -> Self {
+    const fn new(options: &crate::runtime::RuntimeOptions) -> Self {
         Self {
             enabled: options.generation_trace,
             max_tokens: options.generation_trace_max_tokens,
@@ -330,7 +329,7 @@ impl DetailedGenerationTrace {
         }
     }
 
-    fn wants_sample(&self) -> bool {
+    const fn wants_sample(&self) -> bool {
         self.enabled && (self.steps.len() as u64) < self.max_tokens
     }
 
@@ -347,13 +346,13 @@ impl DetailedGenerationTrace {
             self.skipped_tokens += 1;
             return;
         }
-        self.chosen_token_ids.push(token as i64);
+        self.chosen_token_ids.push(i64::from(token));
         self.chosen_text.push_str(token_text);
-        let step = self.steps.len() as i64 + 1;
+        let step = usize_to_i64_saturating(self.steps.len()).saturating_add(1);
         let trace = match sample {
             Some(sample) => json!({
                 "step": step,
-                "token_id": token as i64,
+                "token_id": i64::from(token),
                 "token_text": token_text,
                 "chosen_logit": rounded_probability(sample.chosen_logit),
                 "chosen_probability": rounded_probability(sample.chosen_probability),
@@ -370,7 +369,7 @@ impl DetailedGenerationTrace {
             }),
             None => json!({
                 "step": step,
-                "token_id": token as i64,
+                "token_id": i64::from(token),
                 "token_text": token_text,
                 "probability_status": "unavailable"
             }),

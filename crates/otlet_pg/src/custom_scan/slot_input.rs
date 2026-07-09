@@ -12,7 +12,7 @@ fn refresh_runtime_subject_state(
     })?;
     runtime
         .semantic_states
-        .insert(subject_id.to_string(), state);
+        .insert(subject_id.to_owned(), state);
     Ok(state)
 }
 
@@ -67,16 +67,13 @@ unsafe fn semantic_join_slot_input(
     slot: *mut pg_sys::TupleTableSlot,
 ) -> Result<Option<Value>, String> {
     unsafe {
-        let input = match slot_jsonb_attribute(slot, "input")? {
-            Some(input) => Some(input),
-            None => slot_semantic_join_jsonb_input(slot)?,
-        };
+        let input = slot_jsonb_attribute(slot, "input")?.or_else(|| slot_semantic_join_jsonb_input(slot));
         let Some(input) = input else {
             return Ok(None);
         };
         match input {
             Value::Object(mut object) => {
-                object.entry("_otlet_mvcc".to_string()).or_insert_with(|| {
+                object.entry("_otlet_mvcc".to_owned()).or_insert_with(|| {
                     serde_json::json!({
                         "semantic_join_index": runtime.index_name,
                         "subject_id": subject_id
@@ -95,16 +92,14 @@ unsafe fn semantic_join_slot_input(
     }
 }
 
-unsafe fn slot_semantic_join_jsonb_input(
-    slot: *mut pg_sys::TupleTableSlot,
-) -> Result<Option<Value>, String> {
+unsafe fn slot_semantic_join_jsonb_input(slot: *mut pg_sys::TupleTableSlot) -> Option<Value> {
     unsafe {
         if slot.is_null() {
-            return Ok(None);
+            return None;
         }
         let tuple_desc = (*slot).tts_tupleDescriptor;
         if tuple_desc.is_null() {
-            return Ok(None);
+            return None;
         }
 
         let natts = (*tuple_desc).natts;
@@ -114,7 +109,8 @@ unsafe fn slot_semantic_join_jsonb_input(
                 continue;
             }
             let mut isnull = false;
-            let datum = pg_sys::slot_getattr(slot, (*attr).attnum as std::ffi::c_int, &mut isnull);
+            let datum =
+                pg_sys::slot_getattr(slot, std::ffi::c_int::from((*attr).attnum), &raw mut isnull);
             if isnull {
                 continue;
             }
@@ -124,10 +120,10 @@ unsafe fn slot_semantic_join_jsonb_input(
                 continue;
             };
             if semantic_join_input_shape(&json.0) {
-                return Ok(Some(json.0));
+                return Some(json.0);
             }
         }
-        Ok(None)
+        None
     }
 }
 
@@ -171,7 +167,8 @@ unsafe fn slot_jsonb_attribute(
                 ));
             }
             let mut isnull = false;
-            let datum = pg_sys::slot_getattr(slot, (*attr).attnum as std::ffi::c_int, &mut isnull);
+            let datum =
+                pg_sys::slot_getattr(slot, std::ffi::c_int::from((*attr).attnum), &raw mut isnull);
             if isnull {
                 return Ok(None);
             }
@@ -197,12 +194,12 @@ unsafe fn slot_row_json(
 
 unsafe fn typed_to_jsonb(datum: pg_sys::Datum, type_oid: pg_sys::Oid) -> Result<Value, String> {
     unsafe {
-        let flinfo =
-            pg_sys::palloc0(std::mem::size_of::<pg_sys::FmgrInfo>()).cast::<pg_sys::FmgrInfo>();
-        pg_sys::fmgr_info(pg_sys::F_TO_JSONB.into(), flinfo);
+        let function_info =
+            pg_sys::palloc0(size_of::<pg_sys::FmgrInfo>()).cast::<pg_sys::FmgrInfo>();
+        pg_sys::fmgr_info(pg_sys::F_TO_JSONB.into(), function_info);
 
         let func_expr =
-            pg_sys::palloc0(std::mem::size_of::<pg_sys::FuncExpr>()).cast::<pg_sys::FuncExpr>();
+            pg_sys::palloc0(size_of::<pg_sys::FuncExpr>()).cast::<pg_sys::FuncExpr>();
         (*func_expr).xpr.type_ = pg_sys::NodeTag::T_FuncExpr;
         (*func_expr).funcid = pg_sys::F_TO_JSONB.into();
         (*func_expr).funcresulttype = pg_sys::JSONBOID;
@@ -213,7 +210,7 @@ unsafe fn typed_to_jsonb(datum: pg_sys::Datum, type_oid: pg_sys::Oid) -> Result<
         (*func_expr).inputcollid = pg_sys::InvalidOid;
         (*func_expr).location = -1;
 
-        let arg = pg_sys::palloc0(std::mem::size_of::<pg_sys::Const>()).cast::<pg_sys::Const>();
+        let arg = pg_sys::palloc0(size_of::<pg_sys::Const>()).cast::<pg_sys::Const>();
         (*arg).xpr.type_ = pg_sys::NodeTag::T_Const;
         (*arg).consttype = type_oid;
         (*arg).consttypmod = -1;
@@ -225,34 +222,35 @@ unsafe fn typed_to_jsonb(datum: pg_sys::Datum, type_oid: pg_sys::Oid) -> Result<
         (*arg).location = -1;
 
         (*func_expr).args = list_make1(arg.cast());
-        (*flinfo).fn_expr = func_expr.cast();
+        (*function_info).fn_expr = func_expr.cast();
 
-        let fcinfo_size = std::mem::size_of::<pg_sys::FunctionCallInfoBaseData>()
-            + std::mem::size_of::<pg_sys::NullableDatum>();
-        let fcinfo = pg_sys::palloc0(fcinfo_size).cast::<pg_sys::FunctionCallInfoBaseData>();
-        (*fcinfo).flinfo = flinfo;
-        (*fcinfo).context = ptr::null_mut();
-        (*fcinfo).resultinfo = ptr::null_mut();
-        (*fcinfo).fncollation = pg_sys::InvalidOid;
-        (*fcinfo).isnull = false;
-        (*fcinfo).nargs = 1;
-        let args_ptr: *mut pg_sys::NullableDatum = ptr::addr_of_mut!((*fcinfo).args).cast();
+        let call_info_size =
+            size_of::<pg_sys::FunctionCallInfoBaseData>() + size_of::<pg_sys::NullableDatum>();
+        let call_info =
+            pg_sys::palloc0(call_info_size).cast::<pg_sys::FunctionCallInfoBaseData>();
+        (*call_info).flinfo = function_info;
+        (*call_info).context = ptr::null_mut();
+        (*call_info).resultinfo = ptr::null_mut();
+        (*call_info).fncollation = pg_sys::InvalidOid;
+        (*call_info).isnull = false;
+        (*call_info).nargs = 1;
+        let args_ptr: *mut pg_sys::NullableDatum = ptr::addr_of_mut!((*call_info).args).cast();
         (*args_ptr).value = datum;
         (*args_ptr).isnull = false;
 
-        let result = pg_sys::to_jsonb(fcinfo);
-        let is_null = (*fcinfo).isnull;
-        pg_sys::pfree(fcinfo.cast());
-        pg_sys::pfree(flinfo.cast());
+        let result = pg_sys::to_jsonb(call_info);
+        let is_null = (*call_info).isnull;
+        pg_sys::pfree(call_info.cast());
+        pg_sys::pfree(function_info.cast());
         pg_sys::list_free_deep((*func_expr).args);
         pg_sys::pfree(func_expr.cast());
 
         if is_null {
-            return Err("Postgres to_jsonb returned null for source slot row".to_string());
+            return Err("Postgres to_jsonb returned null for source slot row".to_owned());
         }
         <JsonB as FromDatum>::from_polymorphic_datum(result, false, pg_sys::JSONBOID)
             .map(|json| json.0)
-            .ok_or_else(|| "Postgres to_jsonb returned an unreadable jsonb datum".to_string())
+            .ok_or_else(|| "Postgres to_jsonb returned an unreadable jsonb datum".to_owned())
     }
 }
 
@@ -260,7 +258,7 @@ unsafe fn slot_tid_text(slot: *mut pg_sys::TupleTableSlot) -> Result<String, Str
     unsafe {
         let tid = &raw const (*slot).tts_tid;
         if !pg_sys::ItemPointerIsValid(tid) {
-            return Err("source slot has no valid ctid".to_string());
+            return Err("source slot has no valid ctid".to_owned());
         }
         let datum = pg_sys::ItemPointerGetDatum(tid);
         pg_output_text(pg_sys::tidout, datum)
@@ -270,9 +268,9 @@ unsafe fn slot_tid_text(slot: *mut pg_sys::TupleTableSlot) -> Result<String, Str
 unsafe fn slot_xmin_text(slot: *mut pg_sys::TupleTableSlot) -> Result<String, String> {
     unsafe {
         let mut should_free = false;
-        let tuple = pg_sys::ExecFetchSlotHeapTuple(slot, false, &mut should_free);
+        let tuple = pg_sys::ExecFetchSlotHeapTuple(slot, false, &raw mut should_free);
         if tuple.is_null() || (*tuple).t_data.is_null() {
-            return Err("source slot has no heap tuple for xmin".to_string());
+            return Err("source slot has no heap tuple for xmin".to_owned());
         }
         let xmin = (*(*tuple).t_data).t_choice.t_heap.t_xmin;
         let text = pg_output_text(pg_sys::xidout, pg_sys::TransactionIdGetDatum(xmin));
@@ -289,9 +287,9 @@ unsafe fn pg_output_text(
 ) -> Result<String, String> {
     unsafe {
         let cstr = direct_function_call::<&CStr>(func, &[Some(datum)])
-            .ok_or_else(|| "Postgres output function returned null".to_string())?;
-        let text = cstr.to_str().map_err(|err| err.to_string())?.to_string();
-        pg_sys::pfree(cstr.as_ptr() as *mut std::ffi::c_void);
+            .ok_or_else(|| "Postgres output function returned null".to_owned())?;
+        let text = cstr.to_str().map_err(|err| err.to_string())?.to_owned();
+        pg_sys::pfree(cstr.as_ptr().cast_mut().cast());
         Ok(text)
     }
 }

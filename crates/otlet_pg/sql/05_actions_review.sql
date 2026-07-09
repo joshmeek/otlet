@@ -181,6 +181,7 @@ DECLARE
   action_type_name text;
   action_status text;
   action_approval_status text;
+  action_rejected_by_watch boolean;
   action_subject_id text;
   action_requires_approval boolean;
   action_creates_record boolean;
@@ -283,23 +284,29 @@ BEGIN
     END;
     action_type_name := COALESCE(NULLIF(action ->> 'type', ''), 'invalid');
     action_error := otlet.action_validation_error(action, complete_job.output, job_row.subject_id, job_row.input);
-    IF action_error IS NULL
-       AND EXISTS (
-         SELECT 1
-         FROM otlet.watches w
-         WHERE w.task_name = job_row.task_name
-           AND cardinality(w.action_types) > 0
-           AND NOT action_type_name = ANY(w.action_types)
-       ) THEN
-      action_error := 'action type ' || action_type_name || ' is not allowed by watch';
-    END IF;
+    action_rejected_by_watch := false;
     action_requires_approval := false;
     action_creates_record := false;
     IF action_error IS NULL THEN
-      SELECT s.requires_approval, s.creates_record
-      INTO action_requires_approval, action_creates_record
-      FROM otlet.action_type_schemas s
-      WHERE s.action_type = action_type_name;
+      SELECT
+        EXISTS (
+          SELECT 1
+          FROM otlet.watches w
+          WHERE w.task_name = job_row.task_name
+            AND cardinality(w.action_types) > 0
+            AND NOT action_type_name = ANY(w.action_types)
+        ),
+        COALESCE(s.requires_approval, false),
+        COALESCE(s.creates_record, false)
+      INTO action_rejected_by_watch, action_requires_approval, action_creates_record
+      FROM (SELECT 1) seed
+      LEFT JOIN otlet.action_type_schemas s ON s.action_type = action_type_name;
+
+      IF action_rejected_by_watch THEN
+        action_error := 'action type ' || action_type_name || ' is not allowed by watch';
+        action_requires_approval := false;
+        action_creates_record := false;
+      END IF;
     END IF;
     action_subject_id := COALESCE(
       NULLIF(action_payload ->> 'subject_id', ''),

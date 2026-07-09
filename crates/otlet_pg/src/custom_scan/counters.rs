@@ -12,11 +12,10 @@ fn record_emitted_freshness_basis(runtime: &mut RuntimeState, subject_id: &str) 
     let basis = runtime
         .subject_freshness_basis
         .get(subject_id)
-        .map(String::as_str)
-        .unwrap_or("runtime_refresh");
+        .map_or("runtime_refresh", String::as_str);
     *runtime
         .emitted_freshness_basis
-        .entry(basis.to_string())
+        .entry(basis.to_owned())
         .or_insert(0) += 1;
 }
 

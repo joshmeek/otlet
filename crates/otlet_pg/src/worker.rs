@@ -4,6 +4,7 @@ use crate::job::{
 use crate::model::{ModelError, ModelMetrics, ModelRun, run_job};
 use pgrx::JsonB;
 use pgrx::bgworkers::{BackgroundWorker, SignalWakeFlags};
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 #[pgrx::pg_guard]
@@ -31,7 +32,7 @@ pub extern "C-unwind" fn otlet_worker_main(_arg: pgrx::pg_sys::Datum) {
         }
 
         while let Some(request) = crate::infer_now::take_request() {
-            process_infer_now_request(request);
+            process_infer_now_request(&request);
         }
 
         let sweep_result: pgrx::spi::Result<()> = BackgroundWorker::transaction(|| {
@@ -59,7 +60,7 @@ pub extern "C-unwind" fn otlet_worker_main(_arg: pgrx::pg_sys::Datum) {
                 (
                     job.task_name.clone(),
                     job.model_name.clone(),
-                    jobs.len() as i64,
+                    i64::try_from(jobs.len()).unwrap_or(i64::MAX),
                 )
             });
 
@@ -77,9 +78,9 @@ pub extern "C-unwind" fn otlet_worker_main(_arg: pgrx::pg_sys::Datum) {
                     batch_ms,
                     batch_result.model_swaps,
                 );
-                drained += job_count as u64;
+                drained += u64::try_from(job_count).unwrap_or(0);
             } else {
-                drained += (batch_result.completed + batch_result.failed) as u64;
+                drained += u64::try_from(batch_result.completed + batch_result.failed).unwrap_or(0);
             }
         }
         crate::wake::record_worker_drain(drained);
@@ -89,8 +90,8 @@ pub extern "C-unwind" fn otlet_worker_main(_arg: pgrx::pg_sys::Datum) {
     pgrx::log!("otlet worker stopped");
 }
 
-fn process_infer_now_request(request: crate::infer_now::InferNowRequest) {
-    if let Err(err) = ensure_inline_task(&request) {
+fn process_infer_now_request(request: &crate::infer_now::InferNowRequest) {
+    if let Err(err) = ensure_inline_task(request) {
         crate::infer_now::finish_request(
             request.id,
             0,
@@ -125,7 +126,7 @@ fn process_infer_now_request(request: crate::infer_now::InferNowRequest) {
     crate::infer_now::mark_request_job_started(request.id, job_id);
     let task_name = job.task_name.clone();
     let subject_id = job.subject_id.clone();
-    if !process_job(job).completed {
+    if !process_job(&job).completed {
         let error = infer_now_job_error(job_id);
         crate::infer_now::finish_request(request.id, job_id, Some(&error));
         return;
@@ -213,7 +214,7 @@ fn infer_now_job_error(job_id: i64) -> String {
 
     match result {
         Ok(Some(error)) => error,
-        Ok(None) => "infer-now job failed without job error".to_string(),
+        Ok(None) => "infer-now job failed without job error".to_owned(),
         Err(err) => format!("infer-now job failed; error lookup failed: {err}"),
     }
 }
@@ -249,13 +250,13 @@ impl JobProcessResult {
         result
     }
 
-    fn add_metrics(&mut self, metrics: &ModelMetrics) {
+    const fn add_metrics(&mut self, metrics: &ModelMetrics) {
         if !metrics.cache_hit && !metrics.inference_cache_hit && metrics.model_memory_bytes > 0 {
             self.model_swaps += 1;
         }
     }
 
-    fn add_result_metrics(&mut self, result: &JobProcessResult) {
+    const fn add_result_metrics(&mut self, result: &Self) {
         self.model_swaps += result.model_swaps;
     }
 }
@@ -267,64 +268,86 @@ struct BatchProcessResult {
     model_swaps: i64,
 }
 
+#[derive(Default)]
+struct ModelSelectionPolicyCache {
+    policies: HashMap<String, Option<ModelSelectionPolicy>>,
+}
+
+impl ModelSelectionPolicyCache {
+    fn lookup(&mut self, task_name: &str) -> pgrx::spi::Result<Option<ModelSelectionPolicy>> {
+        if let Some(policy) = self.policies.get(task_name) {
+            return Ok(policy.clone());
+        }
+
+        let policy = BackgroundWorker::transaction(|| model_selection_policy(task_name))?;
+        self.policies.insert(task_name.to_owned(), policy.clone());
+        Ok(policy)
+    }
+}
+
 impl BatchProcessResult {
-    fn add_metrics(&mut self, result: &JobProcessResult) {
+    const fn add_metrics(&mut self, result: &JobProcessResult) {
         self.model_swaps += result.model_swaps;
     }
 
-    fn add_finished(&mut self, result: JobProcessResult) {
+    const fn add_finished(&mut self, result: &JobProcessResult) {
         if result.completed {
             self.completed += 1;
         } else {
             self.failed += 1;
         }
-        self.add_metrics(&result);
+        self.add_metrics(result);
     }
 }
 
 fn process_job_batch(jobs: Vec<Job>) -> BatchProcessResult {
     let mut batch = BatchProcessResult::default();
+    let mut policy_cache = ModelSelectionPolicyCache::default();
     let mut strong_jobs = Vec::new();
     for job in jobs {
-        let mut result = process_job_deferred(job);
+        let mut result = process_job_deferred(&job, &mut policy_cache);
         if let Some((strong_job, reason)) = result.strong_fallback.take() {
             strong_jobs.push((result, strong_job, reason));
         } else {
-            batch.add_finished(result);
+            batch.add_finished(&result);
         }
     }
 
     for (mut result, job, reason) in strong_jobs {
-        let strong_result = run_strong_attempt_result(job, reason);
+        let strong_result = run_strong_attempt_result(&job, reason);
         result.completed = strong_result.completed;
         result.add_result_metrics(&strong_result);
-        batch.add_finished(result);
+        batch.add_finished(&result);
     }
 
     batch
 }
 
-fn process_job(job: Job) -> JobProcessResult {
-    let mut result = process_job_deferred(job);
+fn process_job(job: &Job) -> JobProcessResult {
+    let mut policy_cache = ModelSelectionPolicyCache::default();
+    let mut result = process_job_deferred(job, &mut policy_cache);
     if let Some((job, reason)) = result.strong_fallback.take() {
-        let strong_result = run_strong_attempt_result(job, reason);
+        let strong_result = run_strong_attempt_result(&job, reason);
         result.completed = strong_result.completed;
         result.add_result_metrics(&strong_result);
     }
     result
 }
 
-fn process_job_deferred(job: Job) -> JobProcessResult {
-    mark_job_started(&job);
+fn process_job_deferred(
+    job: &Job,
+    policy_cache: &mut ModelSelectionPolicyCache,
+) -> JobProcessResult {
+    mark_job_started(job);
 
-    match BackgroundWorker::transaction(|| model_selection_policy(&job.task_name)) {
-        Ok(Some(policy)) => process_selected_job(job, policy),
+    match policy_cache.lookup(&job.task_name) {
+        Ok(Some(policy)) => process_selected_job(job, &policy),
         Ok(None) => process_direct_job(job),
         Err(err) => {
             pgrx::warning!("otlet model selection policy lookup failed: {err}");
             JobProcessResult::completed(fail_attempt(
-                &job,
-                ModelError {
+                job,
+                &ModelError {
                     message: format!("model selection policy lookup failed: {err}"),
                     raw_output: None,
                     prompt_hash: None,
@@ -355,25 +378,25 @@ fn mark_job_started(job: &Job) {
     }
 }
 
-fn process_direct_job(job: Job) -> JobProcessResult {
-    match run_job(&job) {
+fn process_direct_job(job: &Job) -> JobProcessResult {
+    match run_job(job) {
         Ok(run) => {
             let mut result = JobProcessResult::from_run(false, &run);
-            if let Some(accept_checks) = direct_accept_field_checks(&job) {
+            if let Some(accept_checks) = direct_accept_field_checks(job) {
                 let (accepted, _) = accepted_by_policy(&run.output, &accept_checks);
                 if !accepted {
                     result.completed =
-                        reject_direct_attempt(&job, run, "direct_rejected_by_decision_contract");
+                        reject_direct_attempt(job, run, "direct_rejected_by_decision_contract");
                     return result;
                 }
             }
-            result.completed = accept_attempt(&job, run, "direct", "accepted_by_direct_task");
+            result.completed = accept_attempt(job, run, "direct", "accepted_by_direct_task");
             result
         }
         Err(err) => {
             let mut result = JobProcessResult::from_error(false, &err);
             let selection_reason = failure_selection_reason(&err, "direct_attempt_failed");
-            result.completed = fail_attempt(&job, err, "direct", selection_reason);
+            result.completed = fail_attempt(job, &err, "direct", selection_reason);
             result
         }
     }
@@ -413,7 +436,7 @@ fn direct_accept_field_checks(job: &Job) -> Option<serde_json::Value> {
     }))
 }
 
-fn process_selected_job(job: Job, policy: ModelSelectionPolicy) -> JobProcessResult {
+fn process_selected_job(job: &Job, policy: &ModelSelectionPolicy) -> JobProcessResult {
     let cheap_job = job.with_model(&policy.cheap);
     match run_job(&cheap_job) {
         Ok(run) => {
@@ -435,7 +458,7 @@ fn process_selected_job(job: Job, policy: ModelSelectionPolicy) -> JobProcessRes
             result
         }
         Err(err) if err.message == "canceled" => {
-            JobProcessResult::completed(fail_attempt(&cheap_job, err, "cheap", "canceled"))
+            JobProcessResult::completed(fail_attempt(&cheap_job, &err, "cheap", "canceled"))
         }
         Err(err) if err.raw_output.is_some() => {
             let mut result = JobProcessResult::from_error(false, &err);
@@ -451,28 +474,28 @@ fn process_selected_job(job: Job, policy: ModelSelectionPolicy) -> JobProcessRes
         }
         Err(err) => {
             let selection_reason = failure_selection_reason(&err, "cheap_runtime_failed");
-            JobProcessResult::completed(fail_attempt(&cheap_job, err, "cheap", selection_reason))
+            JobProcessResult::completed(fail_attempt(&cheap_job, &err, "cheap", selection_reason))
         }
     }
 }
 
-fn run_strong_attempt_result(job: Job, reason: &str) -> JobProcessResult {
-    match run_job(&job) {
+fn run_strong_attempt_result(job: &Job, reason: &str) -> JobProcessResult {
+    match run_job(job) {
         Ok(run) => {
             let mut result = JobProcessResult::from_run(false, &run);
-            result.completed = accept_attempt(&job, run, "strong", reason);
+            result.completed = accept_attempt(job, run, "strong", reason);
             result
         }
         Err(err) => {
             let mut result = JobProcessResult::from_error(false, &err);
             let selection_reason = failure_selection_reason(&err, "strong_attempt_failed");
-            result.completed = fail_attempt(&job, err, "strong", selection_reason);
+            result.completed = fail_attempt(job, &err, "strong", selection_reason);
             result
         }
     }
 }
 
-fn failure_selection_reason<'a>(err: &ModelError, fallback: &'a str) -> &'a str {
+fn failure_selection_reason<'reason>(err: &ModelError, fallback: &'reason str) -> &'reason str {
     if err.message == "attempt_timeout" {
         "attempt_timeout"
     } else {
@@ -495,12 +518,7 @@ fn accepted_by_policy(
         else {
             return (false, "missing_confidence_field".to_owned());
         };
-        let accepted_confidence = json_string_array(accept_field_checks, "accepted_confidence");
-        if !accepted_confidence.is_empty()
-            && !accepted_confidence
-                .iter()
-                .any(|allowed| allowed == confidence)
-        {
+        if !json_string_array_allows(accept_field_checks, "accepted_confidence", confidence) {
             return (false, "confidence_below_policy".to_owned());
         }
     }
@@ -515,28 +533,38 @@ fn accepted_by_policy(
     let Some(answer) = output.get(answer_field).and_then(serde_json::Value::as_str) else {
         return (false, "missing_decision_field".to_owned());
     };
-    if json_string_array(accept_field_checks, "abstain_values")
-        .iter()
-        .any(|abstain| abstain == answer)
-    {
+    if json_string_array_contains(accept_field_checks, "abstain_values", answer) {
         return (false, "abstained_output".to_owned());
     }
 
     (true, "accepted_by_policy".to_owned())
 }
 
-fn json_string_array(value: &serde_json::Value, key: &str) -> Vec<String> {
+fn json_string_array_allows(value: &serde_json::Value, key: &str, expected: &str) -> bool {
+    let Some(items) = value.get(key).and_then(serde_json::Value::as_array) else {
+        return true;
+    };
+
+    let mut has_strings = false;
+    for item in items.iter().filter_map(serde_json::Value::as_str) {
+        has_strings = true;
+        if item == expected {
+            return true;
+        }
+    }
+    !has_strings
+}
+
+fn json_string_array_contains(value: &serde_json::Value, key: &str, expected: &str) -> bool {
     value
         .get(key)
         .and_then(serde_json::Value::as_array)
-        .map(|items| {
+        .is_some_and(|items| {
             items
                 .iter()
                 .filter_map(serde_json::Value::as_str)
-                .map(str::to_owned)
-                .collect()
+                .any(|item| item == expected)
         })
-        .unwrap_or_default()
 }
 
 fn accept_attempt(job: &Job, run: ModelRun, selection_role: &str, selection_reason: &str) -> bool {
@@ -586,6 +614,7 @@ fn accept_attempt(job: &Job, run: ModelRun, selection_role: &str, selection_reas
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn record_model_attempt_receipt(
     job: &Job,
     raw_output: Option<&str>,
@@ -716,8 +745,8 @@ fn record_failed_model_attempt(
     )
 }
 
-fn fail_attempt(job: &Job, err: ModelError, selection_role: &str, selection_reason: &str) -> bool {
-    record_metrics_from_error(job, &err);
+fn fail_attempt(job: &Job, err: &ModelError, selection_role: &str, selection_reason: &str) -> bool {
+    record_metrics_from_error(job, err);
     let canceled = err.message == "canceled";
     let result: pgrx::spi::Result<()> = BackgroundWorker::transaction(|| {
         pgrx::Spi::connect_mut(|client| {

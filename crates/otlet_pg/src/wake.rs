@@ -90,7 +90,7 @@ pub(crate) fn signal_worker_latch_immediate() -> bool {
 
 #[unsafe(no_mangle)]
 pub extern "C-unwind" fn pg_finfo_otlet_wake_worker() -> *const pg_sys::Pg_finfo_record {
-    &OTLET_WAKE_WORKER_FINFO
+    &raw const OTLET_WAKE_WORKER_FINFO
 }
 
 #[pgrx::pg_guard]
@@ -102,7 +102,7 @@ pub extern "C-unwind" fn otlet_wake_worker(_fcinfo: pg_sys::FunctionCallInfo) ->
 
 #[unsafe(no_mangle)]
 pub extern "C-unwind" fn pg_finfo_otlet_worker_wake_state() -> *const pg_sys::Pg_finfo_record {
-    &OTLET_WORKER_WAKE_STATE_FINFO
+    &raw const OTLET_WORKER_WAKE_STATE_FINFO
 }
 
 #[pgrx::pg_guard]
@@ -169,10 +169,10 @@ unsafe extern "C-unwind" fn otlet_wake_xact_callback(
     _arg: *mut std::ffi::c_void,
 ) {
     let pending = match event {
-        pg_sys::XactEvent::XACT_EVENT_COMMIT | pg_sys::XactEvent::XACT_EVENT_PARALLEL_COMMIT => {
-            PENDING_WAKE.swap(false, Ordering::SeqCst)
-        }
-        pg_sys::XactEvent::XACT_EVENT_ABORT | pg_sys::XactEvent::XACT_EVENT_PARALLEL_ABORT => {
+        pg_sys::XactEvent::XACT_EVENT_COMMIT
+        | pg_sys::XactEvent::XACT_EVENT_PARALLEL_COMMIT
+        | pg_sys::XactEvent::XACT_EVENT_ABORT
+        | pg_sys::XactEvent::XACT_EVENT_PARALLEL_ABORT => {
             PENDING_WAKE.swap(false, Ordering::SeqCst)
         }
         _ => false,

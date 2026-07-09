@@ -56,7 +56,7 @@ unsafe fn planned_custom_child_plan(custom_plans: *mut pg_sys::List) -> *mut pg_
         if custom_plans.is_null() || pg_sys::list_length(custom_plans) == 0 {
             ptr::null_mut()
         } else {
-            pg_sys::list_nth(custom_plans, 0) as *mut pg_sys::Plan
+            pg_sys::list_nth(custom_plans, 0).cast::<pg_sys::Plan>()
         }
     }
 }
@@ -75,7 +75,7 @@ unsafe fn sanitized_subquery_child_path(
         if existing.is_null() {
             return ptr::null_mut();
         }
-        let subquery_path = existing as *mut pg_sys::SubqueryScanPath;
+        let subquery_path = existing.cast::<pg_sys::SubqueryScanPath>();
         if subquery_path.is_null() || (*subquery_path).subpath.is_null() {
             return ptr::null_mut();
         }
@@ -110,7 +110,7 @@ unsafe fn cheapest_subquery_scan_path(rel: *mut pg_sys::RelOptInfo) -> *mut pg_s
         }
         let mut best: *mut pg_sys::Path = ptr::null_mut();
         for idx in 0..pg_sys::list_length((*rel).pathlist) {
-            let path = pg_sys::list_nth((*rel).pathlist, idx) as *mut pg_sys::Path;
+            let path = pg_sys::list_nth((*rel).pathlist, idx).cast::<pg_sys::Path>();
             if path.is_null() || (*path).pathtype != pg_sys::NodeTag::T_SubqueryScan {
                 continue;
             }
@@ -131,7 +131,7 @@ unsafe fn cheapest_postgres_child_scan_path(
         }
         let mut best: *mut pg_sys::Path = ptr::null_mut();
         for idx in 0..pg_sys::list_length((*rel).pathlist) {
-            let path = pg_sys::list_nth((*rel).pathlist, idx) as *mut pg_sys::Path;
+            let path = pg_sys::list_nth((*rel).pathlist, idx).cast::<pg_sys::Path>();
             if path.is_null() || !is_supported_child_scan_path(path) {
                 continue;
             }
@@ -208,7 +208,7 @@ unsafe fn is_owned_semantic_plan_qual(
         };
         for idx in 0..pg_sys::list_length(semantic_restrictinfos) {
             let semantic =
-                pg_sys::list_nth(semantic_restrictinfos, idx) as *mut pg_sys::RestrictInfo;
+                pg_sys::list_nth(semantic_restrictinfos, idx).cast::<pg_sys::RestrictInfo>();
             if semantic.is_null() {
                 continue;
             }
@@ -267,7 +267,7 @@ unsafe fn is_semantic_restrictinfo(
     unsafe {
         for idx in 0..pg_sys::list_length(semantic_restrictinfos) {
             let semantic =
-                pg_sys::list_nth(semantic_restrictinfos, idx) as *mut pg_sys::RestrictInfo;
+                pg_sys::list_nth(semantic_restrictinfos, idx).cast::<pg_sys::RestrictInfo>();
             if semantic.is_null() {
                 continue;
             }
@@ -285,19 +285,19 @@ unsafe fn is_semantic_restrictinfo(
 
 unsafe fn actual_clause_expr(clause: *mut std::ffi::c_void) -> *mut pg_sys::Expr {
     unsafe {
-        let node = clause as *mut pg_sys::Node;
+        let node = clause.cast::<pg_sys::Node>();
         if node.is_null() {
             return ptr::null_mut();
         }
         if (*node).type_ == pg_sys::NodeTag::T_RestrictInfo {
-            let rinfo = clause as *mut pg_sys::RestrictInfo;
+            let rinfo = clause.cast::<pg_sys::RestrictInfo>();
             if rinfo.is_null() {
                 ptr::null_mut()
             } else {
                 (*rinfo).clause
             }
         } else {
-            clause as *mut pg_sys::Expr
+            clause.cast::<pg_sys::Expr>()
         }
     }
 }

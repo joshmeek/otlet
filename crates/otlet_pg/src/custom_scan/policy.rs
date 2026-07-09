@@ -1,10 +1,10 @@
 fn wait_elapsed_ms(start: pg_sys::TimestampTz) -> u64 {
     let now = unsafe { pg_sys::GetCurrentTimestamp() };
     let elapsed = unsafe { pg_sys::TimestampDifferenceMilliseconds(start, now) };
-    elapsed.max(0) as u64
+    nonnegative_count(elapsed)
 }
 
-fn refresh_policy_from_parts(
+const fn refresh_policy_from_parts(
     auto_policy: bool,
     allow_refresh: bool,
     wait_ms: u32,
@@ -23,7 +23,7 @@ fn refresh_policy_from_parts(
     }
 }
 
-fn worker_handoff_from_parts(
+const fn worker_handoff_from_parts(
     auto_policy: bool,
     allow_refresh: bool,
     wait_ms: u32,
@@ -42,7 +42,7 @@ fn worker_handoff_from_parts(
     }
 }
 
-fn infer_now_input_path(infer_ms: u32) -> &'static str {
+const fn infer_now_input_path(infer_ms: u32) -> &'static str {
     if infer_ms == 0 {
         "none"
     } else {
@@ -93,11 +93,17 @@ unsafe fn source_tuple_provider_from_state(
     }
 }
 
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 fn estimated_model_cost_ms(model_ms: f64, infer_subjects: u64) -> u64 {
     if !model_ms.is_finite() || model_ms <= 0.0 {
         return 0;
     }
-    (model_ms * infer_subjects as f64).round().max(0.0) as u64
+    let estimate = (model_ms * infer_subjects as f64).round();
+    if estimate >= u64::MAX as f64 {
+        u64::MAX
+    } else {
+        estimate as u64
+    }
 }
 
 fn with_latest_snapshot<T>(f: impl FnOnce() -> T) -> T {

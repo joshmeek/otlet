@@ -6,7 +6,7 @@ unsafe fn find_semantic_match_predicate(
 ) -> Option<SemanticMatchPredicate> {
     unsafe {
         for idx in 0..pg_sys::list_length(restrictinfos) {
-            let rinfo = pg_sys::list_nth(restrictinfos, idx) as *mut pg_sys::RestrictInfo;
+            let rinfo = pg_sys::list_nth(restrictinfos, idx).cast::<pg_sys::RestrictInfo>();
             if rinfo.is_null() || (*rinfo).clause.is_null() {
                 continue;
             }
@@ -116,7 +116,7 @@ unsafe fn semantic_match_function_parts(
     rti: pg_sys::Index,
 ) -> Option<ParsedSemanticMatch> {
     unsafe {
-        let func = clause as *mut pg_sys::FuncExpr;
+        let func = clause.cast::<pg_sys::FuncExpr>();
         let is_matches = is_otlet_function((*func).funcid, "semantic_matches");
         let is_auto = is_otlet_function((*func).funcid, "semantic_matches_auto");
         let is_join_matches = is_otlet_function((*func).funcid, "semantic_join_matches");
@@ -127,9 +127,9 @@ unsafe fn semantic_match_function_parts(
             return None;
         }
 
-        let index_arg = pg_sys::list_nth((*func).args, 0) as *mut pg_sys::Expr;
-        let subject_arg = pg_sys::list_nth((*func).args, 1) as *mut pg_sys::Expr;
-        let expected_arg = pg_sys::list_nth((*func).args, 2) as *mut pg_sys::Expr;
+        let index_arg = pg_sys::list_nth((*func).args, 0).cast::<pg_sys::Expr>();
+        let subject_arg = pg_sys::list_nth((*func).args, 1).cast::<pg_sys::Expr>();
+        let expected_arg = pg_sys::list_nth((*func).args, 2).cast::<pg_sys::Expr>();
         let policy = semantic_auto_policy(is_any_auto);
         Some(ParsedSemanticMatch {
             index_kind: if is_join {
@@ -187,19 +187,22 @@ fn semantic_auto_policy(enabled: bool) -> SemanticAutoPolicy {
                 .ok()
                 .flatten()
                 .unwrap_or(10_000)
-                .clamp(0, 30_000) as u32,
+                .clamp(0, 30_000)
+                .cast_unsigned(),
             infer_ms: row
                 .get_by_name::<i32, _>("semantic_auto_infer_ms")
                 .ok()
                 .flatten()
                 .unwrap_or(15_000)
-                .clamp(0, 30_000) as u32,
+                .clamp(0, 30_000)
+                .cast_unsigned(),
             infer_max_rows: row
                 .get_by_name::<i32, _>("semantic_auto_max_rows")
                 .ok()
                 .flatten()
                 .unwrap_or(1)
-                .clamp(0, 10) as u32,
+                .clamp(0, 10)
+                .cast_unsigned(),
         })
     })
     .unwrap_or(SemanticAutoPolicy {

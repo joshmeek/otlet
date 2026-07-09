@@ -68,7 +68,7 @@ macro_rules! job_from_row {
             runtime_options: required_col!($row, JsonB, 11).0,
             input_shaping: required_col!($row, JsonB, 12).0,
             decision_contract: required_col!($row, JsonB, 13).0,
-            max_attempt_ms: required_col!($row, i32, 14) as i64,
+            max_attempt_ms: i64::from(required_col!($row, i32, 14)),
         }
     };
 }
@@ -76,7 +76,7 @@ macro_rules! job_from_row {
 pub(crate) fn claim_jobs() -> pgrx::spi::Result<Vec<Job>> {
     pgrx::Spi::connect_mut(|client| {
         let rows = client.update(
-            r#"
+            r"
 SELECT
   j.id,
   j.task_name,
@@ -96,7 +96,7 @@ FROM otlet.claim_jobs() j
 JOIN otlet.tasks t ON t.name = j.task_name
 JOIN otlet.models m ON m.name = t.model_name
 CROSS JOIN otlet.production_policy p
-"#,
+	",
             None,
             &[],
         )?;
@@ -117,7 +117,7 @@ pub(crate) fn insert_infer_now_job(
             JsonB(input.clone()).into(),
         ];
         let rows = client.update(
-            r#"
+            r"
 WITH inserted AS (
   INSERT INTO otlet.jobs (
     task_name,
@@ -154,7 +154,7 @@ FROM inserted j
 JOIN otlet.tasks t ON t.name = j.task_name
 JOIN otlet.models m ON m.name = t.model_name
 CROSS JOIN otlet.production_policy p
-"#,
+	",
             Some(1),
             &args,
         )?;
@@ -174,7 +174,7 @@ pub(crate) fn model_selection_policy(
     pgrx::Spi::connect(|client| {
         let args = [task_name.into()];
         let rows = client.select(
-            r#"
+            r"
 SELECT
   cheap.name,
   cheap.artifact_path,
@@ -187,7 +187,7 @@ FROM otlet.model_selection_policies p
 JOIN otlet.models cheap ON cheap.name = p.cheap_model_name
 JOIN otlet.models strong ON strong.name = p.strong_model_name
 WHERE p.task_name = $1
-"#,
+	",
             Some(1),
             &args,
         )?;

@@ -28,7 +28,7 @@ unsafe fn subject_var(node: *mut pg_sys::Expr, rti: pg_sys::Index) -> Option<Sub
             return None;
         }
         let candidate = if (*node).type_ == pg_sys::NodeTag::T_CoerceViaIO {
-            let coerce = node as *mut pg_sys::CoerceViaIO;
+            let coerce = node.cast::<pg_sys::CoerceViaIO>();
             if (*coerce).resulttype != pg_sys::TEXTOID {
                 return None;
             }
@@ -39,7 +39,7 @@ unsafe fn subject_var(node: *mut pg_sys::Expr, rti: pg_sys::Index) -> Option<Sub
         if candidate.is_null() || (*candidate).type_ != pg_sys::NodeTag::T_Var {
             return None;
         }
-        let var = candidate as *mut pg_sys::Var;
+        let var = candidate.cast::<pg_sys::Var>();
         if (*var).varno < 0 || u32::try_from((*var).varno).ok() != Some(rti) || (*var).varattno <= 0
         {
             return None;
@@ -61,11 +61,11 @@ unsafe fn path_target_has_subject_var(
             return false;
         }
         for idx in 0..pg_sys::list_length((*target).exprs) {
-            let expr = strip_relabel(pg_sys::list_nth((*target).exprs, idx) as *mut pg_sys::Expr);
+            let expr = strip_relabel(pg_sys::list_nth((*target).exprs, idx).cast::<pg_sys::Expr>());
             if expr.is_null() || (*expr).type_ != pg_sys::NodeTag::T_Var {
                 continue;
             }
-            let var = expr as *mut pg_sys::Var;
+            let var = expr.cast::<pg_sys::Var>();
             if (*var).varno >= 0
                 && u32::try_from((*var).varno).ok() == Some(rti)
                 && (*var).varattno == subject_attno
@@ -83,11 +83,11 @@ unsafe fn path_target_has_rel_var(target: *mut pg_sys::PathTarget, rti: pg_sys::
             return false;
         }
         for idx in 0..pg_sys::list_length((*target).exprs) {
-            let expr = strip_relabel(pg_sys::list_nth((*target).exprs, idx) as *mut pg_sys::Expr);
+            let expr = strip_relabel(pg_sys::list_nth((*target).exprs, idx).cast::<pg_sys::Expr>());
             if expr.is_null() || (*expr).type_ != pg_sys::NodeTag::T_Var {
                 continue;
             }
-            let var = expr as *mut pg_sys::Var;
+            let var = expr.cast::<pg_sys::Var>();
             if (*var).varno >= 0
                 && u32::try_from((*var).varno).ok() == Some(rti)
                 && (*var).varattno > 0
@@ -108,6 +108,11 @@ unsafe fn rel_has_lateral_ref(rel: *mut pg_sys::RelOptInfo) -> bool {
     }
 }
 
+fn nonnegative_count(value: i64) -> u64 {
+    value.max(0).cast_unsigned()
+}
+
+#[allow(clippy::too_many_arguments)]
 fn validate_semantic_index_source(
     index_name: &str,
     relid: pg_sys::Oid,
@@ -197,43 +202,36 @@ fn validate_semantic_index_source(
             .map_err(to_string)?;
         let row = stats_table.first();
         let mut stats = SemanticPlannerStats {
-            selected_path: "semantic_lookup".to_string(),
+            selected_path: "semantic_lookup".to_owned(),
             reason: String::new(),
             source_rows: row
                 .get_by_name::<i64, _>("source_rows")
                 .map_err(to_string)?
-                .unwrap_or(0)
-                .max(0) as u64,
+                .map_or(0, nonnegative_count),
             fresh_matches: row
                 .get_by_name::<i64, _>("fresh_matches")
                 .map_err(to_string)?
-                .unwrap_or(0)
-                .max(0) as u64,
+                .map_or(0, nonnegative_count),
             fresh_non_matches: row
                 .get_by_name::<i64, _>("fresh_non_matches")
                 .map_err(to_string)?
-                .unwrap_or(0)
-                .max(0) as u64,
+                .map_or(0, nonnegative_count),
             stale_rows: row
                 .get_by_name::<i64, _>("stale_rows")
                 .map_err(to_string)?
-                .unwrap_or(0)
-                .max(0) as u64,
+                .map_or(0, nonnegative_count),
             missing_rows: row
                 .get_by_name::<i64, _>("missing_rows")
                 .map_err(to_string)?
-                .unwrap_or(0)
-                .max(0) as u64,
+                .map_or(0, nonnegative_count),
             inflight_rows: row
                 .get_by_name::<i64, _>("inflight_rows")
                 .map_err(to_string)?
-                .unwrap_or(0)
-                .max(0) as u64,
+                .map_or(0, nonnegative_count),
             cache_reusable_rows: row
                 .get_by_name::<i64, _>("cache_reusable_rows")
                 .map_err(to_string)?
-                .unwrap_or(0)
-                .max(0) as u64,
+                .map_or(0, nonnegative_count),
             infer_decision_rows: 0,
             fail_closed_decision_rows: 0,
             model_ms: row
@@ -244,16 +242,16 @@ fn validate_semantic_index_source(
             model_cost_source: row
                 .get_by_name::<String, _>("model_cost_source")
                 .map_err(to_string)?
-                .unwrap_or_else(|| "static_fallback".to_string()),
+                .unwrap_or_else(|| "static_fallback".to_owned()),
             path_cost: 0.0,
             stale_reasons: row
                 .get_by_name::<String, _>("stale_reasons")
                 .map_err(to_string)?
-                .unwrap_or_else(|| "{}".to_string()),
+                .unwrap_or_else(|| "{}".to_owned()),
             count_basis: row
                 .get_by_name::<String, _>("count_basis")
                 .map_err(to_string)?
-                .unwrap_or_else(|| "exact".to_string()),
+                .unwrap_or_else(|| "exact".to_owned()),
         };
         finish_planner_stats(
             &mut stats,
@@ -321,43 +319,36 @@ fn validate_semantic_join_index_source(
         }
         let row = table.first();
         let mut stats = SemanticPlannerStats {
-            selected_path: "semantic_join_lookup".to_string(),
+            selected_path: "semantic_join_lookup".to_owned(),
             reason: String::new(),
             source_rows: row
                 .get_by_name::<i64, _>("source_rows")
                 .map_err(to_string)?
-                .unwrap_or(0)
-                .max(0) as u64,
+                .map_or(0, nonnegative_count),
             fresh_matches: row
                 .get_by_name::<i64, _>("fresh_matches")
                 .map_err(to_string)?
-                .unwrap_or(0)
-                .max(0) as u64,
+                .map_or(0, nonnegative_count),
             fresh_non_matches: row
                 .get_by_name::<i64, _>("fresh_non_matches")
                 .map_err(to_string)?
-                .unwrap_or(0)
-                .max(0) as u64,
+                .map_or(0, nonnegative_count),
             stale_rows: row
                 .get_by_name::<i64, _>("stale_rows")
                 .map_err(to_string)?
-                .unwrap_or(0)
-                .max(0) as u64,
+                .map_or(0, nonnegative_count),
             missing_rows: row
                 .get_by_name::<i64, _>("missing_rows")
                 .map_err(to_string)?
-                .unwrap_or(0)
-                .max(0) as u64,
+                .map_or(0, nonnegative_count),
             inflight_rows: row
                 .get_by_name::<i64, _>("inflight_rows")
                 .map_err(to_string)?
-                .unwrap_or(0)
-                .max(0) as u64,
+                .map_or(0, nonnegative_count),
             cache_reusable_rows: row
                 .get_by_name::<i64, _>("cache_reusable_rows")
                 .map_err(to_string)?
-                .unwrap_or(0)
-                .max(0) as u64,
+                .map_or(0, nonnegative_count),
             infer_decision_rows: 0,
             fail_closed_decision_rows: 0,
             model_ms: row
@@ -368,16 +359,16 @@ fn validate_semantic_join_index_source(
             model_cost_source: row
                 .get_by_name::<String, _>("model_cost_source")
                 .map_err(to_string)?
-                .unwrap_or_else(|| "static_fallback".to_string()),
+                .unwrap_or_else(|| "static_fallback".to_owned()),
             path_cost: 0.0,
             stale_reasons: row
                 .get_by_name::<String, _>("stale_reasons")
                 .map_err(to_string)?
-                .unwrap_or_else(|| "{}".to_string()),
+                .unwrap_or_else(|| "{}".to_owned()),
             count_basis: row
                 .get_by_name::<String, _>("count_basis")
                 .map_err(to_string)?
-                .unwrap_or_else(|| "estimated".to_string()),
+                .unwrap_or_else(|| "estimated".to_owned()),
         };
         finish_planner_stats(
             &mut stats,
@@ -388,7 +379,7 @@ fn validate_semantic_join_index_source(
             auto_policy,
         );
         if stats.selected_path == "semantic_lookup" {
-            stats.selected_path = "semantic_join_lookup".to_string();
+            "semantic_join_lookup".clone_into(&mut stats.selected_path);
         }
         stats.reason = format!("semantic join candidate row-source: {}", stats.reason);
         Ok::<Option<SemanticPlannerStats>, String>(Some(stats))

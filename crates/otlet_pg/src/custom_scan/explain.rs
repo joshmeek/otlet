@@ -8,7 +8,7 @@ unsafe extern "C-unwind" fn explain_semantic_custom_scan(
         explain_text("Otlet Node", "Semantic Source CustomScan", es);
         explain_text("Semantic Predicate Owner", "otlet_customscan_executor", es);
         explain_text("Child Semantic Filter", "stripped_before_child_plan", es);
-        let state = node as *mut OtletSemanticCustomScanState;
+        let state = node.cast::<OtletSemanticCustomScanState>();
         if !(*state).runtime.is_null() {
             let runtime = &*(*state).runtime;
             explain_semantic_metadata(
@@ -170,13 +170,12 @@ unsafe fn planner_snapshot_from_state(
     state: *mut OtletSemanticCustomScanState,
 ) -> Option<(SemanticPlannerStats, SemanticAutoPolicy)> {
     unsafe {
-        let selected_path = pg_cstr_str((*state).planner_selected_path)?.to_string();
+        let selected_path = pg_cstr_str((*state).planner_selected_path)?.to_owned();
         Some((
             SemanticPlannerStats {
                 selected_path,
                 reason: pg_cstr_str((*state).planner_reason)
-                    .unwrap_or("planner snapshot")
-                    .to_string(),
+                    .unwrap_or("planner snapshot").to_owned(),
                 source_rows: (*state).known_subjects,
                 fresh_matches: (*state).preloaded_fresh_matches,
                 fresh_non_matches: (*state).preloaded_fresh_non_matches,
@@ -194,15 +193,12 @@ unsafe fn planner_snapshot_from_state(
                     2500.0
                 },
                 model_cost_source: pg_cstr_str((*state).planner_model_cost_source)
-                    .unwrap_or("static_fallback")
-                    .to_string(),
+                    .unwrap_or("static_fallback").to_owned(),
                 path_cost: 0.0,
                 stale_reasons: pg_cstr_str((*state).planner_stale_reasons)
-                    .unwrap_or("{}")
-                    .to_string(),
+                    .unwrap_or("{}").to_owned(),
                 count_basis: pg_cstr_str((*state).planner_count_basis)
-                    .unwrap_or("unknown")
-                    .to_string(),
+                    .unwrap_or("unknown").to_owned(),
             },
             SemanticAutoPolicy {
                 auto_policy: (*state).auto_policy,
@@ -237,10 +233,11 @@ unsafe fn explain_pg_cstr(label: &str, value: *const c_char, es: *mut pg_sys::Ex
     }
 }
 
-struct SemanticExplainMetadata<'a> {
-    index_name: &'a str,
+#[derive(Clone, Copy)]
+struct SemanticExplainMetadata<'explain> {
+    index_name: &'explain str,
     index_kind: Option<&'static str>,
-    expected_json: &'a str,
+    expected_json: &'explain str,
 }
 
 unsafe fn explain_semantic_metadata(
@@ -256,6 +253,7 @@ unsafe fn explain_semantic_metadata(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 unsafe fn explain_semantic_policy(
     auto_policy: bool,
     allow_refresh: bool,
@@ -277,8 +275,8 @@ unsafe fn explain_semantic_policy(
             worker_handoff_from_parts(auto_policy, allow_refresh, wait_ms, infer_ms),
             es,
         );
-        explain_counter("Infer Now Timeout Ms", infer_ms as u64, es);
-        explain_counter("Infer Now Max Rows", infer_max_rows as u64, es);
+        explain_counter("Infer Now Timeout Ms", u64::from(infer_ms), es);
+        explain_counter("Infer Now Max Rows", u64::from(infer_max_rows), es);
         if infer_ms > 0 {
             explain_infer_now_queue(es);
         }
@@ -315,7 +313,7 @@ unsafe fn explain_counter(label: &str, value: u64, es: *mut pg_sys::ExplainState
         pg_sys::ExplainPropertyInteger(
             cstr(label).as_ptr(),
             ptr::null(),
-            value.min(i64::MAX as u64) as i64,
+            i64::try_from(value).unwrap_or(i64::MAX),
             es,
         );
     }

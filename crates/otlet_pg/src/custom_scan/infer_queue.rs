@@ -4,7 +4,7 @@ fn queue_refresh_if_allowed(runtime: &mut RuntimeState, subject_id: &str) {
     }
     runtime
         .queued_refresh_subjects
-        .insert(subject_id.to_string());
+        .insert(subject_id.to_owned());
     match queue_subject_refresh(&runtime.task_name, subject_id) {
         Ok(true) => runtime.queued_refreshes += 1,
         Ok(false) => {}
@@ -37,7 +37,8 @@ fn wait_for_refresh_if_allowed(
         return Ok(SemanticResolution::Unresolved);
     }
     let start = unsafe { pg_sys::GetCurrentTimestamp() };
-    let max_wait_ms = runtime.wait_ms.min(10_000) as std::ffi::c_int;
+    let max_wait_ms = std::ffi::c_int::try_from(runtime.wait_ms.min(10_000))
+        .unwrap_or(std::ffi::c_int::MAX);
     let mut active_seen = active_seen_before_wait;
     loop {
         unsafe {
@@ -56,9 +57,8 @@ fn wait_for_refresh_if_allowed(
                 SubjectSemanticState::FreshNonMatch => return Ok(SemanticResolution::NonMatch),
                 _ => return Ok(SemanticResolution::Unresolved),
             }
-        } else {
-            active_seen = true;
         }
+        active_seen = true;
         let now = unsafe { pg_sys::GetCurrentTimestamp() };
         if unsafe { pg_sys::TimestampDifferenceExceeds(start, now, max_wait_ms) } {
             return Ok(SemanticResolution::Unresolved);
@@ -69,7 +69,7 @@ fn wait_for_refresh_if_allowed(
     }
 }
 
-fn should_prefetch_infer_now(runtime: &RuntimeState) -> bool {
+const fn should_prefetch_infer_now(runtime: &RuntimeState) -> bool {
     runtime.infer_ms > 0 && runtime.infer_max_rows > 1 && !runtime.allow_refresh
 }
 
@@ -91,9 +91,10 @@ unsafe fn prefetch_infer_now_batch(
         return Ok(());
     }
 
+    let mut prefetched_infers = 1usize;
     let mut prefetched_source_rows = 1usize;
     loop {
-        if prefetched_infer_count(&rows) >= target_infer_count {
+        if prefetched_infers >= target_infer_count {
             break;
         }
         if prefetched_source_rows >= runtime.infer_max_rows as usize {
@@ -106,7 +107,11 @@ unsafe fn prefetch_infer_now_batch(
         runtime.rows_seen = runtime.rows_seen.saturating_add(1);
         let mut isnull = false;
         let value = unsafe {
-            pg_sys::slot_getattr(slot, runtime.subject_attno as std::ffi::c_int, &mut isnull)
+            pg_sys::slot_getattr(
+                slot,
+                std::ffi::c_int::from(runtime.subject_attno),
+                &raw mut isnull,
+            )
         };
         if isnull {
             continue;
@@ -114,12 +119,12 @@ unsafe fn prefetch_infer_now_batch(
         let Some(subject_id) = (unsafe { datum_to_text(value, runtime.subject_typid) }) else {
             continue;
         };
-        match runtime
+        let semantic_state = runtime
             .semantic_states
             .get(&subject_id)
             .copied()
-            .unwrap_or(SubjectSemanticState::Missing)
-        {
+            .unwrap_or(SubjectSemanticState::Missing);
+        match semantic_state {
             SubjectSemanticState::FreshMatch => {
                 runtime.fresh_matches = runtime.fresh_matches.saturating_add(1);
                 runtime.lookup_rows = runtime.lookup_rows.saturating_add(1);
@@ -131,20 +136,15 @@ unsafe fn prefetch_infer_now_batch(
                 runtime.lookup_rows = runtime.lookup_rows.saturating_add(1);
             }
             SubjectSemanticState::Stale | SubjectSemanticState::Missing => {
-                if runtime
-                    .semantic_states
-                    .get(&subject_id)
-                    .copied()
-                    .unwrap_or(SubjectSemanticState::Missing)
-                    == SubjectSemanticState::Stale
-                {
+                if semantic_state == SubjectSemanticState::Stale {
                     runtime.stale_rows = runtime.stale_rows.saturating_add(1);
                 } else {
                     runtime.missing_rows = runtime.missing_rows.saturating_add(1);
                 }
-                if prefetched_infer_count(&rows) < target_infer_count
+                if prefetched_infers < target_infer_count
                     && submit_prefetched_infer_row(runtime, &subject_id, slot, &mut rows)?
                 {
+                    prefetched_infers = prefetched_infers.saturating_add(1);
                     continue;
                 }
                 runtime.fail_closed_rows = runtime.fail_closed_rows.saturating_add(1);
@@ -163,29 +163,23 @@ unsafe fn prefetch_infer_now_batch(
 
 fn remaining_infer_capacity(runtime: &RuntimeState) -> usize {
     let policy_remaining = (runtime.infer_max_rows as usize)
-        .saturating_sub(runtime.infer_now_batches as usize);
+        .saturating_sub(usize::try_from(runtime.infer_now_batches).unwrap_or(usize::MAX));
     let queue_remaining = crate::infer_now::queue_snapshot().available_slots;
     policy_remaining.min(queue_remaining)
 }
 
-fn prefetched_infer_count(rows: &[PrefetchedRow]) -> usize {
-    rows.iter()
-        .filter(|row| matches!(row, PrefetchedRow::Infer(_)))
-        .count()
-}
-
 fn submit_prefetched_infer_row(
-    runtime: &mut RuntimeState,
+    runtime: &RuntimeState,
     subject_id: &str,
     slot: *mut pg_sys::TupleTableSlot,
     rows: &mut Vec<PrefetchedRow>,
 ) -> Result<bool, String> {
-    if runtime.infer_ms == 0 || runtime.infer_now_batches >= runtime.infer_max_rows as u64 {
+    if runtime.infer_ms == 0 || runtime.infer_now_batches >= u64::from(runtime.infer_max_rows) {
         return Ok(false);
     }
     let input = semantic_slot_input(runtime, subject_id, slot)
         .map_err(|err| format!("tuple-slot infer-now input failed; SPI fallback disabled: {err}"))?
-        .ok_or_else(|| "tuple-slot infer-now input missing; SPI fallback disabled".to_string())?;
+        .ok_or_else(|| "tuple-slot infer-now input missing; SPI fallback disabled".to_owned())?;
     let submitted_at = unsafe { pg_sys::GetCurrentTimestamp() };
     let snapshot_before = crate::infer_now::snapshot();
     let Some(submitted) =
@@ -195,7 +189,7 @@ fn submit_prefetched_infer_row(
     };
     let buffered_slot = unsafe { copy_slot_buffer(slot)? };
     rows.push(PrefetchedRow::Infer(PendingInferNowRow {
-        subject_id: subject_id.to_string(),
+        subject_id: subject_id.to_owned(),
         slot: buffered_slot,
         submitted,
         submitted_at,
@@ -284,7 +278,7 @@ fn wait_for_prefetched_infer_row(
     }
 }
 
-fn record_infer_now_timeout_deltas(
+const fn record_infer_now_timeout_deltas(
     runtime: &mut RuntimeState,
     before: crate::infer_now::InferNowSnapshot,
     after: crate::infer_now::InferNowSnapshot,
@@ -301,18 +295,18 @@ unsafe fn copy_slot_buffer(
 ) -> Result<*mut pg_sys::TupleTableSlot, String> {
     unsafe {
         if slot.is_null() {
-            return Err("cannot copy null tuple slot".to_string());
+            return Err("cannot copy null tuple slot".to_owned());
         }
         if (*slot).tts_tupleDescriptor.is_null() {
-            return Err("cannot copy tuple slot without tuple descriptor".to_string());
+            return Err("cannot copy tuple slot without tuple descriptor".to_owned());
         }
         if (*slot).tts_ops.is_null() {
-            return Err("cannot copy tuple slot without slot ops".to_string());
+            return Err("cannot copy tuple slot without slot ops".to_owned());
         }
         let buffered_slot =
             pg_sys::MakeSingleTupleTableSlot((*slot).tts_tupleDescriptor, (*slot).tts_ops);
         if buffered_slot.is_null() {
-            return Err("MakeSingleTupleTableSlot returned null".to_string());
+            return Err("MakeSingleTupleTableSlot returned null".to_owned());
         }
         pg_sys::ExecCopySlot(buffered_slot, slot);
         Ok(buffered_slot)
@@ -345,13 +339,13 @@ fn infer_now_if_allowed(
     subject_id: &str,
     slot: *mut pg_sys::TupleTableSlot,
 ) -> Result<SemanticResolution, String> {
-    if runtime.infer_ms == 0 || runtime.infer_now_batches >= runtime.infer_max_rows as u64 {
+    if runtime.infer_ms == 0 || runtime.infer_now_batches >= u64::from(runtime.infer_max_rows) {
         return Ok(SemanticResolution::Unresolved);
     }
 
     let input = semantic_slot_input(runtime, subject_id, slot)
         .map_err(|err| format!("tuple-slot infer-now input failed; SPI fallback disabled: {err}"))?
-        .ok_or_else(|| "tuple-slot infer-now input missing; SPI fallback disabled".to_string())?;
+        .ok_or_else(|| "tuple-slot infer-now input missing; SPI fallback disabled".to_owned())?;
     let start = unsafe { pg_sys::GetCurrentTimestamp() };
     let infer_state_before = crate::infer_now::snapshot();
     let request = crate::infer_now::submit_infer_now(&runtime.task_name, subject_id, &input);
