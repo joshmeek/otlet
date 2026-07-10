@@ -567,6 +567,7 @@ WITH watch_sources AS (
   FROM otlet.worker_events e
   JOIN watch_tasks ON watch_tasks.task_name = e.detail ->> 'task_name'
   WHERE e.event_type = 'queue_admission_suppressed'
+    AND e.detail ? 'task_name'
   GROUP BY e.detail ->> 'task_name'
 ), materialized AS (
   SELECT

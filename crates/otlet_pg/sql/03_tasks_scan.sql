@@ -370,6 +370,9 @@ BEGIN
     SELECT 1
     FROM otlet.worker_events e
     WHERE e.event_type = 'queue_admission_suppressed'
+      AND e.detail ? 'model_name'
+      AND e.detail ->> 'model_name' = suppressed_model_name
+      AND e.detail ? 'task_name'
       AND e.detail ->> 'task_name' = suppressed_task_name
       AND e.detail ->> 'reason' = suppressed_reason
       AND e.created_at > now() - interval '1 minute'

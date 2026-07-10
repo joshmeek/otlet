@@ -351,47 +351,47 @@ BEGIN
   WHERE t.model_name = p_model_name;
 
   SELECT
-    COALESCE(receipt_cost.task_generate_ms, slot_cost.last_generate_ms, receipt_cost.model_generate_ms, 2500)::numeric,
+    COALESCE(task_cost.generate_ms, slot_cost.last_generate_ms, model_cost.generate_ms, 2500)::numeric,
     CASE
-      WHEN receipt_cost.task_generate_ms IS NOT NULL THEN 'task_receipt'
+      WHEN task_cost.generate_ms IS NOT NULL THEN 'task_receipt'
       WHEN slot_cost.last_generate_ms IS NOT NULL THEN 'runtime_slot'
-      WHEN receipt_cost.model_generate_ms IS NOT NULL THEN 'model_receipt'
+      WHEN model_cost.generate_ms IS NOT NULL THEN 'model_receipt'
       ELSE 'static_fallback'
     END
   INTO v_model_ms, v_model_cost_source
   FROM (SELECT 1) one
   LEFT JOIN LATERAL (
-    SELECT
-      (
-        SELECT r.generate_ms::numeric
-        FROM otlet.inference_receipts r
-        WHERE r.task_name = p_task_name
-          AND r.model_name = p_model_name
-          AND r.status = 'complete'
-          AND r.schema_validation_status = 'passed'
-          AND COALESCE(r.generate_ms, 0) > 0
-        ORDER BY r.finished_at DESC
-        LIMIT 1
-      ) AS task_generate_ms,
-      (
-        SELECT r.generate_ms::numeric
-        FROM otlet.inference_receipts r
-        WHERE r.model_name = p_model_name
-          AND r.status = 'complete'
-          AND r.schema_validation_status = 'passed'
-          AND COALESCE(r.generate_ms, 0) > 0
-        ORDER BY r.finished_at DESC
-        LIMIT 1
-      ) AS model_generate_ms
-  ) receipt_cost ON true
+    SELECT r.generate_ms::numeric AS generate_ms
+    FROM otlet.inference_receipts r
+    WHERE r.task_name = p_task_name
+      AND r.model_name = p_model_name
+      AND r.status = 'complete'
+      AND r.schema_validation_status = 'passed'
+      AND COALESCE(r.generate_ms, 0) > 0
+    ORDER BY r.finished_at DESC
+    LIMIT 1
+  ) task_cost ON true
   LEFT JOIN LATERAL (
     SELECT rs.last_generate_ms::numeric AS last_generate_ms
     FROM otlet.runtime_slots rs
-    WHERE rs.model_name = p_model_name
+    WHERE task_cost.generate_ms IS NULL
+      AND rs.model_name = p_model_name
       AND COALESCE(rs.last_generate_ms, 0) > 0
     ORDER BY rs.last_used_at DESC NULLS LAST
     LIMIT 1
-  ) slot_cost ON true;
+  ) slot_cost ON true
+  LEFT JOIN LATERAL (
+    SELECT r.generate_ms::numeric AS generate_ms
+    FROM otlet.inference_receipts r
+    WHERE task_cost.generate_ms IS NULL
+      AND slot_cost.last_generate_ms IS NULL
+      AND r.model_name = p_model_name
+      AND r.status = 'complete'
+      AND r.schema_validation_status = 'passed'
+      AND COALESCE(r.generate_ms, 0) > 0
+    ORDER BY r.finished_at DESC
+    LIMIT 1
+  ) model_cost ON true;
 
   SELECT
     COALESCE(policy.stale_policy, 'lookup_only_fail_closed'),

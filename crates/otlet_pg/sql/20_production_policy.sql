@@ -767,6 +767,7 @@ DECLARE
   delete_stale_count bigint := 0;
   rejected_raw_output_count bigint := 0;
   failed_canceled_job_count bigint := 0;
+  deleted_worker_count bigint := 0;
 BEGIN
   SELECT
     worker_event_retention,
@@ -818,24 +819,26 @@ BEGIN
           )
       );
 
-  WITH event_candidates AS (
-    SELECT e.id
-    FROM otlet.worker_events e
-    WHERE e.created_at < now() - worker_retention
-      AND NOT EXISTS (
-        SELECT 1
-        FROM otlet.jobs j
-        WHERE j.id = e.job_id
-          AND j.status IN ('queued', 'running', 'cancel_requested')
-      )
-    UNION
-    SELECT e.id
-    FROM otlet.worker_events e
-    JOIN otlet_cleanup_job_candidates c ON c.id = e.job_id
-  )
-  SELECT count(*)
-  INTO worker_count
-  FROM event_candidates;
+  IF cleanup_policy_state.requested_dry_run THEN
+    WITH event_candidates AS (
+      SELECT e.id
+      FROM otlet.worker_events e
+      WHERE e.created_at < now() - worker_retention
+        AND NOT EXISTS (
+          SELECT 1
+          FROM otlet.jobs j
+          WHERE j.id = e.job_id
+            AND j.status IN ('queued', 'running', 'cancel_requested')
+        )
+      UNION
+      SELECT e.id
+      FROM otlet.worker_events e
+      JOIN otlet_cleanup_job_candidates c ON c.id = e.job_id
+    )
+    SELECT count(*)
+    INTO worker_count
+    FROM event_candidates;
+  END IF;
 
   SELECT count(*)
   INTO failed_canceled_job_count
@@ -898,10 +901,13 @@ BEGIN
     DELETE FROM otlet.worker_events e
     USING event_candidates c
     WHERE e.id = c.id;
+    GET DIAGNOSTICS worker_count = ROW_COUNT;
 
     DELETE FROM otlet.worker_events e
     USING otlet_cleanup_job_candidates c
     WHERE e.job_id = c.id;
+    GET DIAGNOSTICS deleted_worker_count = ROW_COUNT;
+    worker_count := worker_count + deleted_worker_count;
 
     DELETE FROM otlet.inference_receipts r
     USING otlet_cleanup_job_candidates c

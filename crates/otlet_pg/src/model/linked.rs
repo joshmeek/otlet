@@ -9,6 +9,7 @@ fn run_linked(
     use std::ffi::CString;
 
     let attempt_start = Instant::now();
+    let attempt_deadline = linked_attempt_deadline(attempt_start, job.max_attempt_ms);
     if job_model.artifact_path.starts_with("hf:") {
         return Err(ModelError::new_static("linked llama.cpp runtime requires a local GGUF artifact path"));
     }
@@ -241,14 +242,15 @@ fn run_linked(
     let mut detailed_trace = DetailedGenerationTrace::new(options);
     let mut stop_reason: &'static str = "max_tokens";
     let mut token_piece_buf = vec![0_u8; 128];
+    let mut alternative_piece_output = Vec::new();
     let mut first_token_ms = 0_i64;
     let mut first_token_seen = false;
     let generate_start = Instant::now();
 
+    if linked_attempt_timed_out(attempt_deadline) {
+        return Err(ModelError::attempt_timeout());
+    }
     for _ in 0..options.max_tokens {
-        if linked_attempt_timed_out(attempt_start, job.max_attempt_ms) {
-            return Err(ModelError::attempt_timeout());
-        }
         if cancel_probe.due() && linked_cancel_requested(job.id)? {
             return Err(ModelError::new_static("canceled"));
         }
@@ -267,6 +269,8 @@ fn run_linked(
                     } else {
                         0
                     },
+                    &mut token_piece_buf,
+                    &mut alternative_piece_output,
                 )
             }
         } else {
@@ -288,8 +292,7 @@ fn run_linked(
         }
         let piece_start = output.len();
         linked_token_to_piece_into(cache.vocab, token, &mut token_piece_buf, &mut output)?;
-        let trace_piece = String::from_utf8_lossy(&output[piece_start..]);
-        detailed_trace.observe(token, &trace_piece, sample);
+        detailed_trace.observe(token, &output[piece_start..], sample);
         if let Some(end) = json_completion.observe(&output[piece_start..]) {
             output.truncate(end);
             stop_reason = "json_complete";
@@ -312,7 +315,7 @@ fn run_linked(
             )));
         }
         cache.kv_tokens.push(token);
-        if linked_attempt_timed_out(attempt_start, job.max_attempt_ms) {
+        if linked_attempt_timed_out(attempt_deadline) {
             return Err(ModelError::attempt_timeout());
         }
         position += 1;
@@ -333,9 +336,10 @@ fn run_linked(
             err.utf8_error()
         ))
     })?;
+    let output = trim_model_output(output);
 
     Ok(LinkedRun {
-        raw_output: output.trim().to_owned(),
+        raw_output: output,
         metrics: ModelMetrics {
             artifact_path: cache.artifact_path.clone(),
             load_ms: cache.load_ms,
@@ -343,19 +347,18 @@ fn run_linked(
             model_memory_bytes: cache.model_memory_bytes,
             model_parameters: cache.model_parameters,
             context_window_tokens: cache.context_window_tokens,
-            model_device_policy: cache.model_device_policy.to_owned(),
-            memory_accounting_policy: cache.memory_accounting_policy.to_owned(),
+            model_device_policy: cache.model_device_policy,
+            memory_accounting_policy: cache.memory_accounting_policy,
             worker_process_rss_bytes: worker_memory.rss_bytes,
             worker_process_virtual_bytes: worker_memory.virtual_bytes,
-            worker_memory_sample_policy: worker_memory.policy.to_owned(),
+            worker_memory_sample_policy: worker_memory.policy,
             worker_memory_budget_bytes: u64_to_i64_saturating(options.max_worker_rss_bytes),
-            worker_memory_budget_policy: worker_memory_budget_policy(options.max_worker_rss_bytes)
-                .to_owned(),
+            worker_memory_budget_policy: worker_memory_budget_policy(options.max_worker_rss_bytes),
             prompt_tokens: usize_to_i64_saturating(tokens.len()),
             prompt_cached_tokens_before: usize_to_i64_saturating(prompt_cached_tokens_before),
             prompt_reused_tokens: usize_to_i64_saturating(prompt_reused_tokens),
             prompt_decoded_tokens: usize_to_i64_saturating(prompt_decoded_tokens),
-            prompt_reuse_strategy: prompt_reuse_strategy.to_owned(),
+            prompt_reuse_strategy,
             prompt_prefix_state_bytes,
             prompt_prefix_cache_entries: usize_to_i64_saturating(cache.prompt_prefix_states.len()),
             prompt_prefix_cache_bytes: usize_to_i64_saturating(linked_prompt_prefix_cache_bytes(cache)),
@@ -374,18 +377,30 @@ fn run_linked(
             inference_cache_max_entries: inference_cache_max_entries(),
             inference_cache_max_bytes: inference_cache_max_bytes(),
             inference_cache_evictions: 0,
-            inference_cache_eviction_reason: "none".to_owned(),
-            inference_cache_invalidation_reason: "miss".to_owned(),
+            inference_cache_eviction_reason: "none",
+            inference_cache_invalidation_reason: "miss",
             probability_summary: probability_trace.summary(),
             detailed_trace: detailed_trace.summary(stop_reason),
-            stop_reason: stop_reason.to_owned(),
+            stop_reason,
         },
     })
 }
 
-fn linked_attempt_timed_out(start: Instant, max_attempt_ms: i64) -> bool {
-    max_attempt_ms > 0
-        && start.elapsed().as_millis() >= u128::try_from(max_attempt_ms).unwrap_or(u128::MAX)
+fn trim_model_output(output: String) -> String {
+    if output.len() == output.trim().len() {
+        output
+    } else {
+        output.trim().to_owned()
+    }
+}
+
+fn linked_attempt_deadline(start: Instant, max_attempt_ms: i64) -> Option<Instant> {
+    let milliseconds = u64::try_from(max_attempt_ms).ok().filter(|value| *value > 0)?;
+    start.checked_add(Duration::from_millis(milliseconds))
+}
+
+fn linked_attempt_timed_out(deadline: Option<Instant>) -> bool {
+    deadline.is_some_and(|deadline| Instant::now() >= deadline)
 }
 
 fn linked_decode_threads(options: &crate::runtime::RuntimeOptions) -> i32 {
@@ -549,19 +564,20 @@ fn linked_decode_prompt_tokens(
 /// Cooperative cancellation is checked on a time slice instead of around every
 /// llama.cpp call, so the SPI round-trip does not tax each generated token.
 struct CancelProbe {
-    last_check: Instant,
+    next_check: Instant,
 }
 
 impl CancelProbe {
     fn new() -> Self {
         Self {
-            last_check: Instant::now(),
+            next_check: Instant::now() + Duration::from_millis(LINKED_CANCELLATION_SLICE_MS),
         }
     }
 
     fn due(&mut self) -> bool {
-        if self.last_check.elapsed().as_millis() >= u128::from(LINKED_CANCELLATION_SLICE_MS) {
-            self.last_check = Instant::now();
+        let now = Instant::now();
+        if now >= self.next_check {
+            self.next_check = now + Duration::from_millis(LINKED_CANCELLATION_SLICE_MS);
             true
         } else {
             false
@@ -1093,16 +1109,6 @@ fn linked_token_to_piece_into(
     Ok(())
 }
 
-fn linked_token_to_piece(
-    vocab: *const llama_cpp_sys_4::llama_vocab,
-    token: llama_cpp_sys_4::llama_token,
-) -> String {
-    let mut output = Vec::new();
-    let mut buffer = vec![0_u8; 128];
-    let _ = linked_token_to_piece_into(vocab, token, &mut buffer, &mut output);
-    String::from_utf8_lossy(&output).into_owned()
-}
-
 fn linked_clear_context(context: *mut llama_cpp_sys_4::llama_context) {
     unsafe {
         let memory = llama_cpp_sys_4::llama_get_memory(context);
@@ -1178,7 +1184,11 @@ impl JsonCompletion {
 
 #[cfg(test)]
 mod tests {
-    use super::JsonCompletion;
+    use super::{
+        CancelProbe, JsonCompletion, linked_attempt_deadline, linked_attempt_timed_out,
+        trim_model_output,
+    };
+    use std::time::{Duration, Instant};
 
     #[test]
     fn json_completion_accepts_utf8_split_across_pieces() {
@@ -1206,6 +1216,40 @@ mod tests {
             completion.observe(suffix),
             Some(prefix.len() + suffix.len())
         );
+    }
+
+    #[test]
+    fn trim_model_output_reuses_clean_allocation_and_trims_padding() {
+        let clean = "{\"output\":{},\"actions\":[]}".to_owned();
+        let clean_ptr = clean.as_ptr();
+        let reused = trim_model_output(clean);
+        assert_eq!(reused.as_ptr(), clean_ptr);
+        assert_eq!(
+            trim_model_output(format!("  {reused}\n")),
+            "{\"output\":{},\"actions\":[]}"
+        );
+    }
+
+    #[test]
+    fn attempt_deadline_preserves_disabled_expired_and_future_states() {
+        let now = Instant::now();
+        assert!(linked_attempt_deadline(now, 0).is_none());
+        assert!(linked_attempt_timed_out(linked_attempt_deadline(
+            now - Duration::from_millis(2),
+            1
+        )));
+        assert!(!linked_attempt_timed_out(linked_attempt_deadline(
+            now, 60_000
+        )));
+    }
+
+    #[test]
+    fn cancellation_probe_reschedules_after_becoming_due() {
+        let mut probe = CancelProbe {
+            next_check: Instant::now() - Duration::from_millis(1),
+        };
+        assert!(probe.due());
+        assert!(!probe.due());
     }
 }
 

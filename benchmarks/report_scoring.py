@@ -36,6 +36,8 @@ def add_otlet_fit(row):
 
 
 def gate_failures(row):
+    if "_final_gate_failures" in row:
+        return row["_final_gate_failures"]
     failures = list(row.get("_gate_failures") or [])
     if not failures:
         if row.get("run_status") and row.get("run_status") != "complete":
@@ -73,7 +75,15 @@ def gate_failures(row):
     return failures
 
 
+def finalize_gate_failures(rows):
+    for row in rows:
+        row["_final_gate_failures"] = gate_failures(row)
+    return rows
+
+
 def display_verdict(row):
+    if "_final_display_verdict" in row:
+        return row["_final_display_verdict"]
     if row.get("run_status") and row.get("run_status") != "complete":
         return "not_supported"
     failures = gate_failures(row)
@@ -128,14 +138,20 @@ def display_verdict(row):
 
 
 def gate_status(row):
+    if "_final_gate_status" in row:
+        return row["_final_gate_status"]
     return "pass" if not gate_failures(row) else "fail"
 
 
 def production_score(row):
+    if "_final_production_score" in row:
+        return row["_final_production_score"]
     return num(row.get("trusted_fit_score")) if gate_status(row) == "pass" else 0.0
 
 
 def readiness(row):
+    if "_final_readiness" in row:
+        return row["_final_readiness"]
     if row.get("run_status") and row.get("run_status") != "complete":
         return "not_supported"
     failures = gate_failures(row)
@@ -162,6 +178,15 @@ def readiness(row):
     if num(row.get("schema_valid_rate")) < 0.25 or num(row.get("contract_score")) < 0.25:
         return "contract_blocked"
     return "research_only"
+
+
+def finalize_report_status(rows):
+    for row in rows:
+        row["_final_gate_status"] = gate_status(row)
+        row["_final_display_verdict"] = display_verdict(row)
+        row["_final_readiness"] = readiness(row)
+        row["_final_production_score"] = production_score(row)
+    return rows
 
 
 def first_blocker(row):
@@ -242,12 +267,10 @@ def benchmark_confidence(summaries, raw_summaries, case_count, run_ids):
 
 
 def mean(values):
-    values = [v for v in values if v != "" and v is not None]
     return statistics.fmean(values) if values else 0.0
 
 
 def stdev(values):
-    values = [v for v in values if v != "" and v is not None]
     return statistics.stdev(values) if len(values) >= 2 else 0.0
 
 
@@ -345,12 +368,18 @@ def aggregate_summaries(rows, models):
         )
 
         for field in mean_fields:
-            values = [num(row.get(field), None) for row in group]
-            values = [value for value in values if value is not None]
+            values = [
+                value
+                for row in group
+                if (value := num(row.get(field), None)) is not None
+            ]
             aggregate[field] = mean(values) if values else ""
         for field in max_fields:
-            values = [num(row.get(field), None) for row in group]
-            values = [value for value in values if value is not None]
+            values = [
+                value
+                for row in group
+                if (value := num(row.get(field), None)) is not None
+            ]
             aggregate[field] = max(values) if values else 0.0
 
         repeat_failures = []

@@ -18,6 +18,8 @@ from report_scoring import (
     case_failure_mode,
     current_report_rows,
     display_verdict,
+    finalize_gate_failures,
+    finalize_report_status,
     first_blocker,
     gate_failures,
     gate_status,
@@ -48,9 +50,14 @@ def main():
     for row in cases:
         with_base_key(row, base_by_model)
     summaries = add_missing_model_rows(aggregate_summaries(raw_summaries, models), models)
-    report_summaries = current_report_rows(summaries)
+    report_summaries = finalize_report_status(
+        finalize_gate_failures(current_report_rows(summaries))
+    )
     report_model_keys = {row.get("model_key", "") for row in report_summaries}
     report_cases = [row for row in cases if row.get("base_model_key") in report_model_keys]
+    cases_by_model = {}
+    for row in report_cases:
+        cases_by_model.setdefault(row.get("base_model_key", ""), []).append(row)
     meta = read_kv(run_dir / "metadata.tsv")
     cleanup = read_kv(run_dir / "cleanup.tsv")
     for row in summaries:
@@ -262,9 +269,7 @@ def main():
     for row in diagnostic_ranked_summaries:
         model_key = row.get("model_key", "")
         counts = {}
-        for case in report_cases:
-            if case.get("base_model_key") != model_key:
-                continue
+        for case in cases_by_model.get(model_key, ()):
             mode = case_failure_mode(case)
             counts[mode] = counts.get(mode, 0) + 1
         non_passed = {mode: count for mode, count in counts.items() if mode != "passed"}
@@ -329,14 +334,14 @@ def main():
     seen_failure_models = set()
     for summary in diagnostic_ranked_summaries:
         model_key = summary.get("model_key", "")
-        for row in report_cases:
+        for row in cases_by_model.get(model_key, ()):
             failed = (
                 row.get("schema_valid") != "t"
                 or row.get("match_correct") != "t"
                 or row.get("confidence_correct") != "t"
                 or row.get("action_correct") != "t"
             )
-            if not failed or row.get("base_model_key") != model_key or model_key in seen_failure_models:
+            if not failed or model_key in seen_failure_models:
                 continue
             failure_rows.append(
                 {

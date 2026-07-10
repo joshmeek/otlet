@@ -411,7 +411,7 @@ ON otlet.jobs (leased_until, id)
 WHERE status IN ('running', 'cancel_requested');
 
 CREATE INDEX jobs_finished_terminal_idx
-ON otlet.jobs (finished_at, id)
+ON otlet.jobs (finished_at, created_at, id)
 WHERE status IN ('failed', 'canceled');
 
 CREATE INDEX jobs_complete_subject_finished_idx
@@ -458,9 +458,29 @@ CREATE TABLE otlet.inference_receipts (
 CREATE INDEX inference_receipts_task_model_role_finished_idx
 ON otlet.inference_receipts (task_name, model_name, selection_role, finished_at DESC, id DESC);
 
+CREATE INDEX inference_receipts_model_success_finished_idx
+ON otlet.inference_receipts (model_name, finished_at DESC, id DESC)
+INCLUDE (task_name, generate_ms)
+WHERE status = 'complete'
+  AND schema_validation_status = 'passed'
+  AND COALESCE(generate_ms, 0) > 0;
+
 CREATE INDEX inference_receipts_rejected_retention_idx
 ON otlet.inference_receipts (finished_at, id)
 WHERE selection_status = 'rejected' AND raw_output IS NOT NULL;
+
+CREATE INDEX inference_receipts_trace_steps_finished_idx
+ON otlet.inference_receipts (finished_at, id)
+WHERE jsonb_typeof(trace_summary #> '{detailed_trace,steps}') = 'array'
+  AND jsonb_array_length(trace_summary #> '{detailed_trace,steps}') > 0;
+
+CREATE INDEX inference_receipts_direct_rejected_review_idx
+ON otlet.inference_receipts (finished_at, id)
+WHERE selection_role = 'direct'
+  AND selection_status = 'rejected'
+  AND selection_reason = 'direct_rejected_by_decision_contract'
+  AND schema_validation_status = 'passed'
+  AND NULLIF(raw_output, '') IS NOT NULL;
 
 CREATE TABLE otlet.worker_events (
   id bigserial PRIMARY KEY,
@@ -478,6 +498,10 @@ ON otlet.worker_events (event_type, created_at DESC, id DESC);
 CREATE INDEX worker_events_type_model_created_idx
 ON otlet.worker_events (event_type, (detail ->> 'model_name'), created_at DESC)
 WHERE detail ? 'model_name';
+
+CREATE INDEX worker_events_queue_suppressed_task_created_idx
+ON otlet.worker_events ((detail ->> 'task_name'), created_at DESC, id DESC)
+WHERE event_type = 'queue_admission_suppressed' AND detail ? 'task_name';
 
 CREATE INDEX worker_events_job_id_idx
 ON otlet.worker_events (job_id)
@@ -548,6 +572,11 @@ ON otlet.actions (job_id);
 CREATE INDEX actions_receipt_id_idx
 ON otlet.actions (receipt_id)
 WHERE receipt_id IS NOT NULL;
+
+CREATE INDEX actions_review_queue_idx
+ON otlet.actions (created_at, id)
+WHERE (approval_status = 'required' AND status = 'proposed')
+   OR (action_type = 'review_flag' AND status <> 'rejected');
 
 CREATE TABLE otlet.records (
   id bigserial PRIMARY KEY,

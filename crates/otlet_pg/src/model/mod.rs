@@ -7,7 +7,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fs;
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{Instant, UNIX_EPOCH};
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
 pub(crate) struct ModelRun {
     pub(crate) output: Value,
@@ -28,18 +28,18 @@ pub(crate) struct ModelMetrics {
     pub(crate) model_memory_bytes: i64,
     pub(crate) model_parameters: i64,
     pub(crate) context_window_tokens: i64,
-    pub(crate) model_device_policy: String,
-    pub(crate) memory_accounting_policy: String,
+    pub(crate) model_device_policy: &'static str,
+    pub(crate) memory_accounting_policy: &'static str,
     pub(crate) worker_process_rss_bytes: i64,
     pub(crate) worker_process_virtual_bytes: i64,
-    pub(crate) worker_memory_sample_policy: String,
+    pub(crate) worker_memory_sample_policy: &'static str,
     pub(crate) worker_memory_budget_bytes: i64,
-    pub(crate) worker_memory_budget_policy: String,
+    pub(crate) worker_memory_budget_policy: &'static str,
     pub(crate) prompt_tokens: i64,
     pub(crate) prompt_cached_tokens_before: i64,
     pub(crate) prompt_reused_tokens: i64,
     pub(crate) prompt_decoded_tokens: i64,
-    pub(crate) prompt_reuse_strategy: String,
+    pub(crate) prompt_reuse_strategy: &'static str,
     pub(crate) prompt_prefix_state_bytes: i64,
     pub(crate) prompt_prefix_cache_entries: i64,
     pub(crate) prompt_prefix_cache_bytes: i64,
@@ -58,11 +58,11 @@ pub(crate) struct ModelMetrics {
     pub(crate) inference_cache_max_entries: i64,
     pub(crate) inference_cache_max_bytes: i64,
     pub(crate) inference_cache_evictions: i64,
-    pub(crate) inference_cache_eviction_reason: String,
-    pub(crate) inference_cache_invalidation_reason: String,
+    pub(crate) inference_cache_eviction_reason: &'static str,
+    pub(crate) inference_cache_invalidation_reason: &'static str,
     pub(crate) probability_summary: Value,
     pub(crate) detailed_trace: Value,
-    pub(crate) stop_reason: String,
+    pub(crate) stop_reason: &'static str,
 }
 
 pub(crate) struct ModelError {
@@ -182,11 +182,11 @@ struct RunContext {
     input_content_hash: String,
     inference_cache_contract_hash: String,
     inference_cache_key_basis: &'static str,
-    cache_key: String,
-    content_cache_key: String,
-    contract_cache_key: String,
-    row_cache_key: String,
-    model_cache_key: String,
+    cache_key: u64,
+    content_cache_key: u64,
+    contract_cache_key: u64,
+    row_cache_key: u64,
+    model_cache_key: u64,
     row_identity: String,
     mvcc: Value,
     shaped_input_bytes: i64,
@@ -213,8 +213,11 @@ pub(crate) fn run_job_with_model(job: &Job, model: &JobModel) -> Result<ModelRun
 }
 
 fn run_job_with_model_ref(job: &Job, model: JobModelRef<'_>) -> Result<ModelRun, ModelError> {
-    let options = parse_runtime_options(&job.runtime_options).map_err(ModelError::new)?;
     let digests = task_contract_digests(job);
+    let options = digests
+        .runtime_options
+        .as_ref()
+        .map_err(|err| ModelError::new(err.clone()))?;
     let model_fingerprint_hash = model_fingerprint_hash(model);
     // Cache keys use content/contract/model digests only — look up before
     // allocating shaped JSON or prompt strings. Hits stream the same hashes.
@@ -231,11 +234,11 @@ fn run_job_with_model_ref(job: &Job, model: JobModelRef<'_>) -> Result<ModelRun,
         input_content_hash: job.input_content_hash.clone(),
         inference_cache_contract_hash: digests.inference_cache_contract_hash.clone(),
         inference_cache_key_basis: "content_hash_contract_hash_model_fingerprint",
-        cache_key: String::new(),
-        content_cache_key: String::new(),
-        contract_cache_key: String::new(),
-        row_cache_key: String::new(),
-        model_cache_key: String::new(),
+        cache_key: 0,
+        content_cache_key: 0,
+        contract_cache_key: 0,
+        row_cache_key: 0,
+        model_cache_key: 0,
         row_identity: input_mvcc_row_identity(&job.input, &job.subject_id),
         mvcc: input_mvcc_payload(&job.input),
         shaped_input_bytes: 0,
@@ -250,17 +253,17 @@ fn run_job_with_model_ref(job: &Job, model: JobModelRef<'_>) -> Result<ModelRun,
     };
     let content_cache_key = inference_cache_content_key(job, &cache_probe);
     let contract_cache_key = inference_cache_contract_key(&cache_probe);
-    let row_cache_key = inference_cache_row_key(&content_cache_key, &contract_cache_key);
+    let row_cache_key = inference_cache_row_key(job);
     let model_cache_key = inference_cache_model_key(model, &cache_probe);
-    let cache_key = inference_cache_key(&row_cache_key, &model_cache_key);
+    let cache_key = inference_cache_key(content_cache_key, contract_cache_key, model_cache_key);
 
     let cache_lookup = if options.inference_cache && !options.generation_trace {
         inference_cache_get(
-            &cache_key,
-            &row_cache_key,
-            &content_cache_key,
-            &contract_cache_key,
-            &model_cache_key,
+            cache_key,
+            row_cache_key,
+            content_cache_key,
+            contract_cache_key,
+            model_cache_key,
         )
     } else if options.generation_trace {
         CacheLookup::disabled_for("disabled_for_generation_trace")
@@ -296,9 +299,9 @@ fn run_job_with_model_ref(job: &Job, model: JobModelRef<'_>) -> Result<ModelRun,
         }
         let (prompt_hash, input_hash, shaped_bytes, original_bytes, input_truncated) =
             shaped_prompt_hashes_for_cache_hit(
-                &options,
+                options,
                 &digests.instruction,
-                cached_rendered_schema(&job.output_schema).as_ref(),
+                cached_rendered_schema(&job.output_schema, &digests.output_schema_hash).as_ref(),
                 &job.input,
             );
         let context = RunContext {
@@ -336,21 +339,20 @@ fn run_job_with_model_ref(job: &Job, model: JobModelRef<'_>) -> Result<ModelRun,
                 model_memory_bytes: 0,
                 model_parameters: 0,
                 context_window_tokens: 0,
-                model_device_policy: "preserve_existing_on_inference_cache_hit".to_owned(),
-                memory_accounting_policy: LINKED_MEMORY_ACCOUNTING_POLICY.to_owned(),
+                model_device_policy: "preserve_existing_on_inference_cache_hit",
+                memory_accounting_policy: LINKED_MEMORY_ACCOUNTING_POLICY,
                 worker_process_rss_bytes: worker_memory.rss_bytes,
                 worker_process_virtual_bytes: worker_memory.virtual_bytes,
-                worker_memory_sample_policy: worker_memory.policy.to_owned(),
+                worker_memory_sample_policy: worker_memory.policy,
                 worker_memory_budget_bytes: u64_to_i64_saturating(options.max_worker_rss_bytes),
                 worker_memory_budget_policy: worker_memory_budget_policy(
                     options.max_worker_rss_bytes,
-                )
-                .to_owned(),
+                ),
                 prompt_tokens: 0,
                 prompt_cached_tokens_before: 0,
                 prompt_reused_tokens: 0,
                 prompt_decoded_tokens: 0,
-                prompt_reuse_strategy: "inference_cache_hit".to_owned(),
+                prompt_reuse_strategy: "inference_cache_hit",
                 prompt_prefix_state_bytes: 0,
                 prompt_prefix_cache_entries: 0,
                 prompt_prefix_cache_bytes: 0,
@@ -369,58 +371,51 @@ fn run_job_with_model_ref(job: &Job, model: JobModelRef<'_>) -> Result<ModelRun,
                 inference_cache_max_entries: inference_cache_max_entries(),
                 inference_cache_max_bytes: inference_cache_max_bytes(),
                 inference_cache_evictions: cache_lookup.stats.evictions,
-                inference_cache_eviction_reason: cache_lookup.stats.eviction_reason.to_owned(),
-                inference_cache_invalidation_reason: cache_lookup.reason.to_owned(),
+                inference_cache_eviction_reason: cache_lookup.stats.eviction_reason,
+                inference_cache_invalidation_reason: cache_lookup.reason,
                 probability_summary: probability_unavailable(
                     "inference_cache_hit_no_generation_logits",
                 ),
                 detailed_trace: detailed_trace_unavailable(
                     "inference_cache_hit_no_generation_logits",
-                    &options,
+                    options,
                 ),
-                stop_reason: "inference_cache_hit".to_owned(),
+                stop_reason: "inference_cache_hit",
             },
             context,
         )
     } else {
-        validate_output_schema(&job.output_schema).map_err(|err| {
+        validate_output_schema(&job.output_schema, &digests.output_schema_hash).map_err(|err| {
             ModelError::clean_failure(
                 err,
                 "invalid_output_schema_before_generation",
                 "invalid_output_schema",
             )
         })?;
-        let shaped_input = shaped_model_input(&job.input);
-        let rendered_schema = cached_rendered_schema(&job.output_schema);
+        let rendered_schema =
+            cached_rendered_schema(&job.output_schema, &digests.output_schema_hash);
         let prompt_prefix = cached_prompt_prefix(
             &job.task_name,
-            &options,
+            options,
             &digests.instruction,
             rendered_schema.as_ref(),
-            &digests.output_schema_hash,
         );
-        let prompt_hash = hash_prompt_full(&prompt_prefix, &shaped_input.serialized);
+        let shaped_prompt = shaped_model_prompt(&job.input, &prompt_prefix);
         let context = RunContext {
-            prompt_hash,
-            input_hash: hash_text(&shaped_input.serialized),
+            prompt_hash: shaped_prompt.prompt_hash,
+            input_hash: shaped_prompt.input_hash,
             cache_key,
             content_cache_key,
             contract_cache_key,
             row_cache_key,
             model_cache_key,
-            shaped_input_bytes: shaped_input.bytes,
-            original_shaped_input_bytes: shaped_input.original_bytes,
-            input_truncated: shaped_input.input_truncated,
+            shaped_input_bytes: shaped_prompt.bytes,
+            original_shaped_input_bytes: shaped_prompt.original_bytes,
+            input_truncated: shaped_prompt.input_truncated,
             ..cache_probe
         };
-        let mut full = String::with_capacity(
-            prompt_prefix.len() + shaped_input.serialized.len() + PROMPT_BODY_AFTER_INPUT.len(),
-        );
-        full.push_str(&prompt_prefix);
-        full.push_str(&shaped_input.serialized);
-        full.push_str(PROMPT_BODY_AFTER_INPUT);
         let prompt = PromptParts {
-            full,
+            full: shaped_prompt.full,
             prefix: prompt_prefix,
         };
         let linked = run_linked(
@@ -428,7 +423,7 @@ fn run_job_with_model_ref(job: &Job, model: JobModelRef<'_>) -> Result<ModelRun,
             model,
             &prompt.full,
             &prompt.prefix,
-            &options,
+            options,
             &context.model_fingerprint_hash,
         )
         .map_err(|mut err| {
@@ -439,7 +434,7 @@ fn run_job_with_model_ref(job: &Job, model: JobModelRef<'_>) -> Result<ModelRun,
         })?;
         let mut metrics = linked.metrics;
         metrics.inference_cache_hit = false;
-        metrics.inference_cache_invalidation_reason = cache_lookup.reason.to_owned();
+        metrics.inference_cache_invalidation_reason = cache_lookup.reason;
         (RawOutput::Generated(linked.raw_output), metrics, context)
     };
     let cache_enabled = options.inference_cache && !options.generation_trace;
@@ -517,7 +512,7 @@ fn run_job_with_model_ref(job: &Job, model: JobModelRef<'_>) -> Result<ModelRun,
             .with_metrics(metrics));
         }
     };
-    if let Err(err) = validate_output(&job.output_schema, &output) {
+    if let Err(err) = validate_output(&job.output_schema, &digests.output_schema_hash, &output) {
         return Err(ModelError::with_context(
             err,
             raw_output.into_owned(),
@@ -539,7 +534,7 @@ fn run_job_with_model_ref(job: &Job, model: JobModelRef<'_>) -> Result<ModelRun,
         metrics.inference_cache_entries = stats.entries;
         metrics.inference_cache_bytes = stats.bytes;
         metrics.inference_cache_evictions = stats.evictions;
-        metrics.inference_cache_eviction_reason = stats.eviction_reason.to_owned();
+        metrics.inference_cache_eviction_reason = stats.eviction_reason;
         return Ok(ModelRun {
             output,
             raw_output: raw_json,
@@ -590,12 +585,6 @@ fn prompt_prefix(
     format!(
         "{reasoning}{PROMPT_BODY_BEFORE_INSTRUCTION}{instruction}{PROMPT_BODY_BEFORE_SCHEMA}{rendered_schema}{PROMPT_BODY_BEFORE_INPUT}"
     )
-}
-
-fn hash_prompt_full(prefix: &str, shaped_input: &str) -> String {
-    // Same byte sequence as format!("{prefix}{shaped_input}{PROMPT_BODY_AFTER_INPUT}")
-    // without allocating the concatenated prompt string on cache hits.
-    hash_text_parts(&[prefix, shaped_input, PROMPT_BODY_AFTER_INPUT])
 }
 
 fn response_envelope_schema(output_schema: &Value) -> Value {

@@ -126,6 +126,9 @@ impl ProbabilityTrace {
     }
 
     fn observe(&mut self, sample: Option<&ProbabilitySample>) {
+        if self.max_tokens == 0 {
+            return;
+        }
         if self.max_tokens > 0 && self.sampled_tokens + self.skipped_tokens >= self.max_tokens {
             self.skipped_tokens += 1;
             return;
@@ -203,6 +206,8 @@ unsafe fn probability_sample(
     vocab: *const llama_cpp_sys_4::llama_vocab,
     token: llama_cpp_sys_4::llama_token,
     top_k: u64,
+    token_piece_buffer: &mut Vec<u8>,
+    token_piece_output: &mut Vec<u8>,
 ) -> Option<ProbabilitySample> {
     unsafe {
         if context.is_null() || vocab.is_null() || token < 0 {
@@ -260,12 +265,16 @@ unsafe fn probability_sample(
                 .enumerate()
                 .map(|(index, (token_id, logit))| {
                     let probability = ((logit - top_logit).exp() / denominator).max(0.0);
+                    token_piece_output.clear();
+                    let _ = linked_token_to_piece_into(
+                        vocab,
+                        llama_cpp_sys_4::llama_token::try_from(token_id).unwrap_or_default(),
+                        token_piece_buffer,
+                        token_piece_output,
+                    );
                     TokenAlternative {
                         token_id,
-                        token_text: linked_token_to_piece(
-                            vocab,
-                            llama_cpp_sys_4::llama_token::try_from(token_id).unwrap_or_default(),
-                        ),
+                        token_text: String::from_utf8_lossy(token_piece_output).into_owned(),
                         logit: rounded_probability(logit),
                         probability: rounded_probability(probability),
                         logprob: rounded_probability(if probability > 0.0 {
@@ -301,6 +310,9 @@ fn push_top_logit(top: &mut Vec<(i64, f64)>, limit: usize, token_id: i64, logit:
     if limit == 0 {
         return;
     }
+    if top.len() == limit && top.last().is_some_and(|(_, existing)| logit <= *existing) {
+        return;
+    }
     let insert_at = top.iter().position(|(_, existing)| logit > *existing);
     match insert_at {
         Some(index) => top.insert(index, (token_id, logit)),
@@ -308,6 +320,29 @@ fn push_top_logit(top: &mut Vec<(i64, f64)>, limit: usize, token_id: i64, logit:
         None => {}
     }
     top.truncate(limit);
+}
+
+#[cfg(test)]
+mod trace_tests {
+    use super::{ProbabilityTrace, push_top_logit};
+
+    #[test]
+    fn top_logits_reject_noncompetitive_values_without_changing_order() {
+        let mut top = Vec::new();
+        for (token_id, logit) in [1.0, 3.0, 2.0, 0.5, 4.0].into_iter().enumerate() {
+            push_top_logit(&mut top, 3, token_id as i64, logit);
+        }
+
+        assert_eq!(top, vec![(4, 4.0), (1, 3.0), (2, 2.0)]);
+    }
+
+    #[test]
+    fn disabled_probability_trace_does_not_count_skipped_tokens() {
+        let mut trace = ProbabilityTrace::default();
+        trace.observe(None);
+        assert_eq!(trace.sampled_tokens, 0);
+        assert_eq!(trace.skipped_tokens, 0);
+    }
 }
 
 struct DetailedGenerationTrace {
@@ -345,7 +380,7 @@ impl DetailedGenerationTrace {
     fn observe(
         &mut self,
         token: llama_cpp_sys_4::llama_token,
-        token_text: &str,
+        token_piece: &[u8],
         sample: Option<ProbabilitySample>,
     ) {
         if !self.enabled {
@@ -355,8 +390,9 @@ impl DetailedGenerationTrace {
             self.skipped_tokens += 1;
             return;
         }
+        let token_text = String::from_utf8_lossy(token_piece);
         self.chosen_token_ids.push(i64::from(token));
-        self.chosen_text.push_str(token_text);
+        self.chosen_text.push_str(&token_text);
         let step = usize_to_i64_saturating(self.steps.len()).saturating_add(1);
         let trace = match sample {
             Some(sample) => json!({

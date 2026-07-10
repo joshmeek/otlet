@@ -1,5 +1,7 @@
-struct ShapedInput {
-    serialized: String,
+struct ShapedPrompt {
+    full: String,
+    prompt_hash: String,
+    input_hash: String,
     bytes: i64,
     original_bytes: i64,
     input_truncated: bool,
@@ -35,23 +37,29 @@ fn shaped_input_meta(input: &Value, serialized_len: usize) -> (i64, i64, bool) {
     (bytes, original_bytes, input_truncated)
 }
 
-fn shaped_model_input(input: &Value) -> ShapedInput {
-    let serialized = with_shaped_input_bytes(input, |buf| {
-        // One exact-sized String alloc; TLS keeps capacity for the next job.
-        std::str::from_utf8(buf)
-            .expect("serde_json writes UTF-8")
-            .to_owned()
-    });
-    let (bytes, original_bytes, input_truncated) = shaped_input_meta(input, serialized.len());
-    ShapedInput {
-        serialized,
-        bytes,
-        original_bytes,
-        input_truncated,
-    }
+fn shaped_model_prompt(input: &Value, prefix: &str) -> ShapedPrompt {
+    with_shaped_input_bytes(input, |buf| {
+        let shaped_input = std::str::from_utf8(buf).expect("serde_json writes UTF-8");
+        let (bytes, original_bytes, input_truncated) = shaped_input_meta(input, buf.len());
+        let prompt_hash = hash_text_parts(&[prefix, shaped_input, PROMPT_BODY_AFTER_INPUT]);
+        let input_hash = hash_text(shaped_input);
+        let mut full =
+            String::with_capacity(prefix.len() + shaped_input.len() + PROMPT_BODY_AFTER_INPUT.len());
+        full.push_str(prefix);
+        full.push_str(shaped_input);
+        full.push_str(PROMPT_BODY_AFTER_INPUT);
+        ShapedPrompt {
+            full,
+            prompt_hash,
+            input_hash,
+            bytes,
+            original_bytes,
+            input_truncated,
+        }
+    })
 }
 
-/// Cache-hit path: same hashes/metadata as shaped_model_input + hash_prompt_full
+/// Cache-hit path: same hashes/metadata as shaped_model_prompt
 /// without allocating the shaped JSON String or prompt prefix String.
 fn shaped_prompt_hashes_for_cache_hit(
     options: &crate::runtime::RuntimeOptions,
@@ -104,91 +112,146 @@ fn effective_instruction(instruction: &str, decision_contract: &Value) -> String
 const SCHEMA_VALIDATOR_CACHE_MAX_ENTRIES: usize = 16;
 const RENDERED_SCHEMA_CACHE_MAX_ENTRIES: usize = 16;
 type SchemaValidator = std::sync::Arc<jsonschema::Validator>;
-type SchemaValidatorCache = Vec<(Value, SchemaValidator)>;
-type RenderedSchemaCache = Vec<(Value, std::sync::Arc<str>)>;
 
-fn validate_output(schema: &Value, output: &Value) -> Result<(), String> {
-    let validator = cached_schema_validator(schema)?;
+struct DigestCacheEntry<T> {
+    schema: Value,
+    value: T,
+    last_access: u64,
+}
+
+struct DigestCache<T> {
+    entries: HashMap<String, DigestCacheEntry<T>>,
+    access_clock: u64,
+}
+
+impl<T: Clone> DigestCache<T> {
+    fn new() -> Self {
+        Self {
+            entries: HashMap::with_capacity(4),
+            access_clock: 0,
+        }
+    }
+
+    fn get(&mut self, digest: &str, schema: &Value) -> Option<T> {
+        self.next_access();
+        let entry = self.entries.get_mut(digest)?;
+        if entry.schema != *schema {
+            return None;
+        }
+        entry.last_access = self.access_clock;
+        Some(entry.value.clone())
+    }
+
+    fn insert(&mut self, digest: &str, schema: &Value, value: T, max_entries: usize) {
+        if self.entries.contains_key(digest) {
+            return;
+        }
+        if self.entries.len() >= max_entries
+            && let Some(oldest) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.last_access)
+                .map(|(key, _)| key.clone())
+        {
+            self.entries.remove(&oldest);
+        }
+        self.next_access();
+        self.entries.insert(
+            digest.to_owned(),
+            DigestCacheEntry {
+                schema: schema.clone(),
+                value,
+                last_access: self.access_clock,
+            },
+        );
+    }
+
+    fn next_access(&mut self) {
+        if self.access_clock == u64::MAX {
+            let mut order = self
+                .entries
+                .iter()
+                .map(|(key, entry)| (key.clone(), entry.last_access))
+                .collect::<Vec<_>>();
+            order.sort_unstable_by_key(|(_, last_access)| *last_access);
+            for (index, (key, _)) in order.into_iter().enumerate() {
+                self.entries.get_mut(&key).unwrap().last_access = index as u64 + 1;
+            }
+            self.access_clock = self.entries.len() as u64;
+        }
+        self.access_clock += 1;
+    }
+}
+
+fn validate_output(schema: &Value, schema_digest: &str, output: &Value) -> Result<(), String> {
+    let validator = cached_schema_validator(schema, schema_digest)?;
     validator
         .validate(output)
         .map_err(|err| format!("output schema validation failed: {err}"))
 }
 
-fn validate_output_schema(schema: &Value) -> Result<(), String> {
-    cached_schema_validator(schema).map(|_| ())
+fn validate_output_schema(schema: &Value, schema_digest: &str) -> Result<(), String> {
+    cached_schema_validator(schema, schema_digest).map(|_| ())
 }
 
 /// Task schemas repeat across jobs; compiling a jsonschema validator per run
 /// is wasted work, so keep a small LRU keyed by the exact schema
-fn cached_schema_validator(schema: &Value) -> Result<SchemaValidator, String> {
-    static CACHE: OnceLock<Mutex<SchemaValidatorCache>> = OnceLock::new();
+fn cached_schema_validator(schema: &Value, schema_digest: &str) -> Result<SchemaValidator, String> {
+    static CACHE: OnceLock<Mutex<DigestCache<SchemaValidator>>> = OnceLock::new();
 
-    let cache = CACHE.get_or_init(|| {
-        Mutex::new(Vec::with_capacity(SCHEMA_VALIDATOR_CACHE_MAX_ENTRIES))
-    });
+    let cache = CACHE.get_or_init(|| Mutex::new(DigestCache::new()));
     let mut cache = cache
         .lock()
         .map_err(|_| "schema validator cache lock poisoned".to_owned())?;
-    if let Some(index) = cache.iter().position(|(cached, _)| cached == schema) {
-        let validator = std::sync::Arc::clone(&cache[index].1);
-        if index + 1 < cache.len() {
-            let entry = cache.remove(index);
-            cache.push(entry);
-        }
-        drop(cache);
+    if let Some(validator) = cache.get(schema_digest, schema) {
         return Ok(validator);
     }
 
     let validator = SchemaValidator::new(
         jsonschema::validator_for(schema).map_err(|err| format!("invalid output schema: {err}"))?,
     );
-    cache.push((schema.clone(), std::sync::Arc::clone(&validator)));
-    if cache.len() > SCHEMA_VALIDATOR_CACHE_MAX_ENTRIES {
-        cache.remove(0);
-    }
-    drop(cache);
+    cache.insert(
+        schema_digest,
+        schema,
+        std::sync::Arc::clone(&validator),
+        SCHEMA_VALIDATOR_CACHE_MAX_ENTRIES,
+    );
     Ok(validator)
 }
 
 /// Response-envelope rendering is deterministic per output schema; reuse it
 /// across batch jobs that share a task schema.
-fn cached_rendered_schema(output_schema: &Value) -> Arc<str> {
-    static CACHE: OnceLock<Mutex<RenderedSchemaCache>> = OnceLock::new();
+fn cached_rendered_schema(output_schema: &Value, schema_digest: &str) -> Arc<str> {
+    static CACHE: OnceLock<Mutex<DigestCache<Arc<str>>>> = OnceLock::new();
 
-    let cache = CACHE.get_or_init(|| {
-        Mutex::new(Vec::with_capacity(RENDERED_SCHEMA_CACHE_MAX_ENTRIES))
-    });
+    let cache = CACHE.get_or_init(|| Mutex::new(DigestCache::new()));
     let Ok(mut cache) = cache.lock() else {
         return Arc::from(response_envelope_schema(output_schema).to_string());
     };
-    if let Some(index) = cache
-        .iter()
-        .position(|(cached, _)| cached == output_schema)
-    {
-        let rendered = Arc::clone(&cache[index].1);
-        if index + 1 < cache.len() {
-            let entry = cache.remove(index);
-            cache.push(entry);
-        }
+    if let Some(rendered) = cache.get(schema_digest, output_schema) {
         return rendered;
     }
 
     let shared: Arc<str> = Arc::from(response_envelope_schema(output_schema).to_string());
-    cache.push((output_schema.clone(), Arc::clone(&shared)));
-    if cache.len() > RENDERED_SCHEMA_CACHE_MAX_ENTRIES {
-        cache.remove(0);
-    }
+    cache.insert(
+        schema_digest,
+        output_schema,
+        Arc::clone(&shared),
+        RENDERED_SCHEMA_CACHE_MAX_ENTRIES,
+    );
     shared
 }
 
 fn trim_error(text: &str) -> String {
-    const MAX_ERROR_CHARS: usize = 2000;
-    if text.len() <= MAX_ERROR_CHARS {
+    const MAX_ERROR_BYTES: usize = 2000;
+    if text.len() <= MAX_ERROR_BYTES {
         return text.to_owned();
     }
-    let mut out = String::with_capacity(MAX_ERROR_CHARS);
-    out.extend(text.chars().take(MAX_ERROR_CHARS));
-    out
+    let mut end = MAX_ERROR_BYTES;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text[..end].to_owned()
 }
 
 fn elapsed_ms(start: Instant) -> i64 {
@@ -309,6 +372,10 @@ impl FnvWriter {
         out
     }
 
+    const fn finish_u64(self) -> u64 {
+        self.hash
+    }
+
     fn write_bytes(&mut self, bytes: &[u8]) {
         for byte in bytes {
             self.hash ^= u64::from(*byte);
@@ -347,6 +414,14 @@ fn hash_text_parts(parts: &[&str]) -> String {
         writer.write_bytes(part.as_bytes());
     }
     writer.finish()
+}
+
+fn hash_bytes_parts_u64(parts: &[&[u8]]) -> u64 {
+    let mut writer = FnvWriter::new();
+    for part in parts {
+        writer.write_bytes(part);
+    }
+    writer.finish_u64()
 }
 
 fn model_actions(actions: Value) -> Result<Value, String> {
@@ -416,8 +491,64 @@ fn parse_model_json(raw_output: &str) -> Result<Value, String> {
     Ok(value)
 }
 
+#[cfg(test)]
+mod output_tests {
+    use super::*;
+
+    #[test]
+    fn shaped_model_prompt_preserves_prompt_hashes_and_metadata() {
+        let input = json!({
+            "_otlet_input_truncated": true,
+            "original_shaped_input_bytes": 4096,
+            "text": "hello"
+        });
+        let prefix = "prompt-prefix\n";
+        let serialized = serde_json::to_string(&input).unwrap();
+        let shaped = shaped_model_prompt(&input, prefix);
+
+        assert_eq!(
+            shaped.full,
+            format!("{prefix}{serialized}{PROMPT_BODY_AFTER_INPUT}")
+        );
+        assert_eq!(shaped.prompt_hash, hash_text(&shaped.full));
+        assert_eq!(shaped.input_hash, hash_text(&serialized));
+        assert_eq!(shaped.bytes, serialized.len() as i64);
+        assert_eq!(shaped.original_bytes, 4096);
+        assert!(shaped.input_truncated);
+    }
+
+    #[test]
+    fn digest_cache_preserves_lru_order_when_access_clock_exhausts() {
+        let schema = json!({"type": "object"});
+        let mut cache = DigestCache::new();
+        cache.insert("old", &schema, 1, 2);
+        cache.insert("new", &schema, 2, 2);
+        cache.entries.get_mut("old").unwrap().last_access = 1;
+        cache.entries.get_mut("new").unwrap().last_access = u64::MAX;
+        cache.access_clock = u64::MAX;
+
+        assert_eq!(cache.get("new", &schema), Some(2));
+        cache.insert("third", &schema, 3, 2);
+
+        assert!(!cache.entries.contains_key("old"));
+        assert!(cache.entries.contains_key("new"));
+        assert!(cache.entries.contains_key("third"));
+    }
+
+    #[test]
+    fn trim_error_enforces_utf8_byte_limit() {
+        let text = "\u{1f642}".repeat(2001);
+        let trimmed = trim_error(&text);
+
+        assert_eq!(trimmed.len(), 2000);
+        assert_eq!(trimmed.chars().count(), 500);
+        assert!(text.starts_with(&trimmed));
+    }
+}
+
 struct TaskContractDigests {
     instruction: String,
+    runtime_options: Result<crate::runtime::RuntimeOptions, String>,
     output_schema_hash: String,
     runtime_options_hash: String,
     runtime_options_status: Value,
@@ -447,23 +578,14 @@ fn cached_prompt_prefix(
     options: &crate::runtime::RuntimeOptions,
     instruction: &str,
     rendered_schema: &str,
-    output_schema_hash: &str,
 ) -> Arc<str> {
-    let reasoning_off = options.reasoning == "off";
-    let mut key =
-        String::with_capacity(task_name.len() + output_schema_hash.len() + 8);
-    key.push_str(task_name);
-    key.push('|');
-    key.push_str(output_schema_hash);
-    key.push('|');
-    key.push(if reasoning_off { '0' } else { '1' });
     TASK_PROMPT_PREFIXES.with(|cell| {
         let mut map = cell.borrow_mut();
-        if let Some(cached) = map.get(&key) {
+        if let Some(cached) = map.get(task_name) {
             return Arc::clone(cached);
         }
         let prefix = Arc::<str>::from(prompt_prefix(options, instruction, rendered_schema));
-        map.insert(key, Arc::clone(&prefix));
+        map.insert(task_name.to_owned(), Arc::clone(&prefix));
         prefix
     })
 }
@@ -475,6 +597,7 @@ fn task_contract_digests(job: &Job) -> Arc<TaskContractDigests> {
             return Arc::clone(cached);
         }
         let instruction = effective_instruction(&job.instruction, &job.decision_contract);
+        let runtime_options = parse_runtime_options(&job.runtime_options);
         let instruction_hash = hash_text(&instruction);
         let output_schema_hash = hash_json(&job.output_schema);
         let runtime_options_hash = hash_json(&job.runtime_options);
@@ -503,6 +626,7 @@ fn task_contract_digests(job: &Job) -> Arc<TaskContractDigests> {
         );
         let digests = Arc::new(TaskContractDigests {
             instruction,
+            runtime_options,
             output_schema_hash,
             runtime_options_hash,
             runtime_options_status,

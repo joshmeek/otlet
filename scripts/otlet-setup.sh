@@ -85,15 +85,37 @@ ensure_model() {
   local cached
 
   cached="$(
-    docker exec "$container" sh -lc \
-      "find /var/lib/postgresql/.cache/huggingface/hub/$repo_cache/snapshots '$model_dir' -name '$model_file' -print -quit 2>/dev/null || true"
+    docker exec "$container" sh -c '
+      find -L "$1" "$2" -type f -name "$3" -print 2>/dev/null |
+        while IFS= read -r path; do
+          if [ "$(head -c 4 "$path" 2>/dev/null)" = GGUF ]; then
+            printf "%s\n" "$path"
+            break
+          fi
+        done
+    ' sh "/var/lib/postgresql/.cache/huggingface/hub/$repo_cache/snapshots" "$model_dir" "$model_file"
   )"
   if [ -n "$cached" ]; then
     printf '%s\n' "$cached"
     return
   fi
 
-  docker exec "$container" sh -lc "mkdir -p '$model_dir' && curl -fL --retry 3 '$model_url' -o '$model_dir/$model_file'"
+  if ! docker exec "$container" sh -c '
+    set -eu
+    destination="$1/$2"
+    temporary="$destination.part"
+    mkdir -p "$1"
+    rm -f "$temporary"
+    trap '\''rm -f "$temporary"'\'' EXIT
+    curl -fL --retry 3 --connect-timeout 20 "$3" -o "$temporary"
+    [ "$(head -c 4 "$temporary" 2>/dev/null)" = GGUF ] || {
+      echo "Downloaded model is not a GGUF artifact: $3" >&2
+      exit 1
+    }
+    mv "$temporary" "$destination"
+  ' sh "$model_dir" "$model_file" "$model_url"; then
+    return 1
+  fi
   printf '%s/%s\n' "$model_dir" "$model_file"
 }
 
@@ -101,35 +123,56 @@ log "Building Postgres image $image"
 docker build -t "$image" -f docker/postgres/Dockerfile .
 image_id="$(docker image inspect -f '{{.Id}}' "$image")"
 
-if docker ps -a --format '{{.Names}}' | grep -qx "$container"; then
+container_exists=false
+if docker container inspect "$container" >/dev/null 2>&1; then
+  container_exists=true
   container_image_id="$(docker inspect -f '{{.Image}}' "$container")"
   container_env="$(docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$container")"
-  env_val() { printf '%s\n' "$container_env" | sed -n "s/^$1=//p" | tail -n 1; }
-  container_worker_count="$(env_val OTLET_WORKER_COUNT)"
-  container_llama_threads="$(env_val OTLET_LLAMA_THREADS)"
-  container_llama_batch_threads="$(env_val OTLET_LLAMA_BATCH_THREADS)"
-  container_llama_batch_tokens="$(env_val OTLET_LLAMA_BATCH_TOKENS)"
-  container_llama_ubatch_tokens="$(env_val OTLET_LLAMA_UBATCH_TOKENS)"
-  container_llama_mmap="$(env_val OTLET_LLAMA_MMAP)"
-  container_llama_mlock="$(env_val OTLET_LLAMA_MLOCK)"
-  container_llama_flash_attn="$(env_val OTLET_LLAMA_FLASH_ATTN)"
-  container_llama_no_perf="$(env_val OTLET_LLAMA_NO_PERF)"
-  container_llama_kv_type="$(env_val OTLET_LLAMA_KV_TYPE)"
-  container_llama_kv_type_k="$(env_val OTLET_LLAMA_KV_TYPE_K)"
-  container_llama_kv_type_v="$(env_val OTLET_LLAMA_KV_TYPE_V)"
-  container_omp_proc_bind="$(env_val OMP_PROC_BIND)"
-  container_omp_places="$(env_val OMP_PLACES)"
-  container_gomp_cpu_affinity="$(env_val GOMP_CPU_AFFINITY)"
+  container_worker_count=""
+  container_llama_threads=""
+  container_llama_batch_threads=""
+  container_llama_batch_tokens=""
+  container_llama_ubatch_tokens=""
+  container_llama_mmap=""
+  container_llama_mlock=""
+  container_llama_flash_attn=""
+  container_llama_no_perf=""
+  container_llama_kv_type=""
+  container_llama_kv_type_k=""
+  container_llama_kv_type_v=""
+  container_omp_proc_bind=""
+  container_omp_places=""
+  container_gomp_cpu_affinity=""
+  while IFS='=' read -r key value; do
+    case "$key" in
+      OTLET_WORKER_COUNT) container_worker_count="$value" ;;
+      OTLET_LLAMA_THREADS) container_llama_threads="$value" ;;
+      OTLET_LLAMA_BATCH_THREADS) container_llama_batch_threads="$value" ;;
+      OTLET_LLAMA_BATCH_TOKENS) container_llama_batch_tokens="$value" ;;
+      OTLET_LLAMA_UBATCH_TOKENS) container_llama_ubatch_tokens="$value" ;;
+      OTLET_LLAMA_MMAP) container_llama_mmap="$value" ;;
+      OTLET_LLAMA_MLOCK) container_llama_mlock="$value" ;;
+      OTLET_LLAMA_FLASH_ATTN) container_llama_flash_attn="$value" ;;
+      OTLET_LLAMA_NO_PERF) container_llama_no_perf="$value" ;;
+      OTLET_LLAMA_KV_TYPE) container_llama_kv_type="$value" ;;
+      OTLET_LLAMA_KV_TYPE_K) container_llama_kv_type_k="$value" ;;
+      OTLET_LLAMA_KV_TYPE_V) container_llama_kv_type_v="$value" ;;
+      OMP_PROC_BIND) container_omp_proc_bind="$value" ;;
+      OMP_PLACES) container_omp_places="$value" ;;
+      GOMP_CPU_AFFINITY) container_gomp_cpu_affinity="$value" ;;
+    esac
+  done <<<"$container_env"
   if [ "$container_image_id" != "$image_id" ] || [ "$container_worker_count" != "$worker_count" ] || [ "$container_llama_threads" != "$llama_threads" ] || [ "$container_llama_batch_threads" != "$llama_batch_threads" ] || [ "$container_llama_batch_tokens" != "$llama_batch_tokens" ] || [ "$container_llama_ubatch_tokens" != "$llama_ubatch_tokens" ] || [ "$container_llama_mmap" != "$llama_mmap" ] || [ "$container_llama_mlock" != "$llama_mlock" ] || [ "$container_llama_flash_attn" != "$llama_flash_attn" ] || [ "$container_llama_no_perf" != "$llama_no_perf" ] || [ "$container_llama_kv_type" != "$llama_kv_type" ] || [ "$container_llama_kv_type_k" != "$llama_kv_type_k" ] || [ "$container_llama_kv_type_v" != "$llama_kv_type_v" ] || [ "$container_omp_proc_bind" != "$omp_proc_bind" ] || [ "$container_omp_places" != "$omp_places" ] || [ "$container_gomp_cpu_affinity" != "$gomp_cpu_affinity" ]; then
     log "Replacing stale container image or llama.cpp setting"
     docker start "$container" >/dev/null 2>&1 || true
     docker exec "$container" psql -U postgres -d postgres \
       -c "ALTER SYSTEM RESET shared_preload_libraries;" >/dev/null 2>&1 || true
     docker rm -f "$container" >/dev/null
+    container_exists=false
   fi
 fi
 
-if ! docker ps -a --format '{{.Names}}' | grep -qx "$container"; then
+if [ "$container_exists" = false ]; then
   log "Creating container $container"
   docker run -d \
     --name "$container" \
@@ -175,12 +218,6 @@ docker exec "$container" psql -U postgres -d postgres \
 docker restart "$container" >/dev/null
 wait_ready
 
-docker exec "$container" sh -lc "rm -rf \
-  /target/release/.fingerprint/otlet_pg-* \
-  /target/release/build/otlet_pg-* \
-  /target/release/deps/libotlet_pg* \
-  /target/release/deps/otlet_pg* \
-  /target/release/libotlet_pg*"
 docker exec "$container" cargo pgrx install \
   -p otlet_pg \
   --pg-config /usr/bin/pg_config \
@@ -201,7 +238,6 @@ wait_worker
 
 cheap_model_artifact="$(ensure_model "$cheap_model_repo_cache" "$cheap_model_file" "$cheap_model_url")"
 strong_model_artifact="$(ensure_model "$strong_model_repo_cache" "$strong_model_file" "$strong_model_url")"
-worker_count="$(docker exec "$container" psql -U postgres -d postgres -qAt -c "select count(*) from pg_stat_activity where backend_type = 'otlet worker';")"
 
 printf 'postgres_url=postgres://postgres:%s@127.0.0.1:%s/postgres\n' "$password" "$port"
 printf 'worker_count=%s\n' "$worker_count"

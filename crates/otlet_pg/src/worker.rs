@@ -7,7 +7,6 @@ use crate::model::{
 use pgrx::JsonB;
 use pgrx::bgworkers::{BackgroundWorker, SignalWakeFlags};
 use serde_json::Value;
-use std::collections::HashMap;
 use std::sync::LazyLock;
 use std::time::{Duration, Instant};
 
@@ -336,26 +335,22 @@ struct BatchProcessResult {
     model_swaps: i64,
 }
 
+#[derive(Default)]
 struct ModelSelectionPolicyCache {
-    policies: HashMap<String, Option<ModelSelectionPolicy>>,
-}
-
-impl Default for ModelSelectionPolicyCache {
-    fn default() -> Self {
-        Self {
-            policies: HashMap::with_capacity(4),
-        }
-    }
+    cached: Option<(String, Option<ModelSelectionPolicy>)>,
 }
 
 impl ModelSelectionPolicyCache {
     fn get(&mut self, task_name: &str) -> pgrx::spi::Result<Option<&ModelSelectionPolicy>> {
-        // Avoid allocating the key on every hit (HashMap::entry(to_owned) always owns).
-        if !self.policies.contains_key(task_name) {
+        if self
+            .cached
+            .as_ref()
+            .is_none_or(|(cached_task, _)| cached_task != task_name)
+        {
             let policy = BackgroundWorker::transaction(|| model_selection_policy(task_name))?;
-            self.policies.insert(task_name.to_owned(), policy);
+            self.cached = Some((task_name.to_owned(), policy));
         }
-        Ok(self.policies.get(task_name).and_then(Option::as_ref))
+        Ok(self.cached.as_ref().and_then(|(_, policy)| policy.as_ref()))
     }
 }
 
@@ -1247,18 +1242,18 @@ fn record_metrics_with_client(
         metrics.inference_cache_entries.into(),
         metrics.inference_cache_bytes.into(),
         metrics.inference_cache_evictions.into(),
-        metrics.inference_cache_invalidation_reason.as_str().into(),
+        metrics.inference_cache_invalidation_reason.into(),
         metrics.model_memory_bytes.into(),
         metrics.model_parameters.into(),
         metrics.context_window_tokens.into(),
-        metrics.model_device_policy.as_str().into(),
-        metrics.memory_accounting_policy.as_str().into(),
+        metrics.model_device_policy.into(),
+        metrics.memory_accounting_policy.into(),
         metrics.worker_process_rss_bytes.into(),
         metrics.worker_process_virtual_bytes.into(),
-        metrics.worker_memory_sample_policy.as_str().into(),
+        metrics.worker_memory_sample_policy.into(),
         metrics.inference_cache_max_entries.into(),
         metrics.inference_cache_max_bytes.into(),
-        metrics.inference_cache_eviction_reason.as_str().into(),
+        metrics.inference_cache_eviction_reason.into(),
     ];
     client.update(
         "SELECT otlet.record_runtime_slot_metrics($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24)",
