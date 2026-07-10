@@ -277,14 +277,10 @@ unsafe fn typed_to_jsonb_scratch() -> TypedToJsonbScratch {
         return scratch;
     }
     unsafe {
-        let function_info = pg_sys::MemoryContextAllocZero(
-            pg_sys::TopMemoryContext,
-            size_of::<pg_sys::FmgrInfo>(),
-        )
-        .cast::<pg_sys::FmgrInfo>();
-        pg_sys::fmgr_info(pg_sys::F_TO_JSONB.into(), function_info);
-
         let old_context = pg_sys::MemoryContextSwitchTo(pg_sys::TopMemoryContext);
+        let function_info = pg_sys::palloc0(size_of::<pg_sys::FmgrInfo>())
+            .cast::<pg_sys::FmgrInfo>();
+        pg_sys::fmgr_info(pg_sys::F_TO_JSONB.into(), function_info);
         let func_expr = pg_sys::palloc0(size_of::<pg_sys::FuncExpr>()).cast::<pg_sys::FuncExpr>();
         (*func_expr).xpr.type_ = pg_sys::NodeTag::T_FuncExpr;
         (*func_expr).funcid = pg_sys::F_TO_JSONB.into();
@@ -457,19 +453,6 @@ const SEMANTIC_JOIN_WAIT_MATERIALIZE_STATE_SQL: &str = "WITH active AS ( \
                    END AS semantic_state \
                  FROM materialized, active \
                  LEFT JOIN latest l ON true";
-
-fn semantic_state_from_spi_table(
-    table: pgrx::spi::SpiTupleTable<'_>,
-) -> Result<SubjectSemanticState, String> {
-    let row = table.first();
-    let label = row
-        .get_by_name::<String, _>("semantic_state")
-        .map_err(to_string)?
-        .ok_or_else(|| "otlet semantic_state SPI returned null".to_owned())?;
-    SubjectSemanticState::from_label(&label).ok_or_else(|| {
-        format!("otlet unexpected semantic_state from SPI: {label}")
-    })
-}
 
 fn wait_poll_state_from_spi_table(
     table: pgrx::spi::SpiTupleTable<'_>,

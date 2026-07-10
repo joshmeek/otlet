@@ -1,10 +1,10 @@
 # Otlet Worked Example
 
-This learning file follows the worked-example structure from [this study](https://www.tandfonline.com/doi/full/10.1080/01443410.2023.2273762)
+Use this learning file as a worked example, following the structure from [this study](https://www.tandfonline.com/doi/full/10.1080/01443410.2023.2273762)
 
 Follow one Docker-backed Otlet entity-resolution loop: leave vendor rows in Postgres tables, select hard candidate pairs in SQL, enqueue durable model work, let the resident worker try a cheap local model and escalate hard rows to a stronger local model, validate `same_entity` / `different_entity` / `unclear`, record typed actions, and preserve receipts
 
-Output blocks below come from a Docker-backed run on July 7, 2026 with `./scripts/otlet-setup.sh` and `./scripts/otlet-demo.sh`. Job IDs, receipt IDs, timestamps, token counts, timings, and token rates vary by machine and cache state
+The output blocks come from a Docker-backed run on July 7, 2026 with `./scripts/otlet-setup.sh` and `./scripts/otlet-demo.sh`. Job IDs, receipt IDs, timestamps, token counts, timings, and token rates vary by machine and cache state
 
 ## Example Path
 

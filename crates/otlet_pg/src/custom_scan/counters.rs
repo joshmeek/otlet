@@ -15,10 +15,7 @@ fn planner_stats_from_loaded_state(
         stats.inflight_rows = counts.inflight;
         stats.model_ms = loaded_state.model_ms;
         stats.model_cost_source = std::mem::take(&mut loaded_state.model_cost_source);
-        // Prefer preload-aggregated stale reasons when present (row path).
-        // Join begin-scan may have moved plan-time stale_reasons into the SPI
-        // arg; the join SELECT returns that value into loaded_state, so always
-        // restore from preload (normalize empty to "{}").
+        // Use begin-scan stale reasons so prepared plans report current state
         let preload_stale = std::mem::take(&mut loaded_state.stale_reasons);
         if private.index_kind == SemanticIndexKind::Join {
             stats.stale_reasons = if preload_stale.is_empty() {

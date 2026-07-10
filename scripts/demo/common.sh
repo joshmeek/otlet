@@ -95,7 +95,6 @@ SELECT EXISTS (
   SELECT 1 FROM otlet.jobs
   WHERE task_name = :'task_name'
     AND status IN ('queued','running','cancel_requested')
-  LIMIT 1
 )::text
 SQL
 )"
@@ -142,7 +141,6 @@ SELECT EXISTS (
   SELECT 1 FROM otlet.jobs
   WHERE task_name = :'task_name'
     AND status IN ('queued','running','cancel_requested')
-  LIMIT 1
 )::text
 SQL
 )"

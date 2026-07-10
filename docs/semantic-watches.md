@@ -1,6 +1,6 @@
 # Semantic Watches
 
-This guide extends the direct entity-resolution walkthrough into reusable semantic state through jobs, receipts, outputs, actions, materializations, and freshness checks
+Use this guide to extend the direct entity-resolution walkthrough into reusable semantic state through jobs, receipts, outputs, actions, materializations, and freshness checks
 
 The vendor-pair demo covers the end-to-end path. Smaller learning tables isolate each transfer pattern
 

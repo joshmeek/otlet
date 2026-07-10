@@ -104,8 +104,8 @@ fn effective_instruction(instruction: &str, decision_contract: &Value) -> String
 const SCHEMA_VALIDATOR_CACHE_MAX_ENTRIES: usize = 16;
 const RENDERED_SCHEMA_CACHE_MAX_ENTRIES: usize = 16;
 type SchemaValidator = std::sync::Arc<jsonschema::Validator>;
-type SchemaValidatorCache = Vec<(String, SchemaValidator)>;
-type RenderedSchemaCache = Vec<(String, std::sync::Arc<str>)>;
+type SchemaValidatorCache = Vec<(Value, SchemaValidator)>;
+type RenderedSchemaCache = Vec<(Value, std::sync::Arc<str>)>;
 
 fn validate_output(schema: &Value, output: &Value) -> Result<(), String> {
     let validator = cached_schema_validator(schema)?;
@@ -119,18 +119,17 @@ fn validate_output_schema(schema: &Value) -> Result<(), String> {
 }
 
 /// Task schemas repeat across jobs; compiling a jsonschema validator per run
-/// is wasted work, so keep a small LRU keyed by the schema fingerprint.
+/// is wasted work, so keep a small LRU keyed by the exact schema
 fn cached_schema_validator(schema: &Value) -> Result<SchemaValidator, String> {
     static CACHE: OnceLock<Mutex<SchemaValidatorCache>> = OnceLock::new();
 
-    let key = hash_json(schema);
     let cache = CACHE.get_or_init(|| {
         Mutex::new(Vec::with_capacity(SCHEMA_VALIDATOR_CACHE_MAX_ENTRIES))
     });
     let mut cache = cache
         .lock()
         .map_err(|_| "schema validator cache lock poisoned".to_owned())?;
-    if let Some(index) = cache.iter().position(|(cached, _)| *cached == key) {
+    if let Some(index) = cache.iter().position(|(cached, _)| cached == schema) {
         let validator = std::sync::Arc::clone(&cache[index].1);
         if index + 1 < cache.len() {
             let entry = cache.remove(index);
@@ -143,7 +142,7 @@ fn cached_schema_validator(schema: &Value) -> Result<SchemaValidator, String> {
     let validator = SchemaValidator::new(
         jsonschema::validator_for(schema).map_err(|err| format!("invalid output schema: {err}"))?,
     );
-    cache.push((key, std::sync::Arc::clone(&validator)));
+    cache.push((schema.clone(), std::sync::Arc::clone(&validator)));
     if cache.len() > SCHEMA_VALIDATOR_CACHE_MAX_ENTRIES {
         cache.remove(0);
     }
@@ -153,7 +152,7 @@ fn cached_schema_validator(schema: &Value) -> Result<SchemaValidator, String> {
 
 /// Response-envelope rendering is deterministic per output schema; reuse it
 /// across batch jobs that share a task schema.
-fn cached_rendered_schema(output_schema: &Value, output_schema_hash: &str) -> Arc<str> {
+fn cached_rendered_schema(output_schema: &Value) -> Arc<str> {
     static CACHE: OnceLock<Mutex<RenderedSchemaCache>> = OnceLock::new();
 
     let cache = CACHE.get_or_init(|| {
@@ -164,7 +163,7 @@ fn cached_rendered_schema(output_schema: &Value, output_schema_hash: &str) -> Ar
     };
     if let Some(index) = cache
         .iter()
-        .position(|(cached, _)| cached == output_schema_hash)
+        .position(|(cached, _)| cached == output_schema)
     {
         let rendered = Arc::clone(&cache[index].1);
         if index + 1 < cache.len() {
@@ -175,7 +174,7 @@ fn cached_rendered_schema(output_schema: &Value, output_schema_hash: &str) -> Ar
     }
 
     let shared: Arc<str> = Arc::from(response_envelope_schema(output_schema).to_string());
-    cache.push((output_schema_hash.to_owned(), Arc::clone(&shared)));
+    cache.push((output_schema.clone(), Arc::clone(&shared)));
     if cache.len() > RENDERED_SCHEMA_CACHE_MAX_ENTRIES {
         cache.remove(0);
     }
@@ -417,7 +416,6 @@ fn parse_model_json(raw_output: &str) -> Result<Value, String> {
     Ok(value)
 }
 
-#[derive(Clone)]
 struct TaskContractDigests {
     instruction: String,
     output_schema_hash: String,

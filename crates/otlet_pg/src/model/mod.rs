@@ -298,7 +298,7 @@ fn run_job_with_model_ref(job: &Job, model: JobModelRef<'_>) -> Result<ModelRun,
             shaped_prompt_hashes_for_cache_hit(
                 &options,
                 &digests.instruction,
-                cached_rendered_schema(&job.output_schema, &digests.output_schema_hash).as_ref(),
+                cached_rendered_schema(&job.output_schema).as_ref(),
                 &job.input,
             );
         let context = RunContext {
@@ -391,8 +391,7 @@ fn run_job_with_model_ref(job: &Job, model: JobModelRef<'_>) -> Result<ModelRun,
             )
         })?;
         let shaped_input = shaped_model_input(&job.input);
-        let rendered_schema =
-            cached_rendered_schema(&job.output_schema, &digests.output_schema_hash);
+        let rendered_schema = cached_rendered_schema(&job.output_schema);
         let prompt_prefix = cached_prompt_prefix(
             &job.task_name,
             &options,
@@ -463,12 +462,12 @@ fn run_job_with_model_ref(job: &Job, model: JobModelRef<'_>) -> Result<ModelRun,
     let raw_json = raw_output.as_str().trim().to_owned();
     let Some(object) = json.as_object_mut() else {
         return Err(ModelError::with_context(
-                "model JSON must be an object".to_owned(),
-                raw_output.into_owned(),
-                &context,
-                trace_summary,
-                raw_output_hash.clone(),
-            )
+            "model JSON must be an object".to_owned(),
+            raw_output.into_owned(),
+            &context,
+            trace_summary,
+            raw_output_hash.clone(),
+        )
         .with_metrics(metrics));
     };
     if let Some(extra_key) = object
@@ -477,32 +476,32 @@ fn run_job_with_model_ref(job: &Job, model: JobModelRef<'_>) -> Result<ModelRun,
         .cloned()
     {
         return Err(ModelError::with_context(
-                format!("model JSON unsupported top-level key: {extra_key}"),
-                raw_output.into_owned(),
-                &context,
-                trace_summary,
-                raw_output_hash.clone(),
-            )
+            format!("model JSON unsupported top-level key: {extra_key}"),
+            raw_output.into_owned(),
+            &context,
+            trace_summary,
+            raw_output_hash.clone(),
+        )
         .with_metrics(metrics));
     }
     let Some(output) = object.remove("output") else {
         return Err(ModelError::with_context(
-                "model JSON missing output".to_owned(),
-                raw_output.into_owned(),
-                &context,
-                trace_summary,
-                raw_output_hash.clone(),
-            )
+            "model JSON missing output".to_owned(),
+            raw_output.into_owned(),
+            &context,
+            trace_summary,
+            raw_output_hash.clone(),
+        )
         .with_metrics(metrics));
     };
     let Some(actions_value) = object.remove("actions") else {
         return Err(ModelError::with_context(
-                "model JSON missing actions".to_owned(),
-                raw_output.into_owned(),
-                &context,
-                trace_summary,
-                raw_output_hash.clone(),
-            )
+            "model JSON missing actions".to_owned(),
+            raw_output.into_owned(),
+            &context,
+            trace_summary,
+            raw_output_hash.clone(),
+        )
         .with_metrics(metrics));
     };
     let actions = match model_actions(actions_value) {
@@ -520,12 +519,12 @@ fn run_job_with_model_ref(job: &Job, model: JobModelRef<'_>) -> Result<ModelRun,
     };
     if let Err(err) = validate_output(&job.output_schema, &output) {
         return Err(ModelError::with_context(
-                err,
-                raw_output.into_owned(),
-                &context,
-                trace_summary,
-                raw_output_hash.clone(),
-            )
+            err,
+            raw_output.into_owned(),
+            &context,
+            trace_summary,
+            raw_output_hash.clone(),
+        )
         .with_metrics(metrics));
     }
     if cache_enabled && !metrics.inference_cache_hit {

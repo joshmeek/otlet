@@ -122,6 +122,21 @@ FROM otlet.inference_receipt_token_trace t
 CROSS JOIN LATERAL jsonb_array_elements(t.top_alternatives) WITH ORDINALITY AS alt(value, ordinality);
 
 CREATE VIEW otlet.inference_trace_summary AS
+WITH token_summary AS (
+  SELECT
+    t.receipt_id,
+    count(*)::bigint AS token_steps,
+    COALESCE(sum(
+      CASE
+        WHEN jsonb_typeof(t.top_alternatives) = 'array'
+          THEN jsonb_array_length(t.top_alternatives)
+        ELSE 0
+      END
+    ), 0)::bigint AS top_k_alternatives,
+    string_agg(t.token_text_readable, '' ORDER BY t.step) AS chosen_text_readable
+  FROM otlet.inference_receipt_token_trace t
+  GROUP BY t.receipt_id
+)
 SELECT
   s.receipt_id,
   s.job_id,
@@ -181,20 +196,9 @@ SELECT
   s.inference_cache_eviction_reason,
   s.inference_cache_reason,
   pg_column_size(r.trace_summary)::bigint AS trace_summary_bytes,
-  COALESCE((
-    SELECT count(*)
-    FROM otlet.inference_receipt_token_trace t
-    WHERE t.receipt_id = s.receipt_id
-  ), 0)::bigint AS token_steps,
-  COALESCE((
-    SELECT count(*)
-    FROM otlet.inference_receipt_token_alternative_trace a
-    WHERE a.receipt_id = s.receipt_id
-  ), 0)::bigint AS top_k_alternatives,
-  COALESCE((
-    SELECT string_agg(t.token_text_readable, '' ORDER BY t.step)
-    FROM otlet.inference_receipt_token_trace t
-    WHERE t.receipt_id = s.receipt_id
-  ), '') AS chosen_text_readable
+  COALESCE(tokens.token_steps, 0)::bigint AS token_steps,
+  COALESCE(tokens.top_k_alternatives, 0)::bigint AS top_k_alternatives,
+  COALESCE(tokens.chosen_text_readable, '') AS chosen_text_readable
 FROM otlet.inference_receipt_trace_status s
-JOIN otlet.inference_receipts r ON r.id = s.receipt_id;
+JOIN otlet.inference_receipts r ON r.id = s.receipt_id
+LEFT JOIN token_summary tokens ON tokens.receipt_id = s.receipt_id;

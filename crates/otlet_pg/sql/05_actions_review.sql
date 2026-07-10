@@ -220,9 +220,6 @@ BEGIN
   IF jsonb_typeof(COALESCE(complete_job.actions, '[]'::jsonb)) IS DISTINCT FROM 'array' THEN
     RAISE EXCEPTION 'otlet complete_job actions must be an array';
   END IF;
-  IF jsonb_typeof(complete_job.output) IS DISTINCT FROM 'object' THEN
-    RAISE EXCEPTION 'otlet complete_job output must be a JSON object';
-  END IF;
   IF jsonb_typeof(COALESCE(complete_job.trace_summary, '{}'::jsonb)) IS DISTINCT FROM 'object' THEN
     RAISE EXCEPTION 'otlet complete_job trace_summary must be a JSON object';
   END IF;
@@ -288,8 +285,7 @@ BEGIN
   SELECT *
   INTO saved_output
   FROM otlet.outputs o
-  WHERE o.job_id = job_row.id
-  LIMIT 1;
+  WHERE o.job_id = job_row.id;
 
   IF NOT FOUND THEN
     RETURN;

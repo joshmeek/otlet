@@ -314,9 +314,10 @@ require_regex "$performance_ratio_contract" '^[1-9][0-9]*\|[1-9][0-9]*\|[0-9]+(\
 audit_export_contract="$(psql_value <<'SQL'
 SELECT (SELECT count(*) FROM otlet.redaction_policy_status)::text || '|' ||
        (SELECT count(*) > 0 FROM otlet.audit_receipt_export)::text || '|' ||
-       (SELECT count(*) >= 0 FROM otlet.audit_review_export)::text || '|' ||
-       (SELECT count(*) >= 0 FROM otlet.semantic_dependency_audit)::text || '|' ||
-       (SELECT count(*) >= 0 FROM otlet.worker_batch_timing_status)::text || '|' ||
+       (SELECT count(*) > 0 FROM otlet.audit_review_export)::text || '|' ||
+       (SELECT count(*) > 0 FROM otlet.audit_eval_label_export)::text || '|' ||
+       (SELECT count(*) > 0 FROM otlet.semantic_dependency_audit)::text || '|' ||
+       (SELECT count(*) > 0 FROM otlet.worker_batch_timing_status)::text || '|' ||
        (SELECT NOT EXISTS (
           SELECT 1
           FROM information_schema.columns
@@ -327,8 +328,29 @@ SELECT (SELECT count(*) FROM otlet.redaction_policy_status)::text || '|' ||
 SQL
 )"
 echo "audit_export_contract=$audit_export_contract"
-[ "$audit_export_contract" = "1|true|true|true|true|true" ] || {
+[ "$audit_export_contract" = "1|true|true|true|true|true|true" ] || {
   echo "Expected audit export surfaces and redaction withholdings, got $audit_export_contract" >&2
+  exit 1
+}
+
+prepared_metadata_output="$(psql_value -v watch_name="$row_customscan_watch" <<'SQL'
+BEGIN;
+PREPARE otlet_prepared_metadata_probe AS
+SELECT count(*)
+FROM public.otlet_demo_customscan_signal
+WHERE otlet.semantic_matches(:'watch_name', id, '{}'::jsonb);
+EXECUTE otlet_prepared_metadata_probe;
+UPDATE otlet.semantic_indexes
+SET record_type = 'prepared_metadata_probe'
+WHERE name = :'watch_name';
+EXECUTE otlet_prepared_metadata_probe;
+ROLLBACK;
+SQL
+)"
+prepared_metadata_contract="$(head -n 1 <<<"$prepared_metadata_output")|$(tail -n 1 <<<"$prepared_metadata_output")"
+echo "prepared_metadata_contract=$prepared_metadata_contract"
+[ "$prepared_metadata_contract" = "1|0" ] || {
+  echo "Expected prepared CustomScan to reload current semantic metadata, got $prepared_metadata_contract" >&2
   exit 1
 }
 

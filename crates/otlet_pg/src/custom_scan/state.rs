@@ -295,25 +295,11 @@ enum SemanticResolution {
     Unresolved,
 }
 
-struct RowPreloadMeta {
-    source_table: String,
-    subject_column: String,
-    input_columns_sql: String,
-    input_shaping_sql: String,
-    task_name: String,
-    record_type: String,
-    contract_hash: String,
-}
-
-struct JoinPreloadMeta {
-    task_name: String,
-    record_type: String,
-}
-
 struct LoadedSemanticState {
     source_table: String,
     task_name: String,
     record_type: String,
+    input_columns: Option<Vec<String>>,
     freshness_basis_counts: String,
     stale_reasons: String,
     model_ms: f64,
@@ -349,9 +335,6 @@ struct SemanticMatchPredicate {
     subject_typid: pg_sys::Oid,
     restrict_info: *mut pg_sys::RestrictInfo,
     estimated_rows: f64,
-    input_columns: Option<Vec<String>>,
-    row_preload_meta: Option<RowPreloadMeta>,
-    join_preload_meta: Option<JoinPreloadMeta>,
     planner_stats: SemanticPlannerStats,
 }
 

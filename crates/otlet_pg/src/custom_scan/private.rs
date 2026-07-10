@@ -9,48 +9,7 @@ struct CustomScanPrivate {
     infer_max_rows: u32,
     subject_attno: i16,
     subject_typid: pg_sys::Oid,
-    input_columns: Option<Vec<String>>,
-    row_preload_meta: Option<RowPreloadMeta>,
-    join_preload_meta: Option<JoinPreloadMeta>,
     planner_stats: Option<SemanticPlannerStats>,
-}
-
-fn row_preload_meta_to_json(meta: &RowPreloadMeta) -> Value {
-    json!({
-        "source_table": &meta.source_table,
-        "subject_column": &meta.subject_column,
-        "input_columns_sql": &meta.input_columns_sql,
-        "input_shaping_sql": &meta.input_shaping_sql,
-        "task_name": &meta.task_name,
-        "record_type": &meta.record_type,
-        "contract_hash": &meta.contract_hash,
-    })
-}
-
-fn row_preload_meta_from_json(value: &Value) -> Option<RowPreloadMeta> {
-    Some(RowPreloadMeta {
-        source_table: value.get("source_table")?.as_str()?.to_owned(),
-        subject_column: value.get("subject_column")?.as_str()?.to_owned(),
-        input_columns_sql: value.get("input_columns_sql")?.as_str()?.to_owned(),
-        input_shaping_sql: value.get("input_shaping_sql")?.as_str()?.to_owned(),
-        task_name: value.get("task_name")?.as_str()?.to_owned(),
-        record_type: value.get("record_type")?.as_str()?.to_owned(),
-        contract_hash: value.get("contract_hash")?.as_str()?.to_owned(),
-    })
-}
-
-fn join_preload_meta_to_json(meta: &JoinPreloadMeta) -> Value {
-    json!({
-        "task_name": &meta.task_name,
-        "record_type": &meta.record_type,
-    })
-}
-
-fn join_preload_meta_from_json(value: &Value) -> Option<JoinPreloadMeta> {
-    Some(JoinPreloadMeta {
-        task_name: value.get("task_name")?.as_str()?.to_owned(),
-        record_type: value.get("record_type")?.as_str()?.to_owned(),
-    })
 }
 
 fn planner_stats_to_json(stats: &SemanticPlannerStats) -> Value {
@@ -111,9 +70,6 @@ unsafe fn custom_private_from_predicate(predicate: &SemanticMatchPredicate) -> *
             "infer_max_rows": predicate.infer_max_rows,
             "subject_attno": predicate.subject_attno,
             "subject_typid": predicate.subject_typid.to_u32(),
-            "input_columns": &predicate.input_columns,
-            "row_preload_meta": predicate.row_preload_meta.as_ref().map(row_preload_meta_to_json),
-            "join_preload_meta": predicate.join_preload_meta.as_ref().map(join_preload_meta_to_json),
             "planner_stats": planner_stats_to_json(&predicate.planner_stats),
         });
         let mut list = ptr::null_mut();
@@ -181,22 +137,6 @@ unsafe fn custom_private_from_list(private: *mut pg_sys::List) -> Option<CustomS
                 payload.get("subject_typid")?.as_u64()?,
             )
             .ok()?),
-            input_columns: payload
-                .get("input_columns")
-                .and_then(Value::as_array)
-                .map(|columns| {
-                    let mut out = Vec::with_capacity(columns.len());
-                    for column in columns.iter().filter_map(Value::as_str) {
-                        out.push(column.to_owned());
-                    }
-                    out
-                }),
-            row_preload_meta: payload
-                .get("row_preload_meta")
-                .and_then(row_preload_meta_from_json),
-            join_preload_meta: payload
-                .get("join_preload_meta")
-                .and_then(join_preload_meta_from_json),
             planner_stats: payload.get("planner_stats").and_then(planner_stats_from_json),
         })
     }

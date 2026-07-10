@@ -458,17 +458,6 @@ CREATE TABLE otlet.inference_receipts (
 CREATE INDEX inference_receipts_task_model_role_finished_idx
 ON otlet.inference_receipts (task_name, model_name, selection_role, finished_at DESC, id DESC);
 
-CREATE INDEX inference_receipts_job_complete_idx
-ON otlet.inference_receipts (job_id, id DESC)
-WHERE status = 'complete';
-
-CREATE INDEX inference_receipts_job_failed_idx
-ON otlet.inference_receipts (job_id, id DESC)
-WHERE status = 'failed';
-
-CREATE INDEX inference_receipts_job_attempt_idx
-ON otlet.inference_receipts (job_id, attempt_index DESC);
-
 CREATE INDEX inference_receipts_rejected_retention_idx
 ON otlet.inference_receipts (finished_at, id)
 WHERE selection_status = 'rejected' AND raw_output IS NOT NULL;
@@ -556,6 +545,10 @@ CREATE TABLE otlet.actions (
 CREATE INDEX actions_job_id_idx
 ON otlet.actions (job_id);
 
+CREATE INDEX actions_receipt_id_idx
+ON otlet.actions (receipt_id)
+WHERE receipt_id IS NOT NULL;
+
 CREATE TABLE otlet.records (
   id bigserial PRIMARY KEY,
   action_id bigint REFERENCES otlet.actions(id),
@@ -564,6 +557,10 @@ CREATE TABLE otlet.records (
   body jsonb NOT NULL,
   created_at timestamptz NOT NULL DEFAULT now()
 );
+
+CREATE INDEX records_action_id_idx
+ON otlet.records (action_id)
+WHERE action_id IS NOT NULL;
 
 CREATE TABLE otlet.eval_labels (
   id bigserial PRIMARY KEY,

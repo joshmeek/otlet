@@ -54,9 +54,9 @@ The value reports a ready runtime, a ready model slot, bounded cache entries and
 
 The production policy row and status views expose SQL state under `otlet`: `production_policy_status`, `production_status`, `model_queue_status`, `worker_throughput_status`, and `cleanup_policy_state(true)`
 
-Queue caps are admission-time controls. Rows enter `otlet.jobs` through `run_task`, watch refresh, semantic refresh, or `ask`; direct inserts are internal/testing-only and can bypass admission accounting. `verify_invariants()` reports every broken invariant as a row; the demo requires `SELECT count(*) FROM otlet.verify_invariants()` to return `0` (`invariant_contract=0`). One of those checks is `queued_jobs_within_model_cap` when queued depth for any model exceeds `max_queued_jobs_per_model`
+Queue caps are admission-time controls. Rows enter `otlet.jobs` through `run_task`, watch refresh, semantic refresh, or `ask`; direct inserts are internal/testing-only and can bypass admission accounting. `verify_invariants()` returns one row per violation. The demo requires `SELECT count(*) FROM otlet.verify_invariants()` to return `0` (`invariant_contract=0`). The `queued_jobs_within_model_cap` check reports models whose queued depth exceeds `max_queued_jobs_per_model`
 
-Otlet debounces suppressed queue-admission events per task and reason for one minute, so a full queue stays visible without flooding `worker_events`. `production_status` also exposes `semantic_materialization_failed_events` and `semantic_materialization_last_failed_at`. Nonzero `max_worker_rss_bytes` budgets require Linux process-status RSS sampling; runtime-option validation rejects unsupported builds before queue execution. Cleanup can prune old failed or canceled jobs after outputs, actions, eval labels, and receipts no longer reference them
+Otlet debounces suppressed queue-admission events per task and reason for one minute, so a full queue stays visible without flooding `worker_events`. `production_status` exposes `semantic_materialization_failed_events` and `semantic_materialization_last_failed_at`. Nonzero `max_worker_rss_bytes` budgets require Linux process-status RSS sampling; runtime-option validation rejects unsupported builds before queue execution. Cleanup can prune old failed or canceled jobs after outputs, actions, eval labels, and receipts no longer reference them
 
 The resident worker attaches to the `postgres` database. Supporting worker registration across multiple databases requires separate shared-memory and latch routing
 
@@ -91,7 +91,7 @@ cleanup_policy_dry_run=0|0|0|0|0|0|0|true
 
 ### Step 3b - Performance Ratios
 
-`production_status` also exposes trusted-output and model-work ratios. The demo prints them as one contract line:
+`production_status` exposes trusted-output and model-work ratios. The demo prints them as one contract line:
 
 ```sql
 SELECT trusted_output_rows::text || '|' ||
@@ -132,7 +132,7 @@ Contract: `true|true` (demo prints `materialization_failure_status_contract=true
 SELECT count(*) FROM otlet.verify_invariants();
 ```
 
-Contract: `0` (demo prints `invariant_contract=0`). The suite also fails closed on expired or NULL leases for `running` and `cancel_requested` jobs, complete receipts without schema pass, materializations missing `source_hash`, and error runtime slots. `production_status` and `verify_invariants` name the receipt invariant `complete_receipts_are_schema_validated`; throughput views use `completed_jobs` and `last_batch_completed_jobs`. Step 6 of `docs/semantic-watches.md` anchors the planner vocabulary for `selected_path` / `Planner Selected Path` and `freshness_basis`
+Contract: `0` (demo prints `invariant_contract=0`). The suite fails closed on expired or NULL leases for `running` and `cancel_requested` jobs, complete receipts without schema pass, materializations missing `source_hash`, and error runtime slots. `production_status` and `verify_invariants` name the receipt invariant `complete_receipts_are_schema_validated`; throughput views use `completed_jobs` and `last_batch_completed_jobs`. Step 6 of `docs/semantic-watches.md` anchors the planner vocabulary for `selected_path` / `Planner Selected Path` and `freshness_basis`
 
 Operators query redacted, read-only projections through `otlet.audit_receipt_export`, `otlet.audit_review_export`, `otlet.audit_eval_label_export`, `otlet.semantic_dependency_audit`, and `otlet.worker_batch_timing_status`. `otlet.redaction_policy_status` lists withheld fields
 

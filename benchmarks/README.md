@@ -1,6 +1,6 @@
 # Otlet Benchmarks
 
-The benchmark harness measures local GGUF models as Otlet workers over compact Postgres row evidence
+The benchmark harness measures local GGUF models as Otlet workers over compact Postgres row evidence. It does not measure general knowledge
 
 Run the Otlet proof path first:
 
@@ -34,7 +34,7 @@ for threads in 1 2 4 6 8 12; do
 done
 ```
 
-Thread-sweep results apply to the measured host. Concurrent infer-now callers fill the bounded shared-memory queue, while the default resident worker serializes llama.cpp generation
+On the measured host, concurrent infer-now callers fill the bounded shared-memory queue. The default resident worker serializes llama.cpp generation
 
 The probe accepts `OTLET_PROBE_LLAMA_THREADS=<n>`, `OTLET_PROBE_LLAMA_BATCH_THREADS=<n>`, and `OTLET_PROBE_RUNTIME_OPTIONS='{"max_tokens":64}'` for one run. The setup path accepts deployment-level llama.cpp knobs before `./scripts/otlet-setup.sh`:
 
@@ -54,7 +54,7 @@ The probe accepts `OTLET_PROBE_LLAMA_THREADS=<n>`, `OTLET_PROBE_LLAMA_BATCH_THRE
 | `OTLET_LLAMA_KV_TYPE_V` | set V cache type only | llama.cpp default |
 | `OMP_PROC_BIND`, `OMP_PLACES`, `GOMP_CPU_AFFINITY` | OpenMP CPU placement | unset |
 
-These controls depend on host hardware. Re-run `./scripts/otlet-setup.sh` after changing startup knobs so the worker process starts with the new environment
+Host hardware determines these controls. Re-run `./scripts/otlet-setup.sh` after changing startup knobs so the worker process starts with the new environment
 
 Use `OTLET_WORKER_COUNT=1` unless a local probe shows a wall-clock win and acceptable RSS. A qwen35_4b infer-now probe on the current Docker CPU measured four warm concurrent callers like this:
 

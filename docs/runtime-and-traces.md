@@ -304,7 +304,7 @@ ON otlet.jobs (task_name, subject_id)
 WHERE status IN ('queued', 'running', 'cancel_requested');
 ```
 
-This run creates one synthetic failed job, then lets `run_task` enqueue a second job for that subject
+The example creates one synthetic failed job, then lets `run_task` enqueue a second job for that subject
 
 The worker claims the second job and rejects the output against the strict JSON contract:
 

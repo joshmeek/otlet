@@ -233,7 +233,7 @@ fn run_linked(
         return Err(ModelError::new_static("linked llama.cpp sampler start failed"));
     }
     let sampler = LinkedSampler { ptr: sampler_ptr };
-    let mut output = String::with_capacity(linked_output_capacity(options.max_tokens));
+    let mut output = Vec::with_capacity(linked_output_capacity(options.max_tokens));
     let mut json_completion = JsonCompletion::new();
     let mut position = tokens.len();
     let mut generated_tokens = 0_i64;
@@ -287,8 +287,9 @@ fn run_linked(
             first_token_seen = true;
         }
         let piece_start = output.len();
-        linked_token_to_piece_into(cache.vocab, token, &mut token_piece_buf, &mut output);
-        detailed_trace.observe(token, &output[piece_start..], sample);
+        linked_token_to_piece_into(cache.vocab, token, &mut token_piece_buf, &mut output)?;
+        let trace_piece = String::from_utf8_lossy(&output[piece_start..]);
+        detailed_trace.observe(token, &trace_piece, sample);
         if let Some(end) = json_completion.observe(&output[piece_start..]) {
             output.truncate(end);
             stop_reason = "json_complete";
@@ -326,6 +327,12 @@ fn run_linked(
     };
     let worker_memory = process_memory_sample();
     enforce_worker_rss_budget(&worker_memory, options.max_worker_rss_bytes)?;
+    let output = String::from_utf8(output).map_err(|err| {
+        ModelError::new(format!(
+            "linked llama.cpp output was not valid UTF-8: {}",
+            err.utf8_error()
+        ))
+    })?;
 
     Ok(LinkedRun {
         raw_output: output.trim().to_owned(),
@@ -1025,14 +1032,14 @@ fn linked_token_to_piece_into(
     vocab: *const llama_cpp_sys_4::llama_vocab,
     token: llama_cpp_sys_4::llama_token,
     buffer: &mut Vec<u8>,
-    output: &mut String,
-) {
+    output: &mut Vec<u8>,
+) -> Result<(), ModelError> {
     if buffer.len() < 128 {
         buffer.resize(128, 0);
     }
-    let Ok(buffer_len) = i32::try_from(buffer.len()) else {
-        return;
-    };
+    let buffer_len = i32::try_from(buffer.len()).map_err(|_| {
+        ModelError::new_static("linked llama.cpp token piece buffer overflowed i32")
+    })?;
     let mut size = unsafe {
         llama_cpp_sys_4::llama_token_to_piece(
             vocab,
@@ -1044,17 +1051,21 @@ fn linked_token_to_piece_into(
         )
     };
     if size < 0 {
-        let Some(required) = size.checked_neg().and_then(|value| usize::try_from(value).ok())
-        else {
-            return;
-        };
+        let required = size
+            .checked_neg()
+            .and_then(|value| usize::try_from(value).ok())
+            .ok_or_else(|| {
+                ModelError::new_static("linked llama.cpp token piece size was invalid")
+            })?;
         if required > LINKED_MAX_TOKEN_PIECE_BYTES {
-            return;
+            return Err(ModelError::new(format!(
+                "linked llama.cpp token piece exceeded {LINKED_MAX_TOKEN_PIECE_BYTES} bytes"
+            )));
         }
         buffer.resize(required, 0);
-        let Ok(buffer_len) = i32::try_from(buffer.len()) else {
-            return;
-        };
+        let buffer_len = i32::try_from(buffer.len()).map_err(|_| {
+            ModelError::new_static("linked llama.cpp token piece buffer overflowed i32")
+        })?;
         size = unsafe {
             llama_cpp_sys_4::llama_token_to_piece(
                 vocab,
@@ -1067,27 +1078,29 @@ fn linked_token_to_piece_into(
         };
     }
     if size <= 0 {
-        return;
+        return Ok(());
     }
-    let Ok(size) = usize::try_from(size) else {
-        return;
-    };
+    let size = usize::try_from(size).map_err(|_| {
+        ModelError::new_static("linked llama.cpp token piece size overflowed usize")
+    })?;
     if size > buffer.len() {
-        return;
+        return Err(ModelError::new(format!(
+            "linked llama.cpp token piece exceeded its buffer: {size} > {}",
+            buffer.len()
+        )));
     }
-    if let Ok(piece) = std::str::from_utf8(&buffer[..size]) {
-        output.push_str(piece);
-    }
+    output.extend_from_slice(&buffer[..size]);
+    Ok(())
 }
 
 fn linked_token_to_piece(
     vocab: *const llama_cpp_sys_4::llama_vocab,
     token: llama_cpp_sys_4::llama_token,
 ) -> String {
-    let mut output = String::new();
+    let mut output = Vec::new();
     let mut buffer = vec![0_u8; 128];
-    linked_token_to_piece_into(vocab, token, &mut buffer, &mut output);
-    output
+    let _ = linked_token_to_piece_into(vocab, token, &mut buffer, &mut output);
+    String::from_utf8_lossy(&output).into_owned()
 }
 
 fn linked_clear_context(context: *mut llama_cpp_sys_4::llama_context) {
@@ -1120,33 +1133,33 @@ impl JsonCompletion {
         }
     }
 
-    fn observe(&mut self, text: &str) -> Option<usize> {
+    fn observe(&mut self, bytes: &[u8]) -> Option<usize> {
         if self.complete_end.is_some() {
             return self.complete_end;
         }
 
-        for (index, ch) in text.char_indices() {
+        for (index, byte) in bytes.iter().copied().enumerate() {
             if self.in_string {
                 if self.escape {
                     self.escape = false;
-                } else if ch == '\\' {
+                } else if byte == b'\\' {
                     self.escape = true;
-                } else if ch == '"' {
+                } else if byte == b'"' {
                     self.in_string = false;
                 }
                 continue;
             }
 
-            match ch {
-                '"' => self.in_string = true,
-                '{' => {
+            match byte {
+                b'"' => self.in_string = true,
+                b'{' => {
                     self.depth += 1;
                     self.seen_open = true;
                 }
-                '}' => {
+                b'}' => {
                     self.depth -= 1;
                     if self.seen_open && self.depth == 0 {
-                        self.complete_end = Some(self.bytes_seen + index + ch.len_utf8());
+                        self.complete_end = Some(self.bytes_seen + index + 1);
                         return self.complete_end;
                     }
                     if self.depth < 0 {
@@ -1158,8 +1171,41 @@ impl JsonCompletion {
             }
         }
 
-        self.bytes_seen += text.len();
+        self.bytes_seen += bytes.len();
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::JsonCompletion;
+
+    #[test]
+    fn json_completion_accepts_utf8_split_across_pieces() {
+        let mut completion = JsonCompletion::new();
+        let prefix = b"{\"text\":\"";
+        let split_utf8 = [0xe2, 0x82, 0xac];
+        let suffix = b"\"} trailing";
+
+        assert_eq!(completion.observe(prefix), None);
+        assert_eq!(completion.observe(&split_utf8), None);
+        assert_eq!(
+            completion.observe(suffix),
+            Some(prefix.len() + split_utf8.len() + 2)
+        );
+    }
+
+    #[test]
+    fn json_completion_keeps_escape_state_across_pieces() {
+        let mut completion = JsonCompletion::new();
+        let prefix = b"{\"text\":\"quoted\\";
+        let suffix = b"\"\"}";
+
+        assert_eq!(completion.observe(prefix), None);
+        assert_eq!(
+            completion.observe(suffix),
+            Some(prefix.len() + suffix.len())
+        );
     }
 }
 

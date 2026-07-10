@@ -1,6 +1,6 @@
 # Entity Resolution Walkthrough
 
-This SQL walkthrough expands the entity-resolution path from `docs/otlet-worked-example.md`. Start with `./scripts/otlet-setup.sh`, then paste each section into the `psql` session described there
+Use this SQL walkthrough to expand the entity-resolution path from `docs/otlet-worked-example.md`. Start with `./scripts/otlet-setup.sh`, then paste each section into the `psql` session described there
 
 Run the sections in order before adapting them. Each section names the state it creates and the output to inspect. Follow-up checks live in [runtime-and-traces.md](runtime-and-traces.md), [semantic-watches.md](semantic-watches.md), and [production-contract.md](production-contract.md)
 
@@ -20,7 +20,7 @@ SELECT otlet.register_model(
 );
 ```
 
-The Otlet background worker owns `linked_inproc` inference. It loads a local GGUF through in-process llama.cpp and keeps the model resident across jobs. Postgres exposes the queue, source row identity, output validation, receipts, traces, and runtime state through SQL
+The Otlet background worker runs `linked_inproc` inference. It loads a local GGUF through in-process llama.cpp and keeps the model resident across jobs. Postgres exposes the queue, source row identity, output validation, receipts, traces, and runtime state through SQL
 
 ## Step 2 - Create The Source Tables
 
@@ -106,7 +106,7 @@ DELETE FROM otlet.tasks
 WHERE name = 'entity_resolution_demo';
 ```
 
-This cleanup makes the example rerunnable. Production flows retain their history
+Delete prior demo state to make the example rerunnable. Production flows retain their history
 
 ## Step 4 - Create The Task
 

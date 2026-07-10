@@ -29,11 +29,6 @@ fn queue_refresh_if_allowed(runtime: &mut RuntimeState, subject_id: &str) {
     if !runtime.allow_refresh || runtime.queued_refresh_subjects.contains(subject_id) {
         return;
     }
-    // Bound the dedupe set so large fail-closed scans cannot grow without limit.
-    let refresh_cap = usize::try_from(runtime.infer_max_rows.max(64)).unwrap_or(64);
-    if runtime.queued_refresh_subjects.len() >= refresh_cap {
-        return;
-    }
     match queue_subject_refresh(&runtime.task_name, subject_id) {
         Ok(true) => {
             runtime

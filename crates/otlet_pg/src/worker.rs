@@ -1,6 +1,5 @@
 use crate::job::{
-    Job, ModelSelectionPolicy, claim_jobs, insert_infer_now_job, model_selection_policies_for_tasks,
-    model_selection_policy,
+    Job, ModelSelectionPolicy, claim_jobs, insert_infer_now_job, model_selection_policy,
 };
 use crate::model::{
     ModelError, ModelMetrics, ModelRun, clear_task_contract_digests, run_job, run_job_with_model,
@@ -350,12 +349,6 @@ impl Default for ModelSelectionPolicyCache {
 }
 
 impl ModelSelectionPolicyCache {
-    fn seed(&mut self, policies: HashMap<String, Option<ModelSelectionPolicy>>) {
-        for (task_name, policy) in policies {
-            self.policies.entry(task_name).or_insert(policy);
-        }
-    }
-
     fn get(&mut self, task_name: &str) -> pgrx::spi::Result<Option<&ModelSelectionPolicy>> {
         // Avoid allocating the key on every hit (HashMap::entry(to_owned) always owns).
         if !self.policies.contains_key(task_name) {
@@ -388,20 +381,6 @@ fn process_job_batch(jobs: Vec<Job>) -> BatchProcessResult {
     mark_jobs_started(&jobs);
     let mut batch = BatchProcessResult::default();
     let mut policy_cache = ModelSelectionPolicyCache::default();
-    let mut task_names = Vec::with_capacity(jobs.len().min(8));
-    for job in &jobs {
-        if !task_names.iter().any(|name| name == &job.task_name) {
-            task_names.push(job.task_name.clone());
-        }
-    }
-    if !task_names.is_empty() {
-        match BackgroundWorker::transaction(|| model_selection_policies_for_tasks(&task_names)) {
-            Ok(policies) => policy_cache.seed(policies),
-            Err(err) => {
-                pgrx::warning!("otlet worker batch policy prefetch failed: {err}");
-            }
-        }
-    }
     let mut strong_jobs = Vec::with_capacity(jobs.len().min(8));
     for job in jobs {
         let mut result = process_job_deferred(&job, &mut policy_cache, true);
@@ -818,11 +797,13 @@ fn accept_attempt_with_model(
     selection_role: &str,
     selection_reason: &str,
 ) -> (bool, bool) {
-    // Complete first, then record slot metrics in the same SPI session so a
-    // failed complete cannot advance runtime_slot counters. Materialize stays
-    // in a separate transaction so it cannot roll back an accepted job.
+    // Keep telemetry separate so a metric error cannot roll back completion
+    // Materialization also stays separate from the accepted job transaction
     // Returns (completed, semantic_materialized).
     let metrics = run.metrics.as_ref();
+    if let Some(metrics) = metrics {
+        record_metrics(job, model_name, metrics);
+    }
     let result: pgrx::spi::Result<bool> = BackgroundWorker::transaction(|| {
         pgrx::Spi::connect_mut(|client| {
             let args = [
@@ -846,9 +827,6 @@ fn accept_attempt_with_model(
             )?;
             if rows.first().get::<i64>(1)?.is_none() {
                 return Ok(false);
-            }
-            if let Some(metrics) = metrics {
-                record_metrics_with_client(client, job, model_name, metrics)?;
             }
             Ok(true)
         })
@@ -934,15 +912,15 @@ fn record_model_attempt_receipt_with_model(
                 Some(1),
                 &args,
             )?;
-            if let Some(metrics) = metrics {
-                record_metrics_with_client(client, job, model_name, metrics)?;
-            }
             Ok(())
         })
     });
     if let Err(err) = result {
         pgrx::warning!("otlet worker model-attempt receipt failed: {err}");
         return false;
+    }
+    if let Some(metrics) = metrics {
+        record_metrics(job, model_name, metrics);
     }
     true
 }
@@ -1029,6 +1007,9 @@ fn reject_direct_attempt(job: &Job, run: ModelRun, selection_reason: &str) -> bo
             "direct",
             selection_reason,
         );
+    }
+    if let Some(metrics) = metrics {
+        record_metrics(job, job.model_name.as_str(), metrics);
     }
     false
 }
@@ -1135,9 +1116,11 @@ fn fail_attempt_with_model(
     selection_role: &str,
     selection_reason: &str,
 ) -> bool {
-    // Fail the job first; only then record slot metrics so a failed fail_job
-    // cannot advance runtime_slot counters.
     let metrics = err.metrics.as_ref().map(|m| m.as_ref());
+    if let Some(metrics) = metrics {
+        // Metrics are best effort and must not roll back terminal job state
+        record_metrics(job, model_name, metrics);
+    }
     let canceled = err.message == "canceled";
     let result: pgrx::spi::Result<()> = BackgroundWorker::transaction(|| {
         pgrx::Spi::connect_mut(|client| {
@@ -1161,9 +1144,6 @@ fn fail_attempt_with_model(
                 Some(1),
                 &args,
             )?;
-            if let Some(metrics) = metrics {
-                record_metrics_with_client(client, job, model_name, metrics)?;
-            }
             Ok(())
         })
     });
@@ -1178,6 +1158,17 @@ fn fail_attempt_with_model(
         pgrx::warning!("otlet worker failed job {}: {}", job.id, err.message);
     }
     false
+}
+
+fn record_metrics(job: &Job, model_name: &str, metrics: &ModelMetrics) {
+    let result: pgrx::spi::Result<()> = BackgroundWorker::transaction(|| {
+        pgrx::Spi::connect_mut(|client| {
+            record_metrics_with_client(client, job, model_name, metrics)
+        })
+    });
+    if let Err(err) = result {
+        pgrx::warning!("otlet worker metric update failed: {err}");
+    }
 }
 
 fn record_metrics_with_client(

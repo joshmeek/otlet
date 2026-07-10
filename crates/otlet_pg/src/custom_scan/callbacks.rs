@@ -48,37 +48,11 @@ unsafe extern "C-unwind" fn begin_semantic_custom_scan(
         if child_plan.is_null() {
             pgrx::error!("otlet semantic CustomScan requires a PG-created child plan");
         }
-        // Take plan-time stash once; begin-scan is the sole consumer.
-        let mut stashed_stats = private.planner_stats.take();
-        // Join preload needs stale_reasons as an SPI arg. Move it out of the
-        // stash; the join SELECT returns $3 into loaded_state.stale_reasons and
-        // planner_stats_from_loaded_state overlays it back for EXPLAIN.
-        let stashed_stale_reasons = if private.index_kind == SemanticIndexKind::Join {
-            stashed_stats
-                .as_mut()
-                .map(|stats| std::mem::take(&mut stats.stale_reasons))
-        } else {
-            None
-        };
-        let stashed_model_ms = stashed_stats.as_ref().map(|stats| stats.model_ms);
-        let stashed_model_cost_source = stashed_stats
-            .as_mut()
-            .map(|stats| std::mem::take(&mut stats.model_cost_source));
-        let stashed_source_rows = stashed_stats.as_ref().map(|stats| stats.source_rows);
-        let stashed_row_meta = private.row_preload_meta.take();
-        let stashed_join_meta = private.join_preload_meta.take();
+        let stashed_stats = private.planner_stats.take();
         let mut loaded_state = load_semantic_states(
             private.index_kind,
             &private.index_name,
             &private.expected_json,
-            BeginScanStash {
-                stale_reasons: stashed_stale_reasons,
-                row_meta: stashed_row_meta,
-                join_meta: stashed_join_meta,
-                model_ms: stashed_model_ms,
-                model_cost_source: stashed_model_cost_source,
-                source_rows: stashed_source_rows,
-            },
         )
         .unwrap_or_else(|err| pgrx::error!("{err}"));
         // Prefer plan-time vocabulary from custom_private; overlay exact preload
@@ -130,7 +104,7 @@ unsafe extern "C-unwind" fn begin_semantic_custom_scan(
             record_type: loaded_state.record_type,
             // Filled after child_plan is set so provider/policy strings match runtime.
             infer_now_executor_context_json: String::new(),
-            input_columns: private.input_columns,
+            input_columns: loaded_state.input_columns,
             preloaded_freshness_basis: loaded_state.freshness_basis_counts,
             preloaded_fresh_matches: preloaded_counts.fresh_matches,
             preloaded_fresh_non_matches: preloaded_counts.fresh_non_matches,

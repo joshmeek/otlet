@@ -238,10 +238,6 @@ BEGIN
   IF jsonb_typeof(COALESCE(record_model_attempt.trace_summary, '{}'::jsonb)) IS DISTINCT FROM 'object' THEN
     RAISE EXCEPTION 'otlet record_model_attempt trace_summary must be a JSON object';
   END IF;
-  IF record_model_attempt.output IS NOT NULL
-     AND jsonb_typeof(record_model_attempt.output) IS DISTINCT FROM 'object' THEN
-    RAISE EXCEPTION 'otlet record_model_attempt output must be a JSON object';
-  END IF;
   IF COALESCE(record_model_attempt.selection_role, 'direct') NOT IN ('direct', 'cheap', 'strong') THEN
     RAISE EXCEPTION 'otlet record_model_attempt selection_role must be direct, cheap, or strong';
   END IF;

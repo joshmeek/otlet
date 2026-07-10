@@ -1,49 +1,4 @@
-type OtletFunctionCache = Option<(pg_sys::TimestampTz, HashMap<(u32, &'static str), bool>)>;
-
 unsafe fn is_otlet_function(funcid: pg_sys::Oid, expected_name: &str) -> bool {
-    unsafe {
-        // Statement-scoped cache: func OIDs are stable within a plan, and
-        // semantic_matches* clauses may probe the same OID repeatedly.
-        let expected_static: &'static str = match expected_name {
-            "semantic_matches" => "semantic_matches",
-            "semantic_matches_auto" => "semantic_matches_auto",
-            "semantic_join_matches" => "semantic_join_matches",
-            "semantic_join_matches_auto" => "semantic_join_matches_auto",
-            _ => return is_otlet_function_uncached(funcid, expected_name),
-        };
-        let stmt_start = pg_sys::GetCurrentStatementStartTimestamp();
-        thread_local! {
-            static CACHE: std::cell::RefCell<OtletFunctionCache> =
-                const { std::cell::RefCell::new(None) };
-        }
-        if let Some(cached) = CACHE.with(|cell| {
-            let mut guard = cell.borrow_mut();
-            match guard.as_mut() {
-                Some((cached_start, map)) if *cached_start == stmt_start => {
-                    map.get(&(funcid.to_u32(), expected_static)).copied()
-                }
-                _ => {
-                    *guard = Some((stmt_start, HashMap::with_capacity(8)));
-                    None
-                }
-            }
-        }) {
-            return cached;
-        }
-        let result = is_otlet_function_uncached(funcid, expected_name);
-        CACHE.with(|cell| {
-            let mut guard = cell.borrow_mut();
-            if let Some((cached_start, map)) = guard.as_mut()
-                && *cached_start == stmt_start
-            {
-                map.insert((funcid.to_u32(), expected_static), result);
-            }
-        });
-        result
-    }
-}
-
-unsafe fn is_otlet_function_uncached(funcid: pg_sys::Oid, expected_name: &str) -> bool {
     unsafe {
         let func_name = pg_sys::get_func_name(funcid);
         if func_name.is_null() {
@@ -135,18 +90,6 @@ unsafe fn path_target_var_flags(
     }
 }
 
-unsafe fn path_target_has_subject_var(
-    target: *mut pg_sys::PathTarget,
-    rti: pg_sys::Index,
-    subject_attno: i16,
-) -> bool {
-    path_target_var_flags(target, rti, subject_attno).0
-}
-
-unsafe fn path_target_has_rel_var(target: *mut pg_sys::PathTarget, rti: pg_sys::Index) -> bool {
-    path_target_var_flags(target, rti, 0).1
-}
-
 unsafe fn rel_has_lateral_ref(rel: *mut pg_sys::RelOptInfo) -> bool {
     unsafe {
         !rel.is_null()
@@ -171,12 +114,12 @@ fn validate_semantic_index_source(
     infer_ms: u32,
     infer_max_rows: u32,
     auto_policy: bool,
-) -> Option<(SemanticPlannerStats, Option<Vec<String>>, Option<RowPreloadMeta>)> {
+) -> Option<SemanticPlannerStats> {
     match pgrx::Spi::connect(|client| {
         // One SELECT: metadata + plan/current_rows stats (same fail-closed gates).
         let args = [
             index_name.into(),
-            (relid.to_u32() as i32).into(),
+            i64::from(relid.to_u32()).into(),
             expected_json.into(),
         ];
         let table = client
@@ -184,15 +127,8 @@ fn validate_semantic_index_source(
                 "WITH meta AS ( \
                    SELECT \
                      si.source_table, \
-                     si.subject_column, \
-                     CASE WHEN si.input_columns IS NULL THEN NULL ELSE to_jsonb(si.input_columns)::text END AS input_columns_json, \
-                     quote_nullable(si.input_columns)::text AS input_columns_sql, \
-                     quote_nullable(t.input_shaping::text)::text AS input_shaping_sql, \
-                     si.task_name, \
-                     si.record_type, \
-                     otlet.task_contract_hash(t.instruction, t.output_schema, t.model_name, t.runtime_options, t.input_shaping, t.decision_contract) AS contract_hash \
+                     si.subject_column \
                    FROM otlet.semantic_indexes si \
-                   JOIN otlet.tasks t ON t.name = si.task_name \
                    WHERE si.name = $1 AND si.source_table::regclass = $2::oid \
                    LIMIT 1 \
                  ), \
@@ -217,12 +153,6 @@ fn validate_semantic_index_source(
                  SELECT \
                    (SELECT source_table FROM meta) AS source_table, \
                    (SELECT subject_column FROM meta) AS subject_column, \
-                   (SELECT input_columns_json FROM meta) AS input_columns_json, \
-                   (SELECT input_columns_sql FROM meta) AS input_columns_sql, \
-                   (SELECT input_shaping_sql FROM meta) AS input_shaping_sql, \
-                   (SELECT task_name FROM meta) AS task_name, \
-                   (SELECT record_type FROM meta) AS record_type, \
-                   (SELECT contract_hash FROM meta) AS contract_hash, \
                    COALESCE((SELECT total_subjects FROM plan), 0)::bigint AS source_rows, \
                    (SELECT count(*) FROM current_rows WHERE stale = false AND body @> $3::jsonb)::bigint AS fresh_matches, \
                    (SELECT count(*) FROM current_rows WHERE stale = false AND NOT (body @> $3::jsonb))::bigint AS fresh_non_matches, \
@@ -239,69 +169,29 @@ fn validate_semantic_index_source(
             )
             .map_err(to_string)?;
         if table.is_empty() {
-            return Ok::<Option<(SemanticPlannerStats, Option<Vec<String>>, Option<RowPreloadMeta>)>, String>(None);
+            return Ok::<Option<SemanticPlannerStats>, String>(None);
         }
         let row = table.first();
         let Some(source_table) = row
             .get_by_name::<String, _>("source_table")
             .map_err(to_string)?
         else {
-            return Ok::<Option<(SemanticPlannerStats, Option<Vec<String>>, Option<RowPreloadMeta>)>, String>(None);
+            return Ok::<Option<SemanticPlannerStats>, String>(None);
         };
         let Some(subject_column) = row
             .get_by_name::<String, _>("subject_column")
             .map_err(to_string)?
         else {
-            return Ok::<Option<(SemanticPlannerStats, Option<Vec<String>>, Option<RowPreloadMeta>)>, String>(None);
+            return Ok::<Option<SemanticPlannerStats>, String>(None);
         };
         if source_table.is_empty() || subject_column.is_empty() {
-            return Ok::<Option<(SemanticPlannerStats, Option<Vec<String>>, Option<RowPreloadMeta>)>, String>(None);
+            return Ok::<Option<SemanticPlannerStats>, String>(None);
         }
-        let input_columns = row
-            .get_by_name::<String, _>("input_columns_json")
-            .map_err(to_string)?
-            .map(|json| serde_json::from_str::<Vec<String>>(&json).map_err(to_string))
-            .transpose()?;
         let subject_column_cstr = CString::new(subject_column.as_str()).map_err(to_string)?;
         let indexed_attno = unsafe { pg_sys::get_attnum(relid, subject_column_cstr.as_ptr()) };
         if indexed_attno != subject_attno {
-            return Ok::<Option<(SemanticPlannerStats, Option<Vec<String>>, Option<RowPreloadMeta>)>, String>(None);
+            return Ok::<Option<SemanticPlannerStats>, String>(None);
         }
-        let Some(task_name) = row
-            .get_by_name::<String, _>("task_name")
-            .map_err(to_string)?
-        else {
-            return Ok::<Option<(SemanticPlannerStats, Option<Vec<String>>, Option<RowPreloadMeta>)>, String>(None);
-        };
-        let Some(record_type) = row
-            .get_by_name::<String, _>("record_type")
-            .map_err(to_string)?
-        else {
-            return Ok::<Option<(SemanticPlannerStats, Option<Vec<String>>, Option<RowPreloadMeta>)>, String>(None);
-        };
-        let Some(contract_hash) = row
-            .get_by_name::<String, _>("contract_hash")
-            .map_err(to_string)?
-        else {
-            return Ok::<Option<(SemanticPlannerStats, Option<Vec<String>>, Option<RowPreloadMeta>)>, String>(None);
-        };
-        let input_columns_sql = row
-            .get_by_name::<String, _>("input_columns_sql")
-            .map_err(to_string)?
-            .unwrap_or_else(|| "NULL".to_owned());
-        let input_shaping_sql = row
-            .get_by_name::<String, _>("input_shaping_sql")
-            .map_err(to_string)?
-            .unwrap_or_else(|| "'{}'".to_owned());
-        let row_preload_meta = Some(RowPreloadMeta {
-            source_table,
-            subject_column,
-            input_columns_sql,
-            input_shaping_sql,
-            task_name,
-            record_type,
-            contract_hash,
-        });
 
         let mut stats = SemanticPlannerStats {
             selected_path: "semantic_lookup".to_owned(),
@@ -363,11 +253,7 @@ fn validate_semantic_index_source(
             infer_max_rows,
             auto_policy,
         );
-        Ok::<Option<(SemanticPlannerStats, Option<Vec<String>>, Option<RowPreloadMeta>)>, String>(Some((
-            stats,
-            input_columns,
-            row_preload_meta,
-        )))
+        Ok::<Option<SemanticPlannerStats>, String>(Some(stats))
     }) {
         Ok(stats) => stats,
         Err(err) => {
@@ -385,15 +271,13 @@ fn validate_semantic_join_index_source(
     infer_ms: u32,
     infer_max_rows: u32,
     auto_policy: bool,
-) -> Option<(SemanticPlannerStats, Option<JoinPreloadMeta>)> {
+) -> Option<SemanticPlannerStats> {
     match pgrx::Spi::connect(|client| {
         let stats_args = [index_name.into(), expected_json.into()];
         let stats_table = client
             .select(
-                "WITH meta AS ( \
-                   SELECT \
-                     sji.task_name, \
-                     sji.record_type \
+                 "WITH meta AS ( \
+                   SELECT true AS ok \
                    FROM otlet.semantic_join_indexes sji \
                    WHERE sji.name = $1 \
                    LIMIT 1 \
@@ -417,9 +301,7 @@ fn validate_semantic_join_index_source(
                    WHERE EXISTS (SELECT 1 FROM meta) \
                  ) \
                  SELECT \
-                   (SELECT true FROM meta) AS meta_ok, \
-                   (SELECT task_name FROM meta) AS task_name, \
-                   (SELECT record_type FROM meta) AS record_type, \
+                   (SELECT ok FROM meta) AS meta_ok, \
                    COALESCE((SELECT total_subjects FROM plan), 0)::bigint AS source_rows, \
                    (SELECT count(*) FROM current_rows WHERE stale = false AND body @> $2::jsonb)::bigint AS fresh_matches, \
                    (SELECT count(*) FROM current_rows WHERE stale = false AND NOT (body @> $2::jsonb))::bigint AS fresh_non_matches, \
@@ -436,7 +318,7 @@ fn validate_semantic_join_index_source(
             )
             .map_err(to_string)?;
         if stats_table.is_empty() {
-            return Ok::<Option<(SemanticPlannerStats, Option<JoinPreloadMeta>)>, String>(None);
+            return Ok::<Option<SemanticPlannerStats>, String>(None);
         }
         let row = stats_table.first();
         if row
@@ -444,7 +326,7 @@ fn validate_semantic_join_index_source(
             .map_err(to_string)?
             .is_none()
         {
-            return Ok::<Option<(SemanticPlannerStats, Option<JoinPreloadMeta>)>, String>(None);
+            return Ok::<Option<SemanticPlannerStats>, String>(None);
         }
         let mut stats = SemanticPlannerStats {
             selected_path: "semantic_lookup".to_owned(),
@@ -510,20 +392,7 @@ fn validate_semantic_join_index_source(
             stats.selected_path = "semantic_join_lookup".to_owned();
         }
         stats.reason = format!("semantic join candidate row-source: {}", stats.reason);
-        let join_meta = match (
-            row.get_by_name::<String, _>("task_name").map_err(to_string)?,
-            row.get_by_name::<String, _>("record_type").map_err(to_string)?,
-        ) {
-            (Some(task_name), Some(record_type)) => Some(JoinPreloadMeta {
-                task_name,
-                record_type,
-            }),
-            _ => None,
-        };
-        Ok::<Option<(SemanticPlannerStats, Option<JoinPreloadMeta>)>, String>(Some((
-            stats,
-            join_meta,
-        )))
+        Ok::<Option<SemanticPlannerStats>, String>(Some(stats))
     }) {
         Ok(stats) => stats,
         Err(err) => {

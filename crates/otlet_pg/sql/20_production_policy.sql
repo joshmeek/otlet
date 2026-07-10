@@ -739,24 +739,28 @@ BEGIN
   CREATE TEMP TABLE otlet_cleanup_job_candidates ON COMMIT DROP AS
     SELECT j.id
     FROM otlet.jobs j
-    LEFT JOIN otlet.outputs o ON o.job_id = j.id
-    LEFT JOIN otlet.actions a ON a.job_id = j.id
-    LEFT JOIN LATERAL (
-      SELECT true AS has_ref
-      FROM otlet.inference_receipts r
-      WHERE r.job_id = j.id
-        AND (
-          EXISTS (SELECT 1 FROM otlet.outputs o2 WHERE o2.receipt_id = r.id LIMIT 1)
-          OR EXISTS (SELECT 1 FROM otlet.actions a2 WHERE a2.receipt_id = r.id LIMIT 1)
-          OR EXISTS (SELECT 1 FROM otlet.eval_labels l WHERE l.receipt_id = r.id LIMIT 1)
-        )
-      LIMIT 1
-    ) ref ON true
     WHERE j.status IN ('failed', 'canceled')
       AND COALESCE(j.finished_at, j.created_at) < now() - failed_job_retention_interval
-      AND o.job_id IS NULL
-      AND a.job_id IS NULL
-      AND ref.has_ref IS NULL;
+      AND NOT EXISTS (
+        SELECT 1
+        FROM otlet.outputs o
+        WHERE o.job_id = j.id
+      )
+      AND NOT EXISTS (
+        SELECT 1
+        FROM otlet.actions a
+        WHERE a.job_id = j.id
+      )
+      AND NOT EXISTS (
+        SELECT 1
+        FROM otlet.inference_receipts r
+        WHERE r.job_id = j.id
+          AND (
+            EXISTS (SELECT 1 FROM otlet.outputs o WHERE o.receipt_id = r.id)
+            OR EXISTS (SELECT 1 FROM otlet.actions a WHERE a.receipt_id = r.id)
+            OR EXISTS (SELECT 1 FROM otlet.eval_labels l WHERE l.receipt_id = r.id)
+          )
+      );
 
   WITH event_candidates AS (
     SELECT e.id

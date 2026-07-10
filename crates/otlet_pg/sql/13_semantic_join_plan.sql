@@ -340,7 +340,7 @@ BEGIN
     count(DISTINCT j.subject_id) FILTER (
       WHERE j.task_name = p_task_name
     )::bigint,
-    count(*)::bigint,
+    count(j.id)::bigint,
     COALESCE(otlet.available_model_queue_slots(p_model_name), 0)::bigint
   INTO v_inflight_subjects, v_worker_queue_depth, v_available_queue_slots
   FROM otlet.tasks t
@@ -361,14 +361,27 @@ BEGIN
   FROM (SELECT 1) one
   LEFT JOIN LATERAL (
     SELECT
-      (array_agg(r.generate_ms ORDER BY r.finished_at DESC)
-         FILTER (WHERE r.task_name = p_task_name))[1]::numeric AS task_generate_ms,
-      (array_agg(r.generate_ms ORDER BY r.finished_at DESC))[1]::numeric AS model_generate_ms
-    FROM otlet.inference_receipts r
-    WHERE r.model_name = p_model_name
-      AND r.status = 'complete'
-      AND r.schema_validation_status = 'passed'
-      AND COALESCE(r.generate_ms, 0) > 0
+      (
+        SELECT r.generate_ms::numeric
+        FROM otlet.inference_receipts r
+        WHERE r.task_name = p_task_name
+          AND r.model_name = p_model_name
+          AND r.status = 'complete'
+          AND r.schema_validation_status = 'passed'
+          AND COALESCE(r.generate_ms, 0) > 0
+        ORDER BY r.finished_at DESC
+        LIMIT 1
+      ) AS task_generate_ms,
+      (
+        SELECT r.generate_ms::numeric
+        FROM otlet.inference_receipts r
+        WHERE r.model_name = p_model_name
+          AND r.status = 'complete'
+          AND r.schema_validation_status = 'passed'
+          AND COALESCE(r.generate_ms, 0) > 0
+        ORDER BY r.finished_at DESC
+        LIMIT 1
+      ) AS model_generate_ms
   ) receipt_cost ON true
   LEFT JOIN LATERAL (
     SELECT rs.last_generate_ms::numeric AS last_generate_ms

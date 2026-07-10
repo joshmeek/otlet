@@ -1,7 +1,6 @@
 use pgrx::JsonB;
 use serde_json::Value;
 
-#[derive(Clone)]
 pub(crate) struct Job {
     pub(crate) id: i64,
     pub(crate) task_name: String,
@@ -19,14 +18,12 @@ pub(crate) struct Job {
     pub(crate) max_attempt_ms: i64,
 }
 
-#[derive(Clone)]
 pub(crate) struct JobModel {
     pub(crate) name: String,
     pub(crate) artifact_path: String,
     pub(crate) artifact_hash: Option<String>,
 }
 
-#[derive(Clone)]
 pub(crate) struct ModelSelectionPolicy {
     pub(crate) cheap: JobModel,
     pub(crate) strong: JobModel,
@@ -259,69 +256,5 @@ WHERE p.task_name = $1
             },
             accept_field_checks: required_col!(row, JsonB, 7).0,
         }))
-    })
-}
-
-pub(crate) fn model_selection_policies_for_tasks(
-    task_names: &[String],
-) -> pgrx::spi::Result<std::collections::HashMap<String, Option<ModelSelectionPolicy>>> {
-    use std::collections::HashMap;
-
-    let mut policies = HashMap::with_capacity(task_names.len());
-    for task_name in task_names {
-        policies.insert(task_name.clone(), None);
-    }
-    if task_names.is_empty() {
-        return Ok(policies);
-    }
-
-    pgrx::Spi::connect(|client| {
-        let names = Value::Array(
-            task_names
-                .iter()
-                .map(|name| Value::String(name.clone()))
-                .collect(),
-        );
-        let args = [JsonB(names).into()];
-        let rows = client.select(
-            r"
-SELECT
-  p.task_name,
-  cheap.name,
-  cheap.artifact_path,
-  cheap.artifact_hash,
-  strong.name,
-  strong.artifact_path,
-  strong.artifact_hash,
-  p.accept_field_checks
-FROM otlet.model_selection_policies p
-JOIN otlet.models cheap ON cheap.name = p.cheap_model_name
-JOIN otlet.models strong ON strong.name = p.strong_model_name
-WHERE p.task_name IN (SELECT jsonb_array_elements_text($1::jsonb))
-	",
-            None,
-            &args,
-        )?;
-
-        for row in rows {
-            let task_name = required_col!(row, String, 1);
-            policies.insert(
-                task_name,
-                Some(ModelSelectionPolicy {
-                    cheap: JobModel {
-                        name: required_col!(row, String, 2),
-                        artifact_path: required_col!(row, String, 3),
-                        artifact_hash: row.get::<String>(4)?,
-                    },
-                    strong: JobModel {
-                        name: required_col!(row, String, 5),
-                        artifact_path: required_col!(row, String, 6),
-                        artifact_hash: row.get::<String>(7)?,
-                    },
-                    accept_field_checks: required_col!(row, JsonB, 8).0,
-                }),
-            );
-        }
-        Ok(policies)
     })
 }

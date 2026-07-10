@@ -29,8 +29,8 @@ Run `./scripts/otlet-setup.sh`, then `./scripts/otlet-demo.sh` to prove the cont
 | 1 | Packaging and security | Active hardening | Maintain a small setup and demo; add permission, redaction, and upgrade proof |
 | 2 | Output reliability and benchmark truth | Active hardening | Add prompt-template and quant sweeps under the existing quality gates |
 | 3 | Planner, executor, and cache | Active hardening | Add runtime fingerprints, load admission, decoder-batch probes, and EXPLAIN parity |
-| 4 | Explain and trace | Active hardening | Add audit export views and SQL-visible redaction status |
-| 5 | Semantic freshness | Active hardening | Export dependency audits for rows, joins, deletes, candidate changes, and schema drift |
+| 4 | Explain and trace | Active hardening | Add role-scoped grants, permission tests, and enforced prompt and trace redaction |
+| 5 | Semantic freshness | Active hardening | Extend dependency audits to source deletes and candidate-set changes |
 | 6 | Action safety | Active hardening | Extend typed actions to bounded SQL proposals, target allowlists, and idempotent replay |
 | 7 | Managed Postgres packaging | Open | Test native workers where providers allow them and a SQL-bound agent where providers block them |
 | 8 | GPU acceleration | Open | Add device policy after the CPU resident-worker path has measured proof |
@@ -43,9 +43,9 @@ Run `./scripts/otlet-setup.sh`, then `./scripts/otlet-demo.sh` to prove the cont
 | Output reliability hardening | Compare prompt templates and quantizations for each model family under one fixture and gate set |
 | Planner, executor, and cache hardening | Align SQL plan rows, semantic status views, runtime fingerprints, CustomScan EXPLAIN, receipts, runtime/cache views, and demo output |
 | Action lifecycle extension | Add bounded SQL proposal actions, dry-run plans, approvals, receipts, and source-table write checks |
-| Semantic freshness hardening | Add dependency audit export for source updates, deletes, schema drift, contract changes, and candidate changes |
+| Semantic freshness hardening | Extend dependency audit export to source deletes and candidate-set changes |
 | Watch definition export | Add import/export for row and pair watches |
-| Explain and trace hardening | Add audit export views and redaction policy |
+| Explain and trace hardening | Add role-scoped grants, permission tests, and enforced prompt and trace redaction |
 | Model residency and timing | Add pre-load memory admission, pressure metrics, and single-context decoder-batch probes before changing slot policy |
 | Grammar-constrained decode | Add grammar or JSON-schema decode after linked llama exposes a worker-safe hook |
 | Persisted cache storage | Add disk-backed cache after a measured workload proves in-process cache misses hurt |
@@ -53,7 +53,7 @@ Run `./scripts/otlet-setup.sh`, then `./scripts/otlet-demo.sh` to prove the cont
 | GPU acceleration | Report device policy, memory accounting, throughput, energy per trusted job, crash behavior, and EXPLAIN-visible device state |
 | Core limits research | Test Access Method and fork paths when CustomScan cannot expose a required contract |
 | Entity resolution packs | Ship vendor, customer, and product packs with candidate SQL, prompts, schemas, actions, fixtures, and gates |
-| Audit export and redaction | Add views and policies for decisions, receipts, source hashes, approvals, corrections, eval labels, and trace summaries |
+| Audit export and redaction | Add role-scoped grants, permission tests, and enforced redaction for stored prompts and token traces |
 
 Define each open track through SQL-visible state, a closed failure mode, and demo or benchmark proof before adding code
 
@@ -61,7 +61,7 @@ Define each open track through SQL-visible state, a closed failure mode, and dem
 
 Otlet treats output reliability as part of the database contract. Trusted output uses a fixed top-level `output` plus `actions` envelope. Invalid JSON, schema failures, bad action envelopes, false merges, and failed model attempts stay in receipts and diagnostic benchmark data, outside trusted output
 
-Qwen3.5 4B stays the default stable model under the 4B and 4 GB project cap. The fast probe filters smaller candidates before a full benchmark run. MiniStral 3B, Phi-4 mini, SmolLM3 3B, and GLM Edge 4B run faster in CPU quick probes. Each failed adversarial row-text, numeric-threshold, markdown-fence, or schema gates
+Qwen3.5 4B stays the default stable model under the 4B and 4 GB project cap. The fast probe filters smaller candidates before a full benchmark run. MiniStral 3B, Phi-4 mini, SmolLM3 3B, and GLM Edge 4B run faster in CPU quick probes. Each model failed at least one adversarial row-text, numeric-threshold, markdown-fence, or schema gate
 
 Next benchmark work:
 
@@ -85,7 +85,7 @@ Treat cache behavior as part of the runtime contract. Cache keys, invalidation r
 
 Use measured runtime history for costing: load time, warm generation time, token counts, schema failures, cache hits, cache invalidation reasons, stale refresh rate, worker queue depth, model-selection attempts, and materialization coverage. Postgres chooses the cheap fresh lookup path when it can and shows the reason when it cannot
 
-Add a timing split before the next executor rewrite: `tokenize_ms`, `prompt_decode_ms`, `generate_ms`, `finish_sql_ms`, and `materialize_ms`. Use those fields to decide whether prompt decode, SQL finish work, or materialization owns warm-job latency. Worker complete/fail paths stamp `finish_sql_ms` and `materialize_ms` onto receipt `trace_summary`; `inference_receipt_trace_status` and `inference_trace_summary` expose them as nullable columns
+The timing split records `tokenize_ms`, `prompt_decode_ms`, `generate_ms`, `finish_sql_ms`, and `materialize_ms`. Use those fields to decide whether prompt decode, SQL finish work, or materialization owns warm-job latency. Worker complete/fail paths stamp `finish_sql_ms` and `materialize_ms` onto receipt `trace_summary`; `inference_receipt_trace_status` and `inference_trace_summary` expose them as nullable columns
 
 Add one runtime fingerprint to receipts, trace views, and benchmark artifacts. Include the artifact hash, quantization, prompt-template name and hash, linked llama.cpp revision and build flags, effective context, batch, ubatch, KV, mmap, mlock, flash-attention, thread, affinity, NUMA, CPU topology, and memory capacity. Add output-affecting fields to cache contracts before persisted cache storage ships
 
@@ -99,7 +99,7 @@ Add host-scoped probes for physical cores versus SMT, NUMA-local versus interlea
 
 Gate resident-worker parallelism on measured proof. A qwen35_4b probe on the current Docker CPU measured four warm concurrent infer-now callers at `11.22s` with one worker and six threads, `13.02s` with two workers and six threads each, and `11.51s` with two workers and three threads each. Extra workers created overlapping llama.cpp generation, doubled resident model contexts, and failed to beat the one-worker default. Before changing the default, add per-worker RSS totals, model-specific admission caps, queue fairness proof, and database responsiveness checks
 
-Idle expired-job sweeps run at most every 30 seconds; after a productive claim drain the worker schedules the next sweep immediately so lease reclaim stays prompt under load
+Idle expired-job sweeps run at most every 30 seconds. After a productive claim drain, the worker makes the next sweep due so lease reclaim stays prompt under load
 
 Test single-context multi-sequence decoding before adding workers. Compare 1, 4, and 8 homogeneous claimed jobs with shared prompt prefixes. Require stable quality gates, cancellation, queue order, RSS, tail latency, throughput, and database responsiveness before changing the sequential decoder path
 
@@ -125,7 +125,7 @@ Otlet tracks the source dependencies behind row indexes, semantic joins, candida
 
 Each answer records the source rows read, trusted hash or MVCC identity, candidate set, and reuse/rejection reason for materialized state
 
-Add dependency audit exports for the row, join, delete, candidate-query, and schema-drift decisions that drive stale/fresh state. `otlet.semantic_dependency_audit` ships the latest materialization row per subject with `stale_reason`, hashes, and `source_dependencies`. Delete/candidate-query drift export surfaces remain open
+Add dependency audit exports for the row, join, delete, candidate-query, and schema-drift decisions that drive stale/fresh state. `otlet.semantic_dependency_audit` returns the latest materialization row per subject with `stale_reason`, hashes, and `source_dependencies`. Delete/candidate-query drift export surfaces remain open
 
 ## Entity Resolution Packs
 
@@ -143,7 +143,7 @@ Production defaults use low-detail tracing or disable it. SQL explains disabled 
 
 Use `generation_trace_top_k=0` when token alternatives are not part of the question. In a smoke probe, Otlet kept probability and chosen-token trace while avoiding the top-alternative scan cost
 
-Add audit export views for decisions, receipts, source hashes, approvals, corrections, eval labels, and trace summaries. Current read-only surfaces: `otlet.audit_receipt_export`, `otlet.audit_review_export`, `otlet.audit_eval_label_export`, `otlet.semantic_dependency_audit`, and `otlet.worker_batch_timing_status`. `otlet.redaction_policy_status` documents the active withheld-field contract. Add enforced redaction before exporting prompt, source, or token detail
+Otlet exposes read-only audit surfaces through `otlet.audit_receipt_export`, `otlet.audit_review_export`, `otlet.audit_eval_label_export`, `otlet.semantic_dependency_audit`, and `otlet.worker_batch_timing_status`. `otlet.redaction_policy_status` documents the active withheld-field contract. Add role-scoped grants, permission tests, and enforced redaction before exporting prompt, source, or token detail
 
 ## Action Safety
 

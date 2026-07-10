@@ -27,6 +27,14 @@ FROM otlet.inference_receipts r
 LEFT JOIN otlet.outputs o ON o.receipt_id = r.id;
 
 CREATE VIEW otlet.runs AS
+WITH receipt_attempts AS (
+  SELECT
+    job_id,
+    count(*)::bigint AS model_attempt_count,
+    bool_or(selection_role = 'strong') AS escalated
+  FROM otlet.inference_receipts
+  GROUP BY job_id
+)
 SELECT
   j.id AS job_id,
   j.task_name,
@@ -38,11 +46,11 @@ SELECT
   j.started_at,
   j.finished_at,
   j.cancel_requested_at,
-  accepted.output_id,
-  accepted.output,
-  COALESCE(accepted.output_raw_output, accepted.raw_output, j.raw_output) AS raw_output,
-  accepted.receipt_id,
-  accepted.receipt_id AS accepted_receipt_id,
+  o.id AS output_id,
+  o.output,
+  COALESCE(o.raw_output, accepted.raw_output, j.raw_output) AS raw_output,
+  accepted.id AS receipt_id,
+  accepted.id AS accepted_receipt_id,
   accepted.model_name,
   accepted.model_name AS accepted_model_name,
   accepted.runtime_name,
@@ -59,76 +67,15 @@ SELECT
   accepted.selection_role AS model_selection_role,
   accepted.selection_status AS model_selection_status,
   accepted.selection_reason AS model_selection_reason,
-  COALESCE(accepted.model_attempt_count, 0)::bigint AS model_attempt_count,
-  COALESCE(accepted.escalated, false) AS escalated,
+  COALESCE(attempts.model_attempt_count, 0)::bigint AS model_attempt_count,
+  COALESCE(attempts.escalated, false) AS escalated,
   j.created_at AS job_created_at,
-  accepted.output_created_at,
+  o.created_at AS output_created_at,
   accepted.finished_at AS receipt_finished_at
 FROM otlet.jobs j
-LEFT JOIN LATERAL (
-  SELECT
-    acc.receipt_id,
-    acc.model_name,
-    acc.runtime_name,
-    acc.prompt_hash,
-    acc.input_hash,
-    acc.output_schema_hash,
-    acc.raw_output_hash,
-    acc.raw_output,
-    acc.prompt_tokens,
-    acc.generated_tokens,
-    acc.generate_ms,
-    acc.tokens_per_second,
-    acc.schema_validation_status,
-    acc.trace_summary,
-    acc.selection_role,
-    acc.selection_status,
-    acc.selection_reason,
-    acc.finished_at,
-    acc.output_id,
-    acc.output,
-    acc.output_raw_output,
-    acc.output_created_at,
-    agg.model_attempt_count,
-    agg.escalated
-  FROM (
-    SELECT
-      count(*)::bigint AS model_attempt_count,
-      bool_or(ar.selection_role = 'strong') AS escalated
-    FROM otlet.inference_receipts ar
-    WHERE ar.job_id = j.id
-  ) agg
-  LEFT JOIN LATERAL (
-    SELECT
-      ar.id AS receipt_id,
-      ar.model_name,
-      ar.runtime_name,
-      ar.prompt_hash,
-      ar.input_hash,
-      ar.output_schema_hash,
-      ar.raw_output_hash,
-      ar.raw_output,
-      ar.prompt_tokens,
-      ar.generated_tokens,
-      ar.generate_ms,
-      ar.tokens_per_second,
-      ar.schema_validation_status,
-      ar.trace_summary,
-      ar.selection_role,
-      ar.selection_status,
-      ar.selection_reason,
-      ar.finished_at,
-      o.id AS output_id,
-      o.output,
-      o.raw_output AS output_raw_output,
-      o.created_at AS output_created_at
-    FROM otlet.outputs o
-    JOIN otlet.inference_receipts ar ON ar.id = o.receipt_id
-    WHERE o.job_id = j.id
-    ORDER BY ar.attempt_index DESC, ar.id DESC
-    LIMIT 1
-  ) acc ON true
-) accepted ON true;
+LEFT JOIN receipt_attempts attempts ON attempts.job_id = j.id
+LEFT JOIN otlet.outputs o ON o.job_id = j.id
+LEFT JOIN otlet.inference_receipts accepted ON accepted.id = o.receipt_id;
 
 CREATE VIEW otlet.action_status AS
 SELECT
@@ -744,20 +691,32 @@ LEFT JOIN LATERAL (
 ) materialization ON true;
 
 CREATE VIEW otlet.task_inference_cache_status AS
-WITH receipt_cache AS (
+WITH receipt_cache AS MATERIALIZED (
   SELECT
     task_name,
-    receipt_id,
+    id AS receipt_id,
     selection_status,
-    inference_cache_hit,
-    inference_cache_key_basis,
-    inference_cache_reason,
-    receipt_finished_at,
+    COALESCE(trace_summary ->> 'inference_cache_hit', 'false')::boolean AS inference_cache_hit,
+    COALESCE(
+      trace_summary #>> '{cache,key_basis}',
+      trace_summary ->> 'inference_cache_key_basis'
+    ) AS inference_cache_key_basis,
+    COALESCE(
+      trace_summary #>> '{cache,invalidation_reason}',
+      trace_summary ->> 'inference_cache_invalidation_reason'
+    ) AS inference_cache_reason,
+    finished_at AS receipt_finished_at,
     (
-      inference_cache_reason IS NOT NULL
-      AND inference_cache_reason NOT IN ('disabled', 'disabled_for_generation_trace')
+      COALESCE(
+        trace_summary #>> '{cache,invalidation_reason}',
+        trace_summary ->> 'inference_cache_invalidation_reason'
+      ) IS NOT NULL
+      AND COALESCE(
+        trace_summary #>> '{cache,invalidation_reason}',
+        trace_summary ->> 'inference_cache_invalidation_reason'
+      ) NOT IN ('disabled', 'disabled_for_generation_trace')
     ) AS cache_enabled
-  FROM otlet.inference_receipt_trace_status
+  FROM otlet.inference_receipts
 ),
 task_cache AS (
   SELECT
@@ -772,9 +731,30 @@ task_cache AS (
     count(*) FILTER (WHERE selection_status = 'accepted' AND inference_cache_hit)::bigint AS accepted_cache_hits,
     count(*) FILTER (WHERE selection_status = 'rejected' AND inference_cache_hit)::bigint AS rejected_cache_hits,
     count(*) FILTER (WHERE selection_status = 'failed' AND inference_cache_hit)::bigint AS failed_cache_hits,
-    array_remove(array_agg(DISTINCT inference_cache_key_basis), NULL) AS key_basis_values,
-    (array_agg(inference_cache_reason ORDER BY receipt_finished_at DESC, receipt_id DESC))[1] AS last_cache_reason
+    array_remove(array_agg(DISTINCT inference_cache_key_basis), NULL) AS key_basis_values
   FROM receipt_cache
+  GROUP BY task_name
+),
+latest_cache AS (
+  SELECT DISTINCT ON (task_name)
+    task_name,
+    inference_cache_reason AS last_cache_reason
+  FROM receipt_cache
+  ORDER BY task_name, receipt_finished_at DESC, receipt_id DESC
+),
+reason_counts AS (
+  SELECT
+    task_name,
+    COALESCE(inference_cache_reason, 'unknown') AS reason,
+    count(*)::bigint AS receipt_count
+  FROM receipt_cache
+  GROUP BY task_name, COALESCE(inference_cache_reason, 'unknown')
+),
+task_reasons AS (
+  SELECT
+    task_name,
+    jsonb_object_agg(reason, receipt_count ORDER BY reason) AS cache_reasons
+  FROM reason_counts
   GROUP BY task_name
 )
 SELECT
@@ -795,17 +775,8 @@ SELECT
   c.rejected_cache_hits,
   c.failed_cache_hits,
   to_jsonb(c.key_basis_values) AS inference_cache_key_bases,
-  c.last_cache_reason,
+  latest.last_cache_reason,
   COALESCE(reasons.cache_reasons, '{}'::jsonb) AS cache_reasons
 FROM task_cache c
-LEFT JOIN LATERAL (
-  SELECT jsonb_object_agg(reason, receipt_count ORDER BY reason) AS cache_reasons
-  FROM (
-    SELECT
-      COALESCE(r.inference_cache_reason, 'unknown') AS reason,
-      count(*)::bigint AS receipt_count
-    FROM receipt_cache r
-    WHERE r.task_name = c.task_name
-    GROUP BY COALESCE(r.inference_cache_reason, 'unknown')
-  ) reason_counts
-) reasons ON true;
+LEFT JOIN latest_cache latest USING (task_name)
+LEFT JOIN task_reasons reasons USING (task_name);

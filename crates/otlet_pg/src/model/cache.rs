@@ -63,7 +63,6 @@ fn model_fingerprint_hash(model: JobModelRef<'_>) -> Arc<str> {
         return Arc::<str>::from(hash_text_parts(&["catalog_hash:", hash]));
     }
 
-    #[derive(Clone)]
     struct FingerprintMeta {
         modified_ms: u128,
         bytes: u64,
@@ -184,7 +183,6 @@ impl CacheLookup {
     }
 }
 
-#[derive(Clone)]
 struct InferenceCacheStats {
     entries: i64,
     bytes: i64,
