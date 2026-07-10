@@ -16,6 +16,7 @@ pub(crate) struct Job {
     pub(crate) input_shaping: Value,
     pub(crate) decision_contract: Value,
     pub(crate) max_attempt_ms: i64,
+    pub(crate) claim_attempt: i32,
 }
 
 pub(crate) struct JobModel {
@@ -72,6 +73,7 @@ macro_rules! job_from_row {
             input_shaping: required_col!($row, JsonB, 12).0,
             decision_contract: required_col!($row, JsonB, 13).0,
             max_attempt_ms: i64::from(required_col!($row, i32, 14)),
+            claim_attempt: required_col!($row, i32, 15),
         }
     };
 }
@@ -96,6 +98,7 @@ WITH claimed AS (
     m.name AS model_name,
     p.default_runtime_options,
     p.max_attempt_ms,
+    j.attempts,
     otlet.semantic_shaped_input(j.input, t.input_shaping) AS shaped_input
   FROM otlet.claim_jobs() j
   JOIN otlet.tasks t ON t.name = j.task_name
@@ -117,7 +120,8 @@ SELECT
   default_runtime_options || runtime_options,
   input_shaping,
   decision_contract,
-  otlet.effective_task_max_attempt_ms(default_runtime_options || runtime_options, max_attempt_ms)
+  otlet.effective_task_max_attempt_ms(default_runtime_options || runtime_options, max_attempt_ms),
+  attempts
 FROM claimed
 	",
             None,
@@ -157,8 +161,21 @@ inserted AS (
     started_at,
     finished_at
   )
-  SELECT $1, $2, $3::jsonb, 'running', 1, now() + p.job_lease_interval, now(), NULL
+  SELECT
+    $1,
+    $2,
+    $3::jsonb,
+    'running',
+    1,
+    now() + otlet.effective_job_lease_interval(
+      p.default_runtime_options || t.runtime_options,
+      p.max_attempt_ms,
+      p.job_lease_interval
+    ),
+    now(),
+    NULL
   FROM policy p
+  JOIN otlet.tasks t ON t.name = $1
   ON CONFLICT (task_name, subject_id)
   WHERE status IN ('queued', 'running', 'cancel_requested')
   DO NOTHING
@@ -178,7 +195,8 @@ SELECT
   default_runtime_options || runtime_options,
   input_shaping,
   decision_contract,
-  otlet.effective_task_max_attempt_ms(default_runtime_options || runtime_options, max_attempt_ms)
+  otlet.effective_task_max_attempt_ms(default_runtime_options || runtime_options, max_attempt_ms),
+  attempts
 FROM (
   SELECT
     j.id,
@@ -194,6 +212,7 @@ FROM (
     m.name AS model_name,
     p.default_runtime_options,
     p.max_attempt_ms,
+    j.attempts,
     otlet.semantic_shaped_input(j.input, t.input_shaping) AS shaped_input
   FROM inserted j
   JOIN otlet.tasks t ON t.name = j.task_name

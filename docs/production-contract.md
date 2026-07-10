@@ -56,6 +56,8 @@ The production policy row and status views expose SQL state under `otlet`: `prod
 
 Queue caps are admission-time controls. Rows enter `otlet.jobs` through `run_task`, watch refresh, semantic refresh, or `ask`; direct inserts are internal/testing-only and can bypass admission accounting. `verify_invariants()` returns one row per violation. The demo requires `SELECT count(*) FROM otlet.verify_invariants()` to return `0` (`invariant_contract=0`). The `queued_jobs_within_model_cap` check reports models whose queued depth exceeds `max_queued_jobs_per_model`
 
+Claimed jobs use `otlet.effective_job_lease_interval(...)`, which covers the task attempt timeout plus 30 seconds of completion grace. Workers call `otlet.renew_job_lease(job_id, expected_attempt)` before each direct, cheap, or strong model attempt. The expected attempt is a fence: a stale worker cannot renew a job after another worker has reclaimed it. `model_selection_policy_status.effective_job_lease_interval` exposes the derived interval
+
 Otlet debounces suppressed queue-admission events per task and reason for one minute, so a full queue stays visible without flooding `worker_events`. `production_status` exposes `semantic_materialization_failed_events` and `semantic_materialization_last_failed_at`. Nonzero `max_worker_rss_bytes` budgets require Linux process-status RSS sampling; runtime-option validation rejects unsupported builds before queue execution. Cleanup can prune old failed or canceled jobs after outputs, actions, eval labels, and receipts no longer reference them
 
 The resident worker attaches to the `postgres` database. Supporting worker registration across multiple databases requires separate shared-memory and latch routing

@@ -142,7 +142,15 @@ SELECT
     ELSE NULL
   END AS task_max_attempt_ms,
   policy.max_attempt_ms AS policy_max_attempt_ms,
-  otlet.effective_task_max_attempt_ms(t.runtime_options, policy.max_attempt_ms) AS effective_max_attempt_ms,
+  otlet.effective_task_max_attempt_ms(
+    policy.default_runtime_options || t.runtime_options,
+    policy.max_attempt_ms
+  ) AS effective_max_attempt_ms,
+  otlet.effective_job_lease_interval(
+    policy.default_runtime_options || t.runtime_options,
+    policy.max_attempt_ms,
+    policy.job_lease_interval
+  ) AS effective_job_lease_interval,
   cheap_q.queue_state AS cheap_queue_state,
   cheap_q.queued_jobs AS cheap_queued_jobs,
   cheap_q.running_jobs AS cheap_running_jobs,

@@ -530,6 +530,9 @@ fn mark_job_started(job: &Job) {
 }
 
 fn process_direct_job(job: &Job) -> JobProcessResult {
+    if let Some(result) = guard_job_lease(job, job.model_name.as_str(), "direct") {
+        return result;
+    }
     match run_job(job) {
         Ok(run) => {
             let mut result = JobProcessResult::from_run(false, &run);
@@ -639,6 +642,9 @@ fn value_string_array_contains(items: &Value, expected: &str) -> bool {
 fn process_selected_job(job: &Job, policy: &ModelSelectionPolicy) -> JobProcessResult {
     // Run cheap model without cloning the full Job; SPI helpers take model_name.
     let cheap_name = policy.cheap.name.as_str();
+    if let Some(result) = guard_job_lease(job, cheap_name, "cheap") {
+        return result;
+    }
     match run_job_with_model(job, &policy.cheap) {
         Ok(run) => {
             let (accepted, reason) = accepted_by_policy(&run.output, &policy.accept_field_checks);
@@ -702,6 +708,9 @@ fn run_strong_attempt_with_model(
     strong: &crate::job::JobModel,
     reason: &str,
 ) -> JobProcessResult {
+    if let Some(result) = guard_job_lease(job, strong.name.as_str(), "strong") {
+        return result;
+    }
     match run_job_with_model(job, strong) {
         Ok(run) => {
             let mut result = JobProcessResult::from_run(false, &run);
@@ -724,6 +733,57 @@ fn run_strong_attempt_with_model(
                 selection_reason,
             )
         }
+    }
+}
+
+fn guard_job_lease(job: &Job, model_name: &str, selection_role: &str) -> Option<JobProcessResult> {
+    match renew_job_lease(job) {
+        Ok(false) => None,
+        Ok(true) => {
+            let err = ModelError::new_static("canceled");
+            Some(fail_attempt_result_with_model(
+                job,
+                model_name,
+                &err,
+                selection_role,
+                "canceled",
+            ))
+        }
+        Err(message) => {
+            pgrx::warning!(
+                "otlet worker skipped job {} after lease fence failure: {}",
+                job.id,
+                message
+            );
+            let err = ModelError::new(message);
+            Some(JobProcessResult::failed_with(&err))
+        }
+    }
+}
+
+fn renew_job_lease(job: &Job) -> Result<bool, String> {
+    let result: pgrx::spi::Result<Option<bool>> = BackgroundWorker::transaction(|| {
+        pgrx::Spi::connect_mut(|client| {
+            let args = [job.id.into(), job.claim_attempt.into()];
+            let rows = client.update(
+                "SELECT status FROM otlet.renew_job_lease($1, $2) LIMIT 1",
+                Some(1),
+                &args,
+            )?;
+            if rows.is_empty() {
+                return Ok(None);
+            }
+            Ok(rows
+                .first()
+                .get::<String>(1)?
+                .map(|status| status == "cancel_requested"))
+        })
+    });
+
+    match result {
+        Ok(Some(canceled)) => Ok(canceled),
+        Ok(None) => Err("job lease fence lost: claim attempt is no longer active".to_owned()),
+        Err(err) => Err(format!("job lease renewal failed: {err}")),
     }
 }
 

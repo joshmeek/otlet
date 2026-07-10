@@ -7,6 +7,8 @@ AS $$
       worker_claim_batch_size AS batch_size,
       worker_claim_task_cursor AS task_cursor,
       max_attempts,
+      max_attempt_ms,
+      default_runtime_options,
       job_lease_interval
     FROM otlet.production_policy
     WHERE name = 'default'
@@ -88,7 +90,13 @@ AS $$
     LIMIT 1
   ),
   claimable AS (
-    SELECT j.id
+    SELECT
+      j.id,
+      otlet.effective_job_lease_interval(
+        p.default_runtime_options || t.runtime_options,
+        p.max_attempt_ms,
+        p.job_lease_interval
+      ) AS lease_interval
     FROM otlet.jobs j
     JOIN otlet.tasks t ON t.name = j.task_name
     JOIN otlet.models m ON m.name = t.model_name
@@ -128,18 +136,42 @@ AS $$
     UPDATE otlet.jobs j
     SET status = CASE WHEN j.status = 'cancel_requested' THEN 'cancel_requested' ELSE 'running' END,
         attempts = attempts + 1,
-        leased_until = now() + p.job_lease_interval,
+        leased_until = now() + claimable.lease_interval,
         error = CASE WHEN j.status = 'cancel_requested' THEN j.error ELSE NULL END,
         raw_output = NULL,
         started_at = now(),
         finished_at = NULL
     FROM claimable
-    CROSS JOIN policy p
     CROSS JOIN advance_cursor
     WHERE j.id = claimable.id
     RETURNING j.*
   )
   SELECT * FROM updated ORDER BY created_at, id;
+$$;
+
+CREATE FUNCTION otlet.renew_job_lease(
+  job_id bigint,
+  expected_attempt integer
+) RETURNS TABLE (
+  status text,
+  leased_until timestamptz
+)
+LANGUAGE sql
+AS $$
+  UPDATE otlet.jobs j
+  SET leased_until = now() + otlet.effective_job_lease_interval(
+    p.default_runtime_options || t.runtime_options,
+    p.max_attempt_ms,
+    p.job_lease_interval
+  )
+  FROM otlet.tasks t
+  CROSS JOIN otlet.production_policy p
+  WHERE j.id = renew_job_lease.job_id
+    AND j.attempts = renew_job_lease.expected_attempt
+    AND j.status IN ('running', 'cancel_requested')
+    AND t.name = j.task_name
+    AND p.name = 'default'
+  RETURNING j.status, j.leased_until;
 $$;
 
 CREATE FUNCTION otlet.mark_job_started(job_id bigint) RETURNS void

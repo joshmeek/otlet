@@ -5,6 +5,76 @@ FROM otlet.production_policy_status;
 SQL
 )"
 echo "production_policy_contract=$production_policy_contract"
+
+lease_interval_contract="$(psql_value <<'SQL'
+SELECT EXTRACT(epoch FROM otlet.effective_job_lease_interval(
+         '{}'::jsonb,
+         300000,
+         interval '5 minutes'
+       ))::bigint::text || '|' ||
+       EXTRACT(epoch FROM otlet.effective_job_lease_interval(
+         '{"max_attempt_ms":1000}'::jsonb,
+         300000,
+         interval '1 second'
+       ))::bigint::text;
+SQL
+)"
+echo "lease_interval_contract=$lease_interval_contract"
+[ "$lease_interval_contract" = "330|31" ] || {
+  echo "Expected timeout-aware job leases with 30-second completion grace, got $lease_interval_contract" >&2
+  exit 1
+}
+
+lease_fence_task="lease_fence_demo"
+cleanup_task "$lease_fence_task"
+lease_fence_contract="$(psql_value -v task_name="$lease_fence_task" -v model_name="$strong_model_name" <<'SQL'
+BEGIN;
+UPDATE otlet.production_policy
+SET job_lease_interval = interval '1 second',
+    default_runtime_options = '{"max_attempt_ms":2000}'::jsonb,
+    worker_claim_batch_size = 1,
+    worker_claim_task_cursor = ''
+WHERE name = 'default';
+WITH created AS (
+  SELECT otlet.create_task(
+    :'task_name',
+    'SELECT NULL::text AS subject_id, ''{}''::jsonb AS input WHERE false',
+    'Lease fence smoke placeholder',
+    '{"type":"object"}'::jsonb,
+    :'model_name',
+    '{"max_tokens":1,"reasoning":"off"}'::jsonb
+  ) AS task
+)
+INSERT INTO otlet.jobs (task_name, subject_id, input)
+SELECT :'task_name', 'lease-fence-1', '{}'::jsonb
+FROM created;
+CREATE TEMP TABLE lease_claim AS
+SELECT id, attempts, leased_until
+FROM otlet.claim_jobs();
+CREATE TEMP TABLE wrong_renew AS
+SELECT renewed.*
+FROM lease_claim claim
+CROSS JOIN LATERAL otlet.renew_job_lease(claim.id, claim.attempts + 1) renewed;
+CREATE TEMP TABLE current_renew AS
+SELECT renewed.*
+FROM lease_claim claim
+CROSS JOIN LATERAL otlet.renew_job_lease(claim.id, claim.attempts) renewed;
+SELECT (SELECT count(*) FROM lease_claim)::text || '|' ||
+       (SELECT count(*) FROM wrong_renew)::text || '|' ||
+       COALESCE((SELECT status FROM current_renew), '') || '|' ||
+       COALESCE((SELECT (leased_until > now() + interval '30 seconds')::text FROM current_renew), 'false') || '|' ||
+       COALESCE((SELECT (
+         leased_until > now() + interval '31 seconds'
+         AND leased_until < now() + interval '33 seconds'
+       )::text FROM current_renew), 'false');
+ROLLBACK;
+SQL
+)"
+echo "lease_fence_contract=$lease_fence_contract"
+[ "$lease_fence_contract" = "1|0|running|true|true" ] || {
+  echo "Expected claim-attempt fencing and timeout-aware lease renewal, got $lease_fence_contract" >&2
+  exit 1
+}
 [ "$production_policy_contract" = "default|refresh_then_fail_closed|3|300000|8" ] || {
   echo "Expected default production policy, got $production_policy_contract" >&2
   exit 1

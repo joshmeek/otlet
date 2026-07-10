@@ -22,6 +22,21 @@ AS $$
   )::integer;
 $$;
 
+CREATE FUNCTION otlet.effective_job_lease_interval(
+  runtime_options jsonb,
+  policy_max_attempt_ms integer,
+  configured_lease_interval interval
+) RETURNS interval
+LANGUAGE sql
+IMMUTABLE
+AS $$
+  SELECT GREATEST(
+    COALESCE($3, interval '5 minutes'),
+    otlet.effective_task_max_attempt_ms($1, $2) * interval '1 millisecond'
+      + interval '30 seconds'
+  );
+$$;
+
 CREATE FUNCTION otlet.create_task(
   task_name text,
   input_query text,
