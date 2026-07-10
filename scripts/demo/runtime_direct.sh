@@ -56,6 +56,12 @@ require_regex "$direct_ask_receipt_contract" "^$strong_model_name\\|complete\\|p
 }
 
 log "Checking opt-in direct decision contract gate"
+direct_gate_jobs_completed_before="$(psql_value -v model_name="$strong_model_name" <<'SQL'
+SELECT jobs_completed
+FROM otlet.runtime_slots
+WHERE model_name = :'model_name';
+SQL
+)"
 psql_exec \
   -v task_name="$direct_gate_task" \
   -v model_name="$strong_model_name" >/dev/null <<'SQL'
@@ -112,6 +118,19 @@ SQL
 echo "direct_gate_contract=$direct_gate_contract"
 [ "$direct_gate_contract" = "failed|rejected|direct_rejected_by_decision_contract|passed|0|1|unclear" ] || {
   echo "Expected opt-in direct gate to reject an abstention without trusted output and expose review_queue, got $direct_gate_contract" >&2
+  exit 1
+}
+direct_gate_metrics_contract="$(psql_value \
+  -v model_name="$strong_model_name" \
+  -v jobs_completed_before="$direct_gate_jobs_completed_before" <<'SQL'
+SELECT jobs_completed - :'jobs_completed_before'::bigint
+FROM otlet.runtime_slots
+WHERE model_name = :'model_name';
+SQL
+)"
+echo "direct_gate_metrics_contract=$direct_gate_metrics_contract"
+[ "$direct_gate_metrics_contract" = "1" ] || {
+  echo "Expected one runtime metric update for one rejected direct attempt, got $direct_gate_metrics_contract" >&2
   exit 1
 }
 

@@ -1040,9 +1040,6 @@ fn reject_direct_attempt(job: &Job, run: ModelRun, selection_reason: &str) -> bo
                 Some(1),
                 &args,
             )?;
-            if let Some(metrics) = metrics {
-                record_metrics_with_client(client, job, job.model_name.as_str(), metrics)?;
-            }
             Ok(())
         })
     });

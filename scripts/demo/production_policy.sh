@@ -94,6 +94,88 @@ echo "production_status_contract=$production_status_contract"
   exit 1
 }
 
+cleanup_policy_contract="$(psql_value -v model_name="$strong_model_name" <<'SQL'
+BEGIN;
+UPDATE otlet.production_policy
+SET worker_event_retention = interval '100 years',
+    failed_job_retention = interval '100 years'
+WHERE name = 'default';
+INSERT INTO otlet.tasks (
+  name,
+  input_query,
+  instruction,
+  output_schema,
+  model_name
+)
+VALUES (
+  'cleanup_policy_contract',
+  'SELECT NULL::text AS subject_id, ''{}''::jsonb AS input WHERE false',
+  'Cleanup policy contract placeholder',
+  '{"type":"object"}'::jsonb,
+  :'model_name'
+)
+ON CONFLICT (name) DO UPDATE
+SET model_name = EXCLUDED.model_name;
+CREATE TEMP TABLE cleanup_contract_jobs AS
+WITH inserted AS (
+  INSERT INTO otlet.jobs (
+    task_name,
+    subject_id,
+    input,
+    status,
+    created_at,
+    finished_at
+  )
+  VALUES
+    ('cleanup_policy_contract', 'active-old-event', '{}'::jsonb, 'queued', now() - interval '200 years', NULL),
+    ('cleanup_policy_contract', 'failed-recent-event', '{}'::jsonb, 'failed', now() - interval '200 years', now() - interval '200 years'),
+    ('cleanup_policy_contract', 'failed-null-finished', '{}'::jsonb, 'failed', now() - interval '200 years', NULL),
+    ('cleanup_policy_contract', 'complete-old-event', '{}'::jsonb, 'complete', now() - interval '200 years', now() - interval '200 years'),
+    ('cleanup_policy_contract', 'complete-recent-event', '{}'::jsonb, 'complete', now(), now())
+  RETURNING id, subject_id
+)
+SELECT * FROM inserted;
+INSERT INTO otlet.worker_events (event_type, job_id, created_at)
+SELECT
+  'cleanup_policy_contract',
+  id,
+  CASE subject_id
+    WHEN 'failed-recent-event' THEN now()
+    WHEN 'complete-recent-event' THEN now()
+    ELSE now() - interval '200 years'
+  END
+FROM cleanup_contract_jobs;
+CREATE TEMP TABLE cleanup_contract_dry AS
+SELECT * FROM otlet.cleanup_policy_state(true);
+CREATE TEMP TABLE cleanup_contract_run AS
+SELECT * FROM otlet.cleanup_policy_state(false);
+SELECT (
+         (SELECT worker_events = 3 AND failed_canceled_jobs = 2 AND dry_run FROM cleanup_contract_dry)
+         AND (SELECT worker_events = 3 AND failed_canceled_jobs = 2 AND NOT dry_run FROM cleanup_contract_run)
+       )::text || '|' ||
+       ((SELECT count(*) FROM otlet.jobs WHERE task_name = 'cleanup_policy_contract') = 3)::text || '|' ||
+       ((SELECT count(*) FROM otlet.worker_events WHERE event_type = 'cleanup_policy_contract') = 2)::text || '|' ||
+       EXISTS (
+         SELECT 1
+         FROM otlet.worker_events e
+         JOIN cleanup_contract_jobs j ON j.id = e.job_id
+         WHERE j.subject_id = 'active-old-event'
+       )::text || '|' ||
+       EXISTS (
+         SELECT 1
+         FROM otlet.worker_events e
+         JOIN cleanup_contract_jobs j ON j.id = e.job_id
+         WHERE j.subject_id = 'complete-recent-event'
+       )::text;
+ROLLBACK;
+SQL
+)"
+echo "cleanup_policy_contract=$cleanup_policy_contract"
+[ "$cleanup_policy_contract" = "true|true|true|true|true" ] || {
+  echo "Expected cleanup policy retention contract true|true|true|true|true, got $cleanup_policy_contract" >&2
+  exit 1
+}
+
 psql_exec \
   -v join_index_name="$join_index_name" \
   -v row_triage_watch="$row_triage_watch" \
@@ -147,6 +229,41 @@ SQL
 echo "model_queue_status_contract=$model_queue_status_contract"
 [ "$model_queue_status_contract" = "queue_accepting|0|0" ] || {
   echo "Expected empty accepting model queue, got $model_queue_status_contract" >&2
+  exit 1
+}
+
+queue_underfill_contract="$(psql_value <<'SQL'
+BEGIN;
+INSERT INTO otlet.models (name, artifact_path)
+VALUES ('queue_underfill_contract_model', '/tmp/not-used.gguf');
+INSERT INTO otlet.tasks (name, input_query, instruction, output_schema, model_name)
+VALUES (
+  'queue_underfill_contract_task',
+  'SELECT ''subject-'' || lpad(i::text, 2, ''0'') AS subject_id, ''{}''::jsonb AS input FROM generate_series(1, 10) AS g(i)',
+  'Queue underfill contract placeholder',
+  '{"type":"object"}'::jsonb,
+  'queue_underfill_contract_model'
+);
+UPDATE otlet.production_policy
+SET max_queued_jobs_per_model = 5
+WHERE name = 'default';
+INSERT INTO otlet.jobs (task_name, subject_id, input)
+SELECT 'queue_underfill_contract_task', 'subject-' || lpad(i::text, 2, '0'), '{}'::jsonb
+FROM generate_series(1, 3) AS g(i);
+CREATE TEMP TABLE queue_underfill_result AS
+SELECT otlet.run_task('queue_underfill_contract_task') AS queued;
+SELECT (SELECT queued FROM queue_underfill_result)::text || '|' ||
+       (SELECT count(*) FROM otlet.jobs WHERE task_name = 'queue_underfill_contract_task')::text || '|' ||
+       (SELECT count(*)
+        FROM otlet.worker_events
+        WHERE event_type = 'queue_admission_suppressed'
+          AND detail ->> 'task_name' = 'queue_underfill_contract_task')::text;
+ROLLBACK;
+SQL
+)"
+echo "queue_underfill_contract=$queue_underfill_contract"
+[ "$queue_underfill_contract" = "2|5|1" ] || {
+  echo "Expected queue underfill contract 2|5|1, got $queue_underfill_contract" >&2
   exit 1
 }
 

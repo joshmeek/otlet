@@ -325,14 +325,17 @@ STABLE
 AS $$
   SELECT GREATEST(
     p.max_queued_jobs_per_model
-      - count(j.id),
+      - (
+        SELECT count(*)
+        FROM otlet.jobs j
+        JOIN otlet.tasks t ON t.name = j.task_name
+        WHERE j.status = 'queued'
+          AND t.model_name = $1
+      ),
     0
   )::integer
   FROM otlet.production_policy p
-  LEFT JOIN otlet.tasks t ON t.model_name = $1
-  LEFT JOIN otlet.jobs j ON j.task_name = t.name AND j.status = 'queued'
-  WHERE p.name = 'default'
-  GROUP BY p.max_queued_jobs_per_model;
+  WHERE p.name = 'default';
 $$;
 
 CREATE FUNCTION otlet.record_queue_admission_suppressed(
@@ -385,7 +388,6 @@ DECLARE
   model_name text;
   queue_slots integer;
   queued bigint;
-  has_pending boolean := false;
   has_overflow boolean := false;
 BEGIN
   SELECT input_query, tasks.model_name
@@ -402,78 +404,65 @@ BEGIN
   END IF;
 
   PERFORM pg_advisory_xact_lock(hashtext('otlet_queue:' || model_name));
-  SELECT otlet.available_model_queue_slots(model_name) INTO queue_slots;
-  IF queue_slots <= 0 THEN
-    EXECUTE format(
-      'SELECT EXISTS (SELECT 1 FROM (%s) otlet_input LIMIT 1)',
-      query
-    )
-    INTO has_pending;
-
-    IF has_pending THEN
-      PERFORM otlet.record_queue_admission_suppressed(run_task.task_name, model_name);
-    END IF;
-
-    RETURN 0;
-  END IF;
-
   EXECUTE format(
     'WITH queue_capacity AS (
        SELECT GREATEST(
          p.max_queued_jobs_per_model
-           - count(j.id),
+           - (
+             SELECT count(*)
+             FROM otlet.jobs j
+             JOIN otlet.tasks queued_tasks ON queued_tasks.name = j.task_name
+             WHERE j.status = ''queued''
+               AND queued_tasks.model_name = %L
+           ),
          0
        )::integer AS slots
        FROM otlet.production_policy p
-       LEFT JOIN otlet.tasks queued_tasks ON queued_tasks.model_name = %L
-       LEFT JOIN otlet.jobs j
-         ON j.task_name = queued_tasks.name
-        AND j.status = ''queued''
        WHERE p.name = ''default''
-       GROUP BY p.max_queued_jobs_per_model
-     )
-     INSERT INTO otlet.jobs (task_name, subject_id, input)
-     SELECT %L, subject_id::text, input::jsonb
-     FROM (
+     ),
+     bounded_input AS MATERIALIZED (
        SELECT subject_id::text AS subject_id, input::jsonb AS input
        FROM (%s) otlet_input
+       WHERE NOT EXISTS (
+         SELECT 1
+         FROM otlet.jobs active_job
+         WHERE active_job.task_name = %L
+           AND active_job.subject_id = otlet_input.subject_id::text
+           AND active_job.status IN (''queued'', ''running'', ''cancel_requested'')
+       )
+       ORDER BY subject_id
+       LIMIT (SELECT slots + 1 FROM queue_capacity)
+     ),
+     inserted AS (
+       INSERT INTO otlet.jobs (task_name, subject_id, input)
+       SELECT %L, subject_id, input
+       FROM bounded_input
        ORDER BY subject_id
        LIMIT (SELECT slots FROM queue_capacity)
-     ) otlet_bounded_input
-     ON CONFLICT (task_name, subject_id)
-     WHERE status IN (''queued'', ''running'', ''cancel_requested'')
-     DO NOTHING',
+       ON CONFLICT (task_name, subject_id)
+       WHERE status IN (''queued'', ''running'', ''cancel_requested'')
+       DO NOTHING
+       RETURNING 1
+     )
+     SELECT
+       (SELECT count(*) FROM inserted),
+       (SELECT count(*) FROM bounded_input) > queue_capacity.slots,
+       queue_capacity.slots
+     FROM queue_capacity',
     model_name,
+    query,
     task_name,
-    query
-  );
-  GET DIAGNOSTICS queued = ROW_COUNT;
+    task_name
+  )
+  INTO queued, has_overflow, queue_slots;
 
-  IF queued >= queue_slots THEN
-    EXECUTE format(
-      'SELECT EXISTS (
-         SELECT 1
-         FROM (
-           SELECT subject_id::text AS subject_id, input::jsonb AS input
-           FROM (%s) otlet_input
-           ORDER BY subject_id
-           OFFSET %s
-           LIMIT 1
-         ) otlet_overflow_input
-       )',
-      query,
-      queue_slots
-    )
-    INTO has_overflow;
-
-    IF has_overflow THEN
-      PERFORM otlet.record_queue_admission_suppressed(
-        run_task.task_name,
-        model_name,
-        suppressed_queued_jobs => queued,
-        suppressed_queue_slots => queue_slots
-      );
-    END IF;
+  IF has_overflow THEN
+    PERFORM otlet.record_queue_admission_suppressed(
+      run_task.task_name,
+      model_name,
+      suppressed_queued_jobs => queued,
+      suppressed_queue_slots => queue_slots
+    );
   END IF;
 
   IF queued > 0 THEN
@@ -514,59 +503,58 @@ BEGIN
   END IF;
 
   PERFORM pg_advisory_xact_lock(hashtext('otlet_queue:' || model_name));
-  SELECT otlet.available_model_queue_slots(model_name) INTO queue_slots;
-  IF queue_slots <= 0 THEN
-    EXECUTE format(
-      'SELECT EXISTS (
-         SELECT 1
-         FROM (%s) otlet_input
-         WHERE subject_id::text = %L
-         LIMIT 1
-       )',
-      query,
-      run_task_subject.subject_id
-    )
-    INTO has_pending;
-
-    IF has_pending THEN
-      PERFORM otlet.record_queue_admission_suppressed(
-        run_task_subject.task_name,
-        model_name,
-        run_task_subject.subject_id
-      );
-    END IF;
-
-    RETURN 0;
-  END IF;
-
   EXECUTE format(
     'WITH queue_capacity AS (
        SELECT GREATEST(
          p.max_queued_jobs_per_model
-           - count(j.id),
+           - (
+             SELECT count(*)
+             FROM otlet.jobs j
+             JOIN otlet.tasks queued_tasks ON queued_tasks.name = j.task_name
+             WHERE j.status = ''queued''
+               AND queued_tasks.model_name = %L
+           ),
          0
        )::integer AS slots
        FROM otlet.production_policy p
-       LEFT JOIN otlet.tasks queued_tasks ON queued_tasks.model_name = %L
-       LEFT JOIN otlet.jobs j
-         ON j.task_name = queued_tasks.name
-        AND j.status = ''queued''
        WHERE p.name = ''default''
-       GROUP BY p.max_queued_jobs_per_model
+     ),
+     pending_input AS MATERIALIZED (
+       SELECT subject_id::text AS subject_id, input::jsonb AS input
+       FROM (%s) otlet_input
+       WHERE subject_id::text = %L
+       LIMIT 1
+     ),
+     inserted AS (
+       INSERT INTO otlet.jobs (task_name, subject_id, input)
+       SELECT %L, subject_id, input
+       FROM pending_input
+       WHERE (SELECT slots FROM queue_capacity) > 0
+       ON CONFLICT (task_name, subject_id)
+       WHERE status IN (''queued'', ''running'', ''cancel_requested'')
+       DO NOTHING
+       RETURNING 1
      )
-     INSERT INTO otlet.jobs (task_name, subject_id, input)
-     SELECT %L, subject_id::text, input::jsonb FROM (%s) otlet_input
-     WHERE subject_id::text = %L
-       AND (SELECT slots FROM queue_capacity) > 0
-     ON CONFLICT (task_name, subject_id)
-     WHERE status IN (''queued'', ''running'', ''cancel_requested'')
-     DO NOTHING',
+     SELECT
+       (SELECT count(*) FROM inserted),
+       EXISTS (SELECT 1 FROM pending_input),
+       queue_capacity.slots
+     FROM queue_capacity',
     model_name,
-    run_task_subject.task_name,
     query,
-    run_task_subject.subject_id
-  );
-  GET DIAGNOSTICS queued = ROW_COUNT;
+    run_task_subject.subject_id,
+    run_task_subject.task_name
+  )
+  INTO queued, has_pending, queue_slots;
+
+  IF queue_slots <= 0 AND has_pending THEN
+    PERFORM otlet.record_queue_admission_suppressed(
+      run_task_subject.task_name,
+      model_name,
+      run_task_subject.subject_id
+    );
+  END IF;
+
   IF queued > 0 THEN
     PERFORM otlet.wake_worker();
   END IF;

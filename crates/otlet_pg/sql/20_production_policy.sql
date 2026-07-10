@@ -34,9 +34,14 @@ SELECT
     WHERE j.status IN ('running', 'cancel_requested')
       AND (j.leased_until IS NULL OR j.leased_until < now())
   )::bigint AS expired_running_jobs,
-  slots.available_queue_slots,
+  GREATEST(
+    p.max_queued_jobs_per_model::bigint
+      - count(j.id) FILTER (WHERE j.status = 'queued'),
+    0
+  ) AS available_queue_slots,
   CASE
-    WHEN slots.available_queue_slots <= 0 THEN 'queue_full'
+    WHEN count(j.id) FILTER (WHERE j.status = 'queued') >= p.max_queued_jobs_per_model
+    THEN 'queue_full'
     ELSE 'queue_accepting'
   END AS queue_state,
   COALESCE(suppressed.suppressed_events, 0)::bigint AS queue_admission_suppressed_events,
@@ -44,16 +49,16 @@ SELECT
 FROM otlet.models m
 CROSS JOIN otlet.production_policy p
 LEFT JOIN otlet.tasks t ON t.model_name = m.name
-LEFT JOIN otlet.jobs j ON j.task_name = t.name
-LEFT JOIN LATERAL (
-  SELECT otlet.available_model_queue_slots(m.name)::bigint AS available_queue_slots
-) slots ON true
+LEFT JOIN otlet.jobs j
+  ON j.task_name = t.name
+ AND j.status IN ('queued', 'running', 'cancel_requested')
 LEFT JOIN LATERAL (
   SELECT
     count(*)::bigint AS suppressed_events,
     max(e.created_at) AS last_suppressed_at
   FROM otlet.worker_events e
   WHERE e.event_type = 'queue_admission_suppressed'
+    AND e.detail ? 'model_name'
     AND e.detail ->> 'model_name' = m.name
 ) suppressed ON true
 WHERE p.name = 'default'
@@ -61,7 +66,6 @@ GROUP BY
   m.name,
   m.max_active_jobs,
   p.max_queued_jobs_per_model,
-  slots.available_queue_slots,
   suppressed.suppressed_events,
   suppressed.last_suppressed_at;
 
@@ -87,6 +91,7 @@ LEFT JOIN LATERAL (
   SELECT e.detail, e.created_at
   FROM otlet.worker_events e
   WHERE e.event_type = 'worker_batch_finished'
+    AND e.detail ? 'model_name'
     AND e.detail ->> 'model_name' = m.name
   ORDER BY e.created_at DESC, e.id DESC
   LIMIT 1
@@ -111,6 +116,7 @@ LEFT JOIN LATERAL (
       COALESCE((e.detail ->> 'failed_jobs')::bigint, 0) AS failed_jobs
     FROM otlet.worker_events e
     WHERE e.event_type = 'worker_batch_finished'
+      AND e.detail ? 'model_name'
       AND e.detail ->> 'model_name' = m.name
     ORDER BY e.created_at DESC, e.id DESC
     LIMIT 16
@@ -163,24 +169,60 @@ LEFT JOIN otlet.model_queue_status cheap_q ON cheap_q.model_name = p.cheap_model
 WHERE policy.name = 'default';
 
 CREATE VIEW otlet.model_selection_status AS
+WITH job_counts AS (
+  SELECT
+    j.task_name,
+    count(*)::bigint AS total_jobs,
+    count(*) FILTER (WHERE j.status = 'complete')::bigint AS complete_jobs,
+    count(*) FILTER (WHERE j.status = 'failed')::bigint AS failed_jobs
+  FROM otlet.jobs j
+  GROUP BY j.task_name
+),
+attempt_counts AS (
+  SELECT
+    r.task_name,
+    count(*) FILTER (WHERE r.selection_role = 'cheap')::bigint AS cheap_attempts,
+    count(*) FILTER (
+      WHERE r.selection_role = 'cheap'
+        AND r.selection_status = 'accepted'
+    )::bigint AS cheap_accepted,
+    count(*) FILTER (
+      WHERE r.selection_role = 'cheap'
+        AND r.selection_status = 'rejected'
+    )::bigint AS cheap_rejected,
+    count(*) FILTER (
+      WHERE r.selection_role = 'cheap'
+        AND r.schema_validation_status = 'failed'
+    )::bigint AS cheap_schema_failed,
+    count(*) FILTER (WHERE r.selection_role = 'strong')::bigint AS strong_attempts,
+    count(*) FILTER (
+      WHERE r.selection_role = 'strong'
+        AND r.selection_status = 'accepted'
+    )::bigint AS strong_accepted,
+    count(*) FILTER (
+      WHERE r.selection_role = 'strong'
+        AND r.selection_status = 'failed'
+    )::bigint AS strong_failed,
+    count(DISTINCT r.job_id) FILTER (WHERE r.selection_role = 'strong')::bigint AS escalated_jobs
+  FROM otlet.inference_receipts r
+  GROUP BY r.task_name
+)
 SELECT
   p.task_name,
-  count(DISTINCT j.id)::bigint AS total_jobs,
-  count(DISTINCT j.id) FILTER (WHERE j.status = 'complete')::bigint AS complete_jobs,
-  count(DISTINCT j.id) FILTER (WHERE j.status = 'failed')::bigint AS failed_jobs,
-  count(r.id) FILTER (WHERE r.selection_role = 'cheap')::bigint AS cheap_attempts,
-  count(r.id) FILTER (WHERE r.selection_role = 'cheap' AND r.selection_status = 'accepted')::bigint AS cheap_accepted,
-  count(r.id) FILTER (WHERE r.selection_role = 'cheap' AND r.selection_status = 'rejected')::bigint AS cheap_rejected,
-  count(r.id) FILTER (WHERE r.selection_role = 'cheap' AND r.schema_validation_status = 'failed')::bigint AS cheap_schema_failed,
-  count(r.id) FILTER (WHERE r.selection_role = 'strong')::bigint AS strong_attempts,
-  count(r.id) FILTER (WHERE r.selection_role = 'strong' AND r.selection_status = 'accepted')::bigint AS strong_accepted,
-  count(r.id) FILTER (WHERE r.selection_role = 'strong' AND r.selection_status = 'failed')::bigint AS strong_failed,
-  count(DISTINCT r.job_id) FILTER (WHERE r.selection_role = 'strong')::bigint AS escalated_jobs
+  COALESCE(j.total_jobs, 0)::bigint AS total_jobs,
+  COALESCE(j.complete_jobs, 0)::bigint AS complete_jobs,
+  COALESCE(j.failed_jobs, 0)::bigint AS failed_jobs,
+  COALESCE(a.cheap_attempts, 0)::bigint AS cheap_attempts,
+  COALESCE(a.cheap_accepted, 0)::bigint AS cheap_accepted,
+  COALESCE(a.cheap_rejected, 0)::bigint AS cheap_rejected,
+  COALESCE(a.cheap_schema_failed, 0)::bigint AS cheap_schema_failed,
+  COALESCE(a.strong_attempts, 0)::bigint AS strong_attempts,
+  COALESCE(a.strong_accepted, 0)::bigint AS strong_accepted,
+  COALESCE(a.strong_failed, 0)::bigint AS strong_failed,
+  COALESCE(a.escalated_jobs, 0)::bigint AS escalated_jobs
 FROM otlet.model_selection_policies p
-LEFT JOIN otlet.jobs j ON j.task_name = p.task_name
-LEFT JOIN otlet.inference_receipts r ON r.job_id = j.id
-GROUP BY
-  p.task_name;
+LEFT JOIN job_counts j ON j.task_name = p.task_name
+LEFT JOIN attempt_counts a ON a.task_name = p.task_name;
 
 CREATE FUNCTION otlet.verify_invariants(sample_limit integer DEFAULT NULL)
 RETURNS TABLE (
@@ -748,7 +790,13 @@ BEGIN
     SELECT j.id
     FROM otlet.jobs j
     WHERE j.status IN ('failed', 'canceled')
-      AND COALESCE(j.finished_at, j.created_at) < now() - failed_job_retention_interval
+      AND (
+        j.finished_at < now() - failed_job_retention_interval
+        OR (
+          j.finished_at IS NULL
+          AND j.created_at < now() - failed_job_retention_interval
+        )
+      )
       AND NOT EXISTS (
         SELECT 1
         FROM otlet.outputs o
@@ -773,16 +821,17 @@ BEGIN
   WITH event_candidates AS (
     SELECT e.id
     FROM otlet.worker_events e
-    WHERE (
-        e.created_at < now() - worker_retention
-        AND NOT EXISTS (
-          SELECT 1
-          FROM otlet.jobs j
-          WHERE j.id = e.job_id
-            AND j.status IN ('queued', 'running', 'cancel_requested')
-        )
+    WHERE e.created_at < now() - worker_retention
+      AND NOT EXISTS (
+        SELECT 1
+        FROM otlet.jobs j
+        WHERE j.id = e.job_id
+          AND j.status IN ('queued', 'running', 'cancel_requested')
       )
-      OR e.job_id IN (SELECT id FROM otlet_cleanup_job_candidates)
+    UNION
+    SELECT e.id
+    FROM otlet.worker_events e
+    JOIN otlet_cleanup_job_candidates c ON c.id = e.job_id
   )
   SELECT count(*)
   INTO worker_count
@@ -838,16 +887,13 @@ BEGIN
     WITH event_candidates AS (
       SELECT e.id
       FROM otlet.worker_events e
-      WHERE (
-          e.created_at < now() - worker_retention
-          AND NOT EXISTS (
-            SELECT 1
-            FROM otlet.jobs j
-            WHERE j.id = e.job_id
-              AND j.status IN ('queued', 'running', 'cancel_requested')
-          )
+      WHERE e.created_at < now() - worker_retention
+        AND NOT EXISTS (
+          SELECT 1
+          FROM otlet.jobs j
+          WHERE j.id = e.job_id
+            AND j.status IN ('queued', 'running', 'cancel_requested')
         )
-        OR e.job_id IN (SELECT id FROM otlet_cleanup_job_candidates)
     )
     DELETE FROM otlet.worker_events e
     USING event_candidates c
