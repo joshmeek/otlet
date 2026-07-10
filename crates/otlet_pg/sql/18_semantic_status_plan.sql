@@ -37,6 +37,7 @@ CREATE FUNCTION otlet.semantic_index_plan(
 )
 LANGUAGE plpgsql
 VOLATILE
+ROWS 1
 AS $$
 DECLARE
   index_row otlet.semantic_indexes%ROWTYPE;

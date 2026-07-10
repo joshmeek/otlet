@@ -242,18 +242,8 @@ abstention_items AS (
     ORDER BY sm.updated_at DESC, sm.id DESC
     LIMIT 1
   ) materialization ON true
-  CROSS JOIN LATERAL (
-    SELECT
-      COALESCE(NULLIF(t.decision_contract ->> 'answer_field', ''), 'match') AS answer_field,
-      COALESCE(
-        (
-          SELECT array_agg(value)
-          FROM jsonb_array_elements_text(COALESCE(t.decision_contract -> 'abstain_values', '["unclear"]'::jsonb)) AS abstain(value)
-        ),
-        ARRAY[]::text[]
-      ) AS abstain_values
-  ) contract
-  WHERE o.output ->> contract.answer_field = ANY(contract.abstain_values)
+  WHERE COALESCE(t.decision_contract -> 'abstain_values', '["unclear"]'::jsonb)
+      ? (o.output ->> COALESCE(NULLIF(t.decision_contract ->> 'answer_field', ''), 'match'))
     AND NOT EXISTS (
       SELECT 1
       FROM otlet.eval_labels l
@@ -398,15 +388,8 @@ SELECT
     FROM otlet.outputs o
     JOIN otlet.jobs j ON j.id = o.job_id
     JOIN otlet.tasks t ON t.name = j.task_name
-    CROSS JOIN LATERAL (
-      SELECT COALESCE(NULLIF(t.decision_contract ->> 'answer_field', ''), 'match') AS answer_field,
-             COALESCE(t.decision_contract -> 'abstain_values', '["unclear"]'::jsonb) AS abstain_values
-    ) contract
-    WHERE EXISTS (
-      SELECT 1
-      FROM jsonb_array_elements_text(contract.abstain_values) value(abstain_value)
-      WHERE o.output ->> contract.answer_field = value.abstain_value
-    )
+    WHERE COALESCE(t.decision_contract -> 'abstain_values', '["unclear"]'::jsonb)
+        ? (o.output ->> COALESCE(NULLIF(t.decision_contract ->> 'answer_field', ''), 'match'))
   ) AS abstained_outputs,
   (
     SELECT count(*)::bigint
@@ -429,6 +412,16 @@ SELECT
 FROM otlet.inference_receipts;
 
 CREATE VIEW otlet.inference_receipt_trace_status AS
+WITH latest_materialization AS (
+  SELECT DISTINCT ON (a.receipt_id)
+    a.receipt_id,
+    sm.freshness_basis
+  FROM otlet.actions a
+  JOIN otlet.records rec ON rec.action_id = a.id
+  JOIN otlet.semantic_materializations sm ON sm.record_id = rec.id
+  WHERE a.receipt_id IS NOT NULL
+  ORDER BY a.receipt_id, sm.updated_at DESC, sm.id DESC
+)
 SELECT
   r.id AS receipt_id,
   r.job_id,
@@ -445,250 +438,247 @@ SELECT
   r.prompt_hash,
   r.prompt_tokens,
   CASE
-    WHEN jsonb_typeof(r.trace_summary -> 'prompt_cached_tokens_before') = 'number'
-      THEN (r.trace_summary ->> 'prompt_cached_tokens_before')::bigint
+    WHEN jsonb_typeof(trace.summary -> 'prompt_cached_tokens_before') = 'number'
+      THEN (trace.summary ->> 'prompt_cached_tokens_before')::bigint
     ELSE NULL
   END AS prompt_cached_tokens_before,
   CASE
-    WHEN jsonb_typeof(r.trace_summary -> 'prompt_reused_tokens') = 'number'
-      THEN (r.trace_summary ->> 'prompt_reused_tokens')::bigint
+    WHEN jsonb_typeof(trace.summary -> 'prompt_reused_tokens') = 'number'
+      THEN (trace.summary ->> 'prompt_reused_tokens')::bigint
     ELSE NULL
   END AS prompt_reused_tokens,
   CASE
-    WHEN jsonb_typeof(r.trace_summary -> 'prompt_decoded_tokens') = 'number'
-      THEN (r.trace_summary ->> 'prompt_decoded_tokens')::bigint
+    WHEN jsonb_typeof(trace.summary -> 'prompt_decoded_tokens') = 'number'
+      THEN (trace.summary ->> 'prompt_decoded_tokens')::bigint
     ELSE NULL
   END AS prompt_decoded_tokens,
-  r.trace_summary ->> 'prompt_reuse_strategy' AS prompt_reuse_strategy,
+  trace.summary ->> 'prompt_reuse_strategy' AS prompt_reuse_strategy,
   CASE
-    WHEN jsonb_typeof(r.trace_summary -> 'prompt_prefix_state_bytes') = 'number'
-      THEN (r.trace_summary ->> 'prompt_prefix_state_bytes')::bigint
+    WHEN jsonb_typeof(trace.summary -> 'prompt_prefix_state_bytes') = 'number'
+      THEN (trace.summary ->> 'prompt_prefix_state_bytes')::bigint
     ELSE NULL
   END AS prompt_prefix_state_bytes,
   CASE
-    WHEN jsonb_typeof(r.trace_summary -> 'prompt_prefix_cache_entries') = 'number'
-      THEN (r.trace_summary ->> 'prompt_prefix_cache_entries')::bigint
+    WHEN jsonb_typeof(trace.summary -> 'prompt_prefix_cache_entries') = 'number'
+      THEN (trace.summary ->> 'prompt_prefix_cache_entries')::bigint
     ELSE NULL
   END AS prompt_prefix_cache_entries,
   CASE
-    WHEN jsonb_typeof(r.trace_summary -> 'prompt_prefix_cache_bytes') = 'number'
-      THEN (r.trace_summary ->> 'prompt_prefix_cache_bytes')::bigint
+    WHEN jsonb_typeof(trace.summary -> 'prompt_prefix_cache_bytes') = 'number'
+      THEN (trace.summary ->> 'prompt_prefix_cache_bytes')::bigint
     ELSE NULL
   END AS prompt_prefix_cache_bytes,
   CASE
-    WHEN jsonb_typeof(r.trace_summary -> 'effective_llama_threads') = 'number'
-      THEN (r.trace_summary ->> 'effective_llama_threads')::bigint
+    WHEN jsonb_typeof(trace.summary -> 'effective_llama_threads') = 'number'
+      THEN (trace.summary ->> 'effective_llama_threads')::bigint
     ELSE NULL
   END AS effective_llama_threads,
   CASE
-    WHEN jsonb_typeof(r.trace_summary -> 'effective_llama_batch_threads') = 'number'
-      THEN (r.trace_summary ->> 'effective_llama_batch_threads')::bigint
+    WHEN jsonb_typeof(trace.summary -> 'effective_llama_batch_threads') = 'number'
+      THEN (trace.summary ->> 'effective_llama_batch_threads')::bigint
     ELSE NULL
   END AS effective_llama_batch_threads,
   r.generated_tokens,
   r.generate_ms,
   r.tokens_per_second,
   CASE
-    WHEN jsonb_typeof(r.trace_summary -> 'tokenize_ms') = 'number'
-      THEN (r.trace_summary ->> 'tokenize_ms')::bigint
+    WHEN jsonb_typeof(trace.summary -> 'tokenize_ms') = 'number'
+      THEN (trace.summary ->> 'tokenize_ms')::bigint
     ELSE NULL
   END AS tokenize_ms,
   CASE
-    WHEN jsonb_typeof(r.trace_summary -> 'prompt_decode_ms') = 'number'
-      THEN (r.trace_summary ->> 'prompt_decode_ms')::bigint
+    WHEN jsonb_typeof(trace.summary -> 'prompt_decode_ms') = 'number'
+      THEN (trace.summary ->> 'prompt_decode_ms')::bigint
     ELSE NULL
   END AS prompt_decode_ms,
   CASE
-    WHEN jsonb_typeof(r.trace_summary -> 'finish_sql_ms') = 'number'
-      THEN (r.trace_summary ->> 'finish_sql_ms')::bigint
+    WHEN jsonb_typeof(trace.summary -> 'finish_sql_ms') = 'number'
+      THEN (trace.summary ->> 'finish_sql_ms')::bigint
     ELSE NULL
   END AS finish_sql_ms,
   CASE
-    WHEN jsonb_typeof(r.trace_summary -> 'materialize_ms') = 'number'
-      THEN (r.trace_summary ->> 'materialize_ms')::bigint
+    WHEN jsonb_typeof(trace.summary -> 'materialize_ms') = 'number'
+      THEN (trace.summary ->> 'materialize_ms')::bigint
     ELSE NULL
   END AS materialize_ms,
   CASE
-    WHEN jsonb_typeof(r.trace_summary -> 'first_token_ms') = 'number'
-      THEN (r.trace_summary ->> 'first_token_ms')::bigint
+    WHEN jsonb_typeof(trace.summary -> 'first_token_ms') = 'number'
+      THEN (trace.summary ->> 'first_token_ms')::bigint
     ELSE NULL
   END AS first_token_ms,
   CASE
-    WHEN jsonb_typeof(r.trace_summary -> 'ttft_ms') = 'number'
-      THEN (r.trace_summary ->> 'ttft_ms')::bigint
+    WHEN jsonb_typeof(trace.summary -> 'ttft_ms') = 'number'
+      THEN (trace.summary ->> 'ttft_ms')::bigint
     ELSE NULL
   END AS ttft_ms,
   CASE
-    WHEN jsonb_typeof(r.trace_summary -> 'steady_tokens_per_second') = 'number'
-      THEN (r.trace_summary ->> 'steady_tokens_per_second')::numeric
+    WHEN jsonb_typeof(trace.summary -> 'steady_tokens_per_second') = 'number'
+      THEN (trace.summary ->> 'steady_tokens_per_second')::numeric
     ELSE NULL
   END AS steady_tokens_per_second,
   r.schema_validation_status,
-  r.trace_summary ->> 'trace_version' AS trace_version,
-  r.trace_summary,
+  trace.summary ->> 'trace_version' AS trace_version,
+  trace.summary AS trace_summary,
   COALESCE(
-    NULLIF(r.trace_summary #>> '{decision,preset_name}', ''),
-    NULLIF(r.trace_summary ->> 'decision_preset_name', '')
+    NULLIF(trace.summary #>> '{decision,preset_name}', ''),
+    NULLIF(trace.summary ->> 'decision_preset_name', '')
   ) AS decision_preset_name,
   COALESCE(
-    NULLIF(r.trace_summary #>> '{decision,preset_contract_hash}', ''),
-    NULLIF(r.trace_summary ->> 'decision_preset_contract_hash', '')
+    NULLIF(trace.summary #>> '{decision,preset_contract_hash}', ''),
+    NULLIF(trace.summary ->> 'decision_preset_contract_hash', '')
   ) AS decision_preset_contract_hash,
-  r.trace_summary -> 'runtime_options_status' AS runtime_options_status,
-  r.trace_summary ->> 'executor_origin' AS executor_origin,
-  r.trace_summary ->> 'executor_node' AS executor_node,
-  r.trace_summary ->> 'executor_boundary' AS executor_boundary,
-  r.trace_summary ->> 'planner_selected_path' AS planner_selected_path,
-  r.trace_summary ->> 'source_tuple_provider' AS source_tuple_provider,
-  r.trace_summary ->> 'refresh_policy' AS refresh_policy,
-  r.trace_summary ->> 'semantic_index_kind' AS semantic_index_kind,
-  r.trace_summary ->> 'semantic_index_name' AS semantic_index_name,
-  r.trace_summary -> 'probability_summary' ->> 'status' AS probability_status,
-  r.trace_summary -> 'probability_summary' ->> 'method' AS probability_method,
-  r.trace_summary -> 'detailed_trace' ->> 'status' AS detailed_trace_status,
-  r.trace_summary -> 'detailed_trace' ->> 'trace_contract' AS detailed_trace_contract,
-  r.trace_summary -> 'detailed_trace' ->> 'storage_policy' AS detailed_trace_storage_policy,
-  r.trace_summary -> 'detailed_trace' ->> 'logprob_policy' AS detailed_trace_logprob_policy,
+  trace.summary -> 'runtime_options_status' AS runtime_options_status,
+  trace.summary ->> 'executor_origin' AS executor_origin,
+  trace.summary ->> 'executor_node' AS executor_node,
+  trace.summary ->> 'executor_boundary' AS executor_boundary,
+  trace.summary ->> 'planner_selected_path' AS planner_selected_path,
+  trace.summary ->> 'source_tuple_provider' AS source_tuple_provider,
+  trace.summary ->> 'refresh_policy' AS refresh_policy,
+  trace.summary ->> 'semantic_index_kind' AS semantic_index_kind,
+  trace.summary ->> 'semantic_index_name' AS semantic_index_name,
+  trace.summary -> 'probability_summary' ->> 'status' AS probability_status,
+  trace.summary -> 'probability_summary' ->> 'method' AS probability_method,
+  trace.summary -> 'detailed_trace' ->> 'status' AS detailed_trace_status,
+  trace.summary -> 'detailed_trace' ->> 'trace_contract' AS detailed_trace_contract,
+  trace.summary -> 'detailed_trace' ->> 'storage_policy' AS detailed_trace_storage_policy,
+  trace.summary -> 'detailed_trace' ->> 'logprob_policy' AS detailed_trace_logprob_policy,
   CASE
-    WHEN jsonb_typeof(r.trace_summary #> '{detailed_trace,max_tokens}') = 'number'
-      THEN (r.trace_summary #>> '{detailed_trace,max_tokens}')::bigint
+    WHEN jsonb_typeof(trace.summary #> '{detailed_trace,max_tokens}') = 'number'
+      THEN (trace.summary #>> '{detailed_trace,max_tokens}')::bigint
     ELSE NULL
   END AS detailed_trace_max_tokens,
   CASE
-    WHEN jsonb_typeof(r.trace_summary #> '{detailed_trace,top_k}') = 'number'
-      THEN (r.trace_summary #>> '{detailed_trace,top_k}')::bigint
+    WHEN jsonb_typeof(trace.summary #> '{detailed_trace,top_k}') = 'number'
+      THEN (trace.summary #>> '{detailed_trace,top_k}')::bigint
     ELSE NULL
   END AS detailed_trace_top_k,
   CASE
-    WHEN jsonb_typeof(r.trace_summary #> '{detailed_trace,captured_tokens}') = 'number'
-      THEN (r.trace_summary #>> '{detailed_trace,captured_tokens}')::bigint
+    WHEN jsonb_typeof(trace.summary #> '{detailed_trace,captured_tokens}') = 'number'
+      THEN (trace.summary #>> '{detailed_trace,captured_tokens}')::bigint
     ELSE NULL
   END AS detailed_trace_captured_tokens,
   CASE
-    WHEN jsonb_typeof(r.trace_summary #> '{detailed_trace,skipped_tokens}') = 'number'
-      THEN (r.trace_summary #>> '{detailed_trace,skipped_tokens}')::bigint
+    WHEN jsonb_typeof(trace.summary #> '{detailed_trace,skipped_tokens}') = 'number'
+      THEN (trace.summary #>> '{detailed_trace,skipped_tokens}')::bigint
     ELSE NULL
   END AS detailed_trace_skipped_tokens,
-  r.trace_summary ->> 'row_identity' AS row_identity,
-  r.trace_summary -> 'mvcc' AS mvcc,
+  trace.summary ->> 'row_identity' AS row_identity,
+  trace.summary -> 'mvcc' AS mvcc,
   CASE
-    WHEN jsonb_typeof(r.trace_summary #> '{input_shaping,shaped_input_bytes}') = 'number'
-      THEN (r.trace_summary #>> '{input_shaping,shaped_input_bytes}')::bigint
-    WHEN jsonb_typeof(r.trace_summary -> 'shaped_input_bytes') = 'number'
-      THEN (r.trace_summary ->> 'shaped_input_bytes')::bigint
+    WHEN jsonb_typeof(trace.summary #> '{input_shaping,shaped_input_bytes}') = 'number'
+      THEN (trace.summary #>> '{input_shaping,shaped_input_bytes}')::bigint
+    WHEN jsonb_typeof(trace.summary -> 'shaped_input_bytes') = 'number'
+      THEN (trace.summary ->> 'shaped_input_bytes')::bigint
     ELSE NULL
   END AS shaped_input_bytes,
   CASE
-    WHEN jsonb_typeof(r.trace_summary #> '{input_shaping,original_shaped_input_bytes}') = 'number'
-      THEN (r.trace_summary #>> '{input_shaping,original_shaped_input_bytes}')::bigint
-    WHEN jsonb_typeof(r.trace_summary -> 'original_shaped_input_bytes') = 'number'
-      THEN (r.trace_summary ->> 'original_shaped_input_bytes')::bigint
+    WHEN jsonb_typeof(trace.summary #> '{input_shaping,original_shaped_input_bytes}') = 'number'
+      THEN (trace.summary #>> '{input_shaping,original_shaped_input_bytes}')::bigint
+    WHEN jsonb_typeof(trace.summary -> 'original_shaped_input_bytes') = 'number'
+      THEN (trace.summary ->> 'original_shaped_input_bytes')::bigint
     ELSE NULL
   END AS original_shaped_input_bytes,
   CASE
-    WHEN jsonb_typeof(r.trace_summary #> '{input_shaping,max_shaped_input_bytes}') = 'number'
-      THEN (r.trace_summary #>> '{input_shaping,max_shaped_input_bytes}')::bigint
-    WHEN jsonb_typeof(r.trace_summary -> 'max_shaped_input_bytes') = 'number'
-      THEN (r.trace_summary ->> 'max_shaped_input_bytes')::bigint
+    WHEN jsonb_typeof(trace.summary #> '{input_shaping,max_shaped_input_bytes}') = 'number'
+      THEN (trace.summary #>> '{input_shaping,max_shaped_input_bytes}')::bigint
+    WHEN jsonb_typeof(trace.summary -> 'max_shaped_input_bytes') = 'number'
+      THEN (trace.summary ->> 'max_shaped_input_bytes')::bigint
     ELSE NULL
   END AS max_shaped_input_bytes,
   COALESCE(
-    r.trace_summary #>> '{input_shaping,input_truncated}',
-    r.trace_summary ->> 'input_truncated',
+    trace.summary #>> '{input_shaping,input_truncated}',
+    trace.summary ->> 'input_truncated',
     'false'
   )::boolean AS input_truncated,
   COALESCE(
-    r.trace_summary #>> '{input_shaping,applied}',
-    r.trace_summary ->> 'input_shaping_applied',
+    trace.summary #>> '{input_shaping,applied}',
+    trace.summary ->> 'input_shaping_applied',
     'false'
   )::boolean AS input_shaping_applied,
   materialization.freshness_basis,
-  COALESCE(r.trace_summary #>> '{policies,worker_handoff}', r.trace_summary ->> 'worker_handoff') AS worker_handoff,
-  COALESCE(r.trace_summary #>> '{policies,stale_policy}', r.trace_summary ->> 'stale_policy') AS stale_policy,
-  r.trace_summary ->> 'stop_reason' AS stop_reason,
-  r.trace_summary ->> 'schema_force' AS schema_force,
-  r.trace_summary ->> 'decode_constraint' AS decode_constraint,
-  r.trace_summary ->> 'decode_constraint_reason' AS decode_constraint_reason,
-  r.trace_summary ->> 'output_schema_hash' AS trace_output_schema_hash,
+  COALESCE(trace.summary #>> '{policies,worker_handoff}', trace.summary ->> 'worker_handoff') AS worker_handoff,
+  COALESCE(trace.summary #>> '{policies,stale_policy}', trace.summary ->> 'stale_policy') AS stale_policy,
+  trace.summary ->> 'stop_reason' AS stop_reason,
+  trace.summary ->> 'schema_force' AS schema_force,
+  trace.summary ->> 'decode_constraint' AS decode_constraint,
+  trace.summary ->> 'decode_constraint_reason' AS decode_constraint_reason,
+  trace.summary ->> 'output_schema_hash' AS trace_output_schema_hash,
   r.output_schema_hash AS receipt_output_schema_hash,
-  r.trace_summary ->> 'raw_output_hash' AS trace_raw_output_hash,
+  trace.summary ->> 'raw_output_hash' AS trace_raw_output_hash,
   r.raw_output_hash AS receipt_raw_output_hash,
   CASE
-    WHEN jsonb_typeof(r.trace_summary -> 'model_memory_bytes') = 'number'
-      THEN (r.trace_summary ->> 'model_memory_bytes')::bigint
+    WHEN jsonb_typeof(trace.summary -> 'model_memory_bytes') = 'number'
+      THEN (trace.summary ->> 'model_memory_bytes')::bigint
     ELSE NULL
   END AS model_memory_bytes,
   CASE
-    WHEN jsonb_typeof(r.trace_summary -> 'worker_process_rss_bytes') = 'number'
-      THEN (r.trace_summary ->> 'worker_process_rss_bytes')::bigint
+    WHEN jsonb_typeof(trace.summary -> 'worker_process_rss_bytes') = 'number'
+      THEN (trace.summary ->> 'worker_process_rss_bytes')::bigint
     ELSE NULL
   END AS worker_process_rss_bytes,
   CASE
-    WHEN jsonb_typeof(r.trace_summary -> 'worker_process_virtual_bytes') = 'number'
-      THEN (r.trace_summary ->> 'worker_process_virtual_bytes')::bigint
+    WHEN jsonb_typeof(trace.summary -> 'worker_process_virtual_bytes') = 'number'
+      THEN (trace.summary ->> 'worker_process_virtual_bytes')::bigint
     ELSE NULL
   END AS worker_process_virtual_bytes,
-  COALESCE(r.trace_summary #>> '{memory,worker_memory_sample_policy}', r.trace_summary ->> 'worker_memory_sample_policy') AS worker_memory_sample_policy,
+  COALESCE(trace.summary #>> '{memory,worker_memory_sample_policy}', trace.summary ->> 'worker_memory_sample_policy') AS worker_memory_sample_policy,
   CASE
-    WHEN jsonb_typeof(r.trace_summary #> '{memory,worker_memory_budget_bytes}') = 'number'
-      THEN (r.trace_summary #>> '{memory,worker_memory_budget_bytes}')::bigint
-    WHEN jsonb_typeof(r.trace_summary -> 'worker_memory_budget_bytes') = 'number'
-      THEN (r.trace_summary ->> 'worker_memory_budget_bytes')::bigint
+    WHEN jsonb_typeof(trace.summary #> '{memory,worker_memory_budget_bytes}') = 'number'
+      THEN (trace.summary #>> '{memory,worker_memory_budget_bytes}')::bigint
+    WHEN jsonb_typeof(trace.summary -> 'worker_memory_budget_bytes') = 'number'
+      THEN (trace.summary ->> 'worker_memory_budget_bytes')::bigint
     ELSE NULL
   END AS worker_memory_budget_bytes,
-  COALESCE(r.trace_summary #>> '{memory,worker_memory_budget_policy}', r.trace_summary ->> 'worker_memory_budget_policy') AS worker_memory_budget_policy,
-  COALESCE(r.trace_summary ->> 'model_cache_hit', 'false')::boolean AS model_cache_hit,
-  COALESCE(r.trace_summary ->> 'inference_cache_hit', 'false')::boolean AS inference_cache_hit,
-  COALESCE(r.trace_summary #>> '{cache,key_basis}', r.trace_summary ->> 'inference_cache_key_basis') AS inference_cache_key_basis,
+  COALESCE(trace.summary #>> '{memory,worker_memory_budget_policy}', trace.summary ->> 'worker_memory_budget_policy') AS worker_memory_budget_policy,
+  COALESCE(trace.summary ->> 'model_cache_hit', 'false')::boolean AS model_cache_hit,
+  COALESCE(trace.summary ->> 'inference_cache_hit', 'false')::boolean AS inference_cache_hit,
+  COALESCE(trace.summary #>> '{cache,key_basis}', trace.summary ->> 'inference_cache_key_basis') AS inference_cache_key_basis,
   CASE
-    WHEN jsonb_typeof(r.trace_summary #> '{cache,entries}') = 'number'
-      THEN (r.trace_summary #>> '{cache,entries}')::bigint
-    WHEN jsonb_typeof(r.trace_summary -> 'inference_cache_entries') = 'number'
-      THEN (r.trace_summary ->> 'inference_cache_entries')::bigint
+    WHEN jsonb_typeof(trace.summary #> '{cache,entries}') = 'number'
+      THEN (trace.summary #>> '{cache,entries}')::bigint
+    WHEN jsonb_typeof(trace.summary -> 'inference_cache_entries') = 'number'
+      THEN (trace.summary ->> 'inference_cache_entries')::bigint
     ELSE NULL
   END AS inference_cache_entries,
   CASE
-    WHEN jsonb_typeof(r.trace_summary #> '{cache,bytes}') = 'number'
-      THEN (r.trace_summary #>> '{cache,bytes}')::bigint
-    WHEN jsonb_typeof(r.trace_summary -> 'inference_cache_bytes') = 'number'
-      THEN (r.trace_summary ->> 'inference_cache_bytes')::bigint
+    WHEN jsonb_typeof(trace.summary #> '{cache,bytes}') = 'number'
+      THEN (trace.summary #>> '{cache,bytes}')::bigint
+    WHEN jsonb_typeof(trace.summary -> 'inference_cache_bytes') = 'number'
+      THEN (trace.summary ->> 'inference_cache_bytes')::bigint
     ELSE NULL
   END AS inference_cache_bytes,
   CASE
-    WHEN jsonb_typeof(r.trace_summary #> '{cache,max_entries}') = 'number'
-      THEN (r.trace_summary #>> '{cache,max_entries}')::bigint
-    WHEN jsonb_typeof(r.trace_summary -> 'inference_cache_max_entries') = 'number'
-      THEN (r.trace_summary ->> 'inference_cache_max_entries')::bigint
+    WHEN jsonb_typeof(trace.summary #> '{cache,max_entries}') = 'number'
+      THEN (trace.summary #>> '{cache,max_entries}')::bigint
+    WHEN jsonb_typeof(trace.summary -> 'inference_cache_max_entries') = 'number'
+      THEN (trace.summary ->> 'inference_cache_max_entries')::bigint
     ELSE NULL
   END AS inference_cache_max_entries,
   CASE
-    WHEN jsonb_typeof(r.trace_summary #> '{cache,max_bytes}') = 'number'
-      THEN (r.trace_summary #>> '{cache,max_bytes}')::bigint
-    WHEN jsonb_typeof(r.trace_summary -> 'inference_cache_max_bytes') = 'number'
-      THEN (r.trace_summary ->> 'inference_cache_max_bytes')::bigint
+    WHEN jsonb_typeof(trace.summary #> '{cache,max_bytes}') = 'number'
+      THEN (trace.summary #>> '{cache,max_bytes}')::bigint
+    WHEN jsonb_typeof(trace.summary -> 'inference_cache_max_bytes') = 'number'
+      THEN (trace.summary ->> 'inference_cache_max_bytes')::bigint
     ELSE NULL
   END AS inference_cache_max_bytes,
   CASE
-    WHEN jsonb_typeof(r.trace_summary #> '{cache,evictions}') = 'number'
-      THEN (r.trace_summary #>> '{cache,evictions}')::bigint
-    WHEN jsonb_typeof(r.trace_summary -> 'inference_cache_evictions') = 'number'
-      THEN (r.trace_summary ->> 'inference_cache_evictions')::bigint
+    WHEN jsonb_typeof(trace.summary #> '{cache,evictions}') = 'number'
+      THEN (trace.summary #>> '{cache,evictions}')::bigint
+    WHEN jsonb_typeof(trace.summary -> 'inference_cache_evictions') = 'number'
+      THEN (trace.summary ->> 'inference_cache_evictions')::bigint
     ELSE NULL
   END AS inference_cache_evictions,
-  COALESCE(r.trace_summary #>> '{cache,eviction_reason}', r.trace_summary ->> 'inference_cache_eviction_reason') AS inference_cache_eviction_reason,
-  COALESCE(r.trace_summary #>> '{cache,invalidation_reason}', r.trace_summary ->> 'inference_cache_invalidation_reason') AS inference_cache_reason,
+  COALESCE(trace.summary #>> '{cache,eviction_reason}', trace.summary ->> 'inference_cache_eviction_reason') AS inference_cache_eviction_reason,
+  COALESCE(trace.summary #>> '{cache,invalidation_reason}', trace.summary ->> 'inference_cache_invalidation_reason') AS inference_cache_reason,
   r.finished_at AS receipt_finished_at
 FROM otlet.inference_receipts r
+CROSS JOIN LATERAL (
+  -- Expand the toasted object once and keep the projection from being pulled up
+  SELECT r.trace_summary || '{}'::jsonb AS summary
+  OFFSET 0
+) trace
 LEFT JOIN otlet.outputs o ON o.receipt_id = r.id
-LEFT JOIN LATERAL (
-  SELECT sm.freshness_basis
-  FROM otlet.semantic_materializations sm
-  JOIN otlet.records rec ON rec.id = sm.record_id
-  JOIN otlet.actions a ON a.id = rec.action_id
-  WHERE a.receipt_id = r.id
-  ORDER BY sm.updated_at DESC, sm.id DESC
-  LIMIT 1
-) materialization ON true;
+LEFT JOIN latest_materialization materialization ON materialization.receipt_id = r.id;
 
 CREATE VIEW otlet.task_inference_cache_status AS
 WITH receipt_cache AS MATERIALIZED (
@@ -696,27 +686,32 @@ WITH receipt_cache AS MATERIALIZED (
     task_name,
     id AS receipt_id,
     selection_status,
-    COALESCE(trace_summary ->> 'inference_cache_hit', 'false')::boolean AS inference_cache_hit,
+    COALESCE(trace.summary ->> 'inference_cache_hit', 'false')::boolean AS inference_cache_hit,
     COALESCE(
-      trace_summary #>> '{cache,key_basis}',
-      trace_summary ->> 'inference_cache_key_basis'
+      trace.summary #>> '{cache,key_basis}',
+      trace.summary ->> 'inference_cache_key_basis'
     ) AS inference_cache_key_basis,
     COALESCE(
-      trace_summary #>> '{cache,invalidation_reason}',
-      trace_summary ->> 'inference_cache_invalidation_reason'
+      trace.summary #>> '{cache,invalidation_reason}',
+      trace.summary ->> 'inference_cache_invalidation_reason'
     ) AS inference_cache_reason,
     finished_at AS receipt_finished_at,
     (
       COALESCE(
-        trace_summary #>> '{cache,invalidation_reason}',
-        trace_summary ->> 'inference_cache_invalidation_reason'
+        trace.summary #>> '{cache,invalidation_reason}',
+        trace.summary ->> 'inference_cache_invalidation_reason'
       ) IS NOT NULL
       AND COALESCE(
-        trace_summary #>> '{cache,invalidation_reason}',
-        trace_summary ->> 'inference_cache_invalidation_reason'
+        trace.summary #>> '{cache,invalidation_reason}',
+        trace.summary ->> 'inference_cache_invalidation_reason'
       ) NOT IN ('disabled', 'disabled_for_generation_trace')
     ) AS cache_enabled
-  FROM otlet.inference_receipts
+  FROM otlet.inference_receipts r
+  CROSS JOIN LATERAL (
+    -- Expand the toasted object once and keep the projection from being pulled up
+    SELECT r.trace_summary || '{}'::jsonb AS summary
+    OFFSET 0
+  ) trace
 ),
 task_cache AS (
   SELECT

@@ -304,6 +304,7 @@ CREATE FUNCTION otlet.semantic_plan_from_counts(
   checked_at timestamptz
 )
 LANGUAGE plpgsql
+ROWS 1
 AS $$
 DECLARE
   v_total_subjects bigint := COALESCE(p_total_subjects, 0);
@@ -538,6 +539,7 @@ CREATE FUNCTION otlet.semantic_join_index_plan(
   checked_at timestamptz
 )
 LANGUAGE plpgsql
+ROWS 1
 AS $$
 DECLARE
   index_row otlet.semantic_join_indexes%ROWTYPE;

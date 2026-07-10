@@ -21,7 +21,7 @@ keep_models="${OTLET_PROBE_KEEP_MODELS:-0}"
 scratch_root="${OTLET_PROBE_MODEL_DIR:-/var/lib/postgresql/otlet-probe-models}"
 run_id="probe-$(date -u +%Y%m%dT%H%M%SZ)-$$"
 scratch_dir="$scratch_root/$run_id"
-downloaded_paths="$scratch_dir/downloaded.tsv"
+downloaded_paths="$(mktemp "${TMPDIR:-/tmp}/otlet-probe-downloads.XXXXXX")"
 
 source "$script_dir/lib.sh"
 source "$script_dir/model_artifacts.sh"
@@ -35,6 +35,7 @@ selected_models() {
 }
 
 cleanup_downloads() {
+  rm -f "$downloaded_paths"
   if [[ "$keep_models" == "1" ]]; then
     return
   fi

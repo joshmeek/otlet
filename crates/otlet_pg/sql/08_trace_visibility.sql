@@ -62,33 +62,33 @@ per_receipt AS (
     r.job_id,
     r.status,
     r.error,
-    r.trace_summary -> 'detailed_trace' ->> 'status' AS detailed_trace_status,
-    r.trace_summary -> 'detailed_trace' ->> 'trace_contract' AS detailed_trace_contract,
+    trace.summary -> 'detailed_trace' ->> 'status' AS detailed_trace_status,
+    trace.summary -> 'detailed_trace' ->> 'trace_contract' AS detailed_trace_contract,
     CASE
-      WHEN jsonb_typeof(r.trace_summary #> '{detailed_trace,captured_tokens}') = 'number'
-        THEN (r.trace_summary #>> '{detailed_trace,captured_tokens}')::bigint
+      WHEN jsonb_typeof(trace.summary #> '{detailed_trace,captured_tokens}') = 'number'
+        THEN (trace.summary #>> '{detailed_trace,captured_tokens}')::bigint
       ELSE NULL
     END AS detailed_trace_captured_tokens,
     CASE
-      WHEN jsonb_typeof(r.trace_summary #> '{detailed_trace,top_k}') = 'number'
-        THEN (r.trace_summary #>> '{detailed_trace,top_k}')::bigint
+      WHEN jsonb_typeof(trace.summary #> '{detailed_trace,top_k}') = 'number'
+        THEN (trace.summary #>> '{detailed_trace,top_k}')::bigint
       ELSE NULL
     END AS detailed_trace_top_k,
-    r.trace_summary ->> 'row_identity' AS row_identity,
-    r.trace_summary -> 'mvcc' AS mvcc,
-    COALESCE(r.trace_summary #>> '{policies,worker_handoff}', r.trace_summary ->> 'worker_handoff') AS worker_handoff,
-    COALESCE(r.trace_summary #>> '{policies,stale_policy}', r.trace_summary ->> 'stale_policy') AS stale_policy,
-    r.trace_summary ->> 'stop_reason' AS stop_reason,
-    r.trace_summary ->> 'executor_origin' AS executor_origin,
-    r.trace_summary ->> 'executor_node' AS executor_node,
-    COALESCE(r.trace_summary ->> 'inference_cache_hit', 'false')::boolean AS inference_cache_hit,
-    COALESCE(r.trace_summary #>> '{cache,key_basis}', r.trace_summary ->> 'inference_cache_key_basis') AS inference_cache_key_basis,
-    COALESCE(r.trace_summary #>> '{cache,eviction_reason}', r.trace_summary ->> 'inference_cache_eviction_reason') AS inference_cache_eviction_reason,
-    COALESCE(r.trace_summary #>> '{cache,invalidation_reason}', r.trace_summary ->> 'inference_cache_invalidation_reason') AS inference_cache_reason,
+    trace.summary ->> 'row_identity' AS row_identity,
+    trace.summary -> 'mvcc' AS mvcc,
+    COALESCE(trace.summary #>> '{policies,worker_handoff}', trace.summary ->> 'worker_handoff') AS worker_handoff,
+    COALESCE(trace.summary #>> '{policies,stale_policy}', trace.summary ->> 'stale_policy') AS stale_policy,
+    trace.summary ->> 'stop_reason' AS stop_reason,
+    trace.summary ->> 'executor_origin' AS executor_origin,
+    trace.summary ->> 'executor_node' AS executor_node,
+    COALESCE(trace.summary ->> 'inference_cache_hit', 'false')::boolean AS inference_cache_hit,
+    COALESCE(trace.summary #>> '{cache,key_basis}', trace.summary ->> 'inference_cache_key_basis') AS inference_cache_key_basis,
+    COALESCE(trace.summary #>> '{cache,eviction_reason}', trace.summary ->> 'inference_cache_eviction_reason') AS inference_cache_eviction_reason,
+    COALESCE(trace.summary #>> '{cache,invalidation_reason}', trace.summary ->> 'inference_cache_invalidation_reason') AS inference_cache_reason,
     pg_column_size(r.trace_summary)::bigint AS trace_summary_bytes,
     CASE
-      WHEN jsonb_typeof(r.trace_summary #> '{detailed_trace,chosen_token_ids}') = 'array'
-        THEN jsonb_array_length(r.trace_summary #> '{detailed_trace,chosen_token_ids}')::bigint
+      WHEN jsonb_typeof(trace.summary #> '{detailed_trace,chosen_token_ids}') = 'array'
+        THEN jsonb_array_length(trace.summary #> '{detailed_trace,chosen_token_ids}')::bigint
       ELSE 0::bigint
     END AS chosen_token_ids,
     COALESCE(tok.token_steps, 0)::bigint AS token_steps,
@@ -99,6 +99,11 @@ per_receipt AS (
     (action_jobs.job_id IS NOT NULL) AS has_action,
     (materialized_subjects.task_name IS NOT NULL) AS has_materialization_source_hash
   FROM otlet.inference_receipts r
+  CROSS JOIN LATERAL (
+    -- Expand the toasted object once and keep the projection from being pulled up
+    SELECT r.trace_summary || '{}'::jsonb AS summary
+    OFFSET 0
+  ) trace
   LEFT JOIN token_counts tok ON tok.receipt_id = r.id
   LEFT JOIN alternative_counts alt ON alt.receipt_id = r.id
   LEFT JOIN output_jobs ON output_jobs.job_id = r.job_id

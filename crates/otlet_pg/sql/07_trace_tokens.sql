@@ -40,18 +40,18 @@ SELECT
   r.input_hash,
   r.output_schema_hash,
   r.raw_output_hash,
-  r.trace_summary ->> 'model_fingerprint_hash' AS model_fingerprint_hash,
-  r.trace_summary ->> 'runtime_options_hash' AS runtime_options_hash,
-  r.trace_summary ->> 'row_identity' AS row_identity,
-  r.trace_summary -> 'mvcc' AS mvcc,
-  r.trace_summary ->> 'worker_handoff' AS worker_handoff,
-  r.trace_summary ->> 'stale_policy' AS stale_policy,
-  r.trace_summary ->> 'stop_reason' AS stop_reason,
-  r.trace_summary -> 'detailed_trace' ->> 'trace_contract' AS trace_contract,
-  r.trace_summary -> 'detailed_trace' ->> 'storage_policy' AS storage_policy,
-  r.trace_summary -> 'detailed_trace' ->> 'logprob_policy' AS logprob_policy,
-  COALESCE((r.trace_summary #>> '{detailed_trace,max_tokens}')::int, 0) AS max_tokens,
-  COALESCE((r.trace_summary #>> '{detailed_trace,top_k}')::int, 0) AS top_k,
+  trace.summary ->> 'model_fingerprint_hash' AS model_fingerprint_hash,
+  trace.summary ->> 'runtime_options_hash' AS runtime_options_hash,
+  trace.summary ->> 'row_identity' AS row_identity,
+  trace.summary -> 'mvcc' AS mvcc,
+  trace.summary ->> 'worker_handoff' AS worker_handoff,
+  trace.summary ->> 'stale_policy' AS stale_policy,
+  trace.summary ->> 'stop_reason' AS stop_reason,
+  trace.summary -> 'detailed_trace' ->> 'trace_contract' AS trace_contract,
+  trace.summary -> 'detailed_trace' ->> 'storage_policy' AS storage_policy,
+  trace.summary -> 'detailed_trace' ->> 'logprob_policy' AS logprob_policy,
+  COALESCE((trace.summary #>> '{detailed_trace,max_tokens}')::int, 0) AS max_tokens,
+  COALESCE((trace.summary #>> '{detailed_trace,top_k}')::int, 0) AS top_k,
   step.ordinality::int AS step,
   (step.value ->> 'token_id')::bigint AS token_id,
   step.value ->> 'token_text' AS token_text,
@@ -79,10 +79,15 @@ SELECT
   step.value ->> 'probability_status' AS probability_status,
   COALESCE(step.value -> 'top_alternatives', '[]'::jsonb) AS top_alternatives
 FROM otlet.inference_receipts r
+CROSS JOIN LATERAL (
+  -- Expand the toasted object once and keep the projection from being pulled up
+  SELECT r.trace_summary || '{}'::jsonb AS summary
+  OFFSET 0
+) trace
 CROSS JOIN LATERAL jsonb_array_elements(
   CASE
-    WHEN jsonb_typeof(r.trace_summary #> '{detailed_trace,steps}') = 'array'
-      THEN r.trace_summary #> '{detailed_trace,steps}'
+    WHEN jsonb_typeof(trace.summary #> '{detailed_trace,steps}') = 'array'
+      THEN trace.summary #> '{detailed_trace,steps}'
     ELSE '[]'::jsonb
   END
 ) WITH ORDINALITY AS step(value, ordinality);

@@ -22,6 +22,16 @@ for term in \
   require_contains "$runtime_contract" "$term" "Expected runtime status to contain $term"
 done
 
+task_cache_view_contract="$(psql_exec -qAt <<'SQL'
+SELECT (to_regclass('otlet.task_inference_cache_status') IS NOT NULL)::text;
+SQL
+)"
+echo "task_cache_view_contract=$task_cache_view_contract"
+[ "$task_cache_view_contract" = "true" ] || {
+  echo "Expected otlet.task_inference_cache_status to exist" >&2
+  exit 1
+}
+
 log "Checking estimated planner on 1M-row source"
 planner_1m_output="$(
   psql_exec -qAt -v model_name="$strong_model_name" <<'SQL'
