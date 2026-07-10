@@ -33,6 +33,9 @@ SELECT runtime_status || '|' ||
        slot_state || '|' ||
        COALESCE(tokens_per_second::text, '') || '|' ||
        (COALESCE(inference_cache_entries, 0) <= COALESCE(inference_cache_max_entries, 0))::text || '|' ||
+       (COALESCE(inference_cache_max_entries, 0) > 0)::text || '|' ||
+       (COALESCE(inference_cache_max_bytes, 0) > 0)::text || '|' ||
+       COALESCE(inference_cache_last_eviction_reason, '') || '|' ||
        COALESCE(worker_memory_sample_policy, '') AS runtime_contract
 FROM otlet.runtime_status
 WHERE model_name = 'qwen3_1_7b'
@@ -42,16 +45,16 @@ LIMIT 1;
 Representative output from the demo run:
 
 ```text
-runtime_status_contract=ready|ready|35.71|true|linux_proc_self_status_vmrss_vmsize_sampled_after_worker_run
+runtime_status_contract=ready|ready|35.71|true|true|true|none|linux_proc_self_status_vmrss_vmsize_sampled_after_worker_run
 ```
 
-The value reports a ready runtime, a ready model slot, bounded cache entries, and Linux process-status memory sampling after a worker run
+The value reports a ready runtime, a ready model slot, bounded cache entries and byte caps, no recent eviction, and Linux process-status memory sampling after a worker run
 
 ## Step 3 - Inspect Production Policy
 
 The production policy row and status views are ordinary SQL state under `otlet`: `production_policy_status`, `production_status`, `model_queue_status`, `worker_throughput_status`, and `cleanup_policy_state(true)`
 
-Queue caps are admission-time controls. Rows enter `otlet.jobs` through `run_task`, watch refresh, semantic refresh, or `ask`; direct inserts are internal/testing-only and can bypass admission accounting. `verify_invariants()` reports `queued_jobs_within_model_cap` if queued depth for any model exceeds `max_queued_jobs_per_model`
+Queue caps are admission-time controls. Rows enter `otlet.jobs` through `run_task`, watch refresh, semantic refresh, or `ask`; direct inserts are internal/testing-only and can bypass admission accounting. `verify_invariants()` reports every broken invariant as a row; the demo requires `SELECT count(*) FROM otlet.verify_invariants()` to return `0` (`invariant_contract=0`). One of those checks is `queued_jobs_within_model_cap` when queued depth for any model exceeds `max_queued_jobs_per_model`
 
 Otlet debounces suppressed queue-admission events per task and reason for one minute, so a full queue stays visible without flooding `worker_events`. `production_status` also exposes `semantic_materialization_failed_events` and `semantic_materialization_last_failed_at`. Nonzero `max_worker_rss_bytes` budgets require Linux process-status RSS sampling; unsupported builds reject the option during runtime-option validation instead of letting jobs fail later. Cleanup can prune old failed/canceled jobs only when outputs, actions, eval labels, and receipt references no longer keep them alive
 
@@ -85,6 +88,51 @@ model_queue_status_contract=queue_accepting|0|0
 throughput_status_contract=queue_accepting|0|0|4|4|0
 cleanup_policy_dry_run=0|0|0|0|0|0|0|true
 ```
+
+### Step 3b - Performance Ratios
+
+`production_status` also exposes trusted-output and model-work ratios. The demo prints them as one contract line:
+
+```sql
+SELECT trusted_output_rows::text || '|' ||
+       model_invocations::text || '|' ||
+       round(model_invocations_per_trusted_row, 3)::text || '|' ||
+       model_processed_tokens::text || '|' ||
+       round(model_processed_tokens_per_trusted_row, 3)::text
+FROM otlet.production_status;
+```
+
+Representative demo output:
+
+```text
+performance_ratio_contract=34|43|1.265|15948|469.059
+```
+
+### Step 3c - Materialization Failure Visibility
+
+```sql
+BEGIN;
+INSERT INTO otlet.worker_events (event_type, message, detail)
+VALUES (
+  'semantic_materialization_failed',
+  'smoke',
+  '{"task_name":"demo","model_name":"qwen35_4b","error":"smoke"}'::jsonb
+);
+SELECT (semantic_materialization_failed_events >= 1)::text || '|' ||
+       (semantic_materialization_last_failed_at IS NOT NULL)::text
+FROM otlet.production_status;
+ROLLBACK;
+```
+
+Contract: `true|true` (demo prints `materialization_failure_status_contract=true|true`)
+
+### Step 3d - Zero Invariant Violations
+
+```sql
+SELECT count(*) FROM otlet.verify_invariants();
+```
+
+Contract: `0` (demo prints `invariant_contract=0`). Beyond queue caps, the suite also fails closed on expired or NULL leases for `running`/`cancel_requested` jobs (`no_expired_running_jobs`), complete receipts without schema pass (`complete_receipts_are_schema_validated`), materializations missing `source_hash`, and error runtime slots
 
 ## Step 4 - Know The Remaining Production Boundaries
 

@@ -182,9 +182,13 @@ unsafe extern "C-unwind" fn plan_semantic_custom_path(
 }
 
 fn planner_stats_unknown() -> SemanticPlannerStats {
+    planner_stats_with_reason("planner probe not run")
+}
+
+fn planner_stats_with_reason(reason: &'static str) -> SemanticPlannerStats {
     SemanticPlannerStats {
         selected_path: "semantic_lookup".to_owned(),
-        reason: "planner probe not run".to_owned(),
+        reason: reason.to_owned(),
         source_rows: 0,
         fresh_matches: 0,
         fresh_non_matches: 0,
@@ -249,7 +253,8 @@ fn finish_planner_stats(
             waited_rows,
             queued_rows,
             fail_closed_rows,
-        );
+        )
+        .to_owned();
         if unresolved > 0 {
             stats.reason = format!(
                 "auto semantic policy: fresh={} wait={} infer={} queue={} fail_closed={}",
@@ -271,7 +276,7 @@ fn finish_planner_stats(
         stats.path_cost = base_scan
             + lookup_cost
             + planner_bounded_infer_cost(stats, bounded_infer_rows, model_cost);
-        "bounded_infer_now".clone_into(&mut stats.selected_path);
+        stats.selected_path = "bounded_infer_now".to_owned();
         stats.reason = format!(
             "bounded infer-now over {bounded_infer_rows} unresolved rows; fresh={} stale={} missing={} in_flight={}",
             stats.fresh_matches, stats.stale_rows, stats.missing_rows, stats.inflight_rows
@@ -280,14 +285,14 @@ fn finish_planner_stats(
         stats.fail_closed_decision_rows = unresolved.saturating_sub(stats.inflight_rows);
         stats.path_cost =
             base_scan + lookup_cost + (stats.inflight_rows as f64 * f64::from(wait_ms) / 100.0);
-        "wait_for_refresh".clone_into(&mut stats.selected_path);
+        stats.selected_path = "wait_for_refresh".to_owned();
         stats.reason = format!(
             "bounded wait for {} in-flight rows; fresh={} stale={} missing={}",
             stats.inflight_rows, stats.fresh_matches, stats.stale_rows, stats.missing_rows
         );
     } else if allow_refresh && unresolved > 0 {
         stats.path_cost = base_scan + lookup_cost + unresolved as f64 * 0.50;
-        "queue_refresh".clone_into(&mut stats.selected_path);
+        stats.selected_path = "queue_refresh".to_owned();
         stats.reason = format!(
             "queue refresh and fail closed for {unresolved} unresolved rows; fresh={}",
             stats.fresh_matches
@@ -295,14 +300,14 @@ fn finish_planner_stats(
     } else if unresolved > 0 {
         stats.fail_closed_decision_rows = unresolved;
         stats.path_cost = base_scan + lookup_cost;
-        "lookup_fail_closed".clone_into(&mut stats.selected_path);
+        stats.selected_path = "lookup_fail_closed".to_owned();
         stats.reason = format!(
             "fail closed for {unresolved} unresolved rows; fresh={}",
             stats.fresh_matches
         );
     } else {
         stats.path_cost = base_scan + lookup_cost;
-        "semantic_lookup".clone_into(&mut stats.selected_path);
+        stats.selected_path = "semantic_lookup".to_owned();
         stats.reason = format!(
             "all source rows resolved from fresh semantic state; fresh={}",
             stats.fresh_matches
@@ -315,7 +320,7 @@ fn selected_path_from_decisions(
     wait_rows: u64,
     queue_rows: u64,
     fail_closed_rows: u64,
-) -> String {
+) -> &'static str {
     if infer_rows > 0 {
         "bounded_infer_now"
     } else if wait_rows > 0 {
@@ -326,7 +331,7 @@ fn selected_path_from_decisions(
         "lookup_fail_closed"
     } else {
         "semantic_lookup"
-    }.to_owned()
+    }
 }
 
 fn planner_model_cost_unit(model_ms: f64, infer_ms: u32) -> f64 {

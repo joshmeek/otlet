@@ -75,7 +75,7 @@ Next benchmark work:
 
 ## Planner, Executor, And Cache
 
-Use one decision vocabulary for semantic lookup, queue refresh, wait, fail-closed, fresh inference, bounded infer-now, and cache reuse. Keep SQL plan functions, semantic status views, CustomScan EXPLAIN, receipts, current-row SQL, and demo output aligned on that vocabulary
+Use one decision vocabulary for semantic lookup, queue refresh, wait, fail-closed, fresh inference, bounded infer-now, and cache reuse. Keep SQL plan functions, semantic status views, CustomScan EXPLAIN, receipts, current-row SQL, and demo output aligned on that vocabulary. The EXPLAIN field table in `docs/semantic-watches.md` (Step 6) is the shared anchor for `selected_path` / `Planner Selected Path`, `freshness_basis`, and related labels
 
 `EXPLAIN (ANALYZE, VERBOSE)` shows selected model, resident state, source identity, source hash, stale policy, cache decision, worker handoff, token counts, schema validation, trace policy, receipt IDs, provenance links, estimated model time, and model runtime
 
@@ -85,13 +85,15 @@ Use measured runtime history for costing: load time, warm generation time, token
 
 Add a timing split before the next executor rewrite: `tokenize_ms`, `prompt_decode_ms`, `generate_ms`, `finish_sql_ms`, and `materialize_ms`. Use those fields to decide whether prompt decode, SQL finish work, or materialization owns warm-job latency
 
-Keep cache-hit paths easy to preserve. A live smoke run completed cached jobs in milliseconds with no generation, so future watch and demo work keeps trace mode off for cacheable production paths and keeps stable content, contract, and model keys
+Keep cache-hit paths easy to preserve. A live smoke run completed cached jobs in milliseconds with no generation, so future watch and demo work keeps trace mode off for cacheable production paths and keeps stable content, contract, and model keys. Cache-hit receipt hashes still match the miss path; they stream the same prompt and input bytes without allocating the full prompt string
 
 Keep CPU tuning measurable. Current controls cover release builds, native CPU code, OpenMP, a six-thread default cap, per-job `llama_threads`, startup `OTLET_LLAMA_BATCH_TOKENS`, `OTLET_LLAMA_MMAP`, `OTLET_LLAMA_MLOCK`, and `OTLET_LLAMA_FLASH_ATTN`. Add BLAS, KV-cache quantization, context-window policy, grammar decoding, or device offload only after a probe shows better Otlet pass rate or latency on the SQL path
 
 Keep resident-worker parallelism gated. A qwen35_4b probe on the current Docker CPU measured four warm concurrent infer-now callers at `11.22s` with one worker and six threads, `13.02s` with two workers and six threads each, and `11.51s` with two workers and three threads each. Extra workers created overlapping llama.cpp generation, doubled resident model contexts, and failed to beat the one-worker default. Before changing the default, add per-worker RSS totals, model-specific admission caps, queue fairness proof, and database responsiveness checks
 
 Test multi-resident model contexts before changing slot policy. Alternating cheap and strong models pays model-load time on each swap; a keyed model cache can remove that cost when the memory budget allows both artifacts
+
+Production status uses `complete_receipts_are_schema_validated` for the schema invariant. That name is distinct from throughput counters such as `completed_jobs` / `last_batch_completed_jobs` on worker batch status
 
 ## Watch And Review Contracts
 

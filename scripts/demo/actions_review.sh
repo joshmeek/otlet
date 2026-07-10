@@ -71,7 +71,7 @@ SELECT otlet.complete_job(
 )
 FROM inserted;
 SQL
-action_allowlist_contract="$(psql_value "
+action_allowlist_contract="$(psql_exec -qAt -v task_name="$action_allowlist_task" <<'SQL'
 SELECT count(*) FILTER (
          WHERE action_type = 'note'
            AND status = 'rejected'
@@ -83,11 +83,12 @@ SELECT count(*) FILTER (
          FROM otlet.records r
          JOIN otlet.actions a ON a.id = r.action_id
          JOIN otlet.jobs j ON j.id = a.job_id
-         WHERE j.task_name = '$action_allowlist_task'
+         WHERE j.task_name = :'task_name'
        )
 FROM otlet.action_status
-WHERE task_name = '$action_allowlist_task';
-")"
+WHERE task_name = :'task_name';
+SQL
+)"
 echo "action_allowlist_contract=$action_allowlist_contract"
 [ "$action_allowlist_contract" = "1|1|0" ] || {
   echo "Expected watch action allowlist to reject note without creating a record, got $action_allowlist_contract" >&2

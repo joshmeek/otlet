@@ -1,5 +1,6 @@
 fn run_linked(
     job: &Job,
+    job_model: JobModelRef<'_>,
     prompt: &str,
     prompt_prefix: &str,
     options: &crate::runtime::RuntimeOptions,
@@ -8,10 +9,8 @@ fn run_linked(
     use std::ffi::CString;
 
     let attempt_start = Instant::now();
-    if job.artifact_path.starts_with("hf:") {
-        return Err(ModelError::new(
-            "linked llama.cpp runtime requires a local GGUF artifact path".to_owned(),
-        ));
+    if job_model.artifact_path.starts_with("hf:") {
+        return Err(ModelError::new_static("linked llama.cpp runtime requires a local GGUF artifact path"));
     }
     LINKED_BACKEND.get_or_init(|| unsafe {
         llama_cpp_sys_4::llama_backend_init();
@@ -20,15 +19,15 @@ fn run_linked(
     let cache = LINKED_CACHE.get_or_init(|| Mutex::new(None));
     let mut cache = cache
         .lock()
-        .map_err(|_| ModelError::new("linked llama.cpp cache lock poisoned".to_owned()))?;
+        .map_err(|_| ModelError::new_static("linked llama.cpp cache lock poisoned"))?;
     let cache_hit = cache.as_ref().is_some_and(|cached| {
-        cached.artifact_path == job.artifact_path
-            && cached.model_fingerprint_hash == model_fingerprint_hash
+        cached.artifact_path == job_model.artifact_path
+            && cached.model_fingerprint_hash.as_ref() == model_fingerprint_hash
     });
 
     if !cache_hit {
-        let model_path = CString::new(job.artifact_path.as_bytes())
-            .map_err(|_| ModelError::new("linked llama.cpp model path is invalid".to_owned()))?;
+        let model_path = CString::new(job_model.artifact_path.as_bytes())
+            .map_err(|_| ModelError::new_static("linked llama.cpp model path is invalid"))?;
         let mut model_params = unsafe { llama_cpp_sys_4::llama_model_default_params() };
         model_params.n_gpu_layers = 0;
         model_params.use_mmap = linked_env_bool("OTLET_LLAMA_MMAP", model_params.use_mmap);
@@ -44,9 +43,7 @@ fn run_linked(
         };
         let load_ms = elapsed_ms(load_start);
         if model_ptr.is_null() {
-            return Err(ModelError::new(
-                "linked llama.cpp model load failed".to_owned(),
-            ));
+            return Err(ModelError::new_static("linked llama.cpp model load failed"));
         }
         let model = LinkedModel { ptr: model_ptr };
 
@@ -65,9 +62,7 @@ fn run_linked(
         let context_ptr = unsafe { llama_cpp_sys_4::llama_init_from_model(model.ptr, ctx_params) };
         let ctx_ms = elapsed_ms(ctx_start);
         if context_ptr.is_null() {
-            return Err(ModelError::new(
-                "linked llama.cpp context start failed".to_owned(),
-            ));
+            return Err(ModelError::new_static("linked llama.cpp context start failed"));
         }
         let context = LinkedContext { ptr: context_ptr };
         let model_memory_bytes =
@@ -79,32 +74,31 @@ fn run_linked(
 
         let vocab = unsafe { llama_cpp_sys_4::llama_model_get_vocab(model.ptr) };
         if vocab.is_null() {
-            return Err(ModelError::new(
-                "linked llama.cpp model has no vocab".to_owned(),
-            ));
+            return Err(ModelError::new_static("linked llama.cpp model has no vocab"));
         }
 
         *cache = Some(LinkedCache {
-            artifact_path: job.artifact_path.clone(),
-            model_fingerprint_hash: model_fingerprint_hash.to_owned(),
+            artifact_path: job_model.artifact_path.to_owned(),
+            model_fingerprint_hash: Arc::<str>::from(model_fingerprint_hash),
             _model: model,
             context,
             vocab,
-            kv_tokens: Vec::new(),
-            prompt_prefix_states: Vec::new(),
+            kv_tokens: Vec::with_capacity(512),
+            prompt_prefix_states: Vec::with_capacity(LINKED_PROMPT_PREFIX_STATE_MAX_ENTRIES),
+            batch: None,
             load_ms,
             ctx_ms,
             model_memory_bytes,
             model_parameters,
             context_window_tokens,
-            model_device_policy: LINKED_MODEL_DEVICE_POLICY.to_owned(),
-            memory_accounting_policy: LINKED_MEMORY_ACCOUNTING_POLICY.to_owned(),
+            model_device_policy: LINKED_MODEL_DEVICE_POLICY,
+            memory_accounting_policy: LINKED_MEMORY_ACCOUNTING_POLICY,
         });
     }
 
     let cache = cache
         .as_mut()
-        .ok_or_else(|| ModelError::new("linked llama.cpp cache did not initialize".to_owned()))?;
+        .ok_or_else(|| ModelError::new_static("linked llama.cpp cache did not initialize"))?;
     let decode_threads = linked_decode_threads(options);
     let batch_threads = linked_batch_threads(options, decode_threads);
     unsafe {
@@ -115,9 +109,7 @@ fn run_linked(
     let prompt_prefix_tokens = tokenize_linked(cache.vocab, prompt_prefix)?;
     let tokenize_ms = elapsed_ms(tokenize_start);
     if tokens.is_empty() {
-        return Err(ModelError::new(
-            "linked llama.cpp prompt produced no tokens".to_owned(),
-        ));
+        return Err(ModelError::new_static("linked llama.cpp prompt produced no tokens"));
     }
 
     validate_linked_token_budget(tokens.len(), options.max_tokens, cache.context_window_tokens)?;
@@ -128,7 +120,7 @@ fn run_linked(
     }
 
     if linked_cancel_requested(job.id)? {
-        return Err(ModelError::new("canceled".to_owned()));
+        return Err(ModelError::new_static("canceled"));
     }
     let mut cancel_probe = CancelProbe::new();
 
@@ -137,10 +129,24 @@ fn run_linked(
     let prompt_decode_start = Instant::now();
     let prompt_cached_tokens_before = cache.kv_tokens.len();
     let prompt_batch_tokens = linked_prompt_batch_tokens();
-    let mut batch = LinkedBatch::new(prompt_batch_tokens)?;
+    let owned_batch = match cache.batch.take() {
+        Some(batch) if batch.capacity == prompt_batch_tokens => batch,
+        _ => LinkedBatch::new(prompt_batch_tokens)?,
+    };
+    // Raw dest pointer lets Drop restore the batch without holding a borrow on
+    // LinkedCache, so prompt-prefix helpers can still mutate cache fields.
+    let mut batch_slot = LinkedBatchSlot {
+        batch: Some(owned_batch),
+        dest: std::ptr::from_mut(&mut cache.batch),
+    };
+    let batch = batch_slot
+        .batch
+        .as_mut()
+        .ok_or_else(|| ModelError::new_static("linked llama.cpp batch did not initialize"))?;
+    batch.reset();
     let mut prompt_reused_tokens = 0;
     let mut prompt_decoded_tokens = tokens.len();
-    let mut prompt_reuse_strategy = "full_prompt_decode".to_owned();
+    let mut prompt_reuse_strategy: &'static str = "full_prompt_decode";
     let mut prompt_prefix_state_bytes = 0_i64;
     let prefix_reusable = linked_prompt_prefix_reusable(&tokens, &prompt_prefix_tokens);
     if prefix_reusable {
@@ -150,12 +156,12 @@ fn run_linked(
         {
             prompt_reused_tokens = prompt_prefix_tokens.len();
             prompt_decoded_tokens = tokens.len().saturating_sub(prompt_reused_tokens);
-            "prefix_state_restored".clone_into(&mut prompt_reuse_strategy);
+            prompt_reuse_strategy = "prefix_state_restored";
             prompt_prefix_state_bytes = usize_to_i64_saturating(state_bytes);
             linked_decode_prompt_tokens(
                 job,
                 cache.context.ptr,
-                &mut batch,
+                batch,
                 &tokens[prompt_reused_tokens..],
                 prompt_reused_tokens,
                 prompt_batch_tokens,
@@ -169,7 +175,7 @@ fn run_linked(
             linked_decode_prompt_tokens(
                 job,
                 cache.context.ptr,
-                &mut batch,
+                batch,
                 &prompt_prefix_tokens,
                 0,
                 prompt_batch_tokens,
@@ -177,17 +183,14 @@ fn run_linked(
                 &mut cancel_probe,
                 false,
             )?;
-            let saved_prefix = linked_save_prompt_prefix_state(
-                cache,
-                &prompt_prefix_hash,
-                &prompt_prefix_tokens,
-            );
+            let saved_prefix =
+                linked_save_prompt_prefix_state(cache, &prompt_prefix_hash, &prompt_prefix_tokens);
             prompt_reuse_strategy = saved_prefix.strategy;
             prompt_prefix_state_bytes = usize_to_i64_saturating(saved_prefix.state_bytes);
             linked_decode_prompt_tokens(
                 job,
                 cache.context.ptr,
-                &mut batch,
+                batch,
                 &tokens[prompt_prefix_tokens.len()..],
                 prompt_prefix_tokens.len(),
                 prompt_batch_tokens,
@@ -202,14 +205,14 @@ fn run_linked(
         prompt_reused_tokens = common_prefix;
         prompt_decoded_tokens = tokens.len().saturating_sub(common_prefix);
         if common_prefix > 0 {
-            "kv_prefix_reused".clone_into(&mut prompt_reuse_strategy);
+            prompt_reuse_strategy = "kv_prefix_reused";
         } else if !prompt_prefix_tokens.is_empty() {
-            "prefix_token_mismatch".clone_into(&mut prompt_reuse_strategy);
+            prompt_reuse_strategy = "prefix_token_mismatch";
         }
         linked_decode_prompt_tokens(
             job,
             cache.context.ptr,
-            &mut batch,
+            batch,
             &tokens[common_prefix..],
             common_prefix,
             prompt_batch_tokens,
@@ -222,9 +225,7 @@ fn run_linked(
 
     let sampler_ptr = unsafe { llama_cpp_sys_4::llama_sampler_init_greedy() };
     if sampler_ptr.is_null() {
-        return Err(ModelError::new(
-            "linked llama.cpp sampler start failed".to_owned(),
-        ));
+        return Err(ModelError::new_static("linked llama.cpp sampler start failed"));
     }
     let sampler = LinkedSampler { ptr: sampler_ptr };
     let mut output = String::with_capacity(linked_output_capacity(options.max_tokens));
@@ -233,7 +234,7 @@ fn run_linked(
     let mut generated_tokens = 0_i64;
     let mut probability_trace = ProbabilityTrace::new(options);
     let mut detailed_trace = DetailedGenerationTrace::new(options);
-    let mut stop_reason = "max_tokens".to_owned();
+    let mut stop_reason: &'static str = "max_tokens";
     let mut token_piece_buf = vec![0_u8; 128];
     let mut first_token_ms = 0_i64;
     let mut first_token_seen = false;
@@ -244,7 +245,7 @@ fn run_linked(
             return Err(ModelError::attempt_timeout());
         }
         if cancel_probe.due() && linked_cancel_requested(job.id)? {
-            return Err(ModelError::new("canceled".to_owned()));
+            return Err(ModelError::new_static("canceled"));
         }
         let token =
             unsafe { llama_cpp_sys_4::llama_sampler_sample(sampler.ptr, cache.context.ptr, -1) };
@@ -268,7 +269,7 @@ fn run_linked(
         };
         probability_trace.observe(sample.as_ref());
         if unsafe { llama_cpp_sys_4::llama_vocab_is_eog(cache.vocab, token) } {
-            "eog_token".clone_into(&mut stop_reason);
+            stop_reason = "eog_token";
             break;
         }
 
@@ -285,7 +286,7 @@ fn run_linked(
         detailed_trace.observe(token, &output[piece_start..], sample);
         if let Some(end) = json_completion.observe(&output[piece_start..]) {
             output.truncate(end);
-            "json_complete".clone_into(&mut stop_reason);
+            stop_reason = "json_complete";
             break;
         }
 
@@ -293,7 +294,7 @@ fn run_linked(
         batch.add(
             token,
             i32::try_from(position).map_err(|_| {
-                ModelError::new("linked llama.cpp generation position overflowed i32".to_owned())
+                ModelError::new_static("linked llama.cpp generation position overflowed i32")
             })?,
             true,
         )?;
@@ -330,11 +331,11 @@ fn run_linked(
             model_memory_bytes: cache.model_memory_bytes,
             model_parameters: cache.model_parameters,
             context_window_tokens: cache.context_window_tokens,
-            model_device_policy: cache.model_device_policy.clone(),
-            memory_accounting_policy: cache.memory_accounting_policy.clone(),
+            model_device_policy: cache.model_device_policy.to_owned(),
+            memory_accounting_policy: cache.memory_accounting_policy.to_owned(),
             worker_process_rss_bytes: worker_memory.rss_bytes,
             worker_process_virtual_bytes: worker_memory.virtual_bytes,
-            worker_memory_sample_policy: worker_memory.policy,
+            worker_memory_sample_policy: worker_memory.policy.to_owned(),
             worker_memory_budget_bytes: u64_to_i64_saturating(options.max_worker_rss_bytes),
             worker_memory_budget_policy: worker_memory_budget_policy(options.max_worker_rss_bytes)
                 .to_owned(),
@@ -342,7 +343,7 @@ fn run_linked(
             prompt_cached_tokens_before: usize_to_i64_saturating(prompt_cached_tokens_before),
             prompt_reused_tokens: usize_to_i64_saturating(prompt_reused_tokens),
             prompt_decoded_tokens: usize_to_i64_saturating(prompt_decoded_tokens),
-            prompt_reuse_strategy,
+            prompt_reuse_strategy: prompt_reuse_strategy.to_owned(),
             prompt_prefix_state_bytes,
             prompt_prefix_cache_entries: usize_to_i64_saturating(cache.prompt_prefix_states.len()),
             prompt_prefix_cache_bytes: usize_to_i64_saturating(linked_prompt_prefix_cache_bytes(cache)),
@@ -364,8 +365,8 @@ fn run_linked(
             inference_cache_eviction_reason: "none".to_owned(),
             inference_cache_invalidation_reason: "miss".to_owned(),
             probability_summary: probability_trace.summary(),
-            detailed_trace: detailed_trace.summary(&stop_reason),
-            stop_reason,
+            detailed_trace: detailed_trace.summary(stop_reason),
+            stop_reason: stop_reason.to_owned(),
         },
     })
 }
@@ -456,11 +457,15 @@ fn linked_apply_kv_cache_type(params: &mut llama_cpp_sys_4::llama_context_params
 }
 
 fn linked_ggml_type(value: &str) -> Option<llama_cpp_sys_4::ggml_type> {
-    match value.to_ascii_lowercase().as_str() {
-        "f16" => Some(llama_cpp_sys_4::GGML_TYPE_F16),
-        "q8" | "q8_0" => Some(llama_cpp_sys_4::GGML_TYPE_Q8_0),
-        "q4" | "q4_0" => Some(llama_cpp_sys_4::GGML_TYPE_Q4_0),
-        _ => None,
+    // Env values are tiny; compare case-insensitively without allocating.
+    if value.eq_ignore_ascii_case("f16") {
+        Some(llama_cpp_sys_4::GGML_TYPE_F16)
+    } else if value.eq_ignore_ascii_case("q8") || value.eq_ignore_ascii_case("q8_0") {
+        Some(llama_cpp_sys_4::GGML_TYPE_Q8_0)
+    } else if value.eq_ignore_ascii_case("q4") || value.eq_ignore_ascii_case("q4_0") {
+        Some(llama_cpp_sys_4::GGML_TYPE_Q4_0)
+    } else {
+        None
     }
 }
 
@@ -508,13 +513,13 @@ fn linked_decode_prompt_tokens(
             batch.add(
                 *token,
                 i32::try_from(position).map_err(|_| {
-                    ModelError::new("linked llama.cpp prompt position overflowed i32".to_owned())
+                    ModelError::new_static("linked llama.cpp prompt position overflowed i32")
                 })?,
                 final_logits && decoded_tokens + chunk_index + 1 == tokens.len(),
             )?;
         }
         if cancel_probe.due() && linked_cancel_requested(job.id)? {
-            return Err(ModelError::new("canceled".to_owned()));
+            return Err(ModelError::new_static("canceled"));
         }
         let decode_status = unsafe { llama_cpp_sys_4::llama_decode(context, batch.value) };
         if decode_status != 0 {
@@ -601,7 +606,7 @@ fn linked_restore_prompt_prefix_state(
 }
 
 struct SavedPromptPrefix {
-    strategy: String,
+    strategy: &'static str,
     state_bytes: usize,
 }
 
@@ -615,14 +620,14 @@ fn linked_save_prompt_prefix_state(
     if state_size == 0 {
         linked_remove_prompt_prefix_state(cache, prompt_prefix_hash);
         return SavedPromptPrefix {
-            strategy: "prefix_state_unavailable".to_owned(),
+            strategy: "prefix_state_unavailable",
             state_bytes: 0,
         };
     }
     if state_size > LINKED_PROMPT_PREFIX_STATE_MAX_BYTES {
         linked_remove_prompt_prefix_state(cache, prompt_prefix_hash);
         return SavedPromptPrefix {
-            strategy: "prefix_state_too_large".to_owned(),
+            strategy: "prefix_state_too_large",
             state_bytes: 0,
         };
     }
@@ -639,7 +644,7 @@ fn linked_save_prompt_prefix_state(
     if written != state.len() {
         linked_remove_prompt_prefix_state(cache, prompt_prefix_hash);
         return SavedPromptPrefix {
-            strategy: "prefix_state_save_failed".to_owned(),
+            strategy: "prefix_state_save_failed",
             state_bytes: 0,
         };
     }
@@ -655,7 +660,7 @@ fn linked_save_prompt_prefix_state(
     );
     linked_evict_prompt_prefix_states(cache);
     SavedPromptPrefix {
-        strategy: "prefix_state_saved".to_owned(),
+        strategy: "prefix_state_saved",
         state_bytes: state_size,
     }
 }
@@ -736,8 +741,8 @@ fn validate_linked_token_budget(
     context_window_tokens: i64,
 ) -> Result<(), ModelError> {
     let Ok(context_window_tokens) = usize::try_from(context_window_tokens) else {
-        return Err(ModelError::clean_failure(
-            "linked llama.cpp context window is invalid".to_owned(),
+        return Err(ModelError::clean_failure_static(
+            "linked llama.cpp context window is invalid",
             "prompt_token_budget_before_generation",
             "invalid_context_window",
         ));
@@ -773,7 +778,7 @@ struct LinkedRun {
 
 struct LinkedCache {
     artifact_path: String,
-    model_fingerprint_hash: String,
+    model_fingerprint_hash: Arc<str>,
     context: LinkedContext,
     _model: LinkedModel,
     vocab: *const llama_cpp_sys_4::llama_vocab,
@@ -781,13 +786,15 @@ struct LinkedCache {
     /// to reuse the KV cache for shared prompt prefixes across jobs.
     kv_tokens: Vec<llama_cpp_sys_4::llama_token>,
     prompt_prefix_states: Vec<PromptPrefixState>,
+    /// Reused across jobs while the model stays resident.
+    batch: Option<LinkedBatch>,
     load_ms: i64,
     ctx_ms: i64,
     model_memory_bytes: i64,
     model_parameters: i64,
     context_window_tokens: i64,
-    model_device_policy: String,
-    memory_accounting_policy: String,
+    model_device_policy: &'static str,
+    memory_accounting_policy: &'static str,
 }
 
 unsafe impl Send for LinkedCache {}
@@ -796,12 +803,6 @@ struct PromptPrefixState {
     hash: String,
     tokens: Vec<llama_cpp_sys_4::llama_token>,
     state: Vec<u8>,
-}
-
-struct ProcessMemorySample {
-    rss_bytes: i64,
-    virtual_bytes: i64,
-    policy: String,
 }
 
 struct LinkedModel {
@@ -832,6 +833,22 @@ impl Drop for LinkedContext {
     }
 }
 
+struct LinkedBatchSlot {
+    batch: Option<LinkedBatch>,
+    dest: *mut Option<LinkedBatch>,
+}
+
+impl Drop for LinkedBatchSlot {
+    fn drop(&mut self) {
+        if let Some(batch) = self.batch.take() {
+            // Safety: dest points at LinkedCache.batch for this run_linked call
+            unsafe {
+                *self.dest = Some(batch);
+            }
+        }
+    }
+}
+
 struct LinkedBatch {
     value: llama_cpp_sys_4::llama_batch,
     capacity: usize,
@@ -840,7 +857,7 @@ struct LinkedBatch {
 impl LinkedBatch {
     fn new(capacity: usize) -> Result<Self, ModelError> {
         let capacity_i32 = i32::try_from(capacity).map_err(|_| {
-            ModelError::new("linked llama.cpp batch capacity overflowed i32".to_owned())
+            ModelError::new_static("linked llama.cpp batch capacity overflowed i32")
         })?;
         let value = unsafe { llama_cpp_sys_4::llama_batch_init(capacity_i32, 0, 1) };
         let batch = Self { value, capacity };
@@ -850,9 +867,7 @@ impl LinkedBatch {
             || batch.value.seq_id.is_null()
             || batch.value.logits.is_null()
         {
-            return Err(ModelError::new(
-                "linked llama.cpp batch allocation failed".to_owned(),
-            ));
+            return Err(ModelError::new_static("linked llama.cpp batch allocation failed"));
         }
 
         Ok(batch)
@@ -869,13 +884,11 @@ impl LinkedBatch {
         logits: bool,
     ) -> Result<(), ModelError> {
         if self.value.n_tokens < 0 {
-            return Err(ModelError::new(
-                "linked llama.cpp batch token count is invalid".to_owned(),
-            ));
+            return Err(ModelError::new_static("linked llama.cpp batch token count is invalid"));
         }
 
         let index = usize::try_from(self.value.n_tokens).map_err(|_| {
-            ModelError::new("linked llama.cpp batch token count overflowed usize".to_owned())
+            ModelError::new_static("linked llama.cpp batch token count overflowed usize")
         })?;
         if index >= self.capacity {
             return Err(ModelError::new(format!(
@@ -886,9 +899,7 @@ impl LinkedBatch {
 
         let seq_id = unsafe { *self.value.seq_id.add(index) };
         if seq_id.is_null() {
-            return Err(ModelError::new(
-                "linked llama.cpp batch sequence slot is null".to_owned(),
-            ));
+            return Err(ModelError::new_static("linked llama.cpp batch sequence slot is null"));
         }
 
         unsafe {
@@ -928,10 +939,10 @@ fn tokenize_linked(
     text: &str,
 ) -> Result<Vec<llama_cpp_sys_4::llama_token>, ModelError> {
     let text = std::ffi::CString::new(text)
-        .map_err(|_| ModelError::new("linked llama.cpp prompt contains null byte".to_owned()))?;
+        .map_err(|_| ModelError::new_static("linked llama.cpp prompt contains null byte"))?;
     let text_len = i32::try_from(text.as_bytes().len()).map_err(|_| {
-        ModelError::clean_failure(
-            "linked llama.cpp prompt is too large to tokenize".to_owned(),
+        ModelError::clean_failure_static(
+            "linked llama.cpp prompt is too large to tokenize",
             "prompt_token_budget_before_generation",
             "prompt_exceeds_context_window",
         )
@@ -962,11 +973,11 @@ fn tokenize_linked(
     }
 
     let capacity_usize = usize::try_from(capacity).map_err(|_| {
-        ModelError::new("linked llama.cpp prompt capacity overflowed usize".to_owned())
+        ModelError::new_static("linked llama.cpp prompt capacity overflowed usize")
     })?;
     let mut tokens = vec![0; capacity_usize];
     let tokens_len = i32::try_from(tokens.len()).map_err(|_| {
-        ModelError::new("linked llama.cpp token buffer length overflowed i32".to_owned())
+        ModelError::new_static("linked llama.cpp token buffer length overflowed i32")
     })?;
     let actual = unsafe {
         llama_cpp_sys_4::llama_tokenize(
@@ -985,7 +996,7 @@ fn tokenize_linked(
         )));
     }
     let actual_usize = usize::try_from(actual).map_err(|_| {
-        ModelError::new("linked llama.cpp tokenize result overflowed usize".to_owned())
+        ModelError::new_static("linked llama.cpp tokenize result overflowed usize")
     })?;
     if actual_usize > tokens.len() {
         return Err(ModelError::new(format!(
@@ -999,9 +1010,7 @@ fn tokenize_linked(
 
 fn token_capacity_from_probe(size: i32) -> Result<i32, ModelError> {
     if size == i32::MIN {
-        return Err(ModelError::new(
-            "linked llama.cpp tokenize returned invalid token count".to_owned(),
-        ));
+        return Err(ModelError::new_static("linked llama.cpp tokenize returned invalid token count"));
     }
 
     Ok(size.abs())
@@ -1148,21 +1157,36 @@ impl JsonCompletion {
 }
 
 fn linked_cancel_requested(job_id: i64) -> Result<bool, ModelError> {
-    let result: pgrx::spi::Result<bool> = pgrx::bgworkers::BackgroundWorker::transaction(|| {
-        pgrx::Spi::connect_mut(|client| {
-            let args = [job_id.into()];
-            let rows = client.update(
-                "SELECT status = 'cancel_requested' FROM otlet.jobs WHERE id = $1",
-                Some(1),
-                &args,
-            )?;
-            if rows.is_empty() {
-                return Ok(false);
-            }
+    let result: pgrx::spi::Result<Result<bool, ModelError>> =
+        pgrx::bgworkers::BackgroundWorker::transaction(|| {
+            // Read-only probe — use select so the plan stays non-volatile.
+            pgrx::Spi::connect(|client| {
+                let args = [job_id.into()];
+                let rows = client.select(
+                    "SELECT status = 'cancel_requested' FROM otlet.jobs WHERE id = $1 LIMIT 1",
+                    Some(1),
+                    &args,
+                )?;
+                if rows.is_empty() {
+                    // Fail closed: a vanished job mid-decode must not keep generating.
+                    return Ok(Err(ModelError::new_static(
+                        "linked cancellation check: job row missing",
+                    )));
+                }
 
-            Ok(rows.first().get::<bool>(1)?.unwrap_or(false))
-        })
-    });
+                match rows.first().get::<bool>(1)? {
+                    Some(canceled) => Ok(Ok(canceled)),
+                    None => Ok(Err(ModelError::new_static(
+                        "linked cancellation check: cancel flag unreadable",
+                    ))),
+                }
+            })
+        });
 
-    result.map_err(|err| ModelError::new(format!("linked cancellation check failed: {err}")))
+    match result {
+        Ok(inner) => inner,
+        Err(err) => Err(ModelError::new(format!(
+            "linked cancellation check failed: {err}"
+        ))),
+    }
 }

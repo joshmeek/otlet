@@ -12,6 +12,7 @@ Use `otlet.ask` for one-off questions over row-shaped JSON. This example summari
 
 ```sh
 ./scripts/otlet-setup.sh
+./scripts/otlet-demo.sh
 ```
 
 ```sql

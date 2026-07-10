@@ -29,49 +29,27 @@ fn record_infer_now_failed_provenance(
     Ok(())
 }
 
-fn record_infer_now_executor_context(runtime: &RuntimeState, job_id: i64) -> Result<(), String> {
-    let context = json!({
-        "executor_origin": "customscan_infer_now",
-        "executor_node": "Otlet Semantic Source CustomScan",
-        "executor_boundary": "CustomScan owned Postgres-planned source child scan",
-        "planner_selected_path": runtime.planner_selected_path.as_str(),
-        "source_tuple_provider": source_tuple_provider(runtime),
-        "refresh_policy": refresh_policy_from_parts(
-            runtime.auto_policy,
-            runtime.allow_refresh,
-            runtime.wait_ms,
-            runtime.infer_ms
-        ),
-        "semantic_index_kind": runtime.index_kind.as_str(),
-        "semantic_index_name": runtime.index_name.as_str()
-    });
-    pgrx::Spi::connect_mut(|client| {
-        let args = [job_id.into(), JsonB(context).into()];
-        client
-            .update(
-                "UPDATE otlet.inference_receipts \
-                 SET trace_summary = trace_summary || $2 \
-                 WHERE job_id = $1 AND status = 'complete'",
-                None,
-                &args,
-            )
-            .map_err(to_string)?;
-        Ok::<(), String>(())
-    })
-}
-
 fn infer_now_failed_provenance_counts(
     job_id: i64,
 ) -> Result<InferNowFailedProvenanceCounts, String> {
-    let query = format!(
-        "SELECT count(*)::bigint AS receipts, \
-                COALESCE(max(id), 0)::bigint AS receipt_id \
-         FROM otlet.inference_receipts \
-         WHERE job_id = {job_id} AND status = 'failed'"
-    );
     pgrx::Spi::connect(|client| {
+        let args = [job_id.into()];
         let table = client
-            .select(query.as_str(), Some(1), &[])
+            .select(
+                // Always one row (like count(*)); empty peek still yields 0|0.
+                "SELECT CASE WHEN r.id IS NULL THEN 0 ELSE 1 END::bigint AS receipts, \
+                        COALESCE(r.id, 0)::bigint AS receipt_id \
+                 FROM (SELECT 1) AS _ \
+                 LEFT JOIN LATERAL ( \
+                   SELECT id \
+                   FROM otlet.inference_receipts \
+                   WHERE job_id = $1 AND status = 'failed' \
+                   ORDER BY attempt_index DESC, id DESC \
+                   LIMIT 1 \
+                 ) r ON true",
+                Some(1),
+                &args,
+            )
             .map_err(to_string)?;
         let row = table.first();
         Ok(InferNowFailedProvenanceCounts {
@@ -87,78 +65,169 @@ fn infer_now_failed_provenance_counts(
     })
 }
 
-fn infer_now_provenance_counts(job_id: i64) -> Result<InferNowProvenanceCounts, String> {
-    let query = format!(
-        "WITH receipt AS ( \
-           SELECT * \
-           FROM otlet.inference_receipts \
-           WHERE job_id = {job_id} AND status = 'complete' \
-           ORDER BY id DESC \
-           LIMIT 1 \
-         ) \
-         SELECT \
-           (SELECT count(*)::bigint FROM otlet.inference_receipts WHERE job_id = {job_id} AND status = 'complete') AS receipts, \
-           COALESCE((SELECT id FROM receipt), 0)::bigint AS receipt_id, \
-           COALESCE((SELECT prompt_tokens FROM receipt), 0)::bigint AS prompt_tokens, \
-           COALESCE((SELECT generated_tokens FROM receipt), 0)::bigint AS generated_tokens, \
-           COALESCE((SELECT generate_ms FROM receipt), 0)::bigint AS generate_ms, \
-           COALESCE((SELECT trace_summary ->> 'trace_version' FROM receipt), '') AS trace_version, \
-           COALESCE((SELECT trace_summary -> 'probability_summary' ->> 'status' FROM receipt), '') AS probability_status, \
-           COALESCE((SELECT trace_summary ->> 'schema_force' FROM receipt), '') AS schema_force, \
-           COALESCE((SELECT trace_summary -> 'detailed_trace' ->> 'status' FROM receipt), '') AS detailed_trace_status, \
-           COALESCE(NULLIF((SELECT trace_summary #>> '{{detailed_trace,captured_tokens}}' FROM receipt), '')::bigint, 0)::bigint AS detailed_trace_captured_tokens, \
-           COALESCE(NULLIF((SELECT trace_summary #>> '{{detailed_trace,top_k}}' FROM receipt), '')::bigint, 0)::bigint AS detailed_trace_top_k"
-    );
-    pgrx::Spi::connect(|client| {
-        let table = client
-            .select(query.as_str(), Some(1), &[])
-            .map_err(to_string)?;
-        let row = table.first();
-        Ok(InferNowProvenanceCounts {
-            receipts: row
-                .get_by_name::<i64, _>("receipts")
-                .map_err(to_string)?
-                .map_or(0, nonnegative_count),
-            receipt_id: row
-                .get_by_name::<i64, _>("receipt_id")
-                .map_err(to_string)?
-                .map_or(0, nonnegative_count),
-            prompt_tokens: row
-                .get_by_name::<i64, _>("prompt_tokens")
-                .map_err(to_string)?
-                .map_or(0, nonnegative_count),
-            generated_tokens: row
-                .get_by_name::<i64, _>("generated_tokens")
-                .map_err(to_string)?
-                .map_or(0, nonnegative_count),
-            generate_ms: row
-                .get_by_name::<i64, _>("generate_ms")
-                .map_err(to_string)?
-                .map_or(0, nonnegative_count),
-            trace_version: row
-                .get_by_name::<String, _>("trace_version")
-                .map_err(to_string)?
-                .unwrap_or_default(),
-            probability_status: row
-                .get_by_name::<String, _>("probability_status")
-                .map_err(to_string)?
-                .unwrap_or_default(),
-            schema_force: row
-                .get_by_name::<String, _>("schema_force")
-                .map_err(to_string)?
-                .unwrap_or_default(),
-            detailed_trace_status: row
-                .get_by_name::<String, _>("detailed_trace_status")
-                .map_err(to_string)?
-                .unwrap_or_default(),
-            detailed_trace_captured_tokens: row
-                .get_by_name::<i64, _>("detailed_trace_captured_tokens")
-                .map_err(to_string)?
-                .map_or(0, nonnegative_count),
-            detailed_trace_top_k: row
-                .get_by_name::<i64, _>("detailed_trace_top_k")
-                .map_err(to_string)?
-                .map_or(0, nonnegative_count),
-        })
-    })
+// Pure SELECT — CustomScan infer-now can run under a non-volatile planner/executor
+// context, so UPDATE must stay on client.update(), not inside SELECT.
+// Args: $1=job_id, $2=subject_id, $3=expected_json, $4=task_name, $5=record_type
+const INFER_NOW_PROVENANCE_AND_ROW_STATE_SQL: &str = "WITH receipt AS ( \
+                   SELECT id, prompt_tokens, generated_tokens, generate_ms, trace_summary \
+                   FROM otlet.inference_receipts \
+                   WHERE job_id = $1 AND status = 'complete' \
+                   ORDER BY attempt_index DESC, id DESC \
+                   LIMIT 1 \
+                 ), \
+                 latest AS ( \
+                   SELECT sm.subject_id, sm.stale, (sm.body @> $3::jsonb) AS matches_expected, \
+                     sm.updated_at, sm.id \
+                   FROM otlet.semantic_materializations sm \
+                   WHERE sm.task_name = $4 \
+                     AND sm.record_type = $5 \
+                     AND sm.subject_id = $2 \
+                   ORDER BY sm.updated_at DESC, sm.id DESC \
+                   LIMIT 1 \
+                 ), \
+                 state AS ( \
+                   SELECT CASE \
+                     WHEN EXISTS ( \
+                       SELECT 1 FROM otlet.jobs j \
+                       WHERE j.task_name = $4 \
+                         AND j.subject_id = $2 \
+                         AND j.status IN ('queued', 'running', 'cancel_requested') \
+                       LIMIT 1 \
+                     ) AND (l.subject_id IS NULL OR l.stale) THEN 'in_flight' \
+                     WHEN l.subject_id IS NULL THEN 'missing' \
+                     WHEN l.stale THEN 'stale' \
+                     WHEN l.matches_expected THEN 'fresh_match' \
+                     ELSE 'fresh_non_match' \
+                   END AS semantic_state \
+                   FROM (VALUES ($2::text)) ss(subject_id) \
+                   LEFT JOIN latest l USING (subject_id) \
+                 ) \
+                 SELECT \
+                   CASE WHEN r.id IS NULL THEN 0 ELSE 1 END::bigint AS receipts, \
+                   COALESCE(r.id, 0)::bigint AS receipt_id, \
+                   COALESCE(r.prompt_tokens, 0)::bigint AS prompt_tokens, \
+                   COALESCE(r.generated_tokens, 0)::bigint AS generated_tokens, \
+                   COALESCE(r.generate_ms, 0)::bigint AS generate_ms, \
+                   COALESCE(r.trace_summary ->> 'trace_version', '') AS trace_version, \
+                   COALESCE(r.trace_summary -> 'probability_summary' ->> 'status', '') AS probability_status, \
+                   COALESCE(r.trace_summary ->> 'schema_force', '') AS schema_force, \
+                   COALESCE(r.trace_summary -> 'detailed_trace' ->> 'status', '') AS detailed_trace_status, \
+                   COALESCE(NULLIF(r.trace_summary #>> '{detailed_trace,captured_tokens}', '')::bigint, 0)::bigint AS detailed_trace_captured_tokens, \
+                   COALESCE(NULLIF(r.trace_summary #>> '{detailed_trace,top_k}', '')::bigint, 0)::bigint AS detailed_trace_top_k, \
+                   s.semantic_state \
+                 FROM state s \
+                 LEFT JOIN receipt r ON true";
+
+// Args: $1=job_id, $2=index_name, $3=subject_id, $4=expected_json, $5=task_name
+const INFER_NOW_PROVENANCE_AND_JOIN_STATE_SQL: &str = "WITH receipt AS ( \
+                   SELECT id, prompt_tokens, generated_tokens, generate_ms, trace_summary \
+                   FROM otlet.inference_receipts \
+                   WHERE job_id = $1 AND status = 'complete' \
+                   ORDER BY attempt_index DESC, id DESC \
+                   LIMIT 1 \
+                 ), \
+                 current_row AS ( \
+                   SELECT subject_id, body, stale \
+                   FROM otlet.semantic_join_index_current_rows($2, false) \
+                   WHERE subject_id = $3 \
+                 ), \
+                 state AS ( \
+                   SELECT CASE \
+                     WHEN EXISTS ( \
+                       SELECT 1 FROM otlet.jobs j \
+                       WHERE j.task_name = $5 \
+                         AND j.subject_id = $3 \
+                         AND j.status IN ('queued', 'running', 'cancel_requested') \
+                       LIMIT 1 \
+                     ) AND (c.subject_id IS NULL OR c.stale) THEN 'in_flight' \
+                     WHEN c.subject_id IS NULL THEN 'missing' \
+                     WHEN c.stale THEN 'stale' \
+                     WHEN c.body @> $4::jsonb THEN 'fresh_match' \
+                     ELSE 'fresh_non_match' \
+                   END AS semantic_state \
+                   FROM (VALUES ($3::text)) ss(subject_id) \
+                   LEFT JOIN current_row c USING (subject_id) \
+                 ) \
+                 SELECT \
+                   CASE WHEN r.id IS NULL THEN 0 ELSE 1 END::bigint AS receipts, \
+                   COALESCE(r.id, 0)::bigint AS receipt_id, \
+                   COALESCE(r.prompt_tokens, 0)::bigint AS prompt_tokens, \
+                   COALESCE(r.generated_tokens, 0)::bigint AS generated_tokens, \
+                   COALESCE(r.generate_ms, 0)::bigint AS generate_ms, \
+                   COALESCE(r.trace_summary ->> 'trace_version', '') AS trace_version, \
+                   COALESCE(r.trace_summary -> 'probability_summary' ->> 'status', '') AS probability_status, \
+                   COALESCE(r.trace_summary ->> 'schema_force', '') AS schema_force, \
+                   COALESCE(r.trace_summary -> 'detailed_trace' ->> 'status', '') AS detailed_trace_status, \
+                   COALESCE(NULLIF(r.trace_summary #>> '{detailed_trace,captured_tokens}', '')::bigint, 0)::bigint AS detailed_trace_captured_tokens, \
+                   COALESCE(NULLIF(r.trace_summary #>> '{detailed_trace,top_k}', '')::bigint, 0)::bigint AS detailed_trace_top_k, \
+                   s.semantic_state \
+                 FROM state s \
+                 LEFT JOIN receipt r ON true";
+
+const INFER_NOW_STAMP_EXECUTOR_CONTEXT_SQL: &str = "UPDATE otlet.inference_receipts \
+                 SET trace_summary = trace_summary || $2::jsonb \
+                 WHERE id = ( \
+                   SELECT r.id FROM otlet.inference_receipts r \
+                   WHERE r.job_id = $1 AND r.status = 'complete' \
+                   ORDER BY r.attempt_index DESC, r.id DESC \
+                   LIMIT 1 \
+                 )";
+
+fn provenance_and_state_from_spi_table(
+    table: pgrx::spi::SpiTupleTable<'_>,
+) -> Result<(InferNowProvenanceCounts, SubjectSemanticState), String> {
+    let row = table.first();
+    let provenance = InferNowProvenanceCounts {
+        receipts: row
+            .get_by_name::<i64, _>("receipts")
+            .map_err(to_string)?
+            .map_or(0, nonnegative_count),
+        receipt_id: row
+            .get_by_name::<i64, _>("receipt_id")
+            .map_err(to_string)?
+            .map_or(0, nonnegative_count),
+        prompt_tokens: row
+            .get_by_name::<i64, _>("prompt_tokens")
+            .map_err(to_string)?
+            .map_or(0, nonnegative_count),
+        generated_tokens: row
+            .get_by_name::<i64, _>("generated_tokens")
+            .map_err(to_string)?
+            .map_or(0, nonnegative_count),
+        generate_ms: row
+            .get_by_name::<i64, _>("generate_ms")
+            .map_err(to_string)?
+            .map_or(0, nonnegative_count),
+        trace_version: row
+            .get_by_name::<String, _>("trace_version")
+            .map_err(to_string)?
+            .unwrap_or_default(),
+        probability_status: row
+            .get_by_name::<String, _>("probability_status")
+            .map_err(to_string)?
+            .unwrap_or_default(),
+        schema_force: row
+            .get_by_name::<String, _>("schema_force")
+            .map_err(to_string)?
+            .unwrap_or_default(),
+        detailed_trace_status: row
+            .get_by_name::<String, _>("detailed_trace_status")
+            .map_err(to_string)?
+            .unwrap_or_default(),
+        detailed_trace_captured_tokens: row
+            .get_by_name::<i64, _>("detailed_trace_captured_tokens")
+            .map_err(to_string)?
+            .map_or(0, nonnegative_count),
+        detailed_trace_top_k: row
+            .get_by_name::<i64, _>("detailed_trace_top_k")
+            .map_err(to_string)?
+            .map_or(0, nonnegative_count),
+    };
+    let label = row
+        .get_by_name::<String, _>("semantic_state")
+        .map_err(to_string)?
+        .ok_or_else(|| "otlet semantic_state SPI returned null".to_owned())?;
+    let state = SubjectSemanticState::from_label(&label)
+        .ok_or_else(|| format!("otlet unexpected semantic_state from SPI: {label}"))?;
+    Ok((provenance, state))
 }

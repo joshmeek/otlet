@@ -13,10 +13,6 @@ psql_exec() {
   docker exec -i "$container" psql -U postgres -d postgres -v ON_ERROR_STOP=1 "$@"
 }
 
-psql_value() {
-  docker exec "$container" psql -U postgres -d postgres -qAt -v ON_ERROR_STOP=1 -c "$1"
-}
-
 require_contains() {
   local text="$1"
   local needle="$2"
@@ -89,9 +85,14 @@ wait_task_complete() {
   local active complete failed
 
   for _ in $(seq 1 "$attempts"); do
-    active="$(psql_value "SELECT count(*) FROM otlet.jobs WHERE task_name = '$task' AND status IN ('queued','running','cancel_requested');")"
-    complete="$(psql_value "SELECT count(*) FROM otlet.jobs WHERE task_name = '$task' AND status = 'complete';")"
-    failed="$(psql_value "SELECT count(*) FROM otlet.jobs WHERE task_name = '$task' AND status IN ('failed','canceled');")"
+    IFS='|' read -r active complete failed <<<"$(psql_exec -qAt -v task_name="$task" <<'SQL'
+SELECT count(*) FILTER (WHERE status IN ('queued','running','cancel_requested'))::text || '|' ||
+       count(*) FILTER (WHERE status = 'complete')::text || '|' ||
+       count(*) FILTER (WHERE status IN ('failed','canceled'))::text
+FROM otlet.jobs
+WHERE task_name = :'task_name';
+SQL
+)"
     if [ "$failed" != "0" ]; then
       psql_exec -P border=2 -P null='' -v task_name="$task" <<'SQL'
 SELECT job_id, task_name, subject_id, status, error, raw_output
@@ -119,9 +120,14 @@ wait_task_failed() {
   local active complete failed
 
   for _ in $(seq 1 "$attempts"); do
-    active="$(psql_value "SELECT count(*) FROM otlet.jobs WHERE task_name = '$task' AND status IN ('queued','running','cancel_requested');")"
-    complete="$(psql_value "SELECT count(*) FROM otlet.jobs WHERE task_name = '$task' AND status = 'complete';")"
-    failed="$(psql_value "SELECT count(*) FROM otlet.jobs WHERE task_name = '$task' AND status IN ('failed','canceled');")"
+    IFS='|' read -r active complete failed <<<"$(psql_exec -qAt -v task_name="$task" <<'SQL'
+SELECT count(*) FILTER (WHERE status IN ('queued','running','cancel_requested'))::text || '|' ||
+       count(*) FILTER (WHERE status = 'complete')::text || '|' ||
+       count(*) FILTER (WHERE status IN ('failed','canceled'))::text
+FROM otlet.jobs
+WHERE task_name = :'task_name';
+SQL
+)"
     if [ "$failed" -ge "$expected_failed" ] && [ "$active" = "0" ]; then
       return 0
     fi

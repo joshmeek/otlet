@@ -263,6 +263,9 @@ The SQL plan row and CustomScan EXPLAIN use the same terms for the planner contr
 | Stale reasons | `stale_reasons` | `Planner Stale Reasons` | Same JSON shape for stale subject counts |
 | Infer-now prediction | `infer_now_subjects`, `fail_closed_subjects` | `Planner Infer Now Subjects`, `Planner Fail Closed Subjects` | CustomScan also reports actual executor counters |
 | Freshness basis | `semantic_index_current_rows.freshness_basis` | `Preloaded Fresh Subjects / Basis`, `Emitted Freshness Basis` | Current-row SQL reports row freshness; CustomScan reports aggregate executor evidence |
+| Child plan attachment | (none) | `Child Plan Attached` | Counter; `1` once begin-scan attaches the Postgres child plan |
+| Source tuple path | (none) | `Source Tuple Provider` | Matches executor context; row scans report `child_plan_execprocnode`, joins report `child_subquery_join_execprocnode` |
+| Predicate owner | (none) | `Semantic Predicate Owner` | Always `otlet_customscan_executor` |
 
 EXPLAIN line ledger for this pass:
 
@@ -283,6 +286,9 @@ count_basis | exact
 Captured CustomScan EXPLAIN excerpt:
 
 ```text
+Child Plan Attached: 1
+Semantic Predicate Owner: otlet_customscan_executor
+Source Tuple Provider: child_plan_execprocnode
 Planner Selected Path: semantic_lookup
 Planner Stale Reasons: {}
 Count Basis: exact
@@ -307,6 +313,9 @@ Representative output excerpt:
 Custom Scan (Otlet Semantic Source CustomScan) on public.otlet_demo_semantic_vendor v
   Otlet Node: Semantic Source CustomScan
   Child Semantic Filter: stripped_before_child_plan
+  Child Plan Attached: 1
+  Semantic Predicate Owner: otlet_customscan_executor
+  Source Tuple Provider: child_plan_execprocnode
   Semantic Index: demo_semantic_vendor_idx
   Planner Selected Path: semantic_lookup
   Count Basis: exact
@@ -389,6 +398,9 @@ Representative output excerpt:
 ```text
 Custom Scan (Otlet Semantic Source CustomScan) on public.otlet_demo_semantic_vendor v
   Otlet Node: Semantic Source CustomScan
+  Child Plan Attached: 1
+  Semantic Predicate Owner: otlet_customscan_executor
+  Source Tuple Provider: child_plan_execprocnode
   Semantic Index: demo_semantic_vendor_idx
   Refresh Policy: auto_lookup_wait_infer_refresh_fail_closed
   Infer Now Timeout Ms: 15000

@@ -29,10 +29,13 @@ SELECT
   count(j.id) FILTER (WHERE j.status = 'queued')::bigint AS queued_jobs,
   count(j.id) FILTER (WHERE j.status = 'running')::bigint AS running_jobs,
   count(j.id) FILTER (WHERE j.status = 'cancel_requested')::bigint AS cancel_requested_jobs,
-  count(j.id) FILTER (WHERE j.status = 'running' AND j.leased_until < now())::bigint AS expired_running_jobs,
-  otlet.available_model_queue_slots(m.name)::bigint AS available_queue_slots,
+  count(j.id) FILTER (
+    WHERE j.status IN ('running', 'cancel_requested')
+      AND (j.leased_until IS NULL OR j.leased_until < now())
+  )::bigint AS expired_running_jobs,
+  slots.available_queue_slots,
   CASE
-    WHEN otlet.available_model_queue_slots(m.name) <= 0 THEN 'queue_full'
+    WHEN slots.available_queue_slots <= 0 THEN 'queue_full'
     ELSE 'queue_accepting'
   END AS queue_state,
   COALESCE(suppressed.suppressed_events, 0)::bigint AS queue_admission_suppressed_events,
@@ -41,6 +44,9 @@ FROM otlet.models m
 CROSS JOIN otlet.production_policy p
 LEFT JOIN otlet.tasks t ON t.model_name = m.name
 LEFT JOIN otlet.jobs j ON j.task_name = t.name
+LEFT JOIN LATERAL (
+  SELECT otlet.available_model_queue_slots(m.name)::bigint AS available_queue_slots
+) slots ON true
 LEFT JOIN LATERAL (
   SELECT
     count(*)::bigint AS suppressed_events,
@@ -53,6 +59,7 @@ GROUP BY
   m.name,
   m.max_active_jobs,
   p.max_queued_jobs_per_model,
+  slots.available_queue_slots,
   suppressed.suppressed_events,
   suppressed.last_suppressed_at;
 
@@ -263,12 +270,12 @@ BEGIN
   FROM (
     SELECT
       m.name AS model_name,
-      count(j.id) FILTER (WHERE j.status = 'queued')::bigint AS queued_jobs,
+      count(j.id)::bigint AS queued_jobs,
       p.max_queued_jobs_per_model
     FROM otlet.production_policy p
     JOIN otlet.models m ON true
     LEFT JOIN otlet.tasks t ON t.model_name = m.name
-    LEFT JOIN otlet.jobs j ON j.task_name = t.name
+    LEFT JOIN otlet.jobs j ON j.task_name = t.name AND j.status = 'queued'
     GROUP BY m.name, p.max_queued_jobs_per_model
   ) q
   WHERE q.queued_jobs > q.max_queued_jobs_per_model;
@@ -287,6 +294,60 @@ BEGIN
   FROM otlet.actions a
   WHERE a.apply_status = 'applied'
     AND a.approval_status IS DISTINCT FROM 'approved';
+
+  RETURN QUERY
+  SELECT
+    'no_expired_running_jobs'::text,
+    'job'::text,
+    j.id::text,
+    jsonb_build_object(
+      'status', j.status,
+      'leased_until', j.leased_until,
+      'attempts', j.attempts
+    )
+  FROM otlet.jobs j
+  WHERE j.status IN ('running', 'cancel_requested')
+    AND (j.leased_until IS NULL OR j.leased_until < now());
+
+  RETURN QUERY
+  SELECT
+    'complete_receipts_are_schema_validated'::text,
+    'receipt'::text,
+    r.id::text,
+    jsonb_build_object(
+      'job_id', r.job_id,
+      'status', r.status,
+      'schema_validation_status', r.schema_validation_status
+    )
+  FROM otlet.inference_receipts r
+  WHERE r.status = 'complete'
+    AND r.schema_validation_status IS DISTINCT FROM 'passed';
+
+  RETURN QUERY
+  SELECT
+    'materializations_have_source_hashes'::text,
+    'materialization'::text,
+    sm.id::text,
+    jsonb_build_object(
+      'task_name', sm.task_name,
+      'subject_id', sm.subject_id,
+      'stale', sm.stale
+    )
+  FROM otlet.semantic_materializations sm
+  WHERE sm.source_hash IS NULL;
+
+  RETURN QUERY
+  SELECT
+    'no_runtime_slot_errors'::text,
+    'runtime'::text,
+    rs.model_name::text,
+    jsonb_build_object(
+      'runtime_status', rs.runtime_status,
+      'slot_state', rs.slot_state
+    )
+  FROM otlet.runtime_status rs
+  WHERE rs.runtime_status = 'error'
+     OR rs.slot_state = 'error';
 
   FOR index_row IN
     SELECT
@@ -505,7 +566,10 @@ WITH queue AS (
     count(*) FILTER (WHERE status = 'queued')::bigint AS queued_jobs,
     count(*) FILTER (WHERE status = 'running')::bigint AS running_jobs,
     count(*) FILTER (WHERE status = 'cancel_requested')::bigint AS cancel_requested_jobs,
-    count(*) FILTER (WHERE status = 'running' AND leased_until < now())::bigint AS expired_running_jobs,
+    count(*) FILTER (
+      WHERE status IN ('running', 'cancel_requested')
+        AND (leased_until IS NULL OR leased_until < now())
+    )::bigint AS expired_running_jobs,
     count(*) FILTER (WHERE status = 'failed')::bigint AS failed_jobs,
     count(*) FILTER (WHERE status = 'canceled')::bigint AS canceled_jobs
   FROM otlet.jobs
@@ -605,7 +669,7 @@ SELECT
   materialization_failures.semantic_materialization_failed_events,
   materialization_failures.semantic_materialization_last_failed_at,
   (q.expired_running_jobs = 0) AS no_expired_running_jobs,
-  (r.complete_without_schema_pass = 0) AS completed_jobs_are_schema_validated,
+  (r.complete_without_schema_pass = 0) AS complete_receipts_are_schema_validated,
   (s.materializations_without_source_hash = 0) AS materializations_have_source_hashes,
   (COALESCE(runtime.error_runtime_slots, 0) = 0) AS no_runtime_slot_errors,
   (COALESCE(runtime.cache_entries_within_cap, true) AND COALESCE(runtime.cache_bytes_within_cap, true)) AS cache_within_bounds,

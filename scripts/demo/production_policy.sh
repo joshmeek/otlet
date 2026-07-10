@@ -1,21 +1,23 @@
-production_policy_contract="$(psql_value "
+production_policy_contract="$(psql_exec -qAt <<'SQL'
 SELECT name || '|' || stale_policy || '|' || max_attempts::text || '|' ||
        max_attempt_ms::text || '|' || worker_claim_batch_size::text
 FROM otlet.production_policy_status;
-")"
+SQL
+)"
 echo "production_policy_contract=$production_policy_contract"
 [ "$production_policy_contract" = "default|refresh_then_fail_closed|3|300000|8" ] || {
   echo "Expected default production policy, got $production_policy_contract" >&2
   exit 1
 }
 
-production_status_contract="$(psql_value "
+production_status_contract="$(psql_exec -qAt <<'SQL'
 SELECT no_expired_running_jobs::text || '|' ||
-       completed_jobs_are_schema_validated::text || '|' ||
+       complete_receipts_are_schema_validated::text || '|' ||
        cache_within_bounds::text || '|' ||
        trace_within_bounds::text
 FROM otlet.production_status;
-")"
+SQL
+)"
 echo "production_status_contract=$production_status_contract"
 [ "$production_status_contract" = "true|true|true|true" ] || {
   echo "Expected healthy production status, got $production_status_contract" >&2
@@ -66,11 +68,12 @@ cleanup_task "$row_triage_policy_task"
 cleanup_task "$entity_task"
 cleanup_task "$join_task"
 
-model_queue_status_contract="$(psql_value "
+model_queue_status_contract="$(psql_exec -qAt -v model_name="$cheap_model_name" <<'SQL'
 SELECT queue_state || '|' || queued_jobs::text || '|' || running_jobs::text
 FROM otlet.model_queue_status
-WHERE model_name = '$cheap_model_name';
-")"
+WHERE model_name = :'model_name';
+SQL
+)"
 echo "model_queue_status_contract=$model_queue_status_contract"
 [ "$model_queue_status_contract" = "queue_accepting|0|0" ] || {
   echo "Expected empty accepting model queue, got $model_queue_status_contract" >&2
@@ -293,18 +296,20 @@ done
 for pid in "${queue_race_pids[@]}"; do
   wait "$pid"
 done
-queue_race_contract="$(psql_value "
+queue_race_contract="$(psql_exec -qAt -v task_name="$queue_race_task" <<'SQL'
 SELECT (count(*) FILTER (WHERE status = 'queued') <= 5)::text || '|' ||
        (count(*) = 5)::text
 FROM otlet.jobs
-WHERE task_name = '$queue_race_task';
-")"
+WHERE task_name = :'task_name';
+SQL
+)"
 echo "queue_admission_race_contract=$queue_race_contract"
-queue_cap_invariant_contract="$(psql_value "
+queue_cap_invariant_contract="$(psql_exec -qAt <<'SQL'
 SELECT (count(*) = 0)::text
 FROM otlet.verify_invariants()
 WHERE invariant_name = 'queued_jobs_within_model_cap';
-")"
+SQL
+)"
 echo "queue_cap_invariant_contract=$queue_cap_invariant_contract"
 cleanup_task "$queue_race_task"
 wait "$queue_lock_pid"

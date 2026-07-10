@@ -310,12 +310,12 @@ STABLE
 AS $$
   SELECT GREATEST(
     p.max_queued_jobs_per_model
-      - count(j.id) FILTER (WHERE j.status = 'queued'),
+      - count(j.id),
     0
   )::integer
   FROM otlet.production_policy p
   LEFT JOIN otlet.tasks t ON t.model_name = $1
-  LEFT JOIN otlet.jobs j ON j.task_name = t.name
+  LEFT JOIN otlet.jobs j ON j.task_name = t.name AND j.status = 'queued'
   GROUP BY p.max_queued_jobs_per_model;
 $$;
 
@@ -405,12 +405,14 @@ BEGIN
     'WITH queue_capacity AS (
        SELECT GREATEST(
          p.max_queued_jobs_per_model
-           - count(j.id) FILTER (WHERE j.status = ''queued''),
+           - count(j.id),
          0
        )::integer AS slots
        FROM otlet.production_policy p
        LEFT JOIN otlet.tasks queued_tasks ON queued_tasks.model_name = %L
-       LEFT JOIN otlet.jobs j ON j.task_name = queued_tasks.name
+       LEFT JOIN otlet.jobs j
+         ON j.task_name = queued_tasks.name
+        AND j.status = ''queued''
        GROUP BY p.max_queued_jobs_per_model
      )
      INSERT INTO otlet.jobs (task_name, subject_id, input)
@@ -524,12 +526,14 @@ BEGIN
     'WITH queue_capacity AS (
        SELECT GREATEST(
          p.max_queued_jobs_per_model
-           - count(j.id) FILTER (WHERE j.status = ''queued''),
+           - count(j.id),
          0
        )::integer AS slots
        FROM otlet.production_policy p
        LEFT JOIN otlet.tasks queued_tasks ON queued_tasks.model_name = %L
-       LEFT JOIN otlet.jobs j ON j.task_name = queued_tasks.name
+       LEFT JOIN otlet.jobs j
+         ON j.task_name = queued_tasks.name
+        AND j.status = ''queued''
        GROUP BY p.max_queued_jobs_per_model
      )
      INSERT INTO otlet.jobs (task_name, subject_id, input)

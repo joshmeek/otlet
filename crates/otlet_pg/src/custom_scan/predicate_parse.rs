@@ -20,7 +20,7 @@ unsafe fn find_semantic_match_predicate(
                     if rte_kind != pg_sys::RTEKind::RTE_RELATION {
                         continue;
                     }
-                    let (stats, input_columns) = validate_semantic_index_source(
+                    let (stats, input_columns, row_meta) = validate_semantic_index_source(
                         &predicate.index_name,
                         relid,
                         predicate.subject_attno,
@@ -32,13 +32,14 @@ unsafe fn find_semantic_match_predicate(
                         predicate.auto_policy,
                     )?;
                     predicate.input_columns = input_columns;
+                    predicate.row_preload_meta = row_meta;
                     Some(stats)
                 }
                 SemanticIndexKind::Join => {
                     if rte_kind != pg_sys::RTEKind::RTE_SUBQUERY {
                         continue;
                     }
-                    validate_semantic_join_index_source(
+                    let (stats, join_meta) = validate_semantic_join_index_source(
                         &predicate.index_name,
                         &predicate.expected_json,
                         predicate.allow_refresh,
@@ -46,7 +47,9 @@ unsafe fn find_semantic_match_predicate(
                         predicate.infer_ms,
                         predicate.infer_max_rows,
                         predicate.auto_policy,
-                    )
+                    )?;
+                    predicate.join_preload_meta = join_meta;
+                    Some(stats)
                 }
             };
             if let Some(stats) = stats {
@@ -86,6 +89,8 @@ unsafe fn semantic_match_from_clause(
             restrict_info: ptr::null_mut(),
             estimated_rows: 1.0,
             input_columns: None,
+            row_preload_meta: None,
+            join_preload_meta: None,
             planner_stats: planner_stats_unknown(),
         })
     }
@@ -103,6 +108,7 @@ struct ParsedSemanticMatch {
     infer_max_rows: u32,
 }
 
+#[derive(Clone, Copy)]
 struct SemanticAutoPolicy {
     auto_policy: bool,
     allow_refresh: bool,
@@ -160,7 +166,20 @@ fn semantic_auto_policy(enabled: bool) -> SemanticAutoPolicy {
         };
     }
 
-    pgrx::Spi::connect(|client| {
+    // One SPI read per statement: production_policy is a single-row table and
+    // begin-scan already freezes knobs from plan-time private data.
+    let stmt_start = unsafe { pg_sys::GetCurrentStatementStartTimestamp() };
+    thread_local! {
+        static CACHED: std::cell::Cell<Option<(pg_sys::TimestampTz, SemanticAutoPolicy)>> =
+            const { std::cell::Cell::new(None) };
+    }
+    if let Some((cached_start, policy)) = CACHED.get()
+        && cached_start == stmt_start
+    {
+        return policy;
+    }
+
+    let policy = pgrx::Spi::connect(|client| {
         let table = client
             .select(
                 "SELECT \
@@ -177,11 +196,12 @@ fn semantic_auto_policy(enabled: bool) -> SemanticAutoPolicy {
         let row = table.first();
         Some(SemanticAutoPolicy {
             auto_policy: true,
+            // Null allow_refresh fails closed (no refresh) rather than permissive.
             allow_refresh: row
                 .get_by_name::<bool, _>("allow_refresh")
                 .ok()
                 .flatten()
-                .unwrap_or(true),
+                .unwrap_or(false),
             wait_ms: row
                 .get_by_name::<i32, _>("semantic_auto_wait_ms")
                 .ok()
@@ -206,10 +226,13 @@ fn semantic_auto_policy(enabled: bool) -> SemanticAutoPolicy {
         })
     })
     .unwrap_or(SemanticAutoPolicy {
+        // SPI failure: fail closed — no refresh, no wait/infer budget.
         auto_policy: true,
-        allow_refresh: true,
-        wait_ms: 10_000,
-        infer_ms: 15_000,
-        infer_max_rows: 1,
-    })
+        allow_refresh: false,
+        wait_ms: 0,
+        infer_ms: 0,
+        infer_max_rows: 0,
+    });
+    CACHED.set(Some((stmt_start, policy)));
+    policy
 }

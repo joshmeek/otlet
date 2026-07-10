@@ -45,45 +45,90 @@ fn inference_cache_contract_hash(
     ])
 }
 
-fn inference_cache_model_key(job: &Job, context: &RunContext) -> String {
+fn inference_cache_model_key(model: JobModelRef<'_>, context: &RunContext) -> String {
     hash_text_parts(&[
         "model=",
-        &job.model_name,
+        model.name,
         "|fingerprint=",
         &context.model_fingerprint_hash,
     ])
 }
 
-fn model_fingerprint_hash(job: &Job) -> String {
-    if let Some(hash) = job
+fn model_fingerprint_hash(model: JobModelRef<'_>) -> Arc<str> {
+    if let Some(hash) = model
         .artifact_hash
-        .as_deref()
         .map(str::trim)
         .filter(|hash| !hash.is_empty())
     {
-        return hash_text_parts(&["catalog_hash:", hash]);
+        return Arc::<str>::from(hash_text_parts(&["catalog_hash:", hash]));
     }
 
-    fs::metadata(&job.artifact_path).map_or_else(
-        |_| hash_text_parts(&["path_only:", &job.artifact_path]),
-        |metadata| {
-            let modified_ms = metadata
-                .modified()
-                .ok()
-                .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
-                .map_or(0, |duration| duration.as_millis());
-            let bytes = metadata.len().to_string();
-            let modified_ms = modified_ms.to_string();
-            hash_text_parts(&[
-                "local_file:path=",
-                &job.artifact_path,
-                ":bytes=",
-                &bytes,
-                ":mtime_ms=",
-                &modified_ms,
-            ])
-        },
-    )
+    #[derive(Clone)]
+    struct FingerprintMeta {
+        modified_ms: u128,
+        bytes: u64,
+        hash: Arc<str>,
+    }
+
+    static FINGERPRINT_CACHE: OnceLock<Mutex<HashMap<String, FingerprintMeta>>> = OnceLock::new();
+
+    let metadata = match fs::metadata(model.artifact_path) {
+        Ok(metadata) => metadata,
+        Err(_) => {
+            return Arc::<str>::from(hash_text_parts(&["path_only:", model.artifact_path]));
+        }
+    };
+    let modified_ms = metadata
+        .modified()
+        .ok()
+        .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+        .map_or(0, |duration| duration.as_millis());
+    let bytes = metadata.len();
+
+    let cache = FINGERPRINT_CACHE.get_or_init(|| Mutex::new(HashMap::with_capacity(32)));
+    if let Ok(mut cache) = cache.lock() {
+        if let Some(cached) = cache.get(model.artifact_path)
+            && cached.modified_ms == modified_ms
+            && cached.bytes == bytes
+        {
+            return Arc::clone(&cached.hash);
+        }
+
+        let hash = local_file_fingerprint(model.artifact_path, modified_ms, bytes);
+        let shared = Arc::<str>::from(hash);
+        if cache.len() >= 32 {
+            // Drop an arbitrary entry; process-local and rebuilt from metadata
+            cache.drain().next();
+        }
+        cache.insert(
+            model.artifact_path.to_owned(),
+            FingerprintMeta {
+                modified_ms,
+                bytes,
+                hash: Arc::clone(&shared),
+            },
+        );
+        return shared;
+    }
+
+    Arc::<str>::from(local_file_fingerprint(
+        model.artifact_path,
+        modified_ms,
+        bytes,
+    ))
+}
+
+fn local_file_fingerprint(path: &str, modified_ms: u128, bytes: u64) -> String {
+    let bytes_text = bytes.to_string();
+    let modified_text = modified_ms.to_string();
+    hash_text_parts(&[
+        "local_file:path=",
+        path,
+        ":bytes=",
+        &bytes_text,
+        ":mtime_ms=",
+        &modified_text,
+    ])
 }
 
 fn input_mvcc_row_identity(input: &Value, subject_id: &str) -> String {
@@ -103,7 +148,12 @@ fn input_mvcc_row_identity(input: &Value, subject_id: &str) -> String {
         .or_else(|| mvcc.get("pk"))
         .and_then(Value::as_str)
         .unwrap_or(subject_id);
-    format!("{table}:{row}")
+    // Keep human-readable table:row for receipt/trace identity
+    let mut identity = String::with_capacity(table.len() + row.len() + 1);
+    identity.push_str(table);
+    identity.push(':');
+    identity.push_str(row);
+    identity
 }
 
 fn input_mvcc_payload(input: &Value) -> Value {
@@ -115,8 +165,8 @@ fn input_mvcc_payload(input: &Value) -> Value {
 }
 
 struct CacheLookup {
-    raw_output: Option<String>,
-    reason: String,
+    raw_output: Option<Arc<str>>,
+    reason: &'static str,
     stats: InferenceCacheStats,
 }
 
@@ -125,10 +175,10 @@ impl CacheLookup {
         Self::disabled_for("disabled")
     }
 
-    fn disabled_for(reason: &str) -> Self {
+    fn disabled_for(reason: &'static str) -> Self {
         Self {
             raw_output: None,
-            reason: reason.to_owned(),
+            reason,
             stats: InferenceCacheStats::default(),
         }
     }
@@ -139,7 +189,7 @@ struct InferenceCacheStats {
     entries: i64,
     bytes: i64,
     evictions: i64,
-    eviction_reason: String,
+    eviction_reason: &'static str,
 }
 
 impl Default for InferenceCacheStats {
@@ -148,7 +198,7 @@ impl Default for InferenceCacheStats {
             entries: 0,
             bytes: 0,
             evictions: 0,
-            eviction_reason: "none".to_owned(),
+            eviction_reason: "none",
         }
     }
 }
@@ -159,18 +209,61 @@ struct InferenceCacheEntry {
     content_key: String,
     contract_key: String,
     model_key: String,
-    raw_output: String,
+    raw_output: Arc<str>,
     bytes: usize,
 }
 
-#[derive(Default)]
 struct InferenceCache {
     entries: Vec<InferenceCacheEntry>,
+    key_index: HashMap<String, usize>,
     bytes: usize,
     hits: i64,
     misses: i64,
     evictions: i64,
-    last_eviction_reason: String,
+    last_eviction_reason: &'static str,
+}
+
+impl Default for InferenceCache {
+    fn default() -> Self {
+        Self {
+            entries: Vec::with_capacity(32),
+            key_index: HashMap::with_capacity(32),
+            bytes: 0,
+            hits: 0,
+            misses: 0,
+            evictions: 0,
+            last_eviction_reason: "none",
+        }
+    }
+}
+
+impl InferenceCache {
+    fn promote_to_mru(&mut self, index: usize) {
+        if index + 1 >= self.entries.len() {
+            return;
+        }
+        let entry = self.entries.remove(index);
+        for shifted in &self.entries[index..] {
+            if let Some(idx) = self.key_index.get_mut(&shifted.key) {
+                *idx = idx.saturating_sub(1);
+            }
+        }
+        let new_index = self.entries.len();
+        self.key_index.insert(entry.key.clone(), new_index);
+        self.entries.push(entry);
+    }
+
+    fn remove_at(&mut self, index: usize) -> InferenceCacheEntry {
+        let entry = self.entries.remove(index);
+        self.key_index.remove(&entry.key);
+        self.bytes = self.bytes.saturating_sub(entry.bytes);
+        for shifted in &self.entries[index..] {
+            if let Some(idx) = self.key_index.get_mut(&shifted.key) {
+                *idx = idx.saturating_sub(1);
+            }
+        }
+        entry
+    }
 }
 
 fn inference_cache_get(
@@ -184,21 +277,18 @@ fn inference_cache_get(
     let Ok(mut cache) = cache.lock() else {
         return CacheLookup {
             raw_output: None,
-            reason: "lock_poisoned".to_owned(),
+            reason: "lock_poisoned",
             stats: InferenceCacheStats::default(),
         };
     };
 
-    if let Some(index) = cache.entries.iter().position(|entry| entry.key == key) {
-        let raw_output = cache.entries[index].raw_output.clone();
-        if index + 1 < cache.entries.len() {
-            let entry = cache.entries.remove(index);
-            cache.entries.push(entry);
-        }
+    if let Some(&index) = cache.key_index.get(key) {
+        let raw_output = Arc::clone(&cache.entries[index].raw_output);
+        cache.promote_to_mru(index);
         cache.hits += 1;
         return CacheLookup {
             raw_output: Some(raw_output),
-            reason: "hit".to_owned(),
+            reason: "hit",
             stats: cache.stats(),
         };
     }
@@ -210,7 +300,7 @@ fn inference_cache_get(
         if entry.content_key == content_key && entry.contract_key != contract_key {
             return CacheLookup {
                 raw_output: None,
-                reason: "contract_changed".to_owned(),
+                reason: "contract_changed",
                 stats: cache.stats(),
             };
         }
@@ -231,7 +321,7 @@ fn inference_cache_get(
     };
     CacheLookup {
         raw_output: None,
-        reason: reason.to_owned(),
+        reason,
         stats: cache.stats(),
     }
 }
@@ -256,16 +346,18 @@ fn inference_cache_put(
         + model_key.len()
         + raw_output.len();
     if bytes > INFERENCE_CACHE_MAX_BYTES {
-        "entry_too_large".clone_into(&mut cache.last_eviction_reason);
+        cache.last_eviction_reason = "entry_too_large";
         return cache.stats();
     }
 
-    if let Some(index) = cache.entries.iter().position(|entry| entry.key == key) {
-        let old = cache.entries.remove(index);
-        cache.bytes = cache.bytes.saturating_sub(old.bytes);
+    if let Some(&index) = cache.key_index.get(&key) {
+        let _ = cache.remove_at(index);
     }
 
     cache.bytes += bytes;
+    let index = cache.entries.len();
+    let raw_output = Arc::<str>::from(raw_output);
+    cache.key_index.insert(key.clone(), index);
     cache.entries.push(InferenceCacheEntry {
         key,
         row_key,
@@ -282,14 +374,12 @@ fn inference_cache_put(
         if cache.entries.is_empty() {
             break;
         }
-        if cache.entries.len() > INFERENCE_CACHE_MAX_ENTRIES {
+        cache.last_eviction_reason = if cache.entries.len() > INFERENCE_CACHE_MAX_ENTRIES {
             "entry_count_limit"
         } else {
             "byte_limit"
-        }
-        .clone_into(&mut cache.last_eviction_reason);
-        let old = cache.entries.remove(0);
-        cache.bytes = cache.bytes.saturating_sub(old.bytes);
+        };
+        let _ = cache.remove_at(0);
         cache.evictions += 1;
     }
 
@@ -302,11 +392,7 @@ impl InferenceCache {
             entries: usize_to_i64_saturating(self.entries.len()),
             bytes: usize_to_i64_saturating(self.bytes),
             evictions: self.evictions,
-            eviction_reason: if self.last_eviction_reason.is_empty() {
-                "none".to_owned()
-            } else {
-                self.last_eviction_reason.clone()
-            },
+            eviction_reason: self.last_eviction_reason,
         }
     }
 }

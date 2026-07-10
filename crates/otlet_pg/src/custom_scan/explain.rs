@@ -9,6 +9,11 @@ unsafe extern "C-unwind" fn explain_semantic_custom_scan(
         explain_text("Semantic Predicate Owner", "otlet_customscan_executor", es);
         explain_text("Child Semantic Filter", "stripped_before_child_plan", es);
         let state = node.cast::<OtletSemanticCustomScanState>();
+        explain_counter(
+            "Child Plan Attached",
+            u64::from((*state).has_child_plan),
+            es,
+        );
         if !(*state).runtime.is_null() {
             let runtime = &*(*state).runtime;
             explain_semantic_metadata(
@@ -34,6 +39,13 @@ unsafe extern "C-unwind" fn explain_semantic_custom_scan(
             explain_text("Planner Stale Reasons", &runtime.planner_stale_reasons, es);
             explain_text("Count Basis", &runtime.planner_count_basis, es);
             explain_text("Model Cost Source", &runtime.planner_model_cost_source, es);
+            if runtime.planner_path_cost.is_finite() && runtime.planner_path_cost > 0.0 {
+                explain_text(
+                    "Planner Path Cost",
+                    &format!("{:.3}", runtime.planner_path_cost),
+                    es,
+                );
+            }
             explain_counter(
                 "Planner Infer Now Subjects",
                 runtime.planner_infer_decision_rows,
@@ -55,7 +67,9 @@ unsafe extern "C-unwind" fn explain_semantic_custom_scan(
             explain_text(
                 "Preloaded Fresh Subjects / Basis",
                 &fresh_subject_basis_line(
-                    runtime_preloaded_fresh_count(runtime),
+                    runtime
+                        .preloaded_fresh_matches
+                        .saturating_add(runtime.preloaded_fresh_non_matches),
                     &runtime.preloaded_freshness_basis,
                 ),
                 es,
@@ -67,12 +81,17 @@ unsafe extern "C-unwind" fn explain_semantic_custom_scan(
             );
             explain_counter(
                 "Preloaded Stale Subjects",
-                runtime_state_count(runtime, SubjectSemanticState::Stale),
+                runtime.preloaded_stale_subjects,
+                es,
+            );
+            explain_counter(
+                "Preloaded Missing Subjects",
+                runtime.preloaded_missing_subjects,
                 es,
             );
             explain_counter(
                 "Preloaded In Flight Subjects",
-                runtime_state_count(runtime, SubjectSemanticState::InFlight),
+                runtime.preloaded_inflight_subjects,
                 es,
             );
             explain_scan_counters!(
@@ -86,12 +105,10 @@ unsafe extern "C-unwind" fn explain_semantic_custom_scan(
             );
             explain_runtime_trace(runtime, es);
         } else if let Some(private) = custom_private_from_plan(node) {
-            let (planner_stats, policy) =
-                planner_snapshot_from_state(state).unwrap_or_else(|| {
-                    let planner_stats = reload_private_planner_stats(&private);
-                    let policy = semantic_policy_for_selected_path(&planner_stats.selected_path);
-                    (planner_stats, policy)
-                });
+            // Prefer begin-scan snapshots already on the CustomScanState
+            // (pg_cstr + scalars) so EXPLAIN after runtime free avoids rebuilding
+            // a SemanticPlannerStats. Fall back to stashed/SPI plan stats only
+            // when the state snapshot is absent (pre-begin or legacy plans).
             explain_semantic_metadata(
                 SemanticExplainMetadata {
                     index_name: &private.index_name,
@@ -100,31 +117,73 @@ unsafe extern "C-unwind" fn explain_semantic_custom_scan(
                 },
                 es,
             );
-            explain_semantic_policy(
-                policy.auto_policy,
-                policy.allow_refresh,
-                policy.wait_ms,
-                policy.infer_ms,
-                policy.infer_max_rows,
-                infer_now_input_path(policy.infer_ms),
-                source_tuple_provider_from_state(state),
-                es,
-            );
-            explain_text("Planner Selected Path", &planner_stats.selected_path, es);
-            explain_text("Planner Reason", &planner_stats.reason, es);
-            explain_text("Planner Stale Reasons", &planner_stats.stale_reasons, es);
-            explain_text("Count Basis", &planner_stats.count_basis, es);
-            explain_text("Model Cost Source", &planner_stats.model_cost_source, es);
-            explain_counter(
-                "Planner Infer Now Subjects",
-                planner_stats.infer_decision_rows,
-                es,
-            );
-            explain_counter(
-                "Planner Fail Closed Subjects",
-                planner_stats.fail_closed_decision_rows,
-                es,
-            );
+            let model_ms;
+            let infer_decision_rows;
+            if pg_cstr_str((*state).planner_selected_path).is_some() {
+                explain_semantic_policy(
+                    (*state).auto_policy,
+                    (*state).allow_refresh,
+                    (*state).wait_ms,
+                    (*state).infer_ms,
+                    (*state).infer_max_rows,
+                    infer_now_input_path((*state).infer_ms),
+                    source_tuple_provider_from_state(state),
+                    es,
+                );
+                let _ = explain_planner_from_state(state, es);
+                model_ms = if (*state).planner_model_ms.is_finite()
+                    && (*state).planner_model_ms > 0.0
+                {
+                    (*state).planner_model_ms
+                } else {
+                    2500.0
+                };
+                infer_decision_rows = (*state).planner_infer_decision_rows;
+            } else {
+                // Borrow stashed stats when present; SPI reload only for legacy
+                // plans missing both state snapshot and custom_private stash.
+                let reloaded;
+                let planner_stats = if let Some(stats) = private.planner_stats.as_ref() {
+                    stats
+                } else {
+                    reloaded = reload_private_planner_stats(&private);
+                    &reloaded
+                };
+                explain_semantic_policy(
+                    private.auto_policy,
+                    private.allow_refresh,
+                    private.wait_ms,
+                    private.infer_ms,
+                    private.infer_max_rows,
+                    infer_now_input_path(private.infer_ms),
+                    source_tuple_provider_from_state(state),
+                    es,
+                );
+                explain_text("Planner Selected Path", &planner_stats.selected_path, es);
+                explain_text("Planner Reason", &planner_stats.reason, es);
+                explain_text("Planner Stale Reasons", &planner_stats.stale_reasons, es);
+                explain_text("Count Basis", &planner_stats.count_basis, es);
+                explain_text("Model Cost Source", &planner_stats.model_cost_source, es);
+                if planner_stats.path_cost.is_finite() && planner_stats.path_cost > 0.0 {
+                    explain_text(
+                        "Planner Path Cost",
+                        &format!("{:.3}", planner_stats.path_cost),
+                        es,
+                    );
+                }
+                explain_counter(
+                    "Planner Infer Now Subjects",
+                    planner_stats.infer_decision_rows,
+                    es,
+                );
+                explain_counter(
+                    "Planner Fail Closed Subjects",
+                    planner_stats.fail_closed_decision_rows,
+                    es,
+                );
+                model_ms = planner_stats.model_ms;
+                infer_decision_rows = planner_stats.infer_decision_rows;
+            }
             explain_pg_cstr("Source Relation", (*state).source_table, es);
             explain_pg_cstr("Task", (*state).task_name, es);
             explain_pg_cstr("Record Type", (*state).record_type, es);
@@ -151,6 +210,11 @@ unsafe extern "C-unwind" fn explain_semantic_custom_scan(
                 es,
             );
             explain_counter(
+                "Preloaded Missing Subjects",
+                (*state).preloaded_missing_subjects,
+                es,
+            );
+            explain_counter(
                 "Preloaded In Flight Subjects",
                 (*state).preloaded_inflight_subjects,
                 es,
@@ -158,7 +222,7 @@ unsafe extern "C-unwind" fn explain_semantic_custom_scan(
             explain_scan_counters!(
                 &*state,
                 pg_cstr_str((*state).infer_now_last_error),
-                estimated_model_cost_ms(planner_stats.model_ms, planner_stats.infer_decision_rows),
+                estimated_model_cost_ms(model_ms, infer_decision_rows),
                 es
             );
             explain_state_trace(state, es);
@@ -166,48 +230,53 @@ unsafe extern "C-unwind" fn explain_semantic_custom_scan(
     }
 }
 
-unsafe fn planner_snapshot_from_state(
+unsafe fn explain_planner_from_state(
     state: *mut OtletSemanticCustomScanState,
-) -> Option<(SemanticPlannerStats, SemanticAutoPolicy)> {
+    es: *mut pg_sys::ExplainState,
+) -> bool {
     unsafe {
-        let selected_path = pg_cstr_str((*state).planner_selected_path)?.to_owned();
-        Some((
-            SemanticPlannerStats {
-                selected_path,
-                reason: pg_cstr_str((*state).planner_reason)
-                    .unwrap_or("planner snapshot").to_owned(),
-                source_rows: (*state).known_subjects,
-                fresh_matches: (*state).preloaded_fresh_matches,
-                fresh_non_matches: (*state).preloaded_fresh_non_matches,
-                stale_rows: (*state).preloaded_stale_subjects,
-                missing_rows: 0,
-                inflight_rows: (*state).preloaded_inflight_subjects,
-                cache_reusable_rows: 0,
-                infer_decision_rows: (*state).planner_infer_decision_rows,
-                fail_closed_decision_rows: (*state).planner_fail_closed_decision_rows,
-                model_ms: if (*state).planner_model_ms.is_finite()
-                    && (*state).planner_model_ms > 0.0
-                {
-                    (*state).planner_model_ms
-                } else {
-                    2500.0
-                },
-                model_cost_source: pg_cstr_str((*state).planner_model_cost_source)
-                    .unwrap_or("static_fallback").to_owned(),
-                path_cost: 0.0,
-                stale_reasons: pg_cstr_str((*state).planner_stale_reasons)
-                    .unwrap_or("{}").to_owned(),
-                count_basis: pg_cstr_str((*state).planner_count_basis)
-                    .unwrap_or("unknown").to_owned(),
-            },
-            SemanticAutoPolicy {
-                auto_policy: (*state).auto_policy,
-                allow_refresh: (*state).allow_refresh,
-                wait_ms: (*state).wait_ms,
-                infer_ms: (*state).infer_ms,
-                infer_max_rows: (*state).infer_max_rows,
-            },
-        ))
+        let Some(selected_path) = pg_cstr_str((*state).planner_selected_path) else {
+            return false;
+        };
+        explain_text("Planner Selected Path", selected_path, es);
+        explain_text(
+            "Planner Reason",
+            pg_cstr_str((*state).planner_reason).unwrap_or("planner snapshot"),
+            es,
+        );
+        explain_text(
+            "Planner Stale Reasons",
+            pg_cstr_str((*state).planner_stale_reasons).unwrap_or("{}"),
+            es,
+        );
+        explain_text(
+            "Count Basis",
+            pg_cstr_str((*state).planner_count_basis).unwrap_or("unknown"),
+            es,
+        );
+        explain_text(
+            "Model Cost Source",
+            pg_cstr_str((*state).planner_model_cost_source).unwrap_or("static_fallback"),
+            es,
+        );
+        if (*state).planner_path_cost.is_finite() && (*state).planner_path_cost > 0.0 {
+            explain_text(
+                "Planner Path Cost",
+                &format!("{:.3}", (*state).planner_path_cost),
+                es,
+            );
+        }
+        explain_counter(
+            "Planner Infer Now Subjects",
+            (*state).planner_infer_decision_rows,
+            es,
+        );
+        explain_counter(
+            "Planner Fail Closed Subjects",
+            (*state).planner_fail_closed_decision_rows,
+            es,
+        );
+        true
     }
 }
 
@@ -319,22 +388,9 @@ unsafe fn explain_counter(label: &str, value: u64, es: *mut pg_sys::ExplainState
     }
 }
 
-fn runtime_state_count(runtime: &RuntimeState, state: SubjectSemanticState) -> u64 {
-    runtime
-        .semantic_states
-        .values()
-        .filter(|value| **value == state)
-        .count() as u64
-}
-
 fn fresh_subject_basis_line(count: u64, basis: &str) -> String {
     let basis = if basis.trim().is_empty() { "{}" } else { basis };
     format!("{count} {basis}")
-}
-
-fn runtime_preloaded_fresh_count(runtime: &RuntimeState) -> u64 {
-    runtime_state_count(runtime, SubjectSemanticState::FreshMatch)
-        .saturating_add(runtime_state_count(runtime, SubjectSemanticState::FreshNonMatch))
 }
 
 unsafe fn explain_runtime_trace(runtime: &RuntimeState, es: *mut pg_sys::ExplainState) {

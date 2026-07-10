@@ -20,7 +20,7 @@ unsafe extern "C-unwind" fn begin_semantic_custom_scan(
 ) {
     unsafe {
         let state = node.cast::<OtletSemanticCustomScanState>();
-        let Some(private) = custom_private_from_plan(node) else {
+        let Some(mut private) = custom_private_from_plan(node) else {
             return;
         };
         let relation = (*node).ss.ss_currentRelation;
@@ -48,30 +48,66 @@ unsafe extern "C-unwind" fn begin_semantic_custom_scan(
         if child_plan.is_null() {
             pgrx::error!("otlet semantic CustomScan requires a PG-created child plan");
         }
-        let loaded_state = load_semantic_states(
+        // Take plan-time stash once; begin-scan is the sole consumer.
+        let mut stashed_stats = private.planner_stats.take();
+        // Join preload needs stale_reasons as an SPI arg. Move it out of the
+        // stash; the join SELECT returns $3 into loaded_state.stale_reasons and
+        // planner_stats_from_loaded_state overlays it back for EXPLAIN.
+        let stashed_stale_reasons = if private.index_kind == SemanticIndexKind::Join {
+            stashed_stats
+                .as_mut()
+                .map(|stats| std::mem::take(&mut stats.stale_reasons))
+        } else {
+            None
+        };
+        let stashed_model_ms = stashed_stats.as_ref().map(|stats| stats.model_ms);
+        let stashed_model_cost_source = stashed_stats
+            .as_mut()
+            .map(|stats| std::mem::take(&mut stats.model_cost_source));
+        let stashed_source_rows = stashed_stats.as_ref().map(|stats| stats.source_rows);
+        let stashed_row_meta = private.row_preload_meta.take();
+        let stashed_join_meta = private.join_preload_meta.take();
+        let mut loaded_state = load_semantic_states(
             private.index_kind,
             &private.index_name,
             &private.expected_json,
+            BeginScanStash {
+                stale_reasons: stashed_stale_reasons,
+                row_meta: stashed_row_meta,
+                join_meta: stashed_join_meta,
+                model_ms: stashed_model_ms,
+                model_cost_source: stashed_model_cost_source,
+                source_rows: stashed_source_rows,
+            },
         )
         .unwrap_or_else(|err| pgrx::error!("{err}"));
-        let planner_stats = reload_private_planner_stats(&private);
-        let policy = semantic_policy_for_selected_path(&planner_stats.selected_path);
+        // Prefer plan-time vocabulary from custom_private; overlay exact preload
+        // counts. Keep executor knobs from plan-time private data.
+        let (planner_stats, preloaded_counts) =
+            planner_stats_from_loaded_state(&private, stashed_stats, &mut loaded_state);
+        let policy = SemanticAutoPolicy {
+            auto_policy: private.auto_policy,
+            allow_refresh: private.allow_refresh,
+            wait_ms: private.wait_ms,
+            infer_ms: private.infer_ms,
+            infer_max_rows: private.infer_max_rows,
+        };
         snapshot_planner_state(state, &planner_stats, &policy);
+        (*state).index_kind = private.index_kind;
+        // Child plan is required above; snapshot for EXPLAIN after runtime free.
+        (*state).has_child_plan = !child_plan.is_null();
         (*state).source_table = pg_cstr(&loaded_state.source_table);
         (*state).task_name = pg_cstr(&loaded_state.task_name);
         (*state).record_type = pg_cstr(&loaded_state.record_type);
         (*state).known_subjects = loaded_state.subjects.len() as u64;
-        (*state).preloaded_fresh_matches =
-            subject_state_count(&loaded_state.subjects, SubjectSemanticState::FreshMatch);
-        (*state).preloaded_fresh_non_matches =
-            subject_state_count(&loaded_state.subjects, SubjectSemanticState::FreshNonMatch);
+        (*state).preloaded_fresh_matches = preloaded_counts.fresh_matches;
+        (*state).preloaded_fresh_non_matches = preloaded_counts.fresh_non_matches;
         (*state).preloaded_freshness_basis = pg_cstr(&loaded_state.freshness_basis_counts);
         (*state).emitted_freshness_basis = pg_cstr("");
-        (*state).preloaded_stale_subjects =
-            subject_state_count(&loaded_state.subjects, SubjectSemanticState::Stale);
-        (*state).preloaded_inflight_subjects =
-            subject_state_count(&loaded_state.subjects, SubjectSemanticState::InFlight);
-        (*state).runtime = Box::into_raw(Box::new(RuntimeState {
+        (*state).preloaded_stale_subjects = preloaded_counts.stale;
+        (*state).preloaded_missing_subjects = preloaded_counts.missing;
+        (*state).preloaded_inflight_subjects = preloaded_counts.inflight;
+        let mut runtime = RuntimeState {
             index_kind: private.index_kind,
             index_name: private.index_name,
             expected_json: private.expected_json,
@@ -86,13 +122,21 @@ unsafe extern "C-unwind" fn begin_semantic_custom_scan(
             planner_model_cost_source: planner_stats.model_cost_source,
             planner_model_ms: planner_stats.model_ms,
             planner_count_basis: planner_stats.count_basis,
+            planner_path_cost: planner_stats.path_cost,
             planner_infer_decision_rows: planner_stats.infer_decision_rows,
             planner_fail_closed_decision_rows: planner_stats.fail_closed_decision_rows,
             source_table: loaded_state.source_table,
             task_name: loaded_state.task_name,
             record_type: loaded_state.record_type,
+            // Filled after child_plan is set so provider/policy strings match runtime.
+            infer_now_executor_context_json: String::new(),
             input_columns: private.input_columns,
             preloaded_freshness_basis: loaded_state.freshness_basis_counts,
+            preloaded_fresh_matches: preloaded_counts.fresh_matches,
+            preloaded_fresh_non_matches: preloaded_counts.fresh_non_matches,
+            preloaded_stale_subjects: preloaded_counts.stale,
+            preloaded_missing_subjects: preloaded_counts.missing,
+            preloaded_inflight_subjects: preloaded_counts.inflight,
             source_reltype: if relation.is_null() {
                 pg_sys::InvalidOid
             } else {
@@ -100,6 +144,7 @@ unsafe extern "C-unwind" fn begin_semantic_custom_scan(
             },
             subject_attno: private.subject_attno,
             subject_typid: private.subject_typid,
+            join_input_attno: resolve_join_input_attno(child_plan, private.index_kind),
             child_plan,
             owns_child_plan,
             semantic_states: loaded_state.subjects,
@@ -136,9 +181,18 @@ unsafe extern "C-unwind" fn begin_semantic_custom_scan(
             infer_trace_detailed_captured_tokens: 0,
             infer_trace_detailed_top_k: 0,
             child_plan_rows: 0,
-            queued_refresh_subjects: HashSet::new(),
-            pending_output_rows: VecDeque::new(),
-        }));
+            queued_refresh_subjects: HashSet::with_capacity(
+                usize::try_from(private.infer_max_rows.max(8)).unwrap_or(8),
+            ),
+            pending_output_rows: VecDeque::with_capacity(
+                usize::try_from(private.infer_max_rows)
+                    .unwrap_or(0)
+                    .max(1),
+            ),
+        };
+        runtime.infer_now_executor_context_json =
+            freeze_infer_now_executor_context_json(&runtime);
+        (*state).runtime = Box::into_raw(Box::new(runtime));
     }
 }
 
@@ -159,6 +213,7 @@ unsafe fn snapshot_planner_state(
         (*state).planner_model_cost_source = pg_cstr(&planner_stats.model_cost_source);
         (*state).planner_model_ms = planner_stats.model_ms;
         (*state).planner_count_basis = pg_cstr(&planner_stats.count_basis);
+        (*state).planner_path_cost = planner_stats.path_cost;
         (*state).planner_infer_decision_rows = planner_stats.infer_decision_rows;
         (*state).planner_fail_closed_decision_rows = planner_stats.fail_closed_decision_rows;
     }
@@ -266,7 +321,7 @@ unsafe fn resolve_stale_or_missing_subject(
         if should_prefetch_infer_now(runtime) {
             if let Err(err) = prefetch_infer_now_batch(node, runtime, subject_id, slot) {
                 runtime.infer_now_failures = runtime.infer_now_failures.saturating_add(1);
-                runtime.infer_now_last_error = truncate_infer_now_error(&err);
+                truncate_infer_now_error_into(&mut runtime.infer_now_last_error, &err);
                 pgrx::warning!("otlet semantic CustomScan infer-now batch failed: {err}");
             }
             return emit_buffered_row(node, runtime);

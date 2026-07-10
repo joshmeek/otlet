@@ -203,6 +203,7 @@ WITH action_items AS (
     FROM otlet.semantic_materializations sm
     WHERE sm.task_name = j.task_name
       AND sm.subject_id = j.subject_id
+      AND (w.record_type IS NULL OR sm.record_type = w.record_type)
     ORDER BY sm.updated_at DESC, sm.id DESC
     LIMIT 1
   ) materialization ON true
@@ -260,6 +261,7 @@ abstention_items AS (
     FROM otlet.semantic_materializations sm
     WHERE sm.task_name = j.task_name
       AND sm.subject_id = j.subject_id
+      AND (w.record_type IS NULL OR sm.record_type = w.record_type)
     ORDER BY sm.updated_at DESC, sm.id DESC
     LIMIT 1
   ) materialization ON true
@@ -318,6 +320,7 @@ direct_rejected_items AS (
     FROM otlet.semantic_materializations sm
     WHERE sm.task_name = j.task_name
       AND sm.subject_id = j.subject_id
+      AND (w.record_type IS NULL OR sm.record_type = w.record_type)
     ORDER BY sm.updated_at DESC, sm.id DESC
     LIMIT 1
   ) materialization ON true

@@ -401,6 +401,17 @@ CREATE UNIQUE INDEX jobs_active_subject_idx
 ON otlet.jobs (task_name, subject_id)
 WHERE status IN ('queued', 'running', 'cancel_requested');
 
+CREATE INDEX jobs_task_status_idx
+ON otlet.jobs (task_name, status);
+
+CREATE INDEX jobs_expired_lease_idx
+ON otlet.jobs (leased_until, id)
+WHERE status IN ('running', 'cancel_requested');
+
+CREATE INDEX jobs_finished_terminal_idx
+ON otlet.jobs (finished_at, id)
+WHERE status IN ('failed', 'canceled');
+
 CREATE TABLE otlet.inference_receipts (
   id bigserial PRIMARY KEY,
   job_id bigint NOT NULL REFERENCES otlet.jobs(id),
@@ -441,6 +452,21 @@ CREATE TABLE otlet.inference_receipts (
 CREATE INDEX inference_receipts_task_model_role_finished_idx
 ON otlet.inference_receipts (task_name, model_name, selection_role, finished_at DESC, id DESC);
 
+CREATE INDEX inference_receipts_job_complete_idx
+ON otlet.inference_receipts (job_id, id DESC)
+WHERE status = 'complete';
+
+CREATE INDEX inference_receipts_job_failed_idx
+ON otlet.inference_receipts (job_id, id DESC)
+WHERE status = 'failed';
+
+CREATE INDEX inference_receipts_job_attempt_idx
+ON otlet.inference_receipts (job_id, attempt_index DESC);
+
+CREATE INDEX inference_receipts_rejected_retention_idx
+ON otlet.inference_receipts (finished_at, id)
+WHERE selection_status = 'rejected' AND raw_output IS NOT NULL;
+
 CREATE TABLE otlet.worker_events (
   id bigserial PRIMARY KEY,
   event_type text NOT NULL,
@@ -450,6 +476,17 @@ CREATE TABLE otlet.worker_events (
   detail jsonb NOT NULL DEFAULT '{}'::jsonb,
   created_at timestamptz NOT NULL DEFAULT now()
 );
+
+CREATE INDEX worker_events_type_created_idx
+ON otlet.worker_events (event_type, created_at DESC, id DESC);
+
+CREATE INDEX worker_events_type_model_created_idx
+ON otlet.worker_events (event_type, (detail ->> 'model_name'), created_at DESC)
+WHERE detail ? 'model_name';
+
+CREATE INDEX worker_events_job_id_idx
+ON otlet.worker_events (job_id)
+WHERE job_id IS NOT NULL;
 
 CREATE TABLE otlet.outputs (
   id bigserial PRIMARY KEY,
@@ -510,6 +547,9 @@ CREATE TABLE otlet.actions (
   CHECK (apply_status IN ('not_applicable', 'applied', 'failed'))
 );
 
+CREATE INDEX actions_job_id_idx
+ON otlet.actions (job_id);
+
 CREATE TABLE otlet.records (
   id bigserial PRIMARY KEY,
   action_id bigint REFERENCES otlet.actions(id),
@@ -542,6 +582,21 @@ ON otlet.eval_labels (source_table, subject_id, source_hash);
 
 CREATE INDEX eval_labels_receipt_idx
 ON otlet.eval_labels (receipt_id, action_id);
+
+CREATE INDEX eval_labels_manual_action_idx
+ON otlet.eval_labels (action_id)
+WHERE label_source = 'manual_correction' AND action_id IS NOT NULL;
+
+CREATE INDEX eval_labels_manual_output_idx
+ON otlet.eval_labels (output_id)
+WHERE label_source = 'manual_correction' AND output_id IS NOT NULL;
+
+CREATE INDEX eval_labels_manual_receipt_idx
+ON otlet.eval_labels (receipt_id)
+WHERE label_source = 'manual_correction' AND receipt_id IS NOT NULL;
+
+CREATE INDEX eval_labels_created_at_idx
+ON otlet.eval_labels (created_at, id);
 
 CREATE TABLE otlet.semantic_materializations (
   id bigserial PRIMARY KEY,
@@ -576,6 +631,13 @@ CREATE TABLE otlet.semantic_materializations (
 
 CREATE INDEX semantic_materializations_lookup_idx
 ON otlet.semantic_materializations (task_name, record_type, stale, subject_id);
+
+CREATE INDEX semantic_materializations_subject_latest_idx
+ON otlet.semantic_materializations (task_name, record_type, subject_id, updated_at DESC, id DESC);
+
+CREATE INDEX semantic_materializations_source_delete_idx
+ON otlet.semantic_materializations (updated_at, id)
+WHERE stale AND stale_reason = 'source_delete';
 
 CREATE INDEX semantic_materializations_source_idx
 ON otlet.semantic_materializations (source_table, subject_id, task_name, record_type, stale);

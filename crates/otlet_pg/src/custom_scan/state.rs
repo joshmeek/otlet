@@ -29,6 +29,7 @@ impl SemanticIndexKind {
 struct OtletSemanticCustomScanState {
     css: pg_sys::CustomScanState,
     runtime: *mut RuntimeState,
+    index_kind: SemanticIndexKind,
     source_table: *mut c_char,
     task_name: *mut c_char,
     record_type: *mut c_char,
@@ -38,6 +39,7 @@ struct OtletSemanticCustomScanState {
     preloaded_freshness_basis: *mut c_char,
     emitted_freshness_basis: *mut c_char,
     preloaded_stale_subjects: u64,
+    preloaded_missing_subjects: u64,
     preloaded_inflight_subjects: u64,
     auto_policy: bool,
     allow_refresh: bool,
@@ -50,6 +52,7 @@ struct OtletSemanticCustomScanState {
     planner_model_cost_source: *mut c_char,
     planner_model_ms: f64,
     planner_count_basis: *mut c_char,
+    planner_path_cost: f64,
     planner_infer_decision_rows: u64,
     planner_fail_closed_decision_rows: u64,
     rows_seen: u64,
@@ -83,6 +86,8 @@ struct OtletSemanticCustomScanState {
     infer_trace_detailed_captured_tokens: u64,
     infer_trace_detailed_top_k: u64,
     child_plan_rows: u64,
+    /// True once begin-scan attached a PG child plan (EXPLAIN provider parity).
+    has_child_plan: bool,
 }
 
 struct RuntimeState {
@@ -100,16 +105,26 @@ struct RuntimeState {
     planner_model_cost_source: String,
     planner_model_ms: f64,
     planner_count_basis: String,
+    planner_path_cost: f64,
     planner_infer_decision_rows: u64,
     planner_fail_closed_decision_rows: u64,
     source_table: String,
     task_name: String,
     record_type: String,
+    /// Frozen once at begin-scan for infer-now receipt stamping (pre-serialized JSON text).
+    infer_now_executor_context_json: String,
     input_columns: Option<Vec<String>>,
     preloaded_freshness_basis: String,
+    preloaded_fresh_matches: u64,
+    preloaded_fresh_non_matches: u64,
+    preloaded_stale_subjects: u64,
+    preloaded_missing_subjects: u64,
+    preloaded_inflight_subjects: u64,
     source_reltype: pg_sys::Oid,
     subject_attno: i16,
     subject_typid: pg_sys::Oid,
+    // Join child "input" jsonb attnum resolved once at begin-scan (0 = unset).
+    join_input_attno: i16,
     child_plan: *mut pg_sys::PlanState,
     owns_child_plan: bool,
     semantic_states: HashMap<String, SubjectSemanticState>,
@@ -192,11 +207,29 @@ enum SemanticResolution {
     Unresolved,
 }
 
+struct RowPreloadMeta {
+    source_table: String,
+    subject_column: String,
+    input_columns_sql: String,
+    input_shaping_sql: String,
+    task_name: String,
+    record_type: String,
+    contract_hash: String,
+}
+
+struct JoinPreloadMeta {
+    task_name: String,
+    record_type: String,
+}
+
 struct LoadedSemanticState {
     source_table: String,
     task_name: String,
     record_type: String,
     freshness_basis_counts: String,
+    stale_reasons: String,
+    model_ms: f64,
+    model_cost_source: String,
     freshness_basis_by_subject: HashMap<String, String>,
     subjects: HashMap<String, SubjectSemanticState>,
 }
@@ -208,6 +241,7 @@ impl SubjectSemanticState {
             "fresh_non_match" => Some(Self::FreshNonMatch),
             "stale" => Some(Self::Stale),
             "in_flight" => Some(Self::InFlight),
+            "missing" => Some(Self::Missing),
             _ => None,
         }
     }
@@ -227,6 +261,8 @@ struct SemanticMatchPredicate {
     restrict_info: *mut pg_sys::RestrictInfo,
     estimated_rows: f64,
     input_columns: Option<Vec<String>>,
+    row_preload_meta: Option<RowPreloadMeta>,
+    join_preload_meta: Option<JoinPreloadMeta>,
     planner_stats: SemanticPlannerStats,
 }
 

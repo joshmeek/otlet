@@ -34,37 +34,26 @@ fn source_rows_sql(
 ) -> String {
     let subject_identifier = sql_identifier(subject_column);
     let source_table_literal = sql_literal(source_table);
+    // Build the MVCC+row envelope once; both hashes read the same object.
     format!(
-        "SELECT (src.{subject_identifier})::text AS subject_id, \
-                md5(jsonb_build_object( \
-                  '_otlet_mvcc', jsonb_build_object( \
+        "SELECT projected.subject_id, \
+                md5(projected.input_obj::text) AS source_hash, \
+                otlet.semantic_content_hash(projected.input_obj, {input_shaping_sql}::jsonb) AS content_hash \
+         FROM ( \
+           SELECT (src.{subject_identifier})::text AS subject_id, \
+                  jsonb_build_object( \
+                    '_otlet_mvcc', jsonb_build_object( \
+                      'table', {source_table_literal}, \
+                      'subject_id', (src.{subject_identifier})::text, \
+                      'ctid', src.ctid::text, \
+                      'xmin', src.xmin::text \
+                    ), \
                     'table', {source_table_literal}, \
-                    'subject_id', (src.{subject_identifier})::text, \
-                    'ctid', src.ctid::text, \
-                    'xmin', src.xmin::text \
-                  ), \
-                  'table', {source_table_literal}, \
-                  'row', otlet.semantic_project_row(to_jsonb(src), {input_columns_sql}::text[]) \
-                )::text) AS source_hash, \
-                otlet.semantic_content_hash(jsonb_build_object( \
-                  '_otlet_mvcc', jsonb_build_object( \
-                    'table', {source_table_literal}, \
-                    'subject_id', (src.{subject_identifier})::text, \
-                    'ctid', src.ctid::text, \
-                    'xmin', src.xmin::text \
-                  ), \
-                  'table', {source_table_literal}, \
-                  'row', otlet.semantic_project_row(to_jsonb(src), {input_columns_sql}::text[]) \
-                ), {input_shaping_sql}::jsonb) AS content_hash \
-         FROM {source_table} AS src"
+                    'row', otlet.semantic_project_row(to_jsonb(src), {input_columns_sql}::text[]) \
+                  ) AS input_obj \
+           FROM {source_table} AS src \
+         ) projected"
     )
-}
-
-fn row_predicate_match_sql(
-    body_expr: &str,
-    expected_json: &str,
-) -> String {
-    format!("{body_expr} @> {}::jsonb", sql_literal(expected_json))
 }
 
 fn to_string<E: std::fmt::Display>(err: E) -> String {

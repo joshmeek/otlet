@@ -19,7 +19,7 @@ fn generation_trace_summary(
         "output_schema_hash": context.output_schema_hash,
         "runtime_options_hash": context.runtime_options_hash,
         "runtime_options_status": context.runtime_options_status,
-        "model_fingerprint_hash": context.model_fingerprint_hash,
+        "model_fingerprint_hash": context.model_fingerprint_hash.as_ref(),
         "raw_output_hash": raw_output_hash,
         "prompt_tokens": metrics.prompt_tokens,
         "prompt_cached_tokens_before": metrics.prompt_cached_tokens_before,
@@ -225,9 +225,13 @@ unsafe fn probability_sample(
         let mut top_logit = f64::NEG_INFINITY;
         let mut denominator = 0.0_f64;
         let mut rank = 1_i64;
-        let mut top: Vec<(i64, f64)> = Vec::new();
         let track_top = top_k > 0;
         let top_limit = usize::try_from(top_k).unwrap_or(usize::MAX);
+        let mut top: Vec<(i64, f64)> = if track_top {
+            Vec::with_capacity(top_limit.min(16))
+        } else {
+            Vec::new()
+        };
         for index in 0..usize::try_from(vocab_tokens).ok()? {
             let logit = f64::from(*logits.add(index));
             if !logit.is_finite() {
@@ -317,15 +321,20 @@ struct DetailedGenerationTrace {
 }
 
 impl DetailedGenerationTrace {
-    const fn new(options: &crate::runtime::RuntimeOptions) -> Self {
+    fn new(options: &crate::runtime::RuntimeOptions) -> Self {
+        let capacity = if options.generation_trace {
+            usize::try_from(options.generation_trace_max_tokens).unwrap_or(0)
+        } else {
+            0
+        };
         Self {
             enabled: options.generation_trace,
             max_tokens: options.generation_trace_max_tokens,
             top_k: options.generation_trace_top_k,
-            steps: Vec::new(),
+            steps: Vec::with_capacity(capacity),
             skipped_tokens: 0,
-            chosen_token_ids: Vec::new(),
-            chosen_text: String::new(),
+            chosen_token_ids: Vec::with_capacity(capacity),
+            chosen_text: String::with_capacity(capacity.saturating_mul(4)),
         }
     }
 

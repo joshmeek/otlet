@@ -14,7 +14,7 @@ const SUPPORTED_RUNTIME_OPTIONS: &[&str] = &[
 ];
 
 pub(crate) struct RuntimeOptions {
-    pub(crate) reasoning: String,
+    pub(crate) reasoning: &'static str,
     pub(crate) max_tokens: u64,
     pub(crate) inference_cache: bool,
     pub(crate) max_worker_rss_bytes: u64,
@@ -28,7 +28,7 @@ pub(crate) struct RuntimeOptions {
 impl Default for RuntimeOptions {
     fn default() -> Self {
         Self {
-            reasoning: "off".to_owned(),
+            reasoning: "off",
             max_tokens: 512,
             inference_cache: true,
             max_worker_rss_bytes: 0,
@@ -57,10 +57,11 @@ pub(crate) fn parse_runtime_options(value: &Value) -> Result<RuntimeOptions, Str
         let reasoning = value
             .as_str()
             .ok_or("runtime_options.reasoning must be a string")?;
-        if !matches!(reasoning, "on" | "off") {
-            return Err("runtime_options.reasoning must be on or off".to_owned());
-        }
-        reasoning.clone_into(&mut options.reasoning);
+        options.reasoning = match reasoning {
+            "on" => "on",
+            "off" => "off",
+            _ => return Err("runtime_options.reasoning must be on or off".to_owned()),
+        };
     }
 
     if let Some(value) = object.get("max_tokens") {
@@ -171,16 +172,15 @@ pub(crate) fn runtime_option_status(value: &Value) -> Value {
             "rejected": ["runtime_options"]
         });
     };
-    let defaulted = SUPPORTED_RUNTIME_OPTIONS
-        .iter()
-        .filter(|key| !object.contains_key(**key))
-        .copied()
-        .collect::<Vec<_>>();
-    let honored = SUPPORTED_RUNTIME_OPTIONS
-        .iter()
-        .filter(|key| object.contains_key(**key))
-        .copied()
-        .collect::<Vec<_>>();
+    let mut honored = Vec::with_capacity(SUPPORTED_RUNTIME_OPTIONS.len());
+    let mut defaulted = Vec::with_capacity(SUPPORTED_RUNTIME_OPTIONS.len());
+    for key in SUPPORTED_RUNTIME_OPTIONS {
+        if object.contains_key(*key) {
+            honored.push(*key);
+        } else {
+            defaulted.push(*key);
+        }
+    }
     json!({
         "policy": "linked_runtime_rejects_unsupported_non_default_options_no_silent_ignore",
         "honored": honored,

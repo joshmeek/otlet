@@ -293,12 +293,11 @@ BEGIN
     RETURN 0;
   END IF;
 
+  -- outputs_one_per_job_idx guarantees at most one row per job.
   SELECT *
   INTO output_row
   FROM otlet.outputs o
-  WHERE o.job_id = job_row.id
-  ORDER BY o.id DESC
-  LIMIT 1;
+  WHERE o.job_id = job_row.id;
 
   IF NOT FOUND THEN
     RETURN 0;

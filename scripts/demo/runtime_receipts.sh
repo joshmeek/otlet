@@ -16,13 +16,14 @@ SQL
 attempt_timeout_failed="0"
 attempt_timeout_complete="0"
 for _ in $(seq 1 180); do
-  attempt_timeout_state="$(psql_value "
+  attempt_timeout_state="$(psql_exec -qAt -v task_name="$attempt_timeout_task" <<'SQL'
 SELECT count(*) FILTER (WHERE status IN ('queued','running','cancel_requested'))::text || '|' ||
        count(*) FILTER (WHERE status = 'failed')::text || '|' ||
        count(*) FILTER (WHERE status = 'complete')::text
 FROM otlet.jobs
-WHERE task_name = '$attempt_timeout_task';
-")"
+WHERE task_name = :'task_name';
+SQL
+)"
   attempt_timeout_failed="$(cut -d'|' -f2 <<<"$attempt_timeout_state")"
   attempt_timeout_complete="$(cut -d'|' -f3 <<<"$attempt_timeout_state")"
   if [ "$attempt_timeout_failed" = "1" ]; then
@@ -38,7 +39,9 @@ done
   echo "Timed out waiting for attempt-timeout smoke, complete=$attempt_timeout_complete failed=$attempt_timeout_failed" >&2
   exit 1
 }
-attempt_timeout_contract="$(psql_value "
+attempt_timeout_contract="$(psql_exec -qAt \
+  -v task_name="$attempt_timeout_task" \
+  -v model_name="$strong_model_name" <<'SQL'
 SELECT j.status || '|' ||
        COALESCE(j.error, '') || '|' ||
        COALESCE(s.selection_reason, '') || '|' ||
@@ -48,22 +51,24 @@ SELECT j.status || '|' ||
 FROM otlet.inference_receipt_trace_status s
 JOIN otlet.jobs j ON j.id = s.job_id
 JOIN otlet.runtime_status rs
-  ON rs.model_name = '$strong_model_name'
-WHERE s.task_name = '$attempt_timeout_task'
+  ON rs.model_name = :'model_name'
+WHERE s.task_name = :'task_name'
 ORDER BY s.receipt_id DESC
 LIMIT 1;
-")"
+SQL
+)"
 echo "attempt_timeout_contract=$attempt_timeout_contract"
 [ "$attempt_timeout_contract" = "failed|attempt_timeout|attempt_timeout|failed|ready|ready" ] || {
   echo "Expected attempt timeout to fail cleanly with healthy worker, got $attempt_timeout_contract" >&2
   exit 1
 }
-attempt_timeout_clamp_contract="$(psql_value "
-SELECT otlet.effective_task_max_attempt_ms('{\"max_attempt_ms\":1}'::jsonb, max_attempt_ms)::text || '|' ||
+attempt_timeout_clamp_contract="$(psql_exec -qAt <<'SQL'
+SELECT otlet.effective_task_max_attempt_ms('{"max_attempt_ms":1}'::jsonb, max_attempt_ms)::text || '|' ||
        otlet.effective_task_max_attempt_ms('{}'::jsonb, max_attempt_ms)::text || '|' ||
-       otlet.effective_task_max_attempt_ms('{\"max_attempt_ms\":999999999}'::jsonb, max_attempt_ms)::text
+       otlet.effective_task_max_attempt_ms('{"max_attempt_ms":999999999}'::jsonb, max_attempt_ms)::text
 FROM otlet.production_policy_status;
-")"
+SQL
+)"
 echo "attempt_timeout_clamp_contract=$attempt_timeout_clamp_contract"
 [ "$attempt_timeout_clamp_contract" = "1|300000|300000" ] || {
   echo "Expected per-task timeout clamp to leave default/global budget unaffected, got $attempt_timeout_clamp_contract" >&2
@@ -86,11 +91,13 @@ SELECT otlet.create_task(
 SELECT otlet.run_task(:'task_name');
 SQL
 wait_task_failed "$malformed_schema_task" 1 120 1
-malformed_schema_contract="$(psql_value "
+malformed_schema_contract="$(psql_exec -qAt \
+  -v task_name="$malformed_schema_task" \
+  -v model_name="$strong_model_name" <<'SQL'
 WITH job_row AS (
   SELECT id, status, error
   FROM otlet.jobs
-  WHERE task_name = '$malformed_schema_task'
+  WHERE task_name = :'task_name'
   ORDER BY id DESC
   LIMIT 1
 ),
@@ -114,8 +121,9 @@ SELECT j.status || '|' ||
 FROM job_row j
 CROSS JOIN receipt_row r
 JOIN otlet.runtime_status rs
-  ON rs.model_name = '$strong_model_name';
-")"
+  ON rs.model_name = :'model_name';
+SQL
+)"
 echo "malformed_schema_worker_contract=$malformed_schema_contract"
 [ "$malformed_schema_contract" = "failed|true|failed|failed|direct_attempt_failed|failed|invalid_output_schema|0|ready|ready" ] || {
   echo "Expected malformed schema to produce a clean failed receipt and healthy worker, got $malformed_schema_contract" >&2
@@ -138,11 +146,13 @@ SELECT otlet.create_task(
 SELECT otlet.run_task(:'task_name');
 SQL
 wait_task_failed "$rss_budget_task" 1 240 1
-rss_budget_contract="$(psql_value "
+rss_budget_contract="$(psql_exec -qAt \
+  -v task_name="$rss_budget_task" \
+  -v model_name="$strong_model_name" <<'SQL'
 WITH job_row AS (
   SELECT id, status, error
   FROM otlet.jobs
-  WHERE task_name = '$rss_budget_task'
+  WHERE task_name = :'task_name'
   ORDER BY id DESC
   LIMIT 1
 ),
@@ -166,8 +176,9 @@ SELECT j.status || '|' ||
 FROM job_row j
 CROSS JOIN receipt_row r
 JOIN otlet.runtime_status rs
-  ON rs.model_name = '$strong_model_name';
-")"
+  ON rs.model_name = :'model_name';
+SQL
+)"
 echo "rss_budget_worker_contract=$rss_budget_contract"
 [ "$rss_budget_contract" = "failed|true|failed|failed|direct_attempt_failed|failed|worker_rss_budget_exceeded|0|ready|ready" ] || {
   echo "Expected RSS budget hit to produce a clean failed receipt and healthy worker, got $rss_budget_contract" >&2
@@ -191,11 +202,13 @@ SELECT otlet.create_task(
 SELECT otlet.run_task(:'task_name');
 SQL
 wait_task_failed "$oversized_prompt_task" 1 300 1
-oversized_prompt_contract="$(psql_value "
+oversized_prompt_contract="$(psql_exec -qAt \
+  -v task_name="$oversized_prompt_task" \
+  -v model_name="$strong_model_name" <<'SQL'
 WITH job_row AS (
   SELECT id, status, error
   FROM otlet.jobs
-  WHERE task_name = '$oversized_prompt_task'
+  WHERE task_name = :'task_name'
   ORDER BY id DESC
   LIMIT 1
 ),
@@ -219,8 +232,9 @@ SELECT j.status || '|' ||
 FROM job_row j
 CROSS JOIN receipt_row r
 JOIN otlet.runtime_status rs
-  ON rs.model_name = '$strong_model_name';
-")"
+  ON rs.model_name = :'model_name';
+SQL
+)"
 echo "oversized_prompt_worker_contract=$oversized_prompt_contract"
 require_regex "$oversized_prompt_contract" '^failed\|true\|failed\|failed\|direct_attempt_failed\|failed\|prompt(_and_generation)?_exceed(s_context_window|_context_window)\|0\|ready\|ready$' "Expected oversized prompt to produce a clean failed receipt and healthy worker"
 
@@ -242,12 +256,24 @@ SELECT otlet.run_task(:'task_name');
 SQL
 cancel_decode_job_id=""
 for _ in $(seq 1 300); do
-  cancel_decode_job_id="$(psql_value "SELECT id FROM otlet.jobs WHERE task_name = '$cancel_decode_task' AND status = 'running' ORDER BY id DESC LIMIT 1;")"
+  cancel_decode_job_id="$(psql_exec -qAt -v task_name="$cancel_decode_task" <<'SQL'
+SELECT id FROM otlet.jobs
+WHERE task_name = :'task_name' AND status = 'running'
+ORDER BY id DESC LIMIT 1;
+SQL
+)"
   if [ -n "$cancel_decode_job_id" ]; then
-    psql_value "SELECT count(*) FROM otlet.cancel_job($cancel_decode_job_id, 'demo cancel mid-decode');" >/dev/null
+    psql_exec -qAt -v job_id="$cancel_decode_job_id" >/dev/null <<'SQL'
+SELECT count(*) FROM otlet.cancel_job(:'job_id'::bigint, 'demo cancel mid-decode');
+SQL
     break
   fi
-  cancel_decode_terminal="$(psql_value "SELECT COALESCE(max(status), '') FROM otlet.jobs WHERE task_name = '$cancel_decode_task' AND status IN ('complete','failed','canceled');")"
+  cancel_decode_terminal="$(psql_exec -qAt -v task_name="$cancel_decode_task" <<'SQL'
+SELECT COALESCE(max(status), '') FROM otlet.jobs
+WHERE task_name = :'task_name'
+  AND status IN ('complete','failed','canceled');
+SQL
+)"
   if [ -n "$cancel_decode_terminal" ]; then
     echo "Expected cancel smoke to reach running state before terminal status, got $cancel_decode_terminal" >&2
     exit 1
@@ -259,11 +285,13 @@ done
   exit 1
 }
 wait_task_failed "$cancel_decode_task" 1 240 1
-cancel_decode_contract="$(psql_value "
+cancel_decode_contract="$(psql_exec -qAt \
+  -v task_name="$cancel_decode_task" \
+  -v model_name="$strong_model_name" <<'SQL'
 WITH job_row AS (
   SELECT id, status, error
   FROM otlet.jobs
-  WHERE task_name = '$cancel_decode_task'
+  WHERE task_name = :'task_name'
   ORDER BY id DESC
   LIMIT 1
 ),
@@ -286,8 +314,9 @@ SELECT j.status || '|' ||
 FROM job_row j
 CROSS JOIN receipt_row r
 JOIN otlet.runtime_status rs
-  ON rs.model_name = '$strong_model_name';
-")"
+  ON rs.model_name = :'model_name';
+SQL
+)"
 echo "cancel_decode_worker_contract=$cancel_decode_contract"
 [ "$cancel_decode_contract" = "canceled|true|canceled|failed|canceled||0|ready|ready" ] || {
   echo "Expected mid-decode cancel to produce a clean canceled receipt and healthy worker, got $cancel_decode_contract" >&2
@@ -332,11 +361,11 @@ SELECT otlet.fail_job(
 )
 FROM invalid_json_claim;
 SQL
-invalid_json_contract="$(psql_value "
+invalid_json_contract="$(psql_exec -qAt -v task_name="$invalid_json_task" <<'SQL'
 WITH job_row AS (
   SELECT id, status, error
   FROM otlet.jobs
-  WHERE task_name = '$invalid_json_task'
+  WHERE task_name = :'task_name'
   ORDER BY id DESC
   LIMIT 1
 ),
@@ -364,7 +393,8 @@ SELECT j.status || '|' ||
        (SELECT materialization_count FROM materialized)::text
 FROM job_row j
 CROSS JOIN receipt_row r;
-")"
+SQL
+)"
 echo "invalid_json_safety_contract=$invalid_json_contract"
 [ "$invalid_json_contract" = "failed|true|failed|failed|failed|0|0|0" ] || {
   echo "Expected invalid JSON to leave only a failed receipt, got $invalid_json_contract" >&2
@@ -437,27 +467,27 @@ SELECT otlet.fail_job(
 FROM inserted
 JOIN output_envelope_cases cases USING (subject_id);
 SQL
-output_envelope_contract="$(psql_value "
+output_envelope_contract="$(psql_exec -qAt -v task_name="$output_envelope_task" <<'SQL'
 WITH cases(subject_id, expected_error, raw_output) AS (
   VALUES
     (
       'markdown-fence',
-      \$err\$invalid model JSON: markdown fences are not allowed: \`\`\`json
-{\"output\":{\"status\":\"ok\"},\"actions\":[]}
-\`\`\`\$err\$,
-      \$raw\$\`\`\`json
-{\"output\":{\"status\":\"ok\"},\"actions\":[]}
-\`\`\`\$raw\$
+      $err$invalid model JSON: markdown fences are not allowed: ```json
+{"output":{"status":"ok"},"actions":[]}
+```$err$,
+      $raw$```json
+{"output":{"status":"ok"},"actions":[]}
+```$raw$
     ),
     (
       'extra-top-level',
       'model JSON unsupported top-level key: extra',
-      '{\"output\":{\"status\":\"ok\"},\"actions\":[],\"extra\":true}'
+      '{"output":{"status":"ok"},"actions":[],"extra":true}'
     ),
     (
       'non-object-action',
       'model JSON actions must contain objects',
-      '{\"output\":{\"status\":\"ok\"},\"actions\":[\"bad\"]}'
+      '{"output":{"status":"ok"},"actions":["bad"]}'
     )
 ), rows AS (
   SELECT c.subject_id,
@@ -474,7 +504,7 @@ WITH cases(subject_id, expected_error, raw_output) AS (
          r.raw_output_hash
   FROM cases c
   JOIN otlet.jobs j
-    ON j.task_name = '$output_envelope_task'
+    ON j.task_name = :'task_name'
    AND j.subject_id = c.subject_id
   JOIN otlet.inference_receipts r ON r.job_id = j.id
 )
@@ -486,7 +516,8 @@ SELECT count(*) FILTER (WHERE subject_id = 'markdown-fence' AND job_error = expe
        (SELECT count(*) FROM otlet.outputs WHERE job_id IN (SELECT job_id FROM rows))::text || '|' ||
        (SELECT count(*) FROM otlet.actions WHERE job_id IN (SELECT job_id FROM rows))::text
 FROM rows;
-")"
+SQL
+)"
 echo "output_envelope_contract=$output_envelope_contract"
 [ "$output_envelope_contract" = "1|1|1|true|true|0|0" ] || {
   echo "Expected strict output envelope failures with raw output hashes, got $output_envelope_contract" >&2
@@ -528,11 +559,11 @@ SELECT otlet.complete_job(
 )
 FROM hallucinated_action_claim;
 SQL
-hallucinated_action_contract="$(psql_value "
+hallucinated_action_contract="$(psql_exec -qAt -v task_name="$hallucinated_action_task" <<'SQL'
 WITH job_row AS (
   SELECT id
   FROM otlet.jobs
-  WHERE task_name = '$hallucinated_action_task'
+  WHERE task_name = :'task_name'
   ORDER BY id DESC
   LIMIT 1
 )
@@ -540,15 +571,16 @@ SELECT (SELECT count(*) FROM otlet.outputs WHERE job_id = j.id)::text || '|' ||
        COALESCE((SELECT status || '|' || COALESCE(error, '') FROM otlet.actions WHERE job_id = j.id ORDER BY id DESC LIMIT 1), '') || '|' ||
        (SELECT count(*) FROM otlet.records r JOIN otlet.actions a ON a.id = r.action_id WHERE a.job_id = j.id)::text || '|' ||
        COALESCE((
-         SELECT (r.raw_output = '{\"output\":{\"status\":\"ok\"},\"actions\":[{\"type\":\"invented_action\",\"body\":{\"subject_id\":\"hallucinated-action-1\",\"text\":\"no record\"}}]}' AND
-                 r.raw_output_hash = md5('{\"output\":{\"status\":\"ok\"},\"actions\":[{\"type\":\"invented_action\",\"body\":{\"subject_id\":\"hallucinated-action-1\",\"text\":\"no record\"}}]}'))::text
+         SELECT (r.raw_output = '{"output":{"status":"ok"},"actions":[{"type":"invented_action","body":{"subject_id":"hallucinated-action-1","text":"no record"}}]}' AND
+                 r.raw_output_hash = md5('{"output":{"status":"ok"},"actions":[{"type":"invented_action","body":{"subject_id":"hallucinated-action-1","text":"no record"}}]}'))::text
          FROM otlet.inference_receipts r
          WHERE r.job_id = j.id
          ORDER BY r.id DESC
          LIMIT 1
        ), 'false')
 FROM job_row j;
-")"
+SQL
+)"
 echo "hallucinated_action_safety_contract=$hallucinated_action_contract"
 [ "$hallucinated_action_contract" = "1|rejected|unsupported action type|0|true" ] || {
   echo "Expected hallucinated action type to be rejected without a record, got $hallucinated_action_contract" >&2

@@ -123,11 +123,12 @@ CROSS JOIN LATERAL (
 ) evidence;
 SQL
 
-source_rows_before="$(psql_value "
+source_rows_before="$(psql_exec -qAt <<'SQL'
 SELECT count(*)::text || '|' ||
        md5(string_agg(to_jsonb(v)::text, ',' ORDER BY v.id))
 FROM public.otlet_demo_vendor_entity v;
-")"
+SQL
+)"
 
 psql_exec \
   -v cheap_model_name="$cheap_model_name" \
@@ -164,68 +165,75 @@ SELECT otlet.run_task(:'task_name');
 SQL
 wait_task_complete "$entity_task" 4 1800 1
 
-entity_contract="$(psql_value "
+entity_contract="$(psql_exec -qAt -v task_name="$entity_task" <<'SQL'
 SELECT count(*) FILTER (WHERE r.status = 'complete')::text || '|' ||
        COALESCE(max(r.output->>'match') FILTER (WHERE r.subject_id = 'vendor-1001:vendor-42'), '') || '|' ||
        COALESCE(max(r.output->>'match') FILTER (WHERE r.subject_id = 'vendor-1001:vendor-77'), '') || '|' ||
        count(*) FILTER (WHERE r.receipt_id IS NOT NULL)::text || '|' ||
        count(*) FILTER (WHERE r.schema_validation_status = 'passed')::text
 FROM otlet.runs r
-WHERE r.task_name = '$entity_task';
-")"
+WHERE r.task_name = :'task_name';
+SQL
+)"
 echo "entity_resolution_contract=$entity_contract"
 [ "$entity_contract" = "4|same_entity|different_entity|4|4" ] || {
   echo "Entity-resolution proof failed: $entity_contract" >&2
   exit 1
 }
 
-model_selection_policy_contract="$(psql_value "
+model_selection_policy_contract="$(psql_exec -qAt -v task_name="$entity_task" <<'SQL'
 SELECT task_name || '|' || cheap_model_name || '|' || strong_model_name || '|' ||
        COALESCE(task_max_attempt_ms::text, '') || '|' ||
        policy_max_attempt_ms::text || '|' ||
        effective_max_attempt_ms::text
 FROM otlet.model_selection_policy_status
-WHERE task_name = '$entity_task';
-")"
+WHERE task_name = :'task_name';
+SQL
+)"
 echo "model_selection_policy_contract=$model_selection_policy_contract"
 [ "$model_selection_policy_contract" = "$entity_task|$cheap_model_name|$strong_model_name||300000|300000" ] || {
   echo "Expected model selection policy contract, got $model_selection_policy_contract" >&2
   exit 1
 }
 
-model_selection_attempts="$(psql_value "
+model_selection_attempts="$(psql_exec -qAt -v task_name="$entity_task" <<'SQL'
 SELECT subject_id || '|' || attempt_index::text || '|' || selection_role || '|' ||
        selection_status || '|' || model_name || '|' ||
        COALESCE(output->>'confidence', '') || '|' || COALESCE(output->>'match', '')
 FROM otlet.model_selection_attempts
-WHERE task_name = '$entity_task'
+WHERE task_name = :'task_name'
 ORDER BY subject_id, attempt_index;
-")"
+SQL
+)"
 while IFS= read -r line; do
   [ -n "$line" ] && echo "model_selection_attempt_contract=$line"
 done <<<"$model_selection_attempts"
 
-model_selection_status_contract="$(psql_value "
+model_selection_status_contract="$(psql_exec -qAt -v task_name="$entity_task" <<'SQL'
 SELECT (cheap_attempts >= 1)::text || '|' ||
        (strong_accepted >= 1)::text || '|' ||
        (escalated_jobs >= 1)::text || '|' ||
        cheap_attempts::text || '|' ||
        strong_attempts::text
 FROM otlet.model_selection_status
-WHERE task_name = '$entity_task';
-")"
+WHERE task_name = :'task_name';
+SQL
+)"
 echo "model_selection_status_contract=$model_selection_status_contract"
 require_regex "$model_selection_status_contract" '^true\|true\|true\|[1-9][0-9]*\|[1-9][0-9]*$' "Expected cheap attempts, strong acceptance, and escalation"
 
-model_swap_contract="$(psql_value "
+model_swap_contract="$(psql_exec -qAt \
+  -v started_at="$script_started" \
+  -v cheap_model_name="$cheap_model_name" \
+  -v strong_model_name="$strong_model_name" <<'SQL'
 WITH swaps AS (
   SELECT detail
   FROM otlet.worker_events
   WHERE event_type = 'model_swap'
-    AND created_at >= '$script_started'::timestamptz
+    AND created_at >= :'started_at'::timestamptz
 )
-SELECT (count(*) FILTER (WHERE detail ->> 'model_name' = '$cheap_model_name') >= 1)::text || '|' ||
-       (count(*) FILTER (WHERE detail ->> 'model_name' = '$strong_model_name') >= 1)::text || '|' ||
+SELECT (count(*) FILTER (WHERE detail ->> 'model_name' = :'cheap_model_name') >= 1)::text || '|' ||
+       (count(*) FILTER (WHERE detail ->> 'model_name' = :'strong_model_name') >= 1)::text || '|' ||
        COALESCE(bool_and(
          COALESCE((detail ->> 'load_ms')::bigint, -1) >= 0
          AND COALESCE((detail ->> 'model_memory_bytes')::bigint, 0) > 0
@@ -237,14 +245,15 @@ SELECT (count(*) FILTER (WHERE detail ->> 'model_name' = '$cheap_model_name') >=
          )
        ), false)::text
 FROM swaps;
-")"
+SQL
+)"
 echo "model_swap_contract=$model_swap_contract"
 [ "$model_swap_contract" = "true|true|true" ] || {
   echo "Expected model swap events for cheap and strong models with memory evidence, got $model_swap_contract" >&2
   exit 1
 }
 
-accepted_output_anomalies="$(psql_value "
+accepted_output_anomalies="$(psql_exec -qAt <<'SQL'
 SELECT count(*)
 FROM (
   SELECT job_id
@@ -252,14 +261,15 @@ FROM (
   GROUP BY job_id
   HAVING count(*) <> 1
 ) bad;
-")"
+SQL
+)"
 echo "accepted_output_anomalies=$accepted_output_anomalies"
 [ "$accepted_output_anomalies" = "0" ] || {
   echo "Expected exactly one accepted output per completed job" >&2
   exit 1
 }
 
-action_contract="$(psql_value "
+action_contract="$(psql_exec -qAt -v task_name="$entity_task" <<'SQL'
 WITH schema_check AS (
   SELECT string_agg(action_type, '|' ORDER BY action_type) AS value
   FROM otlet.action_type_schemas
@@ -267,7 +277,7 @@ WITH schema_check AS (
 ), type_check AS (
   SELECT COALESCE(string_agg(DISTINCT action_type, '|' ORDER BY action_type), '') AS value
   FROM otlet.action_status
-  WHERE task_name = '$entity_task'
+  WHERE task_name = :'task_name'
     AND trusted_output
 ), status_check AS (
   SELECT count(*)::text || '|' ||
@@ -275,12 +285,12 @@ WITH schema_check AS (
          count(*) FILTER (WHERE receipt_id IS NOT NULL AND output_id IS NOT NULL)::text || '|' ||
          count(*) FILTER (WHERE status = 'rejected')::text AS value
   FROM otlet.action_status
-  WHERE task_name = '$entity_task'
+  WHERE task_name = :'task_name'
 ), failed_check AS (
   SELECT count(*)::text AS value
   FROM otlet.action_status a
   JOIN otlet.inference_receipts r ON r.id = a.receipt_id
-  WHERE a.task_name = '$entity_task'
+  WHERE a.task_name = :'task_name'
     AND r.selection_status <> 'accepted'
 ), applyable_check AS (
   SELECT string_agg(action_type || ':' || applyable::text, '|' ORDER BY action_type) AS value
@@ -295,7 +305,8 @@ SELECT concat_ws(E'\n',
   'action_applyable_contract=' || applyable_check.value
 )
 FROM schema_check, type_check, status_check, failed_check, applyable_check;
-")"
+SQL
+)"
 printf '%s\n' "$action_contract"
 require_contains "$action_contract" "action_schema_contract=merge_candidate|new_entity|note|review_flag" "Expected built-in action schemas"
 require_contains "$action_contract" "action_type_contract=merge_candidate|new_entity" "Expected entity-resolution merge_candidate and new_entity actions"
@@ -303,68 +314,75 @@ require_contains "$action_contract" "action_status_contract=4|4|4|0" "Expected f
 require_contains "$action_contract" "failed_attempt_action_contract=0" "Expected failed/rejected attempts to create no actions"
 require_contains "$action_contract" "action_applyable_contract=create_record:true|merge_candidate:false|new_entity:false|note:true|review_flag:false" "Expected applyable metadata to be schema-driven"
 
-merge_action_id="$(psql_value "
+merge_action_id="$(psql_exec -qAt -v task_name="$entity_task" <<'SQL'
 SELECT min(action_id)
 FROM otlet.action_status
-WHERE task_name = '$entity_task'
+WHERE task_name = :'task_name'
   AND action_type = 'merge_candidate';
-")"
-new_entity_action_id="$(psql_value "
+SQL
+)"
+new_entity_action_id="$(psql_exec -qAt -v task_name="$entity_task" <<'SQL'
 SELECT min(action_id)
 FROM otlet.action_status
-WHERE task_name = '$entity_task'
+WHERE task_name = :'task_name'
   AND action_type = 'new_entity';
-")"
+SQL
+)"
 [ -n "$merge_action_id" ] && [ -n "$new_entity_action_id" ] || {
   echo "Expected merge_candidate and new_entity action ids" >&2
   exit 1
 }
 
-action_approve_contract="$(psql_value "
+action_approve_contract="$(psql_exec -qAt -v action_id="$merge_action_id" <<'SQL'
 SELECT status || '|' || approval_status || '|' || COALESCE(review_reason, '')
-FROM otlet.approve_action($merge_action_id, 'demo approval reason');
-")"
+FROM otlet.approve_action(:'action_id'::bigint, 'demo approval reason');
+SQL
+)"
 echo "action_approve_contract=$action_approve_contract"
 [ "$action_approve_contract" = "approved|approved|demo approval reason" ] || {
   echo "Expected merge_candidate approval, got $action_approve_contract" >&2
   exit 1
 }
 
-action_review_reason_contract="$(psql_value "
+action_review_reason_contract="$(psql_exec -qAt -v action_id="$merge_action_id" <<'SQL'
 SELECT approval_status || '|' || COALESCE(review_reason, '')
 FROM otlet.action_status
-WHERE action_id = $merge_action_id;
-")"
+WHERE action_id = :'action_id'::bigint;
+SQL
+)"
 echo "action_review_reason_contract=$action_review_reason_contract"
 [ "$action_review_reason_contract" = "approved|demo approval reason" ] || {
   echo "Expected approval reason in action_status, got $action_review_reason_contract" >&2
   exit 1
 }
 
-action_dry_run_contract="$(psql_value "
+action_dry_run_contract="$(psql_exec -qAt -v action_id="$merge_action_id" <<'SQL'
 SELECT status || '|' || approval_status || '|' || dry_run_status
-FROM otlet.dry_run_action($merge_action_id);
-")"
+FROM otlet.dry_run_action(:'action_id'::bigint);
+SQL
+)"
 echo "action_dry_run_contract=$action_dry_run_contract"
 [ "$action_dry_run_contract" = "approved|approved|passed" ] || {
   echo "Expected approved action dry-run pass, got $action_dry_run_contract" >&2
   exit 1
 }
 
-action_apply_contract="$(psql_value "
+action_apply_contract="$(psql_exec -qAt -v action_id="$merge_action_id" <<'SQL'
 SELECT status || '|' || approval_status || '|' || apply_status || '|' || COALESCE(error, '')
-FROM otlet.apply_action($merge_action_id);
-")"
+FROM otlet.apply_action(:'action_id'::bigint);
+SQL
+)"
 echo "action_apply_contract=$action_apply_contract"
 [ "$action_apply_contract" = "approved|approved|not_applicable|action type has no apply path" ] || {
   echo "Expected merge_candidate apply to stay not_applicable, got $action_apply_contract" >&2
   exit 1
 }
 
-action_reject_contract="$(psql_value "
+action_reject_contract="$(psql_exec -qAt -v action_id="$new_entity_action_id" <<'SQL'
 SELECT status || '|' || approval_status
-FROM otlet.reject_action($new_entity_action_id, 'demo rejection');
-")"
+FROM otlet.reject_action(:'action_id'::bigint, 'demo rejection');
+SQL
+)"
 echo "action_reject_contract=$action_reject_contract"
 [ "$action_reject_contract" = "rejected|rejected" ] || {
   echo "Expected new_entity rejection, got $action_reject_contract" >&2
@@ -479,11 +497,12 @@ echo "posthoc_output_rule_contract=$posthoc_output_rule_contract"
   exit 1
 }
 
-source_rows_after="$(psql_value "
+source_rows_after="$(psql_exec -qAt <<'SQL'
 SELECT count(*)::text || '|' ||
        md5(string_agg(to_jsonb(v)::text, ',' ORDER BY v.id))
 FROM public.otlet_demo_vendor_entity v;
-")"
+SQL
+)"
 source_write_contract="$source_rows_before|$source_rows_after"
 echo "source_write_contract=$source_write_contract"
 [ "$source_rows_before" = "$source_rows_after" ] || {
@@ -491,28 +510,33 @@ echo "source_write_contract=$source_write_contract"
   exit 1
 }
 
-psql_exec >/dev/null <<SQL
-SELECT * FROM otlet.label_action($merge_action_id);
-SELECT * FROM otlet.label_action($new_entity_action_id);
+psql_exec \
+  -v merge_action_id="$merge_action_id" \
+  -v new_entity_action_id="$new_entity_action_id" >/dev/null <<'SQL'
+SELECT * FROM otlet.label_action(:'merge_action_id'::bigint);
+SELECT * FROM otlet.label_action(:'new_entity_action_id'::bigint);
 SQL
-er_eval_label_contract="$(psql_value "
+er_eval_label_contract="$(psql_exec -qAt \
+  -v merge_action_id="$merge_action_id" \
+  -v new_entity_action_id="$new_entity_action_id" <<'SQL'
 WITH labels AS (
   SELECT *
   FROM otlet.eval_labels
-  WHERE action_id IN ($merge_action_id, $new_entity_action_id)
+  WHERE action_id IN (:'merge_action_id'::bigint, :'new_entity_action_id'::bigint)
 ), exported AS (
   SELECT *
   FROM otlet.export_eval_cases(50)
-  WHERE action_id IN ($merge_action_id, $new_entity_action_id)
+  WHERE action_id IN (:'merge_action_id'::bigint, :'new_entity_action_id'::bigint)
 )
 SELECT count(*)::text || '|' ||
-       COALESCE(max(labels.expected_answer) FILTER (WHERE labels.action_id = $merge_action_id), '') || '|' ||
-       COALESCE(max(exported.case_kind) FILTER (WHERE exported.action_id = $merge_action_id), '') || '|' ||
-       COALESCE(max(labels.expected_answer) FILTER (WHERE labels.action_id = $new_entity_action_id), '') || '|' ||
-       COALESCE(max(exported.case_kind) FILTER (WHERE exported.action_id = $new_entity_action_id), '')
+       COALESCE(max(labels.expected_answer) FILTER (WHERE labels.action_id = :'merge_action_id'::bigint), '') || '|' ||
+       COALESCE(max(exported.case_kind) FILTER (WHERE exported.action_id = :'merge_action_id'::bigint), '') || '|' ||
+       COALESCE(max(labels.expected_answer) FILTER (WHERE labels.action_id = :'new_entity_action_id'::bigint), '') || '|' ||
+       COALESCE(max(exported.case_kind) FILTER (WHERE exported.action_id = :'new_entity_action_id'::bigint), '')
 FROM labels
 JOIN exported USING (action_id);
-")"
+SQL
+)"
 echo "er_eval_label_contract=$er_eval_label_contract"
 [ "$er_eval_label_contract" = "2|same_entity|positive|different_entity|hard_negative" ] || {
   echo "Expected ER eval export parity after expected_answer rename, got $er_eval_label_contract" >&2
@@ -589,25 +613,31 @@ FROM otlet.create_watch(
 );
 SQL
 
-queued="$(psql_value "SELECT otlet.refresh_semantic_join_index('$join_index_name');")"
+queued="$(psql_exec -qAt -v index_name="$join_index_name" <<'SQL'
+SELECT otlet.refresh_semantic_join_index(:'index_name');
+SQL
+)"
 echo "semantic_join_refresh_queued=$queued"
 [ "$queued" = "4" ] || {
   echo "Expected 4 semantic join jobs, got $queued" >&2
   exit 1
 }
 wait_task_complete "$join_task" 4 1800 1
-throughput_contracts="$(psql_value "
+throughput_contracts="$(psql_exec -qAt \
+  -v task_name="$join_task" \
+  -v record_type="$record_type" \
+  -v model_name="$cheap_model_name" <<'SQL'
 SELECT count(*) FILTER (WHERE a.action_type = 'create_record' AND a.status = 'complete')::text || '|' ||
-       count(*) FILTER (WHERE r.record_type = '$record_type')::text
+       count(*) FILTER (WHERE r.record_type = :'record_type')::text
 FROM otlet.jobs j
 LEFT JOIN otlet.actions a ON a.job_id = j.id
 LEFT JOIN otlet.records r ON r.action_id = a.id
-WHERE j.task_name = '$join_task';
+WHERE j.task_name = :'task_name';
 
 SELECT count(*)
 FROM otlet.semantic_materializations
-WHERE task_name = '$join_task'
-  AND record_type = '$record_type'
+WHERE task_name = :'task_name'
+  AND record_type = :'record_type'
   AND stale = false;
 
 SELECT q.queue_state || '|' ||
@@ -618,8 +648,9 @@ SELECT q.queue_state || '|' ||
        w.last_batch_failed_jobs::text
 FROM otlet.worker_throughput_status w
 JOIN otlet.model_queue_status q ON q.model_name = w.model_name
-WHERE w.model_name = '$cheap_model_name';
-")"
+WHERE w.model_name = :'model_name';
+SQL
+)"
 auto_records="$(sed -n '1p' <<<"$throughput_contracts")"
 materialized="$(sed -n '2p' <<<"$throughput_contracts")"
 throughput_status_contract="$(sed -n '3p' <<<"$throughput_contracts")"
@@ -641,7 +672,7 @@ echo "throughput_status_contract=$throughput_status_contract"
   exit 1
 }
 
-join_status_contract="$(psql_value "
+join_status_contract="$(psql_exec -qAt -v index_name="$join_index_name" <<'SQL'
 SELECT selected_path || '|' ||
        total_subjects::text || '|' ||
        fresh_subjects::text || '|' ||
@@ -650,7 +681,7 @@ SELECT selected_path || '|' ||
        queue_subjects::text || '|' ||
        fail_closed_subjects::text || '|' ||
        count_basis
-FROM otlet.semantic_join_index_plan('$join_index_name');
+FROM otlet.semantic_join_index_plan(:'index_name');
 SELECT selected_path || '|' ||
        total_subjects::text || '|' ||
        fresh_subjects::text || '|' ||
@@ -659,8 +690,9 @@ SELECT selected_path || '|' ||
        queue_subjects::text || '|' ||
        fail_closed_subjects::text || '|' ||
        count_basis
-FROM otlet.semantic_join_index_plan('$join_index_name', true);
-")"
+FROM otlet.semantic_join_index_plan(:'index_name', true);
+SQL
+)"
 join_status_estimated="$(head -n 1 <<<"$join_status_contract")"
 join_status_exact="$(tail -n 1 <<<"$join_status_contract")"
 echo "semantic_join_status_contract=$join_status_contract"
@@ -669,7 +701,7 @@ echo "semantic_join_status_contract=$join_status_contract"
   exit 1
 }
 
-pair_watch_status_contract="$(psql_value "
+pair_watch_status_contract="$(psql_exec -qAt -v watch_name="$join_index_name" <<'SQL'
 SELECT watch_name || '|' || kind || '|' ||
        total_subjects::text || '|' ||
        fresh_subjects::text || '|' ||
@@ -679,34 +711,37 @@ SELECT watch_name || '|' || kind || '|' ||
        complete_jobs::text || '|' ||
        (proposed_actions >= 4)::text
 FROM otlet.watch_status
-WHERE watch_name = '$join_index_name';
-")"
+WHERE watch_name = :'watch_name';
+SQL
+)"
 echo "pair_watch_status_contract=$pair_watch_status_contract"
 [ "$pair_watch_status_contract" = "$join_index_name|pair|4|4|0|0|0|4|true" ] || {
   echo "Expected pair watch status to show four fresh completed subjects, got $pair_watch_status_contract" >&2
   exit 1
 }
 
-join_lookup_contract="$(psql_value "
+join_lookup_contract="$(psql_exec -qAt -v index_name="$join_index_name" <<'SQL'
 SELECT count(*)::text || '|' ||
-       count(*) FILTER (WHERE body @> '{\"match\":\"same_entity\"}'::jsonb)::text || '|' ||
-       count(*) FILTER (WHERE body @> '{\"match\":\"different_entity\"}'::jsonb)::text
-FROM otlet.semantic_join_index_current_rows('$join_index_name', true);
-")"
+       count(*) FILTER (WHERE body @> '{"match":"same_entity"}'::jsonb)::text || '|' ||
+       count(*) FILTER (WHERE body @> '{"match":"different_entity"}'::jsonb)::text
+FROM otlet.semantic_join_index_current_rows(:'index_name', true);
+SQL
+)"
 echo "semantic_join_lookup_contract=$join_lookup_contract"
 require_regex "$join_lookup_contract" '^4\|[1-9][0-9]*\|[1-9][0-9]*$' "Expected semantic join lookup to include 4 rows, at least one same_entity, and at least one different_entity"
 
-join_match_contract="$(psql_value "
-SELECT otlet.semantic_join_matches('$join_index_name', 'vendor-1001:vendor-42', '{\"match\":\"same_entity\"}'::jsonb)::text || '|' ||
-       otlet.semantic_join_matches('$join_index_name', 'vendor-1001:vendor-77', '{\"match\":\"different_entity\"}'::jsonb)::text;
-")"
+join_match_contract="$(psql_exec -qAt -v index_name="$join_index_name" <<'SQL'
+SELECT otlet.semantic_join_matches(:'index_name', 'vendor-1001:vendor-42', '{"match":"same_entity"}'::jsonb)::text || '|' ||
+       otlet.semantic_join_matches(:'index_name', 'vendor-1001:vendor-77', '{"match":"different_entity"}'::jsonb)::text;
+SQL
+)"
 echo "semantic_join_match_contract=$join_match_contract"
 [ "$join_match_contract" = "true|true" ] || {
   echo "Expected semantic join matches, got $join_match_contract" >&2
   exit 1
 }
 join_customscan_plan="$(
-  psql_exec -P border=2 -P null='' <<SQL
+  psql_exec -P border=2 -P null='' -v index_name="$join_index_name" <<'SQL'
 EXPLAIN (ANALYZE, VERBOSE, COSTS, SUMMARY OFF, TIMING OFF)
 SELECT subject_id
 FROM (
@@ -714,7 +749,7 @@ FROM (
   FROM public.otlet_demo_vendor_pair_input
   OFFSET 0
 ) pair_subjects
-WHERE otlet.semantic_join_matches_auto('$join_index_name', subject_id, '{"match":"same_entity"}'::jsonb);
+WHERE otlet.semantic_join_matches_auto(:'index_name', subject_id, '{"match":"same_entity"}'::jsonb);
 SQL
 )"
 printf '%s\n' "$join_customscan_plan"
@@ -731,9 +766,9 @@ require_contains "$join_customscan_plan" "Actual Lookup Rows: 4" "Expected join 
 require_contains "$join_customscan_plan" "Infer Now Batches: 0" "Expected join CustomScan zero infer-now"
 require_contains "$join_customscan_plan" "Child Plan Source Rows: 4" "Expected join CustomScan child rows"
 
-join_current_row_contract="$(psql_value "
+join_current_row_contract="$(psql_exec -qAt -v index_name="$join_index_name" <<'SQL'
 SELECT count(*)::text
-FROM otlet.semantic_join_index_current_rows('$join_index_name', true)
+FROM otlet.semantic_join_index_current_rows(:'index_name', true)
 WHERE subject_id = 'vendor-1001:vendor-42';
 SELECT selected_path || '|' ||
        total_subjects::text || '|' ||
@@ -741,8 +776,9 @@ SELECT selected_path || '|' ||
        stale_subjects::text || '|' ||
        queue_subjects::text || '|' ||
        count_basis
-FROM otlet.semantic_join_index_plan('$join_index_name', true);
-")"
+FROM otlet.semantic_join_index_plan(:'index_name', true);
+SQL
+)"
 join_subject_rows="$(head -n 1 <<<"$join_current_row_contract")"
 join_sql_plan="$(tail -n 1 <<<"$join_current_row_contract")"
 echo "semantic_join_current_row_contract=$join_subject_rows|$join_sql_plan"
@@ -753,12 +789,13 @@ echo "semantic_join_current_row_contract=$join_subject_rows|$join_sql_plan"
 require_regex "$join_sql_plan" '^semantic_join_lookup\|4\|4\|0\|0\|' "Expected semantic join SQL plan lookup with four fresh subjects"
 
 log "Checking entity-resolution dependency update"
-join_receipts_before_update="$(psql_value "
+join_receipts_before_update="$(psql_exec -qAt -v task_name="$join_task" <<'SQL'
 SELECT count(*)::text
 FROM otlet.inference_receipts ar
 JOIN otlet.jobs j ON j.id = ar.job_id
-WHERE j.task_name = '$join_task';
-")"
+WHERE j.task_name = :'task_name';
+SQL
+)"
 psql_exec >/dev/null <<'SQL'
 SELECT otlet.watch_semantic_stale('public.otlet_demo_vendor_entity'::regclass, 'id');
 UPDATE public.otlet_demo_vendor_entity
@@ -766,16 +803,19 @@ SET notes = notes || '; updated AP contact confirms remittance migration',
     updated_at = clock_timestamp()
 WHERE id = 'vendor-1001';
 SQL
-join_stale_contract="$(psql_value "
+join_stale_contract="$(psql_exec -qAt \
+  -v index_name="$join_index_name" \
+  -v task_name="$join_task" <<'SQL'
 SELECT stale_subjects::text || '|' || fresh_subjects::text
-FROM otlet.semantic_join_index_plan('$join_index_name');
+FROM otlet.semantic_join_index_plan(:'index_name');
 SELECT count(*)::text
-FROM otlet.semantic_join_index_current_rows('$join_index_name', true);
+FROM otlet.semantic_join_index_current_rows(:'index_name', true);
 SELECT count(*)::text
 FROM otlet.inference_receipts ar
 JOIN otlet.jobs j ON j.id = ar.job_id
-WHERE j.task_name = '$join_task';
-")"
+WHERE j.task_name = :'task_name';
+SQL
+)"
 join_stale_subjects="$(head -n 1 <<<"$join_stale_contract")"
 join_fresh_after_lookup="$(sed -n '2p' <<<"$join_stale_contract")"
 join_receipts_after_update="$(tail -n 1 <<<"$join_stale_contract")"
@@ -786,11 +826,11 @@ if [ "$join_stale_subjects|$join_fresh_after_lookup" != "4|0|0" ] || [ "$join_re
 fi
 
 log "Checking contract-change freshness invalidation"
-psql_exec >/dev/null <<SQL
+psql_exec -v task_name="$join_task" >/dev/null <<'SQL'
 WITH current_task AS (
   SELECT *
   FROM otlet.tasks
-  WHERE name = '$join_task'
+  WHERE name = :'task_name'
 )
 SELECT (otlet.create_task(
     name,
@@ -804,14 +844,17 @@ SELECT (otlet.create_task(
   )).name
 FROM current_task;
 SQL
-contract_change_contract="$(psql_value "
+contract_change_contract="$(psql_exec -qAt \
+  -v task_name="$join_task" \
+  -v index_name="$join_index_name" <<'SQL'
 SELECT count(*) FILTER (WHERE sm.stale_reason = 'contract_changed')::text || '|' ||
        count(*) FILTER (WHERE sm.stale)::text
 FROM otlet.semantic_materializations sm
-WHERE sm.task_name = '$join_task';
+WHERE sm.task_name = :'task_name';
 SELECT count(*)::text
-FROM otlet.semantic_join_index_current_rows('$join_index_name', true);
-")"
+FROM otlet.semantic_join_index_current_rows(:'index_name', true);
+SQL
+)"
 contract_change_counts="$(head -n 1 <<<"$contract_change_contract")"
 contract_change_fresh="$(tail -n 1 <<<"$contract_change_contract")"
 echo "contract_change_contract=$contract_change_counts|fresh_after_contract_change=$contract_change_fresh"
@@ -820,35 +863,41 @@ echo "contract_change_contract=$contract_change_counts|fresh_after_contract_chan
   exit 1
 }
 
-trace_contract="$(psql_value "
+trace_contract="$(psql_exec -qAt \
+  -v entity_task="$entity_task" \
+  -v join_task="$join_task" <<'SQL'
 SELECT count(*) FILTER (WHERE receipt_id > 0)::text || '|' ||
        count(*) FILTER (WHERE prompt_tokens > 0)::text || '|' ||
        count(*) FILTER (WHERE generated_tokens >= 0)::text || '|' ||
        count(*) FILTER (WHERE schema_validation_status = 'passed')::text
 FROM otlet.inference_receipt_trace_status
-WHERE task_name IN ('$entity_task', '$join_task')
+WHERE task_name IN (:'entity_task', :'join_task')
   AND status = 'complete';
-")"
+SQL
+)"
 echo "receipt_trace_contract=$trace_contract"
 [ "$trace_contract" = "8|8|8|8" ] || {
   echo "Expected receipt trace contract 8|8|8|8, got $trace_contract" >&2
   exit 1
 }
 
-visibility_status="$(psql_value "
+visibility_status="$(psql_exec -qAt \
+  -v entity_task="$entity_task" \
+  -v join_task="$join_task" <<'SQL'
 SELECT (count(*) > 0)::text || '|' ||
        (COALESCE(sum(detailed_trace_captured_tokens), 0) > 0)::text || '|' ||
        (COALESCE(sum(detailed_trace_captured_tokens * detailed_trace_top_k), 0) > 0)::text || '|' ||
        (COALESCE(max(detailed_trace_max_tokens), 0) > 0)::text || '|' ||
        (COALESCE(max(detailed_trace_top_k), 0) = 3)::text
 FROM otlet.inference_receipt_trace_status
-WHERE task_name IN ('$entity_task', '$join_task')
+WHERE task_name IN (:'entity_task', :'join_task')
   AND status = 'complete';
-")"
+SQL
+)"
 echo "inference_visibility_status=$visibility_status"
 require_contains "$visibility_status" "true|true|true|true|true" "Expected bounded token/top-k trace visibility counters"
 
-cleanup_dry_run="$(psql_value "
+cleanup_dry_run="$(psql_exec -qAt <<'SQL'
 SELECT worker_events::text || '|' ||
        token_trace_rows::text || '|' ||
        token_alternative_rows::text || '|' ||
@@ -858,6 +907,7 @@ SELECT worker_events::text || '|' ||
        failed_canceled_jobs::text || '|' ||
        dry_run::text
 FROM otlet.cleanup_policy_state(true);
-")"
+SQL
+)"
 echo "cleanup_policy_dry_run=$cleanup_dry_run"
 require_regex "$cleanup_dry_run" '^[0-9]+\|[0-9]+\|[0-9]+\|[0-9]+\|[0-9]+\|[0-9]+\|[0-9]+\|true$' "Expected cleanup dry run counts ending in true"

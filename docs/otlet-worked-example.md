@@ -199,6 +199,9 @@ receipt_trace_contract=8|8|8|8
 inference_visibility_status=true|true|true|true|true
 runtime_status_contract=ready|ready|35.71|true|true|true|none|linux_proc_self_status_vmrss_vmsize_sampled_after_worker_run
 planner_1m_contract=estimated|1000000|4.404|true
+performance_ratio_contract=34|43|1.265|15948|469.059
+materialization_failure_status_contract=true|true
+invariant_contract=0
 docker_crash_log_scan=ok
 ```
 

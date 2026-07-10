@@ -337,17 +337,20 @@ DECLARE
 BEGIN
   v_refresh_subjects := v_stale_subjects + v_missing_subjects;
 
-  SELECT count(DISTINCT j.subject_id) FILTER (WHERE j.status IN ('queued', 'running', 'cancel_requested'))
+  SELECT count(DISTINCT j.subject_id)
   INTO v_inflight_subjects
   FROM otlet.jobs j
-  WHERE j.task_name = p_task_name;
+  WHERE j.task_name = p_task_name
+    AND j.status IN ('queued', 'running', 'cancel_requested');
 
   SELECT
-    count(*) FILTER (WHERE j.status IN ('queued', 'running', 'cancel_requested'))::bigint,
+    count(*)::bigint,
     COALESCE(otlet.available_model_queue_slots(p_model_name), 0)::bigint
   INTO v_worker_queue_depth, v_available_queue_slots
   FROM otlet.tasks t
-  LEFT JOIN otlet.jobs j ON j.task_name = t.name
+  LEFT JOIN otlet.jobs j
+    ON j.task_name = t.name
+   AND j.status IN ('queued', 'running', 'cancel_requested')
   WHERE t.model_name = p_model_name;
 
   SELECT

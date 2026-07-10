@@ -199,7 +199,38 @@ BEGIN
   END IF;
 
   SELECT * INTO task_row FROM otlet.tasks WHERE name = job_row.task_name;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'otlet task % does not exist', job_row.task_name;
+  END IF;
   SELECT * INTO model_row FROM otlet.models WHERE name = COALESCE(complete_job.model_name, task_row.model_name);
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'otlet model % does not exist',
+      COALESCE(complete_job.model_name, task_row.model_name);
+  END IF;
+
+  -- Fail before mutating job/receipt state on a bad envelope.
+  IF jsonb_typeof(COALESCE(complete_job.actions, '[]'::jsonb)) IS DISTINCT FROM 'array' THEN
+    RAISE EXCEPTION 'otlet complete_job actions must be an array';
+  END IF;
+  IF jsonb_typeof(complete_job.output) IS DISTINCT FROM 'object' THEN
+    RAISE EXCEPTION 'otlet complete_job output must be a JSON object';
+  END IF;
+  IF jsonb_typeof(COALESCE(complete_job.trace_summary, '{}'::jsonb)) IS DISTINCT FROM 'object' THEN
+    RAISE EXCEPTION 'otlet complete_job trace_summary must be a JSON object';
+  END IF;
+  IF COALESCE(complete_job.selection_role, 'direct') NOT IN ('direct', 'cheap', 'strong') THEN
+    RAISE EXCEPTION 'otlet complete_job selection_role must be direct, cheap, or strong';
+  END IF;
+  IF COALESCE(complete_job.selection_status, 'accepted') NOT IN ('accepted', 'rejected', 'failed') THEN
+    RAISE EXCEPTION 'otlet complete_job selection_status must be accepted, rejected, or failed';
+  END IF;
+  IF COALESCE(complete_job.selection_status, 'accepted') <> 'accepted' THEN
+    RAISE EXCEPTION 'otlet complete_job requires selection_status accepted';
+  END IF;
+  IF COALESCE(complete_job.trace_summary ->> 'schema_validation_status', 'not_run')
+     IS DISTINCT FROM 'passed' THEN
+    RAISE EXCEPTION 'otlet complete_job requires schema_validation_status passed';
+  END IF;
 
   IF job_row.status = 'cancel_requested' THEN
     PERFORM 1
@@ -245,17 +276,15 @@ BEGIN
     error => NULL
   );
 
+  -- outputs_one_per_job_idx; qualify column vs complete_job.job_id param.
   SELECT *
   INTO saved_output
-  FROM otlet.outputs
-  WHERE receipt_id = saved_receipt.id;
+  FROM otlet.outputs o
+  WHERE o.job_id = job_row.id
+  LIMIT 1;
 
   IF NOT FOUND THEN
     RETURN;
-  END IF;
-
-  IF jsonb_typeof(COALESCE(complete_job.actions, '[]'::jsonb)) IS DISTINCT FROM 'array' THEN
-    RAISE EXCEPTION 'otlet complete_job actions must be an array';
   END IF;
 
   PERFORM otlet.touch_runtime_slot(model_row.name, 'ready', 0, NULL);

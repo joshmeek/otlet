@@ -50,14 +50,6 @@ const fn infer_now_input_path(infer_ms: u32) -> &'static str {
     }
 }
 
-fn semantic_policy_for_selected_path(selected_path: &str) -> SemanticAutoPolicy {
-    match selected_path {
-        "bounded_infer_now" | "wait_for_refresh" | "queue_refresh" | "fresh_inference_scan"
-        | "fresh_pair_inference" => semantic_auto_policy(true),
-        _ => semantic_auto_policy(false),
-    }
-}
-
 fn source_tuple_provider(runtime: &RuntimeState) -> &'static str {
     if !runtime.child_plan.is_null() && is_semantic_join_runtime(runtime) {
         "child_subquery_join_execprocnode"
@@ -66,6 +58,26 @@ fn source_tuple_provider(runtime: &RuntimeState) -> &'static str {
     } else {
         "child_plan_required_no_table_beginscan_fallback"
     }
+}
+
+fn freeze_infer_now_executor_context_json(runtime: &RuntimeState) -> String {
+    // Serialize once; finish_infer_now stamps via `$2::jsonb` without re-building Value.
+    json!({
+        "executor_origin": "customscan_infer_now",
+        "executor_node": "Otlet Semantic Source CustomScan",
+        "executor_boundary": "CustomScan owned Postgres-planned source child scan",
+        "planner_selected_path": runtime.planner_selected_path.as_str(),
+        "source_tuple_provider": source_tuple_provider(runtime),
+        "refresh_policy": refresh_policy_from_parts(
+            runtime.auto_policy,
+            runtime.allow_refresh,
+            runtime.wait_ms,
+            runtime.infer_ms
+        ),
+        "semantic_index_kind": runtime.index_kind.as_str(),
+        "semantic_index_name": runtime.index_name.as_str()
+    })
+    .to_string()
 }
 
 fn is_semantic_join_runtime(runtime: &RuntimeState) -> bool {
@@ -85,7 +97,18 @@ unsafe fn source_tuple_provider_from_state(
     state: *mut OtletSemanticCustomScanState,
 ) -> &'static str {
     unsafe {
-        if !state.is_null() && (*state).child_plan_rows > 0 {
+        // Match runtime source_tuple_provider: join by index_kind, else child
+        // plan presence (not child_plan_rows, which stays 0 until first row /
+        // forever on empty scans).
+        if state.is_null() {
+            "not_started"
+        } else if (*state).index_kind == SemanticIndexKind::Join {
+            "child_subquery_join_execprocnode"
+        } else if (*state).has_child_plan
+            || (*state).index_kind == SemanticIndexKind::Row
+        {
+            // Row CustomScan always requires a PG child plan at begin-scan;
+            // report the provider before BeginCustomScan when index_kind is set.
             "child_plan_execprocnode"
         } else {
             "not_started"

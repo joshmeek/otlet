@@ -38,12 +38,13 @@ VALUES ('scoped-1', 'approve', 'initial note outside the model input');
 SELECT otlet.run_task(:'row_scoped_watch' || '_task');
 SQL
 wait_task_complete "$row_scoped_task" 1 900 1
-row_scoped_receipts_before="$(psql_value "
+row_scoped_receipts_before="$(psql_exec -qAt -v task_name="$row_scoped_task" <<'SQL'
 SELECT count(*)::text
 FROM otlet.inference_receipts ar
 JOIN otlet.jobs j ON j.id = ar.job_id
-WHERE j.task_name = '$row_scoped_task';
-")"
+WHERE j.task_name = :'task_name';
+SQL
+)"
 psql_exec >/dev/null <<'SQL'
 ALTER TABLE public.otlet_demo_scoped_signal
 ADD COLUMN unrelated_after_watch text DEFAULT 'not in model input';
@@ -52,20 +53,23 @@ SET ignored_note = ignored_note || '; changed outside scoped input',
     unrelated_after_watch = 'changed after watch'
 WHERE id = 'scoped-1';
 SQL
-row_scoped_contract="$(psql_value "
+row_scoped_contract="$(psql_exec -qAt \
+  -v watch_name="$row_scoped_watch" \
+  -v task_name="$row_scoped_task" <<'SQL'
 SELECT count(*)::text
-FROM otlet.semantic_index_current_rows('$row_scoped_watch', true);
-SELECT otlet.semantic_matches('$row_scoped_watch', 'scoped-1', '{\"decision\":\"pass\"}'::jsonb)::text;
+FROM otlet.semantic_index_current_rows(:'watch_name', true);
+SELECT otlet.semantic_matches(:'watch_name', 'scoped-1', '{"decision":"pass"}'::jsonb)::text;
 SELECT count(*)::text
 FROM otlet.inference_receipts ar
 JOIN otlet.jobs j ON j.id = ar.job_id
-WHERE j.task_name = '$row_scoped_task';
+WHERE j.task_name = :'task_name';
 SELECT COALESCE(input_columns::text, '')
 FROM otlet.watch_status
-WHERE watch_name = '$row_scoped_watch';
+WHERE watch_name = :'watch_name';
 SELECT COALESCE(string_agg(freshness_basis, ',' ORDER BY subject_id), '')
-FROM otlet.semantic_index_current_rows('$row_scoped_watch', true);
-")"
+FROM otlet.semantic_index_current_rows(:'watch_name', true);
+SQL
+)"
 row_scoped_fresh_after="$(head -n 1 <<<"$row_scoped_contract")"
 row_scoped_match_after="$(sed -n '2p' <<<"$row_scoped_contract")"
 row_scoped_receipts_after="$(sed -n '3p' <<<"$row_scoped_contract")"
@@ -76,9 +80,9 @@ echo "row_scoped_contract=$row_scoped_fresh_after|$row_scoped_match_after|$row_s
   echo "Expected scoped watch to stay fresh with unchanged receipts and revalidated basis after unrelated column change, got $row_scoped_fresh_after|$row_scoped_match_after|$row_scoped_receipts_before|$row_scoped_receipts_after|$row_scoped_columns|$row_scoped_basis" >&2
   exit 1
 }
-row_scoped_sql_contract="$(psql_value "
+row_scoped_sql_contract="$(psql_exec -qAt -v watch_name="$row_scoped_watch" <<'SQL'
 SELECT count(*)::text
-FROM otlet.semantic_index_current_rows('$row_scoped_watch', true)
+FROM otlet.semantic_index_current_rows(:'watch_name', true)
 WHERE subject_id = 'scoped-1';
 SELECT selected_path || '|' ||
        total_subjects::text || '|' ||
@@ -86,11 +90,12 @@ SELECT selected_path || '|' ||
        stale_subjects::text || '|' ||
        queue_subjects::text || '|' ||
        count_basis
-FROM otlet.semantic_index_plan('$row_scoped_watch', true);
+FROM otlet.semantic_index_plan(:'watch_name', true);
 SELECT count(*)::text
-FROM otlet.semantic_index_current_rows('$row_scoped_watch', true)
+FROM otlet.semantic_index_current_rows(:'watch_name', true)
 WHERE subject_id = ANY (ARRAY[]::text[]);
-")"
+SQL
+)"
 row_scoped_subject_rows="$(head -n 1 <<<"$row_scoped_sql_contract")"
 row_scoped_plan="$(sed -n '2p' <<<"$row_scoped_sql_contract")"
 row_empty_subject_rows="$(tail -n 1 <<<"$row_scoped_sql_contract")"
@@ -104,19 +109,22 @@ psql_exec >/dev/null <<'SQL'
 ALTER TABLE public.otlet_demo_scoped_signal
 DROP COLUMN signal;
 SQL
-row_schema_drift_contract="$(psql_value "
+row_schema_drift_contract="$(psql_exec -qAt \
+  -v watch_name="$row_scoped_watch" \
+  -v task_name="$row_scoped_task" <<'SQL'
 SELECT count(*)::text
-FROM otlet.semantic_index_current_rows('$row_scoped_watch', true);
+FROM otlet.semantic_index_current_rows(:'watch_name', true);
 SELECT (count(*) FILTER (WHERE stale AND stale_reason = 'schema_drift') >= 1)::text
 FROM otlet.semantic_materializations
-WHERE task_name = '$row_scoped_task'
+WHERE task_name = :'task_name'
   AND subject_id = 'scoped-1';
 SELECT COALESCE(stale_reasons->>'schema_drift', '0')
-FROM otlet.semantic_index_plan('$row_scoped_watch');
+FROM otlet.semantic_index_plan(:'watch_name');
 SELECT COALESCE(stale_reasons->>'schema_drift', '0')
 FROM otlet.semantic_index_status
-WHERE name = '$row_scoped_watch';
-")"
+WHERE name = :'watch_name';
+SQL
+)"
 row_schema_drift_fresh="$(head -n 1 <<<"$row_schema_drift_contract")"
 row_schema_drift_reason="$(sed -n '2p' <<<"$row_schema_drift_contract")"
 row_schema_drift_plan_reason="$(sed -n '3p' <<<"$row_schema_drift_contract")"
@@ -126,18 +134,19 @@ echo "row_schema_drift_contract=$row_schema_drift_fresh|$row_schema_drift_reason
   echo "Expected dropped scoped input column to write schema_drift and expose it in plan/status, got $row_schema_drift_fresh|$row_schema_drift_reason|$row_schema_drift_plan_reason|$row_schema_drift_status_reason" >&2
   exit 1
 }
-row_schema_sql_plan="$(psql_value "
+row_schema_sql_plan="$(psql_exec -qAt -v watch_name="$row_scoped_watch" <<'SQL'
 SELECT selected_path || '|' || stale_subjects::text || '|' || stale_reasons::text
-FROM otlet.semantic_index_plan('$row_scoped_watch');
-")"
+FROM otlet.semantic_index_plan(:'watch_name');
+SQL
+)"
 echo "row_schema_sql_plan_contract=$row_schema_sql_plan"
 require_contains "$row_schema_sql_plan" "schema_drift" "Expected SQL plan stale reason to include schema_drift"
 row_schema_customscan_plan="$(
-  psql_exec -P border=2 -P null='' <<SQL
+  psql_exec -P border=2 -P null='' -v watch_name="$row_scoped_watch" <<'SQL'
 EXPLAIN (ANALYZE, VERBOSE, COSTS, SUMMARY OFF, TIMING OFF)
 SELECT id
 FROM public.otlet_demo_scoped_signal
-WHERE otlet.semantic_matches('$row_scoped_watch', id, '{"decision":"pass"}'::jsonb);
+WHERE otlet.semantic_matches(:'watch_name', id, '{"decision":"pass"}'::jsonb);
 SQL
 )"
 printf '%s\n' "$row_schema_customscan_plan"
@@ -214,20 +223,21 @@ SET stale_policy = 'lookup_only_fail_closed',
     semantic_auto_max_rows = 1
 WHERE name = 'default';
 SQL
-row_customscan_sql_plan_contract="$(psql_value "
+row_customscan_sql_plan_contract="$(psql_exec -qAt -v watch_name="$row_customscan_watch" <<'SQL'
 SELECT selected_path || '|' ||
        infer_now_subjects::text || '|' ||
        fail_closed_subjects::text || '|' ||
        (infer_now_ms > 0)::text || '|' ||
        count_basis
-FROM otlet.semantic_index_plan('$row_customscan_watch', true);
-")"
+FROM otlet.semantic_index_plan(:'watch_name', true);
+SQL
+)"
 row_customscan_infer_plan="$(
-  psql_exec -P border=2 -P null='' <<SQL
+  psql_exec -P border=2 -P null='' -v watch_name="$row_customscan_watch" <<'SQL'
 EXPLAIN (ANALYZE, VERBOSE, COSTS, SUMMARY OFF, TIMING OFF)
 SELECT id
 FROM public.otlet_demo_customscan_signal
-WHERE otlet.semantic_matches_auto('$row_customscan_watch', id, '{}'::jsonb);
+WHERE otlet.semantic_matches_auto(:'watch_name', id, '{}'::jsonb);
 SQL
 )"
 psql_exec >/dev/null <<'SQL'
@@ -260,7 +270,7 @@ require_contains "$row_customscan_infer_plan" "Infer Now Receipts: 1" "Expected 
 require_contains "$row_customscan_infer_plan" "Infer Now Trace Receipt Id:" "Expected infer-now receipt pointer"
 require_contains "$row_customscan_infer_plan" "Rows Returned: 1" "Expected one inferred row returned after bounded infer-now"
 
-queue_suppression_output="$(psql_value "
+queue_suppression_output="$(psql_exec -qAt -v model_name="$strong_model_name" <<'SQL'
 BEGIN;
 UPDATE otlet.production_policy
 SET max_queued_jobs_per_model = 1
@@ -275,16 +285,16 @@ CREATE TABLE public.otlet_demo_queue_flood (
 SELECT otlet.create_watch(
   'row_queue_flood_demo',
   'row',
-  'Return JSON only: {\"output\":{\"status\":\"ok\"},\"actions\":[]}',
-  '{\"type\":\"object\",\"required\":[\"status\"],\"additionalProperties\":false,\"properties\":{\"status\":{\"enum\":[\"ok\"]}}}'::jsonb,
-  '$strong_model_name',
+  'Return JSON only: {"output":{"status":"ok"},"actions":[]}',
+  '{"type":"object","required":["status"],"additionalProperties":false,"properties":{"status":{"enum":["ok"]}}}'::jsonb,
+  :'model_name',
   'public.otlet_demo_queue_flood'::regclass,
   'id',
   NULL,
   'demo_queue_flood_fact',
-  '{\"max_tokens\":64,\"reasoning\":\"off\"}'::jsonb,
+  '{"max_tokens":64,"reasoning":"off"}'::jsonb,
   '{}'::jsonb,
-  '{\"on_change\":\"mark_stale_and_enqueue\"}'::jsonb
+  '{"on_change":"mark_stale_and_enqueue"}'::jsonb
 );
 
 INSERT INTO public.otlet_demo_queue_flood
@@ -310,10 +320,11 @@ SELECT (
   (
     SELECT (queue_admission_suppressed_events >= 1)::text
     FROM otlet.model_queue_status
-    WHERE model_name = '$strong_model_name'
+    WHERE model_name = :'model_name'
   );
 ROLLBACK;
-")"
+SQL
+)"
 queue_suppression_contract="$(tail -n 1 <<<"$queue_suppression_output")"
 echo "queue_suppression_contract=$queue_suppression_contract"
 [ "$queue_suppression_contract" = "1|1|true|true|true" ] || {

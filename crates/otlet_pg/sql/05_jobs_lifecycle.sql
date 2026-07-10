@@ -15,9 +15,10 @@ AS $$
   active_model AS (
     SELECT
       t.model_name,
+      -- Occupied only while a live lease holds; NULL / expired leases are reclaimable.
       count(*) FILTER (
         WHERE j.status = 'running'
-          AND (j.leased_until IS NULL OR j.leased_until >= now())
+          AND j.leased_until >= now()
       ) AS running_jobs,
       count(*) FILTER (
         WHERE j.status = 'cancel_requested'
@@ -47,7 +48,7 @@ AS $$
         j.status = 'queued'
         OR (
           j.status = 'running'
-          AND j.leased_until < now()
+          AND (j.leased_until IS NULL OR j.leased_until < now())
           AND j.attempts < p.max_attempts
         )
         OR (
@@ -95,7 +96,7 @@ AS $$
         j.status = 'queued'
         OR (
           j.status = 'running'
-          AND j.leased_until < now()
+          AND (j.leased_until IS NULL OR j.leased_until < now())
           AND j.attempts < p.max_attempts
         )
         OR (
@@ -141,22 +142,24 @@ LANGUAGE plpgsql
 AS $$
 DECLARE
   job_row otlet.jobs%ROWTYPE;
-  task_row otlet.tasks%ROWTYPE;
-  model_row otlet.models%ROWTYPE;
+  model_name text;
 BEGIN
+  -- claim_jobs / insert_infer_now_job already stamp started_at; this only
+  -- records the runtime slot + worker event for the claimed/running job.
   SELECT * INTO job_row FROM otlet.jobs WHERE id = mark_job_started.job_id;
   IF NOT FOUND THEN
     RETURN;
   END IF;
 
-  UPDATE otlet.jobs
-  SET started_at = COALESCE(started_at, now())
-  WHERE id = job_row.id;
+  SELECT t.model_name INTO model_name
+  FROM otlet.tasks t
+  WHERE t.name = job_row.task_name;
+  -- Warn-only path: skip slot/event noise when the task row is missing.
+  IF model_name IS NULL THEN
+    RETURN;
+  END IF;
 
-  SELECT * INTO task_row FROM otlet.tasks WHERE name = job_row.task_name;
-  SELECT * INTO model_row FROM otlet.models WHERE name = task_row.model_name;
-
-  PERFORM otlet.touch_runtime_slot(model_row.name, 'running', 1, NULL);
+  PERFORM otlet.touch_runtime_slot(model_name, 'running', 1, NULL);
   PERFORM otlet.record_worker_event(
     'job_started',
     job_row.id,
@@ -165,7 +168,7 @@ BEGIN
     jsonb_build_object(
       'task_name', job_row.task_name,
       'subject_id', job_row.subject_id,
-      'model_name', model_row.name
+      'model_name', model_name
     )
   );
 END;
@@ -211,15 +214,45 @@ BEGIN
   END IF;
 
   SELECT * INTO task_row FROM otlet.tasks WHERE name = job_row.task_name;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'otlet task % does not exist', job_row.task_name;
+  END IF;
   SELECT * INTO model_row FROM otlet.models WHERE name = record_model_attempt.model_name;
   IF NOT FOUND THEN
     RAISE EXCEPTION 'otlet model % does not exist', record_model_attempt.model_name;
   END IF;
 
-  SELECT COALESCE(max(r.attempt_index), 0) + 1
-  INTO next_attempt
-  FROM otlet.inference_receipts r
-  WHERE r.job_id = job_row.id;
+  IF jsonb_typeof(COALESCE(record_model_attempt.trace_summary, '{}'::jsonb)) IS DISTINCT FROM 'object' THEN
+    RAISE EXCEPTION 'otlet record_model_attempt trace_summary must be a JSON object';
+  END IF;
+  IF record_model_attempt.output IS NOT NULL
+     AND jsonb_typeof(record_model_attempt.output) IS DISTINCT FROM 'object' THEN
+    RAISE EXCEPTION 'otlet record_model_attempt output must be a JSON object';
+  END IF;
+  IF COALESCE(record_model_attempt.selection_role, 'direct') NOT IN ('direct', 'cheap', 'strong') THEN
+    RAISE EXCEPTION 'otlet record_model_attempt selection_role must be direct, cheap, or strong';
+  END IF;
+  IF COALESCE(record_model_attempt.selection_status, 'accepted') NOT IN ('accepted', 'rejected', 'failed') THEN
+    RAISE EXCEPTION 'otlet record_model_attempt selection_status must be accepted, rejected, or failed';
+  END IF;
+  IF record_model_attempt.receipt_status IS NOT NULL
+     AND record_model_attempt.receipt_status NOT IN ('complete', 'rejected', 'failed', 'canceled') THEN
+    RAISE EXCEPTION 'otlet record_model_attempt receipt_status must be complete, rejected, failed, or canceled';
+  END IF;
+  IF record_model_attempt.schema_validation_status IS NOT NULL
+     AND record_model_attempt.schema_validation_status NOT IN ('passed', 'failed', 'not_run') THEN
+    RAISE EXCEPTION 'otlet record_model_attempt schema_validation_status must be passed, failed, or not_run';
+  END IF;
+
+  -- Prefer index-ordered peek over max() aggregate on (job_id, attempt_index).
+  SELECT COALESCE((
+    SELECT r.attempt_index
+    FROM otlet.inference_receipts r
+    WHERE r.job_id = job_row.id
+    ORDER BY r.attempt_index DESC, r.id DESC
+    LIMIT 1
+  ), 0) + 1
+  INTO next_attempt;
 
   INSERT INTO otlet.inference_receipts (
     job_id,
@@ -336,7 +369,14 @@ BEGIN
   END IF;
 
   SELECT * INTO task_row FROM otlet.tasks WHERE name = job_row.task_name;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'otlet task % does not exist', job_row.task_name;
+  END IF;
   SELECT * INTO model_row FROM otlet.models WHERE name = COALESCE(finish_canceled_job.model_name, task_row.model_name);
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'otlet model % does not exist',
+      COALESCE(finish_canceled_job.model_name, task_row.model_name);
+  END IF;
 
   UPDATE otlet.jobs
   SET status = 'canceled',
@@ -406,11 +446,43 @@ BEGIN
   END IF;
 
   IF job_row.status = 'queued'
-     OR (job_row.status = 'running' AND job_row.leased_until < now()) THEN
+     OR (
+       job_row.status = 'running'
+       AND (job_row.leased_until IS NULL OR job_row.leased_until < now())
+     ) THEN
     UPDATE otlet.jobs
     SET error = cancel_job.reason,
         cancel_requested_at = now()
     WHERE id = job_row.id;
+
+    -- finish_canceled_job fail-closes on missing task/model; terminalize orphans
+    -- without a receipt so cancel still succeeds on corrupt lineage.
+    SELECT * INTO task_row FROM otlet.tasks WHERE name = job_row.task_name;
+    IF NOT FOUND THEN
+      UPDATE otlet.jobs
+      SET status = 'canceled',
+          leased_until = NULL,
+          error = cancel_job.reason,
+          cancel_requested_at = COALESCE(cancel_requested_at, now()),
+          finished_at = now()
+      WHERE id = job_row.id
+      RETURNING * INTO saved_job;
+      RETURN NEXT saved_job;
+      RETURN;
+    END IF;
+    SELECT * INTO model_row FROM otlet.models WHERE name = task_row.model_name;
+    IF NOT FOUND THEN
+      UPDATE otlet.jobs
+      SET status = 'canceled',
+          leased_until = NULL,
+          error = cancel_job.reason,
+          cancel_requested_at = COALESCE(cancel_requested_at, now()),
+          finished_at = now()
+      WHERE id = job_row.id
+      RETURNING * INTO saved_job;
+      RETURN NEXT saved_job;
+      RETURN;
+    END IF;
 
     RETURN QUERY
       SELECT * FROM otlet.finish_canceled_job(job_row.id, release_runtime => job_row.status = 'running');
@@ -426,20 +498,23 @@ BEGIN
     RETURNING * INTO saved_job;
 
     SELECT * INTO task_row FROM otlet.tasks WHERE name = saved_job.task_name;
-    SELECT * INTO model_row FROM otlet.models WHERE name = task_row.model_name;
-
-    PERFORM otlet.record_worker_event(
-      'job_cancel_requested',
-      saved_job.id,
-      'linked_inproc',
-      'otlet job cancellation requested',
-      jsonb_build_object(
-        'task_name', saved_job.task_name,
-        'subject_id', saved_job.subject_id,
-        'model_name', model_row.name,
-        'reason', cancel_job.reason
-      )
-    );
+    IF FOUND THEN
+      SELECT * INTO model_row FROM otlet.models WHERE name = task_row.model_name;
+      IF FOUND THEN
+        PERFORM otlet.record_worker_event(
+          'job_cancel_requested',
+          saved_job.id,
+          'linked_inproc',
+          'otlet job cancellation requested',
+          jsonb_build_object(
+            'task_name', saved_job.task_name,
+            'subject_id', saved_job.subject_id,
+            'model_name', model_row.name,
+            'reason', cancel_job.reason
+          )
+        );
+      END IF;
+    END IF;
 
     RETURN NEXT saved_job;
     RETURN;
@@ -560,7 +635,24 @@ BEGIN
   END IF;
 
   SELECT * INTO task_row FROM otlet.tasks WHERE name = saved_job.task_name;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'otlet task % does not exist', saved_job.task_name;
+  END IF;
   SELECT * INTO model_row FROM otlet.models WHERE name = COALESCE(fail_job.model_name, task_row.model_name);
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'otlet model % does not exist',
+      COALESCE(fail_job.model_name, task_row.model_name);
+  END IF;
+
+  IF jsonb_typeof(COALESCE(fail_job.trace_summary, '{}'::jsonb)) IS DISTINCT FROM 'object' THEN
+    RAISE EXCEPTION 'otlet fail_job trace_summary must be a JSON object';
+  END IF;
+  IF COALESCE(fail_job.selection_role, 'direct') NOT IN ('direct', 'cheap', 'strong') THEN
+    RAISE EXCEPTION 'otlet fail_job selection_role must be direct, cheap, or strong';
+  END IF;
+  IF COALESCE(fail_job.selection_status, 'failed') NOT IN ('accepted', 'rejected', 'failed') THEN
+    RAISE EXCEPTION 'otlet fail_job selection_status must be accepted, rejected, or failed';
+  END IF;
 
   IF saved_job.status = 'cancel_requested' THEN
     RETURN QUERY
@@ -606,7 +698,7 @@ BEGIN
   );
 
   IF fail_job.schema_validation_status = 'failed'
-     OR fail_job.selection_status = 'rejected' THEN
+     OR COALESCE(fail_job.selection_status, 'failed') = 'rejected' THEN
     PERFORM otlet.touch_runtime_slot(model_row.name, 'ready', 0, NULL);
   ELSE
     PERFORM otlet.touch_runtime_slot(model_row.name, 'error', 0, fail_job.error);
@@ -637,19 +729,41 @@ DECLARE
   task_row otlet.tasks%ROWTYPE;
   model_row otlet.models%ROWTYPE;
   swept bigint := 0;
+  canceled_swept bigint := 0;
 BEGIN
   FOR job_row IN
     SELECT j.*
     FROM otlet.jobs j
     CROSS JOIN otlet.production_policy p
     WHERE j.status = 'running'
-      AND j.leased_until < now()
+      AND (j.leased_until IS NULL OR j.leased_until < now())
       AND j.attempts >= p.max_attempts
     ORDER BY j.id
     FOR UPDATE
   LOOP
     SELECT * INTO task_row FROM otlet.tasks WHERE name = job_row.task_name;
+    IF NOT FOUND THEN
+      -- Unclaimable orphan: terminalize without receipt/slot noise.
+      UPDATE otlet.jobs
+      SET status = 'failed',
+          leased_until = NULL,
+          error = 'orphan job: missing task',
+          finished_at = now()
+      WHERE id = job_row.id;
+      swept := swept + 1;
+      CONTINUE;
+    END IF;
     SELECT * INTO model_row FROM otlet.models WHERE name = task_row.model_name;
+    IF NOT FOUND THEN
+      UPDATE otlet.jobs
+      SET status = 'failed',
+          leased_until = NULL,
+          error = 'orphan job: missing model',
+          finished_at = now()
+      WHERE id = job_row.id;
+      swept := swept + 1;
+      CONTINUE;
+    END IF;
 
     UPDATE otlet.jobs
     SET status = 'failed',
@@ -677,6 +791,50 @@ BEGIN
     swept := swept + 1;
   END LOOP;
 
+  -- Symmetric terminalization for cancel_requested rows that exhausted attempts
+  -- and lost their lease (prevents infinite reclaim under nested SPI failure).
+  FOR job_row IN
+    SELECT j.*
+    FROM otlet.jobs j
+    CROSS JOIN otlet.production_policy p
+    WHERE j.status = 'cancel_requested'
+      AND (j.leased_until IS NULL OR j.leased_until < now())
+      AND j.attempts >= p.max_attempts
+    ORDER BY j.id
+    FOR UPDATE
+  LOOP
+    -- finish_canceled_job fail-closes on missing task/model; terminalize orphans
+    -- without a receipt so one corrupt row cannot abort the whole sweep.
+    SELECT * INTO task_row FROM otlet.tasks WHERE name = job_row.task_name;
+    IF NOT FOUND THEN
+      UPDATE otlet.jobs
+      SET status = 'canceled',
+          leased_until = NULL,
+          error = COALESCE(job_row.error, 'orphan job: missing task'),
+          finished_at = now()
+      WHERE id = job_row.id;
+      canceled_swept := canceled_swept + 1;
+      CONTINUE;
+    END IF;
+    SELECT * INTO model_row FROM otlet.models WHERE name = task_row.model_name;
+    IF NOT FOUND THEN
+      UPDATE otlet.jobs
+      SET status = 'canceled',
+          leased_until = NULL,
+          error = COALESCE(job_row.error, 'orphan job: missing model'),
+          finished_at = now()
+      WHERE id = job_row.id;
+      canceled_swept := canceled_swept + 1;
+      CONTINUE;
+    END IF;
+
+    PERFORM otlet.finish_canceled_job(
+      job_row.id,
+      release_runtime => true
+    );
+    canceled_swept := canceled_swept + 1;
+  END LOOP;
+
   IF swept > 0 THEN
     PERFORM otlet.record_worker_event(
       'expired_job_sweep',
@@ -687,6 +845,16 @@ BEGIN
     );
   END IF;
 
-  RETURN swept;
+  IF canceled_swept > 0 THEN
+    PERFORM otlet.record_worker_event(
+      'expired_cancel_requested_sweep',
+      NULL,
+      NULL,
+      'otlet expired cancel_requested jobs finished after max attempts',
+      jsonb_build_object('canceled_jobs', canceled_swept)
+    );
+  END IF;
+
+  RETURN swept + canceled_swept;
 END;
 $$;

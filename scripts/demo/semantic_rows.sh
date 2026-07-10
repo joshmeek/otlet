@@ -46,18 +46,22 @@ SELECT otlet.create_watch(
 SELECT otlet.refresh_semantic_join_index(:'watch_name');
 SQL
 wait_task_complete "$pair_strip_task" 1 900 1
-pair_strip_receipts_before="$(psql_value "
+pair_strip_receipts_before="$(psql_exec -qAt -v task_name="$pair_strip_task" <<'SQL'
 SELECT count(*)
 FROM otlet.inference_receipts r
 JOIN otlet.jobs j ON j.id = r.job_id
-WHERE j.task_name = '$pair_strip_task';
-")"
+WHERE j.task_name = :'task_name';
+SQL
+)"
 psql_exec >/dev/null <<'SQL'
 UPDATE public.otlet_demo_pair_strip
 SET volatile_note = 'second volatile note'
 WHERE id = 'pair-strip-1';
 SQL
-pair_strip_contract="$(psql_value "
+pair_strip_contract="$(psql_exec -qAt \
+  -v task_name="$pair_strip_task" \
+  -v watch_name="$pair_strip_watch" \
+  -v receipts_before="$pair_strip_receipts_before" <<'SQL'
 WITH live AS (
   SELECT input
   FROM public.otlet_demo_pair_strip_input
@@ -65,22 +69,23 @@ WITH live AS (
 ), materialized AS (
   SELECT sm.source_hash
   FROM otlet.semantic_materializations sm
-  WHERE sm.task_name = '$pair_strip_task'
+  WHERE sm.task_name = :'task_name'
     AND sm.subject_id = 'pair-strip-1'
   ORDER BY sm.updated_at DESC, sm.id DESC
   LIMIT 1
 )
-SELECT (SELECT count(*) FROM otlet.semantic_join_index_current_rows('$pair_strip_watch', true))::text || '|' ||
-       (SELECT stale_subjects::text FROM otlet.semantic_join_index_plan('$pair_strip_watch', true)) || '|' ||
+SELECT (SELECT count(*) FROM otlet.semantic_join_index_current_rows(:'watch_name', true))::text || '|' ||
+       (SELECT stale_subjects::text FROM otlet.semantic_join_index_plan(:'watch_name', true)) || '|' ||
        (SELECT (materialized.source_hash IS DISTINCT FROM md5(live.input::text))::text FROM materialized, live) || '|' ||
-       '$pair_strip_receipts_before' || '|' ||
+       :'receipts_before' || '|' ||
        (
          SELECT count(*)::text
          FROM otlet.inference_receipts r
          JOIN otlet.jobs j ON j.id = r.job_id
-         WHERE j.task_name = '$pair_strip_task'
+         WHERE j.task_name = :'task_name'
        );
-")"
+SQL
+)"
 echo "pair_strip_contract=$pair_strip_contract"
 [ "$pair_strip_contract" = "1|0|true|1|1" ] || {
   echo "Expected pair strip-key update to stay fresh with unchanged receipts, got $pair_strip_contract" >&2
@@ -137,7 +142,7 @@ VALUES (
 SQL
 wait_task_complete "$row_triage_task" 1 900 1
 
-row_triage_contract="$(psql_value "
+row_triage_contract="$(psql_exec -qAt -v task_name="$row_triage_task" <<'SQL'
 SELECT count(DISTINCT r.job_id) FILTER (WHERE r.status = 'complete')::text || '|' ||
        COALESCE(max(r.output->>'decision'), '') || '|' ||
        COALESCE(max(r.output->>'confidence'), '') || '|' ||
@@ -146,42 +151,44 @@ SELECT count(DISTINCT r.job_id) FILTER (WHERE r.status = 'complete')::text || '|
        (
          SELECT (count(*) FILTER (WHERE s.freshness_basis = 'content_hash_match') >= 1)::text
          FROM otlet.inference_receipt_trace_status s
-         WHERE s.task_name = '$row_triage_task'
+         WHERE s.task_name = :'task_name'
            AND s.accepted
        )
 FROM otlet.runs r
 LEFT JOIN otlet.action_status a ON a.job_id = r.job_id
-WHERE r.task_name = '$row_triage_task';
-")"
+WHERE r.task_name = :'task_name';
+SQL
+)"
 echo "row_triage_contract=$row_triage_contract"
 [ "$row_triage_contract" = "1|flag|high|1|1|true" ] || {
   echo "Expected non-ER triage task to produce one flagged output and one valid review action, got $row_triage_contract" >&2
   exit 1
 }
 
-row_triage_action_id="$(psql_value "
+row_triage_action_id="$(psql_exec -qAt -v task_name="$row_triage_task" <<'SQL'
 SELECT min(action_id)
 FROM otlet.action_status
-WHERE task_name = '$row_triage_task'
+WHERE task_name = :'task_name'
   AND action_type = 'review_flag'
   AND error IS NULL;
-")"
+SQL
+)"
 [ -n "$row_triage_action_id" ] || {
   echo "Expected row triage review action id" >&2
   exit 1
 }
-psql_exec >/dev/null <<SQL
-SELECT * FROM otlet.label_action($row_triage_action_id, label_source => 'approved_action');
+psql_exec -v action_id="$row_triage_action_id" >/dev/null <<'SQL'
+SELECT * FROM otlet.label_action(:'action_id'::bigint, label_source => 'approved_action');
 SQL
-row_eval_label_contract="$(psql_value "
+row_eval_label_contract="$(psql_exec -qAt -v action_id="$row_triage_action_id" <<'SQL'
 WITH status AS (
   SELECT *
   FROM otlet.eval_label_status
-  WHERE action_id = $row_triage_action_id
+  WHERE action_id = :'action_id'::bigint
 ), exported AS (
   SELECT *
   FROM otlet.export_eval_cases(50)
-  WHERE action_id = $row_triage_action_id
+  WHERE action_id = :'action_id'::bigint
 )
 SELECT count(*)::text || '|' ||
        COALESCE(max(status.expected_answer), '') || '|' ||
@@ -189,7 +196,8 @@ SELECT count(*)::text || '|' ||
        COALESCE(max(exported.expected_answer), '') || '|' ||
        COALESCE(max(exported.case_kind), '')
 FROM status, exported;
-")"
+SQL
+)"
 echo "row_eval_label_contract=$row_eval_label_contract"
 [ "$row_eval_label_contract" = "1|flag|flag|flag|positive" ] || {
   echo "Expected row triage eval label/export to use decision as expected_answer, got $row_eval_label_contract" >&2
@@ -218,36 +226,38 @@ SQL
 echo "row_eval_label_reject_contract=$row_eval_label_reject_contract"
 require_contains "$row_eval_label_reject_contract" "otlet expected_answer same_entity is not valid for task $row_triage_task field decision" "Expected invalid expected_answer to be rejected against task enum"
 
-row_review_queue_contract="$(psql_value "
+row_review_queue_contract="$(psql_exec -qAt -v action_id="$row_triage_action_id" <<'SQL'
 SELECT count(*)::text || '|' ||
        COALESCE(max(queue_kind), '') || '|' ||
        COALESCE(max(watch_name), '') || '|' ||
        COALESCE(max(source_stale::text), '') || '|' ||
        (max(receipt_id) IS NOT NULL)::text
 FROM otlet.review_queue
-WHERE action_id = $row_triage_action_id;
-")"
+WHERE action_id = :'action_id'::bigint;
+SQL
+)"
 echo "row_review_queue_contract=$row_review_queue_contract"
 [ "$row_review_queue_contract" = "1|review_flag|$row_triage_watch|false|true" ] || {
   echo "Expected row review action in review_queue with receipt and fresh source identity, got $row_review_queue_contract" >&2
   exit 1
 }
-psql_exec >/dev/null <<SQL
+psql_exec -v action_id="$row_triage_action_id" >/dev/null <<'SQL'
 SELECT * FROM otlet.correct_action(
-  $row_triage_action_id,
+  :'action_id'::bigint,
   '{"decision":"pass","confidence":"high","action_type":"review_flag"}'::jsonb,
   'demo correction'
 );
 SQL
-row_correction_contract="$(psql_value "
+row_correction_contract="$(psql_exec -qAt -v action_id="$row_triage_action_id" <<'SQL'
 SELECT a.status || '|' ||
        a.approval_status || '|' ||
-       (SELECT count(*) FROM otlet.eval_labels WHERE action_id = $row_triage_action_id AND label_source = 'manual_correction')::text || '|' ||
-       (SELECT count(*) FROM otlet.export_eval_cases(50) WHERE action_id = $row_triage_action_id AND case_kind = 'gold')::text || '|' ||
-       (SELECT count(*) FROM otlet.review_queue WHERE action_id = $row_triage_action_id)::text
+       (SELECT count(*) FROM otlet.eval_labels WHERE action_id = :'action_id'::bigint AND label_source = 'manual_correction')::text || '|' ||
+       (SELECT count(*) FROM otlet.export_eval_cases(50) WHERE action_id = :'action_id'::bigint AND case_kind = 'gold')::text || '|' ||
+       (SELECT count(*) FROM otlet.review_queue WHERE action_id = :'action_id'::bigint)::text
 FROM otlet.actions a
-WHERE a.id = $row_triage_action_id;
-")"
+WHERE a.id = :'action_id'::bigint;
+SQL
+)"
 echo "row_correction_contract=$row_correction_contract"
 [ "$row_correction_contract" = "rejected|rejected|1|1|0" ] || {
   echo "Expected correction to reject action, write gold label, and remove review queue row, got $row_correction_contract" >&2
@@ -303,18 +313,19 @@ VALUES (
 );
 SQL
 wait_task_complete "$numeric_triage_task" 1 900 1
-numeric_triage_action_id="$(psql_value "
+numeric_triage_action_id="$(psql_exec -qAt -v task_name="$numeric_triage_task" <<'SQL'
 SELECT min(action_id)
 FROM otlet.action_status
-WHERE task_name = '$numeric_triage_task'
+WHERE task_name = :'task_name'
   AND action_type = 'review_flag'
   AND error IS NULL;
-")"
+SQL
+)"
 [ -n "$numeric_triage_action_id" ] || {
   echo "Expected numeric triage review_flag action" >&2
   exit 1
 }
-numeric_triage_contract="$(psql_value "
+numeric_triage_contract="$(psql_exec -qAt -v task_name="$numeric_triage_task" <<'SQL'
 SELECT r.status || '|' ||
        COALESCE(r.output->>'decision', '') || '|' ||
        COALESCE(r.output->>'confidence', '') || '|' ||
@@ -330,27 +341,28 @@ JOIN otlet.action_status a
   ON a.job_id = r.job_id
  AND a.action_type = 'review_flag'
 LEFT JOIN otlet.review_queue rq ON rq.action_id = a.action_id
-WHERE r.task_name = '$numeric_triage_task'
+WHERE r.task_name = :'task_name'
 ORDER BY r.job_id DESC
 LIMIT 1;
-")"
+SQL
+)"
 echo "numeric_triage_contract=$numeric_triage_contract"
 [ "$numeric_triage_contract" = "complete|flag|high|true|true|review_flag|true|true|review_flag" ] || {
   echo "Expected numeric triage surfaces to render without NULL surprises, got $numeric_triage_contract" >&2
   exit 1
 }
-psql_exec >/dev/null <<SQL
-SELECT * FROM otlet.label_action($numeric_triage_action_id, label_source => 'approved_action');
+psql_exec -v action_id="$numeric_triage_action_id" >/dev/null <<'SQL'
+SELECT * FROM otlet.label_action(:'action_id'::bigint, label_source => 'approved_action');
 SQL
-numeric_triage_label_contract="$(psql_value "
+numeric_triage_label_contract="$(psql_exec -qAt -v action_id="$numeric_triage_action_id" <<'SQL'
 WITH status AS (
   SELECT *
   FROM otlet.eval_label_status
-  WHERE action_id = $numeric_triage_action_id
+  WHERE action_id = :'action_id'::bigint
 ), exported AS (
   SELECT *
   FROM otlet.export_eval_cases(50)
-  WHERE action_id = $numeric_triage_action_id
+  WHERE action_id = :'action_id'::bigint
 )
 SELECT count(*)::text || '|' ||
        COALESCE(max(status.expected_answer), '') || '|' ||
@@ -358,7 +370,8 @@ SELECT count(*)::text || '|' ||
        COALESCE(max(exported.expected_action_type), '') || '|' ||
        COALESCE(max(exported.case_kind), '')
 FROM status, exported;
-")"
+SQL
+)"
 echo "numeric_triage_label_contract=$numeric_triage_label_contract"
 [ "$numeric_triage_label_contract" = "1|flag|flag|review_flag|positive" ] || {
   echo "Expected numeric triage label/export to round trip through non-ER action, got $numeric_triage_label_contract" >&2
@@ -502,7 +515,7 @@ echo "no_abstain_eval_contract=$no_abstain_eval_contract"
   exit 1
 }
 
-row_watch_status_contract="$(psql_value "
+row_watch_status_contract="$(psql_exec -qAt -v watch_name="$row_triage_watch" <<'SQL'
 SELECT watch_name || '|' || kind || '|' ||
        total_subjects::text || '|' ||
        fresh_subjects::text || '|' ||
@@ -512,27 +525,29 @@ SELECT watch_name || '|' || kind || '|' ||
        complete_jobs::text || '|' ||
        count_basis
 FROM otlet.watch_status
-WHERE watch_name = '$row_triage_watch';
-")"
+WHERE watch_name = :'watch_name';
+SQL
+)"
 echo "row_watch_status_contract=$row_watch_status_contract"
 [ "$row_watch_status_contract" = "$row_triage_watch|row|1|1|0|0|0|1|estimated" ] || {
   echo "Expected row watch status to show one fresh completed row, got $row_watch_status_contract" >&2
   exit 1
 }
-row_plan_basis_contract="$(psql_value "
+row_plan_basis_contract="$(psql_exec -qAt -v watch_name="$row_triage_watch" <<'SQL'
 SELECT count_basis || '|' ||
        total_subjects::text || '|' ||
        fresh_subjects::text || '|' ||
        stale_subjects::text || '|' ||
        missing_subjects::text
-FROM otlet.semantic_index_plan('$row_triage_watch');
+FROM otlet.semantic_index_plan(:'watch_name');
 SELECT count_basis || '|' ||
        total_subjects::text || '|' ||
        fresh_subjects::text || '|' ||
        stale_subjects::text || '|' ||
        missing_subjects::text
-FROM otlet.semantic_index_plan('$row_triage_watch', true);
-")"
+FROM otlet.semantic_index_plan(:'watch_name', true);
+SQL
+)"
 row_plan_estimated="$(head -n 1 <<<"$row_plan_basis_contract")"
 row_plan_exact="$(tail -n 1 <<<"$row_plan_basis_contract")"
 echo "row_plan_basis_contract=$row_plan_estimated|exact=$row_plan_exact"
@@ -540,21 +555,22 @@ echo "row_plan_basis_contract=$row_plan_estimated|exact=$row_plan_exact"
   echo "Expected estimated and exact row plan counts to match on demo row, got $row_plan_estimated|$row_plan_exact" >&2
   exit 1
 }
-row_lookup_basis_contract="$(psql_value "
+row_lookup_basis_contract="$(psql_exec -qAt -v watch_name="$row_triage_watch" <<'SQL'
 SELECT COALESCE(string_agg(freshness_basis, ',' ORDER BY subject_id), '')
-FROM otlet.semantic_index_current_rows('$row_triage_watch', true);
-")"
+FROM otlet.semantic_index_current_rows(:'watch_name', true);
+SQL
+)"
 echo "row_lookup_basis_contract=$row_lookup_basis_contract"
 [ "$row_lookup_basis_contract" = "mvcc_match" ] || {
   echo "Expected unchanged row lookup to report mvcc_match freshness basis, got $row_lookup_basis_contract" >&2
   exit 1
 }
 row_fresh_customscan_plan="$(
-  psql_exec -P border=2 -P null='' <<SQL
+  psql_exec -P border=2 -P null='' -v watch_name="$row_triage_watch" <<'SQL'
 EXPLAIN (ANALYZE, VERBOSE, COSTS, SUMMARY OFF, TIMING OFF)
 SELECT id
 FROM public.otlet_demo_triage_signal
-WHERE otlet.semantic_matches_auto('$row_triage_watch', id, '{"decision":"flag"}'::jsonb);
+WHERE otlet.semantic_matches_auto(:'watch_name', id, '{"decision":"flag"}'::jsonb);
 SQL
 )"
 printf '%s\n' "$row_fresh_customscan_plan"
@@ -571,13 +587,16 @@ require_contains "$row_fresh_customscan_plan" "Infer Now Batches: 0" "Expected f
 require_contains "$row_fresh_customscan_plan" "Infer Now Receipts: 0" "Expected fresh CustomScan zero infer-now receipts"
 
 log "Checking visible row update freshness"
-row_receipts_before_visible_update="$(psql_value "
+row_receipts_before_visible_update="$(psql_exec -qAt -v task_name="$row_triage_task" <<'SQL'
 SELECT count(*)::text
 FROM otlet.inference_receipts ar
 JOIN otlet.jobs j ON j.id = ar.job_id
-WHERE j.task_name = '$row_triage_task';
-")"
-row_visible_stale_contract="$(psql_value "
+WHERE j.task_name = :'task_name';
+SQL
+)"
+row_visible_stale_contract="$(psql_exec -qAt \
+  -v watch_name="$row_triage_watch" \
+  -v task_name="$row_triage_task" <<'SQL'
 BEGIN;
 UPDATE public.otlet_demo_triage_signal
 SET blockers = 0,
@@ -585,25 +604,26 @@ SET blockers = 0,
     evidence = 'Updated review cleared the blocker and recorded manager approval'
 WHERE id = 'triage-1';
 SELECT count(*)::text
-FROM otlet.semantic_index_current_rows('$row_triage_watch', true);
+FROM otlet.semantic_index_current_rows(:'watch_name', true);
 SELECT (count(*) FILTER (WHERE stale AND stale_reason = 'source_update') >= 1)::text
 FROM otlet.semantic_materializations
-WHERE task_name = '$row_triage_task'
+WHERE task_name = :'task_name'
   AND subject_id = 'triage-1';
-SELECT otlet.semantic_matches('$row_triage_watch', 'triage-1', '{\"decision\":\"flag\"}'::jsonb)::text;
+SELECT otlet.semantic_matches(:'watch_name', 'triage-1', '{"decision":"flag"}'::jsonb)::text;
 SELECT count(*)::text
-FROM otlet.semantic_index_current_rows('$row_triage_watch', true)
+FROM otlet.semantic_index_current_rows(:'watch_name', true)
 WHERE subject_id = 'triage-1';
 SAVEPOINT pending_reason_probe;
 UPDATE otlet.semantic_materializations
 SET stale_reason = NULL
-WHERE task_name = '$row_triage_task'
+WHERE task_name = :'task_name'
   AND subject_id = 'triage-1';
 SELECT COALESCE(stale_reasons->>'content_revalidation_pending', '0')
-FROM otlet.semantic_index_plan('$row_triage_watch', true);
+FROM otlet.semantic_index_plan(:'watch_name', true);
 ROLLBACK TO SAVEPOINT pending_reason_probe;
 COMMIT;
-")"
+SQL
+)"
 row_visible_fresh_before="$(head -n 1 <<<"$row_visible_stale_contract")"
 row_visible_source_update="$(sed -n '2p' <<<"$row_visible_stale_contract")"
 row_visible_predicate_match="$(sed -n '3p' <<<"$row_visible_stale_contract")"
@@ -620,14 +640,17 @@ echo "row_content_revalidation_pending_contract=$row_pending_reason"
   exit 1
 }
 wait_task_complete "$row_triage_task" 2 900 1
-row_visible_refresh_contract="$(psql_value "
+row_visible_refresh_contract="$(psql_exec -qAt \
+  -v task_name="$row_triage_task" \
+  -v watch_name="$row_triage_watch" <<'SQL'
 SELECT count(*)::text
 FROM otlet.inference_receipts ar
 JOIN otlet.jobs j ON j.id = ar.job_id
-WHERE j.task_name = '$row_triage_task';
+WHERE j.task_name = :'task_name';
 SELECT count(*)::text
-FROM otlet.semantic_index_current_rows('$row_triage_watch', true);
-")"
+FROM otlet.semantic_index_current_rows(:'watch_name', true);
+SQL
+)"
 row_receipts_after_visible_update="$(head -n 1 <<<"$row_visible_refresh_contract")"
 row_visible_fresh_after="$(tail -n 1 <<<"$row_visible_refresh_contract")"
 row_visible_receipt_delta=$((row_receipts_after_visible_update - row_receipts_before_visible_update))
@@ -645,10 +668,10 @@ SET blockers = 2,
     evidence = 'Wire instructions changed after invoice approval and the requester used urgent payment language'
 WHERE id = 'triage-1';
 SQL
-psql_exec >/dev/null <<SQL
+psql_exec -v task_name="$row_triage_task" >/dev/null <<'SQL'
 INSERT INTO otlet.jobs (task_name, subject_id, input)
 SELECT
-  '$row_triage_task',
+  :'task_name',
   (src.id)::text,
   jsonb_build_object(
     '_otlet_mvcc', jsonb_build_object(
@@ -665,20 +688,23 @@ WHERE src.id = 'triage-1';
 SELECT otlet.wake_worker();
 SQL
 wait_task_complete "$row_triage_task" 3 900 1
-row_cache_revert_contract="$(psql_value "
+row_cache_revert_contract="$(psql_exec -qAt \
+  -v task_name="$row_triage_task" \
+  -v watch_name="$row_triage_watch" <<'SQL'
 SELECT inference_cache_hit::text || '|' ||
        COALESCE(inference_cache_reason, '') || '|' ||
        COALESCE(inference_cache_key_basis, '') || '|' ||
        COALESCE(inference_cache_eviction_reason, '')
 FROM otlet.inference_receipt_trace_status
-WHERE task_name = '$row_triage_task'
+WHERE task_name = :'task_name'
   AND subject_id = 'triage-1'
   AND status = 'complete'
 ORDER BY receipt_id DESC
 LIMIT 1;
 SELECT count(*)::text
-FROM otlet.semantic_index_current_rows('$row_triage_watch', true);
-")"
+FROM otlet.semantic_index_current_rows(:'watch_name', true);
+SQL
+)"
 row_cache_revert_trace="$(head -n 1 <<<"$row_cache_revert_contract")"
 row_cache_revert_fresh="$(tail -n 1 <<<"$row_cache_revert_contract")"
 echo "row_cache_revert_contract=$row_cache_revert_trace|fresh=$row_cache_revert_fresh"
@@ -688,16 +714,18 @@ echo "row_cache_revert_contract=$row_cache_revert_trace|fresh=$row_cache_revert_
 }
 
 log "Checking contract-change inference cache miss"
-psql_exec >/dev/null <<SQL
+psql_exec \
+  -v task_name="$row_triage_task" \
+  -v started_at="$script_started" >/dev/null <<'SQL'
 WITH current_task AS (
   SELECT *
   FROM otlet.tasks
-  WHERE name = '$row_triage_task'
+  WHERE name = :'task_name'
 )
 SELECT (otlet.create_task(
     name,
     input_query,
-    instruction || ' Cache contract drift demo $script_started.',
+    instruction || ' Cache contract drift demo ' || :'started_at' || '.',
     output_schema,
     model_name,
     runtime_options,
@@ -708,7 +736,7 @@ FROM current_task;
 
 INSERT INTO otlet.jobs (task_name, subject_id, input)
 SELECT
-  '$row_triage_task',
+  :'task_name',
   (src.id)::text,
   jsonb_build_object(
     '_otlet_mvcc', jsonb_build_object(
@@ -725,30 +753,32 @@ WHERE src.id = 'triage-1';
 SELECT otlet.wake_worker();
 SQL
 wait_task_complete "$row_triage_task" 4 900 1
-row_contract_cache_contract="$(psql_value "
+row_contract_cache_contract="$(psql_exec -qAt -v task_name="$row_triage_task" <<'SQL'
 SELECT inference_cache_hit::text || '|' ||
        COALESCE(inference_cache_reason, '') || '|' ||
        COALESCE(inference_cache_key_basis, '')
 FROM otlet.inference_receipt_trace_status
-WHERE task_name = '$row_triage_task'
+WHERE task_name = :'task_name'
   AND subject_id = 'triage-1'
   AND status = 'complete'
 ORDER BY receipt_id DESC
 LIMIT 1;
-")"
+SQL
+)"
 echo "row_contract_cache_contract=$row_contract_cache_contract"
 [ "$row_contract_cache_contract" = "false|contract_changed|content_hash_contract_hash_model_fingerprint" ] || {
   echo "Expected contract edit to miss inference cache with contract_changed reason, got $row_contract_cache_contract" >&2
   exit 1
 }
 
-row_manual_reason_contract="$(psql_value "
+row_manual_reason_contract="$(psql_exec -qAt -v task_name="$row_triage_task" <<'SQL'
 SELECT (otlet.mark_semantic_stale(NULL, 'triage-1', 'manual') >= 1)::text;
 SELECT (count(*) FILTER (WHERE stale AND stale_reason = 'manual') >= 1)::text
 FROM otlet.semantic_materializations
-WHERE task_name = '$row_triage_task'
+WHERE task_name = :'task_name'
   AND subject_id = 'triage-1';
-")"
+SQL
+)"
 row_manual_marked="$(head -n 1 <<<"$row_manual_reason_contract")"
 row_manual_reason="$(tail -n 1 <<<"$row_manual_reason_contract")"
 echo "row_manual_reason_contract=$row_manual_marked|$row_manual_reason"
@@ -762,14 +792,17 @@ psql_exec >/dev/null <<'SQL'
 DELETE FROM public.otlet_demo_triage_signal
 WHERE id = 'triage-1';
 SQL
-row_delete_contract="$(psql_value "
+row_delete_contract="$(psql_exec -qAt \
+  -v watch_name="$row_triage_watch" \
+  -v task_name="$row_triage_task" <<'SQL'
 SELECT count(*)::text
-FROM otlet.semantic_index_current_rows('$row_triage_watch', true);
+FROM otlet.semantic_index_current_rows(:'watch_name', true);
 SELECT (count(*) FILTER (WHERE stale AND stale_reason = 'source_delete') >= 1)::text
 FROM otlet.semantic_materializations
-WHERE task_name = '$row_triage_task'
+WHERE task_name = :'task_name'
   AND subject_id = 'triage-1';
-")"
+SQL
+)"
 row_delete_fresh="$(head -n 1 <<<"$row_delete_contract")"
 row_delete_reason="$(tail -n 1 <<<"$row_delete_contract")"
 echo "row_delete_contract=$row_delete_fresh|$row_delete_reason"
@@ -813,7 +846,7 @@ SELECT otlet.fail_job(
 )
 FROM row_triage_invalid_claim;
 SQL
-row_triage_invalid_contract="$(psql_value "
+row_triage_invalid_contract="$(psql_exec -qAt -v task_name="$row_triage_task" <<'SQL'
 SELECT j.status || '|' ||
        (j.error LIKE 'invalid model JSON:%')::text || '|' ||
        r.status || '|' ||
@@ -831,11 +864,12 @@ SELECT j.status || '|' ||
        )
 FROM otlet.jobs j
 JOIN otlet.inference_receipts r ON r.job_id = j.id
-WHERE j.task_name = '$row_triage_task'
+WHERE j.task_name = :'task_name'
   AND j.subject_id = 'triage-invalid-json'
 ORDER BY j.id DESC, r.id DESC
 LIMIT 1;
-")"
+SQL
+)"
 echo "row_triage_invalid_answer_contract=$row_triage_invalid_contract"
 [ "$row_triage_invalid_contract" = "failed|true|failed|failed|failed|true|0|0|0" ] || {
   echo "Expected invalid non-ER model answer to leave only a failed receipt, got $row_triage_invalid_contract" >&2
@@ -899,24 +933,25 @@ VALUES (
 SQL
 wait_task_complete "$row_triage_policy_task" 1 900 1
 
-row_triage_policy_contract="$(psql_value "
+row_triage_policy_contract="$(psql_exec -qAt -v task_name="$row_triage_policy_task" <<'SQL'
 WITH attempts AS (
   SELECT selection_role, selection_status, selection_reason
   FROM otlet.model_selection_attempts
-  WHERE task_name = '$row_triage_policy_task'
+  WHERE task_name = :'task_name'
 )
 SELECT
   (SELECT count(*) FROM attempts WHERE selection_role = 'cheap' AND selection_status = 'rejected' AND selection_reason = 'abstained_output')::text || '|' ||
   (SELECT count(*) FROM attempts WHERE selection_role = 'strong' AND selection_status = 'accepted')::text || '|' ||
-  COALESCE((SELECT output->>'decision' FROM otlet.runs WHERE task_name = '$row_triage_policy_task'), '') || '|' ||
-  (SELECT count(*) FROM otlet.action_status WHERE task_name = '$row_triage_policy_task' AND action_type = 'review_flag')::text;
-")"
+  COALESCE((SELECT output->>'decision' FROM otlet.runs WHERE task_name = :'task_name'), '') || '|' ||
+  (SELECT count(*) FROM otlet.action_status WHERE task_name = :'task_name' AND action_type = 'review_flag')::text;
+SQL
+)"
 echo "row_triage_policy_contract=$row_triage_policy_contract"
 [ "$row_triage_policy_contract" = "1|1|unclear|1" ] || {
   echo "Expected declared triage policy to reject cheap unclear then accept strong unclear with one review action, got $row_triage_policy_contract" >&2
   exit 1
 }
-row_triage_preset_contract="$(psql_value "
+row_triage_preset_contract="$(psql_exec -qAt -v task_name="$row_triage_policy_task" <<'SQL'
 SELECT COALESCE(t.decision_contract ->> 'preset', '') || '|' ||
        ((t.decision_contract ->> 'preset_contract_hash') ~ '^[0-9a-f]{32}$')::text || '|' ||
        COALESCE(p.accept_field_checks ->> 'answer_field', '') || '|' ||
@@ -924,8 +959,9 @@ SELECT COALESCE(t.decision_contract ->> 'preset', '') || '|' ||
        (p.accept_field_checks -> 'accepted_confidence' ? 'medium')::text
 FROM otlet.tasks t
 JOIN otlet.model_selection_policies p ON p.task_name = t.name
-WHERE t.name = '$row_triage_policy_task';
-")"
+WHERE t.name = :'task_name';
+SQL
+)"
 echo "row_triage_preset_contract=$row_triage_preset_contract"
 [ "$row_triage_preset_contract" = "row_triage_decision_v1|true|decision|true|true" ] || {
   echo "Expected triage preset to drive selection policy labels, got $row_triage_preset_contract" >&2
@@ -953,19 +989,20 @@ if [ "$model_selection_shape_status" -eq 0 ]; then
 fi
 require_contains "$model_selection_shape_output" "otlet accept_field_checks.abstain_values requires answer_field" "Expected orphan abstain_values rejection message"
 echo "model_selection_shape_contract=rejected"
-row_triage_preset_trace_contract="$(psql_value "
+row_triage_preset_trace_contract="$(psql_exec -qAt -v task_name="$row_triage_policy_task" <<'SQL'
 SELECT COALESCE(s.decision_preset_name, '') || '|' ||
        (s.decision_preset_contract_hash = t.decision_contract ->> 'preset_contract_hash')::text || '|' ||
        (s.decision_preset_contract_hash = md5(otlet.semantic_canonical_jsonb(p.decision_contract)::text))::text
 FROM otlet.inference_receipt_trace_status s
 JOIN otlet.tasks t ON t.name = s.task_name
 JOIN otlet.decision_rule_presets p ON p.name = s.decision_preset_name
-WHERE s.task_name = '$row_triage_policy_task'
+WHERE s.task_name = :'task_name'
   AND s.selection_role = 'strong'
   AND s.selection_status = 'accepted'
 ORDER BY s.receipt_id DESC
 LIMIT 1;
-")"
+SQL
+)"
 echo "row_triage_preset_trace_contract=$row_triage_preset_trace_contract"
 [ "$row_triage_preset_trace_contract" = "row_triage_decision_v1|true|true" ] || {
   echo "Expected receipt trace status to expose row triage preset provenance, got $row_triage_preset_trace_contract" >&2
@@ -994,7 +1031,7 @@ echo "preset_immutability_contract=$preset_immutability_contract"
   echo "Expected decision rule preset updates to be rejected, got $preset_immutability_contract" >&2
   exit 1
 }
-row_triage_abstention_contract="$(psql_value "
+row_triage_abstention_contract="$(psql_exec -qAt -v task_name="$row_triage_policy_task" <<'SQL'
 WITH task_abstentions AS (
   SELECT count(*)::bigint AS abstained_outputs
   FROM otlet.outputs o
@@ -1004,7 +1041,7 @@ WITH task_abstentions AS (
     SELECT COALESCE(NULLIF(t.decision_contract ->> 'answer_field', ''), 'match') AS answer_field,
            COALESCE(t.decision_contract -> 'abstain_values', '[]'::jsonb) AS abstain_values
   ) contract
-  WHERE j.task_name = '$row_triage_policy_task'
+  WHERE j.task_name = :'task_name'
     AND EXISTS (
       SELECT 1
       FROM jsonb_array_elements_text(contract.abstain_values) value(abstain_value)
@@ -1015,7 +1052,8 @@ SELECT task_abstentions.abstained_outputs::text || '|' ||
        output_reliability_status.abstained_outputs::text
 FROM task_abstentions
 CROSS JOIN otlet.output_reliability_status;
-")"
+SQL
+)"
 echo "row_triage_abstention_contract=$row_triage_abstention_contract"
 require_regex "$row_triage_abstention_contract" '^[1-9][0-9]*\|[1-9][0-9]*$' "Expected nonzero abstention counters for the triage preset"
 
@@ -1038,7 +1076,7 @@ SELECT otlet.create_task(
 SELECT otlet.run_task(:'task_name');
 SQL
 wait_task_complete "$skip_abstain_task" 1 900 1
-skip_abstention_contract="$(psql_value "
+skip_abstention_contract="$(psql_exec -qAt -v task_name="$skip_abstain_task" <<'SQL'
 WITH task_abstentions AS (
   SELECT count(*)::bigint AS abstained_outputs
   FROM otlet.outputs o
@@ -1048,7 +1086,7 @@ WITH task_abstentions AS (
     SELECT COALESCE(NULLIF(t.decision_contract ->> 'answer_field', ''), 'match') AS answer_field,
            COALESCE(t.decision_contract -> 'abstain_values', '[]'::jsonb) AS abstain_values
   ) contract
-  WHERE j.task_name = '$skip_abstain_task'
+  WHERE j.task_name = :'task_name'
     AND EXISTS (
       SELECT 1
       FROM jsonb_array_elements_text(contract.abstain_values) value(abstain_value)
@@ -1059,7 +1097,8 @@ SELECT task_abstentions.abstained_outputs::text || '|' ||
        (output_reliability_status.abstained_outputs >= task_abstentions.abstained_outputs)::text
 FROM task_abstentions
 CROSS JOIN otlet.output_reliability_status;
-")"
+SQL
+)"
 echo "skip_abstention_contract=$skip_abstention_contract"
 [ "$skip_abstention_contract" = "1|true" ] || {
   echo "Expected non-default skip abstention vocabulary to count, got $skip_abstention_contract" >&2

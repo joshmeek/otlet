@@ -121,8 +121,10 @@ pub(crate) struct InferNowRequest {
     pub(crate) id: u64,
     pub(crate) task_name: String,
     pub(crate) subject_id: String,
-    pub(crate) inline_task: Option<Value>,
-    pub(crate) input: Value,
+    /// Raw slot JSON for create_task field extraction via `$n::jsonb`.
+    pub(crate) inline_task_json: Option<String>,
+    /// Canonical JSON text from the shared-memory slot (no parse/re-serialize).
+    pub(crate) input_json: String,
 }
 
 #[derive(Clone, Copy)]
@@ -164,32 +166,32 @@ pub(crate) fn take_request() -> Option<InferNowRequest> {
     let subject_id = read_buf(&slot.subject, slot.subject_len as usize);
     let inline_task_text = read_optional_buf(&slot.inline_task, slot.inline_task_len as usize);
     let input_text = read_buf(&slot.input, slot.input_len as usize);
-    let inline_task = match parse_optional_json("inline_task", inline_task_text.as_deref()) {
-        Ok(value) => value,
-        Err(err) => {
-            {
-                let slot = &mut state.slots[slot_index];
-                slot.state = STATE_FAILED;
-                write_error(slot, &err);
-            }
-            state.failed = state.failed.saturating_add(1);
-            signal_requester_latch(&state.slots[slot_index]);
-            return None;
+    if let Some(text) = inline_task_text.as_deref()
+        && let Err(err) = serde_json::from_str::<Value>(text)
+    {
+        {
+            let slot = &mut state.slots[slot_index];
+            slot.state = STATE_FAILED;
+            write_error(
+                slot,
+                &format!("infer-now inline_task JSON parse failed: {err}"),
+            );
         }
-    };
-    let input = match serde_json::from_str::<Value>(&input_text) {
-        Ok(input) => input,
-        Err(err) => {
-            {
-                let slot = &mut state.slots[slot_index];
-                slot.state = STATE_FAILED;
-                write_error(slot, &format!("infer-now input JSON parse failed: {err}"));
-            }
-            state.failed = state.failed.saturating_add(1);
-            signal_requester_latch(&state.slots[slot_index]);
-            return None;
+        state.failed = state.failed.saturating_add(1);
+        signal_requester_latch(&state.slots[slot_index]);
+        return None;
+    }
+    // Validate JSON once; keep the slot text for `$n::jsonb` (skip Value→JsonB).
+    if let Err(err) = serde_json::from_str::<Value>(&input_text) {
+        {
+            let slot = &mut state.slots[slot_index];
+            slot.state = STATE_FAILED;
+            write_error(slot, &format!("infer-now input JSON parse failed: {err}"));
         }
-    };
+        state.failed = state.failed.saturating_add(1);
+        signal_requester_latch(&state.slots[slot_index]);
+        return None;
+    }
 
     let started_at = unsafe { pg_sys::GetCurrentTimestamp() };
     let start_latency_ms = {
@@ -205,8 +207,8 @@ pub(crate) fn take_request() -> Option<InferNowRequest> {
         id,
         task_name,
         subject_id,
-        inline_task,
-        input,
+        inline_task_json: inline_task_text,
+        input_json: input_text,
     })
 }
 
@@ -343,6 +345,16 @@ pub(crate) fn submit_infer_now(
 ) -> Result<Option<SubmittedInferNow>, String> {
     let input_text = serde_json::to_string(input).map_err(|err| err.to_string())?;
     submit_infer_now_text(task_name, subject_id, None, &input_text)
+}
+
+pub(crate) fn submit_infer_now_bytes(
+    task_name: &str,
+    subject_id: &str,
+    input_json: &[u8],
+) -> Result<Option<SubmittedInferNow>, String> {
+    let input_text = std::str::from_utf8(input_json)
+        .map_err(|err| format!("infer-now input is not valid UTF-8: {err}"))?;
+    submit_infer_now_text(task_name, subject_id, None, input_text)
 }
 
 fn submit_infer_now_with_inline_task(
@@ -654,6 +666,7 @@ fn wait_for_request(request_id: u64, timeout_ms: u32) -> Result<Option<Completed
                 && let Err(err) = cancel_job(cancel_job_id)
             {
                 pgrx::warning!("otlet infer-now timeout cancel failed: {err}");
+                force_cancel_requested(cancel_job_id, "infer-now timeout requested cancellation");
             }
             return Ok(None);
         }
@@ -679,15 +692,44 @@ fn cancel_job(job_id: i64) -> Result<(), String> {
             job_id.into(),
             "infer-now timeout requested cancellation".into(),
         ];
-        client
+        let table = client
             .select(
-                "SELECT count(*) FROM otlet.cancel_job($1, $2)",
-                Some(2),
+                "SELECT id FROM otlet.cancel_job($1, $2) LIMIT 1",
+                Some(1),
                 &args,
             )
-            .map(|_| ())
+            .map_err(|err| err.to_string())?;
+        let canceled = table
+            .first()
+            .get::<i64>(1)
+            .map_err(|err| err.to_string())?
+            .is_some();
+        if !canceled {
+            return Err(format!("cancel_job affected no rows for job_id={job_id}"));
+        }
+        Ok(())
     })
-    .map_err(|err| err.to_string())
+}
+
+fn force_cancel_requested(job_id: i64, reason: &str) {
+    // Error-path only: when cancel_job SPI fails on infer-now timeout, still
+    // mark cancel_requested so linked_cancel_requested can stop decode.
+    let recovery: pgrx::spi::Result<()> = pgrx::Spi::connect_mut(|client| {
+        let args = [job_id.into(), reason.into()];
+        client.update(
+            "UPDATE otlet.jobs \
+             SET status = 'cancel_requested', \
+                 error = $2, \
+                 cancel_requested_at = COALESCE(cancel_requested_at, now()) \
+             WHERE id = $1 AND status = 'running'",
+            Some(1),
+            &args,
+        )?;
+        Ok(())
+    });
+    if let Err(err) = recovery {
+        pgrx::warning!("otlet infer-now force cancel_requested failed: {err}");
+    }
 }
 
 fn signal_requester_latch(slot: &InferNowSlot) {
@@ -710,15 +752,6 @@ fn read_buf(source: &[u8], len: usize) -> String {
 
 fn read_optional_buf(source: &[u8], len: usize) -> Option<String> {
     (len > 0).then(|| read_buf(source, len))
-}
-
-fn parse_optional_json(label: &str, value: Option<&str>) -> Result<Option<Value>, String> {
-    value
-        .map(|value| {
-            serde_json::from_str::<Value>(value)
-                .map_err(|err| format!("infer-now {label} JSON parse failed: {err}"))
-        })
-        .transpose()
 }
 
 fn write_error(slot: &mut InferNowSlot, error: &str) {

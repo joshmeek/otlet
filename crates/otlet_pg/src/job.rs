@@ -33,13 +33,19 @@ pub(crate) struct ModelSelectionPolicy {
     pub(crate) accept_field_checks: Value,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct JobModelRef<'a> {
+    pub(crate) name: &'a str,
+    pub(crate) artifact_path: &'a str,
+    pub(crate) artifact_hash: Option<&'a str>,
+}
+
 impl Job {
-    pub(crate) fn with_model(&self, model: &JobModel) -> Self {
-        Self {
-            artifact_path: model.artifact_path.clone(),
-            artifact_hash: model.artifact_hash.clone(),
-            model_name: model.name.clone(),
-            ..self.clone()
+    pub(crate) fn model_ref(&self) -> JobModelRef<'_> {
+        JobModelRef {
+            name: self.model_name.as_str(),
+            artifact_path: self.artifact_path.as_str(),
+            artifact_hash: self.artifact_hash.as_deref(),
         }
     }
 }
@@ -77,45 +83,64 @@ pub(crate) fn claim_jobs() -> pgrx::spi::Result<Vec<Job>> {
     pgrx::Spi::connect_mut(|client| {
         let rows = client.update(
             r"
+WITH claimed AS (
+  SELECT
+    j.id,
+    j.task_name,
+    j.subject_id,
+    j.input,
+    t.instruction,
+    t.output_schema,
+    t.input_shaping,
+    t.decision_contract,
+    t.runtime_options,
+    m.artifact_path,
+    m.artifact_hash,
+    m.name AS model_name,
+    p.default_runtime_options,
+    p.max_attempt_ms,
+    otlet.semantic_shaped_input(j.input, t.input_shaping) AS shaped_input
+  FROM otlet.claim_jobs() j
+  JOIN otlet.tasks t ON t.name = j.task_name
+  JOIN otlet.models m ON m.name = t.model_name
+  CROSS JOIN otlet.production_policy p
+)
 SELECT
-  j.id,
-  j.task_name,
-  j.subject_id,
-  t.instruction,
-  t.output_schema,
-  otlet.semantic_shaped_input(j.input, t.input_shaping),
-  otlet.semantic_content_hash(j.input, t.input_shaping),
-  m.artifact_path,
-  m.artifact_hash,
-  m.name,
-  p.default_runtime_options || t.runtime_options,
-  t.input_shaping,
-  t.decision_contract,
-  otlet.effective_task_max_attempt_ms(p.default_runtime_options || t.runtime_options, p.max_attempt_ms)
-FROM otlet.claim_jobs() j
-JOIN otlet.tasks t ON t.name = j.task_name
-JOIN otlet.models m ON m.name = t.model_name
-CROSS JOIN otlet.production_policy p
+  id,
+  task_name,
+  subject_id,
+  instruction,
+  output_schema,
+  shaped_input,
+  md5(otlet.semantic_canonical_jsonb(shaped_input)::text),
+  artifact_path,
+  artifact_hash,
+  model_name,
+  default_runtime_options || runtime_options,
+  input_shaping,
+  decision_contract,
+  otlet.effective_task_max_attempt_ms(default_runtime_options || runtime_options, max_attempt_ms)
+FROM claimed
 	",
             None,
             &[],
         )?;
 
-        rows.into_iter().map(|row| Ok(job_from_row!(row))).collect()
+        let mut jobs = Vec::with_capacity(rows.len());
+        for row in rows {
+            jobs.push(job_from_row!(row));
+        }
+        Ok(jobs)
     })
 }
 
 pub(crate) fn insert_infer_now_job(
     task_name: &str,
     subject_id: &str,
-    input: &Value,
+    input_json: &str,
 ) -> pgrx::spi::Result<Option<Job>> {
     pgrx::Spi::connect_mut(|client| {
-        let args = [
-            task_name.into(),
-            subject_id.into(),
-            JsonB(input.clone()).into(),
-        ];
+        let args = [task_name.into(), subject_id.into(), input_json.into()];
         let rows = client.update(
             r"
 WITH inserted AS (
@@ -129,31 +154,48 @@ WITH inserted AS (
     started_at,
     finished_at
   )
-  VALUES ($1, $2, $3, 'running', 1, now() + (SELECT job_lease_interval FROM otlet.production_policy), now(), NULL)
+  VALUES ($1, $2, $3::jsonb, 'running', 1, now() + (SELECT job_lease_interval FROM otlet.production_policy), now(), NULL)
   ON CONFLICT (task_name, subject_id)
   WHERE status IN ('queued', 'running', 'cancel_requested')
   DO NOTHING
   RETURNING *
 )
 SELECT
-  j.id,
-  j.task_name,
-  j.subject_id,
-  t.instruction,
-  t.output_schema,
-  otlet.semantic_shaped_input(j.input, t.input_shaping),
-  otlet.semantic_content_hash(j.input, t.input_shaping),
-  m.artifact_path,
-  m.artifact_hash,
-  m.name,
-  p.default_runtime_options || t.runtime_options,
-  t.input_shaping,
-  t.decision_contract,
-  otlet.effective_task_max_attempt_ms(p.default_runtime_options || t.runtime_options, p.max_attempt_ms)
-FROM inserted j
-JOIN otlet.tasks t ON t.name = j.task_name
-JOIN otlet.models m ON m.name = t.model_name
-CROSS JOIN otlet.production_policy p
+  id,
+  task_name,
+  subject_id,
+  instruction,
+  output_schema,
+  shaped_input,
+  md5(otlet.semantic_canonical_jsonb(shaped_input)::text),
+  artifact_path,
+  artifact_hash,
+  model_name,
+  default_runtime_options || runtime_options,
+  input_shaping,
+  decision_contract,
+  otlet.effective_task_max_attempt_ms(default_runtime_options || runtime_options, max_attempt_ms)
+FROM (
+  SELECT
+    j.id,
+    j.task_name,
+    j.subject_id,
+    t.instruction,
+    t.output_schema,
+    t.input_shaping,
+    t.decision_contract,
+    t.runtime_options,
+    m.artifact_path,
+    m.artifact_hash,
+    m.name AS model_name,
+    p.default_runtime_options,
+    p.max_attempt_ms,
+    otlet.semantic_shaped_input(j.input, t.input_shaping) AS shaped_input
+  FROM inserted j
+  JOIN otlet.tasks t ON t.name = j.task_name
+  JOIN otlet.models m ON m.name = t.model_name
+  CROSS JOIN otlet.production_policy p
+) shaped
 	",
             Some(1),
             &args,
