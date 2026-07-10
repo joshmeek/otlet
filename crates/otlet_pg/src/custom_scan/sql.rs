@@ -10,7 +10,9 @@ unsafe fn pg_cstr_str<'pg>(value: *const c_char) -> Option<&'pg str> {
 }
 
 fn cstr(value: &str) -> CString {
-    CString::new(value).unwrap_or_default()
+    CString::new(value).unwrap_or_else(|_| {
+        CString::new(value.replace('\0', "")).expect("otlet explain string after NUL strip")
+    })
 }
 
 fn pg_cstr(value: &str) -> *mut c_char {

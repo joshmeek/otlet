@@ -1,5 +1,6 @@
 use crate::job::{
-    Job, ModelSelectionPolicy, claim_jobs, insert_infer_now_job, model_selection_policy,
+    Job, ModelSelectionPolicy, claim_jobs, insert_infer_now_job, model_selection_policies_for_tasks,
+    model_selection_policy,
 };
 use crate::model::{
     ModelError, ModelMetrics, ModelRun, clear_task_contract_digests, run_job, run_job_with_model,
@@ -13,6 +14,13 @@ use std::time::{Duration, Instant};
 
 static EMPTY_TRACE_SUMMARY: LazyLock<Value> = LazyLock::new(|| serde_json::json!({}));
 
+/// Bound idle expired-job sweeps so empty-queue wake loops do not re-scan leases
+/// every latch. Lease reclaim still runs at least this often and after any drain.
+const EXPIRED_JOB_SWEEP_INTERVAL: Duration = Duration::from_secs(30);
+/// Bound idle schema probes the same way: DROP/upgrade still fail closed on the
+/// next probe, claim errors, or after productive drain.
+const SCHEMA_READY_PROBE_INTERVAL: Duration = Duration::from_secs(30);
+
 #[pgrx::pg_guard]
 #[unsafe(no_mangle)]
 pub extern "C-unwind" fn otlet_worker_main(_arg: pgrx::pg_sys::Datum) {
@@ -24,32 +32,49 @@ pub extern "C-unwind" fn otlet_worker_main(_arg: pgrx::pg_sys::Datum) {
     pgrx::log!("otlet worker started");
 
     let recovery_interval = Duration::from_millis(crate::wake::MISSED_WAKE_RECOVERY_MS);
+    let mut last_expired_sweep = Instant::now()
+        .checked_sub(EXPIRED_JOB_SWEEP_INTERVAL)
+        .unwrap_or_else(Instant::now);
+    let mut last_schema_probe = Instant::now()
+        .checked_sub(SCHEMA_READY_PROBE_INTERVAL)
+        .unwrap_or_else(Instant::now);
+    let mut schema_probe_due = true;
 
     while BackgroundWorker::wait_latch(Some(recovery_interval)) {
-        // Check every wake so DROP EXTENSION / upgrade fail closed immediately.
-        let schema_ready = match BackgroundWorker::transaction(otlet_schema_ready) {
-            Ok(ready) => ready,
-            Err(err) => {
-                pgrx::warning!("otlet worker schema readiness check failed: {err}");
-                false
+        if schema_probe_due || last_schema_probe.elapsed() >= SCHEMA_READY_PROBE_INTERVAL {
+            let schema_ready = match BackgroundWorker::transaction(otlet_schema_ready) {
+                Ok(ready) => ready,
+                Err(err) => {
+                    pgrx::warning!("otlet worker schema readiness check failed: {err}");
+                    false
+                }
+            };
+            last_schema_probe = Instant::now();
+            if !schema_ready {
+                // Keep probing until the extension surface is back.
+                schema_probe_due = true;
+                continue;
             }
-        };
-        if !schema_ready {
-            continue;
+            schema_probe_due = false;
         }
 
         while let Some(request) = crate::infer_now::take_request() {
             process_infer_now_request(request);
+            schema_probe_due = true;
         }
 
-        let sweep_result: pgrx::spi::Result<()> = BackgroundWorker::transaction(|| {
-            pgrx::Spi::connect_mut(|client| {
-                client.update("SELECT otlet.sweep_expired_jobs()", Some(1), &[])?;
-                Ok(())
-            })
-        });
-        if let Err(err) = sweep_result {
-            pgrx::warning!("otlet worker expired job sweep failed: {err}");
+        if last_expired_sweep.elapsed() >= EXPIRED_JOB_SWEEP_INTERVAL {
+            let sweep_result: pgrx::spi::Result<()> = BackgroundWorker::transaction(|| {
+                pgrx::Spi::connect_mut(|client| {
+                    client.update("SELECT otlet.sweep_expired_jobs()", Some(1), &[])?;
+                    Ok(())
+                })
+            });
+            if let Err(err) = sweep_result {
+                pgrx::warning!("otlet worker expired job sweep failed: {err}");
+                schema_probe_due = true;
+            }
+            last_expired_sweep = Instant::now();
         }
 
         let mut drained = 0;
@@ -59,6 +84,7 @@ pub extern "C-unwind" fn otlet_worker_main(_arg: pgrx::pg_sys::Datum) {
                 Ok(jobs) => jobs,
                 Err(err) => {
                     pgrx::warning!("otlet worker claim failed: {err}");
+                    schema_probe_due = true;
                     break;
                 }
             };
@@ -94,6 +120,13 @@ pub extern "C-unwind" fn otlet_worker_main(_arg: pgrx::pg_sys::Datum) {
             }
         }
         crate::wake::record_worker_drain(drained);
+        if drained > 0 {
+            // After productive work, reclaim expired leases and re-check schema promptly.
+            last_expired_sweep = Instant::now()
+                .checked_sub(EXPIRED_JOB_SWEEP_INTERVAL)
+                .unwrap_or_else(Instant::now);
+            schema_probe_due = true;
+        }
     }
 
     crate::wake::unregister_worker_latch();
@@ -317,6 +350,12 @@ impl Default for ModelSelectionPolicyCache {
 }
 
 impl ModelSelectionPolicyCache {
+    fn seed(&mut self, policies: HashMap<String, Option<ModelSelectionPolicy>>) {
+        for (task_name, policy) in policies {
+            self.policies.entry(task_name).or_insert(policy);
+        }
+    }
+
     fn get(&mut self, task_name: &str) -> pgrx::spi::Result<Option<&ModelSelectionPolicy>> {
         // Avoid allocating the key on every hit (HashMap::entry(to_owned) always owns).
         if !self.policies.contains_key(task_name) {
@@ -349,6 +388,20 @@ fn process_job_batch(jobs: Vec<Job>) -> BatchProcessResult {
     mark_jobs_started(&jobs);
     let mut batch = BatchProcessResult::default();
     let mut policy_cache = ModelSelectionPolicyCache::default();
+    let mut task_names = Vec::with_capacity(jobs.len().min(8));
+    for job in &jobs {
+        if !task_names.iter().any(|name| name == &job.task_name) {
+            task_names.push(job.task_name.clone());
+        }
+    }
+    if !task_names.is_empty() {
+        match BackgroundWorker::transaction(|| model_selection_policies_for_tasks(&task_names)) {
+            Ok(policies) => policy_cache.seed(policies),
+            Err(err) => {
+                pgrx::warning!("otlet worker batch policy prefetch failed: {err}");
+            }
+        }
+    }
     let mut strong_jobs = Vec::with_capacity(jobs.len().min(8));
     for job in jobs {
         let mut result = process_job_deferred(&job, &mut policy_cache, true);

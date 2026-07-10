@@ -106,7 +106,12 @@ fn run_linked(
     }
     let tokenize_start = Instant::now();
     let tokens = tokenize_linked(cache.vocab, prompt)?;
-    let prompt_prefix_tokens = tokenize_linked(cache.vocab, prompt_prefix)?;
+    // Skip prefix tokenization when the string cannot be a prefix of the prompt.
+    let prompt_prefix_tokens = if !prompt_prefix.is_empty() && prompt.starts_with(prompt_prefix) {
+        tokenize_linked(cache.vocab, prompt_prefix)?
+    } else {
+        Vec::new()
+    };
     let tokenize_ms = elapsed_ms(tokenize_start);
     if tokens.is_empty() {
         return Err(ModelError::new_static("linked llama.cpp prompt produced no tokens"));
@@ -1070,7 +1075,9 @@ fn linked_token_to_piece_into(
     if size > buffer.len() {
         return;
     }
-    output.push_str(&String::from_utf8_lossy(&buffer[..size]));
+    if let Ok(piece) = std::str::from_utf8(&buffer[..size]) {
+        output.push_str(piece);
+    }
 }
 
 fn linked_token_to_piece(

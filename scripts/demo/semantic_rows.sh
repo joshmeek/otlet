@@ -515,41 +515,46 @@ echo "no_abstain_eval_contract=$no_abstain_eval_contract"
   exit 1
 }
 
-row_watch_status_contract="$(psql_exec -qAt -v watch_name="$row_triage_watch" <<'SQL'
-SELECT watch_name || '|' || kind || '|' ||
-       total_subjects::text || '|' ||
-       fresh_subjects::text || '|' ||
-       stale_subjects::text || '|' ||
-       missing_subjects::text || '|' ||
-       queued_jobs::text || '|' ||
-       complete_jobs::text || '|' ||
-       count_basis
-FROM otlet.watch_status
-WHERE watch_name = :'watch_name';
+row_status_plan_contracts="$(psql_value -v watch_name="$row_triage_watch" <<'SQL'
+SELECT
+  (
+    SELECT watch_name || '|' || kind || '|' ||
+           total_subjects::text || '|' ||
+           fresh_subjects::text || '|' ||
+           stale_subjects::text || '|' ||
+           missing_subjects::text || '|' ||
+           queued_jobs::text || '|' ||
+           complete_jobs::text || '|' ||
+           count_basis
+    FROM otlet.watch_status
+    WHERE watch_name = :'watch_name'
+  ) || E'\n' ||
+  (
+    SELECT count_basis || '|' ||
+           total_subjects::text || '|' ||
+           fresh_subjects::text || '|' ||
+           stale_subjects::text || '|' ||
+           missing_subjects::text
+    FROM otlet.semantic_index_plan(:'watch_name')
+  ) || E'\n' ||
+  (
+    SELECT count_basis || '|' ||
+           total_subjects::text || '|' ||
+           fresh_subjects::text || '|' ||
+           stale_subjects::text || '|' ||
+           missing_subjects::text
+    FROM otlet.semantic_index_plan(:'watch_name', true)
+  );
 SQL
 )"
+row_watch_status_contract="$(sed -n '1p' <<<"$row_status_plan_contracts")"
+row_plan_estimated="$(sed -n '2p' <<<"$row_status_plan_contracts")"
+row_plan_exact="$(sed -n '3p' <<<"$row_status_plan_contracts")"
 echo "row_watch_status_contract=$row_watch_status_contract"
 [ "$row_watch_status_contract" = "$row_triage_watch|row|1|1|0|0|0|1|estimated" ] || {
   echo "Expected row watch status to show one fresh completed row, got $row_watch_status_contract" >&2
   exit 1
 }
-row_plan_basis_contract="$(psql_exec -qAt -v watch_name="$row_triage_watch" <<'SQL'
-SELECT count_basis || '|' ||
-       total_subjects::text || '|' ||
-       fresh_subjects::text || '|' ||
-       stale_subjects::text || '|' ||
-       missing_subjects::text
-FROM otlet.semantic_index_plan(:'watch_name');
-SELECT count_basis || '|' ||
-       total_subjects::text || '|' ||
-       fresh_subjects::text || '|' ||
-       stale_subjects::text || '|' ||
-       missing_subjects::text
-FROM otlet.semantic_index_plan(:'watch_name', true);
-SQL
-)"
-row_plan_estimated="$(head -n 1 <<<"$row_plan_basis_contract")"
-row_plan_exact="$(tail -n 1 <<<"$row_plan_basis_contract")"
 echo "row_plan_basis_contract=$row_plan_estimated|exact=$row_plan_exact"
 [ "$row_plan_estimated|$row_plan_exact" = "estimated|1|1|0|0|exact|1|1|0|0" ] || {
   echo "Expected estimated and exact row plan counts to match on demo row, got $row_plan_estimated|$row_plan_exact" >&2

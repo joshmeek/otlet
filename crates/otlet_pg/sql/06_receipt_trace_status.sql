@@ -59,49 +59,76 @@ SELECT
   accepted.selection_role AS model_selection_role,
   accepted.selection_status AS model_selection_status,
   accepted.selection_reason AS model_selection_reason,
-  COALESCE(attempts.model_attempt_count, 0)::bigint AS model_attempt_count,
-  COALESCE(attempts.escalated, false) AS escalated,
+  COALESCE(accepted.model_attempt_count, 0)::bigint AS model_attempt_count,
+  COALESCE(accepted.escalated, false) AS escalated,
   j.created_at AS job_created_at,
   accepted.output_created_at,
   accepted.finished_at AS receipt_finished_at
 FROM otlet.jobs j
 LEFT JOIN LATERAL (
   SELECT
-    ar.id AS receipt_id,
-    ar.model_name,
-    ar.runtime_name,
-    ar.prompt_hash,
-    ar.input_hash,
-    ar.output_schema_hash,
-    ar.raw_output_hash,
-    ar.raw_output,
-    ar.prompt_tokens,
-    ar.generated_tokens,
-    ar.generate_ms,
-    ar.tokens_per_second,
-    ar.schema_validation_status,
-    ar.trace_summary,
-    ar.selection_role,
-    ar.selection_status,
-    ar.selection_reason,
-    ar.finished_at,
-    o.id AS output_id,
-    o.output,
-    o.raw_output AS output_raw_output,
-    o.created_at AS output_created_at
-  FROM otlet.outputs o
-  JOIN otlet.inference_receipts ar ON ar.id = o.receipt_id
-  WHERE o.job_id = j.id
-  ORDER BY ar.attempt_index DESC, ar.id DESC
-  LIMIT 1
-) accepted ON true
-LEFT JOIN LATERAL (
-  SELECT
-    count(*)::bigint AS model_attempt_count,
-    bool_or(ar.selection_role = 'strong') AS escalated
-  FROM otlet.inference_receipts ar
-  WHERE ar.job_id = j.id
-) attempts ON true;
+    acc.receipt_id,
+    acc.model_name,
+    acc.runtime_name,
+    acc.prompt_hash,
+    acc.input_hash,
+    acc.output_schema_hash,
+    acc.raw_output_hash,
+    acc.raw_output,
+    acc.prompt_tokens,
+    acc.generated_tokens,
+    acc.generate_ms,
+    acc.tokens_per_second,
+    acc.schema_validation_status,
+    acc.trace_summary,
+    acc.selection_role,
+    acc.selection_status,
+    acc.selection_reason,
+    acc.finished_at,
+    acc.output_id,
+    acc.output,
+    acc.output_raw_output,
+    acc.output_created_at,
+    agg.model_attempt_count,
+    agg.escalated
+  FROM (
+    SELECT
+      count(*)::bigint AS model_attempt_count,
+      bool_or(ar.selection_role = 'strong') AS escalated
+    FROM otlet.inference_receipts ar
+    WHERE ar.job_id = j.id
+  ) agg
+  LEFT JOIN LATERAL (
+    SELECT
+      ar.id AS receipt_id,
+      ar.model_name,
+      ar.runtime_name,
+      ar.prompt_hash,
+      ar.input_hash,
+      ar.output_schema_hash,
+      ar.raw_output_hash,
+      ar.raw_output,
+      ar.prompt_tokens,
+      ar.generated_tokens,
+      ar.generate_ms,
+      ar.tokens_per_second,
+      ar.schema_validation_status,
+      ar.trace_summary,
+      ar.selection_role,
+      ar.selection_status,
+      ar.selection_reason,
+      ar.finished_at,
+      o.id AS output_id,
+      o.output,
+      o.raw_output AS output_raw_output,
+      o.created_at AS output_created_at
+    FROM otlet.outputs o
+    JOIN otlet.inference_receipts ar ON ar.id = o.receipt_id
+    WHERE o.job_id = j.id
+    ORDER BY ar.attempt_index DESC, ar.id DESC
+    LIMIT 1
+  ) acc ON true
+) accepted ON true;
 
 CREATE VIEW otlet.action_status AS
 SELECT
@@ -241,13 +268,13 @@ abstention_items AS (
     o.output,
     r.trace_summary #>> '{mvcc,table}' AS source_table,
     COALESCE(r.trace_summary #>> '{mvcc,source_hash}', md5((r.trace_summary -> 'mvcc')::text)) AS source_hash,
-    otlet.semantic_content_hash(j.input, t.input_shaping) AS content_hash,
-    COALESCE(materialization.content_hash, otlet.semantic_content_hash(j.input, t.input_shaping)) AS current_content_hash,
+    hashed.content_hash,
+    COALESCE(materialization.content_hash, hashed.content_hash) AS current_content_hash,
     (
       COALESCE(materialization.stale, false)
       OR (
         materialization.content_hash IS NOT NULL
-        AND materialization.content_hash IS DISTINCT FROM otlet.semantic_content_hash(j.input, t.input_shaping)
+        AND materialization.content_hash IS DISTINCT FROM hashed.content_hash
       )
     ) AS source_stale,
     o.created_at
@@ -256,6 +283,9 @@ abstention_items AS (
   JOIN otlet.tasks t ON t.name = j.task_name
   JOIN otlet.inference_receipts r ON r.id = o.receipt_id
   LEFT JOIN otlet.watches w ON w.task_name = j.task_name
+  CROSS JOIN LATERAL (
+    SELECT otlet.semantic_content_hash(j.input, t.input_shaping) AS content_hash
+  ) hashed
   LEFT JOIN LATERAL (
     SELECT sm.content_hash, sm.stale
     FROM otlet.semantic_materializations sm
@@ -301,13 +331,13 @@ direct_rejected_items AS (
     r.raw_output::jsonb -> 'output' AS output,
     r.trace_summary #>> '{mvcc,table}' AS source_table,
     COALESCE(r.trace_summary #>> '{mvcc,source_hash}', md5((r.trace_summary -> 'mvcc')::text)) AS source_hash,
-    otlet.semantic_content_hash(j.input, t.input_shaping) AS content_hash,
-    COALESCE(materialization.content_hash, otlet.semantic_content_hash(j.input, t.input_shaping)) AS current_content_hash,
+    hashed.content_hash,
+    COALESCE(materialization.content_hash, hashed.content_hash) AS current_content_hash,
     (
       COALESCE(materialization.stale, false)
       OR (
         materialization.content_hash IS NOT NULL
-        AND materialization.content_hash IS DISTINCT FROM otlet.semantic_content_hash(j.input, t.input_shaping)
+        AND materialization.content_hash IS DISTINCT FROM hashed.content_hash
       )
     ) AS source_stale,
     r.finished_at AS created_at
@@ -315,6 +345,9 @@ direct_rejected_items AS (
   JOIN otlet.jobs j ON j.id = r.job_id
   JOIN otlet.tasks t ON t.name = j.task_name
   LEFT JOIN otlet.watches w ON w.task_name = j.task_name
+  CROSS JOIN LATERAL (
+    SELECT otlet.semantic_content_hash(j.input, t.input_shaping) AS content_hash
+  ) hashed
   LEFT JOIN LATERAL (
     SELECT sm.content_hash, sm.stale
     FROM otlet.semantic_materializations sm
@@ -518,6 +551,16 @@ SELECT
       THEN (r.trace_summary ->> 'prompt_decode_ms')::bigint
     ELSE NULL
   END AS prompt_decode_ms,
+  CASE
+    WHEN jsonb_typeof(r.trace_summary -> 'finish_sql_ms') = 'number'
+      THEN (r.trace_summary ->> 'finish_sql_ms')::bigint
+    ELSE NULL
+  END AS finish_sql_ms,
+  CASE
+    WHEN jsonb_typeof(r.trace_summary -> 'materialize_ms') = 'number'
+      THEN (r.trace_summary ->> 'materialize_ms')::bigint
+    ELSE NULL
+  END AS materialize_ms,
   CASE
     WHEN jsonb_typeof(r.trace_summary -> 'first_token_ms') = 'number'
       THEN (r.trace_summary ->> 'first_token_ms')::bigint

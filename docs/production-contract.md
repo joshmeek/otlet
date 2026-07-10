@@ -1,6 +1,6 @@
 # Production Contract
 
-Use this after the entity-resolution and semantic-watch checks. It inspects the production surfaces that keep model work bounded, visible, and database-owned
+Use this after the entity-resolution and semantic-watch checks. It inspects production surfaces for bounded, visible, database-owned model work
 
 ## Step 1 - Inspect Trace Visibility Across The System
 
@@ -22,9 +22,9 @@ Representative output:
 inference_visibility_status=true|true|true|true|true
 ```
 
-Those booleans prove receipts, token steps, top-k alternatives, bounded trace tokens, and top-k width were present
+The five booleans confirm receipts, token steps, top-k alternatives, bounded trace tokens, and bounded top-k width
 
-## Step 2 - Inspect Runtime Status After Advanced Runs
+## Step 2 - Inspect Runtime Status After Demo Runs
 
 Runtime status shows the resident model slot, cache bounds, memory samples, and last run metrics
 
@@ -52,15 +52,15 @@ The value reports a ready runtime, a ready model slot, bounded cache entries and
 
 ## Step 3 - Inspect Production Policy
 
-The production policy row and status views are ordinary SQL state under `otlet`: `production_policy_status`, `production_status`, `model_queue_status`, `worker_throughput_status`, and `cleanup_policy_state(true)`
+The production policy row and status views expose SQL state under `otlet`: `production_policy_status`, `production_status`, `model_queue_status`, `worker_throughput_status`, and `cleanup_policy_state(true)`
 
 Queue caps are admission-time controls. Rows enter `otlet.jobs` through `run_task`, watch refresh, semantic refresh, or `ask`; direct inserts are internal/testing-only and can bypass admission accounting. `verify_invariants()` reports every broken invariant as a row; the demo requires `SELECT count(*) FROM otlet.verify_invariants()` to return `0` (`invariant_contract=0`). One of those checks is `queued_jobs_within_model_cap` when queued depth for any model exceeds `max_queued_jobs_per_model`
 
-Otlet debounces suppressed queue-admission events per task and reason for one minute, so a full queue stays visible without flooding `worker_events`. `production_status` also exposes `semantic_materialization_failed_events` and `semantic_materialization_last_failed_at`. Nonzero `max_worker_rss_bytes` budgets require Linux process-status RSS sampling; unsupported builds reject the option during runtime-option validation instead of letting jobs fail later. Cleanup can prune old failed/canceled jobs only when outputs, actions, eval labels, and receipt references no longer keep them alive
+Otlet debounces suppressed queue-admission events per task and reason for one minute, so a full queue stays visible without flooding `worker_events`. `production_status` also exposes `semantic_materialization_failed_events` and `semantic_materialization_last_failed_at`. Nonzero `max_worker_rss_bytes` budgets require Linux process-status RSS sampling; runtime-option validation rejects unsupported builds before queue execution. Cleanup can prune old failed or canceled jobs after outputs, actions, eval labels, and receipts no longer reference them
 
-The resident worker attaches to the `postgres` database. Multi-database worker registration needs separate shared-memory and latch routing work before it is a supported deployment shape
+The resident worker attaches to the `postgres` database. Supporting worker registration across multiple databases requires separate shared-memory and latch routing
 
-Native llama.cpp faults happen below Rust's normal error boundary. Otlet's containment contract is Postgres worker restart plus lease recovery: Otlet trusts no partial model output, and `otlet.sweep_expired_jobs()` fails expired running jobs that reached the attempt limit with a receipt. The full demo also scans container logs and prints `docker_crash_log_scan=ok` when no worker crash, panic, assertion, or terminated server process appears during the run
+Native llama.cpp faults bypass Rust's error boundary. Otlet contains them through Postgres worker restart and lease recovery. Otlet trusts no partial model output, and `otlet.sweep_expired_jobs()` fails expired running jobs that reached the attempt limit with a receipt. The demo scans container logs and prints `docker_crash_log_scan=ok` when the run contains no worker crash, panic, assertion, or terminated server process
 
 ```sql
 SELECT otlet.sweep_expired_jobs();
@@ -132,9 +132,11 @@ Contract: `true|true` (demo prints `materialization_failure_status_contract=true
 SELECT count(*) FROM otlet.verify_invariants();
 ```
 
-Contract: `0` (demo prints `invariant_contract=0`). Beyond queue caps, the suite also fails closed on expired or NULL leases for `running`/`cancel_requested` jobs (`no_expired_running_jobs`), complete receipts without schema pass (`complete_receipts_are_schema_validated`), materializations missing `source_hash`, and error runtime slots
+Contract: `0` (demo prints `invariant_contract=0`). The suite also fails closed on expired or NULL leases for `running` and `cancel_requested` jobs, complete receipts without schema pass, materializations missing `source_hash`, and error runtime slots. `production_status` and `verify_invariants` name the receipt invariant `complete_receipts_are_schema_validated`; throughput views use `completed_jobs` and `last_batch_completed_jobs`. Step 6 of `docs/semantic-watches.md` anchors the planner vocabulary for `selected_path` / `Planner Selected Path` and `freshness_basis`
 
-## Step 4 - Know The Remaining Production Boundaries
+Operators query redacted, read-only projections through `otlet.audit_receipt_export`, `otlet.audit_review_export`, `otlet.audit_eval_label_export`, `otlet.semantic_dependency_audit`, and `otlet.worker_batch_timing_status`. `otlet.redaction_policy_status` lists withheld fields
+
+## Step 4 - Assign Application-Owned Controls
 
 Otlet installs internal production policy, bounded queues, leases, sweeps, validation evidence, action approval state, status views, and cleanup dry-run/apply functions. Your application owns tenant access, app roles, and who may approve or apply actions
 

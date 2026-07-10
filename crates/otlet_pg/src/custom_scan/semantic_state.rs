@@ -193,17 +193,18 @@ fn load_semantic_states(
              (sm.content_hash IS NOT DISTINCT FROM src.content_hash AND sm.contract_hash IS NOT DISTINCT FROM $3::text) DESC, \
              sm.updated_at DESC, sm.id DESC \
          ), \
+         active_jobs AS ( \
+           SELECT DISTINCT j.subject_id \
+           FROM otlet.jobs j \
+           JOIN source_rows src ON src.subject_id = j.subject_id \
+           WHERE j.task_name = $1 \
+             AND j.status IN ('queued', 'running', 'cancel_requested') \
+         ), \
          semantic_state AS ( \
            SELECT \
              src.subject_id, \
              CASE \
-               WHEN EXISTS ( \
-                 SELECT 1 FROM otlet.jobs j \
-                 WHERE j.task_name = $1 \
-                   AND j.subject_id = src.subject_id \
-                   AND j.status IN ('queued', 'running', 'cancel_requested') \
-                 LIMIT 1 \
-               ) AND (l.subject_id IS NULL OR status.is_stale) THEN 'in_flight' \
+               WHEN a.subject_id IS NOT NULL AND (l.subject_id IS NULL OR status.is_stale) THEN 'in_flight' \
                WHEN l.subject_id IS NULL THEN 'missing' \
                WHEN status.is_stale THEN 'stale' \
                WHEN l.matches_expected THEN 'fresh_match' \
@@ -219,6 +220,7 @@ fn load_semantic_states(
              END AS stale_reason \
            FROM source_rows src \
            LEFT JOIN latest_materializations l USING (subject_id) \
+           LEFT JOIN active_jobs a USING (subject_id) \
            LEFT JOIN LATERAL {freshness_status_sql} status ON l.subject_id IS NOT NULL \
          ) \
          SELECT subject_id, semantic_state, freshness_basis, stale_reason \
@@ -230,6 +232,7 @@ fn load_semantic_states(
             .map_err(to_string)?;
         let capacity = preload_subject_capacity(stashed_source_rows, table.len());
         let mut subjects = HashMap::with_capacity(capacity);
+        let mut subject_counts = PreloadedSubjectCounts::new();
         let mut freshness_basis_counts = BTreeMap::new();
         let mut stale_reason_counts = BTreeMap::new();
         let mut freshness_basis_by_subject = HashMap::with_capacity(capacity);
@@ -273,6 +276,7 @@ fn load_semantic_states(
             {
                 *stale_reason_counts.entry(stale_reason).or_insert(0) += 1;
             }
+            subject_counts.record(state);
             subjects.insert(subject_id, state);
             if subjects.len() > SEMANTIC_PRELOAD_SUBJECT_CAP {
                 return Err(format!(
@@ -290,6 +294,7 @@ fn load_semantic_states(
             model_cost_source,
             freshness_basis_by_subject,
             subjects,
+            subject_counts,
         })
     })
 }
@@ -422,6 +427,7 @@ fn load_semantic_join_states(
                    SELECT DISTINCT j.subject_id \
                    FROM otlet.jobs j \
                    JOIN meta m ON m.task_name = j.task_name \
+                   JOIN current_rows cr ON cr.subject_id = j.subject_id \
                    WHERE j.status IN ('queued', 'running', 'cancel_requested') \
                  ), \
                  subjects AS ( \
@@ -436,7 +442,7 @@ fn load_semantic_join_states(
                      END AS semantic_state, \
                      c.freshness_basis \
                    FROM current_rows c \
-                   FULL JOIN active_jobs a USING (subject_id) \
+                   LEFT JOIN active_jobs a USING (subject_id) \
                  ) \
                  SELECT \
                    m.task_name, \
@@ -466,6 +472,7 @@ fn load_semantic_join_states(
         let mut stale_reasons = "{}".to_owned();
         let capacity = preload_subject_capacity(stashed_source_rows, table.len());
         let mut subjects = HashMap::with_capacity(capacity);
+        let mut subject_counts = PreloadedSubjectCounts::new();
         let mut freshness_basis_counts = BTreeMap::new();
         let mut freshness_basis_by_subject = HashMap::with_capacity(capacity);
         let mut saw_meta = false;
@@ -516,6 +523,7 @@ fn load_semantic_join_states(
                         .or_insert(0) += 1;
                     freshness_basis_by_subject.insert(subject_id.clone(), freshness_basis);
                 }
+                subject_counts.record(state);
                 subjects.insert(subject_id, state);
                 if subjects.len() > SEMANTIC_PRELOAD_SUBJECT_CAP {
                     return Err(format!(
@@ -538,6 +546,7 @@ fn load_semantic_join_states(
             model_cost_source,
             freshness_basis_by_subject,
             subjects,
+            subject_counts,
         })
     })
 }

@@ -79,6 +79,8 @@ struct OtletSemanticCustomScanState {
     infer_trace_prompt_tokens: u64,
     infer_trace_generated_tokens: u64,
     infer_trace_generate_ms: u64,
+    infer_trace_finish_sql_ms: u64,
+    infer_trace_materialize_ms: u64,
     infer_trace_version: *mut c_char,
     infer_trace_probability_status: *mut c_char,
     infer_trace_schema_force: *mut c_char,
@@ -88,6 +90,57 @@ struct OtletSemanticCustomScanState {
     child_plan_rows: u64,
     /// True once begin-scan attached a PG child plan (EXPLAIN provider parity).
     has_child_plan: bool,
+}
+
+#[derive(Default)]
+struct EmittedFreshnessCounts {
+    content_hash_match: u64,
+    mvcc_match: u64,
+    revalidated_after_benign_update: u64,
+    runtime_refresh: u64,
+    other: BTreeMap<String, u64>,
+}
+
+impl EmittedFreshnessCounts {
+    fn clear(&mut self) {
+        *self = Self::default();
+    }
+
+    fn is_empty(&self) -> bool {
+        self.content_hash_match == 0
+            && self.mvcc_match == 0
+            && self.revalidated_after_benign_update == 0
+            && self.runtime_refresh == 0
+            && self.other.is_empty()
+    }
+}
+
+fn emitted_freshness_counts_json(counts: &EmittedFreshnessCounts) -> String {
+    if counts.is_empty() {
+        return "{}".to_owned();
+    }
+    let mut value = serde_json::Map::new();
+    if counts.content_hash_match > 0 {
+        value.insert("content_hash_match".to_owned(), json!(counts.content_hash_match));
+    }
+    if counts.mvcc_match > 0 {
+        value.insert("mvcc_match".to_owned(), json!(counts.mvcc_match));
+    }
+    if counts.revalidated_after_benign_update > 0 {
+        value.insert(
+            "revalidated_after_benign_update".to_owned(),
+            json!(counts.revalidated_after_benign_update),
+        );
+    }
+    if counts.runtime_refresh > 0 {
+        value.insert("runtime_refresh".to_owned(), json!(counts.runtime_refresh));
+    }
+    for (k, v) in &counts.other {
+        if *v > 0 {
+            value.insert(k.clone(), json!(v));
+        }
+    }
+    Value::Object(value).to_string()
 }
 
 struct RuntimeState {
@@ -129,7 +182,7 @@ struct RuntimeState {
     owns_child_plan: bool,
     semantic_states: HashMap<String, SubjectSemanticState>,
     subject_freshness_basis: HashMap<String, String>,
-    emitted_freshness_basis: BTreeMap<String, u64>,
+    emitted_freshness_basis: EmittedFreshnessCounts,
     rows_seen: u64,
     rows_returned: u64,
     lookup_rows: u64,
@@ -154,6 +207,8 @@ struct RuntimeState {
     infer_trace_prompt_tokens: u64,
     infer_trace_generated_tokens: u64,
     infer_trace_generate_ms: u64,
+    infer_trace_finish_sql_ms: u64,
+    infer_trace_materialize_ms: u64,
     infer_trace_version: String,
     infer_trace_probability_status: String,
     infer_trace_schema_force: String,
@@ -170,6 +225,8 @@ struct InferNowTraceExplain<'trace> {
     prompt_tokens: u64,
     generated_tokens: u64,
     generate_ms: u64,
+    finish_sql_ms: u64,
+    materialize_ms: u64,
     version: Option<&'trace str>,
     probability_status: Option<&'trace str>,
     schema_force: Option<&'trace str>,
@@ -198,6 +255,37 @@ enum SubjectSemanticState {
     Stale,
     InFlight,
     Missing,
+}
+
+#[derive(Clone, Copy)]
+struct PreloadedSubjectCounts {
+    fresh_matches: u64,
+    fresh_non_matches: u64,
+    stale: u64,
+    inflight: u64,
+    missing: u64,
+}
+
+impl PreloadedSubjectCounts {
+    const fn new() -> Self {
+        Self {
+            fresh_matches: 0,
+            fresh_non_matches: 0,
+            stale: 0,
+            inflight: 0,
+            missing: 0,
+        }
+    }
+
+    fn record(&mut self, state: SubjectSemanticState) {
+        match state {
+            SubjectSemanticState::FreshMatch => self.fresh_matches += 1,
+            SubjectSemanticState::FreshNonMatch => self.fresh_non_matches += 1,
+            SubjectSemanticState::Stale => self.stale += 1,
+            SubjectSemanticState::InFlight => self.inflight += 1,
+            SubjectSemanticState::Missing => self.missing += 1,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -232,6 +320,7 @@ struct LoadedSemanticState {
     model_cost_source: String,
     freshness_basis_by_subject: HashMap<String, String>,
     subjects: HashMap<String, SubjectSemanticState>,
+    subject_counts: PreloadedSubjectCounts,
 }
 
 impl SubjectSemanticState {

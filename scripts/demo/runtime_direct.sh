@@ -354,3 +354,8 @@ echo "input_shape_sql_contract=$input_shape_sql_contract"
   echo "Expected SQL input shaping vector to match Rust semantics, got $input_shape_sql_contract" >&2
   exit 1
 }
+
+psql_exec >/dev/null <<'SQL'
+DROP TABLE IF EXISTS public.readme_vendor_note;
+DROP TABLE IF EXISTS public.otlet_demo_direct_gate;
+SQL

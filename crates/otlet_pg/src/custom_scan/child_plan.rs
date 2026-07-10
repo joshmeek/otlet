@@ -173,10 +173,18 @@ unsafe fn non_semantic_plan_quals(
     rti: pg_sys::Index,
 ) -> *mut pg_sys::List {
     unsafe {
+        // Parse semantic signatures once; clause loop only re-parses each plan qual.
+        let semantic_preds = collect_semantic_predicates(semantic_restrictinfos, rti);
         let mut output: *mut pg_sys::List = ptr::null_mut();
         for idx in 0..pg_sys::list_length(clauses) {
             let clause = pg_sys::list_nth(clauses, idx);
-            if clause.is_null() || is_owned_semantic_plan_qual(clause, semantic_restrictinfos, rti)
+            if clause.is_null()
+                || is_owned_semantic_plan_qual(
+                    clause,
+                    semantic_restrictinfos,
+                    &semantic_preds,
+                    rti,
+                )
             {
                 continue;
             }
@@ -190,9 +198,35 @@ unsafe fn non_semantic_plan_quals(
     }
 }
 
+unsafe fn collect_semantic_predicates(
+    semantic_restrictinfos: *mut pg_sys::List,
+    rti: pg_sys::Index,
+) -> Vec<SemanticMatchPredicate> {
+    unsafe {
+        let len = pg_sys::list_length(semantic_restrictinfos);
+        let mut out = Vec::with_capacity(usize::try_from(len).unwrap_or(0));
+        for idx in 0..len {
+            let semantic =
+                pg_sys::list_nth(semantic_restrictinfos, idx).cast::<pg_sys::RestrictInfo>();
+            if semantic.is_null() {
+                continue;
+            }
+            let semantic_expr = actual_clause_expr(semantic.cast());
+            if semantic_expr.is_null() {
+                continue;
+            }
+            if let Some(pred) = semantic_match_from_clause(semantic_expr, rti) {
+                out.push(pred);
+            }
+        }
+        out
+    }
+}
+
 unsafe fn is_owned_semantic_plan_qual(
     clause: *mut std::ffi::c_void,
     semantic_restrictinfos: *mut pg_sys::List,
+    semantic_preds: &[SemanticMatchPredicate],
     rti: pg_sys::Index,
 ) -> bool {
     unsafe {
@@ -206,23 +240,9 @@ unsafe fn is_owned_semantic_plan_qual(
         let Some(clause_predicate) = semantic_match_from_clause(clause_expr, rti) else {
             return false;
         };
-        for idx in 0..pg_sys::list_length(semantic_restrictinfos) {
-            let semantic =
-                pg_sys::list_nth(semantic_restrictinfos, idx).cast::<pg_sys::RestrictInfo>();
-            if semantic.is_null() {
-                continue;
-            }
-            let semantic_expr = actual_clause_expr(semantic.cast());
-            if semantic_expr.is_null() {
-                continue;
-            }
-            if let Some(semantic_predicate) = semantic_match_from_clause(semantic_expr, rti)
-                && same_semantic_signature(&clause_predicate, &semantic_predicate)
-            {
-                return true;
-            }
-        }
-        false
+        semantic_preds
+            .iter()
+            .any(|semantic_predicate| same_semantic_signature(&clause_predicate, semantic_predicate))
     }
 }
 

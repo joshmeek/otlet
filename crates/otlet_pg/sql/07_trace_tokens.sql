@@ -146,6 +146,8 @@ SELECT
   s.tokens_per_second,
   s.tokenize_ms,
   s.prompt_decode_ms,
+  s.finish_sql_ms,
+  s.materialize_ms,
   s.first_token_ms,
   s.ttft_ms,
   s.steady_tokens_per_second,

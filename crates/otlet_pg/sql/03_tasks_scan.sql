@@ -316,6 +316,7 @@ AS $$
   FROM otlet.production_policy p
   LEFT JOIN otlet.tasks t ON t.model_name = $1
   LEFT JOIN otlet.jobs j ON j.task_name = t.name AND j.status = 'queued'
+  WHERE p.name = 'default'
   GROUP BY p.max_queued_jobs_per_model;
 $$;
 
@@ -413,6 +414,7 @@ BEGIN
        LEFT JOIN otlet.jobs j
          ON j.task_name = queued_tasks.name
         AND j.status = ''queued''
+       WHERE p.name = ''default''
        GROUP BY p.max_queued_jobs_per_model
      )
      INSERT INTO otlet.jobs (task_name, subject_id, input)
@@ -534,6 +536,7 @@ BEGIN
        LEFT JOIN otlet.jobs j
          ON j.task_name = queued_tasks.name
         AND j.status = ''queued''
+       WHERE p.name = ''default''
        GROUP BY p.max_queued_jobs_per_model
      )
      INSERT INTO otlet.jobs (task_name, subject_id, input)

@@ -187,6 +187,8 @@ DECLARE
   action_creates_record boolean;
   action_record_type text;
   action_record_body jsonb;
+  has_action_type_restriction boolean := false;
+  finish_started timestamptz := clock_timestamp();
 BEGIN
   SELECT * INTO job_row
   FROM otlet.jobs
@@ -198,11 +200,17 @@ BEGIN
     RETURN;
   END IF;
 
-  SELECT * INTO task_row FROM otlet.tasks WHERE name = job_row.task_name;
+  SELECT t.model_name, t.input_shaping
+  INTO task_row.model_name, task_row.input_shaping
+  FROM otlet.tasks t
+  WHERE t.name = job_row.task_name;
   IF NOT FOUND THEN
     RAISE EXCEPTION 'otlet task % does not exist', job_row.task_name;
   END IF;
-  SELECT * INTO model_row FROM otlet.models WHERE name = COALESCE(complete_job.model_name, task_row.model_name);
+  SELECT m.name
+  INTO model_row.name
+  FROM otlet.models m
+  WHERE m.name = COALESCE(complete_job.model_name, task_row.model_name);
   IF NOT FOUND THEN
     RAISE EXCEPTION 'otlet model % does not exist',
       COALESCE(complete_job.model_name, task_row.model_name);
@@ -302,6 +310,15 @@ BEGIN
     )
   );
 
+  -- One probe for the job's task: skip per-action watch scans when unrestricted.
+  SELECT EXISTS (
+    SELECT 1
+    FROM otlet.watches w
+    WHERE w.task_name = job_row.task_name
+      AND cardinality(w.action_types) > 0
+  )
+  INTO has_action_type_restriction;
+
   FOR action IN SELECT value FROM jsonb_array_elements(COALESCE(complete_job.actions, '[]'::jsonb)) LOOP
     action_payload := CASE
       WHEN jsonb_typeof(action) = 'object' THEN action
@@ -318,13 +335,16 @@ BEGIN
     action_creates_record := false;
     IF action_error IS NULL THEN
       SELECT
-        EXISTS (
-          SELECT 1
-          FROM otlet.watches w
-          WHERE w.task_name = job_row.task_name
-            AND cardinality(w.action_types) > 0
-            AND NOT action_type_name = ANY(w.action_types)
-        ),
+        CASE
+          WHEN has_action_type_restriction THEN EXISTS (
+            SELECT 1
+            FROM otlet.watches w
+            WHERE w.task_name = job_row.task_name
+              AND cardinality(w.action_types) > 0
+              AND NOT action_type_name = ANY(w.action_types)
+          )
+          ELSE false
+        END,
         COALESCE(s.requires_approval, false),
         COALESCE(s.creates_record, false)
       INTO action_rejected_by_watch, action_requires_approval, action_creates_record
@@ -406,6 +426,16 @@ BEGIN
       );
     END IF;
   END LOOP;
+
+  UPDATE otlet.inference_receipts r
+  SET trace_summary = r.trace_summary || jsonb_build_object(
+    'finish_sql_ms',
+    GREATEST(
+      0,
+      CEIL(EXTRACT(epoch FROM (clock_timestamp() - finish_started)) * 1000)
+    )::bigint
+  )
+  WHERE r.id = saved_receipt.id;
 
   RETURN NEXT saved_output;
 END;

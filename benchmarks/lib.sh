@@ -7,7 +7,7 @@ psql_exec() {
 }
 
 psql_value() {
-  docker exec -i "$container" psql -U "$db_user" -d "$db" -X -qAt -v ON_ERROR_STOP=1 "$@"
+  psql_exec -qAt "$@"
 }
 
 psql_file() {

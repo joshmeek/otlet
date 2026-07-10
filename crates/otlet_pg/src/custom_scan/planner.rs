@@ -27,8 +27,8 @@ unsafe extern "C-unwind" fn otlet_set_rel_pathlist(
         if relation_has_rowmark(root, rti) {
             return;
         }
-        let target_has_subject =
-            path_target_has_subject_var((*rel).reltarget, rti, predicate.subject_attno);
+        let (target_has_subject, target_has_rel_var) =
+            path_target_var_flags((*rel).reltarget, rti, predicate.subject_attno);
         let executor_owned_policy = predicate.auto_policy
             || predicate.allow_refresh
             || predicate.wait_ms > 0
@@ -36,7 +36,7 @@ unsafe extern "C-unwind" fn otlet_set_rel_pathlist(
         if !target_has_subject
             && (predicate.index_kind == SemanticIndexKind::Join
                 || (!executor_owned_policy
-                    && !path_target_has_rel_var((*rel).reltarget, rti)
+                    && !target_has_rel_var
                     && !rel_has_lateral_ref(rel)))
         {
             return;

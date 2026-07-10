@@ -101,52 +101,50 @@ unsafe fn subject_var(node: *mut pg_sys::Expr, rti: pg_sys::Index) -> Option<Sub
     }
 }
 
+unsafe fn path_target_var_flags(
+    target: *mut pg_sys::PathTarget,
+    rti: pg_sys::Index,
+    subject_attno: i16,
+) -> (bool, bool) {
+    unsafe {
+        if target.is_null() || (*target).exprs.is_null() {
+            return (false, false);
+        }
+        let mut has_subject = false;
+        let mut has_rel_var = false;
+        for idx in 0..pg_sys::list_length((*target).exprs) {
+            let expr = strip_relabel(pg_sys::list_nth((*target).exprs, idx).cast::<pg_sys::Expr>());
+            if expr.is_null() || (*expr).type_ != pg_sys::NodeTag::T_Var {
+                continue;
+            }
+            let var = expr.cast::<pg_sys::Var>();
+            if (*var).varno < 0 || u32::try_from((*var).varno).ok() != Some(rti) {
+                continue;
+            }
+            if (*var).varattno == subject_attno {
+                has_subject = true;
+            }
+            if (*var).varattno > 0 {
+                has_rel_var = true;
+            }
+            if has_subject && has_rel_var {
+                break;
+            }
+        }
+        (has_subject, has_rel_var)
+    }
+}
+
 unsafe fn path_target_has_subject_var(
     target: *mut pg_sys::PathTarget,
     rti: pg_sys::Index,
     subject_attno: i16,
 ) -> bool {
-    unsafe {
-        if target.is_null() || (*target).exprs.is_null() {
-            return false;
-        }
-        for idx in 0..pg_sys::list_length((*target).exprs) {
-            let expr = strip_relabel(pg_sys::list_nth((*target).exprs, idx).cast::<pg_sys::Expr>());
-            if expr.is_null() || (*expr).type_ != pg_sys::NodeTag::T_Var {
-                continue;
-            }
-            let var = expr.cast::<pg_sys::Var>();
-            if (*var).varno >= 0
-                && u32::try_from((*var).varno).ok() == Some(rti)
-                && (*var).varattno == subject_attno
-            {
-                return true;
-            }
-        }
-        false
-    }
+    path_target_var_flags(target, rti, subject_attno).0
 }
 
 unsafe fn path_target_has_rel_var(target: *mut pg_sys::PathTarget, rti: pg_sys::Index) -> bool {
-    unsafe {
-        if target.is_null() || (*target).exprs.is_null() {
-            return false;
-        }
-        for idx in 0..pg_sys::list_length((*target).exprs) {
-            let expr = strip_relabel(pg_sys::list_nth((*target).exprs, idx).cast::<pg_sys::Expr>());
-            if expr.is_null() || (*expr).type_ != pg_sys::NodeTag::T_Var {
-                continue;
-            }
-            let var = expr.cast::<pg_sys::Var>();
-            if (*var).varno >= 0
-                && u32::try_from((*var).varno).ok() == Some(rti)
-                && (*var).varattno > 0
-            {
-                return true;
-            }
-        }
-        false
-    }
+    path_target_var_flags(target, rti, 0).1
 }
 
 unsafe fn rel_has_lateral_ref(rel: *mut pg_sys::RelOptInfo) -> bool {
@@ -199,7 +197,15 @@ fn validate_semantic_index_source(
                    LIMIT 1 \
                  ), \
                  plan AS ( \
-                   SELECT * \
+                   SELECT \
+                     total_subjects, \
+                     stale_subjects, \
+                     missing_subjects, \
+                     inflight_subjects, \
+                     model_ms, \
+                     model_cost_source, \
+                     count_basis, \
+                     stale_reasons \
                    FROM otlet.semantic_index_plan($1, true) \
                    WHERE EXISTS (SELECT 1 FROM meta) \
                  ), \
@@ -393,7 +399,15 @@ fn validate_semantic_join_index_source(
                    LIMIT 1 \
                  ), \
                  plan AS ( \
-                   SELECT * \
+                   SELECT \
+                     total_subjects, \
+                     stale_subjects, \
+                     missing_subjects, \
+                     inflight_subjects, \
+                     model_ms, \
+                     model_cost_source, \
+                     count_basis, \
+                     stale_reasons \
                    FROM otlet.semantic_join_index_plan($1) \
                    WHERE EXISTS (SELECT 1 FROM meta) \
                  ), \

@@ -181,22 +181,36 @@ echo "entity_resolution_contract=$entity_contract"
   exit 1
 }
 
-model_selection_policy_contract="$(psql_exec -qAt -v task_name="$entity_task" <<'SQL'
-SELECT task_name || '|' || cheap_model_name || '|' || strong_model_name || '|' ||
-       COALESCE(task_max_attempt_ms::text, '') || '|' ||
-       policy_max_attempt_ms::text || '|' ||
-       effective_max_attempt_ms::text
-FROM otlet.model_selection_policy_status
-WHERE task_name = :'task_name';
+entity_selection_contracts="$(psql_value -v task_name="$entity_task" <<'SQL'
+SELECT
+  (
+    SELECT task_name || '|' || cheap_model_name || '|' || strong_model_name || '|' ||
+           COALESCE(task_max_attempt_ms::text, '') || '|' ||
+           policy_max_attempt_ms::text || '|' ||
+           effective_max_attempt_ms::text
+    FROM otlet.model_selection_policy_status
+    WHERE task_name = :'task_name'
+  ) || E'\n' ||
+  (
+    SELECT (cheap_attempts >= 1)::text || '|' ||
+           (strong_accepted >= 1)::text || '|' ||
+           (escalated_jobs >= 1)::text || '|' ||
+           cheap_attempts::text || '|' ||
+           strong_attempts::text
+    FROM otlet.model_selection_status
+    WHERE task_name = :'task_name'
+  );
 SQL
 )"
+model_selection_policy_contract="$(sed -n '1p' <<<"$entity_selection_contracts")"
+model_selection_status_contract="$(sed -n '2p' <<<"$entity_selection_contracts")"
 echo "model_selection_policy_contract=$model_selection_policy_contract"
 [ "$model_selection_policy_contract" = "$entity_task|$cheap_model_name|$strong_model_name||300000|300000" ] || {
   echo "Expected model selection policy contract, got $model_selection_policy_contract" >&2
   exit 1
 }
 
-model_selection_attempts="$(psql_exec -qAt -v task_name="$entity_task" <<'SQL'
+model_selection_attempts="$(psql_value -v task_name="$entity_task" <<'SQL'
 SELECT subject_id || '|' || attempt_index::text || '|' || selection_role || '|' ||
        selection_status || '|' || model_name || '|' ||
        COALESCE(output->>'confidence', '') || '|' || COALESCE(output->>'match', '')
@@ -209,16 +223,6 @@ while IFS= read -r line; do
   [ -n "$line" ] && echo "model_selection_attempt_contract=$line"
 done <<<"$model_selection_attempts"
 
-model_selection_status_contract="$(psql_exec -qAt -v task_name="$entity_task" <<'SQL'
-SELECT (cheap_attempts >= 1)::text || '|' ||
-       (strong_accepted >= 1)::text || '|' ||
-       (escalated_jobs >= 1)::text || '|' ||
-       cheap_attempts::text || '|' ||
-       strong_attempts::text
-FROM otlet.model_selection_status
-WHERE task_name = :'task_name';
-SQL
-)"
 echo "model_selection_status_contract=$model_selection_status_contract"
 require_regex "$model_selection_status_contract" '^true\|true\|true\|[1-9][0-9]*\|[1-9][0-9]*$' "Expected cheap attempts, strong acceptance, and escalation"
 
@@ -878,6 +882,22 @@ SQL
 echo "receipt_trace_contract=$trace_contract"
 [ "$trace_contract" = "8|8|8|8" ] || {
   echo "Expected receipt trace contract 8|8|8|8, got $trace_contract" >&2
+  exit 1
+}
+
+timing_contract="$(psql_exec -qAt \
+  -v entity_task="$entity_task" \
+  -v join_task="$join_task" <<'SQL'
+SELECT count(*) FILTER (WHERE finish_sql_ms IS NOT NULL)::text || '|' ||
+       count(*) FILTER (WHERE materialize_ms IS NOT NULL AND accepted)::text
+FROM otlet.inference_receipt_trace_status
+WHERE task_name IN (:'entity_task', :'join_task')
+  AND status = 'complete';
+SQL
+)"
+echo "receipt_timing_contract=$timing_contract"
+[ "$timing_contract" = "8|8" ] || {
+  echo "Expected receipt timing contract 8|8, got $timing_contract" >&2
   exit 1
 }
 

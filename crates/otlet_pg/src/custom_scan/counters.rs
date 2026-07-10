@@ -1,39 +1,9 @@
-struct PreloadedSubjectCounts {
-    fresh_matches: u64,
-    fresh_non_matches: u64,
-    stale: u64,
-    inflight: u64,
-    missing: u64,
-}
-
-fn count_preloaded_subject_states(
-    subjects: &HashMap<String, SubjectSemanticState>,
-) -> PreloadedSubjectCounts {
-    let mut counts = PreloadedSubjectCounts {
-        fresh_matches: 0,
-        fresh_non_matches: 0,
-        stale: 0,
-        inflight: 0,
-        missing: 0,
-    };
-    for state in subjects.values() {
-        match state {
-            SubjectSemanticState::FreshMatch => counts.fresh_matches += 1,
-            SubjectSemanticState::FreshNonMatch => counts.fresh_non_matches += 1,
-            SubjectSemanticState::Stale => counts.stale += 1,
-            SubjectSemanticState::InFlight => counts.inflight += 1,
-            SubjectSemanticState::Missing => counts.missing += 1,
-        }
-    }
-    counts
-}
-
 fn planner_stats_from_loaded_state(
     private: &CustomScanPrivate,
     stashed_stats: Option<SemanticPlannerStats>,
     loaded_state: &mut LoadedSemanticState,
 ) -> (SemanticPlannerStats, PreloadedSubjectCounts) {
-    let counts = count_preloaded_subject_states(&loaded_state.subjects);
+    let counts = loaded_state.subject_counts;
     // Prefer plan-time vocabulary (reason/path/decisions/path_cost) from the
     // custom_private stash; overlay exact preload subject counts for EXPLAIN.
     if let Some(mut stats) = stashed_stats {
@@ -107,10 +77,22 @@ fn record_emitted_freshness_basis(runtime: &mut RuntimeState, subject_id: &str) 
         .subject_freshness_basis
         .get(subject_id)
         .map_or("runtime_refresh", String::as_str);
-    if let Some(count) = runtime.emitted_freshness_basis.get_mut(basis) {
-        *count += 1;
-    } else {
-        runtime.emitted_freshness_basis.insert(basis.to_owned(), 1);
+    match basis {
+        "content_hash_match" => runtime.emitted_freshness_basis.content_hash_match += 1,
+        "mvcc_match" => runtime.emitted_freshness_basis.mvcc_match += 1,
+        "revalidated_after_benign_update" => {
+            runtime
+                .emitted_freshness_basis
+                .revalidated_after_benign_update += 1
+        }
+        "runtime_refresh" => runtime.emitted_freshness_basis.runtime_refresh += 1,
+        other => {
+            *runtime
+                .emitted_freshness_basis
+                .other
+                .entry(other.to_owned())
+                .or_insert(0) += 1;
+        }
     }
 }
 
@@ -143,6 +125,8 @@ unsafe fn snapshot_runtime_counters(
         (*state).infer_trace_prompt_tokens = runtime.infer_trace_prompt_tokens;
         (*state).infer_trace_generated_tokens = runtime.infer_trace_generated_tokens;
         (*state).infer_trace_generate_ms = runtime.infer_trace_generate_ms;
+        (*state).infer_trace_finish_sql_ms = runtime.infer_trace_finish_sql_ms;
+        (*state).infer_trace_materialize_ms = runtime.infer_trace_materialize_ms;
         (*state).infer_trace_version = pg_cstr(&runtime.infer_trace_version);
         (*state).infer_trace_probability_status = pg_cstr(&runtime.infer_trace_probability_status);
         (*state).infer_trace_schema_force = pg_cstr(&runtime.infer_trace_schema_force);
@@ -153,6 +137,6 @@ unsafe fn snapshot_runtime_counters(
         (*state).child_plan_rows = runtime.child_plan_rows;
         (*state).has_child_plan = !runtime.child_plan.is_null() || runtime.owns_child_plan;
         (*state).emitted_freshness_basis =
-            pg_cstr(&freshness_basis_counts_json(&runtime.emitted_freshness_basis));
+            pg_cstr(&emitted_freshness_counts_json(&runtime.emitted_freshness_basis));
     }
 }

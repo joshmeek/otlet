@@ -86,6 +86,11 @@ echo "planner_1m_contract=$planner_1m_contract"
   exit 1
 }
 
+psql_exec >/dev/null <<'SQL'
+SELECT otlet.drop_watch('plan_1m_demo');
+DROP TABLE IF EXISTS public.otlet_plan_1m;
+SQL
+
 colon_subject_watch="colon_subject_demo"
 colon_subject_task="${colon_subject_watch}_task"
 psql_exec -v watch_name="$colon_subject_watch" >/dev/null <<'SQL'
@@ -306,7 +311,28 @@ SQL
 echo "performance_ratio_contract=$performance_ratio_contract"
 require_regex "$performance_ratio_contract" '^[1-9][0-9]*\|[1-9][0-9]*\|[0-9]+(\.[0-9]+)?\|[1-9][0-9]*\|[0-9]+(\.[0-9]+)?$' "Expected production_status to expose positive model-work ratios"
 
-materialization_failure_status_contract="$(psql_exec -qAt -v model_name="$strong_model_name" <<'SQL'
+audit_export_contract="$(psql_value <<'SQL'
+SELECT (SELECT count(*) FROM otlet.redaction_policy_status)::text || '|' ||
+       (SELECT count(*) > 0 FROM otlet.audit_receipt_export)::text || '|' ||
+       (SELECT count(*) >= 0 FROM otlet.audit_review_export)::text || '|' ||
+       (SELECT count(*) >= 0 FROM otlet.semantic_dependency_audit)::text || '|' ||
+       (SELECT count(*) >= 0 FROM otlet.worker_batch_timing_status)::text || '|' ||
+       (SELECT NOT EXISTS (
+          SELECT 1
+          FROM information_schema.columns
+          WHERE table_schema = 'otlet'
+            AND table_name = 'audit_receipt_export'
+            AND column_name IN ('trace_summary', 'raw_output', 'prompt')
+        ))::text;
+SQL
+)"
+echo "audit_export_contract=$audit_export_contract"
+[ "$audit_export_contract" = "1|true|true|true|true|true" ] || {
+  echo "Expected audit export surfaces and redaction withholdings, got $audit_export_contract" >&2
+  exit 1
+}
+
+materialization_failure_status_contract="$(psql_value -v model_name="$strong_model_name" <<'SQL'
 BEGIN;
 INSERT INTO otlet.worker_events (event_type, message, detail)
 VALUES (

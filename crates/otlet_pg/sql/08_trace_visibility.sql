@@ -21,39 +21,21 @@ WITH per_receipt AS (
     s.inference_cache_reason,
     pg_column_size(r.trace_summary)::bigint AS trace_summary_bytes,
     COALESCE(jsonb_array_length(r.trace_summary #> '{detailed_trace,chosen_token_ids}'), 0)::bigint AS chosen_token_ids,
-    COALESCE((
-      SELECT count(*)
-      FROM otlet.inference_receipt_token_trace t
-      WHERE t.receipt_id = s.receipt_id
-    ), 0)::bigint AS token_steps,
-    COALESCE((
-      SELECT count(*)
-      FROM otlet.inference_receipt_token_trace t
-      WHERE t.receipt_id = s.receipt_id
-        AND t.chosen_logprob IS NOT NULL
-        AND t.chosen_probability IS NOT NULL
-    ), 0)::bigint AS token_logprob_steps,
-    COALESCE((
-      SELECT count(*)
-      FROM otlet.inference_receipt_token_alternative_trace a
-      WHERE a.receipt_id = s.receipt_id
-    ), 0)::bigint AS top_k_alternatives,
-    COALESCE((
-      SELECT count(*)
-      FROM otlet.inference_receipt_token_alternative_trace a
-      WHERE a.receipt_id = s.receipt_id
-        AND a.logprob IS NOT NULL
-        AND a.probability IS NOT NULL
-    ), 0)::bigint AS top_k_logprob_alternatives,
+    COALESCE(tok.token_steps, 0)::bigint AS token_steps,
+    COALESCE(tok.token_logprob_steps, 0)::bigint AS token_logprob_steps,
+    COALESCE(alt.top_k_alternatives, 0)::bigint AS top_k_alternatives,
+    COALESCE(alt.top_k_logprob_alternatives, 0)::bigint AS top_k_logprob_alternatives,
     EXISTS (
       SELECT 1
       FROM otlet.outputs o
       WHERE o.job_id = s.job_id
+      LIMIT 1
     ) AS has_output,
     EXISTS (
       SELECT 1
       FROM otlet.actions a
       WHERE a.job_id = s.job_id
+      LIMIT 1
     ) AS has_action,
     EXISTS (
       SELECT 1
@@ -61,9 +43,30 @@ WITH per_receipt AS (
       WHERE sm.task_name = s.task_name
         AND sm.subject_id = s.subject_id
         AND sm.source_hash IS NOT NULL
+      LIMIT 1
     ) AS has_materialization_source_hash
   FROM otlet.inference_receipt_trace_status s
   JOIN otlet.inference_receipts r ON r.id = s.receipt_id
+  LEFT JOIN LATERAL (
+    SELECT
+      count(*)::bigint AS token_steps,
+      count(*) FILTER (
+        WHERE t.chosen_logprob IS NOT NULL
+          AND t.chosen_probability IS NOT NULL
+      )::bigint AS token_logprob_steps
+    FROM otlet.inference_receipt_token_trace t
+    WHERE t.receipt_id = s.receipt_id
+  ) tok ON true
+  LEFT JOIN LATERAL (
+    SELECT
+      count(*)::bigint AS top_k_alternatives,
+      count(*) FILTER (
+        WHERE a.logprob IS NOT NULL
+          AND a.probability IS NOT NULL
+      )::bigint AS top_k_logprob_alternatives
+    FROM otlet.inference_receipt_token_alternative_trace a
+    WHERE a.receipt_id = s.receipt_id
+  ) alt ON true
 )
 SELECT
   count(*)::bigint AS receipt_count,

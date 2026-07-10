@@ -188,6 +188,7 @@ fn semantic_auto_policy(enabled: bool) -> SemanticAutoPolicy {
                    semantic_auto_infer_ms, \
                    semantic_auto_max_rows \
                  FROM otlet.production_policy \
+                 WHERE name = 'default' \
                  LIMIT 1",
                 Some(1),
                 &[],

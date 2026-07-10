@@ -53,52 +53,58 @@ SET ignored_note = ignored_note || '; changed outside scoped input',
     unrelated_after_watch = 'changed after watch'
 WHERE id = 'scoped-1';
 SQL
-row_scoped_contract="$(psql_exec -qAt \
+row_scoped_contract="$(psql_value \
   -v watch_name="$row_scoped_watch" \
   -v task_name="$row_scoped_task" <<'SQL'
-SELECT count(*)::text
-FROM otlet.semantic_index_current_rows(:'watch_name', true);
-SELECT otlet.semantic_matches(:'watch_name', 'scoped-1', '{"decision":"pass"}'::jsonb)::text;
-SELECT count(*)::text
-FROM otlet.inference_receipts ar
-JOIN otlet.jobs j ON j.id = ar.job_id
-WHERE j.task_name = :'task_name';
-SELECT COALESCE(input_columns::text, '')
-FROM otlet.watch_status
-WHERE watch_name = :'watch_name';
-SELECT COALESCE(string_agg(freshness_basis, ',' ORDER BY subject_id), '')
-FROM otlet.semantic_index_current_rows(:'watch_name', true);
+WITH cur AS (
+  SELECT subject_id, freshness_basis
+  FROM otlet.semantic_index_current_rows(:'watch_name', true)
+)
+SELECT
+  (SELECT count(*)::text FROM cur) || '|' ||
+  otlet.semantic_matches(:'watch_name', 'scoped-1', '{"decision":"pass"}'::jsonb)::text || '|' ||
+  (
+    SELECT count(*)::text
+    FROM otlet.inference_receipts ar
+    JOIN otlet.jobs j ON j.id = ar.job_id
+    WHERE j.task_name = :'task_name'
+  ) || '|' ||
+  (
+    SELECT COALESCE(input_columns::text, '')
+    FROM otlet.watch_status
+    WHERE watch_name = :'watch_name'
+  ) || '|' ||
+  (SELECT COALESCE(string_agg(freshness_basis, ',' ORDER BY subject_id), '') FROM cur);
 SQL
 )"
-row_scoped_fresh_after="$(head -n 1 <<<"$row_scoped_contract")"
-row_scoped_match_after="$(sed -n '2p' <<<"$row_scoped_contract")"
-row_scoped_receipts_after="$(sed -n '3p' <<<"$row_scoped_contract")"
-row_scoped_columns="$(sed -n '4p' <<<"$row_scoped_contract")"
-row_scoped_basis="$(tail -n 1 <<<"$row_scoped_contract")"
+IFS='|' read -r row_scoped_fresh_after row_scoped_match_after row_scoped_receipts_after row_scoped_columns row_scoped_basis <<<"$row_scoped_contract"
 echo "row_scoped_contract=$row_scoped_fresh_after|$row_scoped_match_after|$row_scoped_receipts_before|$row_scoped_receipts_after|$row_scoped_columns|$row_scoped_basis"
 [ "$row_scoped_fresh_after|$row_scoped_match_after|$row_scoped_receipts_before|$row_scoped_receipts_after|$row_scoped_columns|$row_scoped_basis" = "1|true|1|1|{signal}|revalidated_after_benign_update" ] || {
   echo "Expected scoped watch to stay fresh with unchanged receipts and revalidated basis after unrelated column change, got $row_scoped_fresh_after|$row_scoped_match_after|$row_scoped_receipts_before|$row_scoped_receipts_after|$row_scoped_columns|$row_scoped_basis" >&2
   exit 1
 }
-row_scoped_sql_contract="$(psql_exec -qAt -v watch_name="$row_scoped_watch" <<'SQL'
-SELECT count(*)::text
-FROM otlet.semantic_index_current_rows(:'watch_name', true)
-WHERE subject_id = 'scoped-1';
-SELECT selected_path || '|' ||
-       total_subjects::text || '|' ||
-       fresh_subjects::text || '|' ||
-       stale_subjects::text || '|' ||
-       queue_subjects::text || '|' ||
-       count_basis
-FROM otlet.semantic_index_plan(:'watch_name', true);
-SELECT count(*)::text
-FROM otlet.semantic_index_current_rows(:'watch_name', true)
-WHERE subject_id = ANY (ARRAY[]::text[]);
+row_scoped_sql_contract="$(psql_value -v watch_name="$row_scoped_watch" <<'SQL'
+WITH cur AS (
+  SELECT subject_id
+  FROM otlet.semantic_index_current_rows(:'watch_name', true)
+)
+SELECT
+  (SELECT count(*)::text FROM cur WHERE subject_id = 'scoped-1') || E'\n' ||
+  (
+    SELECT selected_path || '|' ||
+           total_subjects::text || '|' ||
+           fresh_subjects::text || '|' ||
+           stale_subjects::text || '|' ||
+           queue_subjects::text || '|' ||
+           count_basis
+    FROM otlet.semantic_index_plan(:'watch_name', true)
+  ) || E'\n' ||
+  (SELECT count(*)::text FROM cur WHERE subject_id = ANY (ARRAY[]::text[]));
 SQL
 )"
-row_scoped_subject_rows="$(head -n 1 <<<"$row_scoped_sql_contract")"
+row_scoped_subject_rows="$(sed -n '1p' <<<"$row_scoped_sql_contract")"
 row_scoped_plan="$(sed -n '2p' <<<"$row_scoped_sql_contract")"
-row_empty_subject_rows="$(tail -n 1 <<<"$row_scoped_sql_contract")"
+row_empty_subject_rows="$(sed -n '3p' <<<"$row_scoped_sql_contract")"
 echo "row_scoped_sql_contract=$row_scoped_subject_rows|$row_scoped_plan|$row_empty_subject_rows"
 [ "$row_scoped_subject_rows|$row_empty_subject_rows" = "1|0" ] || {
   echo "Expected current-row SQL subject and empty-subject filters to return 1|0, got $row_scoped_subject_rows|$row_empty_subject_rows" >&2

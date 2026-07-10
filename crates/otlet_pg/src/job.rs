@@ -104,6 +104,7 @@ WITH claimed AS (
   JOIN otlet.tasks t ON t.name = j.task_name
   JOIN otlet.models m ON m.name = t.model_name
   CROSS JOIN otlet.production_policy p
+  WHERE p.name = 'default'
 )
 SELECT
   id,
@@ -143,7 +144,12 @@ pub(crate) fn insert_infer_now_job(
         let args = [task_name.into(), subject_id.into(), input_json.into()];
         let rows = client.update(
             r"
-WITH inserted AS (
+WITH policy AS (
+  SELECT job_lease_interval, default_runtime_options, max_attempt_ms
+  FROM otlet.production_policy
+  WHERE name = 'default'
+),
+inserted AS (
   INSERT INTO otlet.jobs (
     task_name,
     subject_id,
@@ -154,7 +160,8 @@ WITH inserted AS (
     started_at,
     finished_at
   )
-  VALUES ($1, $2, $3::jsonb, 'running', 1, now() + (SELECT job_lease_interval FROM otlet.production_policy), now(), NULL)
+  SELECT $1, $2, $3::jsonb, 'running', 1, now() + p.job_lease_interval, now(), NULL
+  FROM policy p
   ON CONFLICT (task_name, subject_id)
   WHERE status IN ('queued', 'running', 'cancel_requested')
   DO NOTHING
@@ -194,7 +201,7 @@ FROM (
   FROM inserted j
   JOIN otlet.tasks t ON t.name = j.task_name
   JOIN otlet.models m ON m.name = t.model_name
-  CROSS JOIN otlet.production_policy p
+  CROSS JOIN policy p
 ) shaped
 	",
             Some(1),
@@ -252,5 +259,69 @@ WHERE p.task_name = $1
             },
             accept_field_checks: required_col!(row, JsonB, 7).0,
         }))
+    })
+}
+
+pub(crate) fn model_selection_policies_for_tasks(
+    task_names: &[String],
+) -> pgrx::spi::Result<std::collections::HashMap<String, Option<ModelSelectionPolicy>>> {
+    use std::collections::HashMap;
+
+    let mut policies = HashMap::with_capacity(task_names.len());
+    for task_name in task_names {
+        policies.insert(task_name.clone(), None);
+    }
+    if task_names.is_empty() {
+        return Ok(policies);
+    }
+
+    pgrx::Spi::connect(|client| {
+        let names = Value::Array(
+            task_names
+                .iter()
+                .map(|name| Value::String(name.clone()))
+                .collect(),
+        );
+        let args = [JsonB(names).into()];
+        let rows = client.select(
+            r"
+SELECT
+  p.task_name,
+  cheap.name,
+  cheap.artifact_path,
+  cheap.artifact_hash,
+  strong.name,
+  strong.artifact_path,
+  strong.artifact_hash,
+  p.accept_field_checks
+FROM otlet.model_selection_policies p
+JOIN otlet.models cheap ON cheap.name = p.cheap_model_name
+JOIN otlet.models strong ON strong.name = p.strong_model_name
+WHERE p.task_name IN (SELECT jsonb_array_elements_text($1::jsonb))
+	",
+            None,
+            &args,
+        )?;
+
+        for row in rows {
+            let task_name = required_col!(row, String, 1);
+            policies.insert(
+                task_name,
+                Some(ModelSelectionPolicy {
+                    cheap: JobModel {
+                        name: required_col!(row, String, 2),
+                        artifact_path: required_col!(row, String, 3),
+                        artifact_hash: row.get::<String>(4)?,
+                    },
+                    strong: JobModel {
+                        name: required_col!(row, String, 5),
+                        artifact_path: required_col!(row, String, 6),
+                        artifact_hash: row.get::<String>(7)?,
+                    },
+                    accept_field_checks: required_col!(row, JsonB, 8).0,
+                }),
+            );
+        }
+        Ok(policies)
     })
 }

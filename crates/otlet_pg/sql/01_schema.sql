@@ -119,6 +119,7 @@ DECLARE
   bucket_count integer;
   original_bytes integer;
   max_bytes integer := 0;
+  canonical_text text;
 BEGIN
   IF jsonb_typeof(shaped) IS DISTINCT FROM 'object' THEN
     RETURN shaped;
@@ -171,14 +172,15 @@ BEGIN
       1048576
     )::integer;
   END IF;
-  original_bytes := length(otlet.semantic_canonical_jsonb(shaped)::text);
+  canonical_text := otlet.semantic_canonical_jsonb(shaped)::text;
+  original_bytes := length(canonical_text);
   IF max_bytes > 0 AND original_bytes > max_bytes THEN
     shaped := jsonb_build_object(
       '_otlet_input_truncated', true,
       'truncation_policy', 'max_shaped_input_bytes_fail_toward_abstention',
       'original_shaped_input_bytes', original_bytes,
       'max_shaped_input_bytes', max_bytes,
-      'truncated_input_preview', left(otlet.semantic_canonical_jsonb(shaped)::text, LEAST(max_bytes, 1024))
+      'truncated_input_preview', left(canonical_text, LEAST(max_bytes, 1024))
     );
   END IF;
 
@@ -411,6 +413,10 @@ WHERE status IN ('running', 'cancel_requested');
 CREATE INDEX jobs_finished_terminal_idx
 ON otlet.jobs (finished_at, id)
 WHERE status IN ('failed', 'canceled');
+
+CREATE INDEX jobs_complete_subject_finished_idx
+ON otlet.jobs (task_name, subject_id, finished_at DESC NULLS LAST, id DESC)
+WHERE status = 'complete';
 
 CREATE TABLE otlet.inference_receipts (
   id bigserial PRIMARY KEY,

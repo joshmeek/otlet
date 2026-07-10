@@ -13,6 +13,10 @@ psql_exec() {
   docker exec -i "$container" psql -U postgres -d postgres -v ON_ERROR_STOP=1 "$@"
 }
 
+psql_value() {
+  psql_exec -qAt "$@"
+}
+
 require_contains() {
   local text="$1"
   local needle="$2"
@@ -85,9 +89,22 @@ wait_task_complete() {
   local active complete failed
 
   for _ in $(seq 1 "$attempts"); do
-    IFS='|' read -r active complete failed <<<"$(psql_exec -qAt -v task_name="$task" <<'SQL'
-SELECT count(*) FILTER (WHERE status IN ('queued','running','cancel_requested'))::text || '|' ||
-       count(*) FILTER (WHERE status = 'complete')::text || '|' ||
+    # Cheap active probe while work is in flight; full counts once quiescent.
+    active="$(psql_value -v task_name="$task" <<'SQL'
+SELECT EXISTS (
+  SELECT 1 FROM otlet.jobs
+  WHERE task_name = :'task_name'
+    AND status IN ('queued','running','cancel_requested')
+  LIMIT 1
+)::text
+SQL
+)"
+    if [ "$active" = "t" ]; then
+      sleep "$delay"
+      continue
+    fi
+    IFS='|' read -r complete failed <<<"$(psql_value -v task_name="$task" <<'SQL'
+SELECT count(*) FILTER (WHERE status = 'complete')::text || '|' ||
        count(*) FILTER (WHERE status IN ('failed','canceled'))::text
 FROM otlet.jobs
 WHERE task_name = :'task_name';
@@ -102,7 +119,7 @@ ORDER BY job_id;
 SQL
       return 1
     fi
-    if [ "$complete" -ge "$expected_complete" ] && [ "$active" = "0" ]; then
+    if [ "$complete" -ge "$expected_complete" ]; then
       return 0
     fi
     sleep "$delay"
@@ -120,15 +137,27 @@ wait_task_failed() {
   local active complete failed
 
   for _ in $(seq 1 "$attempts"); do
-    IFS='|' read -r active complete failed <<<"$(psql_exec -qAt -v task_name="$task" <<'SQL'
-SELECT count(*) FILTER (WHERE status IN ('queued','running','cancel_requested'))::text || '|' ||
-       count(*) FILTER (WHERE status = 'complete')::text || '|' ||
+    active="$(psql_value -v task_name="$task" <<'SQL'
+SELECT EXISTS (
+  SELECT 1 FROM otlet.jobs
+  WHERE task_name = :'task_name'
+    AND status IN ('queued','running','cancel_requested')
+  LIMIT 1
+)::text
+SQL
+)"
+    if [ "$active" = "t" ]; then
+      sleep "$delay"
+      continue
+    fi
+    IFS='|' read -r complete failed <<<"$(psql_value -v task_name="$task" <<'SQL'
+SELECT count(*) FILTER (WHERE status = 'complete')::text || '|' ||
        count(*) FILTER (WHERE status IN ('failed','canceled'))::text
 FROM otlet.jobs
 WHERE task_name = :'task_name';
 SQL
 )"
-    if [ "$failed" -ge "$expected_failed" ] && [ "$active" = "0" ]; then
+    if [ "$failed" -ge "$expected_failed" ]; then
       return 0
     fi
     if [ "$complete" != "0" ]; then

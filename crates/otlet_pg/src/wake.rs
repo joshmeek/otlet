@@ -1,6 +1,6 @@
 use pgrx::{IntoDatum, JsonB, PgLwLock, pg_guard, pg_sys};
 use serde_json::json;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 pub(crate) const MISSED_WAKE_RECOVERY_MS: u64 = 5_000;
 pub(crate) const WORKER_LATCH_SLOTS: usize = 4;
@@ -11,7 +11,6 @@ pub(crate) struct WakeState {
     worker_latches: [usize; WORKER_LATCH_SLOTS],
     worker_pids: [i32; WORKER_LATCH_SLOTS],
     worker_registrations: u64,
-    wake_requests: u64,
     wake_commits: u64,
     wake_successes: u64,
     wake_misses: u64,
@@ -28,6 +27,9 @@ unsafe impl pgrx::PGRXSharedMemory for WakeState {}
 pub(crate) static WAKE_STATE: PgLwLock<WakeState> = unsafe { PgLwLock::new(c"otlet wake state") };
 
 static XACT_CALLBACK_REGISTERED: AtomicBool = AtomicBool::new(false);
+static PENDING_WAKE: AtomicBool = AtomicBool::new(false);
+static WAKE_REQUESTS: AtomicU64 = AtomicU64::new(0);
+static WAKE_REQUESTS: AtomicU64 = AtomicU64::new(0);
 static PENDING_WAKE: AtomicBool = AtomicBool::new(false);
 
 static OTLET_WAKE_WORKER_FINFO: pg_sys::Pg_finfo_record =
@@ -78,12 +80,16 @@ pub(crate) fn record_worker_drain(drained: u64) {
 }
 
 pub(crate) fn signal_worker_latch_immediate() -> bool {
-    let mut state = WAKE_STATE.exclusive();
-    state.wake_requests = state.wake_requests.saturating_add(1);
+    WAKE_REQUESTS.fetch_add(1, Ordering::Relaxed);
+    let state = WAKE_STATE.share();
     if !signal_registered_workers(&state) {
+        drop(state);
+        let mut state = WAKE_STATE.exclusive();
         state.wake_misses = state.wake_misses.saturating_add(1);
         return false;
     }
+    drop(state);
+    let mut state = WAKE_STATE.exclusive();
     state.wake_successes = state.wake_successes.saturating_add(1);
     true
 }
@@ -130,7 +136,7 @@ pub extern "C-unwind" fn otlet_worker_wake_state(
         "registered_workers": registered_workers,
         "worker_registrations": state.worker_registrations,
         "worker_lifecycle_policy": "clear_latch_on_clean_stop_and_reregister_on_postmaster_restart",
-        "wake_requests": state.wake_requests,
+        "wake_requests": WAKE_REQUESTS.load(Ordering::Relaxed),
         "wake_commits": state.wake_commits,
         "wake_successes": state.wake_successes,
         "wake_misses": state.wake_misses,
@@ -149,10 +155,12 @@ pub extern "C-unwind" fn otlet_worker_wake_state(
 fn mark_wake_pending() -> bool {
     ensure_xact_callback();
     PENDING_WAKE.store(true, Ordering::SeqCst);
-
-    let mut state = WAKE_STATE.exclusive();
-    state.wake_requests = state.wake_requests.saturating_add(1);
-    state.worker_latches.iter().any(|latch| *latch != 0)
+    WAKE_REQUESTS.fetch_add(1, Ordering::Relaxed);
+    WAKE_STATE
+        .share()
+        .worker_latches
+        .iter()
+        .any(|latch| *latch != 0)
 }
 
 fn ensure_xact_callback() {
@@ -201,12 +209,11 @@ unsafe extern "C-unwind" fn otlet_wake_xact_callback(
 
 fn signal_registered_workers(state: &WakeState) -> bool {
     let mut signaled = false;
-    for latch in state
-        .worker_latches
-        .iter()
-        .copied()
-        .filter(|latch| *latch != 0)
-    {
+    for latch in &state.worker_latches {
+        let latch = *latch;
+        if latch == 0 {
+            continue;
+        }
         unsafe {
             pg_sys::SetLatch(latch as *mut pg_sys::Latch);
         }

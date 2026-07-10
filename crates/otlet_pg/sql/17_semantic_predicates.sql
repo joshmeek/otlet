@@ -17,6 +17,8 @@ BEGIN
     si.source_table,
     si.subject_column,
     si.input_columns,
+    si.task_name,
+    si.record_type,
     t.input_shaping,
     otlet.task_contract_hash(
       t.instruction,
@@ -77,10 +79,8 @@ BEGIN
         sm.updated_at,
         sm.id
       FROM otlet.semantic_materializations sm
-      JOIN otlet.semantic_indexes si
-        ON si.task_name = sm.task_name
-       AND si.record_type = sm.record_type
-      WHERE si.name = semantic_matches.index_name
+      WHERE sm.task_name = index_row.task_name
+        AND sm.record_type = index_row.record_type
         AND sm.subject_id = semantic_matches.subject_id
       ORDER BY
         sm.subject_id,

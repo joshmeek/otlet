@@ -386,7 +386,7 @@ fn model_actions(actions: Value) -> Result<Value, String> {
     Ok(Value::Array(normalized))
 }
 
-fn parse_model_json(raw_output: &str) -> Result<(Value, String), String> {
+fn parse_model_json(raw_output: &str) -> Result<Value, String> {
     let trimmed = raw_output.trim();
     if trimmed.starts_with("```") || trimmed.ends_with("```") {
         return Err(format!(
@@ -414,7 +414,7 @@ fn parse_model_json(raw_output: &str) -> Result<(Value, String), String> {
         return Err("model JSON output must not contain actions".to_owned());
     }
 
-    Ok((value, trimmed.to_owned()))
+    Ok(value)
 }
 
 #[derive(Clone)]
@@ -434,10 +434,40 @@ thread_local! {
     // Avoids re-hashing identical per-task contract fields across claim drains.
     static TASK_CONTRACT_DIGESTS: RefCell<HashMap<String, Arc<TaskContractDigests>>> =
         RefCell::new(HashMap::with_capacity(4));
+    // Same lifetime: reuse the large static prompt prefix across jobs of one task.
+    static TASK_PROMPT_PREFIXES: RefCell<HashMap<String, Arc<str>>> =
+        RefCell::new(HashMap::with_capacity(4));
 }
 
 pub(crate) fn clear_task_contract_digests() {
     TASK_CONTRACT_DIGESTS.with(|cell| cell.borrow_mut().clear());
+    TASK_PROMPT_PREFIXES.with(|cell| cell.borrow_mut().clear());
+}
+
+fn cached_prompt_prefix(
+    task_name: &str,
+    options: &crate::runtime::RuntimeOptions,
+    instruction: &str,
+    rendered_schema: &str,
+    output_schema_hash: &str,
+) -> Arc<str> {
+    let reasoning_off = options.reasoning == "off";
+    let mut key =
+        String::with_capacity(task_name.len() + output_schema_hash.len() + 8);
+    key.push_str(task_name);
+    key.push('|');
+    key.push_str(output_schema_hash);
+    key.push('|');
+    key.push(if reasoning_off { '0' } else { '1' });
+    TASK_PROMPT_PREFIXES.with(|cell| {
+        let mut map = cell.borrow_mut();
+        if let Some(cached) = map.get(&key) {
+            return Arc::clone(cached);
+        }
+        let prefix = Arc::<str>::from(prompt_prefix(options, instruction, rendered_schema));
+        map.insert(key, Arc::clone(&prefix));
+        prefix
+    })
 }
 
 fn task_contract_digests(job: &Job) -> Arc<TaskContractDigests> {

@@ -149,7 +149,7 @@ unsafe extern "C-unwind" fn begin_semantic_custom_scan(
             owns_child_plan,
             semantic_states: loaded_state.subjects,
             subject_freshness_basis: loaded_state.freshness_basis_by_subject,
-            emitted_freshness_basis: BTreeMap::new(),
+            emitted_freshness_basis: EmittedFreshnessCounts::default(),
             rows_seen: 0,
             rows_returned: 0,
             lookup_rows: 0,
@@ -174,6 +174,8 @@ unsafe extern "C-unwind" fn begin_semantic_custom_scan(
             infer_trace_prompt_tokens: 0,
             infer_trace_generated_tokens: 0,
             infer_trace_generate_ms: 0,
+            infer_trace_finish_sql_ms: 0,
+            infer_trace_materialize_ms: 0,
             infer_trace_version: String::new(),
             infer_trace_probability_status: String::new(),
             infer_trace_schema_force: String::new(),
@@ -491,6 +493,8 @@ unsafe extern "C-unwind" fn rescan_semantic_custom_scan(node: *mut pg_sys::Custo
             runtime.infer_trace_prompt_tokens = 0;
             runtime.infer_trace_generated_tokens = 0;
             runtime.infer_trace_generate_ms = 0;
+            runtime.infer_trace_finish_sql_ms = 0;
+            runtime.infer_trace_materialize_ms = 0;
             runtime.infer_trace_version.clear();
             runtime.infer_trace_probability_status.clear();
             runtime.infer_trace_schema_force.clear();

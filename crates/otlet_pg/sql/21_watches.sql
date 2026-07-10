@@ -2,12 +2,13 @@ CREATE FUNCTION otlet.watch_change_trigger() RETURNS trigger
 LANGUAGE plpgsql
 AS $$
 DECLARE
-  watch_row otlet.watches%ROWTYPE;
+  watch_task_name text;
+  watch_on_change text;
   row_input jsonb;
   subject_id text;
 BEGIN
-  SELECT *
-  INTO watch_row
+  SELECT w.task_name, COALESCE(w.trigger_policy ->> 'on_change', 'mark_stale')
+  INTO watch_task_name, watch_on_change
   FROM otlet.watches w
   WHERE w.name = TG_ARGV[1]
     AND w.kind = 'row';
@@ -33,9 +34,9 @@ BEGIN
   );
 
   IF TG_OP <> 'DELETE'
-     AND COALESCE(watch_row.trigger_policy ->> 'on_change', 'mark_stale') = 'mark_stale_and_enqueue'
+     AND watch_on_change = 'mark_stale_and_enqueue'
      AND subject_id IS NOT NULL THEN
-    PERFORM otlet.run_task_subject(watch_row.task_name, subject_id);
+    PERFORM otlet.run_task_subject(watch_task_name, subject_id);
   END IF;
 
   IF TG_OP = 'DELETE' THEN

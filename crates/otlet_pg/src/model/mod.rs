@@ -133,8 +133,8 @@ impl ModelError {
         raw_output: String,
         context: &RunContext,
         trace_summary: Value,
+        raw_output_hash: String,
     ) -> Self {
-        let raw_output_hash = hash_text(&raw_output);
         let mut trace_summary = trace_summary;
         if let Value::Object(object) = &mut trace_summary {
             object.insert(
@@ -393,10 +393,12 @@ fn run_job_with_model_ref(job: &Job, model: JobModelRef<'_>) -> Result<ModelRun,
         let shaped_input = shaped_model_input(&job.input);
         let rendered_schema =
             cached_rendered_schema(&job.output_schema, &digests.output_schema_hash);
-        let prompt_prefix = prompt_prefix(
+        let prompt_prefix = cached_prompt_prefix(
+            &job.task_name,
             &options,
             &digests.instruction,
             rendered_schema.as_ref(),
+            &digests.output_schema_hash,
         );
         let prompt_hash = hash_prompt_full(&prompt_prefix, &shaped_input.serialized);
         let context = RunContext {
@@ -412,11 +414,14 @@ fn run_job_with_model_ref(job: &Job, model: JobModelRef<'_>) -> Result<ModelRun,
             input_truncated: shaped_input.input_truncated,
             ..cache_probe
         };
+        let mut full = String::with_capacity(
+            prompt_prefix.len() + shaped_input.serialized.len() + PROMPT_BODY_AFTER_INPUT.len(),
+        );
+        full.push_str(&prompt_prefix);
+        full.push_str(&shaped_input.serialized);
+        full.push_str(PROMPT_BODY_AFTER_INPUT);
         let prompt = PromptParts {
-            full: format!(
-                "{prompt_prefix}{}{PROMPT_BODY_AFTER_INPUT}",
-                shaped_input.serialized
-            ),
+            full,
             prefix: prompt_prefix,
         };
         let linked = run_linked(
@@ -442,7 +447,7 @@ fn run_job_with_model_ref(job: &Job, model: JobModelRef<'_>) -> Result<ModelRun,
     let raw_output_hash = hash_text(raw_output.as_str());
     let trace_summary = generation_trace_summary(&context, &metrics, &raw_output_hash);
 
-    let (mut json, raw_json) = match parse_model_json(raw_output.as_str()) {
+    let mut json = match parse_model_json(raw_output.as_str()) {
         Ok(parsed) => parsed,
         Err(err) => {
             return Err(ModelError::with_context(
@@ -450,17 +455,20 @@ fn run_job_with_model_ref(job: &Job, model: JobModelRef<'_>) -> Result<ModelRun,
                 raw_output.into_owned(),
                 &context,
                 trace_summary,
+                raw_output_hash.clone(),
             )
             .with_metrics(metrics));
         }
     };
+    let raw_json = raw_output.as_str().trim().to_owned();
     let Some(object) = json.as_object_mut() else {
         return Err(ModelError::with_context(
-            "model JSON must be an object".to_owned(),
-            raw_output.into_owned(),
-            &context,
-            trace_summary,
-        )
+                "model JSON must be an object".to_owned(),
+                raw_output.into_owned(),
+                &context,
+                trace_summary,
+                raw_output_hash.clone(),
+            )
         .with_metrics(metrics));
     };
     if let Some(extra_key) = object
@@ -469,29 +477,32 @@ fn run_job_with_model_ref(job: &Job, model: JobModelRef<'_>) -> Result<ModelRun,
         .cloned()
     {
         return Err(ModelError::with_context(
-            format!("model JSON unsupported top-level key: {extra_key}"),
-            raw_output.into_owned(),
-            &context,
-            trace_summary,
-        )
+                format!("model JSON unsupported top-level key: {extra_key}"),
+                raw_output.into_owned(),
+                &context,
+                trace_summary,
+                raw_output_hash.clone(),
+            )
         .with_metrics(metrics));
     }
     let Some(output) = object.remove("output") else {
         return Err(ModelError::with_context(
-            "model JSON missing output".to_owned(),
-            raw_output.into_owned(),
-            &context,
-            trace_summary,
-        )
+                "model JSON missing output".to_owned(),
+                raw_output.into_owned(),
+                &context,
+                trace_summary,
+                raw_output_hash.clone(),
+            )
         .with_metrics(metrics));
     };
     let Some(actions_value) = object.remove("actions") else {
         return Err(ModelError::with_context(
-            "model JSON missing actions".to_owned(),
-            raw_output.into_owned(),
-            &context,
-            trace_summary,
-        )
+                "model JSON missing actions".to_owned(),
+                raw_output.into_owned(),
+                &context,
+                trace_summary,
+                raw_output_hash.clone(),
+            )
         .with_metrics(metrics));
     };
     let actions = match model_actions(actions_value) {
@@ -502,17 +513,19 @@ fn run_job_with_model_ref(job: &Job, model: JobModelRef<'_>) -> Result<ModelRun,
                 raw_output.into_owned(),
                 &context,
                 trace_summary,
+                raw_output_hash.clone(),
             )
             .with_metrics(metrics));
         }
     };
     if let Err(err) = validate_output(&job.output_schema, &output) {
         return Err(ModelError::with_context(
-            err,
-            raw_output.into_owned(),
-            &context,
-            trace_summary,
-        )
+                err,
+                raw_output.into_owned(),
+                &context,
+                trace_summary,
+                raw_output_hash.clone(),
+            )
         .with_metrics(metrics));
     }
     if cache_enabled && !metrics.inference_cache_hit {
@@ -555,7 +568,7 @@ fn run_job_with_model_ref(job: &Job, model: JobModelRef<'_>) -> Result<ModelRun,
 
 struct PromptParts {
     full: String,
-    prefix: String,
+    prefix: Arc<str>,
 }
 
 // Shared with shaped_prompt_hashes_for_cache_hit so receipt prompt_hash stays

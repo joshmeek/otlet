@@ -368,61 +368,95 @@ unsafe fn pg_output_text(
     }
 }
 
-// Wait-path: materialize then re-read state in one statement (pure SELECT).
+// Wait-path: skip materialize while a job is still active; otherwise materialize
+// then re-read state in one statement (pure SELECT).
 // $1=index_name, $2=subject_id, $3=expected_json, $4=task_name, $5=record_type
-const SEMANTIC_ROW_WAIT_MATERIALIZE_STATE_SQL: &str = "WITH materialized AS ( \
-                   SELECT otlet.materialize_semantic_index_subject($1, $2)::bigint AS n \
+const SEMANTIC_ROW_WAIT_MATERIALIZE_STATE_SQL: &str = "WITH active AS ( \
+                   SELECT EXISTS ( \
+                     SELECT 1 FROM otlet.jobs j \
+                     WHERE j.task_name = $4 \
+                       AND j.subject_id = $2 \
+                       AND j.status IN ('queued', 'running', 'cancel_requested') \
+                     LIMIT 1 \
+                   ) AS is_active \
+                 ), \
+                 materialized AS ( \
+                   SELECT CASE \
+                     WHEN a.is_active THEN 0::bigint \
+                     ELSE otlet.materialize_semantic_index_subject($1, $2)::bigint \
+                   END AS n \
+                   FROM active a \
                  ), \
                  latest AS ( \
-                   SELECT sm.subject_id, sm.stale, (sm.body @> $3::jsonb) AS matches_expected, \
-                     sm.updated_at, sm.id \
-                   FROM otlet.semantic_materializations sm \
-                   WHERE sm.task_name = $4 \
-                     AND sm.record_type = $5 \
-                     AND sm.subject_id = $2 \
-                   ORDER BY sm.updated_at DESC, sm.id DESC \
-                   LIMIT 1 \
-                 ) \
-                 SELECT CASE \
-                   WHEN EXISTS ( \
-                     SELECT 1 FROM otlet.jobs j \
-                     WHERE j.task_name = $4 \
-                       AND j.subject_id = $2 \
-                       AND j.status IN ('queued', 'running', 'cancel_requested') \
+                   SELECT sm.subject_id, sm.stale, (sm.body @> $3::jsonb) AS matches_expected \
+                   FROM active \
+                   LEFT JOIN LATERAL ( \
+                     SELECT sm.subject_id, sm.stale, sm.body \
+                     FROM otlet.semantic_materializations sm \
+                     WHERE NOT active.is_active \
+                       AND sm.task_name = $4 \
+                       AND sm.record_type = $5 \
+                       AND sm.subject_id = $2 \
+                     ORDER BY sm.updated_at DESC, sm.id DESC \
                      LIMIT 1 \
-                   ) AND (l.subject_id IS NULL OR l.stale) THEN 'in_flight' \
-                   WHEN l.subject_id IS NULL THEN 'missing' \
-                   WHEN l.stale THEN 'stale' \
-                   WHEN l.matches_expected THEN 'fresh_match' \
-                   ELSE 'fresh_non_match' \
-                 END AS semantic_state \
-                 FROM materialized, (VALUES ($2::text)) ss(subject_id) \
-                 LEFT JOIN latest l USING (subject_id)";
+                   ) sm ON true \
+                 ) \
+                 SELECT \
+                   active.is_active AS is_active, \
+                   CASE \
+                     WHEN active.is_active THEN 'in_flight' \
+                     WHEN l.subject_id IS NULL THEN 'missing' \
+                     WHEN l.stale THEN 'stale' \
+                     WHEN l.matches_expected THEN 'fresh_match' \
+                     ELSE 'fresh_non_match' \
+                   END AS semantic_state \
+                 FROM materialized, active \
+                 LEFT JOIN latest l ON true";
 
 // $1=index_name, $2=subject_id, $3=expected_json, $4=task_name
-const SEMANTIC_JOIN_WAIT_MATERIALIZE_STATE_SQL: &str = "WITH materialized AS ( \
-                   SELECT otlet.materialize_semantic_join_index_subject($1, $2)::bigint AS n \
-                 ), \
-                 current_row AS ( \
-                   SELECT subject_id, body, stale \
-                   FROM otlet.semantic_join_index_current_rows($1, false) \
-                   WHERE subject_id = $2 \
-                 ) \
-                 SELECT CASE \
-                   WHEN EXISTS ( \
+const SEMANTIC_JOIN_WAIT_MATERIALIZE_STATE_SQL: &str = "WITH active AS ( \
+                   SELECT EXISTS ( \
                      SELECT 1 FROM otlet.jobs j \
                      WHERE j.task_name = $4 \
                        AND j.subject_id = $2 \
                        AND j.status IN ('queued', 'running', 'cancel_requested') \
                      LIMIT 1 \
-                   ) AND (c.subject_id IS NULL OR c.stale) THEN 'in_flight' \
-                   WHEN c.subject_id IS NULL THEN 'missing' \
-                   WHEN c.stale THEN 'stale' \
-                   WHEN c.body @> $3::jsonb THEN 'fresh_match' \
-                   ELSE 'fresh_non_match' \
-                 END AS semantic_state \
-                 FROM materialized, (VALUES ($2::text)) ss(subject_id) \
-                 LEFT JOIN current_row c USING (subject_id)";
+                   ) AS is_active \
+                 ), \
+                 materialized AS ( \
+                   SELECT CASE \
+                     WHEN a.is_active THEN 0::bigint \
+                     ELSE otlet.materialize_semantic_join_index_subject($1, $2)::bigint \
+                   END AS n \
+                   FROM active a \
+                 ), \
+                 latest AS ( \
+                   SELECT sm.subject_id, sm.stale, (sm.body @> $3::jsonb) AS matches_expected \
+                   FROM active \
+                   LEFT JOIN LATERAL ( \
+                     SELECT sm.subject_id, sm.stale, sm.body \
+                     FROM otlet.semantic_materializations sm \
+                     JOIN otlet.semantic_join_indexes sji \
+                       ON sji.task_name = sm.task_name \
+                      AND sji.record_type = sm.record_type \
+                     WHERE NOT active.is_active \
+                       AND sji.name = $1 \
+                       AND sm.subject_id = $2 \
+                     ORDER BY sm.updated_at DESC, sm.id DESC \
+                     LIMIT 1 \
+                   ) sm ON true \
+                 ) \
+                 SELECT \
+                   active.is_active AS is_active, \
+                   CASE \
+                     WHEN active.is_active THEN 'in_flight' \
+                     WHEN l.subject_id IS NULL THEN 'missing' \
+                     WHEN l.stale THEN 'stale' \
+                     WHEN l.matches_expected THEN 'fresh_match' \
+                     ELSE 'fresh_non_match' \
+                   END AS semantic_state \
+                 FROM materialized, active \
+                 LEFT JOIN latest l ON true";
 
 fn semantic_state_from_spi_table(
     table: pgrx::spi::SpiTupleTable<'_>,
@@ -435,4 +469,22 @@ fn semantic_state_from_spi_table(
     SubjectSemanticState::from_label(&label).ok_or_else(|| {
         format!("otlet unexpected semantic_state from SPI: {label}")
     })
+}
+
+fn wait_poll_state_from_spi_table(
+    table: pgrx::spi::SpiTupleTable<'_>,
+) -> Result<(bool, SubjectSemanticState), String> {
+    let row = table.first();
+    let is_active = row
+        .get_by_name::<bool, _>("is_active")
+        .map_err(to_string)?
+        .unwrap_or(false);
+    let label = row
+        .get_by_name::<String, _>("semantic_state")
+        .map_err(to_string)?
+        .ok_or_else(|| "otlet semantic_state SPI returned null".to_owned())?;
+    let state = SubjectSemanticState::from_label(&label).ok_or_else(|| {
+        format!("otlet unexpected semantic_state from SPI: {label}")
+    })?;
+    Ok((is_active, state))
 }

@@ -4,6 +4,8 @@ struct InferNowProvenanceCounts {
     prompt_tokens: u64,
     generated_tokens: u64,
     generate_ms: u64,
+    finish_sql_ms: u64,
+    materialize_ms: u64,
     trace_version: String,
     probability_status: String,
     schema_force: String,
@@ -69,7 +71,19 @@ fn infer_now_failed_provenance_counts(
 // context, so UPDATE must stay on client.update(), not inside SELECT.
 // Args: $1=job_id, $2=subject_id, $3=expected_json, $4=task_name, $5=record_type
 const INFER_NOW_PROVENANCE_AND_ROW_STATE_SQL: &str = "WITH receipt AS ( \
-                   SELECT id, prompt_tokens, generated_tokens, generate_ms, trace_summary \
+                   SELECT \
+                     id, \
+                     prompt_tokens, \
+                     generated_tokens, \
+                     generate_ms, \
+                     NULLIF(trace_summary ->> 'finish_sql_ms', '')::bigint AS finish_sql_ms, \
+                     NULLIF(trace_summary ->> 'materialize_ms', '')::bigint AS materialize_ms, \
+                     COALESCE(trace_summary ->> 'trace_version', '') AS trace_version, \
+                     COALESCE(trace_summary -> 'probability_summary' ->> 'status', '') AS probability_status, \
+                     COALESCE(trace_summary ->> 'schema_force', '') AS schema_force, \
+                     COALESCE(trace_summary -> 'detailed_trace' ->> 'status', '') AS detailed_trace_status, \
+                     NULLIF(trace_summary #>> '{detailed_trace,captured_tokens}', '')::bigint AS detailed_trace_captured_tokens, \
+                     NULLIF(trace_summary #>> '{detailed_trace,top_k}', '')::bigint AS detailed_trace_top_k \
                    FROM otlet.inference_receipts \
                    WHERE job_id = $1 AND status = 'complete' \
                    ORDER BY attempt_index DESC, id DESC \
@@ -108,28 +122,48 @@ const INFER_NOW_PROVENANCE_AND_ROW_STATE_SQL: &str = "WITH receipt AS ( \
                    COALESCE(r.prompt_tokens, 0)::bigint AS prompt_tokens, \
                    COALESCE(r.generated_tokens, 0)::bigint AS generated_tokens, \
                    COALESCE(r.generate_ms, 0)::bigint AS generate_ms, \
-                   COALESCE(r.trace_summary ->> 'trace_version', '') AS trace_version, \
-                   COALESCE(r.trace_summary -> 'probability_summary' ->> 'status', '') AS probability_status, \
-                   COALESCE(r.trace_summary ->> 'schema_force', '') AS schema_force, \
-                   COALESCE(r.trace_summary -> 'detailed_trace' ->> 'status', '') AS detailed_trace_status, \
-                   COALESCE(NULLIF(r.trace_summary #>> '{detailed_trace,captured_tokens}', '')::bigint, 0)::bigint AS detailed_trace_captured_tokens, \
-                   COALESCE(NULLIF(r.trace_summary #>> '{detailed_trace,top_k}', '')::bigint, 0)::bigint AS detailed_trace_top_k, \
+                   COALESCE(r.finish_sql_ms, 0)::bigint AS finish_sql_ms, \
+                   COALESCE(r.materialize_ms, 0)::bigint AS materialize_ms, \
+                   COALESCE(r.trace_version, '') AS trace_version, \
+                   COALESCE(r.probability_status, '') AS probability_status, \
+                   COALESCE(r.schema_force, '') AS schema_force, \
+                   COALESCE(r.detailed_trace_status, '') AS detailed_trace_status, \
+                   COALESCE(r.detailed_trace_captured_tokens, 0)::bigint AS detailed_trace_captured_tokens, \
+                   COALESCE(r.detailed_trace_top_k, 0)::bigint AS detailed_trace_top_k, \
                    s.semantic_state \
                  FROM state s \
                  LEFT JOIN receipt r ON true";
 
 // Args: $1=job_id, $2=index_name, $3=subject_id, $4=expected_json, $5=task_name
 const INFER_NOW_PROVENANCE_AND_JOIN_STATE_SQL: &str = "WITH receipt AS ( \
-                   SELECT id, prompt_tokens, generated_tokens, generate_ms, trace_summary \
+                   SELECT \
+                     id, \
+                     prompt_tokens, \
+                     generated_tokens, \
+                     generate_ms, \
+                     NULLIF(trace_summary ->> 'finish_sql_ms', '')::bigint AS finish_sql_ms, \
+                     NULLIF(trace_summary ->> 'materialize_ms', '')::bigint AS materialize_ms, \
+                     COALESCE(trace_summary ->> 'trace_version', '') AS trace_version, \
+                     COALESCE(trace_summary -> 'probability_summary' ->> 'status', '') AS probability_status, \
+                     COALESCE(trace_summary ->> 'schema_force', '') AS schema_force, \
+                     COALESCE(trace_summary -> 'detailed_trace' ->> 'status', '') AS detailed_trace_status, \
+                     NULLIF(trace_summary #>> '{detailed_trace,captured_tokens}', '')::bigint AS detailed_trace_captured_tokens, \
+                     NULLIF(trace_summary #>> '{detailed_trace,top_k}', '')::bigint AS detailed_trace_top_k \
                    FROM otlet.inference_receipts \
                    WHERE job_id = $1 AND status = 'complete' \
                    ORDER BY attempt_index DESC, id DESC \
                    LIMIT 1 \
                  ), \
                  current_row AS ( \
-                   SELECT subject_id, body, stale \
-                   FROM otlet.semantic_join_index_current_rows($2, false) \
-                   WHERE subject_id = $3 \
+                   SELECT sm.subject_id, sm.body, sm.stale \
+                   FROM otlet.semantic_materializations sm \
+                   JOIN otlet.semantic_join_indexes sji \
+                     ON sji.task_name = sm.task_name \
+                    AND sji.record_type = sm.record_type \
+                   WHERE sji.name = $2 \
+                     AND sm.subject_id = $3 \
+                   ORDER BY sm.updated_at DESC, sm.id DESC \
+                   LIMIT 1 \
                  ), \
                  state AS ( \
                    SELECT CASE \
@@ -154,12 +188,14 @@ const INFER_NOW_PROVENANCE_AND_JOIN_STATE_SQL: &str = "WITH receipt AS ( \
                    COALESCE(r.prompt_tokens, 0)::bigint AS prompt_tokens, \
                    COALESCE(r.generated_tokens, 0)::bigint AS generated_tokens, \
                    COALESCE(r.generate_ms, 0)::bigint AS generate_ms, \
-                   COALESCE(r.trace_summary ->> 'trace_version', '') AS trace_version, \
-                   COALESCE(r.trace_summary -> 'probability_summary' ->> 'status', '') AS probability_status, \
-                   COALESCE(r.trace_summary ->> 'schema_force', '') AS schema_force, \
-                   COALESCE(r.trace_summary -> 'detailed_trace' ->> 'status', '') AS detailed_trace_status, \
-                   COALESCE(NULLIF(r.trace_summary #>> '{detailed_trace,captured_tokens}', '')::bigint, 0)::bigint AS detailed_trace_captured_tokens, \
-                   COALESCE(NULLIF(r.trace_summary #>> '{detailed_trace,top_k}', '')::bigint, 0)::bigint AS detailed_trace_top_k, \
+                   COALESCE(r.finish_sql_ms, 0)::bigint AS finish_sql_ms, \
+                   COALESCE(r.materialize_ms, 0)::bigint AS materialize_ms, \
+                   COALESCE(r.trace_version, '') AS trace_version, \
+                   COALESCE(r.probability_status, '') AS probability_status, \
+                   COALESCE(r.schema_force, '') AS schema_force, \
+                   COALESCE(r.detailed_trace_status, '') AS detailed_trace_status, \
+                   COALESCE(r.detailed_trace_captured_tokens, 0)::bigint AS detailed_trace_captured_tokens, \
+                   COALESCE(r.detailed_trace_top_k, 0)::bigint AS detailed_trace_top_k, \
                    s.semantic_state \
                  FROM state s \
                  LEFT JOIN receipt r ON true";
@@ -196,6 +232,14 @@ fn provenance_and_state_from_spi_table(
             .map_or(0, nonnegative_count),
         generate_ms: row
             .get_by_name::<i64, _>("generate_ms")
+            .map_err(to_string)?
+            .map_or(0, nonnegative_count),
+        finish_sql_ms: row
+            .get_by_name::<i64, _>("finish_sql_ms")
+            .map_err(to_string)?
+            .map_or(0, nonnegative_count),
+        materialize_ms: row
+            .get_by_name::<i64, _>("materialize_ms")
             .map_err(to_string)?
             .map_or(0, nonnegative_count),
         trace_version: row

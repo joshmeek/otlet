@@ -1,8 +1,8 @@
 # Semantic Watches
 
-Use this after the direct entity-resolution walkthrough. It applies the same job, receipt, output, action, materialization, and freshness path to reusable semantic state
+This guide extends the direct entity-resolution walkthrough into reusable semantic state through jobs, receipts, outputs, actions, materializations, and freshness checks
 
-Some sections use the full vendor-pair demo. Others use smaller learning tables so the transfer pattern stays visible
+The vendor-pair demo covers the end-to-end path. Smaller learning tables isolate each transfer pattern
 
 ## Step 1 - Choose Direct Task Or Semantic Index
 
@@ -23,11 +23,11 @@ Use a semantic index when:
 - lookup can skip rows whose source hash is fresh
 - you want reusable semantic rows and executor-visible CustomScan predicates
 
-The direct task path teaches the Otlet contract. The semantic path adds query ergonomics and freshness policy
+The direct task teaches the Otlet contract. Semantic indexes add query ergonomics and freshness policy
 
 ## Step 2 - Map The Otlet Schema
 
-The direct task path gives you the smallest loop. The rest of Otlet uses the same tables
+The direct task uses the smallest loop. Other Otlet surfaces use these tables
 
 Use the catalog to see the durable state Otlet owns:
 
@@ -47,20 +47,20 @@ Representative output:
 (1 row)
 ```
 
-The base tables split into a few jobs:
+Group the base tables by role:
 
 - `models` and `runtime_slots` describe the local resident model runtime
 - `tasks`, `model_selection_policies`, and `jobs` describe durable work and cheap-first escalation policy
-- `outputs`, `action_type_schemas`, `actions`, `records`, `inference_receipts`, and `worker_events` describe what happened
+- `outputs`, `action_type_schemas`, `actions`, `records`, `inference_receipts`, and `worker_events` store results and execution evidence
 - `production_policy` defines queue admission, leases, invalid output handling, stale-result behavior, and cleanup windows
 - `watches`, `semantic_indexes`, and `semantic_materializations` make row-derived model state queryable
-- `watches` and `semantic_join_indexes` do the same for pairwise candidate rows
+- `watches` and `semantic_join_indexes` store pairwise candidate definitions
 
 Use `otlet.runs` for application reads. Use trace and status views for debugging, proof, and learning
 
 ## Step 3 - Materialize Records Into Semantic State
 
-Actions and records form one layer. Semantic materializations make those records reusable from queries
+Otlet stores actions and records first, then exposes records to queries through semantic materializations
 
 This sequence materializes an entity-pair record, watches source changes, and marks the record stale through an update trigger:
 
@@ -110,7 +110,7 @@ UPDATE 1
 (1 row)
 ```
 
-The trigger does not rerun the model. It marks the previous derived fact stale so reads can fail closed or request refresh
+The trigger marks the previous derived fact stale and leaves model reruns to refresh policy
 
 Plain `mark_stale` row watches treat INSERT as missing semantic state rather than stale semantic state. Exact planning shows the new row as unresolved until refresh or infer-now:
 
@@ -250,22 +250,25 @@ SELECT *
 FROM otlet.semantic_index_current_rows('demo_semantic_vendor_idx', true)
 WHERE subject_id = '2';
 ```
+
 ## Step 6 - Read EXPLAIN Field Vocabulary
 
-The SQL plan row and CustomScan EXPLAIN use the same terms for the planner contract
+The SQL plan row and CustomScan EXPLAIN share planner terms
 
 | Concept | SQL plan row | CustomScan EXPLAIN | Parity |
 | --- | --- | --- | --- |
-| Chosen path | `selected_path` | `Planner Selected Path` | Same vocabulary; CustomScan prefixes planner-owned decisions |
-| Reason | `reason` | `Planner Reason` | Same meaning |
+| Chosen path | `selected_path` | `Planner Selected Path` | Shared vocabulary; CustomScan prefixes planner-owned decisions |
+| Reason | `reason` | `Planner Reason` | Equivalent meaning |
 | Count basis | `count_basis` | `Count Basis` | SQL plan rows describe index state; CustomScan source-row predicates use exact or child-plan counts |
-| Model cost basis | `model_cost_source` | `Model Cost Source` | Same ordered basis: task receipt, runtime slot, model receipt, static fallback |
-| Stale reasons | `stale_reasons` | `Planner Stale Reasons` | Same JSON shape for stale subject counts |
+| Model cost basis | `model_cost_source` | `Model Cost Source` | Ordered basis: task receipt, runtime slot, model receipt, static fallback |
+| Stale reasons | `stale_reasons` | `Planner Stale Reasons` | Shared JSON shape for stale subject counts |
 | Infer-now prediction | `infer_now_subjects`, `fail_closed_subjects` | `Planner Infer Now Subjects`, `Planner Fail Closed Subjects` | CustomScan also reports actual executor counters |
 | Freshness basis | `semantic_index_current_rows.freshness_basis` | `Preloaded Fresh Subjects / Basis`, `Emitted Freshness Basis` | Current-row SQL reports row freshness; CustomScan reports aggregate executor evidence |
 | Child plan attachment | (none) | `Child Plan Attached` | Counter; `1` once begin-scan attaches the Postgres child plan |
 | Source tuple path | (none) | `Source Tuple Provider` | Matches executor context; row scans report `child_plan_execprocnode`, joins report `child_subquery_join_execprocnode` |
-| Predicate owner | (none) | `Semantic Predicate Owner` | Always `otlet_customscan_executor` |
+| Predicate owner | (none) | `Semantic Predicate Owner` | Fixed owner: `otlet_customscan_executor` |
+| Warm-job SQL finish | `inference_receipt_trace_status.finish_sql_ms` | `Infer Now Trace Finish Sql Ms` | Optional; stamped inside `complete_job` / `fail_job` |
+| Warm-job materialize | `inference_receipt_trace_status.materialize_ms` | `Infer Now Trace Materialize Ms` | Optional; stamped inside `materialize_completed_semantic_job` |
 
 EXPLAIN line ledger for this pass:
 
@@ -296,9 +299,10 @@ Model Cost Source: task_receipt
 Preloaded Fresh Subjects / Basis: 3 {"mvcc_match": 3}
 Emitted Freshness Basis: {"mvcc_match": 3}
 ```
+
 ## Step 7 - Use CustomScan For Source-Row Predicates
 
-Otlet can own a semantic predicate against the source table through a CustomScan
+Use a CustomScan to evaluate an Otlet semantic predicate against the source table
 
 ```sql
 EXPLAIN (ANALYZE, VERBOSE, COSTS, SUMMARY OFF, TIMING OFF)
@@ -328,7 +332,7 @@ Custom Scan (Otlet Semantic Source CustomScan) on public.otlet_demo_semantic_ven
 
 The child scan reads the source table. Otlet strips the semantic predicate from the child plan and evaluates it against preloaded semantic state
 
-CustomScan uses statement preload semantics. Row-marked queries such as `FOR UPDATE` stay on the ordinary Postgres plan because Otlet blocks the CustomScan planner path when queries include rowmarks; Postgres still owns locking and row recheck behavior. For non-rowmark CustomScan, stale triggers and the next statement pick up concurrent source changes instead of a per-tuple recheck inside the same scan
+CustomScan uses statement preload semantics. Row-marked queries such as `FOR UPDATE` stay on the standard Postgres plan because Otlet blocks the CustomScan planner path when queries include rowmarks; Postgres still owns locking and row recheck behavior. For non-rowmark CustomScan, stale triggers and the next statement pick up concurrent source changes instead of a per-tuple recheck inside that scan
 
 ## Step 8 - Fail Closed On Stale Rows
 
@@ -365,7 +369,8 @@ semantic_stale_status_contract=2|1|0
 (1 row)
 ```
 
-Fail closed means stale facts do not match because old model output looked right
+Fail-closed reads exclude stale facts even when old model output matched
+
 ## Step 9 - Let CustomScan Refresh A Stale Row With Infer-Now
 
 `semantic_matches_auto` lets a source-table query use policy-owned bounded infer-now for stale or missing rows
@@ -442,7 +447,7 @@ Representative output:
 (1 row)
 ```
 
-Receipts carry executor provenance because the same model task can run from the worker queue or from CustomScan infer-now
+Receipts carry executor provenance because one model task can run from the worker queue or from CustomScan infer-now
 
 ## Step 10 - Build A Pair Watch
 
@@ -503,7 +508,7 @@ SELECT 'semantic_join_refresh_queued=' ||
        otlet.refresh_semantic_join_index('learning_entity_pair_idx')::text;
 ```
 
-Wait for the worker the same way the semantic index section does, or run `./scripts/otlet-demo.sh` for the compact proof. Then inspect the automatic materialization:
+Use the semantic-index wait loop, or run `./scripts/otlet-demo.sh` for the compact proof. Then inspect the automatic materialization:
 
 ```sql
 SELECT 'semantic_join_auto_materialized=' ||
@@ -522,9 +527,9 @@ semantic_join_refresh_queued=1
 semantic_join_auto_materialized=1
 ```
 
-`pair_sources` installs the same stale trigger used by row indexes. Updates to declared source rows mark matching pair materializations through `_otlet_mvcc` dependencies, and `drop_watch` removes the trigger when no row index or pair watch still needs it
+`pair_sources` installs the row-index stale trigger. Updates to declared source rows mark matching pair materializations through `_otlet_mvcc` dependencies, and `drop_watch` removes the trigger when no row index or pair watch still needs it
 
-Now inspect the join index:
+Inspect the join index:
 
 ```sql
 SELECT 'semantic_join_status_contract=' ||
@@ -549,7 +554,8 @@ semantic_join_status_contract=semantic_join_lookup|1|1|0|0
 semantic_join_lookup_contract=1|1|0
 ```
 
-A semantic join index uses the same contract: jobs, outputs, actions, records, materializations, receipts
+A semantic join index stores jobs, outputs, actions, records, materializations, and receipts
+
 ## Step 11 - Query A Semantic Join Predicate
 
 ```sql

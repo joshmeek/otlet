@@ -1,8 +1,8 @@
 # Entity Resolution Walkthrough
 
-Use this long SQL walkthrough for the entity-resolution path from `docs/otlet-worked-example.md`. Start with `./scripts/otlet-setup.sh`, then paste these sections into the `psql` session described there
+This SQL walkthrough expands the entity-resolution path from `docs/otlet-worked-example.md`. Start with `./scripts/otlet-setup.sh`, then paste each section into the `psql` session described there
 
-Each section gives a command, the state it creates, and the next output to inspect. Read it once in order before adapting it. The follow-up checks live in [runtime-and-traces.md](runtime-and-traces.md), [semantic-watches.md](semantic-watches.md), and [production-contract.md](production-contract.md)
+Run the sections in order before adapting them. Each section names the state it creates and the output to inspect. Follow-up checks live in [runtime-and-traces.md](runtime-and-traces.md), [semantic-watches.md](semantic-watches.md), and [production-contract.md](production-contract.md)
 
 ## Step 1 - Register The Models
 
@@ -20,11 +20,7 @@ SELECT otlet.register_model(
 );
 ```
 
-`linked_inproc` means the Otlet background worker inside Postgres owns inference
-
-The worker loads a local GGUF through in-process llama.cpp and keeps the model resident across jobs
-
-Postgres can query the queue, source row identity, output validation, receipts, traces, and runtime state
+The Otlet background worker owns `linked_inproc` inference. It loads a local GGUF through in-process llama.cpp and keeps the model resident across jobs. Postgres exposes the queue, source row identity, output validation, receipts, traces, and runtime state through SQL
 
 ## Step 2 - Create The Source Tables
 
@@ -66,6 +62,7 @@ VALUES
 Your application owns these tables
 
 SQL selects candidate pairs first, then Otlet judges those pairs. Merge vendors later through an explicit application workflow outside this model pass
+
 ## Step 3 - Clear Old Demo State
 
 ```sql
@@ -109,9 +106,7 @@ DELETE FROM otlet.tasks
 WHERE name = 'entity_resolution_demo';
 ```
 
-The product flow does not need this cleanup
-
-It makes the example rerunnable
+This cleanup makes the example rerunnable. Production flows retain their history
 
 ## Step 4 - Create The Task
 
@@ -307,7 +302,7 @@ Representative output:
 
 `run_task` executes the task input query and inserts one row into `otlet.jobs` per pair
 
-The user transaction creates durable database work. The resident worker claims it
+The transaction creates durable database work, and the resident worker claims it
 
 The queue keeps model work out of the client request. SQL shows each job at any status: queued, running, complete, failed, or canceled
 
@@ -329,7 +324,7 @@ WHERE task_name = 'entity_resolution_demo'
 ORDER BY id;
 ```
 
-If it is still running, wait a moment and run the query again
+Wait a moment and run the query again while jobs remain active
 
 Representative output:
 
@@ -345,7 +340,8 @@ Representative output:
 (4 rows)
 ```
 
-The worker coordinates through normal database state. It claims jobs from `otlet.jobs`, writes outputs to Otlet tables, and records worker events in `otlet.worker_events`
+The worker coordinates through database tables. It claims jobs from `otlet.jobs`, writes outputs to Otlet tables, and records worker events in `otlet.worker_events`
+
 ## Step 7 - Read The Model Output
 
 ```sql
@@ -373,9 +369,9 @@ Representative output:
 (4 rows)
 ```
 
-`otlet.runs` is a convenience view over jobs, outputs, and receipts
+`otlet.runs` gives SQL access to accepted jobs, outputs, and receipts
 
-Otlet stores the result as database state. You do not have to scrape a terminal response
+Otlet stores each result as database state
 
 Direct entity-resolution tasks ask the model for one typed action. Otlet stores actions when they attach to an accepted, schema-valid output receipt
 
@@ -425,6 +421,7 @@ Representative output:
                       0
 (1 row)
 ```
+
 ## Step 9 - Review The Queue
 
 `otlet.review_queue` gathers actions that need attention, abstention outputs, and review flags with receipt and source-freshness context:
@@ -491,7 +488,7 @@ Representative output:
 (1 row)
 ```
 
-Otlet exports the same correction as local eval data:
+The eval export includes the correction:
 
 ```sql
 SELECT action_id, case_kind, expected_answer, expected_action_type, manual_gold
@@ -510,7 +507,7 @@ Representative output:
 (1 row)
 ```
 
-Eval label confidence uses the same small vocabulary as model outputs: `low`, `medium`, or `high`. Keep calibration notes in `reason` or task-specific fields rather than expanding `expected_confidence`
+Eval label confidence uses `low`, `medium`, or `high`. Record calibration notes in `reason` or task-specific fields rather than expanding `expected_confidence`
 
 Approve, dry-run, and apply one merge proposal:
 
@@ -553,12 +550,13 @@ Representative output:
 
 Semantic refresh jobs create typed `create_record` actions, `otlet.records` rows, and semantic materializations after schema validation passes
 
-Semantic materializations keep two row identities. `source_hash` is MVCC-coupled provenance for the exact row version that produced a job. `content_hash` is the model-input identity used for freshness, excluding Otlet's MVCC envelope so benign row churn can revalidate without rerunning the model
+Semantic materializations store two row identities. `source_hash` is MVCC-coupled provenance for the exact row version that produced a job. `content_hash` is the model-input identity used for freshness, excluding Otlet's MVCC envelope so benign row churn can revalidate without rerunning the model
 
 Input shaping fields are top-level in the task input. Row watches wrap source rows under `row`, so `evidence_fields` does not traverse `row.evidence`; project evidence to a top-level object in the input or pair candidate query. Pair watches treat the candidate query as the shaping declaration, with `strip_keys` available for top-level volatile fields
+
 ## Step 10 - Learn The Action Boundary
 
-Otlet keeps the action vocabulary fixed and typed. The built-in action catalog says which actions need approval and which ones can create Otlet-owned records:
+Otlet uses a fixed, typed action vocabulary. The built-in action catalog says which actions need approval and which ones can create Otlet-owned records:
 
 ```sql
 SELECT action_type, requires_approval, creates_record
@@ -588,4 +586,4 @@ Representative output:
 (1 row)
 ```
 
-Otlet controls write authority here. The model can ask for an action, but Otlet decides which action types can become database state. Otlet stores unsupported actions as rejected evidence when they arrive with an accepted output. `otlet.action_status` shows approval, dry-run, and apply state
+Otlet enforces write authority through the action catalog. The model can request an action; Otlet decides which action types can become database state. Otlet stores unsupported actions as rejected evidence when they arrive with an accepted output. `otlet.action_status` shows approval, dry-run, and apply state

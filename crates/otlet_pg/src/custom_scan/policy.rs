@@ -62,22 +62,50 @@ fn source_tuple_provider(runtime: &RuntimeState) -> &'static str {
 
 fn freeze_infer_now_executor_context_json(runtime: &RuntimeState) -> String {
     // Serialize once; finish_infer_now stamps via `$2::jsonb` without re-building Value.
-    json!({
-        "executor_origin": "customscan_infer_now",
-        "executor_node": "Otlet Semantic Source CustomScan",
-        "executor_boundary": "CustomScan owned Postgres-planned source child scan",
-        "planner_selected_path": runtime.planner_selected_path.as_str(),
-        "source_tuple_provider": source_tuple_provider(runtime),
-        "refresh_policy": refresh_policy_from_parts(
-            runtime.auto_policy,
-            runtime.allow_refresh,
-            runtime.wait_ms,
-            runtime.infer_ms
-        ),
-        "semantic_index_kind": runtime.index_kind.as_str(),
-        "semantic_index_name": runtime.index_name.as_str()
-    })
-    .to_string()
+    let provider = source_tuple_provider(runtime);
+    let refresh = refresh_policy_from_parts(
+        runtime.auto_policy,
+        runtime.allow_refresh,
+        runtime.wait_ms,
+        runtime.infer_ms,
+    );
+    let path = runtime.planner_selected_path.as_str();
+    let kind = runtime.index_kind.as_str();
+    let name = runtime.index_name.as_str();
+    let mut out = String::with_capacity(
+        220 + provider.len() + refresh.len() + path.len() + kind.len() + name.len(),
+    );
+    out.push_str("{\"executor_origin\":\"customscan_infer_now\",\"executor_node\":\"Otlet Semantic Source CustomScan\",\"executor_boundary\":\"CustomScan owned Postgres-planned source child scan\",\"planner_selected_path\":");
+    push_json_string(&mut out, path);
+    out.push_str(",\"source_tuple_provider\":");
+    push_json_string(&mut out, provider);
+    out.push_str(",\"refresh_policy\":");
+    push_json_string(&mut out, refresh);
+    out.push_str(",\"semantic_index_kind\":");
+    push_json_string(&mut out, kind);
+    out.push_str(",\"semantic_index_name\":");
+    push_json_string(&mut out, name);
+    out.push('}');
+    out
+}
+
+fn push_json_string(out: &mut String, value: &str) {
+    out.push('"');
+    for ch in value.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if c.is_control() => {
+                use std::fmt::Write as _;
+                let _ = write!(out, "\\u{:04x}", u32::from(c));
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('"');
 }
 
 fn is_semantic_join_runtime(runtime: &RuntimeState) -> bool {

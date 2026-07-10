@@ -81,6 +81,7 @@ fn wait_for_refresh_if_allowed(
     let max_wait_ms = std::ffi::c_int::try_from(runtime.wait_ms.min(10_000))
         .unwrap_or(std::ffi::c_int::MAX);
     let mut active_seen = active_seen_before_wait;
+    let mut sleep_us: i64 = 50_000;
     loop {
         unsafe {
             pg_sys::ProcessInterrupts();
@@ -110,8 +111,10 @@ fn wait_for_refresh_if_allowed(
             return Ok(SemanticResolution::Unresolved);
         }
         unsafe {
-            pg_sys::pg_usleep(50_000);
+            pg_sys::pg_usleep(sleep_us);
         }
+        // Back off while still in-flight so long waits do not SPI-poll every 50ms.
+        sleep_us = (sleep_us.saturating_mul(2)).min(200_000);
     }
 }
 
@@ -126,33 +129,34 @@ fn wait_poll_active_or_materialize(
     subject_id: &str,
     active_seen: bool,
 ) -> Result<WaitPollOutcome, String> {
-    // One SELECT: materialize as a CTE side effect, then read subject state.
+    // Cheap active-only probe until we have seen an active job. After that, one
+    // SELECT gates materialize on !is_active and returns subject state.
     let fused_sql = match runtime.index_kind {
         SemanticIndexKind::Row => SEMANTIC_ROW_WAIT_MATERIALIZE_STATE_SQL,
         SemanticIndexKind::Join => SEMANTIC_JOIN_WAIT_MATERIALIZE_STATE_SQL,
     };
     pgrx::Spi::connect(|client| {
-        let active_args = [runtime.task_name.as_str().into(), subject_id.into()];
-        let active_table = client
-            .select(
-                "SELECT true AS active \
-                 FROM otlet.jobs \
-                 WHERE task_name = $1 \
-                   AND subject_id = $2 \
-                   AND status IN ('queued', 'running', 'cancel_requested') \
-                 LIMIT 1",
-                Some(1),
-                &active_args,
-            )
-            .map_err(to_string)?;
-        // Empty set = no active job (same as EXISTS false). A present row is true.
-        let active = !active_table.is_empty();
-        if active {
-            return Ok(WaitPollOutcome::StillActive);
-        }
         if !active_seen {
+            let active_args = [runtime.task_name.as_str().into(), subject_id.into()];
+            let active_table = client
+                .select(
+                    "SELECT true AS active \
+                     FROM otlet.jobs \
+                     WHERE task_name = $1 \
+                       AND subject_id = $2 \
+                       AND status IN ('queued', 'running', 'cancel_requested') \
+                     LIMIT 1",
+                    Some(1),
+                    &active_args,
+                )
+                .map_err(to_string)?;
+            // Empty set = no active job (same as EXISTS false). A present row is true.
+            if !active_table.is_empty() {
+                return Ok(WaitPollOutcome::StillActive);
+            }
             return Ok(WaitPollOutcome::NeverActive);
         }
+
         let state_args = match runtime.index_kind {
             SemanticIndexKind::Row => vec![
                 runtime.index_name.as_str().into(),
@@ -171,7 +175,10 @@ fn wait_poll_active_or_materialize(
         let state_table = client
             .select(fused_sql, Some(1), &state_args)
             .map_err(to_string)?;
-        let state = semantic_state_from_spi_table(state_table)?;
+        let (is_active, state) = wait_poll_state_from_spi_table(state_table)?;
+        if is_active {
+            return Ok(WaitPollOutcome::StillActive);
+        }
         runtime
             .semantic_states
             .insert(subject_id.to_owned(), state);
@@ -573,6 +580,12 @@ fn finish_infer_now_success_spi(
     runtime.infer_trace_generate_ms = runtime
         .infer_trace_generate_ms
         .saturating_add(provenance.generate_ms);
+    runtime.infer_trace_finish_sql_ms = runtime
+        .infer_trace_finish_sql_ms
+        .saturating_add(provenance.finish_sql_ms);
+    runtime.infer_trace_materialize_ms = runtime
+        .infer_trace_materialize_ms
+        .saturating_add(provenance.materialize_ms);
     runtime.infer_trace_version = provenance.trace_version;
     runtime.infer_trace_probability_status = provenance.probability_status;
     runtime.infer_trace_schema_force = provenance.schema_force;

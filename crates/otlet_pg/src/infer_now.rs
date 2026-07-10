@@ -232,25 +232,22 @@ pub(crate) fn snapshot() -> InferNowSnapshot {
 
 pub(crate) fn queue_snapshot() -> InferNowQueueSnapshot {
     let state = INFER_NOW_STATE.share();
-    let requested_slots = state
-        .slots
-        .iter()
-        .filter(|slot| slot.state == STATE_REQUESTED)
-        .count();
-    let running_slots = state
-        .slots
-        .iter()
-        .filter(|slot| slot.state == STATE_RUNNING)
-        .count();
+    let mut requested_slots = 0usize;
+    let mut running_slots = 0usize;
+    let mut available_slots = 0usize;
+    for slot in &state.slots {
+        match slot.state {
+            STATE_REQUESTED => requested_slots += 1,
+            STATE_RUNNING => running_slots += 1,
+            STATE_IDLE => available_slots += 1,
+            _ => {}
+        }
+    }
     InferNowQueueSnapshot {
         slot_count: INFER_NOW_SLOTS,
         requested_slots,
         running_slots,
-        available_slots: state
-            .slots
-            .iter()
-            .filter(|slot| slot.state == STATE_IDLE)
-            .count(),
+        available_slots,
         busy_rejections: state.busy_rejections,
     }
 }
@@ -443,38 +440,36 @@ pub(crate) fn signal_infer_now_worker() {
 
 pub(crate) fn status_json() -> JsonB {
     let state = INFER_NOW_STATE.share();
-    let requested_slots = state
-        .slots
-        .iter()
-        .filter(|slot| slot.state == STATE_REQUESTED)
-        .count();
-    let running_slots = state
-        .slots
-        .iter()
-        .filter(|slot| slot.state == STATE_RUNNING)
-        .count();
-    let completed_slots = state
-        .slots
-        .iter()
-        .filter(|slot| slot.state == STATE_DONE)
-        .count();
-    let failed_slots = state
-        .slots
-        .iter()
-        .filter(|slot| slot.state == STATE_FAILED)
-        .count();
-    let active_slot = state
-        .slots
-        .iter()
-        .position(|slot| matches!(slot.state, STATE_RUNNING | STATE_REQUESTED))
-        .map_or(-1, |slot| i32::try_from(slot).unwrap_or(-1));
-    let last_slot = state
-        .slots
-        .iter()
-        .filter(|slot| slot.request_id > 0)
-        .max_by_key(|slot| slot.request_id)
-        .copied()
-        .unwrap_or_default();
+    let mut requested_slots = 0usize;
+    let mut running_slots = 0usize;
+    let mut completed_slots = 0usize;
+    let mut failed_slots = 0usize;
+    let mut available_slots = 0usize;
+    let mut active_slot = -1i32;
+    let mut last_slot = InferNowSlot::default();
+    for (index, slot) in state.slots.iter().enumerate() {
+        match slot.state {
+            STATE_REQUESTED => {
+                requested_slots += 1;
+                if active_slot < 0 {
+                    active_slot = i32::try_from(index).unwrap_or(-1);
+                }
+            }
+            STATE_RUNNING => {
+                running_slots += 1;
+                if active_slot < 0 {
+                    active_slot = i32::try_from(index).unwrap_or(-1);
+                }
+            }
+            STATE_DONE => completed_slots += 1,
+            STATE_FAILED => failed_slots += 1,
+            STATE_IDLE => available_slots += 1,
+            _ => {}
+        }
+        if slot.request_id > last_slot.request_id {
+            last_slot = *slot;
+        }
+    }
     JsonB(json!({
         "state": infer_queue_state_label(requested_slots, running_slots, completed_slots, failed_slots),
         "request_id": state.next_request_id,
@@ -506,7 +501,7 @@ pub(crate) fn status_json() -> JsonB {
         "done_slots": completed_slots,
         "failed_slots": failed_slots,
         "queue_depth": requested_slots + running_slots,
-        "available_slots": state.slots.iter().filter(|slot| slot.state == STATE_IDLE).count(),
+        "available_slots": available_slots,
         "active_slot": active_slot,
         "admission_policy": INFER_NOW_ADMISSION_POLICY,
         "cap_policy": "task_subject_inline_task_input_byte_caps_reject_before_queue_insert",

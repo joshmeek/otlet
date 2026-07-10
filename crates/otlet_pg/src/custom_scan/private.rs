@@ -202,64 +202,47 @@ unsafe fn custom_private_from_list(private: *mut pg_sys::List) -> Option<CustomS
     }
 }
 
-fn reload_private_planner_stats(private: &CustomScanPrivate) -> SemanticPlannerStats {
+fn reload_private_planner_stats_plan_only(private: &CustomScanPrivate) -> SemanticPlannerStats {
     pgrx::Spi::connect(|client| {
-        let args = [
-            private.index_name.as_str().into(),
-            private.expected_json.as_str().into(),
-        ];
+        let args = [private.index_name.as_str().into()];
         let query = match private.index_kind {
             SemanticIndexKind::Row => {
-                "WITH plan AS ( \
-                   SELECT * \
-                   FROM otlet.semantic_index_plan($1, true) \
-                 ), \
-                 current_rows AS ( \
-                   SELECT body, stale \
-                   FROM otlet.semantic_index_current_rows($1, false) \
-                 ) \
-                 SELECT \
-                   COALESCE((SELECT selected_path FROM plan), 'semantic_lookup')::text AS selected_path, \
-                   COALESCE((SELECT reason FROM plan), 'reloaded_from_sql_plan')::text AS reason, \
-                   COALESCE((SELECT total_subjects FROM plan), 0)::bigint AS total_subjects, \
-                   (SELECT count(*) FROM current_rows WHERE stale = false AND body @> $2::jsonb)::bigint AS fresh_matches, \
-                   (SELECT count(*) FROM current_rows WHERE stale = false AND NOT (body @> $2::jsonb))::bigint AS fresh_non_matches, \
-                   COALESCE((SELECT stale_subjects FROM plan), 0)::bigint AS stale_subjects, \
-                   COALESCE((SELECT missing_subjects FROM plan), 0)::bigint AS missing_subjects, \
-                   COALESCE((SELECT inflight_subjects FROM plan), 0)::bigint AS inflight_subjects, \
-                   COALESCE((SELECT infer_now_subjects FROM plan), 0)::bigint AS infer_now_subjects, \
-                   COALESCE((SELECT fail_closed_subjects FROM plan), 0)::bigint AS fail_closed_subjects, \
-                   COALESCE((SELECT model_ms FROM plan), 2500)::float8 AS model_ms, \
-                   COALESCE((SELECT model_cost_source FROM plan), 'static_fallback')::text AS model_cost_source, \
-                   COALESCE((SELECT path_cost FROM plan), 1)::float8 AS path_cost, \
-                   COALESCE((SELECT stale_reasons::text FROM plan), '{}')::text AS stale_reasons, \
-                   COALESCE((SELECT count_basis FROM plan), 'exact')::text AS count_basis"
+                "SELECT \
+                   COALESCE(selected_path, 'semantic_lookup')::text AS selected_path, \
+                   COALESCE(reason, 'reloaded_from_sql_plan')::text AS reason, \
+                   COALESCE(total_subjects, 0)::bigint AS total_subjects, \
+                   0::bigint AS fresh_matches, \
+                   0::bigint AS fresh_non_matches, \
+                   COALESCE(stale_subjects, 0)::bigint AS stale_subjects, \
+                   COALESCE(missing_subjects, 0)::bigint AS missing_subjects, \
+                   COALESCE(inflight_subjects, 0)::bigint AS inflight_subjects, \
+                   COALESCE(infer_now_subjects, 0)::bigint AS infer_now_subjects, \
+                   COALESCE(fail_closed_subjects, 0)::bigint AS fail_closed_subjects, \
+                   COALESCE(model_ms, 2500)::float8 AS model_ms, \
+                   COALESCE(model_cost_source, 'static_fallback')::text AS model_cost_source, \
+                   COALESCE(path_cost, 1)::float8 AS path_cost, \
+                   COALESCE(stale_reasons::text, '{}')::text AS stale_reasons, \
+                   COALESCE(count_basis, 'exact')::text AS count_basis \
+                 FROM otlet.semantic_index_plan($1, true)"
             }
             SemanticIndexKind::Join => {
-                "WITH plan AS ( \
-                   SELECT * \
-                   FROM otlet.semantic_join_index_plan($1) \
-                 ), \
-                 current_rows AS ( \
-                   SELECT body, stale \
-                   FROM otlet.semantic_join_index_current_rows($1, false) \
-                 ) \
-                 SELECT \
-                   COALESCE((SELECT selected_path FROM plan), 'semantic_lookup')::text AS selected_path, \
-                   COALESCE((SELECT reason FROM plan), 'reloaded_from_sql_plan')::text AS reason, \
-                   COALESCE((SELECT total_subjects FROM plan), 0)::bigint AS total_subjects, \
-                   (SELECT count(*) FROM current_rows WHERE stale = false AND body @> $2::jsonb)::bigint AS fresh_matches, \
-                   (SELECT count(*) FROM current_rows WHERE stale = false AND NOT (body @> $2::jsonb))::bigint AS fresh_non_matches, \
-                   COALESCE((SELECT stale_subjects FROM plan), 0)::bigint AS stale_subjects, \
-                   COALESCE((SELECT missing_subjects FROM plan), 0)::bigint AS missing_subjects, \
-                   COALESCE((SELECT inflight_subjects FROM plan), 0)::bigint AS inflight_subjects, \
-                   COALESCE((SELECT infer_now_subjects FROM plan), 0)::bigint AS infer_now_subjects, \
-                   COALESCE((SELECT fail_closed_subjects FROM plan), 0)::bigint AS fail_closed_subjects, \
-                   COALESCE((SELECT model_ms FROM plan), 2500)::float8 AS model_ms, \
-                   COALESCE((SELECT model_cost_source FROM plan), 'static_fallback')::text AS model_cost_source, \
-                   COALESCE((SELECT path_cost FROM plan), 1)::float8 AS path_cost, \
-                   COALESCE((SELECT stale_reasons::text FROM plan), '{}')::text AS stale_reasons, \
-                   COALESCE((SELECT count_basis FROM plan), 'exact')::text AS count_basis"
+                "SELECT \
+                   COALESCE(selected_path, 'semantic_lookup')::text AS selected_path, \
+                   COALESCE(reason, 'reloaded_from_sql_plan')::text AS reason, \
+                   COALESCE(total_subjects, 0)::bigint AS total_subjects, \
+                   0::bigint AS fresh_matches, \
+                   0::bigint AS fresh_non_matches, \
+                   COALESCE(stale_subjects, 0)::bigint AS stale_subjects, \
+                   COALESCE(missing_subjects, 0)::bigint AS missing_subjects, \
+                   COALESCE(inflight_subjects, 0)::bigint AS inflight_subjects, \
+                   COALESCE(infer_now_subjects, 0)::bigint AS infer_now_subjects, \
+                   COALESCE(fail_closed_subjects, 0)::bigint AS fail_closed_subjects, \
+                   COALESCE(model_ms, 2500)::float8 AS model_ms, \
+                   COALESCE(model_cost_source, 'static_fallback')::text AS model_cost_source, \
+                   COALESCE(path_cost, 1)::float8 AS path_cost, \
+                   COALESCE(stale_reasons::text, '{}')::text AS stale_reasons, \
+                   COALESCE(count_basis, 'exact')::text AS count_basis \
+                 FROM otlet.semantic_join_index_plan($1)"
             }
         };
         let table = client.select(query, Some(1), &args).map_err(to_string)?;

@@ -76,7 +76,7 @@ unsafe extern "C-unwind" fn explain_semantic_custom_scan(
             );
             explain_optional_text(
                 "Emitted Freshness Basis",
-                nonempty_str(&freshness_basis_counts_json(&runtime.emitted_freshness_basis)),
+                nonempty_str(&emitted_freshness_counts_json(&runtime.emitted_freshness_basis)),
                 es,
             );
             explain_counter(
@@ -146,7 +146,7 @@ unsafe extern "C-unwind" fn explain_semantic_custom_scan(
                 let planner_stats = if let Some(stats) = private.planner_stats.as_ref() {
                     stats
                 } else {
-                    reloaded = reload_private_planner_stats(&private);
+                    reloaded = reload_private_planner_stats_plan_only(&private);
                     &reloaded
                 };
                 explain_semantic_policy(
@@ -403,6 +403,8 @@ unsafe fn explain_runtime_trace(runtime: &RuntimeState, es: *mut pg_sys::Explain
         prompt_tokens: runtime.infer_trace_prompt_tokens,
         generated_tokens: runtime.infer_trace_generated_tokens,
         generate_ms: runtime.infer_trace_generate_ms,
+        finish_sql_ms: runtime.infer_trace_finish_sql_ms,
+        materialize_ms: runtime.infer_trace_materialize_ms,
         version: nonempty_str(&runtime.infer_trace_version),
         probability_status: nonempty_str(&runtime.infer_trace_probability_status),
         schema_force: nonempty_str(&runtime.infer_trace_schema_force),
@@ -426,6 +428,8 @@ unsafe fn explain_state_trace(
             prompt_tokens: (*state).infer_trace_prompt_tokens,
             generated_tokens: (*state).infer_trace_generated_tokens,
             generate_ms: (*state).infer_trace_generate_ms,
+            finish_sql_ms: (*state).infer_trace_finish_sql_ms,
+            materialize_ms: (*state).infer_trace_materialize_ms,
             version: pg_cstr_str((*state).infer_trace_version),
             probability_status: pg_cstr_str((*state).infer_trace_probability_status),
             schema_force: pg_cstr_str((*state).infer_trace_schema_force),
@@ -455,6 +459,12 @@ unsafe fn explain_infer_now_trace(trace: &InferNowTraceExplain<'_>, es: *mut pg_
             es,
         );
         explain_counter("Infer Now Trace Generate Ms", trace.generate_ms, es);
+        if trace.finish_sql_ms > 0 {
+            explain_counter("Infer Now Trace Finish Sql Ms", trace.finish_sql_ms, es);
+        }
+        if trace.materialize_ms > 0 {
+            explain_counter("Infer Now Trace Materialize Ms", trace.materialize_ms, es);
+        }
         explain_optional_text("Infer Now Trace Version", trace.version, es);
         explain_optional_text("Infer Now Probability Status", trace.probability_status, es);
         explain_optional_text("Infer Now Schema Force", trace.schema_force, es);

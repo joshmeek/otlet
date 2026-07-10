@@ -18,7 +18,8 @@ SELECT
   p.delete_stale_materialization_retention,
   p.rejected_receipt_raw_output_retention,
   p.failed_job_retention
-FROM otlet.production_policy p;
+FROM otlet.production_policy p
+WHERE p.name = 'default';
 
 CREATE VIEW otlet.model_queue_status AS
 SELECT
@@ -55,6 +56,7 @@ LEFT JOIN LATERAL (
   WHERE e.event_type = 'queue_admission_suppressed'
     AND e.detail ->> 'model_name' = m.name
 ) suppressed ON true
+WHERE p.name = 'default'
 GROUP BY
   m.name,
   m.max_active_jobs,
@@ -114,6 +116,7 @@ LEFT JOIN LATERAL (
     LIMIT 16
   ) recent
 ) recent_batches ON true
+WHERE p.name = 'default'
 GROUP BY
   m.name,
   p.worker_claim_batch_size,
@@ -148,7 +151,8 @@ SELECT
 FROM otlet.model_selection_policies p
 JOIN otlet.tasks t ON t.name = p.task_name
 CROSS JOIN otlet.production_policy policy
-LEFT JOIN otlet.model_queue_status cheap_q ON cheap_q.model_name = p.cheap_model_name;
+LEFT JOIN otlet.model_queue_status cheap_q ON cheap_q.model_name = p.cheap_model_name
+WHERE policy.name = 'default';
 
 CREATE VIEW otlet.model_selection_status AS
 SELECT
@@ -682,7 +686,8 @@ CROSS JOIN trusted_output_rows trusted
 CROSS JOIN semantic_state s
 CROSS JOIN runtime
 CROSS JOIN trace
-CROSS JOIN materialization_failures;
+CROSS JOIN materialization_failures
+WHERE p.name = 'default';
 
 CREATE FUNCTION otlet.cleanup_policy_state(
   requested_dry_run boolean DEFAULT true
@@ -727,34 +732,31 @@ BEGIN
     delete_stale_retention,
     rejected_raw_output_retention,
     failed_job_retention_interval
-  FROM otlet.production_policy;
+  FROM otlet.production_policy
+  WHERE name = 'default';
 
   DROP TABLE IF EXISTS otlet_cleanup_job_candidates;
   CREATE TEMP TABLE otlet_cleanup_job_candidates ON COMMIT DROP AS
     SELECT j.id
     FROM otlet.jobs j
+    LEFT JOIN otlet.outputs o ON o.job_id = j.id
+    LEFT JOIN otlet.actions a ON a.job_id = j.id
+    LEFT JOIN LATERAL (
+      SELECT true AS has_ref
+      FROM otlet.inference_receipts r
+      WHERE r.job_id = j.id
+        AND (
+          EXISTS (SELECT 1 FROM otlet.outputs o2 WHERE o2.receipt_id = r.id LIMIT 1)
+          OR EXISTS (SELECT 1 FROM otlet.actions a2 WHERE a2.receipt_id = r.id LIMIT 1)
+          OR EXISTS (SELECT 1 FROM otlet.eval_labels l WHERE l.receipt_id = r.id LIMIT 1)
+        )
+      LIMIT 1
+    ) ref ON true
     WHERE j.status IN ('failed', 'canceled')
       AND COALESCE(j.finished_at, j.created_at) < now() - failed_job_retention_interval
-      AND NOT EXISTS (
-        SELECT 1
-        FROM otlet.outputs o
-        WHERE o.job_id = j.id
-      )
-      AND NOT EXISTS (
-        SELECT 1
-        FROM otlet.actions a
-        WHERE a.job_id = j.id
-      )
-      AND NOT EXISTS (
-        SELECT 1
-        FROM otlet.inference_receipts r
-        WHERE r.job_id = j.id
-          AND (
-            EXISTS (SELECT 1 FROM otlet.outputs o WHERE o.receipt_id = r.id)
-            OR EXISTS (SELECT 1 FROM otlet.actions a WHERE a.receipt_id = r.id)
-            OR EXISTS (SELECT 1 FROM otlet.eval_labels l WHERE l.receipt_id = r.id)
-          )
-      );
+      AND o.job_id IS NULL
+      AND a.job_id IS NULL
+      AND ref.has_ref IS NULL;
 
   WITH event_candidates AS (
     SELECT e.id
