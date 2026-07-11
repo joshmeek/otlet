@@ -1,69 +1,116 @@
 CREATE VIEW otlet.inference_visibility_status AS
-WITH per_receipt AS (
+WITH trace_steps AS MATERIALIZED (
   SELECT
-    s.job_id,
-    s.status,
+    r.id AS receipt_id,
+    step.value
+  FROM otlet.inference_receipts r
+  CROSS JOIN LATERAL jsonb_array_elements(
+    CASE
+      WHEN jsonb_typeof(r.trace_summary #> '{detailed_trace,steps}') = 'array'
+        THEN r.trace_summary #> '{detailed_trace,steps}'
+      ELSE '[]'::jsonb
+    END
+  ) step(value)
+),
+token_counts AS (
+  SELECT
+    receipt_id,
+    count(*)::bigint AS token_steps,
+    count(*) FILTER (
+      WHERE jsonb_typeof(value -> 'chosen_logprob') = 'number'
+        AND jsonb_typeof(value -> 'chosen_probability') = 'number'
+    )::bigint AS token_logprob_steps
+  FROM trace_steps
+  GROUP BY receipt_id
+),
+alternative_counts AS (
+  SELECT
+    steps.receipt_id,
+    count(*)::bigint AS top_k_alternatives,
+    count(*) FILTER (
+      WHERE jsonb_typeof(alt.value -> 'logprob') = 'number'
+        AND jsonb_typeof(alt.value -> 'probability') = 'number'
+    )::bigint AS top_k_logprob_alternatives
+  FROM trace_steps steps
+  CROSS JOIN LATERAL jsonb_array_elements(
+    CASE
+      WHEN jsonb_typeof(steps.value -> 'top_alternatives') = 'array'
+        THEN steps.value -> 'top_alternatives'
+      ELSE '[]'::jsonb
+    END
+  ) alt(value)
+  GROUP BY steps.receipt_id
+),
+output_jobs AS (
+  SELECT job_id
+  FROM otlet.outputs
+  GROUP BY job_id
+),
+action_jobs AS (
+  SELECT job_id
+  FROM otlet.actions
+  GROUP BY job_id
+),
+materialized_subjects AS (
+  SELECT task_name, subject_id
+  FROM otlet.semantic_materializations
+  WHERE source_hash IS NOT NULL
+  GROUP BY task_name, subject_id
+),
+per_receipt AS (
+  SELECT
+    r.job_id,
+    r.status,
     r.error,
-    s.detailed_trace_status,
-    s.detailed_trace_contract,
-    s.detailed_trace_captured_tokens,
-    s.detailed_trace_top_k,
-    s.row_identity,
-    s.mvcc,
-    s.worker_handoff,
-    s.stale_policy,
-    s.stop_reason,
-    s.executor_origin,
-    s.executor_node,
-    s.inference_cache_hit,
-    s.inference_cache_key_basis,
-    s.inference_cache_eviction_reason,
-    s.inference_cache_reason,
+    trace.summary -> 'detailed_trace' ->> 'status' AS detailed_trace_status,
+    trace.summary -> 'detailed_trace' ->> 'trace_contract' AS detailed_trace_contract,
+    CASE
+      WHEN jsonb_typeof(trace.summary #> '{detailed_trace,captured_tokens}') = 'number'
+        THEN (trace.summary #>> '{detailed_trace,captured_tokens}')::bigint
+      ELSE NULL
+    END AS detailed_trace_captured_tokens,
+    CASE
+      WHEN jsonb_typeof(trace.summary #> '{detailed_trace,top_k}') = 'number'
+        THEN (trace.summary #>> '{detailed_trace,top_k}')::bigint
+      ELSE NULL
+    END AS detailed_trace_top_k,
+    trace.summary ->> 'row_identity' AS row_identity,
+    trace.summary -> 'mvcc' AS mvcc,
+    COALESCE(trace.summary #>> '{policies,worker_handoff}', trace.summary ->> 'worker_handoff') AS worker_handoff,
+    COALESCE(trace.summary #>> '{policies,stale_policy}', trace.summary ->> 'stale_policy') AS stale_policy,
+    trace.summary ->> 'stop_reason' AS stop_reason,
+    trace.summary ->> 'executor_origin' AS executor_origin,
+    trace.summary ->> 'executor_node' AS executor_node,
+    COALESCE(trace.summary ->> 'inference_cache_hit', 'false')::boolean AS inference_cache_hit,
+    COALESCE(trace.summary #>> '{cache,key_basis}', trace.summary ->> 'inference_cache_key_basis') AS inference_cache_key_basis,
+    COALESCE(trace.summary #>> '{cache,eviction_reason}', trace.summary ->> 'inference_cache_eviction_reason') AS inference_cache_eviction_reason,
+    COALESCE(trace.summary #>> '{cache,invalidation_reason}', trace.summary ->> 'inference_cache_invalidation_reason') AS inference_cache_reason,
     pg_column_size(r.trace_summary)::bigint AS trace_summary_bytes,
-    COALESCE(jsonb_array_length(r.trace_summary #> '{detailed_trace,chosen_token_ids}'), 0)::bigint AS chosen_token_ids,
-    COALESCE((
-      SELECT count(*)
-      FROM otlet.inference_receipt_token_trace t
-      WHERE t.receipt_id = s.receipt_id
-    ), 0)::bigint AS token_steps,
-    COALESCE((
-      SELECT count(*)
-      FROM otlet.inference_receipt_token_trace t
-      WHERE t.receipt_id = s.receipt_id
-        AND t.chosen_logprob IS NOT NULL
-        AND t.chosen_probability IS NOT NULL
-    ), 0)::bigint AS token_logprob_steps,
-    COALESCE((
-      SELECT count(*)
-      FROM otlet.inference_receipt_token_alternative_trace a
-      WHERE a.receipt_id = s.receipt_id
-    ), 0)::bigint AS top_k_alternatives,
-    COALESCE((
-      SELECT count(*)
-      FROM otlet.inference_receipt_token_alternative_trace a
-      WHERE a.receipt_id = s.receipt_id
-        AND a.logprob IS NOT NULL
-        AND a.probability IS NOT NULL
-    ), 0)::bigint AS top_k_logprob_alternatives,
-    EXISTS (
-      SELECT 1
-      FROM otlet.outputs o
-      WHERE o.job_id = s.job_id
-    ) AS has_output,
-    EXISTS (
-      SELECT 1
-      FROM otlet.actions a
-      WHERE a.job_id = s.job_id
-    ) AS has_action,
-    EXISTS (
-      SELECT 1
-      FROM otlet.semantic_materializations sm
-      WHERE sm.task_name = s.task_name
-        AND sm.subject_id = s.subject_id
-        AND sm.source_hash IS NOT NULL
-    ) AS has_materialization_source_hash
-  FROM otlet.inference_receipt_trace_status s
-  JOIN otlet.inference_receipts r ON r.id = s.receipt_id
+    CASE
+      WHEN jsonb_typeof(trace.summary #> '{detailed_trace,chosen_token_ids}') = 'array'
+        THEN jsonb_array_length(trace.summary #> '{detailed_trace,chosen_token_ids}')::bigint
+      ELSE 0::bigint
+    END AS chosen_token_ids,
+    COALESCE(tok.token_steps, 0)::bigint AS token_steps,
+    COALESCE(tok.token_logprob_steps, 0)::bigint AS token_logprob_steps,
+    COALESCE(alt.top_k_alternatives, 0)::bigint AS top_k_alternatives,
+    COALESCE(alt.top_k_logprob_alternatives, 0)::bigint AS top_k_logprob_alternatives,
+    (output_jobs.job_id IS NOT NULL) AS has_output,
+    (action_jobs.job_id IS NOT NULL) AS has_action,
+    (materialized_subjects.task_name IS NOT NULL) AS has_materialization_source_hash
+  FROM otlet.inference_receipts r
+  CROSS JOIN LATERAL (
+    -- Expand the toasted object once and keep the projection from being pulled up
+    SELECT r.trace_summary || '{}'::jsonb AS summary
+    OFFSET 0
+  ) trace
+  LEFT JOIN token_counts tok ON tok.receipt_id = r.id
+  LEFT JOIN alternative_counts alt ON alt.receipt_id = r.id
+  LEFT JOIN output_jobs ON output_jobs.job_id = r.job_id
+  LEFT JOIN action_jobs ON action_jobs.job_id = r.job_id
+  LEFT JOIN materialized_subjects
+    ON materialized_subjects.task_name = r.task_name
+   AND materialized_subjects.subject_id = r.subject_id
 )
 SELECT
   count(*)::bigint AS receipt_count,

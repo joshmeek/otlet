@@ -3,18 +3,13 @@ fn generation_trace_summary(
     metrics: &ModelMetrics,
     raw_output_hash: &str,
 ) -> Value {
-    let tokens_per_second = if metrics.generate_ms > 0 {
-        Some((metrics.generated_tokens as f64 * 1000.0) / metrics.generate_ms as f64)
-    } else {
-        None
-    };
+    let tokens_per_second = (metrics.generate_ms > 0)
+        .then(|| (metrics.generated_tokens as f64 * 1000.0) / metrics.generate_ms as f64);
     let steady_decode_ms = metrics.generate_ms.saturating_sub(metrics.first_token_ms);
     let steady_tokens = metrics.generated_tokens.saturating_sub(1);
-    let steady_tokens_per_second = if steady_decode_ms > 0 && steady_tokens > 0 {
-        Some((steady_tokens as f64 * 1000.0) / steady_decode_ms as f64)
-    } else {
-        None
-    };
+    let steady_tokens_per_second =
+        (steady_decode_ms > 0 && steady_tokens > 0)
+            .then(|| (steady_tokens as f64 * 1000.0) / steady_decode_ms as f64);
     let summary = json!({
         "trace_version": "otlet_generation_trace_v1",
         "prompt_hash": context.prompt_hash,
@@ -24,7 +19,7 @@ fn generation_trace_summary(
         "output_schema_hash": context.output_schema_hash,
         "runtime_options_hash": context.runtime_options_hash,
         "runtime_options_status": context.runtime_options_status,
-        "model_fingerprint_hash": context.model_fingerprint_hash,
+        "model_fingerprint_hash": context.model_fingerprint_hash.as_ref(),
         "raw_output_hash": raw_output_hash,
         "prompt_tokens": metrics.prompt_tokens,
         "prompt_cached_tokens_before": metrics.prompt_cached_tokens_before,
@@ -114,7 +109,9 @@ struct ProbabilityTrace {
 impl ProbabilityTrace {
     fn new(options: &crate::runtime::RuntimeOptions) -> Self {
         let max_tokens = if options.generation_trace {
-            PROBABILITY_TRACE_MAX_TOKENS.min(options.generation_trace_max_tokens as i64)
+            PROBABILITY_TRACE_MAX_TOKENS.min(u64_to_i64_saturating(
+                options.generation_trace_max_tokens,
+            ))
         } else {
             0
         };
@@ -124,11 +121,14 @@ impl ProbabilityTrace {
         }
     }
 
-    fn wants_sample(&self) -> bool {
+    const fn wants_sample(&self) -> bool {
         self.max_tokens > 0 && self.sampled_tokens + self.skipped_tokens < self.max_tokens
     }
 
     fn observe(&mut self, sample: Option<&ProbabilitySample>) {
+        if self.max_tokens == 0 {
+            return;
+        }
         if self.max_tokens > 0 && self.sampled_tokens + self.skipped_tokens >= self.max_tokens {
             self.skipped_tokens += 1;
             return;
@@ -206,6 +206,8 @@ unsafe fn probability_sample(
     vocab: *const llama_cpp_sys_4::llama_vocab,
     token: llama_cpp_sys_4::llama_token,
     top_k: u64,
+    token_piece_buffer: &mut Vec<u8>,
+    token_piece_output: &mut Vec<u8>,
 ) -> Option<ProbabilitySample> {
     unsafe {
         if context.is_null() || vocab.is_null() || token < 0 {
@@ -219,7 +221,8 @@ unsafe fn probability_sample(
         if logits.is_null() {
             return None;
         }
-        let chosen_logit = *logits.add(token as usize) as f64;
+        let token_index = usize::try_from(token).ok()?;
+        let chosen_logit = f64::from(*logits.add(token_index));
         if !chosen_logit.is_finite() {
             return None;
         }
@@ -227,10 +230,15 @@ unsafe fn probability_sample(
         let mut top_logit = f64::NEG_INFINITY;
         let mut denominator = 0.0_f64;
         let mut rank = 1_i64;
-        let mut top: Vec<(i64, f64)> = Vec::new();
         let track_top = top_k > 0;
-        for index in 0..vocab_tokens as usize {
-            let logit = *logits.add(index) as f64;
+        let top_limit = usize::try_from(top_k).unwrap_or(usize::MAX);
+        let mut top: Vec<(i64, f64)> = if track_top {
+            Vec::with_capacity(top_limit.min(16))
+        } else {
+            Vec::new()
+        };
+        for index in 0..usize::try_from(vocab_tokens).ok()? {
+            let logit = f64::from(*logits.add(index));
             if !logit.is_finite() {
                 continue;
             }
@@ -244,7 +252,7 @@ unsafe fn probability_sample(
                 denominator += (logit - top_logit).exp();
             }
             if track_top {
-                push_top_logit(&mut top, top_k as usize, index as i64, logit);
+                push_top_logit(&mut top, top_limit, usize_to_i64_saturating(index), logit);
             }
         }
         if !top_logit.is_finite() || denominator <= 0.0 || !denominator.is_finite() {
@@ -257,12 +265,16 @@ unsafe fn probability_sample(
                 .enumerate()
                 .map(|(index, (token_id, logit))| {
                     let probability = ((logit - top_logit).exp() / denominator).max(0.0);
+                    token_piece_output.clear();
+                    let _ = linked_token_to_piece_into(
+                        vocab,
+                        llama_cpp_sys_4::llama_token::try_from(token_id).unwrap_or_default(),
+                        token_piece_buffer,
+                        token_piece_output,
+                    );
                     TokenAlternative {
                         token_id,
-                        token_text: linked_token_to_piece(
-                            vocab,
-                            token_id as llama_cpp_sys_4::llama_token,
-                        ),
+                        token_text: String::from_utf8_lossy(token_piece_output).into_owned(),
                         logit: rounded_probability(logit),
                         probability: rounded_probability(probability),
                         logprob: rounded_probability(if probability > 0.0 {
@@ -270,7 +282,7 @@ unsafe fn probability_sample(
                         } else {
                             f64::NEG_INFINITY
                         }),
-                        rank: index as i64 + 1,
+                        rank: usize_to_i64_saturating(index).saturating_add(1),
                     }
                 })
                 .collect()
@@ -298,6 +310,9 @@ fn push_top_logit(top: &mut Vec<(i64, f64)>, limit: usize, token_id: i64, logit:
     if limit == 0 {
         return;
     }
+    if top.len() == limit && top.last().is_some_and(|(_, existing)| logit <= *existing) {
+        return;
+    }
     let insert_at = top.iter().position(|(_, existing)| logit > *existing);
     match insert_at {
         Some(index) => top.insert(index, (token_id, logit)),
@@ -305,6 +320,29 @@ fn push_top_logit(top: &mut Vec<(i64, f64)>, limit: usize, token_id: i64, logit:
         None => {}
     }
     top.truncate(limit);
+}
+
+#[cfg(test)]
+mod trace_tests {
+    use super::{ProbabilityTrace, push_top_logit};
+
+    #[test]
+    fn top_logits_reject_noncompetitive_values_without_changing_order() {
+        let mut top = Vec::new();
+        for (token_id, logit) in [1.0, 3.0, 2.0, 0.5, 4.0].into_iter().enumerate() {
+            push_top_logit(&mut top, 3, token_id as i64, logit);
+        }
+
+        assert_eq!(top, vec![(4, 4.0), (1, 3.0), (2, 2.0)]);
+    }
+
+    #[test]
+    fn disabled_probability_trace_does_not_count_skipped_tokens() {
+        let mut trace = ProbabilityTrace::default();
+        trace.observe(None);
+        assert_eq!(trace.sampled_tokens, 0);
+        assert_eq!(trace.skipped_tokens, 0);
+    }
 }
 
 struct DetailedGenerationTrace {
@@ -319,25 +357,30 @@ struct DetailedGenerationTrace {
 
 impl DetailedGenerationTrace {
     fn new(options: &crate::runtime::RuntimeOptions) -> Self {
+        let capacity = if options.generation_trace {
+            usize::try_from(options.generation_trace_max_tokens).unwrap_or(0)
+        } else {
+            0
+        };
         Self {
             enabled: options.generation_trace,
             max_tokens: options.generation_trace_max_tokens,
             top_k: options.generation_trace_top_k,
-            steps: Vec::new(),
+            steps: Vec::with_capacity(capacity),
             skipped_tokens: 0,
-            chosen_token_ids: Vec::new(),
-            chosen_text: String::new(),
+            chosen_token_ids: Vec::with_capacity(capacity),
+            chosen_text: String::with_capacity(capacity.saturating_mul(4)),
         }
     }
 
-    fn wants_sample(&self) -> bool {
+    const fn wants_sample(&self) -> bool {
         self.enabled && (self.steps.len() as u64) < self.max_tokens
     }
 
     fn observe(
         &mut self,
         token: llama_cpp_sys_4::llama_token,
-        token_text: &str,
+        token_piece: &[u8],
         sample: Option<ProbabilitySample>,
     ) {
         if !self.enabled {
@@ -347,13 +390,14 @@ impl DetailedGenerationTrace {
             self.skipped_tokens += 1;
             return;
         }
-        self.chosen_token_ids.push(token as i64);
-        self.chosen_text.push_str(token_text);
-        let step = self.steps.len() as i64 + 1;
+        let token_text = String::from_utf8_lossy(token_piece);
+        self.chosen_token_ids.push(i64::from(token));
+        self.chosen_text.push_str(&token_text);
+        let step = usize_to_i64_saturating(self.steps.len()).saturating_add(1);
         let trace = match sample {
             Some(sample) => json!({
                 "step": step,
-                "token_id": token as i64,
+                "token_id": i64::from(token),
                 "token_text": token_text,
                 "chosen_logit": rounded_probability(sample.chosen_logit),
                 "chosen_probability": rounded_probability(sample.chosen_probability),
@@ -370,7 +414,7 @@ impl DetailedGenerationTrace {
             }),
             None => json!({
                 "step": step,
-                "token_id": token as i64,
+                "token_id": i64::from(token),
                 "token_text": token_text,
                 "probability_status": "unavailable"
             }),

@@ -34,7 +34,7 @@ Representative output from the demo run:
 (8 rows)
 ```
 
-The cheap model is rejected by the stricter output/action envelope in this run. Rejected attempts stay visible as receipts, every row escalates to `qwen35_4b`, and Otlet materializes the accepted output for each job
+The stricter output/action envelope rejects the cheap model in this run. Rejected attempts stay visible as receipts, every row escalates to `qwen35_4b`, and Otlet materializes the accepted output for each job
 
 ## Step 2 - Read The Receipt
 
@@ -54,9 +54,20 @@ Representative output:
 receipt_attempt_contract=8|4|4|4
 ```
 
-A receipt records evidence for one model run. A selected job can have multiple receipts for the same candidate pair
+A receipt records evidence for one model run. A candidate pair can have multiple receipts when model selection escalates
 
-It links the model, artifact, runtime options, prompt hash, input hash, output schema hash, raw output hash, validation status, timing, token counts, memory summary, and trace summary
+Each receipt links the model, artifact, runtime options, prompt hash, input hash, output schema hash, raw output hash, validation status, timing, token counts, memory summary, and trace summary
+
+Warm-job timing splits `tokenize_ms`, `prompt_decode_ms`, `generate_ms`, `finish_sql_ms`, and `materialize_ms` when present:
+
+```sql
+SELECT 'timing_split_contract=' ||
+       count(*) FILTER (WHERE finish_sql_ms IS NOT NULL)::text || '|' ||
+       count(*) FILTER (WHERE materialize_ms IS NOT NULL)::text
+FROM otlet.inference_trace_summary
+WHERE task_name = 'entity_resolution_demo'
+  AND status = 'complete';
+```
 
 Otlet stores receipts when jobs fail because failures produce evidence too
 
@@ -79,8 +90,6 @@ Representative output:
 runtime_residency_contract=ready|ready|resident_worker_loaded_model_context|true|true
 ```
 
-Otlet exposes model residency here
-
 The worker keeps the local model/context warm across jobs. SQL can see the slot state, memory sample, context window, cache entries, cache bounds, and the last cache reason
 
 SQL shows whether the model loaded, is busy, failed, cached, or went over budget
@@ -96,6 +105,7 @@ SELECT task_name,
 FROM otlet.task_inference_cache_status
 WHERE task_name = 'entity_resolution_demo';
 ```
+
 ## Step 4 - Inspect Token Traces
 
 The task enabled bounded generation tracing:
@@ -108,7 +118,7 @@ The task enabled bounded generation tracing:
 }
 ```
 
-Otlet stores a bounded trace summary on the receipt instead of an unbounded prompt or logits blob
+Otlet stores a bounded trace summary on each receipt
 
 Check the bounded token trace:
 
@@ -126,7 +136,7 @@ Representative output:
 token_trace_contract=128|384|true|true
 ```
 
-Trace data records:
+Otlet records:
 
 - Prompt tokens used by the row
 - Model tokens generated
@@ -135,7 +145,7 @@ Trace data records:
 - Receipt, row identity, input hash, and schema hash attached to the trace
 - Resident model cache and inference-output cache use
 
-Otlet bounds tracing so prompt, token, and logits storage does not turn observability into a data retention problem
+Token and top-k limits bound trace retention
 
 ## Step 5 - Check The Whole Chain
 
@@ -156,7 +166,7 @@ Representative output:
 (1 row)
 ```
 
-That count covers the direct task shape:
+The counts cover the direct task shape:
 
 ```text
 four source candidate pairs
@@ -167,6 +177,7 @@ eight model-attempt receipts
 bounded trace state
 SQL-visible runtime state
 ```
+
 ## Step 6 - Bad Output
 
 If the model returns invalid JSON or a value outside the schema, Otlet fails closed
@@ -185,7 +196,7 @@ The task schema and action rules decide whether model output can become database
 
 ## Step 7 - Create A Retry Task
 
-The next examples reuse this task to show terminal failure evidence and safe requeueing
+Reuse this task for terminal failure evidence and safe requeueing
 
 ```sql
 DROP TABLE IF EXISTS public.learning_retry_source;
@@ -220,6 +231,7 @@ Representative output:
  learning_retry_task | t               | qwen3_1_7b
 (1 row)
 ```
+
 ## Step 8 - Cancel Queued Work
 
 Cancellation changes job lifecycle state
@@ -278,11 +290,11 @@ Representative output:
 (1 row)
 ```
 
-Canceled work still gets a receipt. A canceled model run still leaves evidence
+Otlet records a receipt for canceled work and preserves model-run evidence
 
 ## Step 9 - Understand Retry And Failed-Run Evidence
 
-Otlet leaves failed jobs visible. A failed job is terminal, so you can queue the same task and subject again
+Otlet leaves failed jobs visible. A failed job is terminal, so you can requeue that task and subject
 
 The partial unique index blocks duplicate active work and leaves terminal history reusable:
 
@@ -292,7 +304,7 @@ ON otlet.jobs (task_name, subject_id)
 WHERE status IN ('queued', 'running', 'cancel_requested');
 ```
 
-This run creates one synthetic failed job, then lets `run_task` enqueue a second job for the same subject
+The example creates one synthetic failed job, then lets `run_task` enqueue a second job for that subject
 
 The worker claims the second job and rejects the output against the strict JSON contract:
 
@@ -324,7 +336,8 @@ Representative output:
 (2 rows)
 ```
 
-Failure keeps the raw output, stores the error, and records the attempt in a receipt
+Failure records the raw output, error, and attempt receipt
+
 ## Step 10 - Check Worker Events And Receipt Statuses
 
 Events show worker behavior. Receipts show model behavior

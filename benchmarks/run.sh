@@ -554,6 +554,12 @@ SELECT count(*) FROM otlet.action_status WHERE task_name LIKE :'run_id' || '\_%'
 SQL
 )"
   printf 'psql_smoke_model_selection_views=%s\n' "$(psql_value -c "SELECT (SELECT count(*) FROM otlet.model_selection_attempts), (SELECT count(*) FROM otlet.model_selection_status);")"
+  printf 'psql_smoke_audit_exports=%s\n' "$(psql_value <<'SQL'
+SELECT (SELECT count(*) FROM otlet.redaction_policy_status) || '|' ||
+       (SELECT count(*) FROM otlet.audit_receipt_export) || '|' ||
+       (SELECT count(*) FROM otlet.semantic_dependency_audit);
+SQL
+)"
 
   perform_cleanup
 

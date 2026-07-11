@@ -101,6 +101,11 @@ pgrx::extension_sql_file!(
     name = "watches",
     requires = ["production_policy"]
 );
+pgrx::extension_sql_file!(
+    "../sql/22_audit_export.sql",
+    name = "audit_export",
+    requires = ["watches"]
+);
 
 #[allow(non_snake_case)]
 #[pgrx::pg_guard]

@@ -119,6 +119,7 @@ DECLARE
   bucket_count integer;
   original_bytes integer;
   max_bytes integer := 0;
+  canonical_text text;
 BEGIN
   IF jsonb_typeof(shaped) IS DISTINCT FROM 'object' THEN
     RETURN shaped;
@@ -171,14 +172,15 @@ BEGIN
       1048576
     )::integer;
   END IF;
-  original_bytes := length(otlet.semantic_canonical_jsonb(shaped)::text);
+  canonical_text := otlet.semantic_canonical_jsonb(shaped)::text;
+  original_bytes := length(canonical_text);
   IF max_bytes > 0 AND original_bytes > max_bytes THEN
     shaped := jsonb_build_object(
       '_otlet_input_truncated', true,
       'truncation_policy', 'max_shaped_input_bytes_fail_toward_abstention',
       'original_shaped_input_bytes', original_bytes,
       'max_shaped_input_bytes', max_bytes,
-      'truncated_input_preview', left(otlet.semantic_canonical_jsonb(shaped)::text, LEAST(max_bytes, 1024))
+      'truncated_input_preview', left(canonical_text, LEAST(max_bytes, 1024))
     );
   END IF;
 
@@ -401,6 +403,21 @@ CREATE UNIQUE INDEX jobs_active_subject_idx
 ON otlet.jobs (task_name, subject_id)
 WHERE status IN ('queued', 'running', 'cancel_requested');
 
+CREATE INDEX jobs_task_status_idx
+ON otlet.jobs (task_name, status);
+
+CREATE INDEX jobs_expired_lease_idx
+ON otlet.jobs (leased_until, id)
+WHERE status IN ('running', 'cancel_requested');
+
+CREATE INDEX jobs_finished_terminal_idx
+ON otlet.jobs (finished_at, created_at, id)
+WHERE status IN ('failed', 'canceled');
+
+CREATE INDEX jobs_complete_subject_finished_idx
+ON otlet.jobs (task_name, subject_id, finished_at DESC NULLS LAST, id DESC)
+WHERE status = 'complete';
+
 CREATE TABLE otlet.inference_receipts (
   id bigserial PRIMARY KEY,
   job_id bigint NOT NULL REFERENCES otlet.jobs(id),
@@ -441,6 +458,30 @@ CREATE TABLE otlet.inference_receipts (
 CREATE INDEX inference_receipts_task_model_role_finished_idx
 ON otlet.inference_receipts (task_name, model_name, selection_role, finished_at DESC, id DESC);
 
+CREATE INDEX inference_receipts_model_success_finished_idx
+ON otlet.inference_receipts (model_name, finished_at DESC, id DESC)
+INCLUDE (task_name, generate_ms)
+WHERE status = 'complete'
+  AND schema_validation_status = 'passed'
+  AND COALESCE(generate_ms, 0) > 0;
+
+CREATE INDEX inference_receipts_rejected_retention_idx
+ON otlet.inference_receipts (finished_at, id)
+WHERE selection_status = 'rejected' AND raw_output IS NOT NULL;
+
+CREATE INDEX inference_receipts_trace_steps_finished_idx
+ON otlet.inference_receipts (finished_at, id)
+WHERE jsonb_typeof(trace_summary #> '{detailed_trace,steps}') = 'array'
+  AND jsonb_array_length(trace_summary #> '{detailed_trace,steps}') > 0;
+
+CREATE INDEX inference_receipts_direct_rejected_review_idx
+ON otlet.inference_receipts (finished_at, id)
+WHERE selection_role = 'direct'
+  AND selection_status = 'rejected'
+  AND selection_reason = 'direct_rejected_by_decision_contract'
+  AND schema_validation_status = 'passed'
+  AND NULLIF(raw_output, '') IS NOT NULL;
+
 CREATE TABLE otlet.worker_events (
   id bigserial PRIMARY KEY,
   event_type text NOT NULL,
@@ -450,6 +491,21 @@ CREATE TABLE otlet.worker_events (
   detail jsonb NOT NULL DEFAULT '{}'::jsonb,
   created_at timestamptz NOT NULL DEFAULT now()
 );
+
+CREATE INDEX worker_events_type_created_idx
+ON otlet.worker_events (event_type, created_at DESC, id DESC);
+
+CREATE INDEX worker_events_type_model_created_idx
+ON otlet.worker_events (event_type, (detail ->> 'model_name'), created_at DESC)
+WHERE detail ? 'model_name';
+
+CREATE INDEX worker_events_queue_suppressed_task_created_idx
+ON otlet.worker_events ((detail ->> 'task_name'), created_at DESC, id DESC)
+WHERE event_type = 'queue_admission_suppressed' AND detail ? 'task_name';
+
+CREATE INDEX worker_events_job_id_idx
+ON otlet.worker_events (job_id)
+WHERE job_id IS NOT NULL;
 
 CREATE TABLE otlet.outputs (
   id bigserial PRIMARY KEY,
@@ -510,6 +566,18 @@ CREATE TABLE otlet.actions (
   CHECK (apply_status IN ('not_applicable', 'applied', 'failed'))
 );
 
+CREATE INDEX actions_job_id_idx
+ON otlet.actions (job_id);
+
+CREATE INDEX actions_receipt_id_idx
+ON otlet.actions (receipt_id)
+WHERE receipt_id IS NOT NULL;
+
+CREATE INDEX actions_review_queue_idx
+ON otlet.actions (created_at, id)
+WHERE (approval_status = 'required' AND status = 'proposed')
+   OR (action_type = 'review_flag' AND status <> 'rejected');
+
 CREATE TABLE otlet.records (
   id bigserial PRIMARY KEY,
   action_id bigint REFERENCES otlet.actions(id),
@@ -518,6 +586,10 @@ CREATE TABLE otlet.records (
   body jsonb NOT NULL,
   created_at timestamptz NOT NULL DEFAULT now()
 );
+
+CREATE INDEX records_action_id_idx
+ON otlet.records (action_id)
+WHERE action_id IS NOT NULL;
 
 CREATE TABLE otlet.eval_labels (
   id bigserial PRIMARY KEY,
@@ -542,6 +614,21 @@ ON otlet.eval_labels (source_table, subject_id, source_hash);
 
 CREATE INDEX eval_labels_receipt_idx
 ON otlet.eval_labels (receipt_id, action_id);
+
+CREATE INDEX eval_labels_manual_action_idx
+ON otlet.eval_labels (action_id)
+WHERE label_source = 'manual_correction' AND action_id IS NOT NULL;
+
+CREATE INDEX eval_labels_manual_output_idx
+ON otlet.eval_labels (output_id)
+WHERE label_source = 'manual_correction' AND output_id IS NOT NULL;
+
+CREATE INDEX eval_labels_manual_receipt_idx
+ON otlet.eval_labels (receipt_id)
+WHERE label_source = 'manual_correction' AND receipt_id IS NOT NULL;
+
+CREATE INDEX eval_labels_created_at_idx
+ON otlet.eval_labels (created_at, id);
 
 CREATE TABLE otlet.semantic_materializations (
   id bigserial PRIMARY KEY,
@@ -576,6 +663,13 @@ CREATE TABLE otlet.semantic_materializations (
 
 CREATE INDEX semantic_materializations_lookup_idx
 ON otlet.semantic_materializations (task_name, record_type, stale, subject_id);
+
+CREATE INDEX semantic_materializations_subject_latest_idx
+ON otlet.semantic_materializations (task_name, record_type, subject_id, updated_at DESC, id DESC);
+
+CREATE INDEX semantic_materializations_source_delete_idx
+ON otlet.semantic_materializations (updated_at, id)
+WHERE stale AND stale_reason = 'source_delete';
 
 CREATE INDEX semantic_materializations_source_idx
 ON otlet.semantic_materializations (source_table, subject_id, task_name, record_type, stale);

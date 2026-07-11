@@ -1,10 +1,10 @@
 # Otlet
 
-Otlet is a Postgres extension that runs local LLM inference **inside Postgres**, next to the rows it reads and acts on
+Otlet is a Postgres extension for row judgment. It runs local LLM inference **inside Postgres**, next to the rows it reads and acts on
 
-Otlet is built for row judgment inside Postgres: ask a local model about rows, validate the JSON, keep receipts, and store trusted derived state without writing back to source tables. Entity resolution is the first full path: Otlet can judge hard candidate row pairs, escalate from a small local model to a stronger one, propose typed actions, and materialize the result for later SQL
+Otlet answers questions about rows, validates JSON, keeps receipts, and stores trusted derived state while source tables stay unchanged. Entity resolution is the first full path: Otlet judges hard candidate row pairs, escalates from a small local model to a stronger one, proposes typed actions, and materializes results for later SQL
 
-Otlet uses a `pgrx` extension and a Postgres background worker loaded through `shared_preload_libraries` to keep local model work inside the database process. You can ask for model work from SQL, queue it from rows, refresh semantic state after source changes, and inspect the result without leaving Postgres
+Otlet uses a `pgrx` extension and a Postgres background worker loaded through `shared_preload_libraries` to run local model work inside the database process. You can ask for model work from SQL, queue it from rows, refresh semantic state after source changes, and inspect the result without leaving Postgres
 
 ## Quick Example
 
@@ -12,6 +12,7 @@ Use `otlet.ask` for one-off questions over row-shaped JSON. This example summari
 
 ```sh
 ./scripts/otlet-setup.sh
+./scripts/otlet-demo.sh
 ```
 
 ```sql
@@ -58,7 +59,7 @@ Otlet ran the local model inside Postgres, validated the JSON, and stored the re
 
 ## Longer Example
 
-Entity resolution uses the same SQL and receipt path, but adds candidate pairs, model selection, typed actions, and semantic materialization. The demo registers `qwen3_1_7b` as the cheap model and `qwen35_4b` as the stronger model. On this run, the cheap model is rejected by the strict output envelope on hard rows, so Otlet records rejected receipts and escalates to the stronger model
+Entity resolution extends the SQL and receipt path with candidate pairs, model selection, typed actions, and semantic materialization. The demo registers `qwen3_1_7b` as the cheap model and `qwen35_4b` as the stronger model. On this run, the strict output envelope rejects the cheap model on hard rows. Otlet records rejected receipts and escalates to the stronger model
 
 The task reads candidate vendor pairs, joins source rows, and gives the model compact evidence buckets:
 
@@ -128,12 +129,12 @@ Source rows stayed in `public.otlet_demo_vendor_entity`. Otlet stored jobs, acce
 
 Start with [the worked example](docs/otlet-worked-example.md)
 
-You run the extension with SQL commands and real output. The worked example keeps the setup path and full demo command short; the long chapters live in focused docs:
+The worked example pairs SQL commands with captured output and keeps the setup path short. Focused docs cover the longer paths:
 
 - [Entity resolution walkthrough](docs/entity-resolution-walkthrough.md)
 - [Runtime and traces](docs/runtime-and-traces.md)
 - [Semantic watches](docs/semantic-watches.md)
-- [Production contract](docs/production-contract.md)
+- [Production contract](docs/production-contract.md) for audit export views (`otlet.audit_*`, `otlet.redaction_policy_status`) and invariant naming
 
 Use [benchmarks/README.md](benchmarks/README.md) to compare local GGUF models on Otlet’s row-pair, receipt, action, stale-state, and resource-fit contracts
 

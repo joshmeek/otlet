@@ -37,10 +37,16 @@ BEGIN
     $query$
       SELECT subject_id, input
       FROM (
-        SELECT subject_id::text AS subject_id, input::jsonb AS input
-        FROM (%1$s) otlet_join_candidate
-        ORDER BY subject_id
-        LIMIT %2$s
+        SELECT
+          shaped.subject_id,
+          shaped.input,
+          otlet.semantic_content_hash(shaped.input, %6$L::jsonb) AS content_hash
+        FROM (
+          SELECT subject_id::text AS subject_id, input::jsonb AS input
+          FROM (%1$s) otlet_join_candidate
+          ORDER BY subject_id
+          LIMIT %2$s
+        ) shaped
       ) otlet_join_input
       WHERE NOT EXISTS (
         SELECT 1
@@ -48,7 +54,7 @@ BEGIN
         WHERE sm.task_name = %3$L
           AND sm.record_type = %4$L
           AND sm.subject_id = otlet_join_input.subject_id
-          AND sm.content_hash = otlet.semantic_content_hash(otlet_join_input.input, %6$L::jsonb)
+          AND sm.content_hash = otlet_join_input.content_hash
           AND sm.contract_hash = %5$L
       )
     $query$,
@@ -110,8 +116,8 @@ AS $$
 DECLARE
   index_row otlet.semantic_join_indexes%ROWTYPE;
 BEGIN
-  SELECT *
-  INTO index_row
+  SELECT sji.name, sji.task_name, sji.record_type
+  INTO index_row.name, index_row.task_name, index_row.record_type
   FROM otlet.semantic_join_indexes sji
   WHERE sji.name = drop_watch_pair_index.index_name;
 
@@ -147,8 +153,8 @@ DECLARE
   index_row otlet.semantic_join_indexes%ROWTYPE;
   queued bigint;
 BEGIN
-  SELECT *
-  INTO index_row
+  SELECT sji.name, sji.task_name
+  INTO index_row.name, index_row.task_name
   FROM otlet.semantic_join_indexes sji
   WHERE sji.name = refresh_semantic_join_index.index_name;
 
@@ -177,8 +183,8 @@ DECLARE
   input_query text;
   refreshed bigint;
 BEGIN
-  SELECT *
-  INTO index_row
+  SELECT sji.name, sji.task_name, sji.record_type, sji.candidate_query, sji.max_candidate_rows
+  INTO index_row.name, index_row.task_name, index_row.record_type, index_row.candidate_query, index_row.max_candidate_rows
   FROM otlet.semantic_join_indexes sji
   WHERE sji.name = materialize_semantic_join_index.index_name;
 
@@ -227,8 +233,8 @@ DECLARE
   input_query text;
   refreshed bigint;
 BEGIN
-  SELECT *
-  INTO index_row
+  SELECT sji.name, sji.task_name, sji.record_type, sji.candidate_query, sji.max_candidate_rows
+  INTO index_row.name, index_row.task_name, index_row.record_type, index_row.candidate_query, index_row.max_candidate_rows
   FROM otlet.semantic_join_indexes sji
   WHERE sji.name = materialize_semantic_join_index_subject.index_name;
 
@@ -282,6 +288,7 @@ DECLARE
   saved_action_id bigint;
   refreshed bigint := 0;
   total_refreshed bigint := 0;
+  materialize_started timestamptz := clock_timestamp();
 BEGIN
   SELECT *
   INTO job_row
@@ -293,12 +300,11 @@ BEGIN
     RETURN 0;
   END IF;
 
+  -- outputs_one_per_job_idx guarantees at most one row per job.
   SELECT *
   INTO output_row
   FROM otlet.outputs o
-  WHERE o.job_id = job_row.id
-  ORDER BY o.id DESC
-  LIMIT 1;
+  WHERE o.job_id = job_row.id;
 
   IF NOT FOUND THEN
     RETURN 0;
@@ -376,6 +382,18 @@ BEGIN
 
     total_refreshed := total_refreshed + COALESCE(refreshed, 0);
   END LOOP;
+
+  IF output_row.receipt_id IS NOT NULL THEN
+    UPDATE otlet.inference_receipts r
+    SET trace_summary = r.trace_summary || jsonb_build_object(
+      'materialize_ms',
+      GREATEST(
+        0,
+        CEIL(EXTRACT(epoch FROM (clock_timestamp() - materialize_started)) * 1000)
+      )::bigint
+    )
+    WHERE r.id = output_row.receipt_id;
+  END IF;
 
   RETURN total_refreshed;
 END;

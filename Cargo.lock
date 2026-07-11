@@ -879,6 +879,7 @@ dependencies = [
  "jsonschema",
  "llama-cpp-sys-4",
  "pgrx",
+ "serde",
  "serde_json",
 ]
 

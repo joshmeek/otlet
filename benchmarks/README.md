@@ -1,15 +1,15 @@
 # Otlet Benchmarks
 
-The benchmark harness measures how well a local GGUF model behaves as an Otlet worker over compact Postgres row evidence. It is not a general knowledge benchmark
+The benchmark harness measures local GGUF models as Otlet workers over compact Postgres row evidence. It does not measure general knowledge
 
-Start with the normal Otlet proof path:
+Run the Otlet proof path first:
 
 ```sh
 ./scripts/otlet-setup.sh
 ./scripts/otlet-demo.sh
 ```
 
-Run the fast probe before spending time on a full benchmark. It uses the real Otlet worker on five row-shaped JSON cases and reports viability, pass count, schema passes, token rate, steady decode rate, p95 generation time, p95 TTFT, p95 prompt decode time, and effective llama.cpp decode/batch thread counts:
+Run the fast probe before spending time on a full benchmark. It uses the resident Otlet worker on five row-shaped JSON cases and reports viability, pass count, schema passes, token rate, steady decode rate, p95 generation time, p95 TTFT, p95 prompt decode time, and effective llama.cpp decode/batch thread counts:
 
 ```sh
 OTLET_PROBE_LIMIT_MODELS=ministral3_3b,qwen35_4b,qwen3_1_7b ./benchmarks/quick_probe.sh
@@ -23,7 +23,7 @@ Find current Hugging Face GGUF candidates before adding a model row:
 python3 benchmarks/find_candidates.py
 ```
 
-Sweep CPU thread counts through the same probe:
+Sweep CPU thread counts through that probe:
 
 ```sh
 for threads in 1 2 4 6 8 12; do
@@ -34,7 +34,7 @@ for threads in 1 2 4 6 8 12; do
 done
 ```
 
-Use thread sweeps as host evidence, not a global truth. The default setup starts one resident worker, so concurrent infer-now callers keep the bounded shared-memory queue fed but do not create parallel llama.cpp generation
+On the measured host, concurrent infer-now callers fill the bounded shared-memory queue. The default resident worker serializes llama.cpp generation
 
 The probe accepts `OTLET_PROBE_LLAMA_THREADS=<n>`, `OTLET_PROBE_LLAMA_BATCH_THREADS=<n>`, and `OTLET_PROBE_RUNTIME_OPTIONS='{"max_tokens":64}'` for one run. The setup path accepts deployment-level llama.cpp knobs before `./scripts/otlet-setup.sh`:
 
@@ -42,7 +42,7 @@ The probe accepts `OTLET_PROBE_LLAMA_THREADS=<n>`, `OTLET_PROBE_LLAMA_BATCH_THRE
 | --- | --- | --- |
 | `OTLET_WORKER_COUNT` | resident Postgres workers | `1`, capped at `4`, research only |
 | `OTLET_LLAMA_THREADS` | decode threads | visible cores capped at `6` |
-| `OTLET_LLAMA_BATCH_THREADS` | prompt-decode thread pool | same as decode threads |
+| `OTLET_LLAMA_BATCH_THREADS` | prompt-decode thread pool | decode-thread value |
 | `OTLET_LLAMA_BATCH_TOKENS` | logical prompt batch tokens | `512` |
 | `OTLET_LLAMA_UBATCH_TOKENS` | physical prompt ubatch tokens | `512` |
 | `OTLET_LLAMA_MMAP` | model mmap toggle | llama.cpp default |
@@ -54,9 +54,9 @@ The probe accepts `OTLET_PROBE_LLAMA_THREADS=<n>`, `OTLET_PROBE_LLAMA_BATCH_THRE
 | `OTLET_LLAMA_KV_TYPE_V` | set V cache type only | llama.cpp default |
 | `OMP_PROC_BIND`, `OMP_PLACES`, `GOMP_CPU_AFFINITY` | OpenMP CPU placement | unset |
 
-Treat those as host-specific controls. Re-run `./scripts/otlet-setup.sh` after changing startup knobs so the worker process starts with the new environment
+Host hardware determines these controls. Re-run `./scripts/otlet-setup.sh` after changing startup knobs so the worker process starts with the new environment
 
-Keep `OTLET_WORKER_COUNT=1` unless a local probe shows a wall-clock win and acceptable RSS. A qwen35_4b infer-now probe on the current Docker CPU measured four warm concurrent callers like this:
+Use `OTLET_WORKER_COUNT=1` unless a local probe shows a wall-clock win and acceptable RSS. A qwen35_4b infer-now probe on the current Docker CPU measured four warm concurrent callers like this:
 
 | setup | wall time | shape | result |
 | --- | ---: | --- | --- |
@@ -64,7 +64,7 @@ Keep `OTLET_WORKER_COUNT=1` unless a local probe shows a wall-clock win and acce
 | `2` workers, `6` threads each | `13.02s` | two overlapping jobs | slower from CPU oversubscription |
 | `2` workers, `3` threads each | `11.51s` | two overlapping jobs | near baseline, with about double resident model memory |
 
-The two-worker probes proved real overlapping llama.cpp generation from separate Postgres workers, but they lost wall time or memory on qwen35_4b. Treat worker count as a research control until Otlet has per-worker RSS totals, model-specific admission caps, queue fairness proof, and database responsiveness checks
+The two-worker probes produced overlapping llama.cpp generation from separate Postgres workers and increased wall time or memory on qwen35_4b. Treat worker count as a research control until Otlet has per-worker RSS totals, model-specific admission caps, queue fairness proof, and database responsiveness checks
 
 Run the default-included benchmark model:
 
@@ -84,7 +84,7 @@ Run the current scored comparison set after a prompt, schema, scoring, or runtim
 OTLET_BENCH_LIMIT_MODELS=ministral3_3b,qwen35_4b,gemma4_e2b,glm_edge_4b,gemma4_e4b,phi4_mini OTLET_BENCH_RUNS=1 OTLET_BENCH_PUBLISH_REPORT=1 ./benchmarks/run.sh
 ```
 
-Keep routine model search under 4B active parameters and about 4 GB of local artifact size. Qwen3.5 4B stays the stable default until a smaller model passes the fast probe and the full benchmark. MiniStral, Gemma, GLM Edge, Phi mini, and SmolLM stay in comparison lanes
+Limit routine model search to 4B active parameters and about 4 GB of local artifact size. Qwen3.5 4B stays the stable default until a smaller model passes the fast probe and the full benchmark. MiniStral, Gemma, GLM Edge, Phi mini, and SmolLM stay in comparison lanes
 
 Recent quick-probe findings:
 
@@ -95,7 +95,7 @@ Recent quick-probe findings:
 | `ministral3_3b` | no | `10.48` | failed markdown-fence, adversarial row-text, and numeric-threshold cases |
 | `phi4_mini` | no | `10.69` | schema-valid, failed adversarial row-text and numeric-threshold cases |
 | `smollm3_3b` | no | `8.71` | schema-valid, failed adversarial row-text and numeric-threshold cases |
-| `glm_edge_4b` | no | `6.68` | produced fenced JSON and failed the same hard decisions |
+| `glm_edge_4b` | no | `6.68` | produced fenced JSON and failed the listed hard decisions |
 
 Thread sweep on the current Docker CPU showed the best stable qwen35 setting at 6 threads:
 
@@ -135,7 +135,7 @@ models="$(awk -F '\t' 'NR > 1 && $9 == "true" {print $1}' benchmarks/models.tsv 
 OTLET_BENCH_LIMIT_MODELS="$models" OTLET_BENCH_RUNS=1 OTLET_BENCH_PUBLISH_REPORT=1 ./benchmarks/run.sh
 ```
 
-Run manual candidates when you have a reason to spend the time. Rows marked `candidate`, `diagnostic`, `historical`, or `heavy` stay outside the default run:
+Run manual candidates for targeted research. Rows marked `candidate`, `diagnostic`, `historical`, or `heavy` stay outside the default run:
 
 ```sh
 models="$(awk -F '\t' 'NR > 1 && ($6 == "candidate" || $6 == "diagnostic") {print $1}' benchmarks/models.tsv | paste -sd, -)"
@@ -201,7 +201,7 @@ The score covers:
 - numeric-evidence decisions across threshold pass, threshold breach, incomplete evidence, and adversarial row-text cases
 - extraction and policy-check phases with production gates
 - entity-resolution decisions across duplicates, hard negatives, sparse rows, dirty rows, and abstention cases
-- exact confidence targets, so overconfident or underconfident outputs do not get silent credit
+- exact confidence targets that reject overconfident or underconfident outputs
 - typed actions with no source-table writes
 - row-watch classification as per-row case results
 - semantic materialization and stale-result safety

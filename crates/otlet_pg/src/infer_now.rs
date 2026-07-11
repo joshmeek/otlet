@@ -121,8 +121,10 @@ pub(crate) struct InferNowRequest {
     pub(crate) id: u64,
     pub(crate) task_name: String,
     pub(crate) subject_id: String,
-    pub(crate) inline_task: Option<Value>,
-    pub(crate) input: Value,
+    /// Raw slot JSON for create_task field extraction via `$n::jsonb`.
+    pub(crate) inline_task_json: Option<String>,
+    /// Canonical JSON text from the shared-memory slot (no parse/re-serialize).
+    pub(crate) input_json: String,
 }
 
 #[derive(Clone, Copy)]
@@ -164,32 +166,32 @@ pub(crate) fn take_request() -> Option<InferNowRequest> {
     let subject_id = read_buf(&slot.subject, slot.subject_len as usize);
     let inline_task_text = read_optional_buf(&slot.inline_task, slot.inline_task_len as usize);
     let input_text = read_buf(&slot.input, slot.input_len as usize);
-    let inline_task = match parse_optional_json("inline_task", inline_task_text.as_deref()) {
-        Ok(value) => value,
-        Err(err) => {
-            {
-                let slot = &mut state.slots[slot_index];
-                slot.state = STATE_FAILED;
-                write_error(slot, &err);
-            }
-            state.failed = state.failed.saturating_add(1);
-            signal_requester_latch(&state.slots[slot_index]);
-            return None;
+    if let Some(text) = inline_task_text.as_deref()
+        && let Err(err) = serde_json::from_str::<Value>(text)
+    {
+        {
+            let slot = &mut state.slots[slot_index];
+            slot.state = STATE_FAILED;
+            write_error(
+                slot,
+                &format!("infer-now inline_task JSON parse failed: {err}"),
+            );
         }
-    };
-    let input = match serde_json::from_str::<Value>(&input_text) {
-        Ok(input) => input,
-        Err(err) => {
-            {
-                let slot = &mut state.slots[slot_index];
-                slot.state = STATE_FAILED;
-                write_error(slot, &format!("infer-now input JSON parse failed: {err}"));
-            }
-            state.failed = state.failed.saturating_add(1);
-            signal_requester_latch(&state.slots[slot_index]);
-            return None;
+        state.failed = state.failed.saturating_add(1);
+        signal_requester_latch(&state.slots[slot_index]);
+        return None;
+    }
+    // Validate JSON once; keep the slot text for `$n::jsonb` (skip Value→JsonB).
+    if let Err(err) = serde_json::from_str::<Value>(&input_text) {
+        {
+            let slot = &mut state.slots[slot_index];
+            slot.state = STATE_FAILED;
+            write_error(slot, &format!("infer-now input JSON parse failed: {err}"));
         }
-    };
+        state.failed = state.failed.saturating_add(1);
+        signal_requester_latch(&state.slots[slot_index]);
+        return None;
+    }
 
     let started_at = unsafe { pg_sys::GetCurrentTimestamp() };
     let start_latency_ms = {
@@ -205,8 +207,8 @@ pub(crate) fn take_request() -> Option<InferNowRequest> {
         id,
         task_name,
         subject_id,
-        inline_task,
-        input,
+        inline_task_json: inline_task_text,
+        input_json: input_text,
     })
 }
 
@@ -230,25 +232,22 @@ pub(crate) fn snapshot() -> InferNowSnapshot {
 
 pub(crate) fn queue_snapshot() -> InferNowQueueSnapshot {
     let state = INFER_NOW_STATE.share();
-    let requested_slots = state
-        .slots
-        .iter()
-        .filter(|slot| slot.state == STATE_REQUESTED)
-        .count();
-    let running_slots = state
-        .slots
-        .iter()
-        .filter(|slot| slot.state == STATE_RUNNING)
-        .count();
+    let mut requested_slots = 0usize;
+    let mut running_slots = 0usize;
+    let mut available_slots = 0usize;
+    for slot in &state.slots {
+        match slot.state {
+            STATE_REQUESTED => requested_slots += 1,
+            STATE_RUNNING => running_slots += 1,
+            STATE_IDLE => available_slots += 1,
+            _ => {}
+        }
+    }
     InferNowQueueSnapshot {
         slot_count: INFER_NOW_SLOTS,
         requested_slots,
         running_slots,
-        available_slots: state
-            .slots
-            .iter()
-            .filter(|slot| slot.state == STATE_IDLE)
-            .count(),
+        available_slots,
         busy_rejections: state.busy_rejections,
     }
 }
@@ -309,6 +308,7 @@ pub(crate) fn request_infer_now(
     Ok(wait_for_submitted_infer_now(&submitted, timeout_ms)?.map(|completed| completed.job_id))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn request_infer_now_with_inline_task(
     task_name: &str,
     subject_id: &str,
@@ -342,6 +342,16 @@ pub(crate) fn submit_infer_now(
 ) -> Result<Option<SubmittedInferNow>, String> {
     let input_text = serde_json::to_string(input).map_err(|err| err.to_string())?;
     submit_infer_now_text(task_name, subject_id, None, &input_text)
+}
+
+pub(crate) fn submit_infer_now_bytes(
+    task_name: &str,
+    subject_id: &str,
+    input_json: &[u8],
+) -> Result<Option<SubmittedInferNow>, String> {
+    let input_text = std::str::from_utf8(input_json)
+        .map_err(|err| format!("infer-now input is not valid UTF-8: {err}"))?;
+    submit_infer_now_text(task_name, subject_id, None, input_text)
 }
 
 fn submit_infer_now_with_inline_task(
@@ -404,12 +414,12 @@ fn submit_infer_now_text(
         slot.error_len = 0;
         slot.task_len = write_buf(&mut slot.task, task_name.as_bytes());
         slot.subject_len = write_buf(&mut slot.subject, subject_id.as_bytes());
-        slot.inline_task_len = inline_task_text
-            .map(|text| write_buf(&mut slot.inline_task, text.as_bytes()))
-            .unwrap_or_else(|| {
-                slot.inline_task.fill(0);
-                0
-            });
+        slot.inline_task_len = if let Some(text) = inline_task_text {
+            write_buf(&mut slot.inline_task, text.as_bytes())
+        } else {
+            slot.inline_task.fill(0);
+            0
+        };
         slot.input_len = write_buf(&mut slot.input, input_text.as_bytes());
         request_id
     };
@@ -430,39 +440,36 @@ pub(crate) fn signal_infer_now_worker() {
 
 pub(crate) fn status_json() -> JsonB {
     let state = INFER_NOW_STATE.share();
-    let requested_slots = state
-        .slots
-        .iter()
-        .filter(|slot| slot.state == STATE_REQUESTED)
-        .count();
-    let running_slots = state
-        .slots
-        .iter()
-        .filter(|slot| slot.state == STATE_RUNNING)
-        .count();
-    let completed_slots = state
-        .slots
-        .iter()
-        .filter(|slot| slot.state == STATE_DONE)
-        .count();
-    let failed_slots = state
-        .slots
-        .iter()
-        .filter(|slot| slot.state == STATE_FAILED)
-        .count();
-    let active_slot = state
-        .slots
-        .iter()
-        .position(|slot| matches!(slot.state, STATE_RUNNING | STATE_REQUESTED))
-        .map(|slot| slot as i32)
-        .unwrap_or(-1);
-    let last_slot = state
-        .slots
-        .iter()
-        .filter(|slot| slot.request_id > 0)
-        .max_by_key(|slot| slot.request_id)
-        .copied()
-        .unwrap_or_default();
+    let mut requested_slots = 0usize;
+    let mut running_slots = 0usize;
+    let mut completed_slots = 0usize;
+    let mut failed_slots = 0usize;
+    let mut available_slots = 0usize;
+    let mut active_slot = -1i32;
+    let mut last_slot = InferNowSlot::default();
+    for (index, slot) in state.slots.iter().enumerate() {
+        match slot.state {
+            STATE_REQUESTED => {
+                requested_slots += 1;
+                if active_slot < 0 {
+                    active_slot = i32::try_from(index).unwrap_or(-1);
+                }
+            }
+            STATE_RUNNING => {
+                running_slots += 1;
+                if active_slot < 0 {
+                    active_slot = i32::try_from(index).unwrap_or(-1);
+                }
+            }
+            STATE_DONE => completed_slots += 1,
+            STATE_FAILED => failed_slots += 1,
+            STATE_IDLE => available_slots += 1,
+            _ => {}
+        }
+        if slot.request_id > last_slot.request_id {
+            last_slot = *slot;
+        }
+    }
     JsonB(json!({
         "state": infer_queue_state_label(requested_slots, running_slots, completed_slots, failed_slots),
         "request_id": state.next_request_id,
@@ -494,7 +501,7 @@ pub(crate) fn status_json() -> JsonB {
         "done_slots": completed_slots,
         "failed_slots": failed_slots,
         "queue_depth": requested_slots + running_slots,
-        "available_slots": state.slots.iter().filter(|slot| slot.state == STATE_IDLE).count(),
+        "available_slots": available_slots,
         "active_slot": active_slot,
         "admission_policy": INFER_NOW_ADMISSION_POLICY,
         "cap_policy": "task_subject_inline_task_input_byte_caps_reject_before_queue_insert",
@@ -507,7 +514,7 @@ pub(crate) fn status_json() -> JsonB {
 
 #[unsafe(no_mangle)]
 pub extern "C-unwind" fn pg_finfo_otlet_worker_infer_now() -> *const pg_sys::Pg_finfo_record {
-    &OTLET_WORKER_INFER_NOW_FINFO
+    &raw const OTLET_WORKER_INFER_NOW_FINFO
 }
 
 #[pg_guard]
@@ -515,20 +522,18 @@ pub extern "C-unwind" fn pg_finfo_otlet_worker_infer_now() -> *const pg_sys::Pg_
 pub extern "C-unwind" fn otlet_worker_infer_now(fcinfo: pg_sys::FunctionCallInfo) -> pg_sys::Datum {
     let task_name = unsafe { pgrx::pg_getarg::<String>(fcinfo, 0) }.unwrap_or_default();
     let subject_id = unsafe { pgrx::pg_getarg::<String>(fcinfo, 1) }.unwrap_or_default();
-    let input = unsafe { pgrx::pg_getarg::<JsonB>(fcinfo, 2) }
-        .map(|json| json.0)
-        .unwrap_or_else(|| json!({}));
+    let input =
+        unsafe { pgrx::pg_getarg::<JsonB>(fcinfo, 2) }.map_or_else(|| json!({}), |json| json.0);
     let timeout_ms = unsafe { pgrx::pg_getarg::<i32>(fcinfo, 3) }
         .unwrap_or(10_000)
-        .clamp(0, MAX_WAIT_MS as i32) as u32;
+        .clamp(0, i32::try_from(MAX_WAIT_MS).unwrap_or(i32::MAX))
+        .cast_unsigned();
     let model_name = unsafe { pgrx::pg_getarg::<String>(fcinfo, 4) };
     let instruction = unsafe { pgrx::pg_getarg::<String>(fcinfo, 5) }.unwrap_or_default();
     let output_schema = unsafe { pgrx::pg_getarg::<JsonB>(fcinfo, 6) }
-        .map(|json| json.0)
-        .unwrap_or_else(|| json!({"type":"object"}));
-    let runtime_options = unsafe { pgrx::pg_getarg::<JsonB>(fcinfo, 7) }
-        .map(|json| json.0)
-        .unwrap_or_else(|| json!({}));
+        .map_or_else(|| json!({"type":"object"}), |json| json.0);
+    let runtime_options =
+        unsafe { pgrx::pg_getarg::<JsonB>(fcinfo, 7) }.map_or_else(|| json!({}), |json| json.0);
 
     let job = match model_name.as_deref().filter(|name| !name.is_empty()) {
         Some(model_name) => request_infer_now_with_inline_task(
@@ -555,7 +560,7 @@ pub extern "C-unwind" fn otlet_worker_infer_now(fcinfo: pg_sys::FunctionCallInfo
 
 #[unsafe(no_mangle)]
 pub extern "C-unwind" fn pg_finfo_otlet_worker_infer_now_state() -> *const pg_sys::Pg_finfo_record {
-    &OTLET_WORKER_INFER_NOW_STATE_FINFO
+    &raw const OTLET_WORKER_INFER_NOW_STATE_FINFO
 }
 
 #[pg_guard]
@@ -618,7 +623,7 @@ fn wait_for_request(request_id: u64, timeout_ms: u32) -> Result<Option<Completed
             pg_sys::TimestampDifferenceExceeds(
                 start,
                 pg_sys::GetCurrentTimestamp(),
-                timeout_ms as std::ffi::c_int,
+                std::ffi::c_int::try_from(timeout_ms).unwrap_or(std::ffi::c_int::MAX),
             )
         } {
             let mut cancel_job_id = 0;
@@ -652,10 +657,11 @@ fn wait_for_request(request_id: u64, timeout_ms: u32) -> Result<Option<Completed
                     }
                 }
             }
-            if cancel_job_id > 0 {
-                if let Err(err) = cancel_job(cancel_job_id) {
-                    pgrx::warning!("otlet infer-now timeout cancel failed: {err}");
-                }
+            if cancel_job_id > 0
+                && let Err(err) = cancel_job(cancel_job_id)
+            {
+                pgrx::warning!("otlet infer-now timeout cancel failed: {err}");
+                force_cancel_requested(cancel_job_id, "infer-now timeout requested cancellation");
             }
             return Ok(None);
         }
@@ -663,7 +669,10 @@ fn wait_for_request(request_id: u64, timeout_ms: u32) -> Result<Option<Completed
         unsafe {
             pg_sys::WaitLatch(
                 pg_sys::MyLatch,
-                (pg_sys::WL_LATCH_SET | pg_sys::WL_TIMEOUT | pg_sys::WL_POSTMASTER_DEATH) as i32,
+                i32::try_from(
+                    pg_sys::WL_LATCH_SET | pg_sys::WL_TIMEOUT | pg_sys::WL_POSTMASTER_DEATH,
+                )
+                .unwrap_or(i32::MAX),
                 50,
                 pg_sys::PG_WAIT_EXTENSION,
             );
@@ -678,15 +687,44 @@ fn cancel_job(job_id: i64) -> Result<(), String> {
             job_id.into(),
             "infer-now timeout requested cancellation".into(),
         ];
-        client
+        let table = client
             .select(
-                "SELECT count(*) FROM otlet.cancel_job($1, $2)",
-                Some(2),
+                "SELECT id FROM otlet.cancel_job($1, $2) LIMIT 1",
+                Some(1),
                 &args,
             )
-            .map(|_| ())
+            .map_err(|err| err.to_string())?;
+        let canceled = table
+            .first()
+            .get::<i64>(1)
+            .map_err(|err| err.to_string())?
+            .is_some();
+        if !canceled {
+            return Err(format!("cancel_job affected no rows for job_id={job_id}"));
+        }
+        Ok(())
     })
-    .map_err(|err| err.to_string())
+}
+
+fn force_cancel_requested(job_id: i64, reason: &str) {
+    // Error-path only: when cancel_job SPI fails on infer-now timeout, still
+    // mark cancel_requested so linked_cancel_requested can stop decode.
+    let recovery: pgrx::spi::Result<()> = pgrx::Spi::connect_mut(|client| {
+        let args = [job_id.into(), reason.into()];
+        client.update(
+            "UPDATE otlet.jobs \
+             SET status = 'cancel_requested', \
+                 error = $2, \
+                 cancel_requested_at = COALESCE(cancel_requested_at, now()) \
+             WHERE id = $1 AND status = 'running'",
+            Some(1),
+            &args,
+        )?;
+        Ok(())
+    });
+    if let Err(err) = recovery {
+        pgrx::warning!("otlet infer-now force cancel_requested failed: {err}");
+    }
 }
 
 fn signal_requester_latch(slot: &InferNowSlot) {
@@ -700,7 +738,7 @@ fn signal_requester_latch(slot: &InferNowSlot) {
 fn write_buf(target: &mut [u8], value: &[u8]) -> u32 {
     target.fill(0);
     target[..value.len()].copy_from_slice(value);
-    value.len() as u32
+    u32::try_from(value.len()).unwrap_or(u32::MAX)
 }
 
 fn read_buf(source: &[u8], len: usize) -> String {
@@ -711,21 +749,12 @@ fn read_optional_buf(source: &[u8], len: usize) -> Option<String> {
     (len > 0).then(|| read_buf(source, len))
 }
 
-fn parse_optional_json(label: &str, value: Option<&str>) -> Result<Option<Value>, String> {
-    value
-        .map(|value| {
-            serde_json::from_str::<Value>(value)
-                .map_err(|err| format!("infer-now {label} JSON parse failed: {err}"))
-        })
-        .transpose()
-}
-
 fn write_error(slot: &mut InferNowSlot, error: &str) {
     let bytes = error.as_bytes();
     let len = bytes.len().min(ERROR_CAP);
     slot.error.fill(0);
     slot.error[..len].copy_from_slice(&bytes[..len]);
-    slot.error_len = len as u32;
+    slot.error_len = u32::try_from(len).unwrap_or(u32::MAX);
 }
 
 fn check_len(label: &str, len: usize, cap: usize) -> Result<(), String> {
@@ -745,10 +774,12 @@ fn elapsed_between_ms(start: pg_sys::TimestampTz, end: pg_sys::TimestampTz) -> u
     if start == 0 || end == 0 {
         return 0;
     }
-    unsafe { pg_sys::TimestampDifferenceMilliseconds(start, end) }.max(0) as u64
+    unsafe { pg_sys::TimestampDifferenceMilliseconds(start, end) }
+        .max(0)
+        .cast_unsigned()
 }
 
-fn infer_queue_state_label(
+const fn infer_queue_state_label(
     requested_slots: usize,
     running_slots: usize,
     completed_slots: usize,

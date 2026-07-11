@@ -2,12 +2,13 @@ CREATE FUNCTION otlet.watch_change_trigger() RETURNS trigger
 LANGUAGE plpgsql
 AS $$
 DECLARE
-  watch_row otlet.watches%ROWTYPE;
+  watch_task_name text;
+  watch_on_change text;
   row_input jsonb;
   subject_id text;
 BEGIN
-  SELECT *
-  INTO watch_row
+  SELECT w.task_name, COALESCE(w.trigger_policy ->> 'on_change', 'mark_stale')
+  INTO watch_task_name, watch_on_change
   FROM otlet.watches w
   WHERE w.name = TG_ARGV[1]
     AND w.kind = 'row';
@@ -33,9 +34,9 @@ BEGIN
   );
 
   IF TG_OP <> 'DELETE'
-     AND COALESCE(watch_row.trigger_policy ->> 'on_change', 'mark_stale') = 'mark_stale_and_enqueue'
+     AND watch_on_change = 'mark_stale_and_enqueue'
      AND subject_id IS NOT NULL THEN
-    PERFORM otlet.run_task_subject(watch_row.task_name, subject_id);
+    PERFORM otlet.run_task_subject(watch_task_name, subject_id);
   END IF;
 
   IF TG_OP = 'DELETE' THEN
@@ -532,6 +533,51 @@ WITH watch_sources AS (
     WHERE kind = 'pair'
   ) w
   JOIN LATERAL otlet.semantic_join_index_plan(w.semantic_join_index_name) p ON true
+), watch_tasks AS (
+  SELECT DISTINCT task_name
+  FROM watch_sources
+), watch_materialization_keys AS (
+  SELECT DISTINCT task_name, record_type
+  FROM watch_sources
+), job_counts AS (
+  SELECT
+    j.task_name,
+    count(*) FILTER (WHERE j.status = 'queued')::bigint AS queued_jobs,
+    count(*) FILTER (WHERE j.status = 'running')::bigint AS running_jobs,
+    count(*) FILTER (WHERE j.status = 'complete')::bigint AS complete_jobs,
+    count(*) FILTER (WHERE j.status IN ('failed', 'canceled'))::bigint AS failed_jobs
+  FROM otlet.jobs j
+  JOIN watch_tasks USING (task_name)
+  GROUP BY j.task_name
+), action_counts AS (
+  SELECT
+    j.task_name,
+    count(*) FILTER (WHERE a.status = 'proposed')::bigint AS proposed_actions,
+    count(*) FILTER (WHERE a.status = 'complete')::bigint AS complete_actions,
+    count(*) FILTER (WHERE a.status = 'rejected')::bigint AS rejected_actions
+  FROM otlet.actions a
+  JOIN otlet.jobs j ON j.id = a.job_id
+  JOIN watch_tasks USING (task_name)
+  GROUP BY j.task_name
+), suppression AS (
+  SELECT
+    e.detail ->> 'task_name' AS task_name,
+    count(*)::bigint AS suppressed_events,
+    max(e.created_at) AS last_suppressed_at
+  FROM otlet.worker_events e
+  JOIN watch_tasks ON watch_tasks.task_name = e.detail ->> 'task_name'
+  WHERE e.event_type = 'queue_admission_suppressed'
+    AND e.detail ? 'task_name'
+  GROUP BY e.detail ->> 'task_name'
+), materialized AS (
+  SELECT
+    sm.task_name,
+    sm.record_type,
+    max(sm.updated_at) AS last_materialized_at,
+    count(*) FILTER (WHERE sm.freshness_basis = 'revalidated_after_benign_update')::bigint AS revalidated_materializations
+  FROM otlet.semantic_materializations sm
+  JOIN watch_materialization_keys USING (task_name, record_type)
+  GROUP BY sm.task_name, sm.record_type
 )
 SELECT
   w.watch_name,
@@ -581,37 +627,8 @@ FROM watch_sources w
 LEFT JOIN otlet.semantic_indexes row_index ON row_index.name = w.semantic_index_name
 LEFT JOIN otlet.semantic_join_indexes join_index ON join_index.name = w.semantic_join_index_name
 LEFT JOIN watch_plans plan ON plan.watch_name = w.watch_name
-LEFT JOIN LATERAL (
-  SELECT
-    count(*) FILTER (WHERE j.status = 'queued')::bigint AS queued_jobs,
-    count(*) FILTER (WHERE j.status = 'running')::bigint AS running_jobs,
-    count(*) FILTER (WHERE j.status = 'complete')::bigint AS complete_jobs,
-    count(*) FILTER (WHERE j.status IN ('failed', 'canceled'))::bigint AS failed_jobs
-  FROM otlet.jobs j
-  WHERE j.task_name = w.task_name
-) job_counts ON true
-LEFT JOIN LATERAL (
-  SELECT
-    count(*) FILTER (WHERE a.status = 'proposed')::bigint AS proposed_actions,
-    count(*) FILTER (WHERE a.status = 'complete')::bigint AS complete_actions,
-    count(*) FILTER (WHERE a.status = 'rejected')::bigint AS rejected_actions
-  FROM otlet.actions a
-  JOIN otlet.jobs j ON j.id = a.job_id
-  WHERE j.task_name = w.task_name
-) action_counts ON true
-LEFT JOIN LATERAL (
-  SELECT
-    count(*)::bigint AS suppressed_events,
-    max(e.created_at) AS last_suppressed_at
-  FROM otlet.worker_events e
-  WHERE e.event_type = 'queue_admission_suppressed'
-    AND e.detail ->> 'task_name' = w.task_name
-) suppression ON true
-LEFT JOIN LATERAL (
-  SELECT
-    max(sm.updated_at) AS last_materialized_at,
-    count(*) FILTER (WHERE sm.freshness_basis = 'revalidated_after_benign_update')::bigint AS revalidated_materializations
-  FROM otlet.semantic_materializations sm
-  WHERE sm.task_name = w.task_name
-    AND sm.record_type = w.record_type
-) materialized ON true;
+LEFT JOIN job_counts ON job_counts.task_name = w.task_name
+LEFT JOIN action_counts ON action_counts.task_name = w.task_name
+LEFT JOIN suppression ON suppression.task_name = w.task_name
+LEFT JOIN materialized ON materialized.task_name = w.task_name
+  AND materialized.record_type = w.record_type;

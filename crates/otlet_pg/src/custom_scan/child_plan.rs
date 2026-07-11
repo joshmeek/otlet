@@ -56,7 +56,7 @@ unsafe fn planned_custom_child_plan(custom_plans: *mut pg_sys::List) -> *mut pg_
         if custom_plans.is_null() || pg_sys::list_length(custom_plans) == 0 {
             ptr::null_mut()
         } else {
-            pg_sys::list_nth(custom_plans, 0) as *mut pg_sys::Plan
+            pg_sys::list_nth(custom_plans, 0).cast::<pg_sys::Plan>()
         }
     }
 }
@@ -75,7 +75,7 @@ unsafe fn sanitized_subquery_child_path(
         if existing.is_null() {
             return ptr::null_mut();
         }
-        let subquery_path = existing as *mut pg_sys::SubqueryScanPath;
+        let subquery_path = existing.cast::<pg_sys::SubqueryScanPath>();
         if subquery_path.is_null() || (*subquery_path).subpath.is_null() {
             return ptr::null_mut();
         }
@@ -110,7 +110,7 @@ unsafe fn cheapest_subquery_scan_path(rel: *mut pg_sys::RelOptInfo) -> *mut pg_s
         }
         let mut best: *mut pg_sys::Path = ptr::null_mut();
         for idx in 0..pg_sys::list_length((*rel).pathlist) {
-            let path = pg_sys::list_nth((*rel).pathlist, idx) as *mut pg_sys::Path;
+            let path = pg_sys::list_nth((*rel).pathlist, idx).cast::<pg_sys::Path>();
             if path.is_null() || (*path).pathtype != pg_sys::NodeTag::T_SubqueryScan {
                 continue;
             }
@@ -131,7 +131,7 @@ unsafe fn cheapest_postgres_child_scan_path(
         }
         let mut best: *mut pg_sys::Path = ptr::null_mut();
         for idx in 0..pg_sys::list_length((*rel).pathlist) {
-            let path = pg_sys::list_nth((*rel).pathlist, idx) as *mut pg_sys::Path;
+            let path = pg_sys::list_nth((*rel).pathlist, idx).cast::<pg_sys::Path>();
             if path.is_null() || !is_supported_child_scan_path(path) {
                 continue;
             }
@@ -173,10 +173,18 @@ unsafe fn non_semantic_plan_quals(
     rti: pg_sys::Index,
 ) -> *mut pg_sys::List {
     unsafe {
+        // Parse semantic signatures once; clause loop only re-parses each plan qual.
+        let semantic_preds = collect_semantic_predicates(semantic_restrictinfos, rti);
         let mut output: *mut pg_sys::List = ptr::null_mut();
         for idx in 0..pg_sys::list_length(clauses) {
             let clause = pg_sys::list_nth(clauses, idx);
-            if clause.is_null() || is_owned_semantic_plan_qual(clause, semantic_restrictinfos, rti)
+            if clause.is_null()
+                || is_owned_semantic_plan_qual(
+                    clause,
+                    semantic_restrictinfos,
+                    &semantic_preds,
+                    rti,
+                )
             {
                 continue;
             }
@@ -190,9 +198,35 @@ unsafe fn non_semantic_plan_quals(
     }
 }
 
+unsafe fn collect_semantic_predicates(
+    semantic_restrictinfos: *mut pg_sys::List,
+    rti: pg_sys::Index,
+) -> Vec<SemanticMatchPredicate> {
+    unsafe {
+        let len = pg_sys::list_length(semantic_restrictinfos);
+        let mut out = Vec::with_capacity(usize::try_from(len).unwrap_or(0));
+        for idx in 0..len {
+            let semantic =
+                pg_sys::list_nth(semantic_restrictinfos, idx).cast::<pg_sys::RestrictInfo>();
+            if semantic.is_null() {
+                continue;
+            }
+            let semantic_expr = actual_clause_expr(semantic.cast());
+            if semantic_expr.is_null() {
+                continue;
+            }
+            if let Some(pred) = semantic_match_from_clause(semantic_expr, rti) {
+                out.push(pred);
+            }
+        }
+        out
+    }
+}
+
 unsafe fn is_owned_semantic_plan_qual(
     clause: *mut std::ffi::c_void,
     semantic_restrictinfos: *mut pg_sys::List,
+    semantic_preds: &[SemanticMatchPredicate],
     rti: pg_sys::Index,
 ) -> bool {
     unsafe {
@@ -206,23 +240,9 @@ unsafe fn is_owned_semantic_plan_qual(
         let Some(clause_predicate) = semantic_match_from_clause(clause_expr, rti) else {
             return false;
         };
-        for idx in 0..pg_sys::list_length(semantic_restrictinfos) {
-            let semantic =
-                pg_sys::list_nth(semantic_restrictinfos, idx) as *mut pg_sys::RestrictInfo;
-            if semantic.is_null() {
-                continue;
-            }
-            let semantic_expr = actual_clause_expr(semantic.cast());
-            if semantic_expr.is_null() {
-                continue;
-            }
-            if let Some(semantic_predicate) = semantic_match_from_clause(semantic_expr, rti)
-                && same_semantic_signature(&clause_predicate, &semantic_predicate)
-            {
-                return true;
-            }
-        }
-        false
+        semantic_preds
+            .iter()
+            .any(|semantic_predicate| same_semantic_signature(&clause_predicate, semantic_predicate))
     }
 }
 
@@ -267,7 +287,7 @@ unsafe fn is_semantic_restrictinfo(
     unsafe {
         for idx in 0..pg_sys::list_length(semantic_restrictinfos) {
             let semantic =
-                pg_sys::list_nth(semantic_restrictinfos, idx) as *mut pg_sys::RestrictInfo;
+                pg_sys::list_nth(semantic_restrictinfos, idx).cast::<pg_sys::RestrictInfo>();
             if semantic.is_null() {
                 continue;
             }
@@ -285,19 +305,19 @@ unsafe fn is_semantic_restrictinfo(
 
 unsafe fn actual_clause_expr(clause: *mut std::ffi::c_void) -> *mut pg_sys::Expr {
     unsafe {
-        let node = clause as *mut pg_sys::Node;
+        let node = clause.cast::<pg_sys::Node>();
         if node.is_null() {
             return ptr::null_mut();
         }
         if (*node).type_ == pg_sys::NodeTag::T_RestrictInfo {
-            let rinfo = clause as *mut pg_sys::RestrictInfo;
+            let rinfo = clause.cast::<pg_sys::RestrictInfo>();
             if rinfo.is_null() {
                 ptr::null_mut()
             } else {
                 (*rinfo).clause
             }
         } else {
-            clause as *mut pg_sys::Expr
+            clause.cast::<pg_sys::Expr>()
         }
     }
 }

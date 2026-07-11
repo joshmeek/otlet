@@ -40,18 +40,18 @@ SELECT
   r.input_hash,
   r.output_schema_hash,
   r.raw_output_hash,
-  r.trace_summary ->> 'model_fingerprint_hash' AS model_fingerprint_hash,
-  r.trace_summary ->> 'runtime_options_hash' AS runtime_options_hash,
-  r.trace_summary ->> 'row_identity' AS row_identity,
-  r.trace_summary -> 'mvcc' AS mvcc,
-  r.trace_summary ->> 'worker_handoff' AS worker_handoff,
-  r.trace_summary ->> 'stale_policy' AS stale_policy,
-  r.trace_summary ->> 'stop_reason' AS stop_reason,
-  r.trace_summary -> 'detailed_trace' ->> 'trace_contract' AS trace_contract,
-  r.trace_summary -> 'detailed_trace' ->> 'storage_policy' AS storage_policy,
-  r.trace_summary -> 'detailed_trace' ->> 'logprob_policy' AS logprob_policy,
-  COALESCE((r.trace_summary #>> '{detailed_trace,max_tokens}')::int, 0) AS max_tokens,
-  COALESCE((r.trace_summary #>> '{detailed_trace,top_k}')::int, 0) AS top_k,
+  trace.summary ->> 'model_fingerprint_hash' AS model_fingerprint_hash,
+  trace.summary ->> 'runtime_options_hash' AS runtime_options_hash,
+  trace.summary ->> 'row_identity' AS row_identity,
+  trace.summary -> 'mvcc' AS mvcc,
+  trace.summary ->> 'worker_handoff' AS worker_handoff,
+  trace.summary ->> 'stale_policy' AS stale_policy,
+  trace.summary ->> 'stop_reason' AS stop_reason,
+  trace.summary -> 'detailed_trace' ->> 'trace_contract' AS trace_contract,
+  trace.summary -> 'detailed_trace' ->> 'storage_policy' AS storage_policy,
+  trace.summary -> 'detailed_trace' ->> 'logprob_policy' AS logprob_policy,
+  COALESCE((trace.summary #>> '{detailed_trace,max_tokens}')::int, 0) AS max_tokens,
+  COALESCE((trace.summary #>> '{detailed_trace,top_k}')::int, 0) AS top_k,
   step.ordinality::int AS step,
   (step.value ->> 'token_id')::bigint AS token_id,
   step.value ->> 'token_text' AS token_text,
@@ -79,10 +79,15 @@ SELECT
   step.value ->> 'probability_status' AS probability_status,
   COALESCE(step.value -> 'top_alternatives', '[]'::jsonb) AS top_alternatives
 FROM otlet.inference_receipts r
+CROSS JOIN LATERAL (
+  -- Expand the toasted object once and keep the projection from being pulled up
+  SELECT r.trace_summary || '{}'::jsonb AS summary
+  OFFSET 0
+) trace
 CROSS JOIN LATERAL jsonb_array_elements(
   CASE
-    WHEN jsonb_typeof(r.trace_summary #> '{detailed_trace,steps}') = 'array'
-      THEN r.trace_summary #> '{detailed_trace,steps}'
+    WHEN jsonb_typeof(trace.summary #> '{detailed_trace,steps}') = 'array'
+      THEN trace.summary #> '{detailed_trace,steps}'
     ELSE '[]'::jsonb
   END
 ) WITH ORDINALITY AS step(value, ordinality);
@@ -122,6 +127,21 @@ FROM otlet.inference_receipt_token_trace t
 CROSS JOIN LATERAL jsonb_array_elements(t.top_alternatives) WITH ORDINALITY AS alt(value, ordinality);
 
 CREATE VIEW otlet.inference_trace_summary AS
+WITH token_summary AS (
+  SELECT
+    t.receipt_id,
+    count(*)::bigint AS token_steps,
+    COALESCE(sum(
+      CASE
+        WHEN jsonb_typeof(t.top_alternatives) = 'array'
+          THEN jsonb_array_length(t.top_alternatives)
+        ELSE 0
+      END
+    ), 0)::bigint AS top_k_alternatives,
+    string_agg(t.token_text_readable, '' ORDER BY t.step) AS chosen_text_readable
+  FROM otlet.inference_receipt_token_trace t
+  GROUP BY t.receipt_id
+)
 SELECT
   s.receipt_id,
   s.job_id,
@@ -146,6 +166,8 @@ SELECT
   s.tokens_per_second,
   s.tokenize_ms,
   s.prompt_decode_ms,
+  s.finish_sql_ms,
+  s.materialize_ms,
   s.first_token_ms,
   s.ttft_ms,
   s.steady_tokens_per_second,
@@ -179,20 +201,9 @@ SELECT
   s.inference_cache_eviction_reason,
   s.inference_cache_reason,
   pg_column_size(r.trace_summary)::bigint AS trace_summary_bytes,
-  COALESCE((
-    SELECT count(*)
-    FROM otlet.inference_receipt_token_trace t
-    WHERE t.receipt_id = s.receipt_id
-  ), 0)::bigint AS token_steps,
-  COALESCE((
-    SELECT count(*)
-    FROM otlet.inference_receipt_token_alternative_trace a
-    WHERE a.receipt_id = s.receipt_id
-  ), 0)::bigint AS top_k_alternatives,
-  COALESCE((
-    SELECT string_agg(t.token_text_readable, '' ORDER BY t.step)
-    FROM otlet.inference_receipt_token_trace t
-    WHERE t.receipt_id = s.receipt_id
-  ), '') AS chosen_text_readable
+  COALESCE(tokens.token_steps, 0)::bigint AS token_steps,
+  COALESCE(tokens.top_k_alternatives, 0)::bigint AS top_k_alternatives,
+  COALESCE(tokens.chosen_text_readable, '') AS chosen_text_readable
 FROM otlet.inference_receipt_trace_status s
-JOIN otlet.inference_receipts r ON r.id = s.receipt_id;
+JOIN otlet.inference_receipts r ON r.id = s.receipt_id
+LEFT JOIN token_summary tokens ON tokens.receipt_id = s.receipt_id;

@@ -74,18 +74,24 @@ BEGIN
       SELECT subject_id, input
       FROM (
         SELECT
-          (src.%1$I)::text AS subject_id,
-          jsonb_build_object(
-            '_otlet_mvcc', jsonb_build_object(
+          shaped.subject_id,
+          shaped.input,
+          otlet.semantic_content_hash(shaped.input, %7$L::jsonb) AS content_hash
+        FROM (
+          SELECT
+            (src.%1$I)::text AS subject_id,
+            jsonb_build_object(
+              '_otlet_mvcc', jsonb_build_object(
+                'table', %2$L,
+                'subject_id', (src.%1$I)::text,
+                'ctid', src.ctid::text,
+                'xmin', src.xmin::text
+              ),
               'table', %2$L,
-              'subject_id', (src.%1$I)::text,
-              'ctid', src.ctid::text,
-              'xmin', src.xmin::text
-            ),
-            'table', %2$L,
-            'row', otlet.semantic_project_row(to_jsonb(src), %5$L::text[])
-          ) AS input
-        FROM %3$s AS src
+              'row', otlet.semantic_project_row(to_jsonb(src), %5$L::text[])
+            ) AS input
+          FROM %3$s AS src
+        ) shaped
       ) otlet_semantic_input
       WHERE NOT EXISTS (
         SELECT 1
@@ -93,7 +99,7 @@ BEGIN
         WHERE sm.task_name = %4$L
           AND sm.source_table = %2$L
           AND sm.subject_id = otlet_semantic_input.subject_id
-          AND sm.content_hash = otlet.semantic_content_hash(otlet_semantic_input.input, %7$L::jsonb)
+          AND sm.content_hash = otlet_semantic_input.content_hash
           AND sm.contract_hash = %6$L
       )
     $query$,
@@ -243,8 +249,8 @@ DECLARE
   index_row otlet.semantic_indexes%ROWTYPE;
   updated_count bigint := 0;
 BEGIN
-  SELECT *
-  INTO index_row
+  SELECT si.subject_column, si.source_table, si.input_columns, si.task_name, si.record_type
+  INTO index_row.subject_column, index_row.source_table, index_row.input_columns, index_row.task_name, index_row.record_type
   FROM otlet.semantic_indexes si
   WHERE si.name = mark_semantic_schema_drift.index_name;
 
@@ -254,20 +260,23 @@ BEGIN
 
   EXECUTE format(
     $sql$
-      WITH current_rows AS (
-        SELECT
-          (src.%1$I)::text AS subject_id,
-          to_jsonb(src) AS row_data
-        FROM %2$s AS src
+      WITH missing_columns AS (
+        SELECT 1
+        FROM unnest(%3$L::text[]) AS expected(column_name)
+        WHERE NOT EXISTS (
+          SELECT 1
+          FROM pg_attribute a
+          WHERE a.attrelid = %2$L::regclass
+            AND a.attname = expected.column_name
+            AND a.attnum > 0
+            AND NOT a.attisdropped
+        )
+        LIMIT 1
       ),
       drift_subjects AS (
-        SELECT cr.subject_id
-        FROM current_rows cr
-        WHERE EXISTS (
-          SELECT 1
-          FROM unnest(%3$L::text[]) AS expected(column_name)
-          WHERE NOT (cr.row_data ? expected.column_name)
-        )
+        SELECT (src.%1$I)::text AS subject_id
+        FROM %2$s AS src
+        WHERE EXISTS (SELECT 1 FROM missing_columns)
       )
       UPDATE otlet.semantic_materializations sm
       SET stale = true,
@@ -301,9 +310,29 @@ LANGUAGE plpgsql
 AS $$
 DECLARE
   refreshed bigint;
+  current_contract_hash text;
+  current_input_shaping jsonb;
 BEGIN
   IF NULLIF(materialize_semantic_records.current_input_query, '') IS NULL THEN
     RAISE EXCEPTION 'otlet materialize_semantic_records requires current_input_query';
+  END IF;
+
+  SELECT
+    otlet.task_contract_hash(
+      t.instruction,
+      t.output_schema,
+      t.model_name,
+      t.runtime_options,
+      t.input_shaping,
+      t.decision_contract
+    ),
+    t.input_shaping
+  INTO current_contract_hash, current_input_shaping
+  FROM otlet.tasks t
+  WHERE t.name = materialize_semantic_records.task_name;
+
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'otlet task % does not exist', materialize_semantic_records.task_name;
   END IF;
 
   EXECUTE format(
@@ -321,7 +350,7 @@ BEGIN
         FROM otlet.jobs j
         JOIN current_inputs ci
           ON ci.subject_id = j.subject_id
-         AND md5(ci.input::text) = md5(j.input::text)
+         AND ci.input IS NOT DISTINCT FROM j.input
         WHERE j.task_name = %2$L
           AND j.status = 'complete'
         ORDER BY j.subject_id, j.finished_at DESC NULLS LAST, j.id DESC
@@ -354,15 +383,14 @@ BEGIN
         r.body,
         false,
         md5(j.input::text),
-        otlet.semantic_content_hash(j.input, t.input_shaping),
-        otlet.task_contract_hash(t.instruction, t.output_schema, t.model_name, t.runtime_options, t.input_shaping, t.decision_contract),
+        otlet.semantic_content_hash(j.input, %5$L::jsonb),
+        %6$L,
         NULL,
         'content_hash_match',
         now()
       FROM otlet.records r
       JOIN otlet.actions a ON a.id = r.action_id
       JOIN latest_jobs j ON j.id = a.job_id
-      JOIN otlet.tasks t ON t.name = j.task_name
       JOIN otlet.outputs o ON o.id = a.output_id
       JOIN otlet.inference_receipts ar ON ar.id = o.receipt_id
       WHERE r.record_type = %4$L
@@ -385,7 +413,9 @@ BEGIN
     materialize_semantic_records.current_input_query,
     materialize_semantic_records.task_name,
     materialize_semantic_records.source_table,
-    materialize_semantic_records.record_type
+    materialize_semantic_records.record_type,
+    current_input_shaping,
+    current_contract_hash
   );
 
   GET DIAGNOSTICS refreshed = ROW_COUNT;

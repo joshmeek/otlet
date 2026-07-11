@@ -174,7 +174,6 @@ BEGIN
         FROM (%s) otlet_join_candidate
       ) otlet_join_input
       WHERE subject_id = $1
-      ORDER BY subject_id
       LIMIT 1
     $sql$,
     index_row.candidate_query
@@ -305,6 +304,7 @@ CREATE FUNCTION otlet.semantic_plan_from_counts(
   checked_at timestamptz
 )
 LANGUAGE plpgsql
+ROWS 1
 AS $$
 DECLARE
   v_total_subjects bigint := COALESCE(p_total_subjects, 0);
@@ -337,25 +337,25 @@ DECLARE
 BEGIN
   v_refresh_subjects := v_stale_subjects + v_missing_subjects;
 
-  SELECT count(DISTINCT j.subject_id) FILTER (WHERE j.status IN ('queued', 'running', 'cancel_requested'))
-  INTO v_inflight_subjects
-  FROM otlet.jobs j
-  WHERE j.task_name = p_task_name;
-
   SELECT
-    count(*) FILTER (WHERE j.status IN ('queued', 'running', 'cancel_requested'))::bigint,
+    count(DISTINCT j.subject_id) FILTER (
+      WHERE j.task_name = p_task_name
+    )::bigint,
+    count(j.id)::bigint,
     COALESCE(otlet.available_model_queue_slots(p_model_name), 0)::bigint
-  INTO v_worker_queue_depth, v_available_queue_slots
+  INTO v_inflight_subjects, v_worker_queue_depth, v_available_queue_slots
   FROM otlet.tasks t
-  LEFT JOIN otlet.jobs j ON j.task_name = t.name
+  LEFT JOIN otlet.jobs j
+    ON j.task_name = t.name
+   AND j.status IN ('queued', 'running', 'cancel_requested')
   WHERE t.model_name = p_model_name;
 
   SELECT
-    COALESCE(task_receipt.generate_ms, slot_cost.last_generate_ms, model_receipt.generate_ms, 2500)::numeric,
+    COALESCE(task_cost.generate_ms, slot_cost.last_generate_ms, model_cost.generate_ms, 2500)::numeric,
     CASE
-      WHEN task_receipt.generate_ms IS NOT NULL THEN 'task_receipt'
+      WHEN task_cost.generate_ms IS NOT NULL THEN 'task_receipt'
       WHEN slot_cost.last_generate_ms IS NOT NULL THEN 'runtime_slot'
-      WHEN model_receipt.generate_ms IS NOT NULL THEN 'model_receipt'
+      WHEN model_cost.generate_ms IS NOT NULL THEN 'model_receipt'
       ELSE 'static_fallback'
     END
   INTO v_model_ms, v_model_cost_source
@@ -370,11 +370,12 @@ BEGIN
       AND COALESCE(r.generate_ms, 0) > 0
     ORDER BY r.finished_at DESC
     LIMIT 1
-  ) task_receipt ON true
+  ) task_cost ON true
   LEFT JOIN LATERAL (
     SELECT rs.last_generate_ms::numeric AS last_generate_ms
     FROM otlet.runtime_slots rs
-    WHERE rs.model_name = p_model_name
+    WHERE task_cost.generate_ms IS NULL
+      AND rs.model_name = p_model_name
       AND COALESCE(rs.last_generate_ms, 0) > 0
     ORDER BY rs.last_used_at DESC NULLS LAST
     LIMIT 1
@@ -382,13 +383,15 @@ BEGIN
   LEFT JOIN LATERAL (
     SELECT r.generate_ms::numeric AS generate_ms
     FROM otlet.inference_receipts r
-    WHERE r.model_name = p_model_name
+    WHERE task_cost.generate_ms IS NULL
+      AND slot_cost.last_generate_ms IS NULL
+      AND r.model_name = p_model_name
       AND r.status = 'complete'
       AND r.schema_validation_status = 'passed'
       AND COALESCE(r.generate_ms, 0) > 0
     ORDER BY r.finished_at DESC
     LIMIT 1
-  ) model_receipt ON true;
+  ) model_cost ON true;
 
   SELECT
     COALESCE(policy.stale_policy, 'lookup_only_fail_closed'),
@@ -397,7 +400,7 @@ BEGIN
     COALESCE(policy.semantic_auto_max_rows, 1)
   INTO v_stale_policy, v_auto_wait_ms, v_auto_infer_ms, v_auto_max_rows
   FROM otlet.production_policy policy
-  LIMIT 1;
+  WHERE policy.name = 'default';
 
   IF COALESCE(v_auto_infer_ms, 0) > 0 AND COALESCE(v_auto_max_rows, 0) > 0 THEN
     v_infer_now_subjects := LEAST(v_refresh_subjects, v_auto_max_rows::bigint);
@@ -536,6 +539,7 @@ CREATE FUNCTION otlet.semantic_join_index_plan(
   checked_at timestamptz
 )
 LANGUAGE plpgsql
+ROWS 1
 AS $$
 DECLARE
   index_row otlet.semantic_join_indexes%ROWTYPE;

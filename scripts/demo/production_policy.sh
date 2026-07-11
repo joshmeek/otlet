@@ -1,24 +1,178 @@
-production_policy_contract="$(psql_value "
+production_policy_contract="$(psql_exec -qAt <<'SQL'
 SELECT name || '|' || stale_policy || '|' || max_attempts::text || '|' ||
        max_attempt_ms::text || '|' || worker_claim_batch_size::text
 FROM otlet.production_policy_status;
-")"
+SQL
+)"
 echo "production_policy_contract=$production_policy_contract"
+
+lease_interval_contract="$(psql_value <<'SQL'
+SELECT EXTRACT(epoch FROM otlet.effective_job_lease_interval(
+         '{}'::jsonb,
+         300000,
+         interval '5 minutes'
+       ))::bigint::text || '|' ||
+       EXTRACT(epoch FROM otlet.effective_job_lease_interval(
+         '{"max_attempt_ms":1000}'::jsonb,
+         300000,
+         interval '1 second'
+       ))::bigint::text;
+SQL
+)"
+echo "lease_interval_contract=$lease_interval_contract"
+[ "$lease_interval_contract" = "330|31" ] || {
+  echo "Expected timeout-aware job leases with 30-second completion grace, got $lease_interval_contract" >&2
+  exit 1
+}
+
+lease_fence_task="lease_fence_demo"
+cleanup_task "$lease_fence_task"
+lease_fence_contract="$(psql_value -v task_name="$lease_fence_task" -v model_name="$strong_model_name" <<'SQL'
+BEGIN;
+UPDATE otlet.production_policy
+SET job_lease_interval = interval '1 second',
+    default_runtime_options = '{"max_attempt_ms":2000}'::jsonb,
+    worker_claim_batch_size = 1,
+    worker_claim_task_cursor = ''
+WHERE name = 'default';
+WITH created AS (
+  SELECT otlet.create_task(
+    :'task_name',
+    'SELECT NULL::text AS subject_id, ''{}''::jsonb AS input WHERE false',
+    'Lease fence smoke placeholder',
+    '{"type":"object"}'::jsonb,
+    :'model_name',
+    '{"max_tokens":1,"reasoning":"off"}'::jsonb
+  ) AS task
+)
+INSERT INTO otlet.jobs (task_name, subject_id, input)
+SELECT :'task_name', 'lease-fence-1', '{}'::jsonb
+FROM created;
+CREATE TEMP TABLE lease_claim AS
+SELECT id, attempts, leased_until
+FROM otlet.claim_jobs();
+CREATE TEMP TABLE wrong_renew AS
+SELECT renewed.*
+FROM lease_claim claim
+CROSS JOIN LATERAL otlet.renew_job_lease(claim.id, claim.attempts + 1) renewed;
+CREATE TEMP TABLE current_renew AS
+SELECT renewed.*
+FROM lease_claim claim
+CROSS JOIN LATERAL otlet.renew_job_lease(claim.id, claim.attempts) renewed;
+SELECT (SELECT count(*) FROM lease_claim)::text || '|' ||
+       (SELECT count(*) FROM wrong_renew)::text || '|' ||
+       COALESCE((SELECT status FROM current_renew), '') || '|' ||
+       COALESCE((SELECT (leased_until > now() + interval '30 seconds')::text FROM current_renew), 'false') || '|' ||
+       COALESCE((SELECT (
+         leased_until > now() + interval '31 seconds'
+         AND leased_until < now() + interval '33 seconds'
+       )::text FROM current_renew), 'false');
+ROLLBACK;
+SQL
+)"
+echo "lease_fence_contract=$lease_fence_contract"
+[ "$lease_fence_contract" = "1|0|running|true|true" ] || {
+  echo "Expected claim-attempt fencing and timeout-aware lease renewal, got $lease_fence_contract" >&2
+  exit 1
+}
 [ "$production_policy_contract" = "default|refresh_then_fail_closed|3|300000|8" ] || {
   echo "Expected default production policy, got $production_policy_contract" >&2
   exit 1
 }
 
-production_status_contract="$(psql_value "
+production_status_contract="$(psql_exec -qAt <<'SQL'
 SELECT no_expired_running_jobs::text || '|' ||
-       completed_jobs_are_schema_validated::text || '|' ||
+       complete_receipts_are_schema_validated::text || '|' ||
        cache_within_bounds::text || '|' ||
        trace_within_bounds::text
 FROM otlet.production_status;
-")"
+SQL
+)"
 echo "production_status_contract=$production_status_contract"
 [ "$production_status_contract" = "true|true|true|true" ] || {
   echo "Expected healthy production status, got $production_status_contract" >&2
+  exit 1
+}
+
+cleanup_policy_contract="$(psql_value -v model_name="$strong_model_name" <<'SQL'
+BEGIN;
+UPDATE otlet.production_policy
+SET worker_event_retention = interval '100 years',
+    failed_job_retention = interval '100 years'
+WHERE name = 'default';
+INSERT INTO otlet.tasks (
+  name,
+  input_query,
+  instruction,
+  output_schema,
+  model_name
+)
+VALUES (
+  'cleanup_policy_contract',
+  'SELECT NULL::text AS subject_id, ''{}''::jsonb AS input WHERE false',
+  'Cleanup policy contract placeholder',
+  '{"type":"object"}'::jsonb,
+  :'model_name'
+)
+ON CONFLICT (name) DO UPDATE
+SET model_name = EXCLUDED.model_name;
+CREATE TEMP TABLE cleanup_contract_jobs AS
+WITH inserted AS (
+  INSERT INTO otlet.jobs (
+    task_name,
+    subject_id,
+    input,
+    status,
+    created_at,
+    finished_at
+  )
+  VALUES
+    ('cleanup_policy_contract', 'active-old-event', '{}'::jsonb, 'queued', now() - interval '200 years', NULL),
+    ('cleanup_policy_contract', 'failed-recent-event', '{}'::jsonb, 'failed', now() - interval '200 years', now() - interval '200 years'),
+    ('cleanup_policy_contract', 'failed-null-finished', '{}'::jsonb, 'failed', now() - interval '200 years', NULL),
+    ('cleanup_policy_contract', 'complete-old-event', '{}'::jsonb, 'complete', now() - interval '200 years', now() - interval '200 years'),
+    ('cleanup_policy_contract', 'complete-recent-event', '{}'::jsonb, 'complete', now(), now())
+  RETURNING id, subject_id
+)
+SELECT * FROM inserted;
+INSERT INTO otlet.worker_events (event_type, job_id, created_at)
+SELECT
+  'cleanup_policy_contract',
+  id,
+  CASE subject_id
+    WHEN 'failed-recent-event' THEN now()
+    WHEN 'complete-recent-event' THEN now()
+    ELSE now() - interval '200 years'
+  END
+FROM cleanup_contract_jobs;
+CREATE TEMP TABLE cleanup_contract_dry AS
+SELECT * FROM otlet.cleanup_policy_state(true);
+CREATE TEMP TABLE cleanup_contract_run AS
+SELECT * FROM otlet.cleanup_policy_state(false);
+SELECT (
+         (SELECT worker_events = 3 AND failed_canceled_jobs = 2 AND dry_run FROM cleanup_contract_dry)
+         AND (SELECT worker_events = 3 AND failed_canceled_jobs = 2 AND NOT dry_run FROM cleanup_contract_run)
+       )::text || '|' ||
+       ((SELECT count(*) FROM otlet.jobs WHERE task_name = 'cleanup_policy_contract') = 3)::text || '|' ||
+       ((SELECT count(*) FROM otlet.worker_events WHERE event_type = 'cleanup_policy_contract') = 2)::text || '|' ||
+       EXISTS (
+         SELECT 1
+         FROM otlet.worker_events e
+         JOIN cleanup_contract_jobs j ON j.id = e.job_id
+         WHERE j.subject_id = 'active-old-event'
+       )::text || '|' ||
+       EXISTS (
+         SELECT 1
+         FROM otlet.worker_events e
+         JOIN cleanup_contract_jobs j ON j.id = e.job_id
+         WHERE j.subject_id = 'complete-recent-event'
+       )::text;
+ROLLBACK;
+SQL
+)"
+echo "cleanup_policy_contract=$cleanup_policy_contract"
+[ "$cleanup_policy_contract" = "true|true|true|true|true" ] || {
+  echo "Expected cleanup policy retention contract true|true|true|true|true, got $cleanup_policy_contract" >&2
   exit 1
 }
 
@@ -66,14 +220,50 @@ cleanup_task "$row_triage_policy_task"
 cleanup_task "$entity_task"
 cleanup_task "$join_task"
 
-model_queue_status_contract="$(psql_value "
+model_queue_status_contract="$(psql_exec -qAt -v model_name="$cheap_model_name" <<'SQL'
 SELECT queue_state || '|' || queued_jobs::text || '|' || running_jobs::text
 FROM otlet.model_queue_status
-WHERE model_name = '$cheap_model_name';
-")"
+WHERE model_name = :'model_name';
+SQL
+)"
 echo "model_queue_status_contract=$model_queue_status_contract"
 [ "$model_queue_status_contract" = "queue_accepting|0|0" ] || {
   echo "Expected empty accepting model queue, got $model_queue_status_contract" >&2
+  exit 1
+}
+
+queue_underfill_contract="$(psql_value <<'SQL'
+BEGIN;
+INSERT INTO otlet.models (name, artifact_path)
+VALUES ('queue_underfill_contract_model', '/tmp/not-used.gguf');
+INSERT INTO otlet.tasks (name, input_query, instruction, output_schema, model_name)
+VALUES (
+  'queue_underfill_contract_task',
+  'SELECT ''subject-'' || lpad(i::text, 2, ''0'') AS subject_id, ''{}''::jsonb AS input FROM generate_series(1, 10) AS g(i)',
+  'Queue underfill contract placeholder',
+  '{"type":"object"}'::jsonb,
+  'queue_underfill_contract_model'
+);
+UPDATE otlet.production_policy
+SET max_queued_jobs_per_model = 5
+WHERE name = 'default';
+INSERT INTO otlet.jobs (task_name, subject_id, input)
+SELECT 'queue_underfill_contract_task', 'subject-' || lpad(i::text, 2, '0'), '{}'::jsonb
+FROM generate_series(1, 3) AS g(i);
+CREATE TEMP TABLE queue_underfill_result AS
+SELECT otlet.run_task('queue_underfill_contract_task') AS queued;
+SELECT (SELECT queued FROM queue_underfill_result)::text || '|' ||
+       (SELECT count(*) FROM otlet.jobs WHERE task_name = 'queue_underfill_contract_task')::text || '|' ||
+       (SELECT count(*)
+        FROM otlet.worker_events
+        WHERE event_type = 'queue_admission_suppressed'
+          AND detail ->> 'task_name' = 'queue_underfill_contract_task')::text;
+ROLLBACK;
+SQL
+)"
+echo "queue_underfill_contract=$queue_underfill_contract"
+[ "$queue_underfill_contract" = "2|5|1" ] || {
+  echo "Expected queue underfill contract 2|5|1, got $queue_underfill_contract" >&2
   exit 1
 }
 
@@ -293,18 +483,20 @@ done
 for pid in "${queue_race_pids[@]}"; do
   wait "$pid"
 done
-queue_race_contract="$(psql_value "
+queue_race_contract="$(psql_exec -qAt -v task_name="$queue_race_task" <<'SQL'
 SELECT (count(*) FILTER (WHERE status = 'queued') <= 5)::text || '|' ||
        (count(*) = 5)::text
 FROM otlet.jobs
-WHERE task_name = '$queue_race_task';
-")"
+WHERE task_name = :'task_name';
+SQL
+)"
 echo "queue_admission_race_contract=$queue_race_contract"
-queue_cap_invariant_contract="$(psql_value "
+queue_cap_invariant_contract="$(psql_exec -qAt <<'SQL'
 SELECT (count(*) = 0)::text
 FROM otlet.verify_invariants()
 WHERE invariant_name = 'queued_jobs_within_model_cap';
-")"
+SQL
+)"
 echo "queue_cap_invariant_contract=$queue_cap_invariant_contract"
 cleanup_task "$queue_race_task"
 wait "$queue_lock_pid"

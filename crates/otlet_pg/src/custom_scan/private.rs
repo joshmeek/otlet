@@ -9,7 +9,7 @@ struct CustomScanPrivate {
     infer_max_rows: u32,
     subject_attno: i16,
     subject_typid: pg_sys::Oid,
-    input_columns: Option<Vec<String>>,
+    planner_stats: Option<SemanticPlannerStats>,
 }
 
 unsafe fn custom_private_from_predicate(predicate: &SemanticMatchPredicate) -> *mut pg_sys::List {
@@ -25,7 +25,7 @@ unsafe fn custom_private_from_predicate(predicate: &SemanticMatchPredicate) -> *
             "infer_max_rows": predicate.infer_max_rows,
             "subject_attno": predicate.subject_attno,
             "subject_typid": predicate.subject_typid.to_u32(),
-            "input_columns": &predicate.input_columns
+            "planner_stats": &predicate.planner_stats,
         });
         let mut list = ptr::null_mut();
         list = append_string_node(list, CUSTOM_PRIVATE_MARKER);
@@ -40,7 +40,7 @@ unsafe fn custom_private_from_plan(
         if node.is_null() || (*node).ss.ps.plan.is_null() {
             return None;
         }
-        let scan = (*node).ss.ps.plan as *mut pg_sys::CustomScan;
+        let scan = (*node).ss.ps.plan.cast::<pg_sys::CustomScan>();
         custom_private_from_list((*scan).custom_private)
     }
 }
@@ -51,11 +51,12 @@ unsafe fn custom_private_from_list(private: *mut pg_sys::List) -> Option<CustomS
             return None;
         }
 
-        let marker = string_node_value(pg_sys::list_nth(private, 0) as *mut pg_sys::String)?;
+        let marker = string_node_value(pg_sys::list_nth(private, 0).cast::<pg_sys::String>())?;
         if marker != CUSTOM_PRIVATE_MARKER {
             return None;
         }
-        let payload_text = string_node_value(pg_sys::list_nth(private, 1) as *mut pg_sys::String)?;
+        let payload_text =
+            string_node_value(pg_sys::list_nth(private, 1).cast::<pg_sys::String>())?;
         let payload: Value = serde_json::from_str(&payload_text).ok()?;
 
         Some(CustomScanPrivate {
@@ -64,8 +65,8 @@ unsafe fn custom_private_from_list(private: *mut pg_sys::List) -> Option<CustomS
                 .and_then(Value::as_str)
                 .and_then(SemanticIndexKind::from_str)
                 .unwrap_or(SemanticIndexKind::Row),
-            index_name: payload.get("index_name")?.as_str()?.to_string(),
-            expected_json: payload.get("expected_json")?.as_str()?.to_string(),
+            index_name: payload.get("index_name")?.as_str()?.to_owned(),
+            expected_json: payload.get("expected_json")?.as_str()?.to_owned(),
             auto_policy: payload
                 .get("auto_policy")
                 .and_then(Value::as_bool)
@@ -77,85 +78,69 @@ unsafe fn custom_private_from_list(private: *mut pg_sys::List) -> Option<CustomS
             wait_ms: payload
                 .get("wait_ms")
                 .and_then(Value::as_u64)
-                .unwrap_or(0)
-                .min(u32::MAX as u64) as u32,
+                .map_or(0, u64_to_u32_saturating),
             infer_ms: payload
                 .get("infer_ms")
                 .and_then(Value::as_u64)
-                .unwrap_or(0)
-                .min(u32::MAX as u64) as u32,
+                .map_or(0, u64_to_u32_saturating),
             infer_max_rows: payload
                 .get("infer_max_rows")
                 .and_then(Value::as_u64)
-                .unwrap_or(0)
-                .min(u32::MAX as u64) as u32,
+                .map_or(0, u64_to_u32_saturating),
             subject_attno: payload.get("subject_attno")?.as_i64()?.try_into().ok()?,
-            subject_typid: pg_sys::Oid::from(payload.get("subject_typid")?.as_u64()? as u32),
-            input_columns: payload
-                .get("input_columns")
-                .and_then(Value::as_array)
-                .map(|columns| {
-                    columns
-                        .iter()
-                        .filter_map(Value::as_str)
-                        .map(str::to_string)
-                        .collect()
-                }),
+            subject_typid: pg_sys::Oid::from(u32::try_from(
+                payload.get("subject_typid")?.as_u64()?,
+            )
+            .ok()?),
+            planner_stats: serde_json::from_value(payload.get("planner_stats")?.clone()).ok(),
         })
     }
 }
 
-fn reload_private_planner_stats(private: &CustomScanPrivate) -> SemanticPlannerStats {
-    let plan_function = match private.index_kind {
-        SemanticIndexKind::Row => "otlet.semantic_index_plan",
-        SemanticIndexKind::Join => "otlet.semantic_join_index_plan",
-    };
-    let current_rows_function = match private.index_kind {
-        SemanticIndexKind::Row => "otlet.semantic_index_current_rows",
-        SemanticIndexKind::Join => "otlet.semantic_join_index_current_rows",
-    };
-    let exact_plan = if private.index_kind == SemanticIndexKind::Row {
-        "true"
-    } else {
-        "false"
-    };
-    let query = format!(
-        "WITH plan AS ( \
-           SELECT * \
-           FROM {}({}, {}) \
-         ), \
-         current_rows AS ( \
-           SELECT body, stale \
-           FROM {}({}, false) \
-         ) \
-         SELECT \
-           COALESCE((SELECT selected_path FROM plan), 'semantic_lookup')::text AS selected_path, \
-           COALESCE((SELECT reason FROM plan), 'reloaded_from_sql_plan')::text AS reason, \
-           COALESCE((SELECT total_subjects FROM plan), 0)::bigint AS total_subjects, \
-           count(*) FILTER (WHERE stale = false AND body @> {}::jsonb)::bigint AS fresh_matches, \
-           count(*) FILTER (WHERE stale = false AND NOT (body @> {}::jsonb))::bigint AS fresh_non_matches, \
-           COALESCE((SELECT stale_subjects FROM plan), 0)::bigint AS stale_subjects, \
-           COALESCE((SELECT missing_subjects FROM plan), 0)::bigint AS missing_subjects, \
-           COALESCE((SELECT inflight_subjects FROM plan), 0)::bigint AS inflight_subjects, \
-           COALESCE((SELECT infer_now_subjects FROM plan), 0)::bigint AS infer_now_subjects, \
-           COALESCE((SELECT fail_closed_subjects FROM plan), 0)::bigint AS fail_closed_subjects, \
-           COALESCE((SELECT model_ms FROM plan), 2500)::float8 AS model_ms, \
-           COALESCE((SELECT model_cost_source FROM plan), 'static_fallback')::text AS model_cost_source, \
-           COALESCE((SELECT path_cost FROM plan), 1)::float8 AS path_cost, \
-           COALESCE((SELECT stale_reasons::text FROM plan), '{{}}')::text AS stale_reasons, \
-           COALESCE((SELECT count_basis FROM plan), 'exact')::text AS count_basis \
-         FROM current_rows",
-        plan_function,
-        sql_literal(&private.index_name),
-        exact_plan,
-        current_rows_function,
-        sql_literal(&private.index_name),
-        sql_literal(&private.expected_json),
-        sql_literal(&private.expected_json)
-    );
-
+fn reload_private_planner_stats_plan_only(private: &CustomScanPrivate) -> SemanticPlannerStats {
     pgrx::Spi::connect(|client| {
-        let table = client.select(query.as_str(), Some(1), &[]).map_err(to_string)?;
+        let args = [private.index_name.as_str().into()];
+        let query = match private.index_kind {
+            SemanticIndexKind::Row => {
+                "SELECT \
+                   COALESCE(selected_path, 'semantic_lookup')::text AS selected_path, \
+                   COALESCE(reason, 'reloaded_from_sql_plan')::text AS reason, \
+                   COALESCE(total_subjects, 0)::bigint AS total_subjects, \
+                   0::bigint AS fresh_matches, \
+                   0::bigint AS fresh_non_matches, \
+                   COALESCE(stale_subjects, 0)::bigint AS stale_subjects, \
+                   COALESCE(missing_subjects, 0)::bigint AS missing_subjects, \
+                   COALESCE(inflight_subjects, 0)::bigint AS inflight_subjects, \
+                   COALESCE(infer_now_subjects, 0)::bigint AS infer_now_subjects, \
+                   COALESCE(fail_closed_subjects, 0)::bigint AS fail_closed_subjects, \
+                   COALESCE(model_ms, 2500)::float8 AS model_ms, \
+                   COALESCE(model_cost_source, 'static_fallback')::text AS model_cost_source, \
+                   COALESCE(path_cost, 1)::float8 AS path_cost, \
+                   COALESCE(stale_reasons::text, '{}')::text AS stale_reasons, \
+                   COALESCE(count_basis, 'exact')::text AS count_basis \
+                 FROM otlet.semantic_index_plan($1, true)"
+            }
+            SemanticIndexKind::Join => {
+                "SELECT \
+                   COALESCE(selected_path, 'semantic_lookup')::text AS selected_path, \
+                   COALESCE(reason, 'reloaded_from_sql_plan')::text AS reason, \
+                   COALESCE(total_subjects, 0)::bigint AS total_subjects, \
+                   0::bigint AS fresh_matches, \
+                   0::bigint AS fresh_non_matches, \
+                   COALESCE(stale_subjects, 0)::bigint AS stale_subjects, \
+                   COALESCE(missing_subjects, 0)::bigint AS missing_subjects, \
+                   COALESCE(inflight_subjects, 0)::bigint AS inflight_subjects, \
+                   COALESCE(infer_now_subjects, 0)::bigint AS infer_now_subjects, \
+                   COALESCE(fail_closed_subjects, 0)::bigint AS fail_closed_subjects, \
+                   COALESCE(model_ms, 2500)::float8 AS model_ms, \
+                   COALESCE(model_cost_source, 'static_fallback')::text AS model_cost_source, \
+                   COALESCE(path_cost, 1)::float8 AS path_cost, \
+                   COALESCE(stale_reasons::text, '{}')::text AS stale_reasons, \
+                   COALESCE(count_basis, 'exact')::text AS count_basis \
+                 FROM otlet.semantic_join_index_plan($1)"
+            }
+        };
+        let table = client.select(query, Some(1), &args).map_err(to_string)?;
         if table.is_empty() {
             return Err("missing semantic index plan".to_owned());
         }
@@ -171,8 +156,7 @@ fn reload_private_planner_stats(private: &CustomScanPrivate) -> SemanticPlannerS
             ($name:literal) => {
                 row.get_by_name::<i64, _>($name)
                     .map_err(to_string)?
-                    .unwrap_or(0)
-                    .max(0) as u64
+                    .map_or(0, nonnegative_count)
             };
         }
         let mut stats = SemanticPlannerStats {
@@ -217,26 +201,10 @@ fn reload_private_planner_stats(private: &CustomScanPrivate) -> SemanticPlannerS
     })
     .unwrap_or_else(|err| {
         pgrx::warning!("otlet semantic CustomScan private plan reload failed: {err}");
-        SemanticPlannerStats {
-            selected_path: "semantic_lookup".to_owned(),
-            reason: "private_plan_reload_failed".to_owned(),
-            source_rows: 0,
-            fresh_matches: 0,
-            fresh_non_matches: 0,
-            stale_rows: 0,
-            missing_rows: 0,
-            inflight_rows: 0,
-            cache_reusable_rows: 0,
-            infer_decision_rows: 0,
-            fail_closed_decision_rows: 0,
-            model_ms: 2500.0,
-            model_cost_source: "static_fallback".to_owned(),
-            path_cost: 1.0,
-            stale_reasons: "{}".to_owned(),
-            count_basis: "unknown".to_owned(),
-        }
+        planner_stats_with_reason("private_plan_reload_failed")
     })
 }
+
 
 unsafe fn list_make1(value: *mut std::ffi::c_void) -> *mut pg_sys::List {
     unsafe {
@@ -277,11 +245,8 @@ unsafe fn string_node_value(string_node: *mut pg_sys::String) -> Option<String> 
         {
             return None;
         }
-        Some(
-            CStr::from_ptr((*string_node).sval)
-                .to_string_lossy()
-                .into_owned(),
-        )
+        // Fail closed on invalid UTF-8 rather than silently mojibake plan private.
+        Some(CStr::from_ptr((*string_node).sval).to_str().ok()?.to_owned())
     }
 }
 
@@ -289,7 +254,7 @@ unsafe fn strip_relabel(node: *mut pg_sys::Expr) -> *mut pg_sys::Expr {
     unsafe {
         let mut current = node;
         while !current.is_null() && (*current).type_ == pg_sys::NodeTag::T_RelabelType {
-            current = (*(current as *mut pg_sys::RelabelType)).arg;
+            current = (*current.cast::<pg_sys::RelabelType>()).arg;
         }
         current
     }
@@ -301,7 +266,7 @@ unsafe fn text_const_value(node: *mut pg_sys::Expr) -> Option<String> {
         if node.is_null() || (*node).type_ != pg_sys::NodeTag::T_Const {
             return None;
         }
-        let value = node as *mut pg_sys::Const;
+        let value = node.cast::<pg_sys::Const>();
         if (*value).constisnull || (*value).consttype != pg_sys::TEXTOID {
             return None;
         }
@@ -319,7 +284,7 @@ unsafe fn jsonb_const_text(node: *mut pg_sys::Expr) -> Option<String> {
         if node.is_null() || (*node).type_ != pg_sys::NodeTag::T_Const {
             return None;
         }
-        let value = node as *mut pg_sys::Const;
+        let value = node.cast::<pg_sys::Const>();
         if (*value).constisnull || (*value).consttype != pg_sys::JSONBOID {
             return None;
         }
@@ -337,28 +302,49 @@ unsafe fn datum_to_text(value: pg_sys::Datum, typid: pg_sys::Oid) -> Option<Stri
         if typid == pg_sys::TEXTOID {
             return <String as FromDatum>::from_polymorphic_datum(value, false, typid);
         }
-        let mut output_oid = pg_sys::InvalidOid;
-        let mut is_varlena = false;
-        pg_sys::getTypeOutputInfo(typid, &mut output_oid, &mut is_varlena);
-        if output_oid == pg_sys::InvalidOid {
-            return None;
-        }
+        let output_oid = cached_type_output_oid(typid)?;
         let output = pg_sys::OidOutputFunctionCall(output_oid, value);
         if output.is_null() {
             return None;
         }
-        let text = CStr::from_ptr(output).to_string_lossy().into_owned();
+        // Fail closed on invalid UTF-8 rather than silently mojibake subjects.
+        let text = CStr::from_ptr(output).to_str().ok()?.to_owned();
         pg_sys::pfree(output.cast());
         Some(text)
     }
 }
 
+unsafe fn cached_type_output_oid(typid: pg_sys::Oid) -> Option<pg_sys::Oid> {
+    // Backend-local cache: CustomScan subject extraction is single-threaded per
+    // backend, so avoid a global mutex on every non-text subject row.
+    thread_local! {
+        static CACHE: RefCell<HashMap<pg_sys::Oid, pg_sys::Oid>> =
+            RefCell::new(HashMap::with_capacity(16));
+    }
+    if let Some(oid) = CACHE.with(|cache| cache.borrow().get(&typid).copied()) {
+        return Some(oid);
+    }
+
+    unsafe {
+        let mut output_oid = pg_sys::InvalidOid;
+        let mut is_varlena = false;
+        pg_sys::getTypeOutputInfo(typid, &raw mut output_oid, &raw mut is_varlena);
+        if output_oid == pg_sys::InvalidOid {
+            return None;
+        }
+        CACHE.with(|cache| {
+            cache.borrow_mut().insert(typid, output_oid);
+        });
+        Some(output_oid)
+    }
+}
+
 unsafe fn clear_slot(slot: *mut pg_sys::TupleTableSlot) -> *mut pg_sys::TupleTableSlot {
     unsafe {
-        if !slot.is_null() {
-            pg_sys::ExecClearTuple(slot)
-        } else {
+        if slot.is_null() {
             slot
+        } else {
+            pg_sys::ExecClearTuple(slot)
         }
     }
 }

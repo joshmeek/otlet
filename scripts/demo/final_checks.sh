@@ -1,4 +1,4 @@
-runtime_contract="$(psql_value "
+runtime_contract="$(psql_exec -qAt -v model_name="$cheap_model_name" <<'SQL'
 SELECT runtime_status || '|' ||
        slot_state || '|' ||
        COALESCE(tokens_per_second::text, '') || '|' ||
@@ -8,9 +8,10 @@ SELECT runtime_status || '|' ||
        COALESCE(inference_cache_last_eviction_reason, '') || '|' ||
        COALESCE(worker_memory_sample_policy, '')
 FROM otlet.runtime_status
-WHERE model_name = '$cheap_model_name'
+WHERE model_name = :'model_name'
 LIMIT 1;
-")"
+SQL
+)"
 echo "runtime_status_contract=$runtime_contract"
 for term in \
   "ready|ready" \
@@ -20,6 +21,16 @@ for term in \
   "linux_proc_self_status_vmrss_vmsize_sampled_after_worker_run"; do
   require_contains "$runtime_contract" "$term" "Expected runtime status to contain $term"
 done
+
+task_cache_view_contract="$(psql_exec -qAt <<'SQL'
+SELECT (to_regclass('otlet.task_inference_cache_status') IS NOT NULL)::text;
+SQL
+)"
+echo "task_cache_view_contract=$task_cache_view_contract"
+[ "$task_cache_view_contract" = "true" ] || {
+  echo "Expected otlet.task_inference_cache_status to exist" >&2
+  exit 1
+}
 
 log "Checking estimated planner on 1M-row source"
 planner_1m_output="$(
@@ -84,6 +95,11 @@ echo "planner_1m_contract=$planner_1m_contract"
   echo "Expected estimated 1M-row plan under 100ms, got $planner_1m_contract" >&2
   exit 1
 }
+
+psql_exec >/dev/null <<'SQL'
+SELECT otlet.drop_watch('plan_1m_demo');
+DROP TABLE IF EXISTS public.otlet_plan_1m;
+SQL
 
 colon_subject_watch="colon_subject_demo"
 colon_subject_task="${colon_subject_watch}_task"
@@ -214,7 +230,9 @@ FROM action_row a
 JOIN output_row o ON o.subject_id = a.subject_id;
 SELECT otlet.materialize_semantic_index_subject(:'watch_name', 'tenant:colon-fragment-only:1');
 SQL
-colon_subject_contract="$(psql_value "
+colon_subject_contract="$(psql_exec -qAt \
+  -v watch_name="$colon_subject_watch" \
+  -v task_name="$colon_subject_task" <<'SQL'
 CREATE TEMP TABLE colon_subject_contract_parts (
   key text PRIMARY KEY,
   value text NOT NULL
@@ -222,7 +240,7 @@ CREATE TEMP TABLE colon_subject_contract_parts (
 INSERT INTO colon_subject_contract_parts
 SELECT 'before_mark',
        count(*)::text
-FROM otlet.semantic_index_current_rows('$colon_subject_watch', true)
+FROM otlet.semantic_index_current_rows(:'watch_name', true)
 WHERE subject_id = 'tenant:colon-fragment-only:1';
 INSERT INTO colon_subject_contract_parts
 SELECT 'fragment_mark',
@@ -231,7 +249,7 @@ INSERT INTO colon_subject_contract_parts
 SELECT 'after_fragment',
        count(*)::text
 FROM otlet.semantic_materializations
-WHERE task_name = '$colon_subject_task'
+WHERE task_name = :'task_name'
   AND subject_id = 'tenant:colon-fragment-only:1'
   AND stale;
 INSERT INTO colon_subject_contract_parts
@@ -241,31 +259,31 @@ INSERT INTO colon_subject_contract_parts
 SELECT 'after_exact',
        count(*)::text
 FROM otlet.semantic_materializations
-WHERE task_name = '$colon_subject_task'
+WHERE task_name = :'task_name'
   AND subject_id = 'tenant:colon-fragment-only:1'
   AND stale;
 INSERT INTO colon_subject_contract_parts
 SELECT 'lookup_after_exact',
        count(*)::text
-FROM otlet.semantic_index_current_rows('$colon_subject_watch', true)
+FROM otlet.semantic_index_current_rows(:'watch_name', true)
 WHERE subject_id = 'tenant:colon-fragment-only:1';
 WITH validation AS (
   SELECT
     COALESCE(otlet.action_validation_error(
-      '{\"type\":\"merge_candidate\",\"body\":{\"left_id\":\"tenant:left:1\",\"right_id\":\"tenant:right:2\",\"confidence\":\"high\",\"reason\":\"same\"}}'::jsonb,
-      '{\"match\":\"same_entity\",\"confidence\":\"high\",\"reason\":\"same\"}'::jsonb,
+      '{"type":"merge_candidate","body":{"left_id":"tenant:left:1","right_id":"tenant:right:2","confidence":"high","reason":"same"}}'::jsonb,
+      '{"match":"same_entity","confidence":"high","reason":"same"}'::jsonb,
       'tenant:left:1:tenant:right:2',
-      '{\"action_ids\":{\"left_id\":\"tenant:left:1\",\"right_id\":\"tenant:right:2\"}}'::jsonb
+      '{"action_ids":{"left_id":"tenant:left:1","right_id":"tenant:right:2"}}'::jsonb
     ), 'ok') AS valid_pair,
     COALESCE(otlet.action_validation_error(
-      '{\"type\":\"merge_candidate\",\"body\":{\"left_id\":\"tenant:left:1\",\"right_id\":\"tenant:right:wrong\",\"confidence\":\"high\",\"reason\":\"same\"}}'::jsonb,
-      '{\"match\":\"same_entity\",\"confidence\":\"high\",\"reason\":\"same\"}'::jsonb,
+      '{"type":"merge_candidate","body":{"left_id":"tenant:left:1","right_id":"tenant:right:wrong","confidence":"high","reason":"same"}}'::jsonb,
+      '{"match":"same_entity","confidence":"high","reason":"same"}'::jsonb,
       'tenant:left:1:tenant:right:2',
-      '{\"action_ids\":{\"left_id\":\"tenant:left:1\",\"right_id\":\"tenant:right:2\"}}'::jsonb
+      '{"action_ids":{"left_id":"tenant:left:1","right_id":"tenant:right:2"}}'::jsonb
     ), 'ok') AS invalid_pair,
     COALESCE(otlet.action_validation_error(
-      '{\"type\":\"merge_candidate\",\"body\":{\"left_id\":\"tenant:left:1\",\"right_id\":\"tenant:right:2\",\"confidence\":\"high\",\"reason\":\"same\"}}'::jsonb,
-      '{\"match\":\"same_entity\",\"confidence\":\"high\",\"reason\":\"same\"}'::jsonb,
+      '{"type":"merge_candidate","body":{"left_id":"tenant:left:1","right_id":"tenant:right:2","confidence":"high","reason":"same"}}'::jsonb,
+      '{"match":"same_entity","confidence":"high","reason":"same"}'::jsonb,
       'tenant:left:1:tenant:right:2',
       '{}'::jsonb
     ), 'ok') AS missing_action_ids
@@ -279,7 +297,8 @@ SELECT (SELECT value FROM colon_subject_contract_parts WHERE key = 'before_mark'
        (SELECT valid_pair FROM validation) || '|' ||
        (SELECT invalid_pair FROM validation) || '|' ||
        (SELECT missing_action_ids FROM validation);
-")"
+SQL
+)"
 echo "colon_subject_safety_contract=$colon_subject_contract"
 [ "$colon_subject_contract" = "1|0|0|1|1|0|ok|merge_candidate subject ids must match job subject_id|merge_candidate requires input.action_ids left_id and right_id" ] || {
   echo "Expected colon subject IDs to validate and stale-mark only by exact subject, got $colon_subject_contract" >&2
@@ -290,37 +309,89 @@ SELECT otlet.drop_watch(:'watch_name');
 DROP TABLE IF EXISTS public.otlet_demo_colon_subject;
 SQL
 
-performance_ratio_contract="$(psql_value "
+performance_ratio_contract="$(psql_exec -qAt <<'SQL'
 SELECT trusted_output_rows::text || '|' ||
        model_invocations::text || '|' ||
        round(model_invocations_per_trusted_row, 3)::text || '|' ||
        model_processed_tokens::text || '|' ||
        round(model_processed_tokens_per_trusted_row, 3)::text
 FROM otlet.production_status;
-")"
+SQL
+)"
 echo "performance_ratio_contract=$performance_ratio_contract"
 require_regex "$performance_ratio_contract" '^[1-9][0-9]*\|[1-9][0-9]*\|[0-9]+(\.[0-9]+)?\|[1-9][0-9]*\|[0-9]+(\.[0-9]+)?$' "Expected production_status to expose positive model-work ratios"
 
-materialization_failure_status_contract="$(psql_value "
+audit_export_contract="$(psql_value <<'SQL'
+SELECT (SELECT count(*) FROM otlet.redaction_policy_status)::text || '|' ||
+       (SELECT count(*) > 0 FROM otlet.audit_receipt_export)::text || '|' ||
+       (SELECT count(*) > 0 FROM otlet.audit_review_export)::text || '|' ||
+       (SELECT count(*) > 0 FROM otlet.audit_eval_label_export)::text || '|' ||
+       (SELECT count(*) > 0 FROM otlet.semantic_dependency_audit)::text || '|' ||
+       (SELECT count(*) > 0 FROM otlet.worker_batch_timing_status)::text || '|' ||
+       (SELECT NOT EXISTS (
+          SELECT 1
+          FROM information_schema.columns
+          WHERE table_schema = 'otlet'
+            AND table_name = 'audit_receipt_export'
+            AND column_name IN ('trace_summary', 'raw_output', 'prompt')
+        ))::text;
+SQL
+)"
+echo "audit_export_contract=$audit_export_contract"
+[ "$audit_export_contract" = "1|true|true|true|true|true|true" ] || {
+  echo "Expected audit export surfaces and redaction withholdings, got $audit_export_contract" >&2
+  exit 1
+}
+
+prepared_metadata_output="$(psql_value -v watch_name="$row_customscan_watch" <<'SQL'
+BEGIN;
+PREPARE otlet_prepared_metadata_probe AS
+SELECT count(*)
+FROM public.otlet_demo_customscan_signal
+WHERE otlet.semantic_matches(:'watch_name', id, '{}'::jsonb);
+EXECUTE otlet_prepared_metadata_probe;
+UPDATE otlet.semantic_indexes
+SET record_type = 'prepared_metadata_probe'
+WHERE name = :'watch_name';
+EXECUTE otlet_prepared_metadata_probe;
+ROLLBACK;
+SQL
+)"
+prepared_metadata_contract="$(head -n 1 <<<"$prepared_metadata_output")|$(tail -n 1 <<<"$prepared_metadata_output")"
+echo "prepared_metadata_contract=$prepared_metadata_contract"
+[ "$prepared_metadata_contract" = "1|0" ] || {
+  echo "Expected prepared CustomScan to reload current semantic metadata, got $prepared_metadata_contract" >&2
+  exit 1
+}
+
+materialization_failure_status_contract="$(psql_value -v model_name="$strong_model_name" <<'SQL'
 BEGIN;
 INSERT INTO otlet.worker_events (event_type, message, detail)
 VALUES (
   'semantic_materialization_failed',
   'demo rolled-back materialization failure visibility smoke',
-  '{\"task_name\":\"materialization_failure_status_demo\",\"model_name\":\"qwen35_4b\",\"error\":\"rolled back smoke\"}'::jsonb
+  jsonb_build_object(
+    'task_name', 'materialization_failure_status_demo',
+    'model_name', :'model_name',
+    'error', 'rolled back smoke'
+  )
 );
 SELECT (semantic_materialization_failed_events >= 1)::text || '|' ||
        (semantic_materialization_last_failed_at IS NOT NULL)::text
 FROM otlet.production_status;
 ROLLBACK;
-")"
+SQL
+)"
 echo "materialization_failure_status_contract=$materialization_failure_status_contract"
 [ "$materialization_failure_status_contract" = "true|true" ] || {
   echo "Expected materialization failure status contract true|true, got $materialization_failure_status_contract" >&2
   exit 1
 }
 
-invariant_contract="$(psql_value "SELECT count(*) FROM otlet.verify_invariants();")"
+invariant_contract="$(psql_exec -qAt <<'SQL'
+SELECT count(*) FROM otlet.verify_invariants();
+SQL
+)"
 echo "invariant_contract=$invariant_contract"
 if [ "$invariant_contract" != "0" ]; then
   psql_exec -P border=2 -P null='' <<'SQL'

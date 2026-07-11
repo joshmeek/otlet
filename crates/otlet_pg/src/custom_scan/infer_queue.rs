@@ -1,30 +1,66 @@
+thread_local! {
+    // Match infer_now INPUT_CAP so typical slot JSON avoids growth reallocs.
+    static SEMANTIC_SLOT_INPUT_BYTES: RefCell<Vec<u8>> =
+        RefCell::new(Vec::with_capacity(8192));
+}
+
+const INFER_NOW_INPUT_MISSING: &str =
+    "tuple-slot infer-now input missing; SPI fallback disabled";
+
+fn with_semantic_slot_input_bytes<R>(
+    runtime: &RuntimeState,
+    subject_id: &str,
+    slot: *mut pg_sys::TupleTableSlot,
+    f: impl FnOnce(&[u8]) -> Result<R, String>,
+) -> Result<R, String> {
+    let input = semantic_slot_input(runtime, subject_id, slot)
+        .map_err(|err| format!("tuple-slot infer-now input failed; SPI fallback disabled: {err}"))?
+        .ok_or_else(|| INFER_NOW_INPUT_MISSING.to_owned())?;
+
+    SEMANTIC_SLOT_INPUT_BYTES.with(|cell| {
+        let mut bytes = cell.borrow_mut();
+        bytes.clear();
+        serde_json::to_writer(&mut *bytes, &input).map_err(|err| err.to_string())?;
+        f(&bytes)
+    })
+}
+
 fn queue_refresh_if_allowed(runtime: &mut RuntimeState, subject_id: &str) {
     if !runtime.allow_refresh || runtime.queued_refresh_subjects.contains(subject_id) {
         return;
     }
-    runtime
-        .queued_refresh_subjects
-        .insert(subject_id.to_string());
     match queue_subject_refresh(&runtime.task_name, subject_id) {
-        Ok(true) => runtime.queued_refreshes += 1,
-        Ok(false) => {}
+        Ok(true) => {
+            runtime
+                .queued_refresh_subjects
+                .insert(subject_id.to_owned());
+            runtime.queued_refreshes += 1;
+        }
+        Ok(false) => {
+            // Subject already had an active job; remember so we do not re-SPI.
+            runtime
+                .queued_refresh_subjects
+                .insert(subject_id.to_owned());
+        }
         Err(err) => pgrx::warning!("otlet semantic CustomScan refresh queue failed: {err}"),
     }
 }
 
 fn queue_subject_refresh(task_name: &str, subject_id: &str) -> Result<bool, String> {
-    let query = format!(
-        "SELECT otlet.run_task_subject({}, {})::bigint AS queued",
-        sql_literal(task_name),
-        sql_literal(subject_id)
-    );
     pgrx::Spi::connect(|client| {
+        let args = [task_name.into(), subject_id.into()];
         let table = client
-            .select(query.as_str(), Some(1), &[])
+            .select(
+                "SELECT otlet.run_task_subject($1, $2)::bigint AS queued",
+                Some(1),
+                &args,
+            )
             .map_err(to_string)?;
         let row = table.first();
-        let queued = row.get_by_name::<i64, _>("queued").map_err(to_string)?;
-        Ok(queued.unwrap_or(0) > 0)
+        let Some(queued) = row.get::<i64>(1).map_err(to_string)? else {
+            return Err("otlet.run_task_subject returned null queued count".to_owned());
+        };
+        Ok(queued > 0)
     })
 }
 
@@ -37,39 +73,115 @@ fn wait_for_refresh_if_allowed(
         return Ok(SemanticResolution::Unresolved);
     }
     let start = unsafe { pg_sys::GetCurrentTimestamp() };
-    let max_wait_ms = runtime.wait_ms.min(10_000) as std::ffi::c_int;
+    let max_wait_ms = std::ffi::c_int::try_from(runtime.wait_ms.min(10_000))
+        .unwrap_or(std::ffi::c_int::MAX);
     let mut active_seen = active_seen_before_wait;
+    let mut sleep_us: i64 = 50_000;
     loop {
         unsafe {
             pg_sys::ProcessInterrupts();
         }
-        let active =
-            with_latest_snapshot(|| active_subject_refreshes(&runtime.task_name, subject_id))?;
-        if active == 0 {
-            if !active_seen {
+        // One snapshot+SPI: poll active jobs; on completion transition, materialize
+        // and re-read state without a second connect.
+        let outcome = with_latest_snapshot(|| {
+            wait_poll_active_or_materialize(runtime, subject_id, active_seen)
+        })?;
+        match outcome {
+            WaitPollOutcome::StillActive => {
+                active_seen = true;
+            }
+            WaitPollOutcome::NeverActive => {
                 return Ok(SemanticResolution::Unresolved);
             }
-            with_latest_snapshot(|| materialize_semantic_subject(runtime, subject_id))?;
-            let state = refresh_runtime_subject_state(runtime, subject_id)?;
-            match state {
-                SubjectSemanticState::FreshMatch => return Ok(SemanticResolution::Match),
-                SubjectSemanticState::FreshNonMatch => return Ok(SemanticResolution::NonMatch),
-                _ => return Ok(SemanticResolution::Unresolved),
+            WaitPollOutcome::Resolved(state) => {
+                return Ok(match state {
+                    SubjectSemanticState::FreshMatch => SemanticResolution::Match,
+                    SubjectSemanticState::FreshNonMatch => SemanticResolution::NonMatch,
+                    _ => SemanticResolution::Unresolved,
+                });
             }
-        } else {
-            active_seen = true;
         }
         let now = unsafe { pg_sys::GetCurrentTimestamp() };
         if unsafe { pg_sys::TimestampDifferenceExceeds(start, now, max_wait_ms) } {
             return Ok(SemanticResolution::Unresolved);
         }
         unsafe {
-            pg_sys::pg_usleep(50_000);
+            pg_sys::pg_usleep(sleep_us);
         }
+        // Back off while still in-flight so long waits do not SPI-poll every 50ms.
+        sleep_us = (sleep_us.saturating_mul(2)).min(200_000);
     }
 }
 
-fn should_prefetch_infer_now(runtime: &RuntimeState) -> bool {
+enum WaitPollOutcome {
+    StillActive,
+    NeverActive,
+    Resolved(SubjectSemanticState),
+}
+
+fn wait_poll_active_or_materialize(
+    runtime: &mut RuntimeState,
+    subject_id: &str,
+    active_seen: bool,
+) -> Result<WaitPollOutcome, String> {
+    // Cheap active-only probe until we have seen an active job. After that, one
+    // SELECT gates materialize on !is_active and returns subject state.
+    let fused_sql = match runtime.index_kind {
+        SemanticIndexKind::Row => SEMANTIC_ROW_WAIT_MATERIALIZE_STATE_SQL,
+        SemanticIndexKind::Join => SEMANTIC_JOIN_WAIT_MATERIALIZE_STATE_SQL,
+    };
+    pgrx::Spi::connect(|client| {
+        if !active_seen {
+            let active_args = [runtime.task_name.as_str().into(), subject_id.into()];
+            let active_table = client
+                .select(
+                    "SELECT true AS active \
+                     FROM otlet.jobs \
+                     WHERE task_name = $1 \
+                       AND subject_id = $2 \
+                       AND status IN ('queued', 'running', 'cancel_requested') \
+                     LIMIT 1",
+                    Some(1),
+                    &active_args,
+                )
+                .map_err(to_string)?;
+            // Empty set = no active job (same as EXISTS false). A present row is true.
+            if !active_table.is_empty() {
+                return Ok(WaitPollOutcome::StillActive);
+            }
+            return Ok(WaitPollOutcome::NeverActive);
+        }
+
+        let state_args = match runtime.index_kind {
+            SemanticIndexKind::Row => vec![
+                runtime.index_name.as_str().into(),
+                subject_id.into(),
+                runtime.expected_json.as_str().into(),
+                runtime.task_name.as_str().into(),
+                runtime.record_type.as_str().into(),
+            ],
+            SemanticIndexKind::Join => vec![
+                runtime.index_name.as_str().into(),
+                subject_id.into(),
+                runtime.expected_json.as_str().into(),
+                runtime.task_name.as_str().into(),
+            ],
+        };
+        let state_table = client
+            .select(fused_sql, Some(1), &state_args)
+            .map_err(to_string)?;
+        let (is_active, state) = wait_poll_state_from_spi_table(state_table)?;
+        if is_active {
+            return Ok(WaitPollOutcome::StillActive);
+        }
+        runtime
+            .semantic_states
+            .insert(subject_id.to_owned(), state);
+        Ok(WaitPollOutcome::Resolved(state))
+    })
+}
+
+const fn should_prefetch_infer_now(runtime: &RuntimeState) -> bool {
     runtime.infer_ms > 0 && runtime.infer_max_rows > 1 && !runtime.allow_refresh
 }
 
@@ -85,15 +197,16 @@ unsafe fn prefetch_infer_now_batch(
         return Ok(());
     }
 
-    let mut rows = Vec::new();
+    let mut rows = Vec::with_capacity(target_infer_count.saturating_mul(2).max(4));
     if !submit_prefetched_infer_row(runtime, current_subject_id, current_slot, &mut rows)? {
         runtime.fail_closed_rows = runtime.fail_closed_rows.saturating_add(1);
         return Ok(());
     }
 
+    let mut prefetched_infers = 1usize;
     let mut prefetched_source_rows = 1usize;
     loop {
-        if prefetched_infer_count(&rows) >= target_infer_count {
+        if prefetched_infers >= target_infer_count {
             break;
         }
         if prefetched_source_rows >= runtime.infer_max_rows as usize {
@@ -106,7 +219,11 @@ unsafe fn prefetch_infer_now_batch(
         runtime.rows_seen = runtime.rows_seen.saturating_add(1);
         let mut isnull = false;
         let value = unsafe {
-            pg_sys::slot_getattr(slot, runtime.subject_attno as std::ffi::c_int, &mut isnull)
+            pg_sys::slot_getattr(
+                slot,
+                std::ffi::c_int::from(runtime.subject_attno),
+                &raw mut isnull,
+            )
         };
         if isnull {
             continue;
@@ -114,12 +231,12 @@ unsafe fn prefetch_infer_now_batch(
         let Some(subject_id) = (unsafe { datum_to_text(value, runtime.subject_typid) }) else {
             continue;
         };
-        match runtime
+        let semantic_state = runtime
             .semantic_states
             .get(&subject_id)
             .copied()
-            .unwrap_or(SubjectSemanticState::Missing)
-        {
+            .unwrap_or(SubjectSemanticState::Missing);
+        match semantic_state {
             SubjectSemanticState::FreshMatch => {
                 runtime.fresh_matches = runtime.fresh_matches.saturating_add(1);
                 runtime.lookup_rows = runtime.lookup_rows.saturating_add(1);
@@ -131,20 +248,15 @@ unsafe fn prefetch_infer_now_batch(
                 runtime.lookup_rows = runtime.lookup_rows.saturating_add(1);
             }
             SubjectSemanticState::Stale | SubjectSemanticState::Missing => {
-                if runtime
-                    .semantic_states
-                    .get(&subject_id)
-                    .copied()
-                    .unwrap_or(SubjectSemanticState::Missing)
-                    == SubjectSemanticState::Stale
-                {
+                if semantic_state == SubjectSemanticState::Stale {
                     runtime.stale_rows = runtime.stale_rows.saturating_add(1);
                 } else {
                     runtime.missing_rows = runtime.missing_rows.saturating_add(1);
                 }
-                if prefetched_infer_count(&rows) < target_infer_count
+                if prefetched_infers < target_infer_count
                     && submit_prefetched_infer_row(runtime, &subject_id, slot, &mut rows)?
                 {
+                    prefetched_infers = prefetched_infers.saturating_add(1);
                     continue;
                 }
                 runtime.fail_closed_rows = runtime.fail_closed_rows.saturating_add(1);
@@ -163,45 +275,38 @@ unsafe fn prefetch_infer_now_batch(
 
 fn remaining_infer_capacity(runtime: &RuntimeState) -> usize {
     let policy_remaining = (runtime.infer_max_rows as usize)
-        .saturating_sub(runtime.infer_now_batches as usize);
+        .saturating_sub(usize::try_from(runtime.infer_now_batches).unwrap_or(usize::MAX));
     let queue_remaining = crate::infer_now::queue_snapshot().available_slots;
     policy_remaining.min(queue_remaining)
 }
 
-fn prefetched_infer_count(rows: &[PrefetchedRow]) -> usize {
-    rows.iter()
-        .filter(|row| matches!(row, PrefetchedRow::Infer(_)))
-        .count()
-}
-
 fn submit_prefetched_infer_row(
-    runtime: &mut RuntimeState,
+    runtime: &RuntimeState,
     subject_id: &str,
     slot: *mut pg_sys::TupleTableSlot,
     rows: &mut Vec<PrefetchedRow>,
 ) -> Result<bool, String> {
-    if runtime.infer_ms == 0 || runtime.infer_now_batches >= runtime.infer_max_rows as u64 {
+    if runtime.infer_ms == 0 || runtime.infer_now_batches >= u64::from(runtime.infer_max_rows) {
         return Ok(false);
     }
-    let input = semantic_slot_input(runtime, subject_id, slot)
-        .map_err(|err| format!("tuple-slot infer-now input failed; SPI fallback disabled: {err}"))?
-        .ok_or_else(|| "tuple-slot infer-now input missing; SPI fallback disabled".to_string())?;
-    let submitted_at = unsafe { pg_sys::GetCurrentTimestamp() };
-    let snapshot_before = crate::infer_now::snapshot();
-    let Some(submitted) =
-        crate::infer_now::submit_infer_now(&runtime.task_name, subject_id, &input)?
-    else {
-        return Ok(false);
-    };
-    let buffered_slot = unsafe { copy_slot_buffer(slot)? };
-    rows.push(PrefetchedRow::Infer(PendingInferNowRow {
-        subject_id: subject_id.to_string(),
-        slot: buffered_slot,
-        submitted,
-        submitted_at,
-        snapshot_before,
-    }));
-    Ok(true)
+    with_semantic_slot_input_bytes(runtime, subject_id, slot, |input_bytes| {
+        let submitted_at = unsafe { pg_sys::GetCurrentTimestamp() };
+        let snapshot_before = crate::infer_now::snapshot();
+        let Some(submitted) =
+            crate::infer_now::submit_infer_now_bytes(&runtime.task_name, subject_id, input_bytes)?
+        else {
+            return Ok(false);
+        };
+        let buffered_slot = unsafe { copy_slot_buffer(slot)? };
+        rows.push(PrefetchedRow::Infer(PendingInferNowRow {
+            subject_id: subject_id.to_owned(),
+            slot: buffered_slot,
+            submitted,
+            submitted_at,
+            snapshot_before,
+        }));
+        Ok(true)
+    })
 }
 
 fn resolve_prefetched_rows(runtime: &mut RuntimeState, rows: Vec<PrefetchedRow>) {
@@ -233,7 +338,7 @@ fn resolve_prefetched_rows(runtime: &mut RuntimeState, rows: Vec<PrefetchedRow>)
                     }
                     Err(err) => {
                         runtime.infer_now_failures = runtime.infer_now_failures.saturating_add(1);
-                        runtime.infer_now_last_error = truncate_infer_now_error(&err);
+                        truncate_infer_now_error_into(&mut runtime.infer_now_last_error, &err);
                         runtime.fail_closed_rows = runtime.fail_closed_rows.saturating_add(1);
                         unsafe {
                             pg_sys::ExecDropSingleTupleTableSlot(pending.slot);
@@ -284,7 +389,7 @@ fn wait_for_prefetched_infer_row(
     }
 }
 
-fn record_infer_now_timeout_deltas(
+const fn record_infer_now_timeout_deltas(
     runtime: &mut RuntimeState,
     before: crate::infer_now::InferNowSnapshot,
     after: crate::infer_now::InferNowSnapshot,
@@ -301,18 +406,18 @@ unsafe fn copy_slot_buffer(
 ) -> Result<*mut pg_sys::TupleTableSlot, String> {
     unsafe {
         if slot.is_null() {
-            return Err("cannot copy null tuple slot".to_string());
+            return Err("cannot copy null tuple slot".to_owned());
         }
         if (*slot).tts_tupleDescriptor.is_null() {
-            return Err("cannot copy tuple slot without tuple descriptor".to_string());
+            return Err("cannot copy tuple slot without tuple descriptor".to_owned());
         }
         if (*slot).tts_ops.is_null() {
-            return Err("cannot copy tuple slot without slot ops".to_string());
+            return Err("cannot copy tuple slot without slot ops".to_owned());
         }
         let buffered_slot =
             pg_sys::MakeSingleTupleTableSlot((*slot).tts_tupleDescriptor, (*slot).tts_ops);
         if buffered_slot.is_null() {
-            return Err("MakeSingleTupleTableSlot returned null".to_string());
+            return Err("MakeSingleTupleTableSlot returned null".to_owned());
         }
         pg_sys::ExecCopySlot(buffered_slot, slot);
         Ok(buffered_slot)
@@ -328,16 +433,22 @@ fn infer_now_or_record_failure(
         Ok(resolution) => resolution,
         Err(err) => {
             runtime.infer_now_failures = runtime.infer_now_failures.saturating_add(1);
-            runtime.infer_now_last_error = truncate_infer_now_error(&err);
+            truncate_infer_now_error_into(&mut runtime.infer_now_last_error, &err);
             pgrx::warning!("otlet semantic CustomScan infer-now failed: {err}");
             SemanticResolution::Unresolved
         }
     }
 }
 
-fn truncate_infer_now_error(error: &str) -> String {
+fn truncate_infer_now_error_into(dst: &mut String, error: &str) {
     const MAX_ERROR_CHARS: usize = 512;
-    error.chars().take(MAX_ERROR_CHARS).collect()
+    dst.clear();
+    // UTF-8 byte length upper-bounds char count, so this is a safe fast path.
+    if error.len() <= MAX_ERROR_CHARS {
+        dst.push_str(error);
+        return;
+    }
+    dst.extend(error.chars().take(MAX_ERROR_CHARS));
 }
 
 fn infer_now_if_allowed(
@@ -345,17 +456,15 @@ fn infer_now_if_allowed(
     subject_id: &str,
     slot: *mut pg_sys::TupleTableSlot,
 ) -> Result<SemanticResolution, String> {
-    if runtime.infer_ms == 0 || runtime.infer_now_batches >= runtime.infer_max_rows as u64 {
+    if runtime.infer_ms == 0 || runtime.infer_now_batches >= u64::from(runtime.infer_max_rows) {
         return Ok(SemanticResolution::Unresolved);
     }
 
-    let input = semantic_slot_input(runtime, subject_id, slot)
-        .map_err(|err| format!("tuple-slot infer-now input failed; SPI fallback disabled: {err}"))?
-        .ok_or_else(|| "tuple-slot infer-now input missing; SPI fallback disabled".to_string())?;
     let start = unsafe { pg_sys::GetCurrentTimestamp() };
     let infer_state_before = crate::infer_now::snapshot();
-    let request = crate::infer_now::submit_infer_now(&runtime.task_name, subject_id, &input);
-    let submitted = match request {
+    let submitted = match with_semantic_slot_input_bytes(runtime, subject_id, slot, |input_bytes| {
+        crate::infer_now::submit_infer_now_bytes(&runtime.task_name, subject_id, input_bytes)
+    }) {
         Ok(Some(submitted)) => submitted,
         Ok(None) => {
             runtime.infer_now_ms = runtime.infer_now_ms.saturating_add(wait_elapsed_ms(start));
@@ -402,10 +511,59 @@ fn finish_infer_now_success(
         return Ok(SemanticResolution::Unresolved);
     }
     runtime.infer_now_batches += 1;
-    record_infer_now_executor_context(runtime, job_id)?;
-    // Worker materializes semantic state before finishing infer-now; refresh
-    // local scan state instead of repeating materialization SPI here.
-    let provenance = with_latest_snapshot(|| infer_now_provenance_counts(job_id))?;
+    // One SPI session: stamp executor context, read provenance, refresh subject.
+    let state = with_latest_snapshot(|| {
+        finish_infer_now_success_spi(runtime, subject_id, job_id)
+    })?;
+    runtime.infer_now_ms = runtime.infer_now_ms.saturating_add(wait_elapsed_ms(start));
+    match state {
+        SubjectSemanticState::FreshMatch => Ok(SemanticResolution::Match),
+        SubjectSemanticState::FreshNonMatch => Ok(SemanticResolution::NonMatch),
+        _ => Ok(SemanticResolution::Unresolved),
+    }
+}
+
+fn finish_infer_now_success_spi(
+    runtime: &mut RuntimeState,
+    subject_id: &str,
+    job_id: i64,
+) -> Result<SubjectSemanticState, String> {
+    let fused_sql = match runtime.index_kind {
+        SemanticIndexKind::Row => INFER_NOW_PROVENANCE_AND_ROW_STATE_SQL,
+        SemanticIndexKind::Join => INFER_NOW_PROVENANCE_AND_JOIN_STATE_SQL,
+    };
+    // One SPI session: stamp via update (volatile), then one pure SELECT for
+    // provenance + subject refresh. Avoids UPDATE-in-SELECT under non-volatile
+    // CustomScan contexts. Executor context is frozen at begin-scan.
+    let (provenance, state) = pgrx::Spi::connect_mut(|client| {
+        let update_args = [
+            job_id.into(),
+            runtime.infer_now_executor_context_json.as_str().into(),
+        ];
+        client
+            .update(INFER_NOW_STAMP_EXECUTOR_CONTEXT_SQL, None, &update_args)
+            .map_err(to_string)?;
+        let fused_args = match runtime.index_kind {
+            SemanticIndexKind::Row => vec![
+                job_id.into(),
+                subject_id.into(),
+                runtime.expected_json.as_str().into(),
+                runtime.task_name.as_str().into(),
+                runtime.record_type.as_str().into(),
+            ],
+            SemanticIndexKind::Join => vec![
+                job_id.into(),
+                runtime.index_name.as_str().into(),
+                subject_id.into(),
+                runtime.expected_json.as_str().into(),
+                runtime.task_name.as_str().into(),
+            ],
+        };
+        let fused_table = client
+            .select(fused_sql, Some(1), &fused_args)
+            .map_err(to_string)?;
+        provenance_and_state_from_spi_table(fused_table)
+    })?;
     runtime.infer_receipts = runtime.infer_receipts.saturating_add(provenance.receipts);
     runtime.infer_trace_receipt_id = provenance.receipt_id;
     runtime.infer_trace_prompt_tokens = runtime
@@ -417,17 +575,20 @@ fn finish_infer_now_success(
     runtime.infer_trace_generate_ms = runtime
         .infer_trace_generate_ms
         .saturating_add(provenance.generate_ms);
+    runtime.infer_trace_finish_sql_ms = runtime
+        .infer_trace_finish_sql_ms
+        .saturating_add(provenance.finish_sql_ms);
+    runtime.infer_trace_materialize_ms = runtime
+        .infer_trace_materialize_ms
+        .saturating_add(provenance.materialize_ms);
     runtime.infer_trace_version = provenance.trace_version;
     runtime.infer_trace_probability_status = provenance.probability_status;
     runtime.infer_trace_schema_force = provenance.schema_force;
     runtime.infer_trace_detailed_status = provenance.detailed_trace_status;
     runtime.infer_trace_detailed_captured_tokens = provenance.detailed_trace_captured_tokens;
     runtime.infer_trace_detailed_top_k = provenance.detailed_trace_top_k;
-    let state = refresh_runtime_subject_state(runtime, subject_id)?;
-    runtime.infer_now_ms = runtime.infer_now_ms.saturating_add(wait_elapsed_ms(start));
-    match state {
-        SubjectSemanticState::FreshMatch => Ok(SemanticResolution::Match),
-        SubjectSemanticState::FreshNonMatch => Ok(SemanticResolution::NonMatch),
-        _ => Ok(SemanticResolution::Unresolved),
-    }
+    runtime
+        .semantic_states
+        .insert(subject_id.to_owned(), state);
+    Ok(state)
 }

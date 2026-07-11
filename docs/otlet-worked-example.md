@@ -1,14 +1,14 @@
 # Otlet Worked Example
 
-Use this as a learning file, not a test harness. It is inspired by worked-example research from [this study](https://www.tandfonline.com/doi/full/10.1080/01443410.2023.2273762)
+Use this learning file as a worked example, following the structure from [this study](https://www.tandfonline.com/doi/full/10.1080/01443410.2023.2273762)
 
-You start with one real Otlet entity-resolution loop: keep vendor rows in ordinary Postgres tables, select hard candidate pairs in SQL, enqueue durable model work, let the resident worker try a cheap local model and escalate hard rows to a stronger local model, validate `same_entity` / `different_entity` / `unclear`, record typed actions, and keep receipts
+Follow one Docker-backed Otlet entity-resolution loop: leave vendor rows in Postgres tables, select hard candidate pairs in SQL, enqueue durable model work, let the resident worker try a cheap local model and escalate hard rows to a stronger local model, validate `same_entity` / `different_entity` / `unclear`, record typed actions, and preserve receipts
 
-Output blocks below come from a real Docker-backed run on July 7, 2026 with `./scripts/otlet-setup.sh` and `./scripts/otlet-demo.sh`. Job IDs, receipt IDs, timestamps, token counts, timings, and token rates vary by machine and cache state
+The output blocks come from a Docker-backed run on July 7, 2026 with `./scripts/otlet-setup.sh` and `./scripts/otlet-demo.sh`. Job IDs, receipt IDs, timestamps, token counts, timings, and token rates vary by machine and cache state
 
 ## Example Path
 
-Read once, then run it:
+Run these steps in order:
 
 1. Start a local Otlet runtime
 2. Inspect the source pairs
@@ -16,9 +16,9 @@ Read once, then run it:
 4. Read the accepted model outputs
 5. Inspect cheap-to-strong model selection
 6. Inspect typed actions and review state
-7. Check the same path through semantic joins, stale rows, traces, and production checks
+7. Check semantic joins, stale rows, traces, and production status
 
-Steps 1-6 teach the direct task. Step 7 shows the same contract in watches, CustomScan refresh, traces, and production status
+Steps 1-6 teach the direct task. Step 7 applies its contract to watches, CustomScan refresh, traces, and production status
 
 ## Step 1 - Start Local Otlet
 
@@ -49,7 +49,7 @@ docker exec -it otlet-postgres sh -lc '
 '
 ```
 
-At this point Postgres is running, the Otlet worker exists, and both local GGUF artifacts are visible inside the container
+Postgres now runs the Otlet worker with both local GGUF artifacts visible inside the container
 
 ## Step 2 - Inspect The Source Pairs
 
@@ -95,7 +95,7 @@ Observed contract output:
 entity_resolution_contract=4|same_entity|different_entity|4|4
 ```
 
-Read that as:
+The contract fields report:
 
 - 4 completed entity-resolution jobs
 - `vendor-1001:vendor-42` resolved as `same_entity`
@@ -130,7 +130,7 @@ Observed output:
 (4 rows)
 ```
 
-`otlet.runs` is the read surface for accepted outputs. You do not scrape model text from logs
+`otlet.runs` exposes accepted outputs through SQL
 
 ## Step 5 - Inspect Model Selection
 
@@ -164,7 +164,7 @@ A rejected cheap attempt is still evidence. The accepted strong attempt becomes 
 
 ## Step 6 - Inspect Typed Actions
 
-The model cannot mutate source tables. It can propose typed actions. Otlet validates the action vocabulary and review state:
+The application retains source-table write authority. The model proposes typed actions, and Otlet validates the action vocabulary and review state:
 
 ```text
 action_schema_contract=merge_candidate|new_entity|note|review_flag
@@ -173,7 +173,7 @@ action_status_contract=4|4|4|0
 failed_attempt_action_contract=0
 ```
 
-The full demo then approves and dry-runs the merge candidate, rejects one `new_entity` action to exercise review state, and proves source rows did not change:
+The demo then approves and dry-runs the merge candidate, rejects one `new_entity` action to exercise review state, and proves source rows did not change:
 
 ```text
 action_approve_contract=approved|approved|demo approval reason
@@ -185,7 +185,7 @@ source_write_contract=5|fa7672627cd7ab2a22aba2d9d7035815|5|fa7672627cd7ab2a22aba
 
 Otlet stores trusted actions. The application still owns merge authority
 
-## Step 7 - Check The Wider Path
+## Step 7 - Check Semantic And Production Paths
 
 After the direct task works, check semantic joins, stale rows, receipts, and production status:
 
@@ -199,6 +199,9 @@ receipt_trace_contract=8|8|8|8
 inference_visibility_status=true|true|true|true|true
 runtime_status_contract=ready|ready|35.71|true|true|true|none|linux_proc_self_status_vmrss_vmsize_sampled_after_worker_run
 planner_1m_contract=estimated|1000000|4.404|true
+performance_ratio_contract=34|43|1.265|15948|469.059
+materialization_failure_status_contract=true|true
+invariant_contract=0
 docker_crash_log_scan=ok
 ```
 
@@ -206,11 +209,11 @@ Check these fields in each path: source row identity, job, receipt, output, acti
 
 ## Detailed Walkthroughs
 
-Use these files when you want to run the solved steps by hand:
+Run the detailed paths by hand with these files:
 
 - [Entity resolution walkthrough](entity-resolution-walkthrough.md)
 - [Runtime and traces](runtime-and-traces.md)
 - [Semantic watches](semantic-watches.md)
 - [Production contract](production-contract.md)
 
-Use `./scripts/otlet-demo.sh` as the compact regression proof. Use this Markdown to learn the path before changing it
+Use this Markdown to learn the path, then run `./scripts/otlet-demo.sh` as the compact regression proof

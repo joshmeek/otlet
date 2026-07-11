@@ -18,11 +18,7 @@ unsafe extern "C-unwind" fn otlet_set_rel_pathlist(
         {
             return;
         }
-        let relid = if (*rte).rtekind == pg_sys::RTEKind::RTE_RELATION {
-            Some((*rte).relid)
-        } else {
-            None
-        };
+        let relid = ((*rte).rtekind == pg_sys::RTEKind::RTE_RELATION).then(|| (*rte).relid);
         let Some(predicate) =
             find_semantic_match_predicate((*rel).baserestrictinfo, rti, relid, (*rte).rtekind)
         else {
@@ -31,8 +27,8 @@ unsafe extern "C-unwind" fn otlet_set_rel_pathlist(
         if relation_has_rowmark(root, rti) {
             return;
         }
-        let target_has_subject =
-            path_target_has_subject_var((*rel).reltarget, rti, predicate.subject_attno);
+        let (target_has_subject, target_has_rel_var) =
+            path_target_var_flags((*rel).reltarget, rti, predicate.subject_attno);
         let executor_owned_policy = predicate.auto_policy
             || predicate.allow_refresh
             || predicate.wait_ms > 0
@@ -40,7 +36,7 @@ unsafe extern "C-unwind" fn otlet_set_rel_pathlist(
         if !target_has_subject
             && (predicate.index_kind == SemanticIndexKind::Join
                 || (!executor_owned_policy
-                    && !path_target_has_rel_var((*rel).reltarget, rti)
+                    && !target_has_rel_var
                     && !rel_has_lateral_ref(rel)))
         {
             return;
@@ -57,7 +53,7 @@ unsafe extern "C-unwind" fn otlet_set_rel_pathlist(
         };
         if predicate.index_kind == SemanticIndexKind::Join && child_path.is_null() {
             return;
-        };
+        }
         let filtered_row_cost = 1.0 + (*rel).rows.max(predicate.estimated_rows).max(1.0) * 0.02;
         let custom_total_cost = if predicate.index_kind == SemanticIndexKind::Join
             && (predicate.auto_policy
@@ -70,7 +66,7 @@ unsafe extern "C-unwind" fn otlet_set_rel_pathlist(
             predicate.planner_stats.path_cost.max(filtered_row_cost)
         };
         let custom_path =
-            pg_sys::palloc0(std::mem::size_of::<pg_sys::CustomPath>()) as *mut pg_sys::CustomPath;
+            pg_sys::palloc0(size_of::<pg_sys::CustomPath>()).cast::<pg_sys::CustomPath>();
         (*custom_path).path.type_ = pg_sys::NodeTag::T_CustomPath;
         (*custom_path).path.pathtype = pg_sys::NodeTag::T_CustomScan;
         (*custom_path).path.parent = rel;
@@ -105,7 +101,7 @@ unsafe fn relation_has_rowmark(root: *mut pg_sys::PlannerInfo, rti: pg_sys::Inde
             return false;
         }
         for i in 0..pg_sys::list_length((*root).rowMarks) {
-            let rowmark = pg_sys::list_nth((*root).rowMarks, i) as *mut pg_sys::PlanRowMark;
+            let rowmark = pg_sys::list_nth((*root).rowMarks, i).cast::<pg_sys::PlanRowMark>();
             if !rowmark.is_null() && ((*rowmark).rti == rti || (*rowmark).prti == rti) {
                 return true;
             }
@@ -145,25 +141,23 @@ unsafe extern "C-unwind" fn plan_semantic_custom_path(
         }
 
         let cscan =
-            pg_sys::palloc0(std::mem::size_of::<pg_sys::CustomScan>()) as *mut pg_sys::CustomScan;
+            pg_sys::palloc0(size_of::<pg_sys::CustomScan>()).cast::<pg_sys::CustomScan>();
         (*cscan).scan.plan.type_ = pg_sys::NodeTag::T_CustomScan;
         (*cscan).scan.plan.disabled_nodes = (*best_path).path.disabled_nodes;
         (*cscan).scan.plan.startup_cost = (*best_path).path.startup_cost;
         (*cscan).scan.plan.total_cost = (*best_path).path.total_cost;
         (*cscan).scan.plan.plan_rows = (*best_path).path.rows;
-        (*cscan).scan.plan.plan_width = if !(*best_path).path.pathtarget.is_null() {
-            (*(*best_path).path.pathtarget).width
-        } else {
+        (*cscan).scan.plan.plan_width = if (*best_path).path.pathtarget.is_null() {
             0
+        } else {
+            (*(*best_path).path.pathtarget).width
         };
         (*cscan).scan.plan.parallel_aware = false;
         (*cscan).scan.plan.parallel_safe = false;
         (*cscan).scan.plan.async_capable = false;
         (*cscan).scan.plan.targetlist = tlist;
         (*cscan).scan.plan.qual = ptr::null_mut();
-        (*cscan).scan.scanrelid = if is_join_index {
-            0
-        } else if rel.is_null() {
+        (*cscan).scan.scanrelid = if is_join_index || rel.is_null() {
             0
         } else {
             (*rel).relid
@@ -187,10 +181,10 @@ unsafe extern "C-unwind" fn plan_semantic_custom_path(
     }
 }
 
-fn planner_stats_unknown() -> SemanticPlannerStats {
+fn planner_stats_with_reason(reason: &'static str) -> SemanticPlannerStats {
     SemanticPlannerStats {
-        selected_path: "semantic_lookup".to_string(),
-        reason: "planner probe not run".to_string(),
+        selected_path: "semantic_lookup".to_owned(),
+        reason: reason.to_owned(),
         source_rows: 0,
         fresh_matches: 0,
         fresh_non_matches: 0,
@@ -201,10 +195,10 @@ fn planner_stats_unknown() -> SemanticPlannerStats {
         infer_decision_rows: 0,
         fail_closed_decision_rows: 0,
         model_ms: 2500.0,
-        model_cost_source: "static_fallback".to_string(),
+        model_cost_source: "static_fallback".to_owned(),
         path_cost: 1.0,
-        stale_reasons: "{}".to_string(),
-        count_basis: "unknown".to_string(),
+        stale_reasons: "{}".to_owned(),
+        count_basis: "unknown".to_owned(),
     }
 }
 
@@ -229,7 +223,7 @@ fn finish_planner_stats(
         let inferable_rows = stats.stale_rows.saturating_add(stats.missing_rows);
         let waited_rows = if wait_ms > 0 { stats.inflight_rows } else { 0 };
         let bounded_infer_rows = if infer_ms > 0 && infer_max_rows > 0 {
-            inferable_rows.min(infer_max_rows as u64)
+            inferable_rows.min(u64::from(infer_max_rows))
         } else {
             0
         };
@@ -247,7 +241,7 @@ fn finish_planner_stats(
         stats.fail_closed_decision_rows = fail_closed_rows;
         stats.path_cost = base_scan
             + lookup_cost
-            + waited_rows as f64 * (wait_ms as f64 / 100.0)
+            + waited_rows as f64 * (f64::from(wait_ms) / 100.0)
             + infer_cost
             + queued_rows as f64 * 0.50;
         stats.selected_path = selected_path_from_decisions(
@@ -255,7 +249,8 @@ fn finish_planner_stats(
             waited_rows,
             queued_rows,
             fail_closed_rows,
-        );
+        )
+        .to_owned();
         if unresolved > 0 {
             stats.reason = format!(
                 "auto semantic policy: fresh={} wait={} infer={} queue={} fail_closed={}",
@@ -271,13 +266,13 @@ fn finish_planner_stats(
         let bounded_infer_rows = stats
             .stale_rows
             .saturating_add(stats.missing_rows)
-            .min(infer_max_rows as u64);
+            .min(u64::from(infer_max_rows));
         stats.infer_decision_rows = bounded_infer_rows;
         stats.fail_closed_decision_rows = unresolved.saturating_sub(bounded_infer_rows);
         stats.path_cost = base_scan
             + lookup_cost
             + planner_bounded_infer_cost(stats, bounded_infer_rows, model_cost);
-        stats.selected_path = "bounded_infer_now".to_string();
+        stats.selected_path = "bounded_infer_now".to_owned();
         stats.reason = format!(
             "bounded infer-now over {bounded_infer_rows} unresolved rows; fresh={} stale={} missing={} in_flight={}",
             stats.fresh_matches, stats.stale_rows, stats.missing_rows, stats.inflight_rows
@@ -285,15 +280,15 @@ fn finish_planner_stats(
     } else if wait_ms > 0 && stats.inflight_rows > 0 {
         stats.fail_closed_decision_rows = unresolved.saturating_sub(stats.inflight_rows);
         stats.path_cost =
-            base_scan + lookup_cost + (stats.inflight_rows as f64 * wait_ms as f64 / 100.0);
-        stats.selected_path = "wait_for_refresh".to_string();
+            base_scan + lookup_cost + (stats.inflight_rows as f64 * f64::from(wait_ms) / 100.0);
+        stats.selected_path = "wait_for_refresh".to_owned();
         stats.reason = format!(
             "bounded wait for {} in-flight rows; fresh={} stale={} missing={}",
             stats.inflight_rows, stats.fresh_matches, stats.stale_rows, stats.missing_rows
         );
     } else if allow_refresh && unresolved > 0 {
         stats.path_cost = base_scan + lookup_cost + unresolved as f64 * 0.50;
-        stats.selected_path = "queue_refresh".to_string();
+        stats.selected_path = "queue_refresh".to_owned();
         stats.reason = format!(
             "queue refresh and fail closed for {unresolved} unresolved rows; fresh={}",
             stats.fresh_matches
@@ -301,14 +296,14 @@ fn finish_planner_stats(
     } else if unresolved > 0 {
         stats.fail_closed_decision_rows = unresolved;
         stats.path_cost = base_scan + lookup_cost;
-        stats.selected_path = "lookup_fail_closed".to_string();
+        stats.selected_path = "lookup_fail_closed".to_owned();
         stats.reason = format!(
             "fail closed for {unresolved} unresolved rows; fresh={}",
             stats.fresh_matches
         );
     } else {
         stats.path_cost = base_scan + lookup_cost;
-        stats.selected_path = "semantic_lookup".to_string();
+        stats.selected_path = "semantic_lookup".to_owned();
         stats.reason = format!(
             "all source rows resolved from fresh semantic state; fresh={}",
             stats.fresh_matches
@@ -321,7 +316,7 @@ fn selected_path_from_decisions(
     wait_rows: u64,
     queue_rows: u64,
     fail_closed_rows: u64,
-) -> String {
+) -> &'static str {
     if infer_rows > 0 {
         "bounded_infer_now"
     } else if wait_rows > 0 {
@@ -333,12 +328,11 @@ fn selected_path_from_decisions(
     } else {
         "semantic_lookup"
     }
-    .to_string()
 }
 
 fn planner_model_cost_unit(model_ms: f64, infer_ms: u32) -> f64 {
     let fallback_ms = if infer_ms > 0 {
-        infer_ms as f64
+        f64::from(infer_ms)
     } else {
         2500.0
     };
@@ -357,12 +351,10 @@ fn planner_bounded_infer_cost(
 ) -> f64 {
     let cache_reusable_rows = stats.cache_reusable_rows.min(bounded_infer_rows);
     let model_rows = bounded_infer_rows.saturating_sub(cache_reusable_rows);
-    model_rows as f64 * model_cost + cache_reusable_rows as f64 * planner_cache_hit_cost_unit()
+    model_rows as f64 * model_cost + cache_reusable_rows as f64 * PLANNER_CACHE_HIT_COST_UNIT
 }
 
-fn planner_cache_hit_cost_unit() -> f64 {
-    0.05
-}
+const PLANNER_CACHE_HIT_COST_UNIT: f64 = 0.05;
 
 fn estimated_result_rows(stats: &SemanticPlannerStats, predicate: &SemanticMatchPredicate) -> f64 {
     let mut rows = stats.fresh_matches;
@@ -375,7 +367,7 @@ fn estimated_result_rows(stats: &SemanticPlannerStats, predicate: &SemanticMatch
                 stats
                     .stale_rows
                     .saturating_add(stats.missing_rows)
-                    .min(predicate.infer_max_rows as u64),
+                    .min(u64::from(predicate.infer_max_rows)),
             );
         }
     } else if predicate.infer_ms > 0 && predicate.infer_max_rows > 0 {
@@ -383,7 +375,7 @@ fn estimated_result_rows(stats: &SemanticPlannerStats, predicate: &SemanticMatch
             stats
                 .stale_rows
                 .saturating_add(stats.missing_rows)
-                .min(predicate.infer_max_rows as u64),
+                .min(u64::from(predicate.infer_max_rows)),
         );
     } else if predicate.wait_ms > 0 {
         rows = rows.saturating_add(stats.inflight_rows);

@@ -6,7 +6,7 @@ unsafe fn find_semantic_match_predicate(
 ) -> Option<SemanticMatchPredicate> {
     unsafe {
         for idx in 0..pg_sys::list_length(restrictinfos) {
-            let rinfo = pg_sys::list_nth(restrictinfos, idx) as *mut pg_sys::RestrictInfo;
+            let rinfo = pg_sys::list_nth(restrictinfos, idx).cast::<pg_sys::RestrictInfo>();
             if rinfo.is_null() || (*rinfo).clause.is_null() {
                 continue;
             }
@@ -20,7 +20,7 @@ unsafe fn find_semantic_match_predicate(
                     if rte_kind != pg_sys::RTEKind::RTE_RELATION {
                         continue;
                     }
-                    let (stats, input_columns) = validate_semantic_index_source(
+                    let stats = validate_semantic_index_source(
                         &predicate.index_name,
                         relid,
                         predicate.subject_attno,
@@ -31,14 +31,13 @@ unsafe fn find_semantic_match_predicate(
                         predicate.infer_max_rows,
                         predicate.auto_policy,
                     )?;
-                    predicate.input_columns = input_columns;
                     Some(stats)
                 }
                 SemanticIndexKind::Join => {
                     if rte_kind != pg_sys::RTEKind::RTE_SUBQUERY {
                         continue;
                     }
-                    validate_semantic_join_index_source(
+                    let stats = validate_semantic_join_index_source(
                         &predicate.index_name,
                         &predicate.expected_json,
                         predicate.allow_refresh,
@@ -46,7 +45,8 @@ unsafe fn find_semantic_match_predicate(
                         predicate.infer_ms,
                         predicate.infer_max_rows,
                         predicate.auto_policy,
-                    )
+                    )?;
+                    Some(stats)
                 }
             };
             if let Some(stats) = stats {
@@ -85,8 +85,7 @@ unsafe fn semantic_match_from_clause(
             subject_typid: parts.subject.typid,
             restrict_info: ptr::null_mut(),
             estimated_rows: 1.0,
-            input_columns: None,
-            planner_stats: planner_stats_unknown(),
+            planner_stats: planner_stats_with_reason("planner probe not run"),
         })
     }
 }
@@ -103,6 +102,7 @@ struct ParsedSemanticMatch {
     infer_max_rows: u32,
 }
 
+#[derive(Clone, Copy)]
 struct SemanticAutoPolicy {
     auto_policy: bool,
     allow_refresh: bool,
@@ -116,7 +116,7 @@ unsafe fn semantic_match_function_parts(
     rti: pg_sys::Index,
 ) -> Option<ParsedSemanticMatch> {
     unsafe {
-        let func = clause as *mut pg_sys::FuncExpr;
+        let func = clause.cast::<pg_sys::FuncExpr>();
         let is_matches = is_otlet_function((*func).funcid, "semantic_matches");
         let is_auto = is_otlet_function((*func).funcid, "semantic_matches_auto");
         let is_join_matches = is_otlet_function((*func).funcid, "semantic_join_matches");
@@ -127,9 +127,9 @@ unsafe fn semantic_match_function_parts(
             return None;
         }
 
-        let index_arg = pg_sys::list_nth((*func).args, 0) as *mut pg_sys::Expr;
-        let subject_arg = pg_sys::list_nth((*func).args, 1) as *mut pg_sys::Expr;
-        let expected_arg = pg_sys::list_nth((*func).args, 2) as *mut pg_sys::Expr;
+        let index_arg = pg_sys::list_nth((*func).args, 0).cast::<pg_sys::Expr>();
+        let subject_arg = pg_sys::list_nth((*func).args, 1).cast::<pg_sys::Expr>();
+        let expected_arg = pg_sys::list_nth((*func).args, 2).cast::<pg_sys::Expr>();
         let policy = semantic_auto_policy(is_any_auto);
         Some(ParsedSemanticMatch {
             index_kind: if is_join {
@@ -160,7 +160,20 @@ fn semantic_auto_policy(enabled: bool) -> SemanticAutoPolicy {
         };
     }
 
-    pgrx::Spi::connect(|client| {
+    // One SPI read per statement: production_policy is a single-row table and
+    // begin-scan already freezes knobs from plan-time private data.
+    let stmt_start = unsafe { pg_sys::GetCurrentStatementStartTimestamp() };
+    thread_local! {
+        static CACHED: std::cell::Cell<Option<(pg_sys::TimestampTz, SemanticAutoPolicy)>> =
+            const { std::cell::Cell::new(None) };
+    }
+    if let Some((cached_start, policy)) = CACHED.get()
+        && cached_start == stmt_start
+    {
+        return policy;
+    }
+
+    let policy = pgrx::Spi::connect(|client| {
         let table = client
             .select(
                 "SELECT \
@@ -169,6 +182,7 @@ fn semantic_auto_policy(enabled: bool) -> SemanticAutoPolicy {
                    semantic_auto_infer_ms, \
                    semantic_auto_max_rows \
                  FROM otlet.production_policy \
+                 WHERE name = 'default' \
                  LIMIT 1",
                 Some(1),
                 &[],
@@ -177,36 +191,43 @@ fn semantic_auto_policy(enabled: bool) -> SemanticAutoPolicy {
         let row = table.first();
         Some(SemanticAutoPolicy {
             auto_policy: true,
+            // Null allow_refresh fails closed (no refresh) rather than permissive.
             allow_refresh: row
                 .get_by_name::<bool, _>("allow_refresh")
                 .ok()
                 .flatten()
-                .unwrap_or(true),
+                .unwrap_or(false),
             wait_ms: row
                 .get_by_name::<i32, _>("semantic_auto_wait_ms")
                 .ok()
                 .flatten()
                 .unwrap_or(10_000)
-                .clamp(0, 30_000) as u32,
+                .clamp(0, 30_000)
+                .cast_unsigned(),
             infer_ms: row
                 .get_by_name::<i32, _>("semantic_auto_infer_ms")
                 .ok()
                 .flatten()
                 .unwrap_or(15_000)
-                .clamp(0, 30_000) as u32,
+                .clamp(0, 30_000)
+                .cast_unsigned(),
             infer_max_rows: row
                 .get_by_name::<i32, _>("semantic_auto_max_rows")
                 .ok()
                 .flatten()
                 .unwrap_or(1)
-                .clamp(0, 10) as u32,
+                .clamp(0, 10)
+                .cast_unsigned(),
         })
     })
     .unwrap_or(SemanticAutoPolicy {
+        // SPI failure: fail closed — no refresh, no wait/infer budget.
         auto_policy: true,
-        allow_refresh: true,
-        wait_ms: 10_000,
-        infer_ms: 15_000,
-        infer_max_rows: 1,
-    })
+        allow_refresh: false,
+        wait_ms: 0,
+        infer_ms: 0,
+        infer_max_rows: 0,
+    });
+    CACHED.set(Some((stmt_start, policy)));
+    policy
 }

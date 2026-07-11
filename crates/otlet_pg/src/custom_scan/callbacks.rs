@@ -3,8 +3,8 @@ unsafe extern "C-unwind" fn create_semantic_custom_scan_state(
     _cscan: *mut pg_sys::CustomScan,
 ) -> *mut pg_sys::Node {
     unsafe {
-        let state = pg_sys::palloc0(std::mem::size_of::<OtletSemanticCustomScanState>())
-            as *mut OtletSemanticCustomScanState;
+        let state = pg_sys::palloc0(size_of::<OtletSemanticCustomScanState>())
+            .cast::<OtletSemanticCustomScanState>();
         (*state).css.ss.ps.type_ = pg_sys::NodeTag::T_CustomScanState;
         (*state).css.methods = &raw const CUSTOM_EXEC_METHODS;
         (*state).runtime = ptr::null_mut();
@@ -19,8 +19,8 @@ unsafe extern "C-unwind" fn begin_semantic_custom_scan(
     eflags: std::ffi::c_int,
 ) {
     unsafe {
-        let state = node as *mut OtletSemanticCustomScanState;
-        let Some(private) = custom_private_from_plan(node) else {
+        let state = node.cast::<OtletSemanticCustomScanState>();
+        let Some(mut private) = custom_private_from_plan(node) else {
             return;
         };
         let relation = (*node).ss.ss_currentRelation;
@@ -31,16 +31,16 @@ unsafe extern "C-unwind" fn begin_semantic_custom_scan(
         if !relation.is_null() && !(*node).ss.ps.state.is_null() {
             pg_sys::ExecInitScanTupleSlot(
                 (*node).ss.ps.state,
-                &mut (*node).ss,
+                &raw mut (*node).ss,
                 (*relation).rd_att,
                 pg_sys::table_slot_callbacks(relation),
             );
         } else if relation.is_null() && !child_plan.is_null() && !(*node).ss.ps.state.is_null() {
             let mut ops_fixed = false;
-            let child_ops = pg_sys::ExecGetResultSlotOps(child_plan, &mut ops_fixed);
+            let child_ops = pg_sys::ExecGetResultSlotOps(child_plan, &raw mut ops_fixed);
             pg_sys::ExecInitScanTupleSlot(
                 (*node).ss.ps.state,
-                &mut (*node).ss,
+                &raw mut (*node).ss,
                 pg_sys::ExecGetResultType(child_plan),
                 child_ops,
             );
@@ -48,30 +48,40 @@ unsafe extern "C-unwind" fn begin_semantic_custom_scan(
         if child_plan.is_null() {
             pgrx::error!("otlet semantic CustomScan requires a PG-created child plan");
         }
-        let loaded_state = load_semantic_states(
+        let stashed_stats = private.planner_stats.take();
+        let mut loaded_state = load_semantic_states(
             private.index_kind,
             &private.index_name,
             &private.expected_json,
         )
         .unwrap_or_else(|err| pgrx::error!("{err}"));
-        let planner_stats = reload_private_planner_stats(&private);
-        let policy = semantic_policy_for_selected_path(&planner_stats.selected_path);
+        // Prefer plan-time vocabulary from custom_private; overlay exact preload
+        // counts. Keep executor knobs from plan-time private data.
+        let (planner_stats, preloaded_counts) =
+            planner_stats_from_loaded_state(&private, stashed_stats, &mut loaded_state);
+        let policy = SemanticAutoPolicy {
+            auto_policy: private.auto_policy,
+            allow_refresh: private.allow_refresh,
+            wait_ms: private.wait_ms,
+            infer_ms: private.infer_ms,
+            infer_max_rows: private.infer_max_rows,
+        };
         snapshot_planner_state(state, &planner_stats, &policy);
+        (*state).index_kind = private.index_kind;
+        // Child plan is required above; snapshot for EXPLAIN after runtime free.
+        (*state).has_child_plan = !child_plan.is_null();
         (*state).source_table = pg_cstr(&loaded_state.source_table);
         (*state).task_name = pg_cstr(&loaded_state.task_name);
         (*state).record_type = pg_cstr(&loaded_state.record_type);
         (*state).known_subjects = loaded_state.subjects.len() as u64;
-        (*state).preloaded_fresh_matches =
-            subject_state_count(&loaded_state.subjects, SubjectSemanticState::FreshMatch);
-        (*state).preloaded_fresh_non_matches =
-            subject_state_count(&loaded_state.subjects, SubjectSemanticState::FreshNonMatch);
+        (*state).preloaded_fresh_matches = preloaded_counts.fresh_matches;
+        (*state).preloaded_fresh_non_matches = preloaded_counts.fresh_non_matches;
         (*state).preloaded_freshness_basis = pg_cstr(&loaded_state.freshness_basis_counts);
         (*state).emitted_freshness_basis = pg_cstr("");
-        (*state).preloaded_stale_subjects =
-            subject_state_count(&loaded_state.subjects, SubjectSemanticState::Stale);
-        (*state).preloaded_inflight_subjects =
-            subject_state_count(&loaded_state.subjects, SubjectSemanticState::InFlight);
-        (*state).runtime = Box::into_raw(Box::new(RuntimeState {
+        (*state).preloaded_stale_subjects = preloaded_counts.stale;
+        (*state).preloaded_missing_subjects = preloaded_counts.missing;
+        (*state).preloaded_inflight_subjects = preloaded_counts.inflight;
+        let mut runtime = RuntimeState {
             index_kind: private.index_kind,
             index_name: private.index_name,
             expected_json: private.expected_json,
@@ -86,13 +96,21 @@ unsafe extern "C-unwind" fn begin_semantic_custom_scan(
             planner_model_cost_source: planner_stats.model_cost_source,
             planner_model_ms: planner_stats.model_ms,
             planner_count_basis: planner_stats.count_basis,
+            planner_path_cost: planner_stats.path_cost,
             planner_infer_decision_rows: planner_stats.infer_decision_rows,
             planner_fail_closed_decision_rows: planner_stats.fail_closed_decision_rows,
             source_table: loaded_state.source_table,
             task_name: loaded_state.task_name,
             record_type: loaded_state.record_type,
-            input_columns: private.input_columns,
+            // Filled after child_plan is set so provider/policy strings match runtime.
+            infer_now_executor_context_json: String::new(),
+            input_columns: loaded_state.input_columns,
             preloaded_freshness_basis: loaded_state.freshness_basis_counts,
+            preloaded_fresh_matches: preloaded_counts.fresh_matches,
+            preloaded_fresh_non_matches: preloaded_counts.fresh_non_matches,
+            preloaded_stale_subjects: preloaded_counts.stale,
+            preloaded_missing_subjects: preloaded_counts.missing,
+            preloaded_inflight_subjects: preloaded_counts.inflight,
             source_reltype: if relation.is_null() {
                 pg_sys::InvalidOid
             } else {
@@ -100,11 +118,12 @@ unsafe extern "C-unwind" fn begin_semantic_custom_scan(
             },
             subject_attno: private.subject_attno,
             subject_typid: private.subject_typid,
+            join_input_attno: resolve_join_input_attno(child_plan, private.index_kind),
             child_plan,
             owns_child_plan,
             semantic_states: loaded_state.subjects,
             subject_freshness_basis: loaded_state.freshness_basis_by_subject,
-            emitted_freshness_basis: BTreeMap::new(),
+            emitted_freshness_basis: EmittedFreshnessCounts::default(),
             rows_seen: 0,
             rows_returned: 0,
             lookup_rows: 0,
@@ -129,6 +148,8 @@ unsafe extern "C-unwind" fn begin_semantic_custom_scan(
             infer_trace_prompt_tokens: 0,
             infer_trace_generated_tokens: 0,
             infer_trace_generate_ms: 0,
+            infer_trace_finish_sql_ms: 0,
+            infer_trace_materialize_ms: 0,
             infer_trace_version: String::new(),
             infer_trace_probability_status: String::new(),
             infer_trace_schema_force: String::new(),
@@ -136,9 +157,18 @@ unsafe extern "C-unwind" fn begin_semantic_custom_scan(
             infer_trace_detailed_captured_tokens: 0,
             infer_trace_detailed_top_k: 0,
             child_plan_rows: 0,
-            queued_refresh_subjects: HashSet::new(),
-            pending_output_rows: VecDeque::new(),
-        }));
+            queued_refresh_subjects: HashSet::with_capacity(
+                usize::try_from(private.infer_max_rows.max(8)).unwrap_or(8),
+            ),
+            pending_output_rows: VecDeque::with_capacity(
+                usize::try_from(private.infer_max_rows)
+                    .unwrap_or(0)
+                    .max(1),
+            ),
+        };
+        runtime.infer_now_executor_context_json =
+            freeze_infer_now_executor_context_json(&runtime);
+        (*state).runtime = Box::into_raw(Box::new(runtime));
     }
 }
 
@@ -159,6 +189,7 @@ unsafe fn snapshot_planner_state(
         (*state).planner_model_cost_source = pg_cstr(&planner_stats.model_cost_source);
         (*state).planner_model_ms = planner_stats.model_ms;
         (*state).planner_count_basis = pg_cstr(&planner_stats.count_basis);
+        (*state).planner_path_cost = planner_stats.path_cost;
         (*state).planner_infer_decision_rows = planner_stats.infer_decision_rows;
         (*state).planner_fail_closed_decision_rows = planner_stats.fail_closed_decision_rows;
     }
@@ -170,7 +201,7 @@ unsafe extern "C-unwind" fn exec_semantic_custom_scan(
 ) -> *mut pg_sys::TupleTableSlot {
     unsafe {
         pg_sys::ExecScan(
-            &mut (*node).ss,
+            &raw mut (*node).ss,
             Some(semantic_custom_scan_access),
             Some(semantic_custom_scan_recheck),
         )
@@ -182,8 +213,8 @@ unsafe extern "C-unwind" fn semantic_custom_scan_access(
     scan_state: *mut pg_sys::ScanState,
 ) -> *mut pg_sys::TupleTableSlot {
     unsafe {
-        let node = scan_state as *mut pg_sys::CustomScanState;
-        let state = node as *mut OtletSemanticCustomScanState;
+        let node = scan_state.cast::<pg_sys::CustomScanState>();
+        let state = node.cast::<OtletSemanticCustomScanState>();
         if (*state).runtime.is_null() {
             return clear_slot((*node).ss.ss_ScanTupleSlot);
         }
@@ -199,8 +230,11 @@ unsafe extern "C-unwind" fn semantic_custom_scan_access(
             runtime.rows_seen += 1;
 
             let mut isnull = false;
-            let value =
-                pg_sys::slot_getattr(slot, runtime.subject_attno as std::ffi::c_int, &mut isnull);
+            let value = pg_sys::slot_getattr(
+                slot,
+                std::ffi::c_int::from(runtime.subject_attno),
+                &raw mut isnull,
+            );
             if isnull {
                 continue;
             }
@@ -263,7 +297,7 @@ unsafe fn resolve_stale_or_missing_subject(
         if should_prefetch_infer_now(runtime) {
             if let Err(err) = prefetch_infer_now_batch(node, runtime, subject_id, slot) {
                 runtime.infer_now_failures = runtime.infer_now_failures.saturating_add(1);
-                runtime.infer_now_last_error = truncate_infer_now_error(&err);
+                truncate_infer_now_error_into(&mut runtime.infer_now_last_error, &err);
                 pgrx::warning!("otlet semantic CustomScan infer-now batch failed: {err}");
             }
             return emit_buffered_row(node, runtime);
@@ -335,18 +369,18 @@ unsafe fn init_custom_child_plan(
         }
         if !(*node).custom_ps.is_null() && pg_sys::list_length((*node).custom_ps) > 0 {
             return (
-                pg_sys::list_nth((*node).custom_ps, 0) as *mut pg_sys::PlanState,
+                pg_sys::list_nth((*node).custom_ps, 0).cast::<pg_sys::PlanState>(),
                 false,
             );
         }
         if (*node).ss.ps.plan.is_null() {
             return (ptr::null_mut(), false);
         }
-        let scan = (*node).ss.ps.plan as *mut pg_sys::CustomScan;
+        let scan = (*node).ss.ps.plan.cast::<pg_sys::CustomScan>();
         if (*scan).custom_plans.is_null() || pg_sys::list_length((*scan).custom_plans) == 0 {
             return (ptr::null_mut(), false);
         }
-        let child_plan = pg_sys::list_nth((*scan).custom_plans, 0) as *mut pg_sys::Plan;
+        let child_plan = pg_sys::list_nth((*scan).custom_plans, 0).cast::<pg_sys::Plan>();
         if child_plan.is_null() {
             return (ptr::null_mut(), false);
         }
@@ -373,7 +407,7 @@ unsafe fn next_source_slot(
                 runtime.child_plan_rows += 1;
                 return Some(result_slot);
             }
-            let child_scan_state = runtime.child_plan as *mut pg_sys::ScanState;
+            let child_scan_state = runtime.child_plan.cast::<pg_sys::ScanState>();
             let slot = if child_scan_state.is_null()
                 || slot_is_empty((*child_scan_state).ss_ScanTupleSlot)
             {
@@ -390,7 +424,8 @@ unsafe fn next_source_slot(
 }
 
 unsafe fn slot_is_empty(slot: *mut pg_sys::TupleTableSlot) -> bool {
-    unsafe { slot.is_null() || ((*slot).tts_flags & pg_sys::TTS_FLAG_EMPTY as u16) != 0 }
+    let empty_flag = u16::try_from(pg_sys::TTS_FLAG_EMPTY).unwrap_or(u16::MAX);
+    unsafe { slot.is_null() || ((*slot).tts_flags & empty_flag) != 0 }
 }
 
 #[pgrx::pg_guard]
@@ -404,7 +439,7 @@ unsafe extern "C-unwind" fn semantic_custom_scan_recheck(
 #[pgrx::pg_guard]
 unsafe extern "C-unwind" fn rescan_semantic_custom_scan(node: *mut pg_sys::CustomScanState) {
     unsafe {
-        let state = node as *mut OtletSemanticCustomScanState;
+        let state = node.cast::<OtletSemanticCustomScanState>();
         if !(*state).runtime.is_null() {
             let runtime = &mut *(*state).runtime;
             free_buffered_rows(runtime);
@@ -432,6 +467,8 @@ unsafe extern "C-unwind" fn rescan_semantic_custom_scan(node: *mut pg_sys::Custo
             runtime.infer_trace_prompt_tokens = 0;
             runtime.infer_trace_generated_tokens = 0;
             runtime.infer_trace_generate_ms = 0;
+            runtime.infer_trace_finish_sql_ms = 0;
+            runtime.infer_trace_materialize_ms = 0;
             runtime.infer_trace_version.clear();
             runtime.infer_trace_probability_status.clear();
             runtime.infer_trace_schema_force.clear();
@@ -452,7 +489,7 @@ unsafe extern "C-unwind" fn rescan_semantic_custom_scan(node: *mut pg_sys::Custo
 #[pgrx::pg_guard]
 unsafe extern "C-unwind" fn end_semantic_custom_scan(node: *mut pg_sys::CustomScanState) {
     unsafe {
-        let state = node as *mut OtletSemanticCustomScanState;
+        let state = node.cast::<OtletSemanticCustomScanState>();
         if !(*state).runtime.is_null() {
             let runtime = &mut *(*state).runtime;
             free_buffered_rows(runtime);
