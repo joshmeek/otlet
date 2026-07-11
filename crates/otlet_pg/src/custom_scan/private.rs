@@ -12,51 +12,6 @@ struct CustomScanPrivate {
     planner_stats: Option<SemanticPlannerStats>,
 }
 
-fn planner_stats_to_json(stats: &SemanticPlannerStats) -> Value {
-    json!({
-        "selected_path": &stats.selected_path,
-        "reason": &stats.reason,
-        "source_rows": stats.source_rows,
-        "fresh_matches": stats.fresh_matches,
-        "fresh_non_matches": stats.fresh_non_matches,
-        "stale_rows": stats.stale_rows,
-        "missing_rows": stats.missing_rows,
-        "inflight_rows": stats.inflight_rows,
-        "cache_reusable_rows": stats.cache_reusable_rows,
-        "infer_decision_rows": stats.infer_decision_rows,
-        "fail_closed_decision_rows": stats.fail_closed_decision_rows,
-        "model_ms": stats.model_ms,
-        "model_cost_source": &stats.model_cost_source,
-        "path_cost": stats.path_cost,
-        "stale_reasons": &stats.stale_reasons,
-        "count_basis": &stats.count_basis,
-    })
-}
-
-fn planner_stats_from_json(value: &Value) -> Option<SemanticPlannerStats> {
-    Some(SemanticPlannerStats {
-        selected_path: value.get("selected_path")?.as_str()?.to_owned(),
-        reason: value.get("reason")?.as_str()?.to_owned(),
-        source_rows: value.get("source_rows")?.as_u64()?,
-        fresh_matches: value.get("fresh_matches")?.as_u64()?,
-        fresh_non_matches: value.get("fresh_non_matches")?.as_u64()?,
-        stale_rows: value.get("stale_rows")?.as_u64()?,
-        missing_rows: value.get("missing_rows")?.as_u64()?,
-        inflight_rows: value.get("inflight_rows")?.as_u64()?,
-        cache_reusable_rows: value
-            .get("cache_reusable_rows")
-            .and_then(Value::as_u64)
-            .unwrap_or(0),
-        infer_decision_rows: value.get("infer_decision_rows")?.as_u64()?,
-        fail_closed_decision_rows: value.get("fail_closed_decision_rows")?.as_u64()?,
-        model_ms: value.get("model_ms")?.as_f64()?,
-        model_cost_source: value.get("model_cost_source")?.as_str()?.to_owned(),
-        path_cost: value.get("path_cost")?.as_f64()?,
-        stale_reasons: value.get("stale_reasons")?.as_str()?.to_owned(),
-        count_basis: value.get("count_basis")?.as_str()?.to_owned(),
-    })
-}
-
 unsafe fn custom_private_from_predicate(predicate: &SemanticMatchPredicate) -> *mut pg_sys::List {
     unsafe {
         let payload = json!({
@@ -70,7 +25,7 @@ unsafe fn custom_private_from_predicate(predicate: &SemanticMatchPredicate) -> *
             "infer_max_rows": predicate.infer_max_rows,
             "subject_attno": predicate.subject_attno,
             "subject_typid": predicate.subject_typid.to_u32(),
-            "planner_stats": planner_stats_to_json(&predicate.planner_stats),
+            "planner_stats": &predicate.planner_stats,
         });
         let mut list = ptr::null_mut();
         list = append_string_node(list, CUSTOM_PRIVATE_MARKER);
@@ -137,7 +92,7 @@ unsafe fn custom_private_from_list(private: *mut pg_sys::List) -> Option<CustomS
                 payload.get("subject_typid")?.as_u64()?,
             )
             .ok()?),
-            planner_stats: payload.get("planner_stats").and_then(planner_stats_from_json),
+            planner_stats: serde_json::from_value(payload.get("planner_stats")?.clone()).ok(),
         })
     }
 }

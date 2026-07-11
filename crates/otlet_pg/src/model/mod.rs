@@ -78,13 +78,9 @@ pub(crate) struct ModelError {
 }
 
 impl ModelError {
-    pub(crate) fn new_static(message: &'static str) -> Self {
-        Self::new(message.to_owned())
-    }
-
-    pub(crate) const fn new(message: String) -> Self {
+    pub(crate) fn new(message: impl Into<String>) -> Self {
         Self {
-            message,
+            message: message.into(),
             raw_output: None,
             prompt_hash: None,
             input_hash: None,
@@ -97,7 +93,7 @@ impl ModelError {
     }
 
     fn attempt_timeout() -> Self {
-        let mut err = Self::new_static("attempt_timeout");
+        let mut err = Self::new("attempt_timeout");
         err.schema_validation_status = Some("failed".to_owned());
         err.trace_summary = Some(json!({
             "trace_version": "otlet_generation_trace_v1",
@@ -108,7 +104,7 @@ impl ModelError {
         err
     }
 
-    fn clean_failure(message: String, schema_force: &str, stop_reason: &str) -> Self {
+    fn clean_failure(message: impl Into<String>, schema_force: &str, stop_reason: &str) -> Self {
         let mut err = Self::new(message);
         err.schema_validation_status = Some("failed".to_owned());
         err.trace_summary = Some(json!({
@@ -118,14 +114,6 @@ impl ModelError {
             "stop_reason": stop_reason
         }));
         err
-    }
-
-    fn clean_failure_static(
-        message: &'static str,
-        schema_force: &'static str,
-        stop_reason: &'static str,
-    ) -> Self {
-        Self::clean_failure(message.to_owned(), schema_force, stop_reason)
     }
 
     fn with_context(
@@ -197,7 +185,14 @@ struct RunContext {
 }
 
 pub(crate) fn run_job(job: &Job) -> Result<ModelRun, ModelError> {
-    run_job_with_model_ref(job, job.model_ref())
+    run_job_with_model_ref(
+        job,
+        JobModelRef {
+            name: job.model_name.as_str(),
+            artifact_path: job.artifact_path.as_str(),
+            artifact_hash: job.artifact_hash.as_deref(),
+        },
+    )
 }
 
 /// Run inference using an alternate model without cloning the full Job first.
@@ -268,7 +263,7 @@ fn run_job_with_model_ref(job: &Job, model: JobModelRef<'_>) -> Result<ModelRun,
     } else if options.generation_trace {
         CacheLookup::disabled_for("disabled_for_generation_trace")
     } else {
-        CacheLookup::disabled()
+        CacheLookup::disabled_for("disabled")
     };
 
     enum RawOutput {
@@ -295,7 +290,7 @@ fn run_job_with_model_ref(job: &Job, model: JobModelRef<'_>) -> Result<ModelRun,
     let (raw_output, mut metrics, context) = if let Some(raw_output) = cache_lookup.raw_output {
         // Trusted cache entry already passed schema validation when stored.
         if linked_cancel_requested(job.id)? {
-            return Err(ModelError::new_static("canceled"));
+            return Err(ModelError::new("canceled"));
         }
         let (prompt_hash, input_hash, shaped_bytes, original_bytes, input_truncated) =
             shaped_prompt_hashes_for_cache_hit(

@@ -181,10 +181,6 @@ unsafe extern "C-unwind" fn plan_semantic_custom_path(
     }
 }
 
-fn planner_stats_unknown() -> SemanticPlannerStats {
-    planner_stats_with_reason("planner probe not run")
-}
-
 fn planner_stats_with_reason(reason: &'static str) -> SemanticPlannerStats {
     SemanticPlannerStats {
         selected_path: "semantic_lookup".to_owned(),
@@ -355,12 +351,10 @@ fn planner_bounded_infer_cost(
 ) -> f64 {
     let cache_reusable_rows = stats.cache_reusable_rows.min(bounded_infer_rows);
     let model_rows = bounded_infer_rows.saturating_sub(cache_reusable_rows);
-    model_rows as f64 * model_cost + cache_reusable_rows as f64 * planner_cache_hit_cost_unit()
+    model_rows as f64 * model_cost + cache_reusable_rows as f64 * PLANNER_CACHE_HIT_COST_UNIT
 }
 
-const fn planner_cache_hit_cost_unit() -> f64 {
-    0.05
-}
+const PLANNER_CACHE_HIT_COST_UNIT: f64 = 0.05;
 
 fn estimated_result_rows(stats: &SemanticPlannerStats, predicate: &SemanticMatchPredicate) -> f64 {
     let mut rows = stats.fresh_matches;

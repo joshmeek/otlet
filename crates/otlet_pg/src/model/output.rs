@@ -372,10 +372,6 @@ impl FnvWriter {
         out
     }
 
-    const fn finish_u64(self) -> u64 {
-        self.hash
-    }
-
     fn write_bytes(&mut self, bytes: &[u8]) {
         for byte in bytes {
             self.hash ^= u64::from(*byte);
@@ -421,7 +417,7 @@ fn hash_bytes_parts_u64(parts: &[&[u8]]) -> u64 {
     for part in parts {
         writer.write_bytes(part);
     }
-    writer.finish_u64()
+    writer.hash
 }
 
 fn model_actions(actions: Value) -> Result<Value, String> {

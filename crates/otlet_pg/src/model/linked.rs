@@ -11,7 +11,7 @@ fn run_linked(
     let attempt_start = Instant::now();
     let attempt_deadline = linked_attempt_deadline(attempt_start, job.max_attempt_ms);
     if job_model.artifact_path.starts_with("hf:") {
-        return Err(ModelError::new_static("linked llama.cpp runtime requires a local GGUF artifact path"));
+        return Err(ModelError::new("linked llama.cpp runtime requires a local GGUF artifact path"));
     }
     LINKED_BACKEND.get_or_init(|| unsafe {
         llama_cpp_sys_4::llama_backend_init();
@@ -20,7 +20,7 @@ fn run_linked(
     let cache = LINKED_CACHE.get_or_init(|| Mutex::new(None));
     let mut cache = cache
         .lock()
-        .map_err(|_| ModelError::new_static("linked llama.cpp cache lock poisoned"))?;
+        .map_err(|_| ModelError::new("linked llama.cpp cache lock poisoned"))?;
     let cache_hit = cache.as_ref().is_some_and(|cached| {
         cached.artifact_path == job_model.artifact_path
             && cached.model_fingerprint_hash.as_ref() == model_fingerprint_hash
@@ -28,7 +28,7 @@ fn run_linked(
 
     if !cache_hit {
         let model_path = CString::new(job_model.artifact_path.as_bytes())
-            .map_err(|_| ModelError::new_static("linked llama.cpp model path is invalid"))?;
+            .map_err(|_| ModelError::new("linked llama.cpp model path is invalid"))?;
         let mut model_params = unsafe { llama_cpp_sys_4::llama_model_default_params() };
         model_params.n_gpu_layers = 0;
         model_params.use_mmap = linked_env_bool("OTLET_LLAMA_MMAP", model_params.use_mmap);
@@ -44,7 +44,7 @@ fn run_linked(
         };
         let load_ms = elapsed_ms(load_start);
         if model_ptr.is_null() {
-            return Err(ModelError::new_static("linked llama.cpp model load failed"));
+            return Err(ModelError::new("linked llama.cpp model load failed"));
         }
         let model = LinkedModel { ptr: model_ptr };
 
@@ -63,7 +63,7 @@ fn run_linked(
         let context_ptr = unsafe { llama_cpp_sys_4::llama_init_from_model(model.ptr, ctx_params) };
         let ctx_ms = elapsed_ms(ctx_start);
         if context_ptr.is_null() {
-            return Err(ModelError::new_static("linked llama.cpp context start failed"));
+            return Err(ModelError::new("linked llama.cpp context start failed"));
         }
         let context = LinkedContext { ptr: context_ptr };
         let model_memory_bytes =
@@ -75,7 +75,7 @@ fn run_linked(
 
         let vocab = unsafe { llama_cpp_sys_4::llama_model_get_vocab(model.ptr) };
         if vocab.is_null() {
-            return Err(ModelError::new_static("linked llama.cpp model has no vocab"));
+            return Err(ModelError::new("linked llama.cpp model has no vocab"));
         }
 
         *cache = Some(LinkedCache {
@@ -99,7 +99,7 @@ fn run_linked(
 
     let cache = cache
         .as_mut()
-        .ok_or_else(|| ModelError::new_static("linked llama.cpp cache did not initialize"))?;
+        .ok_or_else(|| ModelError::new("linked llama.cpp cache did not initialize"))?;
     let decode_threads = linked_decode_threads(options);
     let batch_threads = linked_batch_threads(options, decode_threads);
     unsafe {
@@ -115,7 +115,7 @@ fn run_linked(
     };
     let tokenize_ms = elapsed_ms(tokenize_start);
     if tokens.is_empty() {
-        return Err(ModelError::new_static("linked llama.cpp prompt produced no tokens"));
+        return Err(ModelError::new("linked llama.cpp prompt produced no tokens"));
     }
 
     validate_linked_token_budget(tokens.len(), options.max_tokens, cache.context_window_tokens)?;
@@ -126,7 +126,7 @@ fn run_linked(
     }
 
     if linked_cancel_requested(job.id)? {
-        return Err(ModelError::new_static("canceled"));
+        return Err(ModelError::new("canceled"));
     }
     let mut cancel_probe = CancelProbe::new();
 
@@ -148,7 +148,7 @@ fn run_linked(
     let batch = batch_slot
         .batch
         .as_mut()
-        .ok_or_else(|| ModelError::new_static("linked llama.cpp batch did not initialize"))?;
+        .ok_or_else(|| ModelError::new("linked llama.cpp batch did not initialize"))?;
     batch.reset();
     let mut prompt_reused_tokens = 0;
     let mut prompt_decoded_tokens = tokens.len();
@@ -231,7 +231,7 @@ fn run_linked(
 
     let sampler_ptr = unsafe { llama_cpp_sys_4::llama_sampler_init_greedy() };
     if sampler_ptr.is_null() {
-        return Err(ModelError::new_static("linked llama.cpp sampler start failed"));
+        return Err(ModelError::new("linked llama.cpp sampler start failed"));
     }
     let sampler = LinkedSampler { ptr: sampler_ptr };
     let mut output = Vec::with_capacity(linked_output_capacity(options.max_tokens));
@@ -252,7 +252,7 @@ fn run_linked(
     }
     for _ in 0..options.max_tokens {
         if cancel_probe.due() && linked_cancel_requested(job.id)? {
-            return Err(ModelError::new_static("canceled"));
+            return Err(ModelError::new("canceled"));
         }
         let token =
             unsafe { llama_cpp_sys_4::llama_sampler_sample(sampler.ptr, cache.context.ptr, -1) };
@@ -303,7 +303,7 @@ fn run_linked(
         batch.add(
             token,
             i32::try_from(position).map_err(|_| {
-                ModelError::new_static("linked llama.cpp generation position overflowed i32")
+                ModelError::new("linked llama.cpp generation position overflowed i32")
             })?,
             true,
         )?;
@@ -540,13 +540,13 @@ fn linked_decode_prompt_tokens(
             batch.add(
                 *token,
                 i32::try_from(position).map_err(|_| {
-                    ModelError::new_static("linked llama.cpp prompt position overflowed i32")
+                    ModelError::new("linked llama.cpp prompt position overflowed i32")
                 })?,
                 final_logits && decoded_tokens + chunk_index + 1 == tokens.len(),
             )?;
         }
         if cancel_probe.due() && linked_cancel_requested(job.id)? {
-            return Err(ModelError::new_static("canceled"));
+            return Err(ModelError::new("canceled"));
         }
         let decode_status = unsafe { llama_cpp_sys_4::llama_decode(context, batch.value) };
         if decode_status != 0 {
@@ -769,7 +769,7 @@ fn validate_linked_token_budget(
     context_window_tokens: i64,
 ) -> Result<(), ModelError> {
     let Ok(context_window_tokens) = usize::try_from(context_window_tokens) else {
-        return Err(ModelError::clean_failure_static(
+        return Err(ModelError::clean_failure(
             "linked llama.cpp context window is invalid",
             "prompt_token_budget_before_generation",
             "invalid_context_window",
@@ -885,7 +885,7 @@ struct LinkedBatch {
 impl LinkedBatch {
     fn new(capacity: usize) -> Result<Self, ModelError> {
         let capacity_i32 = i32::try_from(capacity).map_err(|_| {
-            ModelError::new_static("linked llama.cpp batch capacity overflowed i32")
+            ModelError::new("linked llama.cpp batch capacity overflowed i32")
         })?;
         let value = unsafe { llama_cpp_sys_4::llama_batch_init(capacity_i32, 0, 1) };
         let batch = Self { value, capacity };
@@ -895,7 +895,7 @@ impl LinkedBatch {
             || batch.value.seq_id.is_null()
             || batch.value.logits.is_null()
         {
-            return Err(ModelError::new_static("linked llama.cpp batch allocation failed"));
+            return Err(ModelError::new("linked llama.cpp batch allocation failed"));
         }
 
         Ok(batch)
@@ -912,11 +912,11 @@ impl LinkedBatch {
         logits: bool,
     ) -> Result<(), ModelError> {
         if self.value.n_tokens < 0 {
-            return Err(ModelError::new_static("linked llama.cpp batch token count is invalid"));
+            return Err(ModelError::new("linked llama.cpp batch token count is invalid"));
         }
 
         let index = usize::try_from(self.value.n_tokens).map_err(|_| {
-            ModelError::new_static("linked llama.cpp batch token count overflowed usize")
+            ModelError::new("linked llama.cpp batch token count overflowed usize")
         })?;
         if index >= self.capacity {
             return Err(ModelError::new(format!(
@@ -927,7 +927,7 @@ impl LinkedBatch {
 
         let seq_id = unsafe { *self.value.seq_id.add(index) };
         if seq_id.is_null() {
-            return Err(ModelError::new_static("linked llama.cpp batch sequence slot is null"));
+            return Err(ModelError::new("linked llama.cpp batch sequence slot is null"));
         }
 
         unsafe {
@@ -967,9 +967,9 @@ fn tokenize_linked(
     text: &str,
 ) -> Result<Vec<llama_cpp_sys_4::llama_token>, ModelError> {
     let text = std::ffi::CString::new(text)
-        .map_err(|_| ModelError::new_static("linked llama.cpp prompt contains null byte"))?;
+        .map_err(|_| ModelError::new("linked llama.cpp prompt contains null byte"))?;
     let text_len = i32::try_from(text.as_bytes().len()).map_err(|_| {
-        ModelError::clean_failure_static(
+        ModelError::clean_failure(
             "linked llama.cpp prompt is too large to tokenize",
             "prompt_token_budget_before_generation",
             "prompt_exceeds_context_window",
@@ -1001,11 +1001,11 @@ fn tokenize_linked(
     }
 
     let capacity_usize = usize::try_from(capacity).map_err(|_| {
-        ModelError::new_static("linked llama.cpp prompt capacity overflowed usize")
+        ModelError::new("linked llama.cpp prompt capacity overflowed usize")
     })?;
     let mut tokens = vec![0; capacity_usize];
     let tokens_len = i32::try_from(tokens.len()).map_err(|_| {
-        ModelError::new_static("linked llama.cpp token buffer length overflowed i32")
+        ModelError::new("linked llama.cpp token buffer length overflowed i32")
     })?;
     let actual = unsafe {
         llama_cpp_sys_4::llama_tokenize(
@@ -1024,7 +1024,7 @@ fn tokenize_linked(
         )));
     }
     let actual_usize = usize::try_from(actual).map_err(|_| {
-        ModelError::new_static("linked llama.cpp tokenize result overflowed usize")
+        ModelError::new("linked llama.cpp tokenize result overflowed usize")
     })?;
     if actual_usize > tokens.len() {
         return Err(ModelError::new(format!(
@@ -1038,7 +1038,7 @@ fn tokenize_linked(
 
 fn token_capacity_from_probe(size: i32) -> Result<i32, ModelError> {
     if size == i32::MIN {
-        return Err(ModelError::new_static("linked llama.cpp tokenize returned invalid token count"));
+        return Err(ModelError::new("linked llama.cpp tokenize returned invalid token count"));
     }
 
     Ok(size.abs())
@@ -1054,7 +1054,7 @@ fn linked_token_to_piece_into(
         buffer.resize(128, 0);
     }
     let buffer_len = i32::try_from(buffer.len()).map_err(|_| {
-        ModelError::new_static("linked llama.cpp token piece buffer overflowed i32")
+        ModelError::new("linked llama.cpp token piece buffer overflowed i32")
     })?;
     let mut size = unsafe {
         llama_cpp_sys_4::llama_token_to_piece(
@@ -1071,7 +1071,7 @@ fn linked_token_to_piece_into(
             .checked_neg()
             .and_then(|value| usize::try_from(value).ok())
             .ok_or_else(|| {
-                ModelError::new_static("linked llama.cpp token piece size was invalid")
+                ModelError::new("linked llama.cpp token piece size was invalid")
             })?;
         if required > LINKED_MAX_TOKEN_PIECE_BYTES {
             return Err(ModelError::new(format!(
@@ -1080,7 +1080,7 @@ fn linked_token_to_piece_into(
         }
         buffer.resize(required, 0);
         let buffer_len = i32::try_from(buffer.len()).map_err(|_| {
-            ModelError::new_static("linked llama.cpp token piece buffer overflowed i32")
+            ModelError::new("linked llama.cpp token piece buffer overflowed i32")
         })?;
         size = unsafe {
             llama_cpp_sys_4::llama_token_to_piece(
@@ -1097,7 +1097,7 @@ fn linked_token_to_piece_into(
         return Ok(());
     }
     let size = usize::try_from(size).map_err(|_| {
-        ModelError::new_static("linked llama.cpp token piece size overflowed usize")
+        ModelError::new("linked llama.cpp token piece size overflowed usize")
     })?;
     if size > buffer.len() {
         return Err(ModelError::new(format!(
@@ -1266,14 +1266,14 @@ fn linked_cancel_requested(job_id: i64) -> Result<bool, ModelError> {
                 )?;
                 if rows.is_empty() {
                     // Fail closed: a vanished job mid-decode must not keep generating.
-                    return Ok(Err(ModelError::new_static(
+                    return Ok(Err(ModelError::new(
                         "linked cancellation check: job row missing",
                     )));
                 }
 
                 match rows.first().get::<bool>(1)? {
                     Some(canceled) => Ok(Ok(canceled)),
-                    None => Ok(Err(ModelError::new_static(
+                    None => Ok(Err(ModelError::new(
                         "linked cancellation check: cancel flag unreadable",
                     ))),
                 }

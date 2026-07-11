@@ -38,16 +38,6 @@ pub(crate) struct JobModelRef<'a> {
     pub(crate) artifact_hash: Option<&'a str>,
 }
 
-impl Job {
-    pub(crate) fn model_ref(&self) -> JobModelRef<'_> {
-        JobModelRef {
-            name: self.model_name.as_str(),
-            artifact_path: self.artifact_path.as_str(),
-            artifact_hash: self.artifact_hash.as_deref(),
-        }
-    }
-}
-
 macro_rules! required_col {
     ($row:expr, $ty:ty, $idx:expr) => {
         $row.get::<$ty>($idx)?

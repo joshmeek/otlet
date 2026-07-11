@@ -338,7 +338,7 @@ struct SemanticMatchPredicate {
     planner_stats: SemanticPlannerStats,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Deserialize, Serialize)]
 struct SemanticPlannerStats {
     selected_path: String,
     reason: String,

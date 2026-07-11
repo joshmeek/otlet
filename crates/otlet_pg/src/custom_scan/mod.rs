@@ -1,4 +1,5 @@
 use pgrx::{FromDatum, JsonB, direct_function_call, pg_sys};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};

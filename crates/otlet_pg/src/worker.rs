@@ -174,7 +174,8 @@ fn process_infer_now_request(request: crate::infer_now::InferNowRequest) {
         // Prefer in-process failure text; fall back to jobs.error for paths that
         // only returned a bool (reject/complete) without a ModelError.
         let error = process_result
-            .take_failure_message()
+            .failure_message
+            .take()
             .unwrap_or_else(|| infer_now_job_error(job_id));
         crate::infer_now::finish_request(id, job_id, Some(&error));
         return;
@@ -322,10 +323,6 @@ impl JobProcessResult {
     fn add_result_metrics(&mut self, result: &Self) {
         self.model_swaps += result.model_swaps;
     }
-
-    fn take_failure_message(&mut self) -> Option<String> {
-        self.failure_message.take()
-    }
 }
 
 #[derive(Default)]
@@ -391,7 +388,7 @@ fn process_job_batch(jobs: Vec<Job>) -> BatchProcessResult {
         let strong_result = match policy_cache.get(&job.task_name) {
             Ok(Some(policy)) => run_strong_attempt_with_model(&job, &policy.strong, reason),
             Ok(None) => {
-                let err = ModelError::new_static("strong_fallback_missing_policy");
+                let err = ModelError::new("strong_fallback_missing_policy");
                 fail_attempt_result_with_model(
                     &job,
                     job.model_name.as_str(),
@@ -431,7 +428,7 @@ fn process_job(job: Job) -> JobProcessResult {
         let strong_result = match policy_cache.get(&job.task_name) {
             Ok(Some(policy)) => run_strong_attempt_with_model(&job, &policy.strong, reason),
             Ok(None) => {
-                let err = ModelError::new_static("strong_fallback_missing_policy");
+                let err = ModelError::new("strong_fallback_missing_policy");
                 fail_attempt_result_with_model(
                     &job,
                     job.model_name.as_str(),
@@ -466,10 +463,10 @@ fn process_job_deferred(
     policy_cache: &mut ModelSelectionPolicyCache,
     already_marked: bool,
 ) -> JobProcessResult {
-    // Keep mark_job_started separate: its failure only warns and must not abort
+    // Keep start marking separate: its failure only warns and must not abort
     // the policy lookup transaction (SPI errors abort the current txn).
     if !already_marked {
-        mark_job_started(job);
+        mark_jobs_started(std::slice::from_ref(job));
     }
 
     match policy_cache.get(&job.task_name) {
@@ -477,8 +474,9 @@ fn process_job_deferred(
         Ok(None) => process_direct_job(job),
         Err(err) => {
             pgrx::warning!("otlet model selection policy lookup failed: {err}");
-            fail_attempt_result(
+            fail_attempt_result_with_model(
                 job,
+                job.model_name.as_str(),
                 &ModelError {
                     message: format!("model selection policy lookup failed: {err}"),
                     raw_output: None,
@@ -520,10 +518,6 @@ fn mark_jobs_started(jobs: &[Job]) {
     }
 }
 
-fn mark_job_started(job: &Job) {
-    mark_jobs_started(std::slice::from_ref(job));
-}
-
 fn process_direct_job(job: &Job) -> JobProcessResult {
     if let Some(result) = guard_job_lease(job, job.model_name.as_str(), "direct") {
         return result;
@@ -531,7 +525,12 @@ fn process_direct_job(job: &Job) -> JobProcessResult {
     match run_job(job) {
         Ok(run) => {
             let mut result = JobProcessResult::from_run(false, &run);
-            if enforce_decision_on_direct(&job.decision_contract) {
+            if job
+                .decision_contract
+                .get("enforce_on_direct")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
                 let (accepted, _) =
                     accepted_by_direct_decision(&run.output, &job.decision_contract);
                 if !accepted {
@@ -544,8 +543,13 @@ fn process_direct_job(job: &Job) -> JobProcessResult {
                     return result;
                 }
             }
-            let (completed, semantic_materialized) =
-                accept_attempt(job, run, "direct", "accepted_by_direct_task");
+            let (completed, semantic_materialized) = accept_attempt_with_model(
+                job,
+                job.model_name.as_str(),
+                run,
+                "direct",
+                "accepted_by_direct_task",
+            );
             result.completed = completed;
             result.semantic_materialized = semantic_materialized;
             if !result.completed {
@@ -555,16 +559,15 @@ fn process_direct_job(job: &Job) -> JobProcessResult {
         }
         Err(err) => {
             let selection_reason = failure_selection_reason(&err, "direct_attempt_failed");
-            fail_attempt_result(job, &err, "direct", selection_reason)
+            fail_attempt_result_with_model(
+                job,
+                job.model_name.as_str(),
+                &err,
+                "direct",
+                selection_reason,
+            )
         }
     }
-}
-
-fn enforce_decision_on_direct(decision_contract: &Value) -> bool {
-    decision_contract
-        .get("enforce_on_direct")
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
 }
 
 /// Same field defaults and accept rules as the former `direct_accept_field_checks`
@@ -656,7 +659,7 @@ fn process_selected_job(job: &Job, policy: &ModelSelectionPolicy) -> JobProcessR
             }
             let mut result = JobProcessResult::from_run(false, &run);
             if !record_rejected_attempt_with_model(job, cheap_name, run, "cheap", reason) {
-                let err = ModelError::new_static("rejected_attempt_receipt_failed");
+                let err = ModelError::new("rejected_attempt_receipt_failed");
                 return fail_attempt_result_with_model(
                     job,
                     cheap_name,
@@ -735,7 +738,7 @@ fn guard_job_lease(job: &Job, model_name: &str, selection_role: &str) -> Option<
     match renew_job_lease(job) {
         Ok(false) => None,
         Ok(true) => {
-            let err = ModelError::new_static("canceled");
+            let err = ModelError::new("canceled");
             Some(fail_attempt_result_with_model(
                 job,
                 model_name,
@@ -830,21 +833,6 @@ fn accepted_by_policy(output: &Value, accept_field_checks: &Value) -> (bool, &'s
     (true, "accepted_by_policy")
 }
 
-fn accept_attempt(
-    job: &Job,
-    run: ModelRun,
-    selection_role: &str,
-    selection_reason: &str,
-) -> (bool, bool) {
-    accept_attempt_with_model(
-        job,
-        job.model_name.as_str(),
-        run,
-        selection_role,
-        selection_reason,
-    )
-}
-
 fn accept_attempt_with_model(
     job: &Job,
     model_name: &str,
@@ -899,7 +887,7 @@ fn accept_attempt_with_model(
                 "otlet worker complete produced no output row for job {}",
                 job.id
             );
-            let err = ModelError::new_static("complete_job_produced_no_output");
+            let err = ModelError::new("complete_job_produced_no_output");
             (
                 fail_attempt_with_model(
                     job,
@@ -1093,21 +1081,6 @@ fn record_failed_model_attempt_with_model(
     )
 }
 
-fn fail_attempt_result(
-    job: &Job,
-    err: &ModelError,
-    selection_role: &str,
-    selection_reason: &str,
-) -> JobProcessResult {
-    fail_attempt_result_with_model(
-        job,
-        job.model_name.as_str(),
-        err,
-        selection_role,
-        selection_reason,
-    )
-}
-
 fn fail_attempt_result_with_model(
     job: &Job,
     model_name: &str,
@@ -1215,70 +1188,62 @@ fn fail_attempt_with_model(
 fn record_metrics(job: &Job, model_name: &str, metrics: &ModelMetrics) {
     let result: pgrx::spi::Result<()> = BackgroundWorker::transaction(|| {
         pgrx::Spi::connect_mut(|client| {
-            record_metrics_with_client(client, job, model_name, metrics)
+            let args = [
+                model_name.into(),
+                metrics.artifact_path.as_str().into(),
+                metrics.load_ms.into(),
+                metrics.ctx_ms.into(),
+                metrics.prompt_tokens.into(),
+                metrics.generated_tokens.into(),
+                metrics.generate_ms.into(),
+                metrics.cache_hit.into(),
+                metrics.inference_cache_hit.into(),
+                metrics.inference_cache_entries.into(),
+                metrics.inference_cache_bytes.into(),
+                metrics.inference_cache_evictions.into(),
+                metrics.inference_cache_invalidation_reason.into(),
+                metrics.model_memory_bytes.into(),
+                metrics.model_parameters.into(),
+                metrics.context_window_tokens.into(),
+                metrics.model_device_policy.into(),
+                metrics.memory_accounting_policy.into(),
+                metrics.worker_process_rss_bytes.into(),
+                metrics.worker_process_virtual_bytes.into(),
+                metrics.worker_memory_sample_policy.into(),
+                metrics.inference_cache_max_entries.into(),
+                metrics.inference_cache_max_bytes.into(),
+                metrics.inference_cache_eviction_reason.into(),
+            ];
+            client.update(
+                "SELECT otlet.record_runtime_slot_metrics($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24)",
+                Some(1),
+                &args,
+            )?;
+            if !metrics.cache_hit && !metrics.inference_cache_hit && metrics.model_memory_bytes > 0
+            {
+                let event_args = [
+                    job.id.into(),
+                    "linked_inproc".into(),
+                    job.task_name.as_str().into(),
+                    model_name.into(),
+                    metrics.artifact_path.as_str().into(),
+                    metrics.load_ms.into(),
+                    metrics.model_memory_bytes.into(),
+                    metrics.worker_process_rss_bytes.into(),
+                    metrics.worker_memory_budget_bytes.into(),
+                ];
+                client.update(
+                    "SELECT otlet.record_worker_event('model_swap', $1, $2, 'model residency changed', jsonb_build_object('task_name', $3, 'model_name', $4, 'artifact_path', $5, 'load_ms', $6, 'model_memory_bytes', $7, 'worker_process_rss_bytes', $8, 'worker_memory_budget_bytes', $9))",
+                    Some(1),
+                    &event_args,
+                )?;
+            }
+            Ok(())
         })
     });
     if let Err(err) = result {
         pgrx::warning!("otlet worker metric update failed: {err}");
     }
-}
-
-fn record_metrics_with_client(
-    client: &mut pgrx::spi::SpiClient<'_>,
-    job: &Job,
-    model_name: &str,
-    metrics: &ModelMetrics,
-) -> pgrx::spi::Result<()> {
-    let args = [
-        model_name.into(),
-        metrics.artifact_path.as_str().into(),
-        metrics.load_ms.into(),
-        metrics.ctx_ms.into(),
-        metrics.prompt_tokens.into(),
-        metrics.generated_tokens.into(),
-        metrics.generate_ms.into(),
-        metrics.cache_hit.into(),
-        metrics.inference_cache_hit.into(),
-        metrics.inference_cache_entries.into(),
-        metrics.inference_cache_bytes.into(),
-        metrics.inference_cache_evictions.into(),
-        metrics.inference_cache_invalidation_reason.into(),
-        metrics.model_memory_bytes.into(),
-        metrics.model_parameters.into(),
-        metrics.context_window_tokens.into(),
-        metrics.model_device_policy.into(),
-        metrics.memory_accounting_policy.into(),
-        metrics.worker_process_rss_bytes.into(),
-        metrics.worker_process_virtual_bytes.into(),
-        metrics.worker_memory_sample_policy.into(),
-        metrics.inference_cache_max_entries.into(),
-        metrics.inference_cache_max_bytes.into(),
-        metrics.inference_cache_eviction_reason.into(),
-    ];
-    client.update(
-        "SELECT otlet.record_runtime_slot_metrics($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24)",
-        Some(1),
-        &args,
-    )?;
-    if !metrics.cache_hit && !metrics.inference_cache_hit && metrics.model_memory_bytes > 0 {
-        let event_args = [
-            job.id.into(),
-            "linked_inproc".into(),
-            job.task_name.as_str().into(),
-            model_name.into(),
-            metrics.artifact_path.as_str().into(),
-            metrics.load_ms.into(),
-            metrics.model_memory_bytes.into(),
-            metrics.worker_process_rss_bytes.into(),
-            metrics.worker_memory_budget_bytes.into(),
-        ];
-        client.update(
-            "SELECT otlet.record_worker_event('model_swap', $1, $2, 'model residency changed', jsonb_build_object('task_name', $3, 'model_name', $4, 'artifact_path', $5, 'load_ms', $6, 'model_memory_bytes', $7, 'worker_process_rss_bytes', $8, 'worker_memory_budget_bytes', $9))",
-            Some(1),
-            &event_args,
-        )?;
-    }
-    Ok(())
 }
 
 fn record_worker_batch_finished(

@@ -75,12 +75,6 @@ def gate_failures(row):
     return failures
 
 
-def finalize_gate_failures(rows):
-    for row in rows:
-        row["_final_gate_failures"] = gate_failures(row)
-    return rows
-
-
 def display_verdict(row):
     if "_final_display_verdict" in row:
         return row["_final_display_verdict"]
@@ -182,6 +176,7 @@ def readiness(row):
 
 def finalize_report_status(rows):
     for row in rows:
+        row["_final_gate_failures"] = gate_failures(row)
         row["_final_gate_status"] = gate_status(row)
         row["_final_display_verdict"] = display_verdict(row)
         row["_final_readiness"] = readiness(row)

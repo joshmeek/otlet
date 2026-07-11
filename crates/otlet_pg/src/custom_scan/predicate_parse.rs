@@ -85,7 +85,7 @@ unsafe fn semantic_match_from_clause(
             subject_typid: parts.subject.typid,
             restrict_info: ptr::null_mut(),
             estimated_rows: 1.0,
-            planner_stats: planner_stats_unknown(),
+            planner_stats: planner_stats_with_reason("planner probe not run"),
         })
     }
 }

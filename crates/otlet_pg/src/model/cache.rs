@@ -200,10 +200,6 @@ struct CacheLookup {
 }
 
 impl CacheLookup {
-    fn disabled() -> Self {
-        Self::disabled_for("disabled")
-    }
-
     fn disabled_for(reason: &'static str) -> Self {
         Self {
             raw_output: None,

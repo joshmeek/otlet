@@ -18,7 +18,6 @@ from report_scoring import (
     case_failure_mode,
     current_report_rows,
     display_verdict,
-    finalize_gate_failures,
     finalize_report_status,
     first_blocker,
     gate_failures,
@@ -50,9 +49,7 @@ def main():
     for row in cases:
         with_base_key(row, base_by_model)
     summaries = add_missing_model_rows(aggregate_summaries(raw_summaries, models), models)
-    report_summaries = finalize_report_status(
-        finalize_gate_failures(current_report_rows(summaries))
-    )
+    report_summaries = finalize_report_status(current_report_rows(summaries))
     report_model_keys = {row.get("model_key", "") for row in report_summaries}
     report_cases = [row for row in cases if row.get("base_model_key") in report_model_keys]
     cases_by_model = {}
