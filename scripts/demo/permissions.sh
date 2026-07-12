@@ -115,6 +115,8 @@ expect_permission_denied "$permission_auditor_role" "SELECT otlet.register_actio
 expect_permission_denied "$permission_auditor_role" "SELECT otlet.disable_action_target('$bounded_action_target')" "auditor action target disable"
 expect_permission_denied "$permission_auditor_role" "SELECT * FROM otlet.cancel_job(0)" "auditor job cancellation"
 expect_permission_denied "$permission_auditor_role" "SELECT * FROM otlet.cleanup_policy_state(true)" "auditor cleanup"
+expect_permission_denied "$permission_auditor_role" "SELECT otlet.export_watch('$numeric_triage_watch')" "auditor watch export"
+expect_permission_denied "$permission_auditor_role" "SELECT otlet.import_watch('{}'::jsonb)" "auditor watch import"
 expect_permission_denied "$permission_auditor_role" "SELECT otlet.grant_auditor_access('$permission_auditor_role'::regrole)" "auditor grant helper"
 expect_permission_denied "$permission_auditor_role" "SELECT otlet.grant_operator_access('$permission_auditor_role'::regrole)" "auditor operator grant helper"
 
@@ -389,6 +391,8 @@ expect_permission_denied "$permission_operator_role" "SELECT * FROM otlet.comple
 expect_permission_denied "$permission_operator_role" "SELECT * FROM otlet.fail_job(0, 'denied')" "operator job failure"
 expect_permission_denied "$permission_operator_role" "SELECT otlet.sweep_expired_jobs()" "operator job sweep"
 expect_permission_denied "$permission_operator_role" "SELECT * FROM otlet.cleanup_policy_state(true)" "operator cleanup"
+expect_permission_denied "$permission_operator_role" "SELECT otlet.export_watch('$numeric_triage_watch')" "operator watch export"
+expect_permission_denied "$permission_operator_role" "SELECT otlet.import_watch('{}'::jsonb)" "operator watch import"
 expect_permission_denied "$permission_operator_role" "SELECT otlet.grant_auditor_access('$permission_operator_role'::regrole)" "operator auditor grant helper"
 expect_permission_denied "$permission_operator_role" "SELECT otlet.grant_operator_access('$permission_operator_role'::regrole)" "operator grant helper"
 
@@ -504,7 +508,7 @@ echo "permission_catalog_contract=$permission_catalog_contract"
 
 permission_contract="public=0/0/0|auditor=8/3|operator=8/9|definer=8/8|positive=7|denied=$permission_denied_count"
 echo "permission_contract=$permission_contract"
-[ "$permission_contract" = "public=0/0/0|auditor=8/3|operator=8/9|definer=8/8|positive=7|denied=44" ] || {
+[ "$permission_contract" = "public=0/0/0|auditor=8/3|operator=8/9|definer=8/8|positive=7|denied=48" ] || {
   echo "Expected complete permission contract, got $permission_contract" >&2
   exit 1
 }

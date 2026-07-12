@@ -196,20 +196,23 @@ bounded_proposal_contract=5|3|1|1|1|2|1
 bounded_dry_run_contract=4|1|4|1
 bounded_queue_contract=4|1
 bounded_execution_contract=approved|bounded apply|1|DO_NOT_TOUCH_SENTINEL|pending||0|DO_NOT_TOUCH_SENTINEL|1|2|2|0
-permission_contract=public=0/0/0|auditor=8/3|operator=8/9|definer=8/8|positive=7|denied=44
+permission_contract=public=0/0/0|auditor=8/3|operator=8/9|definer=8/8|positive=7|denied=48
 ```
 
 Only `row-1` changes through Otlet. Its allowed state, reason, and priority columns change once; its protected sentinel remains. `row-3` stays unchanged. The two replay receipts affect zero rows, and the two rejected apply attempts affect zero rows
 
 ## Step 7 - Check Semantic And Production Paths
 
-After the direct task works, check semantic joins, stale rows, receipts, and production status:
+After the direct task works, check semantic joins, portable watch definitions, stale rows, receipts, and production status:
 
 ```text
 semantic_join_auto_records=4|4
 semantic_join_auto_materialized=4
 semantic_join_lookup_contract=4|1|3
 semantic_join_match_contract=true|true
+watch_replace_contract=true|true|true|true|true|true|true|true|true|true
+watch_round_trip_contract=true|true|true|true|true
+watch_import_failure_contract=9|true
 semantic_join_stale_contract=4|0|fresh_after_lookup=0|receipts=8|8
 receipt_trace_contract=8|8|8|8
 inference_visibility_status=true|true|true|true|true

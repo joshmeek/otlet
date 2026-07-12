@@ -18,6 +18,8 @@ Otlet keeps source rows in user tables. Users select rows with SQL. `otlet.ask(.
 
 The model harness requires a top-level `output` plus `actions` envelope. Otlet records invalid JSON, schema failures, rejected attempts, and rejected actions as receipt evidence and excludes them from trusted output
 
+Extension owners can export row and pair watch definitions as `otlet.watch.v1` JSONB and import them through the same validation path as `create_watch`. The document carries configuration and owner-authored SQL without database state or model artifacts
+
 The planner contract covers semantic lookup, fail-closed stale reads, queue refresh, wait, fresh inference, bounded CustomScan infer-now, current-row SQL lookup, cache decisions, and live EXPLAIN vocabulary. SQL exposes cache keys, invalidation reasons, hit/miss counters, size bounds, runtime status, source-dependency stale reasons, queue admission, fair claims, attempt bounds, cancellation, RSS budget failures, malformed-schema failures, and cleanup dry-run evidence
 
 Run `./scripts/otlet-setup.sh`, then `./scripts/otlet-demo.sh` to prove the contract. Use `benchmarks/run.sh` for SQL-scored model comparisons
@@ -42,14 +44,13 @@ Run `./scripts/otlet-setup.sh`, then `./scripts/otlet-demo.sh` to prove the cont
 | Output reliability hardening | Compare prompt templates and quantizations for each model family under one fixture and gate set |
 | Planner, executor, and cache hardening | Align SQL plan rows, semantic status views, runtime fingerprints, CustomScan EXPLAIN, receipts, runtime/cache views, and demo output |
 | Semantic freshness hardening | Extend dependency audit export to source deletes and candidate-set changes |
-| Watch definition export | Add import/export for row and pair watches |
 | Model residency and timing | Add pre-load memory admission, pressure metrics, and single-context decoder-batch probes before changing slot policy |
 | Grammar-constrained decode | Add grammar or JSON-schema decode after linked llama exposes a worker-safe hook |
 | Persisted cache storage | Add disk-backed cache after a measured workload proves in-process cache misses hurt |
 | Managed Postgres external worker | Build a trusted SQL-bound worker that claims jobs, heartbeats, writes receipts, and fails closed |
 | GPU acceleration | Report device policy, memory accounting, throughput, energy per trusted job, crash behavior, and EXPLAIN-visible device state |
 | Core limits research | Test Access Method and fork paths when CustomScan cannot expose a required contract |
-| Entity resolution packs | Ship vendor, customer, and product packs with candidate SQL, prompts, schemas, actions, fixtures, and gates |
+| Entity resolution packs | Ship vendor, customer, and product packs that reuse `otlet.watch.v1` definitions with prompts, fixtures, and gates |
 
 Define each open track through SQL-visible state, a closed failure mode, and demo or benchmark proof before adding code
 

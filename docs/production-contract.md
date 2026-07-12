@@ -211,7 +211,9 @@ The grant also includes three pure JSON hashing helpers required by `audit_revie
 - `otlet.dry_run_action`
 - `otlet.apply_action`
 
-The six operator functions run as the extension owner with `search_path` fixed to `pg_catalog, otlet, pg_temp`. Operators receive no direct table writes. The owner alone calls `otlet.register_action_target(...)` or `otlet.disable_action_target(...)`. A target must be an ordinary non-partitioned table without RLS, use one primary-key column, and list each writable non-key column. Otlet revalidates that contract during dry run and apply
+The six operator functions run as the extension owner with `search_path` fixed to `pg_catalog, otlet, pg_temp`. Operators receive no direct table writes. The owner alone calls `otlet.register_action_target(...)`, `otlet.disable_action_target(...)`, `otlet.export_watch(...)`, and `otlet.import_watch(...)`. Watch exports contain instructions, policies, schemas, source identifiers, and owner-authored candidate SQL, so auditor and operator roles cannot read or import them
+
+An action target must be an ordinary non-partitioned table without RLS, use one primary-key column, and list each writable non-key column. Otlet revalidates that contract during dry run and apply
 
 Raw targets, execution receipts, outputs, source evidence, trace summaries, token traces, worker functions, model registration, watch administration, cleanup, and the grant helpers stay owner-only. Auditors see execution mode, status, hashes, changed-column names, affected-row count, and replay linkage through `otlet.audit_action_execution_export`, never target row values
 
@@ -221,10 +223,10 @@ Check the installed policy:
 SELECT * FROM otlet.access_policy_status;
 ```
 
-The demo proves the catalog ACLs, eight auditor views, nine operator function grants, seven successful operator paths, and 44 denied paths:
+The demo proves the catalog ACLs, eight auditor views, nine operator function grants, seven successful operator paths, and 48 denied paths:
 
 ```text
-permission_contract=public=0/0/0|auditor=8/3|operator=8/9|definer=8/8|positive=7|denied=44
+permission_contract=public=0/0/0|auditor=8/3|operator=8/9|definer=8/8|positive=7|denied=48
 ```
 
 Your application still owns these deployment boundaries:

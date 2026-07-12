@@ -47,7 +47,7 @@ Representative output:
 ```text
  otlet_base_tables
 -------------------
-                18
+                20
 (1 row)
 ```
 
@@ -575,3 +575,69 @@ semantic_join_match_contract=true
 ```
 
 Use explicit JSON predicates for row and join semantic filters
+
+## Step 12 - Move A Watch Definition
+
+The extension owner can export a row or pair watch as configuration-only JSONB:
+
+```sql
+SELECT jsonb_pretty(otlet.export_watch('learning_entity_pair_idx'));
+```
+
+`otlet.watch.v1` uses the same fields as `otlet.create_watch(...)`. The shortened values below show the key and type contract; export keeps the full instruction, schema, and candidate query
+
+```json
+{
+  "format": "otlet.watch.v1",
+  "name": "learning_entity_pair_idx",
+  "kind": "pair",
+  "instruction": "Compare one candidate pair",
+  "output_schema": {},
+  "model_name": "qwen3_1_7b",
+  "table_name": null,
+  "subject_column": null,
+  "candidate_query": "SELECT subject_id, input FROM public.learning_entity_pair_input",
+  "record_type": "learning_entity_pair",
+  "runtime_options": {},
+  "selection_policy": {},
+  "trigger_policy": {"on_change": "mark_stale"},
+  "action_types": [],
+  "stale_policy": "refresh_then_fail_closed",
+  "input_shaping": {},
+  "decision_contract": {},
+  "max_candidate_rows": 10,
+  "input_columns": null,
+  "pair_sources": [
+    {"table": "public.learning_entity", "subject_column": "id"}
+  ]
+}
+```
+
+The document contains watch configuration and owner-authored candidate SQL. It excludes model paths, source rows, jobs, outputs, actions, receipts, labels, traces, materializations, trigger names, timestamps, and counters
+
+Import requires the referenced model, tables, and columns to exist. The function rejects an existing watch unless the owner requests replacement:
+
+```sql
+SELECT otlet.export_watch('learning_entity_pair_idx') AS watch_definition \gset
+
+SELECT otlet.drop_watch('learning_entity_pair_idx');
+
+SELECT name, kind
+FROM otlet.import_watch(:'watch_definition'::jsonb);
+
+SELECT name, kind
+FROM otlet.import_watch(
+  :'watch_definition'::jsonb,
+  replace_existing => true
+);
+```
+
+Import validates `otlet.watch.v1`, resolves database dependencies, and calls `otlet.create_watch(...)`. A failed import rolls back its statement and leaves an existing watch unchanged
+
+The Docker demo proves replacement, drop/import round trip, lookup preservation, trigger preservation, and nine rejected documents:
+
+```text
+watch_replace_contract=true|true|true|true|true|true|true|true|true|true
+watch_round_trip_contract=true|true|true|true|true
+watch_import_failure_contract=9|true
+```

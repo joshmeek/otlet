@@ -480,6 +480,271 @@ BEGIN
 END;
 $$;
 
+CREATE FUNCTION otlet.export_watch(watch_name text) RETURNS jsonb
+LANGUAGE plpgsql
+STABLE
+AS $$
+DECLARE
+  definition jsonb;
+BEGIN
+  SELECT jsonb_build_object(
+    'format', 'otlet.watch.v1',
+    'name', w.name,
+    'kind', w.kind,
+    'instruction', t.instruction,
+    'output_schema', w.output_schema,
+    'model_name', w.model_name,
+    'table_name', w.source_table,
+    'subject_column', w.subject_column,
+    'candidate_query', w.candidate_query,
+    'record_type', w.record_type,
+    'runtime_options', w.runtime_options,
+    'selection_policy', w.selection_policy,
+    'trigger_policy', w.trigger_policy,
+    'action_types', COALESCE(
+      (
+        SELECT jsonb_agg(action_type ORDER BY action_type)
+        FROM unnest(w.action_types) action_type
+      ),
+      '[]'::jsonb
+    ),
+    'stale_policy', w.stale_policy,
+    'input_shaping', w.input_shaping,
+    'decision_contract', w.decision_contract,
+    'max_candidate_rows', w.max_candidate_rows,
+    'input_columns', CASE
+      WHEN w.input_columns IS NULL THEN 'null'::jsonb
+      ELSE to_jsonb(ARRAY(SELECT column_name FROM unnest(w.input_columns) column_name ORDER BY column_name))
+    END,
+    'pair_sources', COALESCE(
+      (
+        SELECT jsonb_agg(source.value ORDER BY source.value ->> 'table', source.value ->> 'subject_column')
+        FROM jsonb_array_elements(w.pair_sources) source(value)
+      ),
+      '[]'::jsonb
+    )
+  )
+  INTO definition
+  FROM otlet.watches w
+  JOIN otlet.tasks t ON t.name = w.task_name
+  WHERE w.name = export_watch.watch_name;
+
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'otlet watch % does not exist', watch_name;
+  END IF;
+
+  RETURN definition;
+END;
+$$;
+
+CREATE FUNCTION otlet.import_watch(
+  definition jsonb,
+  replace_existing boolean DEFAULT false
+) RETURNS otlet.watches
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  allowed_keys constant text[] := ARRAY[
+    'format',
+    'name',
+    'kind',
+    'instruction',
+    'output_schema',
+    'model_name',
+    'table_name',
+    'subject_column',
+    'candidate_query',
+    'record_type',
+    'runtime_options',
+    'selection_policy',
+    'trigger_policy',
+    'action_types',
+    'stale_policy',
+    'input_shaping',
+    'decision_contract',
+    'max_candidate_rows',
+    'input_columns',
+    'pair_sources'
+  ];
+  object_key text;
+  object_field text;
+  array_field text;
+  watch_name text;
+  watch_kind text;
+  table_name regclass;
+  action_types text[];
+  input_columns text[];
+  saved otlet.watches%ROWTYPE;
+BEGIN
+  IF jsonb_typeof(import_watch.definition) IS DISTINCT FROM 'object' THEN
+    RAISE EXCEPTION 'otlet watch definition must be a JSON object';
+  END IF;
+
+  SELECT key INTO object_key
+  FROM jsonb_object_keys(import_watch.definition) key
+  WHERE NOT key = ANY(allowed_keys)
+  ORDER BY key
+  LIMIT 1;
+  IF object_key IS NOT NULL THEN
+    RAISE EXCEPTION 'otlet watch definition has unsupported key %', object_key;
+  END IF;
+
+  SELECT key INTO object_key
+  FROM unnest(allowed_keys) key
+  WHERE NOT import_watch.definition ? key
+  ORDER BY key
+  LIMIT 1;
+  IF object_key IS NOT NULL THEN
+    RAISE EXCEPTION 'otlet watch definition is missing key %', object_key;
+  END IF;
+
+  IF import_watch.definition ->> 'format' IS DISTINCT FROM 'otlet.watch.v1' THEN
+    RAISE EXCEPTION 'otlet watch definition format must be otlet.watch.v1';
+  END IF;
+
+  FOREACH object_key IN ARRAY ARRAY['name', 'kind', 'instruction', 'model_name', 'record_type', 'stale_policy'] LOOP
+    IF jsonb_typeof(import_watch.definition -> object_key) IS DISTINCT FROM 'string'
+       OR NULLIF(import_watch.definition ->> object_key, '') IS NULL THEN
+      RAISE EXCEPTION 'otlet watch definition % must be a non-empty string', object_key;
+    END IF;
+  END LOOP;
+
+  IF jsonb_typeof(import_watch.definition -> 'output_schema') IS DISTINCT FROM 'object' THEN
+    RAISE EXCEPTION 'otlet watch definition output_schema must be an object';
+  END IF;
+
+  FOREACH object_field IN ARRAY ARRAY[
+    'runtime_options',
+    'selection_policy',
+    'trigger_policy',
+    'input_shaping',
+    'decision_contract'
+  ] LOOP
+    IF jsonb_typeof(import_watch.definition -> object_field) IS DISTINCT FROM 'object' THEN
+      RAISE EXCEPTION 'otlet watch definition % must be an object', object_field;
+    END IF;
+  END LOOP;
+
+  FOREACH array_field IN ARRAY ARRAY['action_types', 'pair_sources'] LOOP
+    IF jsonb_typeof(import_watch.definition -> array_field) IS DISTINCT FROM 'array' THEN
+      RAISE EXCEPTION 'otlet watch definition % must be an array', array_field;
+    END IF;
+  END LOOP;
+  IF NOT import_watch.definition ? 'input_columns'
+     OR jsonb_typeof(import_watch.definition -> 'input_columns') NOT IN ('array', 'null') THEN
+    RAISE EXCEPTION 'otlet watch definition input_columns must be an array or null';
+  END IF;
+  IF EXISTS (
+    SELECT 1
+    FROM jsonb_array_elements(import_watch.definition -> 'action_types') item(value)
+    WHERE jsonb_typeof(item.value) IS DISTINCT FROM 'string'
+  ) THEN
+    RAISE EXCEPTION 'otlet watch definition action_types entries must be strings';
+  END IF;
+  IF jsonb_typeof(import_watch.definition -> 'input_columns') = 'array'
+     AND EXISTS (
+       SELECT 1
+       FROM jsonb_array_elements(import_watch.definition -> 'input_columns') item(value)
+       WHERE jsonb_typeof(item.value) IS DISTINCT FROM 'string'
+     ) THEN
+    RAISE EXCEPTION 'otlet watch definition input_columns entries must be strings';
+  END IF;
+  IF EXISTS (
+    SELECT 1
+    FROM jsonb_array_elements(import_watch.definition -> 'pair_sources') item(value)
+    WHERE jsonb_typeof(item.value) IS DISTINCT FROM 'object'
+  ) THEN
+    RAISE EXCEPTION 'otlet watch definition pair_sources entries must be objects';
+  END IF;
+
+  IF jsonb_typeof(import_watch.definition -> 'max_candidate_rows') IS DISTINCT FROM 'number'
+     OR (import_watch.definition ->> 'max_candidate_rows') !~ '^[1-9][0-9]*$'
+     OR (import_watch.definition ->> 'max_candidate_rows')::numeric > 100000 THEN
+    RAISE EXCEPTION 'otlet watch definition max_candidate_rows must be an integer between 1 and 100000';
+  END IF;
+
+  watch_name := import_watch.definition ->> 'name';
+  watch_kind := import_watch.definition ->> 'kind';
+  IF watch_kind NOT IN ('row', 'pair') THEN
+    RAISE EXCEPTION 'otlet watch definition kind must be row or pair';
+  END IF;
+
+  PERFORM 1 FROM otlet.models m WHERE m.name = import_watch.definition ->> 'model_name';
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'otlet watch definition model % does not exist', import_watch.definition ->> 'model_name';
+  END IF;
+
+  IF EXISTS (SELECT 1 FROM otlet.watches w WHERE w.name = watch_name)
+     AND NOT COALESCE(import_watch.replace_existing, false) THEN
+    RAISE EXCEPTION 'otlet watch % already exists', watch_name;
+  END IF;
+
+  IF watch_kind = 'row' THEN
+    IF jsonb_typeof(import_watch.definition -> 'table_name') IS DISTINCT FROM 'string'
+       OR NULLIF(import_watch.definition ->> 'table_name', '') IS NULL THEN
+      RAISE EXCEPTION 'otlet row watch definition requires table_name';
+    END IF;
+    IF jsonb_typeof(import_watch.definition -> 'subject_column') IS DISTINCT FROM 'string'
+       OR NULLIF(import_watch.definition ->> 'subject_column', '') IS NULL THEN
+      RAISE EXCEPTION 'otlet row watch definition requires subject_column';
+    END IF;
+    IF import_watch.definition -> 'candidate_query' <> 'null'::jsonb
+       OR import_watch.definition -> 'pair_sources' <> '[]'::jsonb THEN
+      RAISE EXCEPTION 'otlet row watch definition cannot declare pair fields';
+    END IF;
+    table_name := to_regclass(import_watch.definition ->> 'table_name');
+    IF table_name IS NULL THEN
+      RAISE EXCEPTION 'otlet row watch definition table % does not exist', import_watch.definition ->> 'table_name';
+    END IF;
+  ELSE
+    IF jsonb_typeof(import_watch.definition -> 'candidate_query') IS DISTINCT FROM 'string'
+       OR NULLIF(import_watch.definition ->> 'candidate_query', '') IS NULL THEN
+      RAISE EXCEPTION 'otlet pair watch definition requires candidate_query';
+    END IF;
+    IF import_watch.definition -> 'table_name' <> 'null'::jsonb
+       OR import_watch.definition -> 'subject_column' <> 'null'::jsonb
+       OR import_watch.definition -> 'input_columns' <> 'null'::jsonb THEN
+      RAISE EXCEPTION 'otlet pair watch definition cannot declare row fields';
+    END IF;
+  END IF;
+
+  SELECT COALESCE(array_agg(value ORDER BY value), ARRAY[]::text[])
+  INTO action_types
+  FROM jsonb_array_elements_text(import_watch.definition -> 'action_types') value;
+
+  IF jsonb_typeof(import_watch.definition -> 'input_columns') = 'array' THEN
+    SELECT COALESCE(array_agg(value ORDER BY value), ARRAY[]::text[])
+    INTO input_columns
+    FROM jsonb_array_elements_text(import_watch.definition -> 'input_columns') value;
+  END IF;
+
+  SELECT * INTO saved
+  FROM otlet.create_watch(
+    watch_name => watch_name,
+    kind => watch_kind,
+    instruction => import_watch.definition ->> 'instruction',
+    output_schema => import_watch.definition -> 'output_schema',
+    model_name => import_watch.definition ->> 'model_name',
+    table_name => table_name,
+    subject_column => COALESCE(import_watch.definition ->> 'subject_column', 'id'),
+    candidate_query => import_watch.definition ->> 'candidate_query',
+    record_type => import_watch.definition ->> 'record_type',
+    runtime_options => import_watch.definition -> 'runtime_options',
+    selection_policy => import_watch.definition -> 'selection_policy',
+    trigger_policy => import_watch.definition -> 'trigger_policy',
+    action_types => action_types,
+    stale_policy => import_watch.definition ->> 'stale_policy',
+    input_shaping => import_watch.definition -> 'input_shaping',
+    decision_contract => import_watch.definition -> 'decision_contract',
+    max_candidate_rows => (import_watch.definition ->> 'max_candidate_rows')::integer,
+    input_columns => input_columns,
+    pair_sources => import_watch.definition -> 'pair_sources'
+  );
+
+  RETURN saved;
+END;
+$$;
+
 CREATE VIEW otlet.watch_status AS
 WITH watch_sources AS (
   SELECT
