@@ -4,7 +4,7 @@ Use this learning file as a worked example, following the structure from [this s
 
 Follow one Docker-backed Otlet entity-resolution loop: leave vendor rows in Postgres tables, select hard candidate pairs in SQL, enqueue durable model work, let the resident worker try a cheap local model and escalate hard rows to a stronger local model, validate `same_entity` / `different_entity` / `unclear`, record typed actions, and preserve receipts
 
-The output blocks come from a Docker-backed run on July 7, 2026 with `./scripts/otlet-setup.sh` and `./scripts/otlet-demo.sh`. Job IDs, receipt IDs, timestamps, token counts, timings, and token rates vary by machine and cache state
+The output blocks come from a Docker-backed run on July 12, 2026 with `./scripts/otlet-setup.sh` and `./scripts/otlet-demo.sh`. Job IDs, receipt IDs, hashes, timestamps, token counts, timings, and token rates are representative and vary by machine and cache state
 
 This walkthrough runs as the extension owner because it registers models and tasks, reads raw attempt state, and administers watches. Production auditors use the redacted `otlet.audit_*` views. Reviewers receive `otlet.grant_operator_access(...)` before calling approval, correction, dry-run, or apply functions. See [production-contract.md](production-contract.md) for the exact grants
 
@@ -168,10 +168,10 @@ A rejected cheap attempt is still evidence. The accepted strong attempt becomes 
 
 ## Step 6 - Inspect Typed Actions
 
-The application retains source-table write authority. The model proposes typed actions, and Otlet validates the action vocabulary and review state:
+The entity-resolution table stays unchanged. The model proposes typed actions, and Otlet validates the action vocabulary and review state:
 
 ```text
-action_schema_contract=merge_candidate|new_entity|note|review_flag
+action_schema_contract=merge_candidate|new_entity|note|review_flag|update_row
 action_type_contract=merge_candidate|new_entity
 action_status_contract=4|4|4|0
 failed_attempt_action_contract=0
@@ -188,6 +188,18 @@ source_write_contract=5|fa7672627cd7ab2a22aba2d9d7035815|5|fa7672627cd7ab2a22aba
 ```
 
 Otlet stores trusted actions. The application still owns merge authority
+
+The demo also registers a separate five-row table for the bounded `update_row` path. It proves accepted and rejected proposals, type-safe dry run, identical idempotency keys, operator apply, concurrent replay, stale source rejection, disabled-target rejection, protected-column preservation, and hashed receipts:
+
+```text
+bounded_proposal_contract=5|3|1|1|1|2|1
+bounded_dry_run_contract=4|1|4|1
+bounded_queue_contract=4|1
+bounded_execution_contract=approved|bounded apply|1|DO_NOT_TOUCH_SENTINEL|pending||0|DO_NOT_TOUCH_SENTINEL|1|2|2|0
+permission_contract=public=0/0/0|auditor=8/3|operator=8/9|definer=8/8|positive=7|denied=44
+```
+
+Only `row-1` changes through Otlet. Its allowed state, reason, and priority columns change once; its protected sentinel remains. `row-3` stays unchanged. The two replay receipts affect zero rows, and the two rejected apply attempts affect zero rows
 
 ## Step 7 - Check Semantic And Production Paths
 

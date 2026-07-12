@@ -347,8 +347,66 @@ BEGIN
       'apply_status', a.apply_status
     )
   FROM otlet.actions a
-  WHERE a.apply_status = 'applied'
+  WHERE a.apply_status IN ('applied', 'replayed')
     AND a.approval_status IS DISTINCT FROM 'approved';
+
+  RETURN QUERY
+  SELECT
+    'applied_updates_have_execution_receipts'::text,
+    'action'::text,
+    a.id::text,
+    jsonb_build_object(
+      'status', a.status,
+      'apply_status', a.apply_status,
+      'idempotency_key_present', a.idempotency_key IS NOT NULL
+    )
+  FROM otlet.actions a
+  WHERE a.action_type = 'update_row'
+    AND a.status = 'applied'
+    AND NOT EXISTS (
+      SELECT 1
+      FROM otlet.action_execution_receipts er
+      WHERE er.action_id = a.id
+        AND er.mode = 'apply'
+        AND er.status IN ('applied', 'replayed')
+    );
+
+  RETURN QUERY
+  SELECT
+    'successful_execution_receipts_have_applied_actions'::text,
+    'action_execution_receipt'::text,
+    er.id::text,
+    jsonb_build_object(
+      'action_id', er.action_id,
+      'receipt_status', er.status,
+      'action_status', a.status
+    )
+  FROM otlet.action_execution_receipts er
+  LEFT JOIN otlet.actions a ON a.id = er.action_id
+  WHERE er.mode = 'apply'
+    AND er.status IN ('applied', 'replayed')
+    AND (a.id IS NULL OR a.status IS DISTINCT FROM 'applied');
+
+  RETURN QUERY
+  SELECT
+    'update_actions_have_bounded_identity'::text,
+    'action'::text,
+    a.id::text,
+    jsonb_build_object(
+      'source_table_present', a.source_table IS NOT NULL,
+      'subject_id_present', a.subject_id IS NOT NULL,
+      'idempotency_key_present', a.idempotency_key IS NOT NULL,
+      'target_present', NULLIF(a.payload #>> '{body,target}', '') IS NOT NULL
+    )
+  FROM otlet.actions a
+  WHERE a.action_type = 'update_row'
+    AND a.status <> 'rejected'
+    AND (
+      a.source_table IS NULL
+      OR a.subject_id IS NULL
+      OR a.idempotency_key IS NULL
+      OR NULLIF(a.payload #>> '{body,target}', '') IS NULL
+    );
 
   RETURN QUERY
   SELECT
@@ -690,6 +748,13 @@ materialization_failures AS (
     max(created_at) AS semantic_materialization_last_failed_at
   FROM otlet.worker_events
   WHERE event_type = 'semantic_materialization_failed'
+),
+action_execution AS (
+  SELECT
+    count(*) FILTER (WHERE mode = 'apply' AND status = 'applied')::bigint AS applied_actions,
+    count(*) FILTER (WHERE mode = 'apply' AND status = 'replayed')::bigint AS replayed_actions,
+    count(*) FILTER (WHERE status = 'failed')::bigint AS failed_action_executions
+  FROM otlet.action_execution_receipts
 )
 SELECT
   p.name AS policy_name,
@@ -739,6 +804,9 @@ SELECT
   trace.max_detailed_trace_top_k,
   materialization_failures.semantic_materialization_failed_events,
   materialization_failures.semantic_materialization_last_failed_at,
+  action_execution.applied_actions,
+  action_execution.replayed_actions,
+  action_execution.failed_action_executions,
   (q.expired_running_jobs = 0) AS no_expired_running_jobs,
   (r.complete_without_schema_pass = 0) AS complete_receipts_are_schema_validated,
   (s.materializations_without_source_hash = 0) AS materializations_have_source_hashes,
@@ -754,6 +822,7 @@ CROSS JOIN semantic_state s
 CROSS JOIN runtime
 CROSS JOIN trace
 CROSS JOIN materialization_failures
+CROSS JOIN action_execution
 WHERE p.name = 'default';
 
 CREATE FUNCTION otlet.cleanup_policy_state(

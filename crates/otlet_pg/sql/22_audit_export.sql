@@ -66,6 +66,7 @@ SELECT
   ARRAY[
     'otlet.audit_receipt_export',
     'otlet.audit_review_export',
+    'otlet.audit_action_execution_export',
     'otlet.audit_eval_label_export',
     'otlet.semantic_dependency_audit',
     'otlet.worker_batch_timing_status',
@@ -133,6 +134,7 @@ FROM otlet.inference_receipt_trace_status s;
 CREATE VIEW otlet.audit_review_export AS
 SELECT
   q.queue_kind,
+  q.next_operator_step,
   q.task_name,
   q.watch_name,
   q.job_subject_id,
@@ -143,6 +145,16 @@ SELECT
   q.action_type,
   q.action_status,
   q.approval_status,
+  q.dry_run_status,
+  q.apply_status,
+  md5(q.idempotency_key) AS idempotency_key_hash,
+  q.execution_receipt_id,
+  q.execution_mode,
+  q.execution_status,
+  q.execution_affected_rows,
+  q.execution_before_hash,
+  q.execution_result_hash,
+  q.execution_error,
   q.review_reason,
   q.source_table,
   q.source_hash,
@@ -151,6 +163,36 @@ SELECT
   q.source_stale,
   q.created_at
 FROM otlet.review_queue q;
+
+CREATE VIEW otlet.audit_action_execution_export AS
+SELECT
+  er.id AS execution_receipt_id,
+  er.action_id,
+  a.job_id,
+  a.receipt_id AS inference_receipt_id,
+  j.task_name,
+  a.subject_id,
+  a.action_type,
+  a.status AS action_status,
+  a.approval_status,
+  a.dry_run_status,
+  a.apply_status,
+  md5(er.idempotency_key) AS idempotency_key_hash,
+  er.mode,
+  er.status,
+  er.target_name,
+  er.target_table,
+  er.identity_hash,
+  er.changed_columns,
+  er.affected_rows,
+  er.before_hash,
+  er.result_hash,
+  er.error,
+  er.replay_of_receipt_id,
+  er.created_at
+FROM otlet.action_execution_receipts er
+JOIN otlet.actions a ON a.id = er.action_id
+JOIN otlet.jobs j ON j.id = a.job_id;
 
 CREATE VIEW otlet.audit_eval_label_export AS
 SELECT

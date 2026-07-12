@@ -277,7 +277,7 @@ action_contract="$(psql_exec -qAt -v task_name="$entity_task" <<'SQL'
 WITH schema_check AS (
   SELECT string_agg(action_type, '|' ORDER BY action_type) AS value
   FROM otlet.action_type_schemas
-  WHERE action_type IN ('merge_candidate', 'new_entity', 'note', 'review_flag')
+  WHERE action_type IN ('merge_candidate', 'new_entity', 'note', 'review_flag', 'update_row')
 ), type_check AS (
   SELECT COALESCE(string_agg(DISTINCT action_type, '|' ORDER BY action_type), '') AS value
   FROM otlet.action_status
@@ -299,7 +299,7 @@ WITH schema_check AS (
 ), applyable_check AS (
   SELECT string_agg(action_type || ':' || applyable::text, '|' ORDER BY action_type) AS value
   FROM otlet.action_type_schemas
-  WHERE action_type IN ('create_record', 'merge_candidate', 'new_entity', 'note', 'review_flag')
+  WHERE action_type IN ('create_record', 'merge_candidate', 'new_entity', 'note', 'review_flag', 'update_row')
 )
 SELECT concat_ws(E'\n',
   'action_schema_contract=' || schema_check.value,
@@ -312,11 +312,11 @@ FROM schema_check, type_check, status_check, failed_check, applyable_check;
 SQL
 )"
 printf '%s\n' "$action_contract"
-require_contains "$action_contract" "action_schema_contract=merge_candidate|new_entity|note|review_flag" "Expected built-in action schemas"
+require_contains "$action_contract" "action_schema_contract=merge_candidate|new_entity|note|review_flag|update_row" "Expected built-in action schemas"
 require_contains "$action_contract" "action_type_contract=merge_candidate|new_entity" "Expected entity-resolution merge_candidate and new_entity actions"
 require_contains "$action_contract" "action_status_contract=4|4|4|0" "Expected four trusted valid entity actions"
 require_contains "$action_contract" "failed_attempt_action_contract=0" "Expected failed/rejected attempts to create no actions"
-require_contains "$action_contract" "action_applyable_contract=create_record:true|merge_candidate:false|new_entity:false|note:true|review_flag:false" "Expected applyable metadata to be schema-driven"
+require_contains "$action_contract" "action_applyable_contract=create_record:true|merge_candidate:false|new_entity:false|note:true|review_flag:false|update_row:true" "Expected applyable metadata to be schema-driven"
 
 merge_action_id="$(psql_exec -qAt -v task_name="$entity_task" <<'SQL'
 SELECT min(action_id)

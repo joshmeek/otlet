@@ -14,7 +14,7 @@ Otlet exposes three proof surfaces:
 | `scripts/otlet-demo.sh` | run the worked demo path with local inference |
 | `benchmarks/run.sh` | compare local GGUF models on Otlet SQL, receipts, actions, row watches, materialization, stale state, and planner contracts |
 
-Otlet keeps source rows in user tables. Users select rows with SQL. `otlet.ask(...)` handles one-off row questions through the resident worker. Named watches own repeatable row and pair jobs, stale policy, candidate SQL, model policy, and runtime options. Otlet passes compact JSON to local GGUF models, runs cheap-first model selection for tasks with a policy, drains bounded queue batches, and stores outputs, attempts, actions, traces, receipts, eval labels, and semantic materializations under `otlet`
+Otlet keeps source rows in user tables. Users select rows with SQL. `otlet.ask(...)` handles one-off row questions through the resident worker. Named watches own repeatable row and pair jobs, stale policy, candidate SQL, model policy, and runtime options. Otlet passes compact JSON to local GGUF models, runs cheap-first model selection for tasks with a policy, drains bounded queue batches, and stores outputs, attempts, actions, traces, receipts, eval labels, and semantic materializations under `otlet`. The bounded write path can update one owner-registered source row after dry run and approval
 
 The model harness requires a top-level `output` plus `actions` envelope. Otlet records invalid JSON, schema failures, rejected attempts, and rejected actions as receipt evidence and excludes them from trusted output
 
@@ -30,7 +30,7 @@ Run `./scripts/otlet-setup.sh`, then `./scripts/otlet-demo.sh` to prove the cont
 | 2 | Output reliability and benchmark truth | Active hardening | Add prompt-template and quant sweeps under the existing quality gates |
 | 3 | Planner, executor, and cache | Active hardening | Add runtime fingerprints, load admission, decoder-batch probes, and EXPLAIN parity |
 | 4 | Semantic freshness | Active hardening | Extend dependency audits to source deletes and candidate-set changes |
-| 5 | Action safety | Active hardening | Extend typed actions to bounded SQL proposals, target allowlists, and idempotent replay |
+| 5 | Action safety | Implemented contract | Maintain the one-table, one-key, one-row `update_row` boundary |
 | 6 | Managed Postgres packaging | Open | Test native workers where providers allow them and a SQL-bound agent where providers block them |
 | 7 | GPU acceleration | Open | Add device policy after the CPU resident-worker path has measured proof |
 | 8 | Core limits | Open research | Test Access Method and Postgres-fork paths for missing planner or executor contracts |
@@ -41,7 +41,6 @@ Run `./scripts/otlet-setup.sh`, then `./scripts/otlet-demo.sh` to prove the cont
 | --- | --- |
 | Output reliability hardening | Compare prompt templates and quantizations for each model family under one fixture and gate set |
 | Planner, executor, and cache hardening | Align SQL plan rows, semantic status views, runtime fingerprints, CustomScan EXPLAIN, receipts, runtime/cache views, and demo output |
-| Action lifecycle extension | Add bounded SQL proposal actions, dry-run plans, approvals, receipts, and source-table write checks |
 | Semantic freshness hardening | Extend dependency audit export to source deletes and candidate-set changes |
 | Watch definition export | Add import/export for row and pair watches |
 | Model residency and timing | Add pre-load memory admission, pressure metrics, and single-context decoder-batch probes before changing slot policy |
@@ -140,13 +139,13 @@ Production defaults use numeric low-detail tracing or disable it. SQL explains d
 
 Use `generation_trace_top_k=0` when token alternatives are not part of the question. In a smoke probe, Otlet kept probability and chosen-token trace while avoiding the top-alternative scan cost
 
-Otlet exposes read-only audit surfaces through `otlet.audit_receipt_export`, `otlet.audit_review_export`, `otlet.audit_eval_label_export`, `otlet.semantic_dependency_audit`, and `otlet.worker_batch_timing_status`. `otlet.redaction_policy_status` reports write-time storage mode, retention, observed sensitive rows, and compliance. `otlet.access_policy_status` reports the enforced `PUBLIC`, auditor, and operator boundary. The demo proves allowed audit reads, operator-only action functions, raw-state denial, fixed security-definer search paths, hash-only prompt evidence, and text-free production traces
+Otlet exposes read-only audit surfaces through `otlet.audit_receipt_export`, `otlet.audit_review_export`, `otlet.audit_action_execution_export`, `otlet.audit_eval_label_export`, `otlet.semantic_dependency_audit`, and `otlet.worker_batch_timing_status`. `otlet.redaction_policy_status` reports write-time storage mode, retention, observed sensitive rows, and compliance. `otlet.access_policy_status` reports the enforced `PUBLIC`, auditor, and operator boundary. The demo proves allowed audit reads, operator-only action functions, raw-state denial, fixed security-definer search paths, hash-only prompt evidence, and text-free production traces
 
 ## Action Safety
 
-The current action lifecycle covers proposed, pending review, approved, rejected, corrected, unclear, dry-run passed, applied, and failed states. SQL functions record reviewer reason and write eval labels from accepted, rejected, and corrected decisions
+The action lifecycle covers proposed, pending dry run, pending approval, approved, rejected, corrected, unclear, ready to apply, applied, replayed, and failed states. SQL functions record reviewer reason and write eval labels from accepted, rejected, and corrected decisions
 
-Next action work adds bounded SQL proposal actions. Source-table apply paths need target allowlists, dry-run plans, idempotency keys, approval records, replay checks, and failure receipts
+`update_row` is the only source-table write action. The owner maps one short target name to one ordinary table, its sole primary key, and at most 16 writable columns. Model output contains only target, identity, and changed values. Otlet requires the job subject and source table to match, converts values through PostgreSQL types, hashes dry-run and apply evidence, locks and rechecks the row, writes exactly once, and records replay or failure without row values. Operators can run the bounded lifecycle but cannot administer targets or update the source table directly
 
 ## Packaging And Security
 

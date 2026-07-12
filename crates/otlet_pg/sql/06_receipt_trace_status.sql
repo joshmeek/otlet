@@ -99,6 +99,8 @@ SELECT
   a.approval_status,
   a.dry_run_status,
   a.apply_status,
+  a.payload #>> '{body,target}' AS target_name,
+  a.idempotency_key,
   a.source_table,
   a.source_hash,
   a.content_hash,
@@ -110,11 +112,26 @@ SELECT
   (o.id IS NOT NULL AND r.selection_status = 'accepted') AS trusted_output,
   a.created_at,
   a.approved_at,
-  a.applied_at
+  a.applied_at,
+  execution.id AS execution_receipt_id,
+  execution.mode AS execution_mode,
+  execution.status AS execution_status,
+  execution.affected_rows AS execution_affected_rows,
+  execution.before_hash AS execution_before_hash,
+  execution.result_hash AS execution_result_hash,
+  execution.error AS execution_error,
+  execution.replay_of_receipt_id
 FROM otlet.actions a
 JOIN otlet.jobs j ON j.id = a.job_id
 LEFT JOIN otlet.outputs o ON o.id = a.output_id
-LEFT JOIN otlet.inference_receipts r ON r.id = a.receipt_id;
+LEFT JOIN otlet.inference_receipts r ON r.id = a.receipt_id
+LEFT JOIN LATERAL (
+  SELECT er.*
+  FROM otlet.action_execution_receipts er
+  WHERE er.action_id = a.id
+  ORDER BY er.created_at DESC, er.id DESC
+  LIMIT 1
+) execution ON true;
 
 CREATE VIEW otlet.eval_label_status AS
 SELECT
@@ -150,9 +167,19 @@ CREATE VIEW otlet.review_queue AS
 WITH action_items AS (
   SELECT
     CASE
+      WHEN a.action_type = 'update_row' AND a.dry_run_status = 'not_run' THEN 'pending_dry_run'
       WHEN a.approval_status = 'required' AND a.status = 'proposed' THEN 'pending_approval'
+      WHEN a.action_type = 'update_row' AND a.status = 'approved' THEN 'ready_to_apply'
       ELSE 'review_flag'
     END AS queue_kind,
+    CASE
+      WHEN a.action_type = 'update_row' AND a.dry_run_status = 'not_run' THEN 'dry_run'
+      WHEN a.action_type = 'update_row' AND a.dry_run_status = 'failed' THEN 'review_failure'
+      WHEN a.action_type = 'update_row' AND a.status = 'proposed' THEN 'approve'
+      WHEN a.action_type = 'update_row' AND a.status = 'approved' THEN 'apply'
+      WHEN a.approval_status = 'required' AND a.status = 'proposed' THEN 'approve'
+      ELSE 'review'
+    END AS next_operator_step,
     j.task_name,
     w.name AS watch_name,
     j.subject_id AS job_subject_id,
@@ -163,6 +190,16 @@ WITH action_items AS (
     a.action_type,
     a.status AS action_status,
     a.approval_status,
+    a.dry_run_status,
+    a.apply_status,
+    a.idempotency_key,
+    execution.id AS execution_receipt_id,
+    execution.mode AS execution_mode,
+    execution.status AS execution_status,
+    execution.affected_rows AS execution_affected_rows,
+    execution.before_hash AS execution_before_hash,
+    execution.result_hash AS execution_result_hash,
+    execution.error AS execution_error,
     a.review_reason,
     o.output,
     a.source_table,
@@ -183,6 +220,13 @@ WITH action_items AS (
   LEFT JOIN otlet.watches w ON w.task_name = j.task_name
   LEFT JOIN otlet.outputs o ON o.id = a.output_id
   LEFT JOIN LATERAL (
+    SELECT er.*
+    FROM otlet.action_execution_receipts er
+    WHERE er.action_id = a.id
+    ORDER BY er.created_at DESC, er.id DESC
+    LIMIT 1
+  ) execution ON true
+  LEFT JOIN LATERAL (
     SELECT sm.content_hash, sm.stale
     FROM otlet.semantic_materializations sm
     WHERE sm.task_name = j.task_name
@@ -200,6 +244,11 @@ WITH action_items AS (
         a.action_type = 'review_flag'
         AND a.status <> 'rejected'
       )
+      OR (
+        a.action_type = 'update_row'
+        AND a.status = 'approved'
+        AND a.apply_status NOT IN ('applied', 'replayed')
+      )
     )
     AND NOT EXISTS (
       SELECT 1
@@ -211,6 +260,7 @@ WITH action_items AS (
 abstention_items AS (
   SELECT
     'abstention_output'::text AS queue_kind,
+    'review'::text AS next_operator_step,
     j.task_name,
     w.name AS watch_name,
     j.subject_id AS job_subject_id,
@@ -221,6 +271,16 @@ abstention_items AS (
     NULL::text AS action_type,
     NULL::text AS action_status,
     NULL::text AS approval_status,
+    NULL::text AS dry_run_status,
+    NULL::text AS apply_status,
+    NULL::text AS idempotency_key,
+    NULL::bigint AS execution_receipt_id,
+    NULL::text AS execution_mode,
+    NULL::text AS execution_status,
+    NULL::bigint AS execution_affected_rows,
+    NULL::text AS execution_before_hash,
+    NULL::text AS execution_result_hash,
+    NULL::text AS execution_error,
     NULL::text AS review_reason,
     o.output,
     r.trace_summary #>> '{mvcc,table}' AS source_table,
@@ -264,6 +324,7 @@ abstention_items AS (
 direct_rejected_items AS (
   SELECT
     'direct_rejected_output'::text AS queue_kind,
+    'review'::text AS next_operator_step,
     j.task_name,
     w.name AS watch_name,
     j.subject_id AS job_subject_id,
@@ -274,6 +335,16 @@ direct_rejected_items AS (
     NULL::text AS action_type,
     NULL::text AS action_status,
     NULL::text AS approval_status,
+    NULL::text AS dry_run_status,
+    NULL::text AS apply_status,
+    NULL::text AS idempotency_key,
+    NULL::bigint AS execution_receipt_id,
+    NULL::text AS execution_mode,
+    NULL::text AS execution_status,
+    NULL::bigint AS execution_affected_rows,
+    NULL::text AS execution_before_hash,
+    NULL::text AS execution_result_hash,
+    NULL::text AS execution_error,
     NULL::text AS review_reason,
     r.candidate_output AS output,
     r.trace_summary #>> '{mvcc,table}' AS source_table,
@@ -318,6 +389,7 @@ direct_rejected_items AS (
 )
 SELECT
   queue_kind,
+  next_operator_step,
   task_name,
   watch_name,
   job_subject_id,
@@ -328,6 +400,16 @@ SELECT
   action_type,
   action_status,
   approval_status,
+  dry_run_status,
+  apply_status,
+  idempotency_key,
+  execution_receipt_id,
+  execution_mode,
+  execution_status,
+  execution_affected_rows,
+  execution_before_hash,
+  execution_result_hash,
+  execution_error,
   review_reason,
   output,
   source_table,
@@ -340,6 +422,7 @@ FROM action_items
 UNION ALL
 SELECT
   queue_kind,
+  next_operator_step,
   task_name,
   watch_name,
   job_subject_id,
@@ -350,6 +433,16 @@ SELECT
   action_type,
   action_status,
   approval_status,
+  dry_run_status,
+  apply_status,
+  idempotency_key,
+  execution_receipt_id,
+  execution_mode,
+  execution_status,
+  execution_affected_rows,
+  execution_before_hash,
+  execution_result_hash,
+  execution_error,
   review_reason,
   output,
   source_table,
@@ -362,6 +455,7 @@ FROM abstention_items
 UNION ALL
 SELECT
   queue_kind,
+  next_operator_step,
   task_name,
   watch_name,
   job_subject_id,
@@ -372,6 +466,16 @@ SELECT
   action_type,
   action_status,
   approval_status,
+  dry_run_status,
+  apply_status,
+  idempotency_key,
+  execution_receipt_id,
+  execution_mode,
+  execution_status,
+  execution_affected_rows,
+  execution_before_hash,
+  execution_result_hash,
+  execution_error,
   review_reason,
   output,
   source_table,

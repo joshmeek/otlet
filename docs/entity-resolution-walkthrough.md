@@ -431,7 +431,7 @@ Representative output:
 `otlet.review_queue` gathers actions that need attention, abstention outputs, and review flags with receipt and source-freshness context:
 
 ```sql
-SELECT queue_kind, task_name, watch_name, subject_id, action_id, receipt_id, source_stale
+SELECT queue_kind, next_operator_step, task_name, watch_name, subject_id, action_id, receipt_id, source_stale
 FROM otlet.review_queue
 WHERE task_name IN ('entity_resolution_demo', 'demo_entity_resolution_idx_task')
 ORDER BY created_at, task_name
@@ -441,9 +441,9 @@ LIMIT 5;
 Representative output:
 
 ```text
-    queue_kind    |            task_name            |         watch_name         | subject_id | action_id | receipt_id | source_stale
-------------------+---------------------------------+----------------------------+------------+-----------+------------+--------------
- pending_approval | demo_entity_resolution_idx_task | demo_entity_resolution_idx | vendor-42  |        35 |         85 | f
+    queue_kind    | next_operator_step |            task_name            |         watch_name         | subject_id | action_id | receipt_id | source_stale
+------------------+--------------------+---------------------------------+----------------------------+------------+-----------+------------+--------------
+ pending_approval | approve            | demo_entity_resolution_idx_task | demo_entity_resolution_idx | vendor-42  |        35 |         85 | f
 (1 row)
 ```
 
@@ -563,7 +563,7 @@ Input shaping fields are top-level in the task input. Row watches wrap source ro
 Otlet uses a fixed, typed action vocabulary. The built-in action catalog says which actions need approval and which ones can create Otlet-owned records:
 
 ```sql
-SELECT action_type, requires_approval, creates_record
+SELECT action_type, requires_approval, creates_record, applyable
 FROM otlet.action_type_schemas
 ORDER BY action_type;
 
@@ -575,14 +575,15 @@ SELECT otlet.action_validation_error(
 Representative output:
 
 ```text
-   action_type   | requires_approval | creates_record
------------------+-------------------+----------------
- create_record   | f                 | t
- merge_candidate | t                 | f
- new_entity      | f                 | f
- note            | f                 | t
- review_flag     | f                 | f
-(5 rows)
+   action_type   | requires_approval | creates_record | applyable
+-----------------+-------------------+----------------+-----------
+ create_record   | f                 | t              | t
+ merge_candidate | t                 | f              | f
+ new_entity      | f                 | f              | f
+ note            | f                 | t              | t
+ review_flag     | f                 | f              | f
+ update_row      | t                 | f              | t
+(6 rows)
 
  rejected_action_error
 -----------------------
@@ -591,3 +592,43 @@ Representative output:
 ```
 
 Otlet enforces write authority through the action catalog. The model can request an action; Otlet decides which action types can become database state. Otlet stores unsupported actions as rejected evidence when they arrive with an accepted output. `otlet.action_status` shows approval, dry-run, and apply state
+
+`update_row` is the only source-table write action. The extension owner registers one ordinary table, its sole primary key, and the columns Otlet may update:
+
+```sql
+SELECT otlet.register_action_target(
+  'review_items',
+  'app.review_items'::regclass,
+  'id',
+  ARRAY['review_state', 'review_reason']::name[]
+);
+```
+
+The model-authored action contains data, not SQL:
+
+```json
+{
+  "type": "update_row",
+  "body": {
+    "target": "review_items",
+    "identity": "item-42",
+    "changes": {
+      "review_state": "approved",
+      "review_reason": "matched source evidence"
+    }
+  }
+}
+```
+
+The identity must equal the job subject, the target must equal the modeled source table, and every changed key must be registered. Version one supports one ordinary table, one single-column primary key, one row, and at most 16 changed columns. It rejects raw SQL, predicates, expressions, joins, generated columns, identity columns, partitions, foreign tables, views, temporary tables, Otlet tables, and RLS targets
+
+Review the typed result before approval, then apply it:
+
+```sql
+SELECT dry_run_status FROM otlet.dry_run_action(:action_id);
+SELECT approval_status FROM otlet.approve_action(:action_id, 'reviewed source evidence');
+SELECT apply_status FROM otlet.apply_action(:action_id);
+SELECT apply_status FROM otlet.apply_action(:action_id);
+```
+
+The first apply updates exactly one row and stores before/after hashes. The second returns `replayed`, writes no row, and links to the original receipt. If the source row, target registration, schema, or privileges changed after dry run, apply fails closed. `correct_action` still means reject plus eval label; a corrected executable write is a new proposal with a new dry run and approval

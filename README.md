@@ -2,7 +2,9 @@
 
 Otlet is a Postgres extension for row judgment. It runs local LLM inference **inside Postgres**, next to the rows it reads and acts on
 
-Otlet answers questions about rows, validates JSON, keeps receipts, and stores trusted derived state while source tables stay unchanged. Entity resolution is the first full path: Otlet judges hard candidate row pairs, escalates from a small local model to a stronger one, proposes typed actions, and materializes results for later SQL
+Otlet answers questions about rows, validates JSON, keeps receipts, and stores trusted derived state. Entity resolution is the first full path: Otlet judges hard candidate row pairs, escalates from a small local model to a stronger one, proposes typed actions, and materializes results for later SQL
+
+For explicit source writes, an owner can register one ordinary table, its single-column primary key, and a fixed list of writable columns. The model can then propose one typed `update_row`; Otlet dry-runs it, requires approval, rechecks the row, writes once, and records hashed execution evidence
 
 Otlet uses a `pgrx` extension and a Postgres background worker loaded through `shared_preload_libraries` to run local model work inside the database process. You can ask for model work from SQL, queue it from rows, refresh semantic state after source changes, and inspect the result without leaving Postgres
 

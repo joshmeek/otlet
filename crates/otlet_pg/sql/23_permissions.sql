@@ -87,6 +87,7 @@ BEGIN
     'otlet.access_policy_status, '
     'otlet.audit_receipt_export, '
     'otlet.audit_review_export, '
+    'otlet.audit_action_execution_export, '
     'otlet.audit_eval_label_export, '
     'otlet.semantic_dependency_audit, '
     'otlet.worker_batch_timing_status TO %I',

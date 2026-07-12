@@ -175,7 +175,7 @@ SELECT count(*) FROM otlet.verify_invariants();
 
 Contract: `0` (demo prints `invariant_contract=0`). The suite fails closed on expired or NULL leases for `running` and `cancel_requested` jobs, complete receipts without schema pass, sensitive evidence that violates the active storage policy, materializations missing `source_hash`, and error runtime slots. `production_status` and `verify_invariants` name the receipt invariant `complete_receipts_are_schema_validated`; throughput views use `completed_jobs` and `last_batch_completed_jobs`. Step 6 of `docs/semantic-watches.md` anchors the planner vocabulary for `selected_path` / `Planner Selected Path` and `freshness_basis`
 
-Operators query redacted, read-only projections through `otlet.audit_receipt_export`, `otlet.audit_review_export`, `otlet.audit_eval_label_export`, `otlet.semantic_dependency_audit`, and `otlet.worker_batch_timing_status`. `otlet.redaction_policy_status` lists withheld fields
+Operators query redacted, read-only projections through `otlet.audit_receipt_export`, `otlet.audit_review_export`, `otlet.audit_action_execution_export`, `otlet.audit_eval_label_export`, `otlet.semantic_dependency_audit`, and `otlet.worker_batch_timing_status`. `otlet.redaction_policy_status` lists withheld fields
 
 ## Step 4 - Grant Role-Scoped Access
 
@@ -197,6 +197,7 @@ The auditor capability grants these redacted policy and audit views:
 - `otlet.access_policy_status`
 - `otlet.audit_receipt_export`
 - `otlet.audit_review_export`
+- `otlet.audit_action_execution_export`
 - `otlet.audit_eval_label_export`
 - `otlet.semantic_dependency_audit`
 - `otlet.worker_batch_timing_status`
@@ -210,7 +211,9 @@ The grant also includes three pure JSON hashing helpers required by `audit_revie
 - `otlet.dry_run_action`
 - `otlet.apply_action`
 
-The six operator functions run as the extension owner with `search_path` fixed to `pg_catalog, otlet, pg_temp`. Operators receive no direct table writes. Raw receipts, outputs, source evidence, trace summaries, token traces, worker functions, model registration, watch administration, cleanup, and the grant helpers stay owner-only
+The six operator functions run as the extension owner with `search_path` fixed to `pg_catalog, otlet, pg_temp`. Operators receive no direct table writes. The owner alone calls `otlet.register_action_target(...)` or `otlet.disable_action_target(...)`. A target must be an ordinary non-partitioned table without RLS, use one primary-key column, and list each writable non-key column. Otlet revalidates that contract during dry run and apply
+
+Raw targets, execution receipts, outputs, source evidence, trace summaries, token traces, worker functions, model registration, watch administration, cleanup, and the grant helpers stay owner-only. Auditors see execution mode, status, hashes, changed-column names, affected-row count, and replay linkage through `otlet.audit_action_execution_export`, never target row values
 
 Check the installed policy:
 
@@ -218,10 +221,10 @@ Check the installed policy:
 SELECT * FROM otlet.access_policy_status;
 ```
 
-The demo proves the catalog ACLs, seven auditor views, nine operator function grants, six successful operator calls, and 35 denied paths:
+The demo proves the catalog ACLs, eight auditor views, nine operator function grants, seven successful operator paths, and 44 denied paths:
 
 ```text
-permission_contract=public=0/0/0|auditor=7/3|operator=7/9|definer=8/8|positive=6|denied=35
+permission_contract=public=0/0/0|auditor=8/3|operator=8/9|definer=8/8|positive=7|denied=44
 ```
 
 Your application still owns these deployment boundaries:
