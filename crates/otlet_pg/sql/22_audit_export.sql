@@ -23,9 +23,10 @@ SELECT
     'otlet.audit_review_export',
     'otlet.audit_eval_label_export',
     'otlet.semantic_dependency_audit',
-    'otlet.worker_batch_timing_status'
+    'otlet.worker_batch_timing_status',
+    'otlet.access_policy_status'
   ]::text[] AS export_views,
-  'Audit export views omit prompts, raw_output, token detail, and full trace_summary. Use inference_receipt_trace_status only when those fields are required.'::text AS notes;
+  'Audit export views omit prompts, raw_output, token detail, and full trace_summary. Raw tables and trace views remain owner-only.'::text AS notes;
 
 CREATE VIEW otlet.audit_receipt_export AS
 SELECT

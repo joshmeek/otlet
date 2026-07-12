@@ -4,6 +4,8 @@ Use this guide to extend the direct entity-resolution walkthrough into reusable 
 
 The vendor-pair demo covers the end-to-end path. Smaller learning tables isolate each transfer pattern
 
+This administrative walkthrough runs as the extension owner because it creates watches, reads raw status and receipt views, and changes source fixtures. Auditors use the redacted exports; action reviewers receive the operator capability described in [production-contract.md](production-contract.md)
+
 ## Step 1 - Choose Direct Task Or Semantic Index
 
 The direct task path gives you the shortest way to learn Otlet

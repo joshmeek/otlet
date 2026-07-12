@@ -6,6 +6,8 @@ Follow one Docker-backed Otlet entity-resolution loop: leave vendor rows in Post
 
 The output blocks come from a Docker-backed run on July 7, 2026 with `./scripts/otlet-setup.sh` and `./scripts/otlet-demo.sh`. Job IDs, receipt IDs, timestamps, token counts, timings, and token rates vary by machine and cache state
 
+This walkthrough runs as the extension owner because it registers models and tasks, reads raw attempt state, and administers watches. Production auditors use the redacted `otlet.audit_*` views. Reviewers receive `otlet.grant_operator_access(...)` before calling approval, correction, dry-run, or apply functions. See [production-contract.md](production-contract.md) for the exact grants
+
 ## Example Path
 
 Run these steps in order:

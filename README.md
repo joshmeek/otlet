@@ -134,7 +134,7 @@ The worked example pairs SQL commands with captured output and keeps the setup p
 - [Entity resolution walkthrough](docs/entity-resolution-walkthrough.md)
 - [Runtime and traces](docs/runtime-and-traces.md)
 - [Semantic watches](docs/semantic-watches.md)
-- [Production contract](docs/production-contract.md) for audit export views (`otlet.audit_*`, `otlet.redaction_policy_status`) and invariant naming
+- [Production contract](docs/production-contract.md) for role grants, audit export views, `otlet.access_policy_status`, redaction policy, and invariant naming
 
 Use [benchmarks/README.md](benchmarks/README.md) to compare local GGUF models on Otlet’s row-pair, receipt, action, stale-state, and resource-fit contracts
 

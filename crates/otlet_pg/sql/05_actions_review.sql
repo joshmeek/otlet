@@ -442,6 +442,8 @@ CREATE FUNCTION otlet.approve_action(
   review_reason text DEFAULT NULL
 ) RETURNS SETOF otlet.actions
 LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, otlet, pg_temp
 AS $$
 DECLARE
   action_row otlet.actions%ROWTYPE;
@@ -469,6 +471,8 @@ CREATE FUNCTION otlet.reject_action(
   review_reason text DEFAULT NULL
 ) RETURNS SETOF otlet.actions
 LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, otlet, pg_temp
 AS $$
 DECLARE
   action_row otlet.actions%ROWTYPE;
@@ -519,6 +523,8 @@ $$;
 
 CREATE FUNCTION otlet.dry_run_action(action_id bigint) RETURNS SETOF otlet.actions
 LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, otlet, pg_temp
 AS $$
 DECLARE
   context_row record;
@@ -555,6 +561,8 @@ $$;
 
 CREATE FUNCTION otlet.apply_action(action_id bigint) RETURNS SETOF otlet.actions
 LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, otlet, pg_temp
 AS $$
 DECLARE
   context_row record;

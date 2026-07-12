@@ -26,10 +26,10 @@ Run `./scripts/otlet-setup.sh`, then `./scripts/otlet-demo.sh` to prove the cont
 
 | Order | Track | Status | Next work |
 | --- | --- | --- | --- |
-| 1 | Packaging and security | Active hardening | Maintain a small setup and demo; add permission, redaction, and upgrade proof |
+| 1 | Packaging and security | Active hardening | Maintain a small setup and demo; add stored redaction and release packaging proof |
 | 2 | Output reliability and benchmark truth | Active hardening | Add prompt-template and quant sweeps under the existing quality gates |
 | 3 | Planner, executor, and cache | Active hardening | Add runtime fingerprints, load admission, decoder-batch probes, and EXPLAIN parity |
-| 4 | Explain and trace | Active hardening | Add role-scoped grants, permission tests, and enforced prompt and trace redaction |
+| 4 | Explain and trace | Active hardening | Enforce stored prompt and trace redaction |
 | 5 | Semantic freshness | Active hardening | Extend dependency audits to source deletes and candidate-set changes |
 | 6 | Action safety | Active hardening | Extend typed actions to bounded SQL proposals, target allowlists, and idempotent replay |
 | 7 | Managed Postgres packaging | Open | Test native workers where providers allow them and a SQL-bound agent where providers block them |
@@ -45,7 +45,7 @@ Run `./scripts/otlet-setup.sh`, then `./scripts/otlet-demo.sh` to prove the cont
 | Action lifecycle extension | Add bounded SQL proposal actions, dry-run plans, approvals, receipts, and source-table write checks |
 | Semantic freshness hardening | Extend dependency audit export to source deletes and candidate-set changes |
 | Watch definition export | Add import/export for row and pair watches |
-| Explain and trace hardening | Add role-scoped grants, permission tests, and enforced prompt and trace redaction |
+| Explain and trace hardening | Enforce stored prompt and trace redaction |
 | Model residency and timing | Add pre-load memory admission, pressure metrics, and single-context decoder-batch probes before changing slot policy |
 | Grammar-constrained decode | Add grammar or JSON-schema decode after linked llama exposes a worker-safe hook |
 | Persisted cache storage | Add disk-backed cache after a measured workload proves in-process cache misses hurt |
@@ -53,7 +53,7 @@ Run `./scripts/otlet-setup.sh`, then `./scripts/otlet-demo.sh` to prove the cont
 | GPU acceleration | Report device policy, memory accounting, throughput, energy per trusted job, crash behavior, and EXPLAIN-visible device state |
 | Core limits research | Test Access Method and fork paths when CustomScan cannot expose a required contract |
 | Entity resolution packs | Ship vendor, customer, and product packs with candidate SQL, prompts, schemas, actions, fixtures, and gates |
-| Audit export and redaction | Add role-scoped grants, permission tests, and enforced redaction for stored prompts and token traces |
+| Audit export and redaction | Enforce redaction for stored prompts and token traces |
 
 Define each open track through SQL-visible state, a closed failure mode, and demo or benchmark proof before adding code
 
@@ -143,7 +143,7 @@ Production defaults use low-detail tracing or disable it. SQL explains disabled 
 
 Use `generation_trace_top_k=0` when token alternatives are not part of the question. In a smoke probe, Otlet kept probability and chosen-token trace while avoiding the top-alternative scan cost
 
-Otlet exposes read-only audit surfaces through `otlet.audit_receipt_export`, `otlet.audit_review_export`, `otlet.audit_eval_label_export`, `otlet.semantic_dependency_audit`, and `otlet.worker_batch_timing_status`. `otlet.redaction_policy_status` documents the active withheld-field contract. Add role-scoped grants, permission tests, and enforced redaction before exporting prompt, source, or token detail
+Otlet exposes read-only audit surfaces through `otlet.audit_receipt_export`, `otlet.audit_review_export`, `otlet.audit_eval_label_export`, `otlet.semantic_dependency_audit`, and `otlet.worker_batch_timing_status`. `otlet.redaction_policy_status` documents withheld fields. `otlet.access_policy_status` reports the enforced `PUBLIC`, auditor, and operator boundary. The demo proves allowed audit reads, operator-only action functions, raw-state denial, and fixed security-definer search paths. Enforce stored redaction before exporting prompt, source, or token detail
 
 ## Action Safety
 
@@ -155,9 +155,13 @@ Next action work adds bounded SQL proposal actions. Source-table apply paths nee
 
 Limit open-source packaging to one setup script, one demo script, a small model path, Docker instructions, crash-log scanning, CPU-only defaults, resource warnings, extension versioning, and upgrade notes
 
+Otlet remains greenfield before its first stable release. Current builds recreate the extension; versioned upgrade and downgrade paths begin with the stable packaging contract
+
 Cover schema permissions, model artifact path permissions, allowed write targets, action approval, prompt visibility, trace visibility, row-level security, superuser requirements, and extension install risk. Redact traces because prompts and token traces can contain source values
 
 Define redaction policy for prompts, source values, traces, receipts, review queues, and audit exports. SQL status views show the active policy and withheld fields via `otlet.redaction_policy_status`. Enforcement that rewrites stored prompts or token traces remains open
+
+Role-scoped access is installed by default. `PUBLIC` has no Otlet schema, table, sequence, or function access. Extension-owner grant helpers give caller-managed roles the redacted auditor capability or the bounded action-operator capability
 
 Use admission control for predictable Postgres behavior under model load: per-task budgets, queue fairness, cancellation, worker RSS policy, model unload behavior, and fail-closed semantics under pressure
 

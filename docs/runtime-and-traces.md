@@ -2,6 +2,8 @@
 
 Use this after the entity-resolution walkthrough queues work. It inspects model selection, receipts, runtime status, trace visibility, retries, cancellation, and failed-run evidence
 
+These diagnostic queries run as the extension owner because they expose raw receipt, output, error, and token state. Auditors use `otlet.audit_receipt_export` and the other redacted exports granted by `otlet.grant_auditor_access(...)`
+
 ## Step 1 - Inspect Model Selection Attempts
 
 ```sql

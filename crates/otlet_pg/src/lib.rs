@@ -106,6 +106,11 @@ pgrx::extension_sql_file!(
     name = "audit_export",
     requires = ["watches"]
 );
+pgrx::extension_sql_file!(
+    "../sql/23_permissions.sql",
+    name = "permissions",
+    requires = ["audit_export"]
+);
 
 #[allow(non_snake_case)]
 #[pgrx::pg_guard]

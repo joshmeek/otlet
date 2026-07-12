@@ -4,6 +4,8 @@ Use this SQL walkthrough to expand the entity-resolution path from `docs/otlet-w
 
 Run the sections in order before adapting them. Each section names the state it creates and the output to inspect. Follow-up checks live in [runtime-and-traces.md](runtime-and-traces.md), [semantic-watches.md](semantic-watches.md), and [production-contract.md](production-contract.md)
 
+The setup and inspection sections run as the extension owner. A delegated reviewer reads `otlet.audit_review_export` and receives `otlet.grant_operator_access(...)` before using the action review functions. Raw `otlet.review_queue`, task configuration, receipts, and trace state remain owner-only
+
 ## Step 1 - Register The Models
 
 ```sql

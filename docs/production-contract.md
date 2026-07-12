@@ -138,56 +138,56 @@ Contract: `0` (demo prints `invariant_contract=0`). The suite fails closed on ex
 
 Operators query redacted, read-only projections through `otlet.audit_receipt_export`, `otlet.audit_review_export`, `otlet.audit_eval_label_export`, `otlet.semantic_dependency_audit`, and `otlet.worker_batch_timing_status`. `otlet.redaction_policy_status` lists withheld fields
 
-## Step 4 - Assign Application-Owned Controls
+## Step 4 - Grant Role-Scoped Access
 
-Otlet installs internal production policy, bounded queues, leases, sweeps, validation evidence, action approval state, status views, and cleanup dry-run/apply functions. Your application owns tenant access, app roles, and who may approve or apply actions
+Otlet revokes schema, table, sequence, and function access from `PUBLIC`. The extension owner keeps raw and administrative access. Applications create their own login or group roles, then the extension owner grants one of two bounded capabilities
 
-Check row-level security:
-
-```sql
-SELECT 'rls_contract=' ||
-       count(*)::text || '|' ||
-       (count(*) FILTER (WHERE relrowsecurity))::text
-FROM pg_class c
-JOIN pg_namespace n ON n.oid = c.relnamespace
-WHERE n.nspname = 'otlet'
-  AND c.relkind = 'r';
-
-SELECT 'installed_policies=' || count(*)::text
-FROM pg_policies
-WHERE schemaname = 'otlet';
-```
-
-Representative output:
-
-```text
-rls_contract=19|0
-installed_policies=0
-```
-
-Check default grants visible through `information_schema`:
+Create roles through your normal provisioning path. These `NOLOGIN` roles show the grant contract:
 
 ```sql
-SELECT 'grant_contract=' ||
-       string_agg(privilege_type || ':' || n::text, '|' ORDER BY privilege_type)
-FROM (
-  SELECT privilege_type, count(*) AS n
-  FROM information_schema.role_table_grants
-  WHERE table_schema = 'otlet'
-  GROUP BY privilege_type
-) grants;
+CREATE ROLE app_otlet_auditor NOLOGIN;
+CREATE ROLE app_otlet_operator NOLOGIN;
+
+SELECT otlet.grant_auditor_access('app_otlet_auditor'::regrole);
+SELECT otlet.grant_operator_access('app_otlet_operator'::regrole);
 ```
 
-Representative output:
+The auditor capability grants these redacted policy and audit views:
+
+- `otlet.redaction_policy_status`
+- `otlet.access_policy_status`
+- `otlet.audit_receipt_export`
+- `otlet.audit_review_export`
+- `otlet.audit_eval_label_export`
+- `otlet.semantic_dependency_audit`
+- `otlet.worker_batch_timing_status`
+
+The grant also includes three pure JSON hashing helpers required by `audit_review_export`; those helpers read no database rows. The operator capability includes auditor access plus these functions:
+
+- `otlet.approve_action`
+- `otlet.reject_action`
+- `otlet.label_action`
+- `otlet.correct_action`
+- `otlet.dry_run_action`
+- `otlet.apply_action`
+
+The six operator functions run as the extension owner with `search_path` fixed to `pg_catalog, otlet, pg_temp`. Operators receive no direct table writes. Raw receipts, outputs, source evidence, trace summaries, token traces, worker functions, model registration, watch administration, cleanup, and the grant helpers stay owner-only
+
+Check the installed policy:
+
+```sql
+SELECT * FROM otlet.access_policy_status;
+```
+
+The demo proves the catalog ACLs, seven auditor views, nine operator function grants, six successful operator calls, and 35 denied paths:
 
 ```text
-grant_contract=DELETE:44|INSERT:44|REFERENCES:44|SELECT:44|TRIGGER:44|TRUNCATE:44|UPDATE:44
+permission_contract=public=0/0/0|auditor=7/3|operator=7/9|definer=8/8|positive=6|denied=35
 ```
 
-Your application owns these production boundaries:
+Your application still owns these deployment boundaries:
 
-- create app roles with the views and functions you want
 - add RLS or schema isolation if multiple tenants share the database
 - schedule `otlet.cleanup_policy_state(false)` if your deployment wants periodic worker-event, trace, stale materialization, rejected raw-output, and unreferenced failed/canceled job pruning
-- expose `otlet.approve_action`, `otlet.reject_action`, `otlet.dry_run_action`, and `otlet.apply_action` to action-operator roles
 - allow action types your application has code to interpret
+- decide which users inherit the auditor and operator roles
