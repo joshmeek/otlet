@@ -71,5 +71,7 @@ write_metadata() {
   append_kv "$metadata_tsv" min_direct_schema_rate "$min_direct_schema_rate"
   append_kv "$metadata_tsv" keep_models "$keep_models"
   append_kv "$metadata_tsv" keep_sql_state "$keep_sql_state"
+  append_kv "$metadata_tsv" sensitive_evidence_mode "diagnostic"
+  append_kv "$metadata_tsv" sensitive_evidence_export_policy "hashes and derived scores only"
   append_kv "$metadata_tsv" scratch_dir "$scratch_dir"
 }

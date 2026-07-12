@@ -320,6 +320,12 @@ ORDER BY case_id;
 SQL
 }
 
+ensure_extension
+if [[ "$(psql_value -c "SELECT sensitive_evidence_mode FROM otlet.production_policy_status;")" != "redacted" ]]; then
+  printf 'quick_probe_blocker=expected redacted sensitive evidence mode\n' >&2
+  exit 1
+fi
+
 printf 'model_key\tviable\tpassed_cases\ttotal_cases\tschema_passed\tmean_tok_s\tmean_steady_tok_s\tp95_generate_ms\tp95_ttft_ms\tp95_prompt_decode_ms\tmean_prompt_tokens\tmean_generated_tokens\tmean_effective_llama_threads\tmean_effective_llama_batch_threads\n'
 
 while IFS=$'\t' read -r model_key hf_repo filename _quant _family tier _license _source _include _max_gb requires_split _declared _active _context _notes; do
@@ -340,7 +346,6 @@ while IFS=$'\t' read -r model_key hf_repo filename _quant _family tier _license 
     continue
   fi
 
-  ensure_extension
   register_model "$model_key" "$artifact_path"
   run_model_probe "$model_key"
 done < <(selected_models)

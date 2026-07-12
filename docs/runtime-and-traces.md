@@ -2,7 +2,7 @@
 
 Use this after the entity-resolution walkthrough queues work. It inspects model selection, receipts, runtime status, trace visibility, retries, cancellation, and failed-run evidence
 
-These diagnostic queries run as the extension owner because they expose raw receipt, output, error, and token state. Auditors use `otlet.audit_receipt_export` and the other redacted exports granted by `otlet.grant_auditor_access(...)`
+These diagnostic queries run as the extension owner because they expose receipt, structured output, error, and numeric token state. Raw model output and token text appear only when the owner enables bounded diagnostic storage. Auditors use `otlet.audit_receipt_export` and the other redacted exports granted by `otlet.grant_auditor_access(...)`
 
 ## Step 1 - Inspect Model Selection Attempts
 
@@ -58,7 +58,7 @@ receipt_attempt_contract=8|4|4|4
 
 A receipt records evidence for one model run. A candidate pair can have multiple receipts when model selection escalates
 
-Each receipt links the model, artifact, runtime options, prompt hash, input hash, output schema hash, raw output hash, validation status, timing, token counts, memory summary, and trace summary
+Each receipt links the model, artifact, runtime options, prompt hash, input hash, output schema hash, raw-output hash, validation status, timing, token counts, memory summary, and trace summary. Otlet does not persist the assembled prompt
 
 Warm-job timing splits `tokenize_ms`, `prompt_decode_ms`, `generate_ms`, `finish_sql_ms`, and `materialize_ms` when present:
 
@@ -120,7 +120,7 @@ The task enabled bounded generation tracing:
 }
 ```
 
-Otlet stores a bounded trace summary on each receipt
+Otlet stores a bounded trace summary on each receipt. Under the default policy, token IDs, ranks, probabilities, and logprobs remain available while token text stays null
 
 Check the bounded token trace:
 
@@ -147,7 +147,7 @@ Otlet records:
 - Receipt, row identity, input hash, and schema hash attached to the trace
 - Resident model cache and inference-output cache use
 
-Token and top-k limits bound trace retention
+Token and top-k limits bound trace retention. `otlet.redaction_policy_status` reports whether any raw output or token text violates the active policy
 
 ## Step 5 - Check The Whole Chain
 
@@ -188,7 +188,7 @@ Check these rows:
 
 - `otlet.jobs.status = 'failed'`
 - `otlet.jobs.error` contains the validation or parse failure
-- `otlet.jobs.raw_output` keeps raw model text for inspection
+- the latest receipt keeps a raw-output hash without raw model text under the default policy
 - `otlet.outputs` has no validated row
 - `otlet.actions` has no trusted row from a failed model attempt
 - `otlet.records` has no row
@@ -311,10 +311,19 @@ The example creates one synthetic failed job, then lets `run_task` enqueue a sec
 The worker claims the second job and rejects the output against the strict JSON contract:
 
 ```sql
-SELECT id, subject_id, status, attempts, error, raw_output IS NOT NULL AS has_raw_output
-FROM otlet.jobs
-WHERE task_name = 'learning_retry_task'
-ORDER BY id;
+SELECT j.id, j.subject_id, j.status, j.attempts, j.error,
+       (r.raw_output_hash IS NOT NULL) AS has_raw_output_hash,
+       (r.raw_output IS NOT NULL) AS has_diagnostic_raw_output
+FROM otlet.jobs j
+LEFT JOIN LATERAL (
+  SELECT receipt.raw_output_hash, receipt.raw_output
+  FROM otlet.inference_receipts receipt
+  WHERE receipt.job_id = j.id
+  ORDER BY receipt.attempt_index DESC, receipt.id DESC
+  LIMIT 1
+) r ON true
+WHERE j.task_name = 'learning_retry_task'
+ORDER BY j.id;
 
 SELECT id AS receipt_id, job_id, task_name, subject_id, status, schema_validation_status, error
 FROM otlet.inference_receipts
@@ -325,20 +334,20 @@ ORDER BY id;
 Representative output:
 
 ```text
- id | subject_id | status | attempts |                                                                                                                                           error                                                                                                                                            | has_raw_output
-----+------------+--------+----------+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+----------------
- 11 | 1          | failed |        1 | learning example synthetic failure                                                                                                                                                                                                                                                         | t
- 12 | 1          | failed |        1 | invalid model JSON: The input is a single row of data. The output must be a JSON object with "output" and "actions" keys, and "actions" must be an array. The output must not have any markdown. The output must not have any prose. The output must not have any other keys than "output" | t
+ id | subject_id | status | attempts |                      error                       | has_raw_output_hash | has_diagnostic_raw_output
+----+------------+--------+----------+--------------------------------------------------+---------------------+---------------------------
+ 11 | 1          | failed |        1 | learning example synthetic failure               | t                   | f
+ 12 | 1          | failed |        1 | invalid model JSON: expected value at line 1 column 1 | t               | f
 (2 rows)
 
- receipt_id | job_id |      task_name      | subject_id | status | schema_validation_status |                                                                                                                                           error
-------------+--------+---------------------+------------+--------+--------------------------+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ receipt_id | job_id |      task_name      | subject_id | status | schema_validation_status |                      error
+------------+--------+---------------------+------------+--------+--------------------------+--------------------------------------------------
          11 |     11 | learning_retry_task | 1          | failed |                          | learning example synthetic failure
-         12 |     12 | learning_retry_task | 1          | failed |                          | invalid model JSON: The input is a single row of data. The output must be a JSON object with "output" and "actions" keys, and "actions" must be an array. The output must not have any markdown. The output must not have any prose. The output must not have any other keys than "output"
+         12 |     12 | learning_retry_task | 1          | failed | failed                   | invalid model JSON: expected value at line 1 column 1
 (2 rows)
 ```
 
-Failure records the raw output, error, and attempt receipt
+Failure records a raw-output hash, a non-sensitive error, and an attempt receipt. Enable diagnostic mode only when you need bounded raw text inside the database
 
 ## Step 10 - Check Worker Events And Receipt Statuses
 

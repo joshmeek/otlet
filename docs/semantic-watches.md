@@ -6,6 +6,8 @@ The vendor-pair demo covers the end-to-end path. Smaller learning tables isolate
 
 This administrative walkthrough runs as the extension owner because it creates watches, reads raw status and receipt views, and changes source fixtures. Auditors use the redacted exports; action reviewers receive the operator capability described in [production-contract.md](production-contract.md)
 
+Watch jobs keep active source input owner-only. Derived receipts follow the same redacted storage policy as direct jobs: hashes and numeric traces remain, while assembled prompts, raw model text, and token text stay out of production storage
+
 ## Step 1 - Choose Direct Task Or Semantic Index
 
 The direct task path gives you the shortest way to learn Otlet

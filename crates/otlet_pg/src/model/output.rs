@@ -187,7 +187,7 @@ fn validate_output(schema: &Value, schema_digest: &str, output: &Value) -> Resul
     let validator = cached_schema_validator(schema, schema_digest)?;
     validator
         .validate(output)
-        .map_err(|err| format!("output schema validation failed: {err}"))
+        .map_err(|_| "output schema validation failed".to_owned())
 }
 
 fn validate_output_schema(schema: &Value, schema_digest: &str) -> Result<(), String> {
@@ -240,18 +240,6 @@ fn cached_rendered_schema(output_schema: &Value, schema_digest: &str) -> Arc<str
         RENDERED_SCHEMA_CACHE_MAX_ENTRIES,
     );
     shared
-}
-
-fn trim_error(text: &str) -> String {
-    const MAX_ERROR_BYTES: usize = 2000;
-    if text.len() <= MAX_ERROR_BYTES {
-        return text.to_owned();
-    }
-    let mut end = MAX_ERROR_BYTES;
-    while !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    text[..end].to_owned()
 }
 
 fn elapsed_ms(start: Instant) -> i64 {
@@ -430,10 +418,8 @@ fn model_actions(actions: Value) -> Result<Value, String> {
         let Value::Object(object) = &action else {
             return Err("model JSON actions must contain objects".to_owned());
         };
-        if let Some(extra_key) = object.keys().find(|key| *key != "type" && *key != "body") {
-            return Err(format!(
-                "model JSON action unsupported key: {extra_key}"
-            ));
+        if object.keys().any(|key| key != "type" && key != "body") {
+            return Err("model JSON action has unsupported key".to_owned());
         }
 
         let Some(action_type) = object.get("type").and_then(Value::as_str) else {
@@ -459,14 +445,11 @@ fn model_actions(actions: Value) -> Result<Value, String> {
 fn parse_model_json(raw_output: &str) -> Result<Value, String> {
     let trimmed = raw_output.trim();
     if trimmed.starts_with("```") || trimmed.ends_with("```") {
-        return Err(format!(
-            "invalid model JSON: markdown fences are not allowed: {}",
-            trim_error(raw_output)
-        ));
+        return Err("invalid model JSON: markdown fences are not allowed".to_owned());
     }
 
     let value = serde_json::from_str::<Value>(trimmed)
-        .map_err(|err| format!("invalid model JSON: {err}: {}", trim_error(raw_output)))?;
+        .map_err(|err| format!("invalid model JSON: {err}"))?;
     let Value::Object(object) = &value else {
         return Err("model JSON must be an object".to_owned());
     };
@@ -532,13 +515,31 @@ mod output_tests {
     }
 
     #[test]
-    fn trim_error_enforces_utf8_byte_limit() {
-        let text = "\u{1f642}".repeat(2001);
-        let trimmed = trim_error(&text);
+    fn parse_errors_do_not_copy_raw_output() {
+        let sentinel = "SECRET-🙂-SOURCE-VALUE";
+        let markdown = parse_model_json(&format!("```json\n{sentinel}\n```"))
+            .expect_err("markdown must fail");
+        let invalid = parse_model_json(&format!("{{\"output\":\"{sentinel}\""))
+            .expect_err("invalid JSON must fail");
 
-        assert_eq!(trimmed.len(), 2000);
-        assert_eq!(trimmed.chars().count(), 500);
-        assert!(text.starts_with(&trimmed));
+        assert!(!markdown.contains(sentinel));
+        assert!(!invalid.contains(sentinel));
+    }
+
+    #[test]
+    fn schema_errors_do_not_copy_output_values() {
+        let sentinel = "SECRET-SCHEMA-SOURCE-VALUE";
+        let schema = json!({
+            "type": "object",
+            "properties": {"status": {"enum": ["ok"]}},
+            "required": ["status"]
+        });
+        let output = json!({"status": sentinel});
+        let error = validate_output(&schema, "safe-error-test", &output)
+            .expect_err("invalid output must fail");
+
+        assert_eq!(error, "output schema validation failed");
+        assert!(!error.contains(sentinel));
     }
 }
 

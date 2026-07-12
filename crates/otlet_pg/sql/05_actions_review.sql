@@ -257,7 +257,6 @@ BEGIN
   SET status = 'complete',
       leased_until = NULL,
       error = NULL,
-      raw_output = NULL,
       finished_at = now()
   WHERE id = complete_job.job_id
   RETURNING * INTO job_row;

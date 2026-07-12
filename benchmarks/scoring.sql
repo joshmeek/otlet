@@ -54,10 +54,10 @@ WITH scored AS (
     g.subject_id,
     g.expected_match,
     r.output ->> 'match' AS actual_match,
-    substring(COALESCE(r.raw_output, '') from '"match"[[:space:]]*:[[:space:]]*"(same_entity|different_entity|unclear)"') AS raw_match,
+    COALESCE(r.diagnostic_output ->> 'match', substring(COALESCE(r.raw_output, '') from '"match"[[:space:]]*:[[:space:]]*"(same_entity|different_entity|unclear)"')) AS raw_match,
     g.expected_confidence_floor,
     r.output ->> 'confidence' AS actual_confidence,
-    substring(COALESCE(r.raw_output, '') from '"confidence"[[:space:]]*:[[:space:]]*"(low|medium|high)"') AS raw_confidence,
+    COALESCE(r.diagnostic_output ->> 'confidence', substring(COALESCE(r.raw_output, '') from '"confidence"[[:space:]]*:[[:space:]]*"(low|medium|high)"')) AS raw_confidence,
     g.expected_action_type,
     a.action_type AS actual_action_type,
     substring(COALESCE(r.raw_output, '') from '"type"[[:space:]]*:[[:space:]]*"(merge_candidate|new_entity|review_flag)"') AS raw_action_type,
@@ -68,11 +68,11 @@ WITH scored AS (
     ) AS schema_valid,
     (r.output ->> 'match') = g.expected_match AS match_correct,
     COALESCE((r.output ->> 'match') = g.expected_match, false)
-      OR substring(COALESCE(r.raw_output, '') from '"match"[[:space:]]*:[[:space:]]*"(same_entity|different_entity|unclear)"') = g.expected_match
+      OR COALESCE(r.diagnostic_output ->> 'match', substring(COALESCE(r.raw_output, '') from '"match"[[:space:]]*:[[:space:]]*"(same_entity|different_entity|unclear)"')) = g.expected_match
       AS diagnostic_match_correct,
     (r.output ->> 'confidence') = g.expected_confidence_floor AS confidence_correct,
     COALESCE((r.output ->> 'confidence') = g.expected_confidence_floor, false)
-      OR substring(COALESCE(r.raw_output, '') from '"confidence"[[:space:]]*:[[:space:]]*"(low|medium|high)"') = g.expected_confidence_floor
+      OR COALESCE(r.diagnostic_output ->> 'confidence', substring(COALESCE(r.raw_output, '') from '"confidence"[[:space:]]*:[[:space:]]*"(low|medium|high)"')) = g.expected_confidence_floor
       AS diagnostic_confidence_correct,
     (
       a.action_type = g.expected_action_type
@@ -147,10 +147,10 @@ WITH scored AS (
     n.subject_id,
     n.expected_decision AS expected_match,
     r.output ->> 'decision' AS actual_match,
-    substring(COALESCE(r.raw_output, '') from '"decision"[[:space:]]*:[[:space:]]*"(flag|pass|unclear)"') AS raw_match,
+    COALESCE(r.diagnostic_output ->> 'decision', substring(COALESCE(r.raw_output, '') from '"decision"[[:space:]]*:[[:space:]]*"(flag|pass|unclear)"')) AS raw_match,
     n.expected_confidence AS expected_confidence_floor,
     r.output ->> 'confidence' AS actual_confidence,
-    substring(COALESCE(r.raw_output, '') from '"confidence"[[:space:]]*:[[:space:]]*"(low|medium|high)"') AS raw_confidence,
+    COALESCE(r.diagnostic_output ->> 'confidence', substring(COALESCE(r.raw_output, '') from '"confidence"[[:space:]]*:[[:space:]]*"(low|medium|high)"')) AS raw_confidence,
     n.expected_action_type,
     a.action_type AS actual_action_type,
     substring(COALESCE(r.raw_output, '') from '"type"[[:space:]]*:[[:space:]]*"(review_flag)"') AS raw_action_type,
@@ -161,11 +161,11 @@ WITH scored AS (
     ) AS schema_valid,
     (r.output ->> 'decision') = n.expected_decision AS match_correct,
     COALESCE((r.output ->> 'decision') = n.expected_decision, false)
-      OR substring(COALESCE(r.raw_output, '') from '"decision"[[:space:]]*:[[:space:]]*"(flag|pass|unclear)"') = n.expected_decision
+      OR COALESCE(r.diagnostic_output ->> 'decision', substring(COALESCE(r.raw_output, '') from '"decision"[[:space:]]*:[[:space:]]*"(flag|pass|unclear)"')) = n.expected_decision
       AS diagnostic_match_correct,
     (r.output ->> 'confidence') = n.expected_confidence AS confidence_correct,
     COALESCE((r.output ->> 'confidence') = n.expected_confidence, false)
-      OR substring(COALESCE(r.raw_output, '') from '"confidence"[[:space:]]*:[[:space:]]*"(low|medium|high)"') = n.expected_confidence
+      OR COALESCE(r.diagnostic_output ->> 'confidence', substring(COALESCE(r.raw_output, '') from '"confidence"[[:space:]]*:[[:space:]]*"(low|medium|high)"')) = n.expected_confidence
       AS diagnostic_confidence_correct,
     CASE
       WHEN n.expected_action_type = 'none' THEN a.action_type IS NULL
@@ -227,10 +227,10 @@ WITH scored AS (
     t.subject_id,
     t.expected_decision AS expected_match,
     r.output ->> 'decision' AS actual_match,
-    substring(COALESCE(r.raw_output, '') from '"decision"[[:space:]]*:[[:space:]]*"(flag|pass|unclear)"') AS raw_match,
+    COALESCE(r.diagnostic_output ->> 'decision', substring(COALESCE(r.raw_output, '') from '"decision"[[:space:]]*:[[:space:]]*"(flag|pass|unclear)"')) AS raw_match,
     t.expected_confidence AS expected_confidence_floor,
     r.output ->> 'confidence' AS actual_confidence,
-    substring(COALESCE(r.raw_output, '') from '"confidence"[[:space:]]*:[[:space:]]*"(low|medium|high)"') AS raw_confidence,
+    COALESCE(r.diagnostic_output ->> 'confidence', substring(COALESCE(r.raw_output, '') from '"confidence"[[:space:]]*:[[:space:]]*"(low|medium|high)"')) AS raw_confidence,
     t.expected_action_type,
     a.action_type AS actual_action_type,
     substring(COALESCE(r.raw_output, '') from '"type"[[:space:]]*:[[:space:]]*"(review_flag)"') AS raw_action_type,
@@ -241,11 +241,11 @@ WITH scored AS (
     ) AS schema_valid,
     (r.output ->> 'decision') = t.expected_decision AS match_correct,
     COALESCE((r.output ->> 'decision') = t.expected_decision, false)
-      OR substring(COALESCE(r.raw_output, '') from '"decision"[[:space:]]*:[[:space:]]*"(flag|pass|unclear)"') = t.expected_decision
+      OR COALESCE(r.diagnostic_output ->> 'decision', substring(COALESCE(r.raw_output, '') from '"decision"[[:space:]]*:[[:space:]]*"(flag|pass|unclear)"')) = t.expected_decision
       AS diagnostic_match_correct,
     (r.output ->> 'confidence') = t.expected_confidence AS confidence_correct,
     COALESCE((r.output ->> 'confidence') = t.expected_confidence, false)
-      OR substring(COALESCE(r.raw_output, '') from '"confidence"[[:space:]]*:[[:space:]]*"(low|medium|high)"') = t.expected_confidence
+      OR COALESCE(r.diagnostic_output ->> 'confidence', substring(COALESCE(r.raw_output, '') from '"confidence"[[:space:]]*:[[:space:]]*"(low|medium|high)"')) = t.expected_confidence
       AS diagnostic_confidence_correct,
     CASE
       WHEN t.expected_action_type = 'none' THEN a.action_type IS NULL
@@ -309,14 +309,14 @@ WITH scored AS (
     concat_ws('|', r.output ->> 'invoice_id', r.output ->> 'vendor_code', r.output ->> 'amount_cents', r.output ->> 'due_date') AS actual_match,
     concat_ws(
       '|',
-      substring(COALESCE(r.raw_output, '') from '"invoice_id"[[:space:]]*:[[:space:]]*"([^"]+)"'),
-      substring(COALESCE(r.raw_output, '') from '"vendor_code"[[:space:]]*:[[:space:]]*"([^"]+)"'),
-      substring(COALESCE(r.raw_output, '') from '"amount_cents"[[:space:]]*:[[:space:]]*([0-9]+)'),
-      substring(COALESCE(r.raw_output, '') from '"due_date"[[:space:]]*:[[:space:]]*"([^"]+)"')
+      COALESCE(r.diagnostic_output ->> 'invoice_id', substring(COALESCE(r.raw_output, '') from '"invoice_id"[[:space:]]*:[[:space:]]*"([^"]+)"')),
+      COALESCE(r.diagnostic_output ->> 'vendor_code', substring(COALESCE(r.raw_output, '') from '"vendor_code"[[:space:]]*:[[:space:]]*"([^"]+)"')),
+      COALESCE(r.diagnostic_output ->> 'amount_cents', substring(COALESCE(r.raw_output, '') from '"amount_cents"[[:space:]]*:[[:space:]]*([0-9]+)')),
+      COALESCE(r.diagnostic_output ->> 'due_date', substring(COALESCE(r.raw_output, '') from '"due_date"[[:space:]]*:[[:space:]]*"([^"]+)"'))
     ) AS raw_match,
     e.expected_confidence AS expected_confidence_floor,
     r.output ->> 'confidence' AS actual_confidence,
-    substring(COALESCE(r.raw_output, '') from '"confidence"[[:space:]]*:[[:space:]]*"(low|medium|high)"') AS raw_confidence,
+    COALESCE(r.diagnostic_output ->> 'confidence', substring(COALESCE(r.raw_output, '') from '"confidence"[[:space:]]*:[[:space:]]*"(low|medium|high)"')) AS raw_confidence,
     'none'::text AS expected_action_type,
     a.action_type AS actual_action_type,
     substring(COALESCE(r.raw_output, '') from '"type"[[:space:]]*:[[:space:]]*"([^"]+)"') AS raw_action_type,
@@ -341,15 +341,15 @@ WITH scored AS (
       false
     )
       OR (
-        substring(COALESCE(r.raw_output, '') from '"invoice_id"[[:space:]]*:[[:space:]]*"([^"]+)"') = e.expected_invoice_id
-        AND substring(COALESCE(r.raw_output, '') from '"vendor_code"[[:space:]]*:[[:space:]]*"([^"]+)"') = e.expected_vendor_code
-        AND substring(COALESCE(r.raw_output, '') from '"amount_cents"[[:space:]]*:[[:space:]]*([0-9]+)') = e.expected_amount_cents::text
-        AND substring(COALESCE(r.raw_output, '') from '"due_date"[[:space:]]*:[[:space:]]*"([^"]+)"') = e.expected_due_date
+        COALESCE(r.diagnostic_output ->> 'invoice_id', substring(COALESCE(r.raw_output, '') from '"invoice_id"[[:space:]]*:[[:space:]]*"([^"]+)"')) = e.expected_invoice_id
+        AND COALESCE(r.diagnostic_output ->> 'vendor_code', substring(COALESCE(r.raw_output, '') from '"vendor_code"[[:space:]]*:[[:space:]]*"([^"]+)"')) = e.expected_vendor_code
+        AND COALESCE(r.diagnostic_output ->> 'amount_cents', substring(COALESCE(r.raw_output, '') from '"amount_cents"[[:space:]]*:[[:space:]]*([0-9]+)')) = e.expected_amount_cents::text
+        AND COALESCE(r.diagnostic_output ->> 'due_date', substring(COALESCE(r.raw_output, '') from '"due_date"[[:space:]]*:[[:space:]]*"([^"]+)"')) = e.expected_due_date
       )
       AS diagnostic_match_correct,
     (r.output ->> 'confidence') = e.expected_confidence AS confidence_correct,
     COALESCE((r.output ->> 'confidence') = e.expected_confidence, false)
-      OR substring(COALESCE(r.raw_output, '') from '"confidence"[[:space:]]*:[[:space:]]*"(low|medium|high)"') = e.expected_confidence
+      OR COALESCE(r.diagnostic_output ->> 'confidence', substring(COALESCE(r.raw_output, '') from '"confidence"[[:space:]]*:[[:space:]]*"(low|medium|high)"')) = e.expected_confidence
       AS diagnostic_confidence_correct,
     a.action_type IS NULL AS action_correct,
     a.action_type IS NULL AS diagnostic_action_correct,
@@ -389,10 +389,10 @@ WITH scored AS (
     p.subject_id,
     p.expected_decision AS expected_match,
     r.output ->> 'decision' AS actual_match,
-    substring(COALESCE(r.raw_output, '') from '"decision"[[:space:]]*:[[:space:]]*"(approve|reject|unclear)"') AS raw_match,
+    COALESCE(r.diagnostic_output ->> 'decision', substring(COALESCE(r.raw_output, '') from '"decision"[[:space:]]*:[[:space:]]*"(approve|reject|unclear)"')) AS raw_match,
     p.expected_confidence AS expected_confidence_floor,
     r.output ->> 'confidence' AS actual_confidence,
-    substring(COALESCE(r.raw_output, '') from '"confidence"[[:space:]]*:[[:space:]]*"(low|medium|high)"') AS raw_confidence,
+    COALESCE(r.diagnostic_output ->> 'confidence', substring(COALESCE(r.raw_output, '') from '"confidence"[[:space:]]*:[[:space:]]*"(low|medium|high)"')) AS raw_confidence,
     p.expected_action_type,
     a.action_type AS actual_action_type,
     substring(COALESCE(r.raw_output, '') from '"type"[[:space:]]*:[[:space:]]*"(review_flag)"') AS raw_action_type,
@@ -403,11 +403,11 @@ WITH scored AS (
     ) AS schema_valid,
     (r.output ->> 'decision') = p.expected_decision AS match_correct,
     COALESCE((r.output ->> 'decision') = p.expected_decision, false)
-      OR substring(COALESCE(r.raw_output, '') from '"decision"[[:space:]]*:[[:space:]]*"(approve|reject|unclear)"') = p.expected_decision
+      OR COALESCE(r.diagnostic_output ->> 'decision', substring(COALESCE(r.raw_output, '') from '"decision"[[:space:]]*:[[:space:]]*"(approve|reject|unclear)"')) = p.expected_decision
       AS diagnostic_match_correct,
     (r.output ->> 'confidence') = p.expected_confidence AS confidence_correct,
     COALESCE((r.output ->> 'confidence') = p.expected_confidence, false)
-      OR substring(COALESCE(r.raw_output, '') from '"confidence"[[:space:]]*:[[:space:]]*"(low|medium|high)"') = p.expected_confidence
+      OR COALESCE(r.diagnostic_output ->> 'confidence', substring(COALESCE(r.raw_output, '') from '"confidence"[[:space:]]*:[[:space:]]*"(low|medium|high)"')) = p.expected_confidence
       AS diagnostic_confidence_correct,
     CASE
       WHEN p.expected_action_type = 'none' THEN a.action_type IS NULL
@@ -603,7 +603,7 @@ WITH scored AS (
     rg.subject_id,
     rg.expected_status AS expected_match,
     r.output ->> 'status' AS actual_match,
-    substring(COALESCE(r.raw_output, '') from '"status"[[:space:]]*:[[:space:]]*"(needs_review|ordinary)"') AS raw_match,
+    COALESCE(r.diagnostic_output ->> 'status', substring(COALESCE(r.raw_output, '') from '"status"[[:space:]]*:[[:space:]]*"(needs_review|ordinary)"')) AS raw_match,
     NULL::text AS expected_confidence_floor,
     NULL::text AS actual_confidence,
     NULL::text AS raw_confidence,
@@ -617,7 +617,7 @@ WITH scored AS (
     ) AS schema_valid,
     (r.output ->> 'status') = rg.expected_status AS match_correct,
     COALESCE((r.output ->> 'status') = rg.expected_status, false)
-      OR substring(COALESCE(r.raw_output, '') from '"status"[[:space:]]*:[[:space:]]*"(needs_review|ordinary)"') = rg.expected_status
+      OR COALESCE(r.diagnostic_output ->> 'status', substring(COALESCE(r.raw_output, '') from '"status"[[:space:]]*:[[:space:]]*"(needs_review|ordinary)"')) = rg.expected_status
       AS diagnostic_match_correct,
     true AS confidence_correct,
     true AS diagnostic_confidence_correct,

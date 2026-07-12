@@ -424,16 +424,14 @@ INSERT INTO output_envelope_cases (subject_id, expected_error, raw_output)
 VALUES
   (
     'markdown-fence',
-    $err$invalid model JSON: markdown fences are not allowed: ```json
-{"output":{"status":"ok"},"actions":[]}
-```$err$,
+    'invalid model JSON: markdown fences are not allowed',
     $raw$```json
 {"output":{"status":"ok"},"actions":[]}
 ```$raw$
   ),
   (
     'extra-top-level',
-    'model JSON unsupported top-level key: extra',
+    'model JSON has unsupported top-level key',
     '{"output":{"status":"ok"},"actions":[],"extra":true}'
   ),
   (
@@ -472,16 +470,14 @@ WITH cases(subject_id, expected_error, raw_output) AS (
   VALUES
     (
       'markdown-fence',
-      $err$invalid model JSON: markdown fences are not allowed: ```json
-{"output":{"status":"ok"},"actions":[]}
-```$err$,
+      'invalid model JSON: markdown fences are not allowed',
       $raw$```json
 {"output":{"status":"ok"},"actions":[]}
 ```$raw$
     ),
     (
       'extra-top-level',
-      'model JSON unsupported top-level key: extra',
+      'model JSON has unsupported top-level key',
       '{"output":{"status":"ok"},"actions":[],"extra":true}'
     ),
     (
@@ -512,7 +508,7 @@ SELECT count(*) FILTER (WHERE subject_id = 'markdown-fence' AND job_error = expe
        count(*) FILTER (WHERE subject_id = 'extra-top-level' AND job_error = expected_error AND receipt_error = expected_error)::text || '|' ||
        count(*) FILTER (WHERE subject_id = 'non-object-action' AND job_error = expected_error AND receipt_error = expected_error)::text || '|' ||
        bool_and(job_status = 'failed' AND receipt_status = 'failed' AND selection_status = 'failed' AND schema_validation_status = 'failed')::text || '|' ||
-       bool_and(raw_output = expected_raw_output AND raw_output_hash = md5(expected_raw_output))::text || '|' ||
+       bool_and(raw_output IS NULL AND raw_output_hash = md5(expected_raw_output))::text || '|' ||
        (SELECT count(*) FROM otlet.outputs WHERE job_id IN (SELECT job_id FROM rows))::text || '|' ||
        (SELECT count(*) FROM otlet.actions WHERE job_id IN (SELECT job_id FROM rows))::text
 FROM rows;
@@ -571,7 +567,7 @@ SELECT (SELECT count(*) FROM otlet.outputs WHERE job_id = j.id)::text || '|' ||
        COALESCE((SELECT status || '|' || COALESCE(error, '') FROM otlet.actions WHERE job_id = j.id ORDER BY id DESC LIMIT 1), '') || '|' ||
        (SELECT count(*) FROM otlet.records r JOIN otlet.actions a ON a.id = r.action_id WHERE a.job_id = j.id)::text || '|' ||
        COALESCE((
-         SELECT (r.raw_output = '{"output":{"status":"ok"},"actions":[{"type":"invented_action","body":{"subject_id":"hallucinated-action-1","text":"no record"}}]}' AND
+         SELECT (r.raw_output IS NULL AND
                  r.raw_output_hash = md5('{"output":{"status":"ok"},"actions":[{"type":"invented_action","body":{"subject_id":"hallucinated-action-1","text":"no record"}}]}'))::text
          FROM otlet.inference_receipts r
          WHERE r.job_id = j.id

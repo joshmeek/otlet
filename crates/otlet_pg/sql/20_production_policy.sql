@@ -16,7 +16,8 @@ SELECT
   p.trace_detail_retention,
   p.eval_label_retention,
   p.delete_stale_materialization_retention,
-  p.rejected_receipt_raw_output_retention,
+  p.sensitive_evidence_mode,
+  p.sensitive_evidence_retention,
   p.failed_job_retention
 FROM otlet.production_policy p
 WHERE p.name = 'default';
@@ -376,6 +377,22 @@ BEGIN
   FROM otlet.inference_receipts r
   WHERE r.status = 'complete'
     AND r.schema_validation_status IS DISTINCT FROM 'passed';
+
+  RETURN QUERY
+  SELECT
+    'sensitive_storage_matches_policy'::text,
+    'redaction_policy'::text,
+    s.policy_name,
+    jsonb_build_object(
+      'sensitive_evidence_mode', s.sensitive_evidence_mode,
+      'raw_output_rows', s.raw_output_rows,
+      'chosen_text_rows', s.chosen_text_rows,
+      'token_text_values', s.token_text_values,
+      'alternative_token_text_values', s.alternative_token_text_values,
+      'overdue_sensitive_rows', s.overdue_sensitive_rows
+    )
+  FROM otlet.redaction_policy_status s
+  WHERE NOT s.storage_compliant;
 
   RETURN QUERY
   SELECT
@@ -747,7 +764,10 @@ CREATE FUNCTION otlet.cleanup_policy_state(
   token_alternative_rows bigint,
   eval_labels bigint,
   delete_stale_materializations bigint,
-  rejected_receipt_raw_outputs bigint,
+  sensitive_raw_outputs bigint,
+  sensitive_chosen_texts bigint,
+  sensitive_token_texts bigint,
+  sensitive_alternative_token_texts bigint,
   failed_canceled_jobs bigint,
   dry_run boolean
 )
@@ -758,14 +778,18 @@ DECLARE
   trace_retention interval;
   eval_retention interval;
   delete_stale_retention interval;
-  rejected_raw_output_retention interval;
+  sensitive_mode text;
+  sensitive_retention interval;
   failed_job_retention_interval interval;
   worker_count bigint := 0;
   token_count bigint := 0;
   alternative_count bigint := 0;
   eval_count bigint := 0;
   delete_stale_count bigint := 0;
-  rejected_raw_output_count bigint := 0;
+  sensitive_raw_output_count bigint := 0;
+  sensitive_chosen_text_count bigint := 0;
+  sensitive_token_text_count bigint := 0;
+  sensitive_alternative_text_count bigint := 0;
   failed_canceled_job_count bigint := 0;
   deleted_worker_count bigint := 0;
 BEGIN
@@ -774,14 +798,16 @@ BEGIN
     trace_detail_retention,
     eval_label_retention,
     delete_stale_materialization_retention,
-    rejected_receipt_raw_output_retention,
+    sensitive_evidence_mode,
+    sensitive_evidence_retention,
     failed_job_retention
   INTO
     worker_retention,
     trace_retention,
     eval_retention,
     delete_stale_retention,
-    rejected_raw_output_retention,
+    sensitive_mode,
+    sensitive_retention,
     failed_job_retention_interval
   FROM otlet.production_policy
   WHERE name = 'default';
@@ -879,12 +905,48 @@ BEGIN
     AND sm.stale_reason = 'source_delete'
     AND sm.updated_at < now() - delete_stale_retention;
 
-  SELECT count(*)
-  INTO rejected_raw_output_count
+  SELECT
+    count(*) FILTER (WHERE r.raw_output IS NOT NULL),
+    count(*) FILTER (WHERE r.trace_summary #>> '{detailed_trace,chosen_text}' IS NOT NULL)
+  INTO sensitive_raw_output_count, sensitive_chosen_text_count
   FROM otlet.inference_receipts r
-  WHERE r.selection_status = 'rejected'
-    AND r.raw_output IS NOT NULL
-    AND r.finished_at < now() - rejected_raw_output_retention;
+  WHERE sensitive_mode = 'redacted'
+     OR r.finished_at < now() - sensitive_retention;
+
+  SELECT count(*)
+  INTO sensitive_token_text_count
+  FROM otlet.inference_receipts r
+  CROSS JOIN LATERAL jsonb_array_elements(
+    CASE
+      WHEN jsonb_typeof(r.trace_summary #> '{detailed_trace,steps}') = 'array'
+        THEN r.trace_summary #> '{detailed_trace,steps}'
+      ELSE '[]'::jsonb
+    END
+  ) step(value)
+  WHERE (sensitive_mode = 'redacted' OR r.finished_at < now() - sensitive_retention)
+    AND jsonb_typeof(step.value) = 'object'
+    AND step.value ? 'token_text';
+
+  SELECT count(*)
+  INTO sensitive_alternative_text_count
+  FROM otlet.inference_receipts r
+  CROSS JOIN LATERAL jsonb_array_elements(
+    CASE
+      WHEN jsonb_typeof(r.trace_summary #> '{detailed_trace,steps}') = 'array'
+        THEN r.trace_summary #> '{detailed_trace,steps}'
+      ELSE '[]'::jsonb
+    END
+  ) step(value)
+  CROSS JOIN LATERAL jsonb_array_elements(
+    CASE
+      WHEN jsonb_typeof(step.value -> 'top_alternatives') = 'array'
+        THEN step.value -> 'top_alternatives'
+      ELSE '[]'::jsonb
+    END
+  ) alt(value)
+  WHERE (sensitive_mode = 'redacted' OR r.finished_at < now() - sensitive_retention)
+    AND jsonb_typeof(alt.value) = 'object'
+    AND alt.value ? 'token_text';
 
   IF NOT cleanup_policy_state.requested_dry_run THEN
     WITH event_candidates AS (
@@ -921,7 +983,12 @@ BEGIN
     SET trace_summary = jsonb_set(
       jsonb_set(
         jsonb_set(
-          jsonb_set(r.trace_summary, '{detailed_trace,steps}', '[]'::jsonb, true),
+          jsonb_set(
+            otlet.redact_trace_summary(r.trace_summary, 'redacted'),
+            '{detailed_trace,steps}',
+            '[]'::jsonb,
+            true
+          ),
           '{detailed_trace,chosen_token_ids}',
           '[]'::jsonb,
           true
@@ -947,10 +1014,15 @@ BEGIN
       AND sm.updated_at < now() - delete_stale_retention;
 
     UPDATE otlet.inference_receipts r
-    SET raw_output = NULL
-    WHERE r.selection_status = 'rejected'
-      AND r.raw_output IS NOT NULL
-      AND r.finished_at < now() - rejected_raw_output_retention;
+    SET raw_output = NULL,
+        trace_summary = otlet.redact_trace_summary(r.trace_summary, 'redacted')
+    WHERE (sensitive_mode = 'redacted' OR r.finished_at < now() - sensitive_retention)
+      AND (
+        r.raw_output IS NOT NULL
+        OR r.trace_summary #>> '{detailed_trace,chosen_text}' IS NOT NULL
+        OR jsonb_path_exists(r.trace_summary, '$.detailed_trace.steps[*].token_text')
+        OR jsonb_path_exists(r.trace_summary, '$.detailed_trace.steps[*].top_alternatives[*].token_text')
+      );
   END IF;
 
   RETURN QUERY SELECT
@@ -959,7 +1031,10 @@ BEGIN
     alternative_count,
     eval_count,
     delete_stale_count,
-    rejected_raw_output_count,
+    sensitive_raw_output_count,
+    sensitive_chosen_text_count,
+    sensitive_token_text_count,
+    sensitive_alternative_text_count,
     failed_canceled_job_count,
     cleanup_policy_state.requested_dry_run;
 END;

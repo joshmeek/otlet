@@ -460,13 +460,9 @@ fn run_job_with_model_ref(job: &Job, model: JobModelRef<'_>) -> Result<ModelRun,
         )
         .with_metrics(metrics));
     };
-    if let Some(extra_key) = object
-        .keys()
-        .find(|key| *key != "output" && *key != "actions")
-        .cloned()
-    {
+    if object.keys().any(|key| key != "output" && key != "actions") {
         return Err(ModelError::with_context(
-            format!("model JSON unsupported top-level key: {extra_key}"),
+            "model JSON has unsupported top-level key".to_owned(),
             raw_output.into_owned(),
             &context,
             trace_summary,

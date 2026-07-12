@@ -148,6 +148,8 @@ Run a one-model default smoke without publishing a local report:
 OTLET_BENCH_LIMIT_MODELS=qwen35_4b OTLET_BENCH_RUNS=1 ./benchmarks/run.sh
 ```
 
+The harness requires the database to start in `redacted` sensitive-evidence mode. It enables `diagnostic` mode for scoring rejected or malformed attempts, writes hashes and derived scores to artifacts, then restores `redacted` mode and runs cleanup. Reports omit assembled prompts, raw model output, and token text
+
 ## Report Output
 
 `OTLET_BENCH_PUBLISH_REPORT=1` writes the latest report under ignored `benchmarks/report/latest/`
@@ -167,7 +169,7 @@ Key files:
 - `benchmarks/report/latest/case_results.tsv`
 - `benchmarks/report/latest/explain.txt`
 
-Raw run artifacts stay under ignored `benchmarks/runs/<timestamp>-<run_id>/`
+Run artifacts stay under ignored `benchmarks/runs/<timestamp>-<run_id>/`
 
 Commit benchmark code and this static README. Do not commit generated run reports or chart snapshots
 

@@ -6,6 +6,8 @@ Run the sections in order before adapting them. Each section names the state it 
 
 The setup and inspection sections run as the extension owner. A delegated reviewer reads `otlet.audit_review_export` and receives `otlet.grant_operator_access(...)` before using the action review functions. Raw `otlet.review_queue`, task configuration, receipts, and trace state remain owner-only
 
+Receipts keep prompt and raw-output hashes under the default storage policy. Accepted output and rejected structured candidates remain available without persisting the assembled prompt or raw model text
+
 ## Step 1 - Register The Models
 
 ```sql

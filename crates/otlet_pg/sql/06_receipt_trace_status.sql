@@ -14,6 +14,7 @@ SELECT
   r.status,
   r.error,
   o.output,
+  r.candidate_output,
   r.raw_output,
   r.raw_output_hash,
   r.prompt_tokens,
@@ -48,25 +49,27 @@ SELECT
   j.cancel_requested_at,
   o.id AS output_id,
   o.output,
-  COALESCE(o.raw_output, accepted.raw_output, j.raw_output) AS raw_output,
-  accepted.id AS receipt_id,
+  latest.candidate_output,
+  COALESCE(o.output, latest.candidate_output) AS diagnostic_output,
+  COALESCE(accepted.raw_output, latest.raw_output) AS raw_output,
+  COALESCE(accepted.id, latest.id) AS receipt_id,
   accepted.id AS accepted_receipt_id,
-  accepted.model_name,
+  COALESCE(accepted.model_name, latest.model_name) AS model_name,
   accepted.model_name AS accepted_model_name,
-  accepted.runtime_name,
-  accepted.prompt_hash,
-  accepted.input_hash,
-  accepted.output_schema_hash,
-  accepted.raw_output_hash,
-  accepted.prompt_tokens,
-  accepted.generated_tokens,
-  accepted.generate_ms,
-  accepted.tokens_per_second,
-  accepted.schema_validation_status,
-  accepted.trace_summary,
-  accepted.selection_role AS model_selection_role,
-  accepted.selection_status AS model_selection_status,
-  accepted.selection_reason AS model_selection_reason,
+  COALESCE(accepted.runtime_name, latest.runtime_name) AS runtime_name,
+  COALESCE(accepted.prompt_hash, latest.prompt_hash) AS prompt_hash,
+  COALESCE(accepted.input_hash, latest.input_hash) AS input_hash,
+  COALESCE(accepted.output_schema_hash, latest.output_schema_hash) AS output_schema_hash,
+  COALESCE(accepted.raw_output_hash, latest.raw_output_hash) AS raw_output_hash,
+  COALESCE(accepted.prompt_tokens, latest.prompt_tokens) AS prompt_tokens,
+  COALESCE(accepted.generated_tokens, latest.generated_tokens) AS generated_tokens,
+  COALESCE(accepted.generate_ms, latest.generate_ms) AS generate_ms,
+  COALESCE(accepted.tokens_per_second, latest.tokens_per_second) AS tokens_per_second,
+  COALESCE(accepted.schema_validation_status, latest.schema_validation_status) AS schema_validation_status,
+  COALESCE(accepted.trace_summary, latest.trace_summary) AS trace_summary,
+  COALESCE(accepted.selection_role, latest.selection_role) AS model_selection_role,
+  COALESCE(accepted.selection_status, latest.selection_status) AS model_selection_status,
+  COALESCE(accepted.selection_reason, latest.selection_reason) AS model_selection_reason,
   COALESCE(attempts.model_attempt_count, 0)::bigint AS model_attempt_count,
   COALESCE(attempts.escalated, false) AS escalated,
   j.created_at AS job_created_at,
@@ -75,7 +78,14 @@ SELECT
 FROM otlet.jobs j
 LEFT JOIN receipt_attempts attempts ON attempts.job_id = j.id
 LEFT JOIN otlet.outputs o ON o.job_id = j.id
-LEFT JOIN otlet.inference_receipts accepted ON accepted.id = o.receipt_id;
+LEFT JOIN otlet.inference_receipts accepted ON accepted.id = o.receipt_id
+LEFT JOIN LATERAL (
+  SELECT r.*
+  FROM otlet.inference_receipts r
+  WHERE r.job_id = j.id
+  ORDER BY r.attempt_index DESC, r.id DESC
+  LIMIT 1
+) latest ON true;
 
 CREATE VIEW otlet.action_status AS
 SELECT
@@ -265,7 +275,7 @@ direct_rejected_items AS (
     NULL::text AS action_status,
     NULL::text AS approval_status,
     NULL::text AS review_reason,
-    r.raw_output::jsonb -> 'output' AS output,
+    r.candidate_output AS output,
     r.trace_summary #>> '{mvcc,table}' AS source_table,
     COALESCE(r.trace_summary #>> '{mvcc,source_hash}', md5((r.trace_summary -> 'mvcc')::text)) AS source_hash,
     hashed.content_hash,
@@ -298,7 +308,7 @@ direct_rejected_items AS (
     AND r.selection_status = 'rejected'
     AND r.selection_reason = 'direct_rejected_by_decision_contract'
     AND r.schema_validation_status = 'passed'
-    AND NULLIF(r.raw_output, '') IS NOT NULL
+    AND r.candidate_output IS NOT NULL
     AND NOT EXISTS (
       SELECT 1
       FROM otlet.eval_labels l
@@ -549,6 +559,7 @@ SELECT
   trace.summary -> 'detailed_trace' ->> 'status' AS detailed_trace_status,
   trace.summary -> 'detailed_trace' ->> 'trace_contract' AS detailed_trace_contract,
   trace.summary -> 'detailed_trace' ->> 'storage_policy' AS detailed_trace_storage_policy,
+  trace.summary -> 'detailed_trace' ->> 'text_storage' AS detailed_trace_text_storage,
   trace.summary -> 'detailed_trace' ->> 'logprob_policy' AS detailed_trace_logprob_policy,
   CASE
     WHEN jsonb_typeof(trace.summary #> '{detailed_trace,max_tokens}') = 'number'

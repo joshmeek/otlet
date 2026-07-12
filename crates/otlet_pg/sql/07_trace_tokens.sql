@@ -190,6 +190,7 @@ SELECT
   s.detailed_trace_status,
   s.detailed_trace_contract,
   s.detailed_trace_storage_policy,
+  s.detailed_trace_text_storage,
   s.detailed_trace_logprob_policy,
   s.detailed_trace_max_tokens,
   s.detailed_trace_top_k,
@@ -203,7 +204,7 @@ SELECT
   pg_column_size(r.trace_summary)::bigint AS trace_summary_bytes,
   COALESCE(tokens.token_steps, 0)::bigint AS token_steps,
   COALESCE(tokens.top_k_alternatives, 0)::bigint AS top_k_alternatives,
-  COALESCE(tokens.chosen_text_readable, '') AS chosen_text_readable
+  tokens.chosen_text_readable
 FROM otlet.inference_receipt_trace_status s
 JOIN otlet.inference_receipts r ON r.id = s.receipt_id
 LEFT JOIN token_summary tokens ON tokens.receipt_id = s.receipt_id;

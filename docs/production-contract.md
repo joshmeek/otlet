@@ -22,7 +22,7 @@ Representative output:
 inference_visibility_status=true|true|true|true|true
 ```
 
-The five booleans confirm receipts, token steps, top-k alternatives, bounded trace tokens, and bounded top-k width
+The five booleans confirm receipts, numeric token steps, numeric top-k alternatives, bounded trace tokens, and bounded top-k width. The default storage policy removes chosen text and token text before it writes the receipt
 
 ## Step 2 - Inspect Runtime Status After Demo Runs
 
@@ -84,11 +84,50 @@ ffi_sweep_safety_contract=1|failed|job lease expired after max attempts|failed|f
 Representative output from the demo contract:
 
 ```text
-production_policy_contract=default|refresh_then_fail_closed|3|300000|8
+production_policy_contract=default|refresh_then_fail_closed|3|300000|8|redacted
 production_status_contract=true|true|true|true
 model_queue_status_contract=queue_accepting|0|0
 throughput_status_contract=queue_accepting|0|0|4|4|0
-cleanup_policy_dry_run=0|0|0|0|0|0|0|true
+cleanup_policy_dry_run=0|0|0|0|0|0|0|0|0|0|true
+```
+
+### Step 3a - Inspect Stored Evidence Redaction
+
+Otlet keeps assembled prompts in worker memory and stores `prompt_hash` on receipts. The `redacted` production default stores raw-output hashes, structured accepted output, structured rejected candidates, token IDs, probabilities, and timing. It removes raw model text, reconstructed chosen text, and token text before receipt insertion
+
+```sql
+SELECT assembled_prompt_storage,
+       sensitive_evidence_mode,
+       raw_output_rows,
+       chosen_text_rows,
+       token_text_values,
+       alternative_token_text_values,
+       overdue_sensitive_rows,
+       storage_compliant
+FROM otlet.redaction_policy_status;
+```
+
+The demo contract is:
+
+```text
+redaction_status_contract=redacted|0|0|0|0|0|true
+```
+
+The extension owner can enable `diagnostic` mode for a bounded local investigation or benchmark. Otlet keeps diagnostic fields owner-only. `sensitive_evidence_retention` controls their lifetime. Switching back to `redacted` makes those fields cleanup candidates without waiting for the interval
+
+```sql
+BEGIN;
+UPDATE otlet.production_policy
+SET sensitive_evidence_mode = 'diagnostic'
+WHERE name = 'default';
+
+-- Run the bounded diagnostic work here
+
+UPDATE otlet.production_policy
+SET sensitive_evidence_mode = 'redacted'
+WHERE name = 'default';
+SELECT * FROM otlet.cleanup_policy_state(false);
+COMMIT;
 ```
 
 ### Step 3b - Performance Ratios
@@ -134,7 +173,7 @@ Contract: `true|true` (demo prints `materialization_failure_status_contract=true
 SELECT count(*) FROM otlet.verify_invariants();
 ```
 
-Contract: `0` (demo prints `invariant_contract=0`). The suite fails closed on expired or NULL leases for `running` and `cancel_requested` jobs, complete receipts without schema pass, materializations missing `source_hash`, and error runtime slots. `production_status` and `verify_invariants` name the receipt invariant `complete_receipts_are_schema_validated`; throughput views use `completed_jobs` and `last_batch_completed_jobs`. Step 6 of `docs/semantic-watches.md` anchors the planner vocabulary for `selected_path` / `Planner Selected Path` and `freshness_basis`
+Contract: `0` (demo prints `invariant_contract=0`). The suite fails closed on expired or NULL leases for `running` and `cancel_requested` jobs, complete receipts without schema pass, sensitive evidence that violates the active storage policy, materializations missing `source_hash`, and error runtime slots. `production_status` and `verify_invariants` name the receipt invariant `complete_receipts_are_schema_validated`; throughput views use `completed_jobs` and `last_batch_completed_jobs`. Step 6 of `docs/semantic-watches.md` anchors the planner vocabulary for `selected_path` / `Planner Selected Path` and `freshness_basis`
 
 Operators query redacted, read-only projections through `otlet.audit_receipt_export`, `otlet.audit_review_export`, `otlet.audit_eval_label_export`, `otlet.semantic_dependency_audit`, and `otlet.worker_batch_timing_status`. `otlet.redaction_policy_status` lists withheld fields
 
@@ -188,6 +227,6 @@ permission_contract=public=0/0/0|auditor=7/3|operator=7/9|definer=8/8|positive=6
 Your application still owns these deployment boundaries:
 
 - add RLS or schema isolation if multiple tenants share the database
-- schedule `otlet.cleanup_policy_state(false)` if your deployment wants periodic worker-event, trace, stale materialization, rejected raw-output, and unreferenced failed/canceled job pruning
+- schedule `otlet.cleanup_policy_state(false)` for worker-event, trace-detail, diagnostic evidence, stale materialization, and unreferenced failed/canceled job pruning
 - allow action types your application has code to interpret
 - decide which users inherit the auditor and operator roles

@@ -923,11 +923,14 @@ SELECT worker_events::text || '|' ||
        token_alternative_rows::text || '|' ||
        eval_labels::text || '|' ||
        delete_stale_materializations::text || '|' ||
-       rejected_receipt_raw_outputs::text || '|' ||
+       sensitive_raw_outputs::text || '|' ||
+       sensitive_chosen_texts::text || '|' ||
+       sensitive_token_texts::text || '|' ||
+       sensitive_alternative_token_texts::text || '|' ||
        failed_canceled_jobs::text || '|' ||
        dry_run::text
 FROM otlet.cleanup_policy_state(true);
 SQL
 )"
 echo "cleanup_policy_dry_run=$cleanup_dry_run"
-require_regex "$cleanup_dry_run" '^[0-9]+\|[0-9]+\|[0-9]+\|[0-9]+\|[0-9]+\|[0-9]+\|[0-9]+\|true$' "Expected cleanup dry run counts ending in true"
+require_regex "$cleanup_dry_run" '^[0-9]+\|[0-9]+\|[0-9]+\|[0-9]+\|[0-9]+\|[0-9]+\|[0-9]+\|[0-9]+\|[0-9]+\|[0-9]+\|true$' "Expected cleanup dry run counts ending in true"

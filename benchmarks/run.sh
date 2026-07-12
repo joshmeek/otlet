@@ -38,6 +38,7 @@ case_results_tsv="$run_dir/case_results.tsv"
 model_summary_tsv="$run_dir/model_summary.tsv"
 explain_txt="$run_dir/explain.txt"
 cleanup_done=0
+sensitive_mode_enabled=0
 artifact_bytes_removed_early=0
 
 mkdir -p "$run_dir"
@@ -497,6 +498,17 @@ main() {
   fi
 
   ensure_extension
+  current_sensitive_mode="$(psql_value -c "SELECT sensitive_evidence_mode FROM otlet.production_policy_status;")"
+  if [[ "$current_sensitive_mode" != "redacted" ]]; then
+    printf 'benchmark_blocker=expected redacted sensitive evidence mode before benchmark, got %s\n' "$current_sensitive_mode" >&2
+    exit 1
+  fi
+  psql_exec -c "UPDATE otlet.production_policy SET sensitive_evidence_mode = 'diagnostic' WHERE name = 'default';" >/dev/null
+  sensitive_mode_enabled=1
+  if [[ "$(psql_value -c "SELECT sensitive_evidence_mode FROM otlet.production_policy_status;")" != "diagnostic" ]]; then
+    printf 'benchmark_blocker=failed to enable diagnostic sensitive evidence mode\n' >&2
+    exit 1
+  fi
   ensure_result_tables
   write_metadata
 
