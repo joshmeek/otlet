@@ -30,7 +30,7 @@ Run `./scripts/otlet-setup.sh`, then `./scripts/otlet-demo.sh` to prove the cont
 | --- | --- | --- | --- |
 | 1 | Packaging and security | Active hardening | Maintain a small setup and demo; add release packaging proof |
 | 2 | Output reliability and benchmark truth | Measured default | Maintain the raw `/no_think` Q4_K_M path and existing fast/full gates |
-| 3 | Planner, executor, and cache | Active hardening | Measure multi-model residency and persisted-cache need, then close Access Method and fork evidence |
+| 3 | Planner, executor, and cache | Active hardening | Measure persisted-cache need, then close Access Method and fork evidence |
 | 4 | Semantic freshness | Implemented contract | Maintain row, pair, delete, candidate, and schema-drift freshness gates |
 | 5 | Action safety | Implemented contract | Maintain the one-table, one-key, one-row `update_row` boundary |
 | 6 | Managed Postgres packaging | Open | Test native workers where providers allow them and a SQL-bound agent where providers block them |
@@ -42,7 +42,7 @@ Run `./scripts/otlet-setup.sh`, then `./scripts/otlet-demo.sh` to prove the cont
 | Track | Next contract |
 | --- | --- |
 | Planner, executor, and cache hardening | Keep SQL plan rows, semantic status views, CustomScan EXPLAIN, receipts, runtime/cache views, and demo output aligned |
-| Model residency and timing | Keep the measured sequential decoder; test safe multi-model residency before changing slot policy |
+| Model residency and timing | Measured one-model, one-context default on the current 8 GB runtime |
 | Persisted cache storage | Add disk-backed cache after a measured workload proves in-process cache misses hurt |
 | Managed Postgres external worker | Build a trusted SQL-bound worker that claims jobs, heartbeats, writes receipts, and fails closed |
 | GPU acceleration | Report device policy, memory accounting, throughput, energy per trusted job, crash behavior, and EXPLAIN-visible device state |
@@ -99,9 +99,9 @@ Idle expired-job sweeps run at most every 30 seconds. After a productive claim d
 
 Single-context multi-sequence decoding did not clear the no-regression gate. Four jobs were slower than sequential execution. An eight-job candidate improved wall time from `28.338s` to `20.574s`, but raised peak worker RSS from `5.919 GB` to `6.605 GB`. Smaller prompt buffers and dropping the resident context reduced memory but erased the speed gain. All outputs and schemas passed, cancellation stayed isolated, and database responsiveness did not regress, but no candidate preserved both throughput and memory. Otlet therefore keeps one sequential resident decoder. Requester timeouts now use the existing shared abort marker and let the worker persist `otlet.cancel_job` before output acceptance, so a caller-side exception cannot roll back cancellation and permit late output
 
-Test multi-resident model contexts before changing slot policy. Alternating cheap and strong models pays model-load time on each swap; a keyed model cache can remove that cost when the memory budget allows both artifacts
+Multi-model residency does not fit the current memory envelope. Four synchronous alternating cheap/strong calls forced four loads and took `45.746-54.277s`; normal four-row cheap-first policy batches already group work into two swaps. The lowest fully used cheap and strong worker RSS samples project `9.941 GB` together after subtracting the cold worker once, exceeding the runtime's `8.218 GB` before reserving Postgres headroom. One-client database load remained responsive with zero failures. Otlet therefore keeps one resident model/context and the existing grouped fallback order
 
-The resident default uses linked llama.cpp with models that fit the memory budget. Open ceiling research on SSD-streamed experts, distributed execution, Medusa, or MTP after a measured Otlet workload requires a larger model
+The installed models expose zero experts and no MTP heads; no compatible draft model is installed. The pinned crate emits MTP bindings, but a real caller fails to link because its speculative-runtime symbols are unresolved. SSD-backed mmap remains ordinary model paging rather than bounded expert streaming. Medusa, MTP, recurrent-state, and streamed-expert execution are not current Otlet runtime contracts
 
 Production status names the schema invariant `complete_receipts_are_schema_validated`. Worker batch status uses throughput counters such as `completed_jobs` and `last_batch_completed_jobs`
 

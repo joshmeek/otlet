@@ -98,6 +98,14 @@ All retained comparisons used one worker, six threads, the same qwen35 task and 
 
 Requester timeout is a separate correctness contract. The resident worker now persists the existing shared-memory abort through `otlet.cancel_job` during prompt/decode probes and immediately before output acceptance. The demo requires a canceled receipt, zero outputs, zero actions, and one healthy worker after the caller transaction raises
 
+### Multi-model residency decision
+
+The worker already runs cheap attempts for a claimed policy batch before its strong fallbacks. Both four-row entity-resolution demo batches recorded two model swaps. A forced synchronous alternating workload still paid a load on every call: cheap/strong/cheap/strong took `54.277s`, and the reverse order took `45.746s`. Cheap loads were `5.172-5.753s`; strong loads were `6.172-9.035s`. Every result and schema passed
+
+A two-entry cache does not fit this runtime. Cold worker RSS was `27.2 MB`; the lowest fully used cheap and strong RSS samples were `4.345 GB` and `5.623 GB`. Their additive projection, subtracting the cold worker once, is `9.941 GB` against `8.218 GB` of memory. That is `1.723 GB` over physical memory before reserving headroom for Postgres. No cache prototype was retained
+
+One-client `SELECT 1` load during the alternating probe completed `1,072,092` transactions with zero failures at `45us` p50, `132us` p95, and `38.448ms` max. The installed GGUFs have no expert or MTP heads, and no compatible draft model is installed. The pinned crate exposes MTP bindings, but its smallest real caller fails to link on unresolved `common_speculative_*` symbols. Otlet keeps one resident context and treats multi-residency, speculative decoding, and expert streaming as new experiments only when the measured memory envelope and installed artifacts change
+
 Run the default-included benchmark model:
 
 ```sh
