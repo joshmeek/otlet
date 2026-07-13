@@ -632,11 +632,11 @@ SQL
 row_visible_fresh_before="$(head -n 1 <<<"$row_visible_stale_contract")"
 row_visible_source_update="$(sed -n '2p' <<<"$row_visible_stale_contract")"
 row_visible_predicate_match="$(sed -n '3p' <<<"$row_visible_stale_contract")"
-row_visible_fdw_rows="$(sed -n '4p' <<<"$row_visible_stale_contract")"
+row_visible_current_rows="$(sed -n '4p' <<<"$row_visible_stale_contract")"
 row_pending_reason="$(sed -n '5p' <<<"$row_visible_stale_contract")"
-echo "row_visible_update_stale_contract=$row_visible_fresh_before|$row_visible_source_update|$row_visible_predicate_match|$row_visible_fdw_rows"
-[ "$row_visible_fresh_before|$row_visible_source_update|$row_visible_predicate_match|$row_visible_fdw_rows" = "0|true|false|0" ] || {
-  echo "Expected visible row update to fail closed across lookup surfaces, got $row_visible_fresh_before|$row_visible_source_update|$row_visible_predicate_match|$row_visible_fdw_rows" >&2
+echo "row_visible_update_stale_contract=$row_visible_fresh_before|$row_visible_source_update|$row_visible_predicate_match|$row_visible_current_rows"
+[ "$row_visible_fresh_before|$row_visible_source_update|$row_visible_predicate_match|$row_visible_current_rows" = "0|true|false|0" ] || {
+  echo "Expected visible row update to fail closed across lookup surfaces, got $row_visible_fresh_before|$row_visible_source_update|$row_visible_predicate_match|$row_visible_current_rows" >&2
   exit 1
 }
 echo "row_content_revalidation_pending_contract=$row_pending_reason"

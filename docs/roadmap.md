@@ -30,12 +30,12 @@ Run `./scripts/otlet-setup.sh`, then `./scripts/otlet-demo.sh` to prove the cont
 | --- | --- | --- | --- |
 | 1 | Packaging and security | Active hardening | Maintain a small setup and demo; add release packaging proof |
 | 2 | Output reliability and benchmark truth | Measured default | Maintain the raw `/no_think` Q4_K_M path and existing fast/full gates |
-| 3 | Planner, executor, and cache | Active hardening | Close Access Method and fork evidence |
+| 3 | Planner, executor, and cache | Active hardening | Close the Postgres fork evidence |
 | 4 | Semantic freshness | Implemented contract | Maintain row, pair, delete, candidate, and schema-drift freshness gates |
 | 5 | Action safety | Implemented contract | Maintain the one-table, one-key, one-row `update_row` boundary |
 | 6 | Managed Postgres packaging | Open | Test native workers where providers allow them and a SQL-bound agent where providers block them |
 | 7 | GPU acceleration | Open | Add device policy after the CPU resident-worker path has measured proof |
-| 8 | Core limits | Open research | Test Access Method and Postgres-fork paths for missing planner or executor contracts |
+| 8 | Core limits | Access Method measured | Test the remaining hypothetical executor seam in a disposable Postgres fork |
 
 ## Open Tracks
 
@@ -45,7 +45,7 @@ Run `./scripts/otlet-setup.sh`, then `./scripts/otlet-demo.sh` to prove the cont
 | Model residency and timing | Measured one-model, one-context default on the current 8 GB runtime |
 | Managed Postgres external worker | Build a trusted SQL-bound worker that claims jobs, heartbeats, writes receipts, and fails closed |
 | GPU acceleration | Report device policy, memory accounting, throughput, energy per trusted job, crash behavior, and EXPLAIN-visible device state |
-| Core limits research | Test Access Method and fork paths when CustomScan cannot expose a required contract |
+| Core limits research | Test one disposable Postgres fork seam, then keep the extension path unless it adds a required capability |
 | Entity resolution packs | Ship vendor, customer, and product packs that reuse `otlet.watch.v1` definitions with prompts, fixtures, and gates |
 
 Define each open track through SQL-visible state, a closed failure mode, and demo or benchmark proof before adding code
@@ -174,7 +174,7 @@ Preserve the SQL contract: resident worker, source rows in user tables, derived 
 
 ## Core Limits
 
-Base the Access Method track on evidence. Test `CREATE ACCESS METHOD`, `IndexAmRoutine`, operator classes, `amcostestimate`, tuple/TID semantics, build, insert, vacuum, update, and bitmap/gettuple paths. If PostgreSQL extension APIs cannot represent semantic model access, document the missing contract and use CustomScan as the extension path
+The PostgreSQL 18 Access Method probe loaded a real handler and operator class, then exercised build, empty build, insert, HOT and indexed updates, delete, vacuum, cost, ordered tuple scan, bitmap scan, reindex, vacuum full, and clean restart. Every delegated btree result stayed exact. The semantic fit failed: scan callbacks select heap TIDs from fixed scan keys before the executor has a projected source or candidate row; HOT changes to unindexed semantic inputs bypass AM insertion; join views cannot be indexed; and PostgreSQL rejects Otlet's correctly volatile semantic predicate as an index expression. A lossy all-TID AM would duplicate the existing child scan without selectivity, while a durable semantic AM would also own new storage, WAL, locking, vacuum, and async result updates. Otlet keeps standard materialization indexes plus CustomScan
 
 If extension APIs hit a hard ceiling, prove the missing planner or executor contract with a small Postgres fork. Use the extension as the public path until a fork proves a capability PostgreSQL cannot expose through hooks
 
