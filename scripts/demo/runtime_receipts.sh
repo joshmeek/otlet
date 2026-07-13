@@ -75,6 +75,81 @@ echo "attempt_timeout_clamp_contract=$attempt_timeout_clamp_contract"
   exit 1
 }
 
+requester_timeout_before="$(psql_exec -qAt <<'SQL'
+SELECT (s ->> 'timeouts') || '|' || (s ->> 'abort_requests')
+FROM (SELECT otlet.worker_infer_now_state() AS s) state;
+SQL
+)"
+IFS='|' read -r requester_timeouts_before requester_aborts_before <<<"$requester_timeout_before"
+requester_timeout_error=""
+if requester_timeout_error="$(psql_exec -qAt -v model_name="$strong_model_name" <<'SQL' 2>&1
+SELECT * FROM otlet.ask(
+  :'model_name',
+  'Return one JSON object only with top-level output and actions. output has status equal ok. actions is empty. No markdown.',
+  jsonb_build_object('payload', repeat('request timeout ', 300)),
+  '{"type":"object","required":["status"],"additionalProperties":false,"properties":{"status":{"enum":["ok"]}}}'::jsonb,
+  '{"max_tokens":512,"reasoning":"off","inference_cache":false}'::jsonb,
+  500
+);
+SQL
+)"; then
+  echo "Expected requester timeout smoke to fail closed" >&2
+  exit 1
+fi
+require_contains "$requester_timeout_error" "otlet ask worker is busy" "Expected requester timeout smoke to report no synchronous result"
+requester_timeout_job_id="$(psql_exec -qAt -c "SELECT otlet.worker_infer_now_state() ->> 'last_cancel_job_id';")"
+[ -n "$requester_timeout_job_id" ] && [ "$requester_timeout_job_id" != "0" ] || {
+  echo "Expected requester timeout smoke to identify the canceled job" >&2
+  exit 1
+}
+for _ in $(seq 1 300); do
+  requester_timeout_status="$(psql_exec -qAt -v job_id="$requester_timeout_job_id" <<'SQL'
+SELECT status FROM otlet.jobs WHERE id = :'job_id'::bigint;
+SQL
+)"
+  case "$requester_timeout_status" in
+    canceled|failed|complete) break ;;
+  esac
+  sleep 0.2
+done
+requester_timeout_contract="$(psql_exec -qAt \
+  -v job_id="$requester_timeout_job_id" \
+  -v model_name="$strong_model_name" \
+  -v timeouts_before="$requester_timeouts_before" \
+  -v aborts_before="$requester_aborts_before" <<'SQL'
+WITH infer AS (
+  SELECT otlet.worker_infer_now_state() AS state
+), job_row AS (
+  SELECT * FROM otlet.jobs WHERE id = :'job_id'::bigint
+), receipt_row AS (
+  SELECT * FROM otlet.inference_receipts
+  WHERE job_id = :'job_id'::bigint
+  ORDER BY id DESC
+  LIMIT 1
+)
+SELECT j.status || '|' ||
+       (j.error = 'infer-now timeout requested job cancellation')::text || '|' ||
+       r.status || '|' || r.selection_reason || '|' ||
+       (SELECT count(*) FROM otlet.outputs WHERE job_id = j.id)::text || '|' ||
+       (SELECT count(*) FROM otlet.actions WHERE job_id = j.id)::text || '|' ||
+       ((infer.state ->> 'timeouts')::bigint > :'timeouts_before'::bigint)::text || '|' ||
+       ((infer.state ->> 'abort_requests')::bigint > :'aborts_before'::bigint)::text || '|' ||
+       ((infer.state ->> 'last_cancel_job_id')::bigint = j.id)::text || '|' ||
+       rs.resident_worker_count::text || '|' ||
+       COALESCE(rs.runtime_status, '') || '|' ||
+       COALESCE(rs.slot_state, '')
+FROM job_row j
+JOIN receipt_row r ON r.job_id = j.id
+CROSS JOIN infer
+JOIN otlet.runtime_status rs ON rs.model_name = :'model_name';
+SQL
+)"
+echo "requester_timeout_contract=$requester_timeout_contract"
+[ "$requester_timeout_contract" = "canceled|true|canceled|canceled|0|0|true|true|true|1|ready|ready" ] || {
+  echo "Expected requester timeout to leave no late output and one healthy worker, got $requester_timeout_contract" >&2
+  exit 1
+}
+
 malformed_schema_task="malformed_schema_worker_demo"
 cleanup_task "$malformed_schema_task"
 psql_exec -v task_name="$malformed_schema_task" -v model_name="$strong_model_name" >/dev/null <<'SQL'

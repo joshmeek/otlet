@@ -1441,6 +1441,12 @@ mod tests {
 }
 
 fn linked_cancel_requested(job_id: i64) -> Result<bool, ModelError> {
+    match crate::infer_now::persist_timeout_cancel(job_id) {
+        Ok(true) => return Ok(true),
+        Ok(false) => {}
+        Err(err) => return Err(ModelError::new(err)),
+    }
+
     let result: pgrx::spi::Result<Result<bool, ModelError>> =
         pgrx::bgworkers::BackgroundWorker::transaction(|| {
             // Read-only probe — use select so the plan stays non-volatile.

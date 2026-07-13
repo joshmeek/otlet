@@ -20,7 +20,7 @@ The linked runtime stops after one balanced JSON object. Otlet then requires the
 
 Extension owners can export row and pair watch definitions as `otlet.watch.v1` JSONB and import them through the same validation path as `create_watch`. The document carries configuration and owner-authored SQL without database state or model artifacts
 
-The planner contract covers semantic lookup, fail-closed stale reads, queue refresh, wait, fresh inference, bounded CustomScan infer-now, current-row SQL lookup, cache decisions, and live EXPLAIN vocabulary. SQL exposes cache keys, invalidation reasons, hit/miss counters, size bounds, runtime status, source-delete and pair-candidate stale reasons, queue admission, fair claims, attempt bounds, cancellation, pre-load model admission, memory pressure, RSS budget failures, malformed-schema failures, and cleanup dry-run evidence
+The planner contract covers semantic lookup, fail-closed stale reads, queue refresh, wait, fresh inference, bounded CustomScan infer-now, current-row SQL lookup, cache decisions, and live EXPLAIN vocabulary. SQL exposes cache keys, invalidation reasons, hit/miss counters, size bounds, runtime status, source-delete and pair-candidate stale reasons, queue admission, fair claims, attempt bounds, cancellation, pre-load model admission, memory pressure, RSS budget failures, malformed-schema failures, and cleanup dry-run evidence. Requester timeouts are also worker-owned: a timed-out SQL transaction cannot roll back the worker's cancellation or materialize a late trusted output
 
 Run `./scripts/otlet-setup.sh`, then `./scripts/otlet-demo.sh` to prove the contract. Use `benchmarks/run.sh` for SQL-scored model comparisons
 
@@ -30,7 +30,7 @@ Run `./scripts/otlet-setup.sh`, then `./scripts/otlet-demo.sh` to prove the cont
 | --- | --- | --- | --- |
 | 1 | Packaging and security | Active hardening | Maintain a small setup and demo; add release packaging proof |
 | 2 | Output reliability and benchmark truth | Measured default | Maintain the raw `/no_think` Q4_K_M path and existing fast/full gates |
-| 3 | Planner, executor, and cache | Active hardening | Run decoder-batch probes, then close Access Method and fork evidence |
+| 3 | Planner, executor, and cache | Active hardening | Measure multi-model residency and persisted-cache need, then close Access Method and fork evidence |
 | 4 | Semantic freshness | Implemented contract | Maintain row, pair, delete, candidate, and schema-drift freshness gates |
 | 5 | Action safety | Implemented contract | Maintain the one-table, one-key, one-row `update_row` boundary |
 | 6 | Managed Postgres packaging | Open | Test native workers where providers allow them and a SQL-bound agent where providers block them |
@@ -42,7 +42,7 @@ Run `./scripts/otlet-setup.sh`, then `./scripts/otlet-demo.sh` to prove the cont
 | Track | Next contract |
 | --- | --- |
 | Planner, executor, and cache hardening | Keep SQL plan rows, semantic status views, CustomScan EXPLAIN, receipts, runtime/cache views, and demo output aligned |
-| Model residency and timing | Keep pre-load admission and pressure evidence passing; test single-context decoder batching before changing slot policy |
+| Model residency and timing | Keep the measured sequential decoder; test safe multi-model residency before changing slot policy |
 | Persisted cache storage | Add disk-backed cache after a measured workload proves in-process cache misses hurt |
 | Managed Postgres external worker | Build a trusted SQL-bound worker that claims jobs, heartbeats, writes receipts, and fails closed |
 | GPU acceleration | Report device policy, memory accounting, throughput, energy per trusted job, crash behavior, and EXPLAIN-visible device state |
@@ -97,7 +97,7 @@ Gate resident-worker parallelism on measured proof. A qwen35_4b probe on the cur
 
 Idle expired-job sweeps run at most every 30 seconds. After a productive claim drain, the worker makes the next sweep due so lease reclaim stays prompt under load
 
-Test single-context multi-sequence decoding before adding workers. Compare 1, 4, and 8 homogeneous claimed jobs with shared prompt prefixes. Require stable quality gates, cancellation, queue order, RSS, tail latency, throughput, and database responsiveness before changing the sequential decoder path
+Single-context multi-sequence decoding did not clear the no-regression gate. Four jobs were slower than sequential execution. An eight-job candidate improved wall time from `28.338s` to `20.574s`, but raised peak worker RSS from `5.919 GB` to `6.605 GB`. Smaller prompt buffers and dropping the resident context reduced memory but erased the speed gain. All outputs and schemas passed, cancellation stayed isolated, and database responsiveness did not regress, but no candidate preserved both throughput and memory. Otlet therefore keeps one sequential resident decoder. Requester timeouts now use the existing shared abort marker and let the worker persist `otlet.cancel_job` before output acceptance, so a caller-side exception cannot roll back cancellation and permit late output
 
 Test multi-resident model contexts before changing slot policy. Alternating cheap and strong models pays model-load time on each swap; a keyed model cache can remove that cost when the memory budget allows both artifacts
 

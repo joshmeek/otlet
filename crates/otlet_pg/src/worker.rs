@@ -847,6 +847,29 @@ fn accept_attempt_with_model(
     if let Some(metrics) = metrics {
         record_metrics(job, model_name, metrics);
     }
+    match crate::infer_now::persist_timeout_cancel(job.id) {
+        Ok(true) => {
+            let err = ModelError::new("canceled");
+            return (
+                fail_attempt_with_model(job, model_name, &err, selection_role, "canceled"),
+                false,
+            );
+        }
+        Ok(false) => {}
+        Err(message) => {
+            let err = ModelError::new(message);
+            return (
+                fail_attempt_with_model(
+                    job,
+                    model_name,
+                    &err,
+                    selection_role,
+                    "infer_now_timeout_cancel_failed",
+                ),
+                false,
+            );
+        }
+    }
     let result: pgrx::spi::Result<bool> = BackgroundWorker::transaction(|| {
         pgrx::Spi::connect_mut(|client| {
             let args = [

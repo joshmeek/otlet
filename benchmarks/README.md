@@ -82,6 +82,22 @@ Use `OTLET_WORKER_COUNT=1` unless a local probe shows a wall-clock win and accep
 
 The two-worker probes produced overlapping llama.cpp generation from separate Postgres workers and increased wall time or memory on qwen35_4b. Treat worker count as a research control until Otlet has per-worker RSS totals, model-specific admission caps, queue fairness proof, and database responsiveness checks
 
+### Single-context batching decision
+
+The current linked llama.cpp API can isolate multiple sequence IDs, KV positions, samplers, JSON stopping, and cancellation in one context. The smallest Otlet prototype still failed the combined throughput and memory gate:
+
+| probe | wall time | peak worker RSS | result |
+| --- | ---: | ---: | --- |
+| 4 sequential jobs | `22.308s` | `5.695 GB` | control |
+| 4 batched jobs | `24.176s` | higher | reject: slower |
+| 8 sequential jobs, paired control | `28.338s` | `5.919 GB` | control |
+| 8 batched jobs, 512-token buffer | `20.574s` | `6.605 GB` | reject: about 686 MB more RSS |
+| 8 batched jobs, 128-token buffer | `35.002s` | `6.266 GB` | reject: slower and still larger |
+
+All retained comparisons used one worker, six threads, the same qwen35 task and prompt identity, cache disabled, and `8/8` correct schema-valid outputs. One-client `SELECT 1` latency during the fastest batch was no worse than sequential load. Dropping the resident sequential context reduced the extra peak to about 290 MB, but bounded buffers then lost the wall-time win. Otlet keeps the sequential decoder and reruns this experiment only when the linked runtime, model, or memory envelope changes
+
+Requester timeout is a separate correctness contract. The resident worker now persists the existing shared-memory abort through `otlet.cancel_job` during prompt/decode probes and immediately before output acceptance. The demo requires a canceled receipt, zero outputs, zero actions, and one healthy worker after the caller transaction raises
+
 Run the default-included benchmark model:
 
 ```sh
