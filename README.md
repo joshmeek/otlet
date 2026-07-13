@@ -8,6 +8,8 @@ For explicit source writes, an owner can register one ordinary table, its single
 
 Otlet uses a `pgrx` extension and a Postgres background worker loaded through `shared_preload_libraries` to run local model work inside the database process. You can ask for model work from SQL, queue it from rows, refresh semantic state after source changes, and inspect the result without leaving Postgres
 
+Linked llama.cpp stops after one balanced JSON object. Otlet then requires the fixed `output` plus `actions` envelope, applies the task JSON Schema and action rules, and stores only trusted state
+
 ## Quick Example
 
 Use `otlet.ask` for one-off questions over row-shaped JSON. This example summarizes customer notes and chooses a next step

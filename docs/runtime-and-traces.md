@@ -60,6 +60,14 @@ A receipt records evidence for one model run. A candidate pair can have multiple
 
 Each receipt links the model, artifact, runtime options, prompt hash, input hash, output schema hash, raw-output hash, validation status, timing, token counts, memory summary, and trace summary. Otlet does not persist the assembled prompt
 
+Linked llama.cpp uses greedy decoding and stops after one balanced JSON object. Otlet then requires the common `output` plus `actions` envelope and runs the task JSON Schema, action schema, decision contract, and selection policy. Inspect the decode and validation contract through the receipt:
+
+```sql
+SELECT schema_force, decode_constraint, decode_constraint_reason
+FROM otlet.inference_receipt_trace_status
+WHERE receipt_id = 2107;
+```
+
 Warm-job timing splits `tokenize_ms`, `prompt_decode_ms`, `generate_ms`, `finish_sql_ms`, and `materialize_ms` when present:
 
 ```sql

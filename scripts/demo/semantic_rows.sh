@@ -699,7 +699,8 @@ row_cache_revert_contract="$(psql_exec -qAt \
 SELECT inference_cache_hit::text || '|' ||
        COALESCE(inference_cache_reason, '') || '|' ||
        COALESCE(inference_cache_key_basis, '') || '|' ||
-       COALESCE(inference_cache_eviction_reason, '')
+       COALESCE(inference_cache_eviction_reason, '') || '|' ||
+       COALESCE(decode_constraint, '')
 FROM otlet.inference_receipt_trace_status
 WHERE task_name = :'task_name'
   AND subject_id = 'triage-1'
@@ -713,7 +714,7 @@ SQL
 row_cache_revert_trace="$(head -n 1 <<<"$row_cache_revert_contract")"
 row_cache_revert_fresh="$(tail -n 1 <<<"$row_cache_revert_contract")"
 echo "row_cache_revert_contract=$row_cache_revert_trace|fresh=$row_cache_revert_fresh"
-[ "$row_cache_revert_trace|$row_cache_revert_fresh" = "true|hit|content_hash_contract_hash_model_fingerprint|none|1" ] || {
+[ "$row_cache_revert_trace|$row_cache_revert_fresh" = "true|hit|content_hash_contract_hash_model_fingerprint|none|greedy_with_balanced_json_object_stop_post_generation_schema_check|1" ] || {
   echo "Expected reverted row content to hit inference cache and remain fresh, got $row_cache_revert_trace|$row_cache_revert_fresh" >&2
   exit 1
 }

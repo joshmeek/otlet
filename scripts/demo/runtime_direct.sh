@@ -32,7 +32,10 @@ FROM asked
 \gset direct_ask_
 SELECT 'direct_ask_contract=' || :'direct_ask_route' || '|' || :'direct_ask_job_id' || '|' || :'direct_ask_receipt_id';
 SELECT 'direct_ask_receipt_contract=' || s.model_name || '|' || s.status || '|' ||
-       s.schema_validation_status || '|' || s.detailed_trace_captured_tokens::text
+       s.schema_validation_status || '|' || s.detailed_trace_captured_tokens::text || '|' ||
+       COALESCE(s.schema_force, '') || '|' || COALESCE(s.decode_constraint, '') || '|' ||
+       COALESCE(s.decode_constraint_reason, '') || '|' ||
+       COALESCE(jsonb_extract_path_text(s.trace_summary, 'probability_summary', 'method'), '')
 FROM otlet.inference_receipt_trace_status s
 WHERE s.receipt_id = :'direct_ask_receipt_id'::bigint;
 SELECT 'direct_ask_cache_contract=' || s.inference_cache_hit::text || '|' ||
@@ -49,7 +52,7 @@ direct_ask_contract="$(sed -n 's/^direct_ask_contract=//p' <<<"$direct_ask_outpu
 direct_ask_receipt_contract="$(sed -n 's/^direct_ask_receipt_contract=//p' <<<"$direct_ask_output")"
 direct_ask_cache_contract="$(sed -n 's/^direct_ask_cache_contract=//p' <<<"$direct_ask_output")"
 require_regex "$direct_ask_contract" '^review_payment\|[1-9][0-9]*\|[1-9][0-9]*$' "Expected direct ask to return review_payment with job and receipt ids"
-require_regex "$direct_ask_receipt_contract" "^$strong_model_name\\|complete\\|passed\\|[1-9][0-9]*$" "Expected direct ask receipt evidence"
+require_regex "$direct_ask_receipt_contract" "^$strong_model_name\\|complete\\|passed\\|[1-9][0-9]*\\|post_generation_json_schema_validation\\|greedy_with_balanced_json_object_stop_post_generation_schema_check\\|balanced_json_stop_prevents_trailing_prose_schema_failures_stay_receipts_only\\|chosen_token_softmax_from_llama_logits$" "Expected direct ask decode and validation evidence"
 [ "$direct_ask_cache_contract" = "false|disabled_for_generation_trace|content_hash_contract_hash_model_fingerprint|true|none" ] || {
   echo "Expected direct ask trace to make cache-disabled-under-generation-trace explicit, got $direct_ask_cache_contract" >&2
   exit 1

@@ -16,7 +16,7 @@ Otlet exposes three proof surfaces:
 
 Otlet keeps source rows in user tables. Users select rows with SQL. `otlet.ask(...)` handles one-off row questions through the resident worker. Named watches own repeatable row and pair jobs, stale policy, candidate SQL, model policy, and runtime options. Otlet passes compact JSON to local GGUF models, runs cheap-first model selection for tasks with a policy, drains bounded queue batches, and stores outputs, attempts, actions, traces, receipts, eval labels, and semantic materializations under `otlet`. The bounded write path can update one owner-registered source row after dry run and approval
 
-The model harness requires a top-level `output` plus `actions` envelope. Otlet records invalid JSON, schema failures, rejected attempts, and rejected actions as receipt evidence and excludes them from trusted output
+The linked runtime stops after one balanced JSON object. Otlet then requires the fixed `output` plus `actions` envelope and applies task JSON Schema, action, decision, and selection validation. Invalid JSON, schema failures, rejected attempts, and rejected actions stay in receipt evidence outside trusted output
 
 Extension owners can export row and pair watch definitions as `otlet.watch.v1` JSONB and import them through the same validation path as `create_watch`. The document carries configuration and owner-authored SQL without database state or model artifacts
 
@@ -45,7 +45,6 @@ Run `./scripts/otlet-setup.sh`, then `./scripts/otlet-demo.sh` to prove the cont
 | Planner, executor, and cache hardening | Align SQL plan rows, semantic status views, runtime fingerprints, CustomScan EXPLAIN, receipts, runtime/cache views, and demo output |
 | Semantic freshness hardening | Extend dependency audit export to source deletes and candidate-set changes |
 | Model residency and timing | Add pre-load memory admission, pressure metrics, and single-context decoder-batch probes before changing slot policy |
-| Grammar-constrained decode | Add grammar or JSON-schema decode after linked llama exposes a worker-safe hook |
 | Persisted cache storage | Add disk-backed cache after a measured workload proves in-process cache misses hurt |
 | Managed Postgres external worker | Build a trusted SQL-bound worker that claims jobs, heartbeats, writes receipts, and fails closed |
 | GPU acceleration | Report device policy, memory accounting, throughput, energy per trusted job, crash behavior, and EXPLAIN-visible device state |
@@ -58,6 +57,8 @@ Define each open track through SQL-visible state, a closed failure mode, and dem
 
 Otlet treats output reliability as part of the database contract. Trusted output uses a fixed top-level `output` plus `actions` envelope. Invalid JSON, schema failures, bad action envelopes, false merges, and failed model attempts stay in receipts and diagnostic benchmark data, outside trusted output
 
+Keep greedy decoding with balanced-object stopping. A same-host native grammar probe reduced steady generation speed, so grammar-constrained decode did not meet Otlet's no-regression bar and is not planned
+
 Qwen3.5 4B stays the default stable model under the 4B and 4 GB project cap. The fast probe filters smaller candidates before a full benchmark run. MiniStral 3B, Phi-4 mini, SmolLM3 3B, and GLM Edge 4B run faster in CPU quick probes. Each model failed at least one adversarial row-text, numeric-threshold, markdown-fence, or schema gate
 
 Next benchmark work:
@@ -68,7 +69,6 @@ Next benchmark work:
 - Sweep `OTLET_PROBE_LLAMA_THREADS` through `benchmarks/quick_probe.sh` before treating CPU token rates as fixed
 - Compare the current raw prompt with and without `/no_think`, the GGUF chat template, and an explicit family template under one fixture and gate set
 - Run quantization ladders for one base model; use a full-precision or hosted reference to distinguish base-model limits from local format and runtime failures
-- Revisit grammar-constrained JSON after linked llama exposes a hook that cannot abort the resident worker
 - Run prompt, template, quantization, and schema changes against one benchmark fixture
 - Use larger local models as ceiling checks; cap Otlet defaults at 4B active parameters and about 4 GB on disk
 
@@ -88,7 +88,7 @@ Add one runtime fingerprint to receipts, trace views, and benchmark artifacts. I
 
 Preserve cache-hit performance. A live smoke run completed cached jobs in milliseconds with no generation, so future watch and demo work disables trace mode for cacheable production paths and preserves stable content, contract, and model keys. Cache-hit receipt hashes still match the miss path; they stream the prompt and input bytes without allocating the full prompt string
 
-Measure CPU tuning through the SQL path. Current controls cover release builds, native CPU code, OpenMP, a six-thread default cap, per-job `llama_threads`, startup `OTLET_LLAMA_BATCH_TOKENS`, `OTLET_LLAMA_MMAP`, `OTLET_LLAMA_MLOCK`, and `OTLET_LLAMA_FLASH_ATTN`. Add BLAS, KV-cache quantization, context-window policy, grammar decoding, or device offload after a probe shows better Otlet pass rate or latency
+Measure CPU tuning through the SQL path. Current controls cover release builds, native CPU code, OpenMP, a six-thread default cap, per-job `llama_threads`, startup `OTLET_LLAMA_BATCH_TOKENS`, `OTLET_LLAMA_MMAP`, `OTLET_LLAMA_MLOCK`, and `OTLET_LLAMA_FLASH_ATTN`. Add BLAS, KV-cache quantization, context-window policy, or device offload after a probe shows better Otlet pass rate or latency
 
 Add pre-load memory admission. Estimate model, context, KV, prefix-cache, and Postgres headroom before loading a model; reject the load before memory pressure begins. Sample major faults, model-file reads, swap, and cgroup memory pressure around each run and expose supported fields through receipts and runtime status
 
