@@ -151,6 +151,7 @@ unsafe extern "C-unwind" fn begin_semantic_custom_scan(
             infer_trace_finish_sql_ms: 0,
             infer_trace_materialize_ms: 0,
             infer_trace_version: String::new(),
+            infer_trace_runtime_fingerprint_hash: String::new(),
             infer_trace_probability_status: String::new(),
             infer_trace_schema_force: String::new(),
             infer_trace_detailed_status: String::new(),
@@ -470,6 +471,7 @@ unsafe extern "C-unwind" fn rescan_semantic_custom_scan(node: *mut pg_sys::Custo
             runtime.infer_trace_finish_sql_ms = 0;
             runtime.infer_trace_materialize_ms = 0;
             runtime.infer_trace_version.clear();
+            runtime.infer_trace_runtime_fingerprint_hash.clear();
             runtime.infer_trace_probability_status.clear();
             runtime.infer_trace_schema_force.clear();
             runtime.infer_trace_detailed_status.clear();

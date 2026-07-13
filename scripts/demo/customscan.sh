@@ -273,6 +273,7 @@ require_contains "$row_customscan_infer_plan" "Actual Fail Closed Rows: 1" "Expe
 require_contains "$row_customscan_infer_plan" "Actual Stale Subjects: 2" "Expected two stale source rows"
 require_contains "$row_customscan_infer_plan" "Infer Now Batches: 1" "Expected one infer-now batch"
 require_contains "$row_customscan_infer_plan" "Infer Now Receipts: 1" "Expected one infer-now receipt"
+require_contains "$row_customscan_infer_plan" "Infer Now Runtime Fingerprint Hash:" "Expected infer-now EXPLAIN to identify the receipt runtime"
 require_contains "$row_customscan_infer_plan" "Infer Now Trace Receipt Id:" "Expected infer-now receipt pointer"
 require_contains "$row_customscan_infer_plan" "Rows Returned: 1" "Expected one inferred row returned after bounded infer-now"
 

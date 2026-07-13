@@ -45,10 +45,21 @@ LIMIT 1;
 Representative output from the demo run:
 
 ```text
-runtime_status_contract=ready|ready|35.71|true|true|true|none|linux_proc_self_status_vmrss_vmsize_sampled_after_worker_run
+runtime_status_contract=ready|ready|55.17|true|true|true|none|linux_proc_self_status_vmrss_vmsize_sampled_after_worker_run
 ```
 
 The value reports a ready runtime, a ready model slot, bounded cache entries and byte caps, no recent eviction, and Linux process-status memory sampling after a worker run
+
+The latest detailed receipt also binds runtime status to the same versioned fingerprint and output-affecting cache contract:
+
+```sql
+SELECT runtime_fingerprint_version,
+       runtime_fingerprint_hash,
+       runtime_output_contract_hash,
+       runtime_fingerprint
+FROM otlet.runtime_status
+WHERE model_name = 'qwen35_4b';
+```
 
 ## Step 3 - Inspect Production Policy
 

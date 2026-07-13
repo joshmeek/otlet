@@ -7,6 +7,7 @@ struct InferNowProvenanceCounts {
     finish_sql_ms: u64,
     materialize_ms: u64,
     trace_version: String,
+    runtime_fingerprint_hash: String,
     probability_status: String,
     schema_force: String,
     detailed_trace_status: String,
@@ -79,6 +80,7 @@ const INFER_NOW_PROVENANCE_AND_ROW_STATE_SQL: &str = "WITH receipt AS ( \
                      NULLIF(trace_summary ->> 'finish_sql_ms', '')::bigint AS finish_sql_ms, \
                      NULLIF(trace_summary ->> 'materialize_ms', '')::bigint AS materialize_ms, \
                      COALESCE(trace_summary ->> 'trace_version', '') AS trace_version, \
+                     COALESCE(trace_summary ->> 'runtime_fingerprint_hash', '') AS runtime_fingerprint_hash, \
                      COALESCE(trace_summary -> 'probability_summary' ->> 'status', '') AS probability_status, \
                      COALESCE(trace_summary ->> 'schema_force', '') AS schema_force, \
                      COALESCE(trace_summary -> 'detailed_trace' ->> 'status', '') AS detailed_trace_status, \
@@ -125,6 +127,7 @@ const INFER_NOW_PROVENANCE_AND_ROW_STATE_SQL: &str = "WITH receipt AS ( \
                    COALESCE(r.finish_sql_ms, 0)::bigint AS finish_sql_ms, \
                    COALESCE(r.materialize_ms, 0)::bigint AS materialize_ms, \
                    COALESCE(r.trace_version, '') AS trace_version, \
+                   COALESCE(r.runtime_fingerprint_hash, '') AS runtime_fingerprint_hash, \
                    COALESCE(r.probability_status, '') AS probability_status, \
                    COALESCE(r.schema_force, '') AS schema_force, \
                    COALESCE(r.detailed_trace_status, '') AS detailed_trace_status, \
@@ -144,6 +147,7 @@ const INFER_NOW_PROVENANCE_AND_JOIN_STATE_SQL: &str = "WITH receipt AS ( \
                      NULLIF(trace_summary ->> 'finish_sql_ms', '')::bigint AS finish_sql_ms, \
                      NULLIF(trace_summary ->> 'materialize_ms', '')::bigint AS materialize_ms, \
                      COALESCE(trace_summary ->> 'trace_version', '') AS trace_version, \
+                     COALESCE(trace_summary ->> 'runtime_fingerprint_hash', '') AS runtime_fingerprint_hash, \
                      COALESCE(trace_summary -> 'probability_summary' ->> 'status', '') AS probability_status, \
                      COALESCE(trace_summary ->> 'schema_force', '') AS schema_force, \
                      COALESCE(trace_summary -> 'detailed_trace' ->> 'status', '') AS detailed_trace_status, \
@@ -191,6 +195,7 @@ const INFER_NOW_PROVENANCE_AND_JOIN_STATE_SQL: &str = "WITH receipt AS ( \
                    COALESCE(r.finish_sql_ms, 0)::bigint AS finish_sql_ms, \
                    COALESCE(r.materialize_ms, 0)::bigint AS materialize_ms, \
                    COALESCE(r.trace_version, '') AS trace_version, \
+                   COALESCE(r.runtime_fingerprint_hash, '') AS runtime_fingerprint_hash, \
                    COALESCE(r.probability_status, '') AS probability_status, \
                    COALESCE(r.schema_force, '') AS schema_force, \
                    COALESCE(r.detailed_trace_status, '') AS detailed_trace_status, \
@@ -244,6 +249,10 @@ fn provenance_and_state_from_spi_table(
             .map_or(0, nonnegative_count),
         trace_version: row
             .get_by_name::<String, _>("trace_version")
+            .map_err(to_string)?
+            .unwrap_or_default(),
+        runtime_fingerprint_hash: row
+            .get_by_name::<String, _>("runtime_fingerprint_hash")
             .map_err(to_string)?
             .unwrap_or_default(),
         probability_status: row

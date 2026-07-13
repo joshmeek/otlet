@@ -58,7 +58,7 @@ receipt_attempt_contract=8|4|4|4
 
 A receipt records evidence for one model run. A candidate pair can have multiple receipts when model selection escalates
 
-Each receipt links the model, artifact, runtime options, prompt hash, input hash, output schema hash, raw-output hash, validation status, timing, token counts, memory summary, and trace summary. Otlet does not persist the assembled prompt
+Each receipt links the model, artifact, runtime options, prompt hash, input hash, output schema hash, raw-output hash, runtime fingerprint, validation status, timing, token counts, memory summary, and trace summary. Otlet does not persist the assembled prompt
 
 Linked llama.cpp uses greedy decoding and stops after one balanced JSON object. Otlet then requires the common `output` plus `actions` envelope and runs the task JSON Schema, action schema, decision contract, and selection policy. Inspect the decode and validation contract through the receipt:
 
@@ -100,11 +100,26 @@ Representative output:
 runtime_residency_contract=ready|ready|resident_worker_loaded_model_context|true|true
 ```
 
-The worker keeps the local model/context warm across jobs. SQL can see the slot state, memory sample, context window, cache entries, cache bounds, and the last cache reason
+The worker keeps the local model/context warm across jobs. SQL can see the slot state, memory sample, context window, cache entries, cache bounds, last cache reason, and latest detailed runtime fingerprint
+
+The full fingerprint describes the artifact, linked build, effective generation settings, CPU placement, and host capacity. Its output-contract hash omits observational host fields and joins content, task contract, and model identity in the inference-cache key:
+
+```sql
+SELECT receipt_id,
+       runtime_fingerprint_version,
+       runtime_fingerprint_hash,
+       runtime_output_contract_hash,
+       runtime_fingerprint -> 'artifact' ->> 'quantization' AS quantization,
+       runtime_fingerprint #>> '{output_contract,prompt_template,name}' AS prompt_template
+FROM otlet.inference_receipt_trace_status
+WHERE runtime_fingerprint_hash IS NOT NULL
+ORDER BY receipt_id DESC
+LIMIT 1;
+```
 
 SQL shows whether the model loaded, is busy, failed, cached, or went over budget
 
-The inference-output cache stores schema-valid raw model output before Otlet applies selection trust. Accepted abstentions and rejected-but-valid attempts may reuse cached bytes; invalid JSON/schema failures stay out of the cache. The receipt still records accepted/rejected/failed status, and the cache key basis stays content hash + contract hash + model fingerprint
+The inference-output cache stores schema-valid raw model output before Otlet applies selection trust. Accepted abstentions and rejected-but-valid attempts may reuse cached bytes; invalid JSON/schema failures stay out of the cache. The receipt still records accepted/rejected/failed status, and the cache key basis is content hash + contract hash + runtime output-contract hash + model fingerprint
 
 ```sql
 SELECT task_name,

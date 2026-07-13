@@ -75,3 +75,27 @@ write_metadata() {
   append_kv "$metadata_tsv" sensitive_evidence_export_policy "hashes and derived scores only"
   append_kv "$metadata_tsv" scratch_dir "$scratch_dir"
 }
+
+append_runtime_metadata() {
+  append_kv "$metadata_tsv" runtime_fingerprint_hashes "$(psql_value -v run_id="$run_id" <<'SQL'
+SELECT COALESCE(jsonb_agg(DISTINCT trace_summary ->> 'runtime_fingerprint_hash')::text, '[]')
+FROM otlet.inference_receipts
+WHERE task_name LIKE :'run_id' || '\_%' ESCAPE '\'
+  AND trace_summary ->> 'runtime_fingerprint_hash' <> '';
+SQL
+)"
+  append_kv "$metadata_tsv" runtime_output_contract_hashes "$(psql_value -v run_id="$run_id" <<'SQL'
+SELECT COALESCE(jsonb_agg(DISTINCT trace_summary ->> 'runtime_output_contract_hash')::text, '[]')
+FROM otlet.inference_receipts
+WHERE task_name LIKE :'run_id' || '\_%' ESCAPE '\'
+  AND trace_summary ->> 'runtime_output_contract_hash' <> '';
+SQL
+)"
+  append_kv "$metadata_tsv" runtime_fingerprints "$(psql_value -v run_id="$run_id" <<'SQL'
+SELECT COALESCE(jsonb_agg(DISTINCT trace_summary -> 'runtime_fingerprint')::text, '[]')
+FROM otlet.inference_receipts
+WHERE task_name LIKE :'run_id' || '\_%' ESCAPE '\'
+  AND trace_summary -> 'runtime_fingerprint' IS NOT NULL;
+SQL
+)"
+}

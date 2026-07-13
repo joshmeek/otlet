@@ -30,7 +30,7 @@ Run `./scripts/otlet-setup.sh`, then `./scripts/otlet-demo.sh` to prove the cont
 | --- | --- | --- | --- |
 | 1 | Packaging and security | Active hardening | Maintain a small setup and demo; add release packaging proof |
 | 2 | Output reliability and benchmark truth | Active hardening | Add prompt-template and quant sweeps under the existing quality gates |
-| 3 | Planner, executor, and cache | Active hardening | Add runtime fingerprints, load admission, decoder-batch probes, and EXPLAIN parity |
+| 3 | Planner, executor, and cache | Active hardening | Add load admission and decoder-batch probes, then close Access Method and fork evidence |
 | 4 | Semantic freshness | Implemented contract | Maintain row, pair, delete, candidate, and schema-drift freshness gates |
 | 5 | Action safety | Implemented contract | Maintain the one-table, one-key, one-row `update_row` boundary |
 | 6 | Managed Postgres packaging | Open | Test native workers where providers allow them and a SQL-bound agent where providers block them |
@@ -42,7 +42,7 @@ Run `./scripts/otlet-setup.sh`, then `./scripts/otlet-demo.sh` to prove the cont
 | Track | Next contract |
 | --- | --- |
 | Output reliability hardening | Compare prompt templates and quantizations for each model family under one fixture and gate set |
-| Planner, executor, and cache hardening | Align SQL plan rows, semantic status views, runtime fingerprints, CustomScan EXPLAIN, receipts, runtime/cache views, and demo output |
+| Planner, executor, and cache hardening | Keep SQL plan rows, semantic status views, CustomScan EXPLAIN, receipts, runtime/cache views, and demo output aligned |
 | Model residency and timing | Add pre-load memory admission, pressure metrics, and single-context decoder-batch probes before changing slot policy |
 | Persisted cache storage | Add disk-backed cache after a measured workload proves in-process cache misses hurt |
 | Managed Postgres external worker | Build a trusted SQL-bound worker that claims jobs, heartbeats, writes receipts, and fails closed |
@@ -83,7 +83,7 @@ Use measured runtime history for costing: load time, warm generation time, token
 
 The timing split records `tokenize_ms`, `prompt_decode_ms`, `generate_ms`, `finish_sql_ms`, and `materialize_ms`. Use those fields to decide whether prompt decode, SQL finish work, or materialization owns warm-job latency. Worker complete/fail paths stamp `finish_sql_ms` and `materialize_ms` onto receipt `trace_summary`; `inference_receipt_trace_status` and `inference_trace_summary` expose them as nullable columns
 
-Add one runtime fingerprint to receipts, trace views, and benchmark artifacts. Include the artifact hash, quantization, prompt-template name and hash, linked llama.cpp revision and build flags, effective context, batch, ubatch, KV, mmap, mlock, flash-attention, thread, affinity, NUMA, CPU topology, and memory capacity. Add output-affecting fields to cache contracts before persisted cache storage ships
+Receipts, trace views, runtime status, infer-now EXPLAIN, demo contracts, and benchmark artifacts share one versioned runtime fingerprint. It binds artifact identity and quantization, prompt-template name and hash, linked llama.cpp revision and build flags, effective context, batch, ubatch, KV, mmap, mlock, flash-attention, threads, affinity, NUMA, CPU topology, and memory capacity. The inference cache includes the output-affecting subset while host-capacity observations stay outside cache invalidation
 
 Preserve cache-hit performance. A live smoke run completed cached jobs in milliseconds with no generation, so future watch and demo work disables trace mode for cacheable production paths and preserves stable content, contract, and model keys. Cache-hit receipt hashes still match the miss path; they stream the prompt and input bytes without allocating the full prompt string
 

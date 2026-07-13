@@ -34,6 +34,10 @@ SELECT
   s.model_memory_bytes,
   s.model_parameters,
   s.context_window_tokens,
+  fingerprint.runtime_fingerprint_version,
+  fingerprint.runtime_fingerprint_hash,
+  fingerprint.runtime_output_contract_hash,
+  fingerprint.runtime_fingerprint,
   s.model_device_policy,
   s.resident_memory_tracked_bytes,
   s.memory_accounting_policy,
@@ -76,6 +80,22 @@ FROM otlet.models m
 LEFT JOIN otlet.runtime_slots s ON s.model_name = m.name
 LEFT JOIN infer_state infer ON true
 LEFT JOIN worker_state ON true
+LEFT JOIN LATERAL (
+  SELECT
+    r.trace_summary ->> 'runtime_fingerprint_version' AS runtime_fingerprint_version,
+    r.trace_summary ->> 'runtime_fingerprint_hash' AS runtime_fingerprint_hash,
+    r.trace_summary ->> 'runtime_output_contract_hash' AS runtime_output_contract_hash,
+    r.trace_summary -> 'runtime_fingerprint' AS runtime_fingerprint
+  FROM otlet.inference_receipts r
+  WHERE r.model_name = m.name
+    AND r.runtime_name = 'linked_inproc'
+    AND r.status = 'complete'
+    AND r.schema_validation_status = 'passed'
+    AND COALESCE(r.generate_ms, 0) > 0
+    AND r.trace_summary ->> 'runtime_fingerprint_hash' <> ''
+  ORDER BY r.finished_at DESC, r.id DESC
+  LIMIT 1
+) fingerprint ON true
 LEFT JOIN LATERAL (
   SELECT (pg_stat_file(COALESCE(s.artifact_path, m.artifact_path), true)).size::bigint AS artifact_bytes
   WHERE COALESCE(s.artifact_path, m.artifact_path) <> ''

@@ -4,7 +4,7 @@ Use this learning file as a worked example, following the structure from [this s
 
 Follow one Docker-backed Otlet entity-resolution loop: leave vendor rows in Postgres tables, select hard candidate pairs in SQL, enqueue durable model work, let the resident worker try a cheap local model and escalate hard rows to a stronger local model, validate `same_entity` / `different_entity` / `unclear`, record typed actions, and preserve receipts
 
-The output blocks come from a Docker-backed run on July 12, 2026 with `./scripts/otlet-setup.sh` and `./scripts/otlet-demo.sh`. Job IDs, receipt IDs, hashes, timestamps, token counts, timings, and token rates are representative and vary by machine and cache state
+The output blocks come from a Docker-backed run on July 13, 2026 with `./scripts/otlet-setup.sh` and `./scripts/otlet-demo.sh`. Job IDs, receipt IDs, hashes, timestamps, token counts, timings, and token rates are representative and vary by machine and cache state
 
 This walkthrough runs as the extension owner because it registers models and tasks, reads raw attempt state, and administers watches. Production auditors use the redacted `otlet.audit_*` views. Reviewers receive `otlet.grant_operator_access(...)` before calling approval, correction, dry-run, or apply functions. See [production-contract.md](production-contract.md) for the exact grants
 
@@ -218,7 +218,8 @@ candidate_changed_contract=1|true|candidate_changed|0
 semantic_join_stale_contract=4|0|fresh_after_lookup=0|receipts=8|8
 receipt_trace_contract=8|8|8|8
 inference_visibility_status=true|true|true|true|true
-runtime_status_contract=ready|ready|35.71|true|true|true|none|linux_proc_self_status_vmrss_vmsize_sampled_after_worker_run
+direct_ask_runtime_fingerprint_contract=otlet_runtime_fingerprint_v1|true|true|Q4_K_M|otlet_raw_json_worker_v1|94a220cd6|512|8217751552
+runtime_status_contract=ready|ready|55.17|true|true|true|none|linux_proc_self_status_vmrss_vmsize_sampled_after_worker_run
 planner_1m_contract=estimated|1000000|4.404|true
 performance_ratio_contract=38|47|1.237|15948|419.684
 materialization_failure_status_contract=true|true

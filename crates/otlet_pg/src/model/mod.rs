@@ -164,6 +164,9 @@ struct RunContext {
     runtime_options_hash: String,
     runtime_options_status: Value,
     model_fingerprint_hash: Arc<str>,
+    runtime_fingerprint: Value,
+    runtime_fingerprint_hash: String,
+    runtime_output_contract_hash: String,
     decision_contract_hash: String,
     decision_preset_name: String,
     decision_preset_contract_hash: String,
@@ -214,6 +217,7 @@ fn run_job_with_model_ref(job: &Job, model: JobModelRef<'_>) -> Result<ModelRun,
         .as_ref()
         .map_err(|err| ModelError::new(err.clone()))?;
     let model_fingerprint_hash = model_fingerprint_hash(model);
+    let runtime_fingerprint = runtime_fingerprint(model, &model_fingerprint_hash, options);
     // Cache keys use content/contract/model digests only — look up before
     // allocating shaped JSON or prompt strings. Hits stream the same hashes.
     let cache_probe = RunContext {
@@ -223,12 +227,15 @@ fn run_job_with_model_ref(job: &Job, model: JobModelRef<'_>) -> Result<ModelRun,
         runtime_options_hash: digests.runtime_options_hash.clone(),
         runtime_options_status: digests.runtime_options_status.clone(),
         model_fingerprint_hash: Arc::clone(&model_fingerprint_hash),
+        runtime_fingerprint: runtime_fingerprint.document,
+        runtime_fingerprint_hash: runtime_fingerprint.hash,
+        runtime_output_contract_hash: runtime_fingerprint.output_contract_hash,
         decision_contract_hash: digests.decision_contract_hash.clone(),
         decision_preset_name: digests.decision_preset_name.clone(),
         decision_preset_contract_hash: digests.decision_preset_contract_hash.clone(),
         input_content_hash: job.input_content_hash.clone(),
         inference_cache_contract_hash: digests.inference_cache_contract_hash.clone(),
-        inference_cache_key_basis: "content_hash_contract_hash_model_fingerprint",
+        inference_cache_key_basis: "content_hash_contract_hash_runtime_output_contract_hash_model_fingerprint",
         cache_key: 0,
         content_cache_key: 0,
         contract_cache_key: 0,
@@ -636,3 +643,4 @@ include!("trace.rs");
 include!("linked.rs");
 include!("cache.rs");
 include!("output.rs");
+include!("fingerprint.rs");

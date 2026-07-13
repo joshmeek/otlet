@@ -641,6 +641,10 @@ SELECT
   r.schema_validation_status,
   trace.summary ->> 'trace_version' AS trace_version,
   trace.summary AS trace_summary,
+  trace.summary ->> 'runtime_fingerprint_version' AS runtime_fingerprint_version,
+  trace.summary ->> 'runtime_fingerprint_hash' AS runtime_fingerprint_hash,
+  trace.summary ->> 'runtime_output_contract_hash' AS runtime_output_contract_hash,
+  trace.summary -> 'runtime_fingerprint' AS runtime_fingerprint,
   COALESCE(
     NULLIF(trace.summary #>> '{decision,preset_name}', ''),
     NULLIF(trace.summary ->> 'decision_preset_name', '')

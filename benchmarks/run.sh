@@ -573,6 +573,8 @@ SELECT (SELECT count(*) FROM otlet.redaction_policy_status) || '|' ||
 SQL
 )"
 
+  append_runtime_metadata
+
   perform_cleanup
 
   local report_path

@@ -271,6 +271,7 @@ The SQL plan row and CustomScan EXPLAIN share planner terms
 | Child plan attachment | (none) | `Child Plan Attached` | Counter; `1` once begin-scan attaches the Postgres child plan |
 | Source tuple path | (none) | `Source Tuple Provider` | Matches executor context; row scans report `child_plan_execprocnode`, joins report `child_subquery_join_execprocnode` |
 | Predicate owner | (none) | `Semantic Predicate Owner` | Fixed owner: `otlet_customscan_executor` |
+| Runtime identity | `inference_receipt_trace_status.runtime_fingerprint_hash` | `Infer Now Runtime Fingerprint Hash` | Same infer-now receipt fingerprint |
 | Warm-job SQL finish | `inference_receipt_trace_status.finish_sql_ms` | `Infer Now Trace Finish Sql Ms` | Optional; stamped inside `complete_job` / `fail_job` |
 | Warm-job materialize | `inference_receipt_trace_status.materialize_ms` | `Infer Now Trace Materialize Ms` | Optional; stamped inside `materialize_completed_semantic_job` |
 
@@ -278,7 +279,7 @@ EXPLAIN line ledger for this pass:
 
 | Surface | Added | Deleted or merged | Net |
 | --- | --- | --- | --- |
-| CustomScan | `Emitted Freshness Basis` | `Preloaded Fresh Subjects` and `Preloaded Freshness Basis` merged into `Preloaded Fresh Subjects / Basis` | 0 |
+| CustomScan | `Emitted Freshness Basis`, `Infer Now Runtime Fingerprint Hash` | `Preloaded Fresh Subjects` and `Preloaded Freshness Basis` merged into `Preloaded Fresh Subjects / Basis` | +1 |
 | SQL plan row | no EXPLAIN line added; `infer_now_subjects` and `infer_now_ms` now use existing columns | none | 0 |
 
 Captured row-plan excerpt:
@@ -423,6 +424,7 @@ Custom Scan (Otlet Semantic Source CustomScan) on public.otlet_demo_semantic_ven
   Actual Infer Resolved Rows: 1
   Infer Now Receipts: 1
   Infer Now Trace Receipt Id: 42
+  Infer Now Runtime Fingerprint Hash: d81c5772b768b969
 ```
 
 The executor refreshed the stale row with a bounded infer-now budget and a receipt

@@ -714,7 +714,7 @@ SQL
 row_cache_revert_trace="$(head -n 1 <<<"$row_cache_revert_contract")"
 row_cache_revert_fresh="$(tail -n 1 <<<"$row_cache_revert_contract")"
 echo "row_cache_revert_contract=$row_cache_revert_trace|fresh=$row_cache_revert_fresh"
-[ "$row_cache_revert_trace|$row_cache_revert_fresh" = "true|hit|content_hash_contract_hash_model_fingerprint|none|greedy_with_balanced_json_object_stop_post_generation_schema_check|1" ] || {
+[ "$row_cache_revert_trace|$row_cache_revert_fresh" = "true|hit|content_hash_contract_hash_runtime_output_contract_hash_model_fingerprint|none|greedy_with_balanced_json_object_stop_post_generation_schema_check|1" ] || {
   echo "Expected reverted row content to hit inference cache and remain fresh, got $row_cache_revert_trace|$row_cache_revert_fresh" >&2
   exit 1
 }
@@ -772,7 +772,7 @@ LIMIT 1;
 SQL
 )"
 echo "row_contract_cache_contract=$row_contract_cache_contract"
-[ "$row_contract_cache_contract" = "false|contract_changed|content_hash_contract_hash_model_fingerprint" ] || {
+[ "$row_contract_cache_contract" = "false|contract_changed|content_hash_contract_hash_runtime_output_contract_hash_model_fingerprint" ] || {
   echo "Expected contract edit to miss inference cache with contract_changed reason, got $row_contract_cache_contract" >&2
   exit 1
 }

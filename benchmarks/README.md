@@ -90,12 +90,14 @@ Recent quick-probe findings:
 
 | model | viable | mean tok/s | result |
 | --- | --- | ---: | --- |
-| `qwen35_4b` | yes | `34.15` | passed all five row-shaped cases with the 6-thread CPU default |
+| `qwen35_4b` | yes | `40.90` | passed all five row-shaped cases with the 6-thread CPU default |
 | `qwen3_1_7b` | no | `68.79` | fast cheap model, failed three correctness cases |
 | `ministral3_3b` | no | `10.48` | failed markdown-fence, adversarial row-text, and numeric-threshold cases |
 | `phi4_mini` | no | `10.69` | schema-valid, failed adversarial row-text and numeric-threshold cases |
 | `smollm3_3b` | no | `8.71` | schema-valid, failed adversarial row-text and numeric-threshold cases |
 | `glm_edge_4b` | no | `6.68` | produced fenced JSON and failed the listed hard decisions |
+
+An interleaved three-sample A/B after runtime fingerprinting measured a `40.90 tok/s` feature median and `41.18 tok/s` unchanged-code median. All six probes passed 5/5; feature p95 generation was `2218 ms` versus `2354 ms` for the control
 
 Thread sweep on the current Docker CPU showed the best stable qwen35 setting at 6 threads:
 
@@ -190,6 +192,8 @@ Score fields are `0.000` to `1.000`
 | `workload_candidate` | production-readiness label for a non-default model |
 
 The generated report includes ranking tables, workload picks, production readiness, first failure modes, out-of-running rows, chart links, model metadata, and rerun commands
+
+Each run metadata file also records the runtime fingerprint documents, full fingerprint hashes, and output-contract hashes observed on its receipts. These values bind performance and quality results to the artifact, prompt template, linked llama.cpp revision, effective context settings, CPU placement, and host capacity
 
 ## Benchmark Scope
 
