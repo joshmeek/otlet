@@ -62,6 +62,8 @@ Qwen3.5 4B stays the default stable model under the 4B and 4 GB project cap. The
 
 Next benchmark work:
 
+- Use the five-case quick probe and focused live contracts for runtime-only work. Reserve the 447-job full suite for output-affecting changes, published comparisons, unexplained regressions, and final integration
+- Use interleaved repeated same-host A/B when thermal load or run order can obscure a runtime result
 - Run comparable model sweeps after harness changes so public charts show workload roles, trusted quality, resource fit, and out-of-running reasons across small, medium, and ceiling local models
 - Limit routine benchmark runs to `include_by_default=true`; run candidate, diagnostic, historical, heavy, and blocked rows by request
 - Use `benchmarks/quick_probe.sh` to reject weak candidates before running the full suite

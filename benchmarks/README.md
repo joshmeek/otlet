@@ -78,11 +78,25 @@ Run a single named model when debugging a candidate:
 OTLET_BENCH_LIMIT_MODELS=phi4_mini OTLET_BENCH_RUNS=1 OTLET_BENCH_PUBLISH_REPORT=1 ./benchmarks/run.sh
 ```
 
-Run the current scored comparison set after a prompt, schema, scoring, or runtime change:
+Run the current scored comparison set after an output-affecting prompt, schema, decoding, model, or scoring change:
 
 ```sh
 OTLET_BENCH_LIMIT_MODELS=ministral3_3b,qwen35_4b,gemma4_e2b,glm_edge_4b,gemma4_e4b,phi4_mini OTLET_BENCH_RUNS=1 OTLET_BENCH_PUBLISH_REPORT=1 ./benchmarks/run.sh
 ```
+
+## Choose The Validation Ring
+
+Use the smallest ring that covers the changed contract:
+
+| Change | Required proof | Full benchmark |
+| --- | --- | --- |
+| Docs, pure views, model-free planner or SQL logic | Static checks plus focused SQL | No |
+| Decode speed, threads, batch, context, load, memory, or other runtime-only behavior | Five-case quick probe; use repeated interleaved same-host A/B when results move | Only if the result is ambiguous or regresses |
+| Cache, queue, cancellation, admission, residency, receipt, status, or EXPLAIN behavior | Fresh setup, full demo, focused SQL, invariants, permissions, crash scan, and quick probe when performance can move | Only if output can change or focused evidence is inconclusive |
+| Prompt, template, quantization, model, decoding, schema acceptance, output selection, or published scores | Comparable quick probe followed by the full suite | Yes |
+| Final integrated runtime state | Complete validation ring | Yes |
+
+A full qwen35 run executes 447 sequential model jobs: 112 direct pair jobs, 110 general reliability jobs, 112 semantic-join jobs, and 113 row-watch jobs. The July 13, 2026 reference run took 51 minutes 33 seconds at `0.1446 jobs/s`. Join replay proves watch-owned worker and materialization behavior. Row watch uses a distinct prompt and schema. Keep those live jobs in the full tier instead of copying earlier outputs into derived state
 
 Limit routine model search to 4B active parameters and about 4 GB of local artifact size. Qwen3.5 4B stays the stable default until a smaller model passes the fast probe and the full benchmark. MiniStral, Gemma, GLM Edge, Phi mini, and SmolLM stay in comparison lanes
 
