@@ -119,6 +119,23 @@ LIMIT 1;
 
 SQL shows whether the model loaded, is busy, failed, cached, or went over budget
 
+Generated runs record `memory_evidence` before and after the model path. Typed receipt and runtime-status columns expose process RSS and swap, system available memory and swap, major-fault and file-read deltas, PSI totals, supported cgroup-v2 usage and events, and the model-load admission decision. With an explicit RSS budget, a cache miss loads llama.cpp metadata without tensor allocation and projects model, KV, and prompt-decode workspace bytes. Otlet rejects the load when that total exceeds worker-budget, system, or finite cgroup headroom. The current resident model stays usable
+
+```sql
+SELECT model_load_admission_decision,
+       model_load_admission_reason,
+       worker_process_rss_bytes,
+       worker_process_swap_bytes,
+       system_memory_available_bytes,
+       worker_major_faults,
+       worker_read_bytes,
+       memory_pressure_some_us,
+       cgroup_memory_oom_events
+FROM otlet.inference_receipt_trace_status
+ORDER BY receipt_id DESC
+LIMIT 1;
+```
+
 The inference-output cache stores schema-valid raw model output before Otlet applies selection trust. Accepted abstentions and rejected-but-valid attempts may reuse cached bytes; invalid JSON/schema failures stay out of the cache. The receipt still records accepted/rejected/failed status, and the cache key basis is content hash + contract hash + runtime output-contract hash + model fingerprint
 
 ```sql

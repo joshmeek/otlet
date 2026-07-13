@@ -20,7 +20,7 @@ The linked runtime stops after one balanced JSON object. Otlet then requires the
 
 Extension owners can export row and pair watch definitions as `otlet.watch.v1` JSONB and import them through the same validation path as `create_watch`. The document carries configuration and owner-authored SQL without database state or model artifacts
 
-The planner contract covers semantic lookup, fail-closed stale reads, queue refresh, wait, fresh inference, bounded CustomScan infer-now, current-row SQL lookup, cache decisions, and live EXPLAIN vocabulary. SQL exposes cache keys, invalidation reasons, hit/miss counters, size bounds, runtime status, source-delete and pair-candidate stale reasons, queue admission, fair claims, attempt bounds, cancellation, RSS budget failures, malformed-schema failures, and cleanup dry-run evidence
+The planner contract covers semantic lookup, fail-closed stale reads, queue refresh, wait, fresh inference, bounded CustomScan infer-now, current-row SQL lookup, cache decisions, and live EXPLAIN vocabulary. SQL exposes cache keys, invalidation reasons, hit/miss counters, size bounds, runtime status, source-delete and pair-candidate stale reasons, queue admission, fair claims, attempt bounds, cancellation, pre-load model admission, memory pressure, RSS budget failures, malformed-schema failures, and cleanup dry-run evidence
 
 Run `./scripts/otlet-setup.sh`, then `./scripts/otlet-demo.sh` to prove the contract. Use `benchmarks/run.sh` for SQL-scored model comparisons
 
@@ -30,7 +30,7 @@ Run `./scripts/otlet-setup.sh`, then `./scripts/otlet-demo.sh` to prove the cont
 | --- | --- | --- | --- |
 | 1 | Packaging and security | Active hardening | Maintain a small setup and demo; add release packaging proof |
 | 2 | Output reliability and benchmark truth | Active hardening | Add prompt-template and quant sweeps under the existing quality gates |
-| 3 | Planner, executor, and cache | Active hardening | Add load admission and decoder-batch probes, then close Access Method and fork evidence |
+| 3 | Planner, executor, and cache | Active hardening | Run decoder-batch probes, then close Access Method and fork evidence |
 | 4 | Semantic freshness | Implemented contract | Maintain row, pair, delete, candidate, and schema-drift freshness gates |
 | 5 | Action safety | Implemented contract | Maintain the one-table, one-key, one-row `update_row` boundary |
 | 6 | Managed Postgres packaging | Open | Test native workers where providers allow them and a SQL-bound agent where providers block them |
@@ -43,7 +43,7 @@ Run `./scripts/otlet-setup.sh`, then `./scripts/otlet-demo.sh` to prove the cont
 | --- | --- |
 | Output reliability hardening | Compare prompt templates and quantizations for each model family under one fixture and gate set |
 | Planner, executor, and cache hardening | Keep SQL plan rows, semantic status views, CustomScan EXPLAIN, receipts, runtime/cache views, and demo output aligned |
-| Model residency and timing | Add pre-load memory admission, pressure metrics, and single-context decoder-batch probes before changing slot policy |
+| Model residency and timing | Keep pre-load admission and pressure evidence passing; test single-context decoder batching before changing slot policy |
 | Persisted cache storage | Add disk-backed cache after a measured workload proves in-process cache misses hurt |
 | Managed Postgres external worker | Build a trusted SQL-bound worker that claims jobs, heartbeats, writes receipts, and fails closed |
 | GPU acceleration | Report device policy, memory accounting, throughput, energy per trusted job, crash behavior, and EXPLAIN-visible device state |
@@ -91,11 +91,11 @@ Preserve cache-hit performance. A live smoke run completed cached jobs in millis
 
 Measure CPU tuning through the SQL path. Current controls cover release builds, native CPU code, OpenMP, a six-thread default cap, per-job `llama_threads`, startup `OTLET_LLAMA_BATCH_TOKENS`, `OTLET_LLAMA_MMAP`, `OTLET_LLAMA_MLOCK`, and `OTLET_LLAMA_FLASH_ATTN`. Add BLAS, KV-cache quantization, context-window policy, or device offload after a probe shows better Otlet pass rate or latency
 
-Add pre-load memory admission. Estimate model, context, KV, prefix-cache, and Postgres headroom before loading a model; reject the load before memory pressure begins. Sample major faults, model-file reads, swap, and cgroup memory pressure around each run and expose supported fields through receipts and runtime status
+Explicit worker budgets now admit a replacement model before tensor allocation. The worker reads llama.cpp metadata without allocating tensors, projects model, KV, and prompt-decode workspace bytes, and compares the total with worker-budget headroom, Linux `MemAvailable`, and finite cgroup-v2 headroom. Current resident model, context, prefix cache, and worker state are already charged in current RSS. Missing required Linux samples fail closed. Receipts, model-swap and rejection events, and runtime status expose the projection, decision, RSS, swap, major faults, model-file reads, PSI, and supported cgroup counters. Budget `0` remains reporting-only
 
 Add host-scoped probes for physical cores versus SMT, NUMA-local versus interleaved placement, and energy where the host exposes counters. Report joules per trusted job with latency, RSS, and database responsiveness
 
-Gate resident-worker parallelism on measured proof. A qwen35_4b probe on the current Docker CPU measured four warm concurrent infer-now callers at `11.22s` with one worker and six threads, `13.02s` with two workers and six threads each, and `11.51s` with two workers and three threads each. Extra workers created overlapping llama.cpp generation, doubled resident model contexts, and failed to beat the one-worker default. Before changing the default, add per-worker RSS totals, model-specific admission caps, queue fairness proof, and database responsiveness checks
+Gate resident-worker parallelism on measured proof. A qwen35_4b probe on the current Docker CPU measured four warm concurrent infer-now callers at `11.22s` with one worker and six threads, `13.02s` with two workers and six threads each, and `11.51s` with two workers and three threads each. Extra workers created overlapping llama.cpp generation, doubled resident model contexts, and failed to beat the one-worker default. Pre-load admission, per-run memory evidence, queue fairness, and worker health now guard the one-worker path. Any later worker-count change must also preserve database responsiveness
 
 Idle expired-job sweeps run at most every 30 seconds. After a productive claim drain, the worker makes the next sweep due so lease reclaim stays prompt under load
 
@@ -115,7 +115,7 @@ The review queue exposes task, subject, decision, confidence, action type, appro
 
 Approval, rejection, correction, and unclear decisions create eval labels without exporting source data. Maintain stable queue views for psql, dashboards, and other clients
 
-Add watch import/export after the in-database contract stops changing
+Watch import and export use the owner-only `otlet.watch.v1` document and the same validation path as `create_watch`
 
 ## Semantic Freshness
 
@@ -161,7 +161,7 @@ Stored sensitive-evidence redaction is installed by default. Assembled prompts s
 
 Role-scoped access is installed by default. `PUBLIC` has no Otlet schema, table, sequence, or function access. Extension-owner grant helpers give caller-managed roles the redacted auditor capability or the bounded action-operator capability
 
-Use admission control for predictable Postgres behavior under model load: per-task budgets, queue fairness, cancellation, worker RSS policy, model unload behavior, and fail-closed semantics under pressure
+Use admission control for predictable Postgres behavior under model load: per-task budgets, pre-load model projection, queue fairness, cancellation, worker RSS policy, model unload behavior, and fail-closed semantics under pressure
 
 ## Managed Postgres Packaging
 

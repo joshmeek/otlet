@@ -739,11 +739,15 @@ SELECT
     ELSE NULL
   END AS model_memory_bytes,
   CASE
+    WHEN jsonb_typeof(trace.summary #> '{memory,after,process_rss_bytes}') = 'number'
+      THEN (trace.summary #>> '{memory,after,process_rss_bytes}')::bigint
     WHEN jsonb_typeof(trace.summary -> 'worker_process_rss_bytes') = 'number'
       THEN (trace.summary ->> 'worker_process_rss_bytes')::bigint
     ELSE NULL
   END AS worker_process_rss_bytes,
   CASE
+    WHEN jsonb_typeof(trace.summary #> '{memory,after,process_virtual_bytes}') = 'number'
+      THEN (trace.summary #>> '{memory,after,process_virtual_bytes}')::bigint
     WHEN jsonb_typeof(trace.summary -> 'worker_process_virtual_bytes') = 'number'
       THEN (trace.summary ->> 'worker_process_virtual_bytes')::bigint
     ELSE NULL
@@ -757,6 +761,75 @@ SELECT
     ELSE NULL
   END AS worker_memory_budget_bytes,
   COALESCE(trace.summary #>> '{memory,worker_memory_budget_policy}', trace.summary ->> 'worker_memory_budget_policy') AS worker_memory_budget_policy,
+  trace.summary -> 'memory' AS memory_evidence,
+  CASE
+    WHEN jsonb_typeof(trace.summary #> '{memory,after,process_swap_bytes}') = 'number'
+      THEN (trace.summary #>> '{memory,after,process_swap_bytes}')::bigint
+    ELSE NULL
+  END AS worker_process_swap_bytes,
+  CASE
+    WHEN jsonb_typeof(trace.summary #> '{memory,after,system_memory_available_bytes}') = 'number'
+      THEN (trace.summary #>> '{memory,after,system_memory_available_bytes}')::bigint
+    ELSE NULL
+  END AS system_memory_available_bytes,
+  CASE
+    WHEN jsonb_typeof(trace.summary #> '{memory,after,system_swap_free_bytes}') = 'number'
+      THEN (trace.summary #>> '{memory,after,system_swap_free_bytes}')::bigint
+    ELSE NULL
+  END AS system_swap_free_bytes,
+  CASE
+    WHEN jsonb_typeof(trace.summary #> '{memory,delta,process_major_faults}') = 'number'
+      THEN (trace.summary #>> '{memory,delta,process_major_faults}')::bigint
+    ELSE NULL
+  END AS worker_major_faults,
+  CASE
+    WHEN jsonb_typeof(trace.summary #> '{memory,delta,process_read_bytes}') = 'number'
+      THEN (trace.summary #>> '{memory,delta,process_read_bytes}')::bigint
+    ELSE NULL
+  END AS worker_read_bytes,
+  CASE
+    WHEN jsonb_typeof(trace.summary #> '{memory,delta,memory_pressure_some_total_us}') = 'number'
+      THEN (trace.summary #>> '{memory,delta,memory_pressure_some_total_us}')::bigint
+    ELSE NULL
+  END AS memory_pressure_some_us,
+  CASE
+    WHEN jsonb_typeof(trace.summary #> '{memory,delta,memory_pressure_full_total_us}') = 'number'
+      THEN (trace.summary #>> '{memory,delta,memory_pressure_full_total_us}')::bigint
+    ELSE NULL
+  END AS memory_pressure_full_us,
+  CASE
+    WHEN jsonb_typeof(trace.summary #> '{memory,after,cgroup_memory_current_bytes}') = 'number'
+      THEN (trace.summary #>> '{memory,after,cgroup_memory_current_bytes}')::bigint
+    ELSE NULL
+  END AS cgroup_memory_current_bytes,
+  CASE
+    WHEN jsonb_typeof(trace.summary #> '{memory,after,cgroup_memory_max_bytes}') = 'number'
+      THEN (trace.summary #>> '{memory,after,cgroup_memory_max_bytes}')::bigint
+    ELSE NULL
+  END AS cgroup_memory_max_bytes,
+  CASE
+    WHEN jsonb_typeof(trace.summary #> '{memory,delta,cgroup_memory_high_events}') = 'number'
+      THEN (trace.summary #>> '{memory,delta,cgroup_memory_high_events}')::bigint
+    ELSE NULL
+  END AS cgroup_memory_high_events,
+  CASE
+    WHEN jsonb_typeof(trace.summary #> '{memory,delta,cgroup_memory_oom_events}') = 'number'
+      THEN (trace.summary #>> '{memory,delta,cgroup_memory_oom_events}')::bigint
+    ELSE NULL
+  END AS cgroup_memory_oom_events,
+  CASE
+    WHEN jsonb_typeof(trace.summary #> '{memory,delta,cgroup_memory_oom_kill_events}') = 'number'
+      THEN (trace.summary #>> '{memory,delta,cgroup_memory_oom_kill_events}')::bigint
+    ELSE NULL
+  END AS cgroup_memory_oom_kill_events,
+  trace.summary #>> '{memory,admission,decision}' AS model_load_admission_decision,
+  trace.summary #>> '{memory,admission,reason}' AS model_load_admission_reason,
+  trace.summary #>> '{memory,admission,policy}' AS model_load_admission_policy,
+  CASE
+    WHEN jsonb_typeof(trace.summary #> '{memory,admission,allowed_additional_bytes}') = 'number'
+      THEN (trace.summary #>> '{memory,admission,allowed_additional_bytes}')::bigint
+    ELSE NULL
+  END AS model_load_allowed_additional_bytes,
   COALESCE(trace.summary ->> 'model_cache_hit', 'false')::boolean AS model_cache_hit,
   COALESCE(trace.summary ->> 'inference_cache_hit', 'false')::boolean AS inference_cache_hit,
   COALESCE(trace.summary #>> '{cache,key_basis}', trace.summary ->> 'inference_cache_key_basis') AS inference_cache_key_basis,

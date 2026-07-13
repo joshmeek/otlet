@@ -18,7 +18,7 @@ for term in \
   "|true|" \
   "|true|true|" \
   "|none|" \
-  "linux_proc_self_status_vmrss_vmsize_sampled_after_worker_run"; do
+  "linux_proc_self_and_optional_cgroup_v2_memory_pressure_v1"; do
   require_contains "$runtime_contract" "$term" "Expected runtime status to contain $term"
 done
 

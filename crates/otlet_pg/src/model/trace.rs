@@ -73,13 +73,7 @@ fn generation_trace_summary(
             "eviction_reason": metrics.inference_cache_eviction_reason,
             "invalidation_reason": metrics.inference_cache_invalidation_reason
         },
-        "memory": {
-            "model_device_policy": metrics.model_device_policy,
-            "memory_accounting_policy": metrics.memory_accounting_policy,
-            "worker_memory_sample_policy": metrics.worker_memory_sample_policy,
-            "worker_memory_budget_bytes": metrics.worker_memory_budget_bytes,
-            "worker_memory_budget_policy": metrics.worker_memory_budget_policy
-        },
+        "memory": metrics.memory_trace,
         "input_shaping": {
             "shaped_input_bytes": context.shaped_input_bytes,
             "original_shaped_input_bytes": context.original_shaped_input_bytes,

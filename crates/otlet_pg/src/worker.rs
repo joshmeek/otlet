@@ -1148,6 +1148,14 @@ fn fail_attempt_with_model(
     selection_reason: &str,
 ) -> bool {
     let metrics = err.metrics.as_ref().map(|m| m.as_ref());
+    let rejected_memory = err.trace_summary.as_ref().and_then(|trace| {
+        (trace
+            .pointer("/memory/admission/decision")
+            .and_then(Value::as_str)
+            == Some("rejected"))
+        .then(|| trace.get("memory").cloned())
+        .flatten()
+    });
     if let Some(metrics) = metrics {
         // Metrics are best effort and must not roll back terminal job state
         record_metrics(job, model_name, metrics);
@@ -1175,6 +1183,19 @@ fn fail_attempt_with_model(
                 Some(1),
                 &args,
             )?;
+            if let Some(memory) = &rejected_memory {
+                let event_args = [
+                    job.id.into(),
+                    job.task_name.as_str().into(),
+                    model_name.into(),
+                    JsonB(memory.clone()).into(),
+                ];
+                client.update(
+                    "SELECT otlet.record_worker_event('model_admission_rejected', $1, 'linked_inproc', 'model load rejected before tensor allocation', jsonb_build_object('task_name', $2, 'model_name', $3, 'memory', $4))",
+                    Some(1),
+                    &event_args,
+                )?;
+            }
             Ok(())
         })
     });
@@ -1237,9 +1258,10 @@ fn record_metrics(job: &Job, model_name: &str, metrics: &ModelMetrics) {
                     metrics.model_memory_bytes.into(),
                     metrics.worker_process_rss_bytes.into(),
                     metrics.worker_memory_budget_bytes.into(),
+                    JsonB(metrics.memory_trace.clone()).into(),
                 ];
                 client.update(
-                    "SELECT otlet.record_worker_event('model_swap', $1, $2, 'model residency changed', jsonb_build_object('task_name', $3, 'model_name', $4, 'artifact_path', $5, 'load_ms', $6, 'model_memory_bytes', $7, 'worker_process_rss_bytes', $8, 'worker_memory_budget_bytes', $9))",
+                    "SELECT otlet.record_worker_event('model_swap', $1, $2, 'model residency changed', jsonb_build_object('task_name', $3, 'model_name', $4, 'artifact_path', $5, 'load_ms', $6, 'model_memory_bytes', $7, 'worker_process_rss_bytes', $8, 'worker_memory_budget_bytes', $9, 'memory', $10))",
                     Some(1),
                     &event_args,
                 )?;

@@ -44,6 +44,23 @@ SELECT
   s.worker_process_rss_bytes,
   s.worker_process_virtual_bytes,
   s.worker_memory_sample_policy,
+  fingerprint.memory_evidence,
+  fingerprint.worker_process_swap_bytes,
+  fingerprint.system_memory_available_bytes,
+  fingerprint.system_swap_free_bytes,
+  fingerprint.worker_major_faults,
+  fingerprint.worker_read_bytes,
+  fingerprint.memory_pressure_some_us,
+  fingerprint.memory_pressure_full_us,
+  fingerprint.cgroup_memory_current_bytes,
+  fingerprint.cgroup_memory_max_bytes,
+  fingerprint.cgroup_memory_high_events,
+  fingerprint.cgroup_memory_oom_events,
+  fingerprint.cgroup_memory_oom_kill_events,
+  fingerprint.model_load_admission_decision,
+  fingerprint.model_load_admission_reason,
+  fingerprint.model_load_admission_policy,
+  fingerprint.model_load_allowed_additional_bytes,
   s.jobs_completed,
   s.failures,
   s.cache_hits,
@@ -82,18 +99,35 @@ LEFT JOIN infer_state infer ON true
 LEFT JOIN worker_state ON true
 LEFT JOIN LATERAL (
   SELECT
-    r.trace_summary ->> 'runtime_fingerprint_version' AS runtime_fingerprint_version,
-    r.trace_summary ->> 'runtime_fingerprint_hash' AS runtime_fingerprint_hash,
-    r.trace_summary ->> 'runtime_output_contract_hash' AS runtime_output_contract_hash,
-    r.trace_summary -> 'runtime_fingerprint' AS runtime_fingerprint
-  FROM otlet.inference_receipts r
+    r.runtime_fingerprint_version,
+    r.runtime_fingerprint_hash,
+    r.runtime_output_contract_hash,
+    r.runtime_fingerprint,
+    r.memory_evidence,
+    r.worker_process_swap_bytes,
+    r.system_memory_available_bytes,
+    r.system_swap_free_bytes,
+    r.worker_major_faults,
+    r.worker_read_bytes,
+    r.memory_pressure_some_us,
+    r.memory_pressure_full_us,
+    r.cgroup_memory_current_bytes,
+    r.cgroup_memory_max_bytes,
+    r.cgroup_memory_high_events,
+    r.cgroup_memory_oom_events,
+    r.cgroup_memory_oom_kill_events,
+    r.model_load_admission_decision,
+    r.model_load_admission_reason,
+    r.model_load_admission_policy,
+    r.model_load_allowed_additional_bytes
+  FROM otlet.inference_receipt_trace_status r
   WHERE r.model_name = m.name
     AND r.runtime_name = 'linked_inproc'
     AND r.status = 'complete'
     AND r.schema_validation_status = 'passed'
     AND COALESCE(r.generate_ms, 0) > 0
-    AND r.trace_summary ->> 'runtime_fingerprint_hash' <> ''
-  ORDER BY r.finished_at DESC, r.id DESC
+    AND r.runtime_fingerprint_hash <> ''
+  ORDER BY r.receipt_finished_at DESC, r.receipt_id DESC
   LIMIT 1
 ) fingerprint ON true
 LEFT JOIN LATERAL (

@@ -219,9 +219,10 @@ semantic_join_stale_contract=4|0|fresh_after_lookup=0|receipts=8|8
 receipt_trace_contract=8|8|8|8
 inference_visibility_status=true|true|true|true|true
 direct_ask_runtime_fingerprint_contract=otlet_runtime_fingerprint_v1|true|true|Q4_K_M|otlet_raw_json_worker_v1|94a220cd6|512|8217751552
-runtime_status_contract=ready|ready|55.17|true|true|true|none|linux_proc_self_status_vmrss_vmsize_sampled_after_worker_run
-planner_1m_contract=estimated|1000000|4.404|true
-performance_ratio_contract=38|47|1.237|15948|419.684
+preload_admission_contract=failed|model_load_admission_rejected|rejected|true|true|true|true|0|true|true|true|true
+runtime_status_contract=ready|ready|40.97|true|true|true|none|linux_proc_self_and_optional_cgroup_v2_memory_pressure_v1
+planner_1m_contract=estimated|1000000|4.305|true
+performance_ratio_contract=40|50|1.250|16550|413.750
 materialization_failure_status_contract=true|true
 invariant_contract=0
 docker_crash_log_scan=ok
@@ -229,7 +230,7 @@ docker_crash_log_scan=ok
 
 Check these fields in each path: source row identity, job, receipt, output, action, materialization, freshness, and status
 
-The candidate contracts show that removal and identical restoration queue no work. Changed candidate content queues one refresh and stays outside fresh lookup until that work completes
+The candidate contracts show that removal and identical restoration queue no work. Changed candidate content queues one refresh and stays outside fresh lookup until that work completes. The pre-load contract shows that an explicit memory budget can reject a replacement model before tensor allocation while preserving the current resident model and worker
 
 ## Detailed Walkthroughs
 

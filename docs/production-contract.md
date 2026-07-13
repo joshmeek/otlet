@@ -26,7 +26,7 @@ The five booleans confirm receipts, numeric token steps, numeric top-k alternati
 
 ## Step 2 - Inspect Runtime Status After Demo Runs
 
-Runtime status shows the resident model slot, cache bounds, memory samples, and last run metrics
+Runtime status shows the resident model slot, cache bounds, memory samples, pressure, and last run metrics
 
 ```sql
 SELECT runtime_status || '|' ||
@@ -45,10 +45,10 @@ LIMIT 1;
 Representative output from the demo run:
 
 ```text
-runtime_status_contract=ready|ready|55.17|true|true|true|none|linux_proc_self_status_vmrss_vmsize_sampled_after_worker_run
+runtime_status_contract=ready|ready|40.97|true|true|true|none|linux_proc_self_and_optional_cgroup_v2_memory_pressure_v1
 ```
 
-The value reports a ready runtime, a ready model slot, bounded cache entries and byte caps, no recent eviction, and Linux process-status memory sampling after a worker run
+The value reports a ready runtime, a ready model slot, bounded cache entries and byte caps, no recent eviction, and Linux process, system, PSI, and optional cgroup-v2 memory sampling around a worker run. Token rates vary with host state
 
 The latest detailed receipt also binds runtime status to the same versioned fingerprint and output-affecting cache contract:
 
@@ -61,6 +61,28 @@ FROM otlet.runtime_status
 WHERE model_name = 'qwen35_4b';
 ```
 
+The receipt view exposes the full `memory_evidence` document and typed columns for RSS, swap, available memory, major faults, file reads, pressure totals, cgroup events, and model-load admission. A nonzero `max_worker_rss_bytes` budget checks a replacement before tensor allocation:
+
+```sql
+SELECT j.status,
+       s.stop_reason,
+       s.model_load_admission_decision,
+       s.model_load_admission_reason,
+       s.model_load_allowed_additional_bytes,
+       s.memory_evidence #>> '{admission,projected_total_bytes}' AS projected_total_bytes
+FROM otlet.inference_receipt_trace_status s
+JOIN otlet.jobs j ON j.id = s.job_id
+WHERE s.task_name = 'preload_admission_demo'
+ORDER BY s.receipt_id DESC
+LIMIT 1;
+```
+
+The demo first makes the smaller model resident, then asks for the larger model with a budget above current RSS but below the projected load. Rejection creates a receipt and `model_admission_rejected` event without a model swap, worker restart, or loss of the resident model:
+
+```text
+preload_admission_contract=failed|model_load_admission_rejected|rejected|true|true|true|true|0|true|true|true|true
+```
+
 ## Step 3 - Inspect Production Policy
 
 The production policy row and status views expose SQL state under `otlet`: `production_policy_status`, `production_status`, `model_queue_status`, `worker_throughput_status`, and `cleanup_policy_state(true)`
@@ -69,7 +91,7 @@ Queue caps are admission-time controls. Rows enter `otlet.jobs` through `run_tas
 
 Claimed jobs use `otlet.effective_job_lease_interval(...)`, which covers the task attempt timeout plus 30 seconds of completion grace. Workers call `otlet.renew_job_lease(job_id, expected_attempt)` before each direct, cheap, or strong model attempt. The expected attempt is a fence: a stale worker cannot renew a job after another worker has reclaimed it. `model_selection_policy_status.effective_job_lease_interval` exposes the derived interval
 
-Otlet debounces suppressed queue-admission events per task and reason for one minute, so a full queue stays visible without flooding `worker_events`. `production_status` exposes `semantic_materialization_failed_events` and `semantic_materialization_last_failed_at`. Nonzero `max_worker_rss_bytes` budgets require Linux process-status RSS sampling; runtime-option validation rejects unsupported builds before queue execution. Cleanup can prune old failed or canceled jobs after outputs, actions, eval labels, and receipts no longer reference them
+Otlet debounces suppressed queue-admission events per task and reason for one minute, so a full queue stays visible without flooding `worker_events`. `production_status` exposes `semantic_materialization_failed_events` and `semantic_materialization_last_failed_at`. Nonzero `max_worker_rss_bytes` budgets require Linux RSS, total-memory, and available-memory samples. A cache miss also requires artifact metadata and a no-allocation llama.cpp projection; missing evidence or insufficient headroom rejects the load before tensor allocation. Cleanup can prune old failed or canceled jobs after outputs, actions, eval labels, and receipts no longer reference them
 
 The resident worker attaches to the `postgres` database. Supporting worker registration across multiple databases requires separate shared-memory and latch routing
 

@@ -34,7 +34,7 @@ pub(crate) struct ModelMetrics {
     pub(crate) worker_process_virtual_bytes: i64,
     pub(crate) worker_memory_sample_policy: &'static str,
     pub(crate) worker_memory_budget_bytes: i64,
-    pub(crate) worker_memory_budget_policy: &'static str,
+    pub(crate) memory_trace: Value,
     pub(crate) prompt_tokens: i64,
     pub(crate) prompt_cached_tokens_before: i64,
     pub(crate) prompt_reused_tokens: i64,
@@ -153,6 +153,13 @@ impl ModelError {
 
     fn with_metrics(mut self, metrics: ModelMetrics) -> Self {
         self.metrics = Some(Box::new(metrics));
+        self
+    }
+
+    fn with_memory_trace(mut self, memory_trace: Value) -> Self {
+        if let Some(Value::Object(trace)) = &mut self.trace_summary {
+            trace.insert("memory".to_owned(), memory_trace);
+        }
         self
     }
 }
@@ -319,19 +326,27 @@ fn run_job_with_model_ref(job: &Job, model: JobModelRef<'_>) -> Result<ModelRun,
             input_truncated,
             ..cache_probe
         };
-        // Cache hits skip /proc sampling unless an RSS budget is configured.
-        // Generation path still enforces the budget before decode.
         let worker_memory = if options.max_worker_rss_bytes > 0 {
             let sample = process_memory_sample();
             enforce_worker_rss_budget(&sample, options.max_worker_rss_bytes)?;
             sample
         } else {
             ProcessMemorySample {
-                rss_bytes: 0,
-                virtual_bytes: 0,
                 policy: "skipped_on_inference_cache_hit_no_rss_budget",
+                ..ProcessMemorySample::default()
             }
         };
+        let memory_admission = ModelLoadAdmission::not_required(
+            "inference_cache_hit",
+            options.max_worker_rss_bytes,
+            &worker_memory,
+        );
+        let memory_trace = build_memory_trace(
+            &worker_memory,
+            &worker_memory,
+            &memory_admission,
+            options.max_worker_rss_bytes,
+        );
         (
             RawOutput::Cached(raw_output),
             ModelMetrics {
@@ -347,9 +362,7 @@ fn run_job_with_model_ref(job: &Job, model: JobModelRef<'_>) -> Result<ModelRun,
                 worker_process_virtual_bytes: worker_memory.virtual_bytes,
                 worker_memory_sample_policy: worker_memory.policy,
                 worker_memory_budget_bytes: u64_to_i64_saturating(options.max_worker_rss_bytes),
-                worker_memory_budget_policy: worker_memory_budget_policy(
-                    options.max_worker_rss_bytes,
-                ),
+                memory_trace,
                 prompt_tokens: 0,
                 prompt_cached_tokens_before: 0,
                 prompt_reused_tokens: 0,

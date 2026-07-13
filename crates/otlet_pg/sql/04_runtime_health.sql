@@ -130,7 +130,7 @@ AS $$
     COALESCE($18, 'llama_model_size_measured_context_window_measured_inference_cache_bytes_measured_no_prompt_token_blob_storage'),
     GREATEST($19, 0),
     GREATEST($20, 0),
-    COALESCE($21, 'linux_proc_self_status_vmrss_vmsize_sampled_after_worker_run'),
+    COALESCE($21, 'linux_proc_self_and_optional_cgroup_v2_memory_pressure_v1'),
     1,
     CASE WHEN NOT $9 AND $8 THEN 1 ELSE 0 END,
     CASE WHEN NOT $9 AND NOT $8 THEN 1 ELSE 0 END,

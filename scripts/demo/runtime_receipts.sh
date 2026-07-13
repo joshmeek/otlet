@@ -185,6 +185,98 @@ echo "rss_budget_worker_contract=$rss_budget_contract"
   exit 1
 }
 
+preload_admission_task="preload_admission_demo"
+cleanup_task "$preload_admission_task"
+preload_instruction='Return one JSON object only with top-level output and actions. output has one key ok set to true. actions is an empty array. No markdown.'
+preload_schema='{"type":"object","required":["ok"],"additionalProperties":false,"properties":{"ok":{"type":"boolean"}}}'
+psql_exec -qAt \
+  -v model_name="$cheap_model_name" \
+  -v instruction="$preload_instruction" \
+  -v output_schema="$preload_schema" >/dev/null <<'SQL'
+SELECT output FROM otlet.ask(
+  :'model_name',
+  :'instruction',
+  '{}'::jsonb,
+  :'output_schema'::jsonb,
+  '{"max_tokens":32,"reasoning":"off","inference_cache":false}'::jsonb,
+  30000
+);
+SQL
+preload_worker_pid_before="$(psql_exec -qAt -c "SELECT pid FROM pg_stat_activity WHERE backend_type = 'otlet worker' LIMIT 1;")"
+preload_swaps_before="$(psql_exec -qAt -c "SELECT count(*) FROM otlet.worker_events WHERE event_type = 'model_swap';")"
+psql_exec \
+  -v task_name="$preload_admission_task" \
+  -v model_name="$strong_model_name" \
+  -v instruction="$preload_instruction" \
+  -v output_schema="$preload_schema" >/dev/null <<'SQL'
+SELECT otlet.create_task(
+  :'task_name',
+  $source$
+    SELECT 'preload-admission-1'::text AS subject_id, '{}'::jsonb AS input
+  $source$::text,
+  :'instruction',
+  :'output_schema'::jsonb,
+  :'model_name',
+  '{"max_tokens":32,"reasoning":"off","inference_cache":false,"max_worker_rss_bytes":7200000000}'::jsonb
+);
+SELECT otlet.run_task(:'task_name');
+SQL
+wait_task_failed "$preload_admission_task" 1 240 1
+preload_admission_contract="$(psql_exec -qAt \
+  -v task_name="$preload_admission_task" <<'SQL'
+WITH evidence AS (
+  SELECT s.*, j.status AS job_status
+  FROM otlet.inference_receipt_trace_status s
+  JOIN otlet.jobs j ON j.id = s.job_id
+  WHERE s.task_name = :'task_name'
+  ORDER BY s.receipt_id DESC
+  LIMIT 1
+)
+SELECT job_status || '|' ||
+       COALESCE(stop_reason, '') || '|' ||
+       COALESCE(model_load_admission_decision, '') || '|' ||
+       (model_load_admission_reason = 'llama_projected_model_kv_batch_exceeds_headroom')::text || '|' ||
+       (model_load_allowed_additional_bytes < jsonb_extract_path_text(memory_evidence, 'admission', 'projected_total_bytes')::bigint)::text || '|' ||
+       (worker_process_rss_bytes > 0)::text || '|' ||
+       (system_memory_available_bytes > 0)::text || '|' ||
+       (SELECT count(*) FROM otlet.outputs WHERE job_id = evidence.job_id)::text
+FROM evidence;
+SQL
+)"
+preload_rejection_event="$(psql_exec -qAt \
+  -v task_name="$preload_admission_task" <<'SQL'
+SELECT (count(*) = 1)::text
+FROM otlet.worker_events e
+JOIN otlet.jobs j ON j.id = e.job_id
+WHERE j.task_name = :'task_name'
+  AND e.event_type = 'model_admission_rejected';
+SQL
+)"
+preload_resident_reuse="$(psql_exec -qAt \
+  -v model_name="$cheap_model_name" \
+  -v instruction="$preload_instruction" \
+  -v output_schema="$preload_schema" <<'SQL'
+SELECT output ->> 'ok' FROM otlet.ask(
+  :'model_name',
+  :'instruction',
+  '{}'::jsonb,
+  :'output_schema'::jsonb,
+  '{"max_tokens":32,"reasoning":"off","inference_cache":false}'::jsonb,
+  30000
+);
+SQL
+)"
+preload_worker_pid_after="$(psql_exec -qAt -c "SELECT pid FROM pg_stat_activity WHERE backend_type = 'otlet worker' LIMIT 1;")"
+preload_swaps_after="$(psql_exec -qAt -c "SELECT count(*) FROM otlet.worker_events WHERE event_type = 'model_swap';")"
+preload_pid_preserved="$([ "$preload_worker_pid_before" = "$preload_worker_pid_after" ] && echo true || echo false)"
+preload_swap_preserved="$([ "$preload_swaps_before" = "$preload_swaps_after" ] && echo true || echo false)"
+preload_admission_contract="$preload_admission_contract|$preload_rejection_event|$preload_resident_reuse|$preload_pid_preserved|$preload_swap_preserved"
+echo "preload_admission_contract=$preload_admission_contract"
+[ "$preload_admission_contract" = "failed|model_load_admission_rejected|rejected|true|true|true|true|0|true|true|true|true" ] || {
+  echo "Expected pre-load rejection to preserve the resident model and worker, got $preload_admission_contract" >&2
+  exit 1
+}
+
 oversized_prompt_task="oversized_prompt_worker_demo"
 cleanup_task "$oversized_prompt_task"
 psql_exec -v task_name="$oversized_prompt_task" -v model_name="$strong_model_name" >/dev/null <<'SQL'

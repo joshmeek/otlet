@@ -59,7 +59,7 @@ FROM otlet.ask(
 (1 row)
 ```
 
-Otlet ran the local model inside Postgres, validated the JSON, and stored the receipt under the `otlet` schema. The assembled prompt stayed in worker memory. The receipt stores prompt, input, schema, raw-output, and runtime-fingerprint hashes without storing prompt or raw model text under the default policy
+Otlet ran the local model inside Postgres, validated the JSON, and stored the receipt under the `otlet` schema. The assembled prompt stayed in worker memory. The receipt stores prompt, input, schema, raw-output, and runtime-fingerprint hashes without storing prompt or raw model text under the default policy. Receipts and runtime status also report worker memory, swap, major faults, file reads, pressure, and explicit-budget model-load admission
 
 ## Longer Example
 
