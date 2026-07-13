@@ -30,7 +30,7 @@ Run `./scripts/otlet-setup.sh`, then `./scripts/otlet-demo.sh` to prove the cont
 | --- | --- | --- | --- |
 | 1 | Packaging and security | Active hardening | Maintain a small setup and demo; add release packaging proof |
 | 2 | Output reliability and benchmark truth | Measured default | Maintain the raw `/no_think` Q4_K_M path and existing fast/full gates |
-| 3 | Planner, executor, and cache | Active hardening | Measure persisted-cache need, then close Access Method and fork evidence |
+| 3 | Planner, executor, and cache | Active hardening | Close Access Method and fork evidence |
 | 4 | Semantic freshness | Implemented contract | Maintain row, pair, delete, candidate, and schema-drift freshness gates |
 | 5 | Action safety | Implemented contract | Maintain the one-table, one-key, one-row `update_row` boundary |
 | 6 | Managed Postgres packaging | Open | Test native workers where providers allow them and a SQL-bound agent where providers block them |
@@ -43,7 +43,6 @@ Run `./scripts/otlet-setup.sh`, then `./scripts/otlet-demo.sh` to prove the cont
 | --- | --- |
 | Planner, executor, and cache hardening | Keep SQL plan rows, semantic status views, CustomScan EXPLAIN, receipts, runtime/cache views, and demo output aligned |
 | Model residency and timing | Measured one-model, one-context default on the current 8 GB runtime |
-| Persisted cache storage | Add disk-backed cache after a measured workload proves in-process cache misses hurt |
 | Managed Postgres external worker | Build a trusted SQL-bound worker that claims jobs, heartbeats, writes receipts, and fails closed |
 | GPU acceleration | Report device policy, memory accounting, throughput, energy per trusted job, crash behavior, and EXPLAIN-visible device state |
 | Core limits research | Test Access Method and fork paths when CustomScan cannot expose a required contract |
@@ -77,7 +76,7 @@ Use one decision vocabulary for semantic lookup, queue refresh, wait, fail-close
 
 `EXPLAIN (ANALYZE, VERBOSE)` shows selected model, resident state, source identity, source hash, stale policy, cache decision, worker handoff, token counts, schema validation, trace policy, receipt IDs, provenance links, estimated model time, and model runtime
 
-Treat cache behavior as part of the runtime contract. Cache keys, invalidation reasons, hit and miss counters, size bounds, EXPLAIN output, runtime status, and benchmark gates must agree. Add persisted cache storage after a measured workload proves the bounded in-process cache misses hurt
+Treat cache behavior as part of the runtime contract. Cache keys, invalidation reasons, hit and miss counters, size bounds, EXPLAIN output, runtime status, and benchmark gates must agree. The fresh demo reached three entries and 880 bytes with one hit and zero evictions. A stable qwen35 probe reduced an exact warm repeat from seconds to about half a second, but a restart discarded the entry. No installed workload showed eviction pressure or repeated restart misses, and the full benchmark disables caching for live-generation truth. Persisting exact raw envelopes would also cross the default hash-only evidence boundary, so Otlet keeps the bounded process-local cache
 
 Use measured runtime history for costing: load time, warm generation time, token counts, schema failures, cache hits, cache invalidation reasons, stale refresh rate, worker queue depth, model-selection attempts, and materialization coverage. Postgres chooses the cheap fresh lookup path when it can and shows the reason when it cannot
 

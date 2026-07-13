@@ -138,6 +138,8 @@ LIMIT 1;
 
 The inference-output cache stores schema-valid raw model output before Otlet applies selection trust. Accepted abstentions and rejected-but-valid attempts may reuse cached bytes; invalid JSON/schema failures stay out of the cache. The receipt still records accepted/rejected/failed status, and the cache key basis is content hash + contract hash + runtime output-contract hash + model fingerprint
 
+The cache is process-local, bounded at 512 entries and 8 MiB, and intentionally not persisted. The fresh demo and a stable restart probe showed no eviction pressure or repeated restart misses. Persisting exact raw envelopes would cross the default hash-only stored-evidence boundary, while parsed trusted output already survives through outputs and semantic materializations
+
 ```sql
 SELECT task_name,
        cache_enabled_receipts,

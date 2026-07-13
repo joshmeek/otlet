@@ -106,6 +106,14 @@ A two-entry cache does not fit this runtime. Cold worker RSS was `27.2 MB`; the 
 
 One-client `SELECT 1` load during the alternating probe completed `1,072,092` transactions with zero failures at `45us` p50, `132us` p95, and `38.448ms` max. The installed GGUFs have no expert or MTP heads, and no compatible draft model is installed. The pinned crate exposes MTP bindings, but its smallest real caller fails to link on unresolved `common_speculative_*` symbols. Otlet keeps one resident context and treats multi-residency, speculative decoding, and expert streaming as new experiments only when the measured memory envelope and installed artifacts change
 
+### Persisted inference-cache decision
+
+The process-local inference-output cache remains the complete cache contract. The fresh demo produced 13 cache-enabled attempts, one hit, 12 misses, a three-entry and 880-byte high-water mark, and zero evictions. A later research sequence reached 13 entries and 2,941 bytes without eviction. The 512-entry cap would use about 116 KiB at that observed average, far below the 8 MiB byte cap
+
+One stable qwen35 row measured a `9.452s` enabled miss, a `0.503s` exact hit, a `3.189s` cache-disabled warm run, and a `15.310s` miss after restart. Every run produced the same schema-valid raw-output and runtime-contract hashes. A second cold miss under one-client `SELECT 1` load completed while 444,899 database transactions ran with zero failures at `47us` p50 and `100us` p95
+
+No installed workload records eviction followed by a repeated-identity miss, and the 447-job full benchmark disables inference caching to measure live generation. A durable cache would persist exact raw envelopes despite the default hash-only evidence policy and duplicate trusted state already kept in outputs and semantic materializations. Otlet therefore adds no disk cache
+
 Run the default-included benchmark model:
 
 ```sh
