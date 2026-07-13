@@ -421,7 +421,11 @@ fn psi_total_us(contents: &str, kind: &str) -> Option<i64> {
 fn cgroup_v2_relative(cgroup: &str) -> Option<&str> {
     cgroup.lines().find_map(|line| {
         let mut parts = line.splitn(3, ':');
-        (parts.next()? == "0" && parts.next()? == "").then(|| parts.next()).flatten()
+        if parts.next()? == "0" && parts.next()?.is_empty() {
+            parts.next()
+        } else {
+            None
+        }
     })
 }
 
