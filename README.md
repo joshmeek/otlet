@@ -2,13 +2,11 @@
 
 Otlet is a Postgres extension for row judgment. It runs local LLM inference **inside Postgres**, next to the rows it reads and acts on
 
-Otlet answers questions about rows, validates JSON, keeps receipts, and stores trusted derived state. Entity resolution is the first full path: Otlet judges hard candidate row pairs, escalates from a small local model to a stronger one, proposes typed actions, and materializes results for later SQL
+Otlet sends selected rows to a local model and stores schema-validated answers with receipts. Entity resolution is the first full path: SQL selects hard candidate pairs, Otlet judges them, and Postgres materializes the results for later queries
 
 For explicit source writes, an owner can register one ordinary table, its single-column primary key, and a fixed list of writable columns. The model can then propose one typed `update_row`; Otlet dry-runs it, requires approval, rechecks the row, writes once, and records hashed execution evidence
 
-Otlet uses a `pgrx` extension and a Postgres background worker loaded through `shared_preload_libraries` to run local model work inside the database process. You can ask for model work from SQL, queue it from rows, refresh semantic state after source changes, and inspect the result without leaving Postgres
-
-Linked llama.cpp stops after one balanced JSON object. Otlet then requires the fixed `output` plus `actions` envelope, applies the task JSON Schema and action rules, and stores only trusted state
+A `pgrx` background worker loaded through `shared_preload_libraries` runs linked llama.cpp inside Postgres and keeps the model resident. Linked llama.cpp stops after one balanced JSON object; Otlet requires the fixed `output` plus `actions` envelope before it stores trusted state
 
 ## Quick Example
 
@@ -59,7 +57,7 @@ FROM otlet.ask(
 (1 row)
 ```
 
-Otlet ran the local model inside Postgres, validated the JSON, and stored the receipt under the `otlet` schema. The assembled prompt stayed in worker memory. The receipt stores prompt, input, schema, raw-output, and runtime-fingerprint hashes without storing prompt or raw model text under the default policy. Receipts and runtime status also report worker memory, swap, major faults, file reads, pressure, and explicit-budget model-load admission
+Otlet ran the local model inside Postgres, validated the JSON, and stored the receipt under `otlet`. The prompt stayed in worker memory. The default receipt keeps hashes, structured output, and model-load evidence without storing prompt or raw model text
 
 ## Longer Example
 

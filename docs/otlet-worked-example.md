@@ -57,7 +57,7 @@ Postgres now runs the Otlet worker with both local GGUF artifacts visible inside
 
 ## Step 2 - Inspect The Source Pairs
 
-The source rows stay in `public`. Otlet receives only compact pair-shaped input:
+The source rows stay in `public`. Otlet receives compact pair-shaped input:
 
 ```sql
 SELECT p.pair_id, r.legal_name AS right_name,
@@ -199,7 +199,7 @@ bounded_execution_contract=approved|bounded apply|1|DO_NOT_TOUCH_SENTINEL|pendin
 permission_contract=public=0/0/0|auditor=8/3|operator=8/9|definer=8/8|positive=7|denied=48
 ```
 
-Only `row-1` changes through Otlet. Its allowed state, reason, and priority columns change once; its protected sentinel remains. `row-3` stays unchanged. The two replay receipts affect zero rows, and the two rejected apply attempts affect zero rows
+Otlet changes `row-1` once and preserves its protected sentinel. `row-3` stays unchanged. The two replay receipts affect zero rows, and the two rejected apply attempts affect zero rows
 
 ## Step 7 - Check Semantic And Production Paths
 
@@ -220,7 +220,9 @@ receipt_trace_contract=8|8|8|8
 inference_visibility_status=true|true|true|true|true
 direct_ask_runtime_fingerprint_contract=otlet_runtime_fingerprint_v1|true|true|Q4_K_M|otlet_raw_json_worker_v1|94a220cd6|512|8217751552
 preload_admission_contract=failed|model_load_admission_rejected|rejected|true|true|true|true|0|true|true|true|true
+requester_timeout_contract=canceled|true|canceled|canceled|0|0|true|true|true|1|ready|ready
 runtime_status_contract=ready|ready|40.97|true|true|true|none|linux_proc_self_and_optional_cgroup_v2_memory_pressure_v1
+redaction_status_contract=redacted|0|0|0|0|0|true
 planner_1m_contract=estimated|1000000|4.305|true
 performance_ratio_contract=40|50|1.250|16550|413.750
 materialization_failure_status_contract=true|true
@@ -230,7 +232,7 @@ docker_crash_log_scan=ok
 
 Check these fields in each path: source row identity, job, receipt, output, action, materialization, freshness, and status
 
-The candidate contracts show that removal and identical restoration queue no work. Changed candidate content queues one refresh and stays outside fresh lookup until that work completes. The pre-load contract shows that an explicit memory budget can reject a replacement model before tensor allocation while preserving the current resident model and worker
+The candidate contracts show that removal and identical restoration queue no work. Changed candidate content queues one refresh and stays outside fresh lookup until that work completes. The pre-load and timeout contracts preserve the current worker without accepting unsafe or late output. The redaction contract confirms that production storage contains no raw model or token text
 
 ## Detailed Walkthroughs
 

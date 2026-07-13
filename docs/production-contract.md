@@ -248,7 +248,7 @@ The six operator functions run as the extension owner with `search_path` fixed t
 
 An action target must be an ordinary non-partitioned table without RLS, use one primary-key column, and list each writable non-key column. Otlet revalidates that contract during dry run and apply
 
-Raw targets, execution receipts, outputs, source evidence, trace summaries, token traces, worker functions, model registration, watch administration, cleanup, and the grant helpers stay owner-only. Auditors see execution mode, status, hashes, changed-column names, affected-row count, and replay linkage through `otlet.audit_action_execution_export`, never target row values
+Raw targets, execution receipts, outputs, source evidence, trace summaries, token traces, worker functions, model registration, watch administration, cleanup, and the grant helpers stay owner-only. Auditors see execution mode, status, hashes, changed-column names, affected-row count, and replay linkage through `otlet.audit_action_execution_export`. They do not see target row values
 
 Check the installed policy:
 

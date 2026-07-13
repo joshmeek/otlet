@@ -17,9 +17,9 @@ OTLET_PROBE_LIMIT_MODELS=ministral3_3b,qwen35_4b,qwen3_1_7b ./benchmarks/quick_p
 
 Set `OTLET_PROBE_DOWNLOAD=1` when you want the probe to fetch a missing GGUF. Downloads go under `/var/lib/postgresql/otlet-probe-models` and the script removes them on exit unless `OTLET_PROBE_KEEP_MODELS=1`
 
-### Current Qwen3.5 4B prompt and quantization decision
+## Current Model Decision
 
-The raw `/no_think` prompt and Q4_K_M artifact remain the defaults. A fresh three-sample control after one warmup passed every five-case correctness and schema gate with median `27.74` mean tok/s, `27.28` steady tok/s, `3158 ms` p95 generation, `1012 ms` p95 TTFT, and `997 ms` p95 prompt decode
+The raw `/no_think` prompt and Q4_K_M artifact remain the defaults. A fresh three-sample control after one warmup passed `5/5` correctness and schema cases with median `27.74` mean tok/s, `27.28` steady tok/s, `3158 ms` p95 generation, `1012 ms` p95 TTFT, and `997 ms` p95 prompt decode
 
 Disposable binaries built from the same commit tested the current prompt, the same prompt without `/no_think`, and the GGUF's embedded one-user chat template. The embedded template renders the same byte boundary as the smallest explicit Qwen ChatML wrapper, so those two labels shared one runtime probe
 
@@ -32,6 +32,8 @@ Disposable binaries built from the same commit tested the current prompt, the sa
 The same-base quantization probe pinned `unsloth/Qwen3.5-4B-GGUF` at `e87f176479d0855a907a41277aca2f8ee7a09523`. Q4_K_M passed `5/5` at `26.13/25.69` mean/steady tok/s. Q5_K_M used 14.8 percent more artifact and runtime-model bytes, loaded in `9841 ms` instead of `5589 ms`, ran at `17.43/17.12` tok/s, and returned `flag` on the adversarial row-text case instead of the evidence-derived `pass`. Q5 stopped at the fast gate, so it did not consume a 447-job full run
 
 These are Otlet SQL-path results for this fixture and host, not general model rankings. Re-run the probe after changing the base model, prompt, runtime, or hardware
+
+## Quick-Probe Controls
 
 Find current Hugging Face GGUF candidates before adding a model row:
 
@@ -56,7 +58,7 @@ The probe accepts `OTLET_PROBE_LLAMA_THREADS=<n>`, `OTLET_PROBE_LLAMA_BATCH_THRE
 
 | knob | scope | default |
 | --- | --- | --- |
-| `OTLET_WORKER_COUNT` | resident Postgres workers | `1`, capped at `4`, research only |
+| `OTLET_WORKER_COUNT` | resident Postgres workers | `1`, capped at `4`, research control |
 | `OTLET_LLAMA_THREADS` | decode threads | visible cores capped at `6` |
 | `OTLET_LLAMA_BATCH_THREADS` | prompt-decode thread pool | decode-thread value |
 | `OTLET_LLAMA_BATCH_TOKENS` | logical prompt batch tokens | `512` |
@@ -66,8 +68,8 @@ The probe accepts `OTLET_PROBE_LLAMA_THREADS=<n>`, `OTLET_PROBE_LLAMA_BATCH_THRE
 | `OTLET_LLAMA_FLASH_ATTN` | `auto`, `on`, or `off` flash attention | llama.cpp default |
 | `OTLET_LLAMA_NO_PERF` | skip llama.cpp perf counters | `true` |
 | `OTLET_LLAMA_KV_TYPE` | set both KV cache types: `f16`, `q8_0`, `q4_0` | llama.cpp default |
-| `OTLET_LLAMA_KV_TYPE_K` | set K cache type only | llama.cpp default |
-| `OTLET_LLAMA_KV_TYPE_V` | set V cache type only | llama.cpp default |
+| `OTLET_LLAMA_KV_TYPE_K` | set K cache type independently | llama.cpp default |
+| `OTLET_LLAMA_KV_TYPE_V` | set V cache type independently | llama.cpp default |
 | `OMP_PROC_BIND`, `OMP_PLACES`, `GOMP_CPU_AFFINITY` | OpenMP CPU placement | unset |
 
 Host hardware determines these controls. Re-run `./scripts/otlet-setup.sh` after changing startup knobs so the worker process starts with the new environment
@@ -82,7 +84,9 @@ Use `OTLET_WORKER_COUNT=1` unless a local probe shows a wall-clock win and accep
 
 The two-worker probes produced overlapping llama.cpp generation from separate Postgres workers and increased wall time or memory on qwen35_4b. Treat worker count as a research control until Otlet has per-worker RSS totals, model-specific admission caps, queue fairness proof, and database responsiveness checks
 
-### Single-context batching decision
+## Measured Runtime Decisions
+
+### Single-context batching
 
 The current linked llama.cpp API can isolate multiple sequence IDs, KV positions, samplers, JSON stopping, and cancellation in one context. The smallest Otlet prototype still failed the combined throughput and memory gate:
 
@@ -94,25 +98,25 @@ The current linked llama.cpp API can isolate multiple sequence IDs, KV positions
 | 8 batched jobs, 512-token buffer | `20.574s` | `6.605 GB` | reject: about 686 MB more RSS |
 | 8 batched jobs, 128-token buffer | `35.002s` | `6.266 GB` | reject: slower and still larger |
 
-All retained comparisons used one worker, six threads, the same qwen35 task and prompt identity, cache disabled, and `8/8` correct schema-valid outputs. One-client `SELECT 1` latency during the fastest batch was no worse than sequential load. Dropping the resident sequential context reduced the extra peak to about 290 MB, but bounded buffers then lost the wall-time win. Otlet keeps the sequential decoder and reruns this experiment only when the linked runtime, model, or memory envelope changes
+All retained comparisons used one worker, six threads, the same qwen35 task and prompt identity, cache disabled, and `8/8` correct schema-valid outputs. One-client `SELECT 1` latency during the fastest batch was no worse than sequential load. Dropping the resident sequential context reduced the extra peak to about 290 MB, but bounded buffers then lost the wall-time win. Otlet keeps the sequential decoder and reruns this experiment after the linked runtime, model, or memory envelope changes
 
-Requester timeout is a separate correctness contract. The resident worker now persists the existing shared-memory abort through `otlet.cancel_job` during prompt/decode probes and immediately before output acceptance. The demo requires a canceled receipt, zero outputs, zero actions, and one healthy worker after the caller transaction raises
+Requester timeout is a separate correctness contract. The resident worker persists the existing shared-memory abort through `otlet.cancel_job` during prompt/decode probes and at the output-acceptance boundary. The demo requires a canceled receipt, zero outputs, zero actions, and one healthy worker after the caller transaction raises
 
-### Multi-model residency decision
+### Multi-model residency
 
-The worker already runs cheap attempts for a claimed policy batch before its strong fallbacks. Both four-row entity-resolution demo batches recorded two model swaps. A forced synchronous alternating workload still paid a load on every call: cheap/strong/cheap/strong took `54.277s`, and the reverse order took `45.746s`. Cheap loads were `5.172-5.753s`; strong loads were `6.172-9.035s`. Every result and schema passed
+The worker runs cheap attempts for a claimed policy batch before its strong fallbacks. Both four-row entity-resolution demo batches recorded two model swaps. A forced synchronous alternating workload paid a load on each call: cheap/strong/cheap/strong took `54.277s`, and the reverse order took `45.746s`. Cheap loads were `5.172-5.753s`; strong loads were `6.172-9.035s`. All eight outputs passed their schemas
 
-A two-entry cache does not fit this runtime. Cold worker RSS was `27.2 MB`; the lowest fully used cheap and strong RSS samples were `4.345 GB` and `5.623 GB`. Their additive projection, subtracting the cold worker once, is `9.941 GB` against `8.218 GB` of memory. That is `1.723 GB` over physical memory before reserving headroom for Postgres. No cache prototype was retained
+A two-entry cache does not fit this runtime. Cold worker RSS was `27.2 MB`; the lowest post-run cheap and strong RSS samples were `4.345 GB` and `5.623 GB`. Their additive projection, subtracting the cold worker once, is `9.941 GB` against `8.218 GB` of memory. That is `1.723 GB` over physical memory before reserving headroom for Postgres. We retained no cache prototype
 
-One-client `SELECT 1` load during the alternating probe completed `1,072,092` transactions with zero failures at `45us` p50, `132us` p95, and `38.448ms` max. The installed GGUFs have no expert or MTP heads, and no compatible draft model is installed. The pinned crate exposes MTP bindings, but its smallest real caller fails to link on unresolved `common_speculative_*` symbols. Otlet keeps one resident context and treats multi-residency, speculative decoding, and expert streaming as new experiments only when the measured memory envelope and installed artifacts change
+One-client `SELECT 1` load during the alternating probe completed `1,072,092` transactions with zero failures at `45us` p50, `132us` p95, and `38.448ms` max. The installed GGUFs have no expert or MTP heads, and the installed model set has no compatible draft model. The pinned crate exposes MTP bindings, but its smallest real caller fails to link on unresolved `common_speculative_*` symbols. Otlet keeps one resident context and treats multi-residency, speculative decoding, and expert streaming as new experiments after the memory envelope or installed artifacts change
 
-### Persisted inference-cache decision
+### Persisted inference cache
 
-The process-local inference-output cache remains the complete cache contract. The fresh demo produced 13 cache-enabled attempts, one hit, 12 misses, a three-entry and 880-byte high-water mark, and zero evictions. A later research sequence reached 13 entries and 2,941 bytes without eviction. The 512-entry cap would use about 116 KiB at that observed average, far below the 8 MiB byte cap
+Otlet keeps the process-local inference-output cache. The fresh demo produced 13 cache-enabled attempts, one hit, 12 misses, a three-entry and 880-byte high-water mark, and zero evictions. A later research sequence reached 13 entries and 2,941 bytes without eviction. The 512-entry cap would use about 116 KiB at that observed average, far below the 8 MiB byte cap
 
-One stable qwen35 row measured a `9.452s` enabled miss, a `0.503s` exact hit, a `3.189s` cache-disabled warm run, and a `15.310s` miss after restart. Every run produced the same schema-valid raw-output and runtime-contract hashes. A second cold miss under one-client `SELECT 1` load completed while 444,899 database transactions ran with zero failures at `47us` p50 and `100us` p95
+One stable qwen35 row measured a `9.452s` enabled miss, a `0.503s` exact hit, a `3.189s` cache-disabled warm run, and a `15.310s` miss after restart. These four runs produced the same schema-valid raw-output and runtime-contract hashes. A second cold miss under one-client `SELECT 1` load completed while 444,899 database transactions ran with zero failures at `47us` p50 and `100us` p95
 
-No installed workload records eviction followed by a repeated-identity miss, and the 447-job full benchmark disables inference caching to measure live generation. A durable cache would persist exact raw envelopes despite the default hash-only evidence policy and duplicate trusted state already kept in outputs and semantic materializations. Otlet therefore adds no disk cache
+No installed workload records eviction followed by a repeated-identity miss, and the 447-job full benchmark disables inference caching to measure live generation. A durable cache would persist exact raw envelopes despite the default hash-only evidence policy and duplicate trusted state already kept in outputs and semantic materializations. Otlet adds no disk cache
 
 Run the default-included benchmark model:
 
@@ -132,15 +136,15 @@ Run the current scored comparison set after an output-affecting prompt, schema, 
 OTLET_BENCH_LIMIT_MODELS=ministral3_3b,qwen35_4b,gemma4_e2b,glm_edge_4b,gemma4_e4b,phi4_mini OTLET_BENCH_RUNS=1 OTLET_BENCH_PUBLISH_REPORT=1 ./benchmarks/run.sh
 ```
 
-## Choose The Validation Ring
+## Validation Rings
 
 Use the smallest ring that covers the changed contract:
 
 | Change | Required proof | Full benchmark |
 | --- | --- | --- |
 | Docs, pure views, model-free planner or SQL logic | Static checks plus focused SQL | No |
-| Decode speed, threads, batch, context, load, memory, or other runtime-only behavior | Five-case quick probe; use repeated interleaved same-host A/B when results move | Only if the result is ambiguous or regresses |
-| Cache, queue, cancellation, admission, residency, receipt, status, or EXPLAIN behavior | Fresh setup, full demo, focused SQL, invariants, permissions, crash scan, and quick probe when performance can move | Only if output can change or focused evidence is inconclusive |
+| Decode speed, threads, batch, context, load, memory, or other runtime-only behavior | Five-case quick probe; use repeated interleaved same-host A/B when results move | If the result is ambiguous or regresses |
+| Cache, queue, cancellation, admission, residency, receipt, status, or EXPLAIN behavior | Fresh setup, full demo, focused SQL, invariants, permissions, crash scan, and quick probe when performance can move | If output can change or focused evidence is inconclusive |
 | Prompt, template, quantization, model, decoding, schema acceptance, output selection, or published scores | Comparable quick probe followed by the full suite | Yes |
 | Final integrated runtime state | Complete validation ring | Yes |
 
@@ -174,7 +178,7 @@ Thread sweep on the current Docker CPU showed the best stable qwen35 setting at 
 | `qwen3_1_7b` | `6` | no | `71.91` |
 | `qwen3_1_7b` | `12` | no | `10.63` |
 
-Recent CPU tuning sweep on `qwen35_4b` kept the old default at `41.89 tok/s` as the before sample. The control-only build stayed neutral at `41.44 tok/s`; every default change below either failed correctness or lost throughput:
+Recent CPU tuning sweep on `qwen35_4b` kept the old default at `41.89 tok/s` as the before sample. The control build stayed neutral at `41.44 tok/s`; each tested default change failed correctness or lost throughput:
 
 | control | tested setting | viable | mean tok/s | result |
 | --- | --- | --- | ---: | --- |
@@ -186,13 +190,13 @@ Recent CPU tuning sweep on `qwen35_4b` kept the old default at `41.89 tok/s` as 
 | mlock | `true` | yes | `24.09` | slower |
 | flash attention | `on` | yes | `31.48` | slower on CPU |
 | perf counters | `OTLET_LLAMA_NO_PERF=false` | yes | `28.33` | slower |
-| KV cache type | `q8_0` | yes | `30.22` | slower; possible memory-only lever |
+| KV cache type | `q8_0` | yes | `30.22` | slower; possible memory lever |
 | KV cache type | `q4_0` | no | `25.16` | failed one decision |
 | OpenMP placement | `PROC_BIND=spread`, `PLACES=cores` | no | `9.95` | timed out one smoke case |
 
-A fresh capability and responsiveness pass kept those defaults. The ARM64 host exposes 12 physical and 12 logical CPUs with one hardware thread per core, no NUMA node interface, no container power counter, and no usable unprivileged host energy counter. Linked llama.cpp has native CPU and OpenMP enabled, BLAS disabled, and no linked BLAS library. `PROC_BIND=close PLACES=cores` also stalled the first probe case for more than 107 seconds
+The host and SQL probes kept the six-thread, F16, unset-placement defaults. The ARM64 host exposes 12 physical and 12 logical CPUs with one hardware thread per core, no NUMA node interface, no container power counter, and no usable unprivileged host energy counter. Linked llama.cpp has native CPU and OpenMP enabled, BLAS disabled, and no linked BLAS library. `PROC_BIND=close PLACES=cores` stalled the first probe case for more than 107 seconds
 
-Rotated F16/Q8 KV A/B blocks initially showed a Q8 lead, then converged to 37.46 versus 37.31 mean tok/s while both stayed 5/5. Q4 repeated at 4/5 by obeying adversarial row text. F16 remains the default and neither candidate earned a full run. A one-client `pgbench` `SELECT 1` probe measured 38 microseconds p50 and 46 microseconds p95 while idle, 40 and 69 microseconds during cold load plus five judgments, and 39 and 87 microseconds while four infer-now callers filled the bounded queue. All database transactions and judgments completed without swap, faults, PSI events, timeouts, or crashes
+The first rotated F16/Q8 KV A/B block showed a Q8 lead, then the medians converged to 37.46 versus 37.31 mean tok/s while both stayed 5/5. Q4 repeated at 4/5 by obeying adversarial row text. F16 remains the default and neither candidate earned a full run. A one-client `pgbench` `SELECT 1` probe measured 38 microseconds p50 and 46 microseconds p95 while idle, 40 and 69 microseconds during cold load plus five judgments, and 39 and 87 microseconds while four infer-now callers filled the bounded queue. All database transactions and judgments completed without swap, faults, PSI events, timeouts, or crashes
 
 Interleaved prompt-prefix probe on `qwen35_4b` now keeps multiple task prefixes in the resident worker. The A/B/A probe used two different inline tasks. Before the bounded multi-prefix cache, the second A decoded the full 424-token prompt again at about `6.7s` prompt decode. After the change, the second A restored 386 prefix tokens, decoded 38 tail tokens, and prompt decode was `1.143s`. The resident worker kept two prefix states using about `130.6 MiB`
 

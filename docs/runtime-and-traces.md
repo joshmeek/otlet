@@ -2,7 +2,7 @@
 
 Use this after the entity-resolution walkthrough queues work. It inspects model selection, receipts, runtime status, trace visibility, retries, cancellation, and failed-run evidence
 
-These diagnostic queries run as the extension owner because they expose receipt, structured output, error, and numeric token state. Raw model output and token text appear only when the owner enables bounded diagnostic storage. Auditors use `otlet.audit_receipt_export` and the other redacted exports granted by `otlet.grant_auditor_access(...)`
+These diagnostic queries run as the extension owner because they expose receipt, structured output, error, and numeric token state. Raw model output and token text appear when the owner enables bounded diagnostic storage. Auditors use `otlet.audit_receipt_export` and the other redacted exports granted by `otlet.grant_auditor_access(...)`
 
 ## Step 1 - Inspect Model Selection Attempts
 
@@ -36,7 +36,7 @@ Representative output from the demo run:
 (8 rows)
 ```
 
-The stricter output/action envelope rejects the cheap model in this run. Rejected attempts stay visible as receipts, every row escalates to `qwen35_4b`, and Otlet materializes the accepted output for each job
+The stricter output/action envelope rejects the cheap model in this run. Rejected attempts stay visible as receipts, all four rows escalate to `qwen35_4b`, and Otlet materializes the accepted output for each job
 
 ## Step 2 - Read The Receipt
 
@@ -138,7 +138,7 @@ LIMIT 1;
 
 The inference-output cache stores schema-valid raw model output before Otlet applies selection trust. Accepted abstentions and rejected-but-valid attempts may reuse cached bytes; invalid JSON/schema failures stay out of the cache. The receipt still records accepted/rejected/failed status, and the cache key basis is content hash + contract hash + runtime output-contract hash + model fingerprint
 
-The cache is process-local, bounded at 512 entries and 8 MiB, and intentionally not persisted. The fresh demo and a stable restart probe showed no eviction pressure or repeated restart misses. Persisting exact raw envelopes would cross the default hash-only stored-evidence boundary, while parsed trusted output already survives through outputs and semantic materializations
+The process-local cache holds at most 512 entries or 8 MiB. Otlet does not persist it. The fresh demo and a stable restart probe showed no eviction pressure or repeated restart misses. Persisting exact raw envelopes would cross the default hash-only stored-evidence boundary, while parsed trusted output survives through outputs and semantic materializations
 
 ```sql
 SELECT task_name,
@@ -336,6 +336,14 @@ Representative output:
 
 Otlet records a receipt for canceled work and preserves model-run evidence
 
+A synchronous infer-now caller can time out while the worker decodes. The requester records a shared abort marker, and the worker calls `otlet.cancel_job` before it can accept output. The caller's failed transaction cannot roll back that worker-owned cancellation
+
+The demo requires the canceled job and receipt, zero outputs and actions, a recorded timeout and abort, the canceled job ID, and one healthy worker:
+
+```text
+requester_timeout_contract=canceled|true|canceled|canceled|0|0|true|true|true|1|ready|ready
+```
+
 ## Step 9 - Understand Retry And Failed-Run Evidence
 
 Otlet leaves failed jobs visible. A failed job is terminal, so you can requeue that task and subject
@@ -389,7 +397,7 @@ Representative output:
 (2 rows)
 ```
 
-Failure records a raw-output hash, a non-sensitive error, and an attempt receipt. Enable diagnostic mode only when you need bounded raw text inside the database
+Failure records a raw-output hash, a non-sensitive error, and an attempt receipt. Enable diagnostic mode when you need bounded raw text inside the database
 
 ## Step 10 - Check Worker Events And Receipt Statuses
 

@@ -593,7 +593,7 @@ Representative output:
 
 Otlet enforces write authority through the action catalog. The model can request an action; Otlet decides which action types can become database state. Otlet stores unsupported actions as rejected evidence when they arrive with an accepted output. `otlet.action_status` shows approval, dry-run, and apply state
 
-`update_row` is the only source-table write action. The extension owner registers one ordinary table, its sole primary key, and the columns Otlet may update:
+Otlet exposes one source-table write action: `update_row`. The extension owner registers one ordinary table, its sole primary key, and the columns Otlet may update:
 
 ```sql
 SELECT otlet.register_action_target(
@@ -620,7 +620,7 @@ The model-authored action contains data, not SQL:
 }
 ```
 
-The identity must equal the job subject, the target must equal the modeled source table, and every changed key must be registered. Version one supports one ordinary table, one single-column primary key, one row, and at most 16 changed columns. It rejects raw SQL, predicates, expressions, joins, generated columns, identity columns, partitions, foreign tables, views, temporary tables, Otlet tables, and RLS targets
+The identity must equal the job subject, the target must equal the modeled source table, and the target registration must list each changed key. Version one supports one ordinary table, one single-column primary key, one row, and at most 16 changed columns. It rejects raw SQL, predicates, expressions, joins, generated columns, identity columns, partitions, foreign tables, views, temporary tables, Otlet tables, and RLS targets
 
 Review the typed result before approval, then apply it:
 
@@ -631,4 +631,4 @@ SELECT apply_status FROM otlet.apply_action(:action_id);
 SELECT apply_status FROM otlet.apply_action(:action_id);
 ```
 
-The first apply updates exactly one row and stores before/after hashes. The second returns `replayed`, writes no row, and links to the original receipt. If the source row, target registration, schema, or privileges changed after dry run, apply fails closed. `correct_action` still means reject plus eval label; a corrected executable write is a new proposal with a new dry run and approval
+The first apply updates one row and stores before/after hashes. The second returns `replayed`, writes no row, and links to the original receipt. If the source row, target registration, schema, or privileges changed after dry run, apply fails closed. `correct_action` still means reject plus eval label; a corrected executable write is a new proposal with a new dry run and approval

@@ -339,7 +339,7 @@ The child scan reads the source table. Otlet strips the semantic predicate from 
 
 CustomScan uses statement preload semantics. Row-marked queries such as `FOR UPDATE` stay on the standard Postgres plan because Otlet blocks the CustomScan planner path when queries include rowmarks; Postgres still owns locking and row recheck behavior. For non-rowmark CustomScan, stale triggers and the next statement pick up concurrent source changes instead of a per-tuple recheck inside that scan
 
-A PostgreSQL 18 Index Access Method probe did not improve this boundary. Its build, insert, update, vacuum, ordered scan, bitmap scan, reindex, and restart paths all worked, but scan callbacks had to select heap TIDs from fixed operator keys before PostgreSQL produced the projected source tuple. HOT changes to an unindexed model input bypassed the AM, join views could not be indexed, and PostgreSQL rejected the volatile semantic predicate as an index expression. Otlet therefore keeps ordinary indexes over materialized state and uses CustomScan when the executor needs source tuples, bounded inference, stale policy, receipts, and EXPLAIN counters
+A PostgreSQL 18 Index Access Method probe did not improve this boundary. Its build, insert, update, vacuum, ordered scan, bitmap scan, reindex, and restart paths all worked, but scan callbacks had to select heap TIDs from fixed operator keys before PostgreSQL produced the projected source tuple. HOT changes to an unindexed model input bypassed the AM, PostgreSQL does not index join views, and PostgreSQL rejected the volatile semantic predicate as an index expression. Otlet keeps ordinary indexes over materialized state and uses CustomScan when the executor needs source tuples, bounded inference, stale policy, receipts, and EXPLAIN counters
 
 A minimal PostgreSQL 18.4 fork did not expose a better executor boundary. Its post-fetch hook filtered ordinary, rescanned, row-locked, and parallel index scans, but bitmap heap and heap-free index-only scans bypassed the hook and returned different rows. EXPLAIN showed no semantic predicate or policy. Matching CustomScan would require more executor patches plus planner, EXPLAIN, receipt, and policy machinery, so Otlet keeps the explicit CustomScan child plan
 
@@ -461,7 +461,7 @@ Receipts carry executor provenance because one model task can run from the worke
 
 ## Step 10 - Build A Pair Watch
 
-Row watches are source-table-oriented. Pair watches are candidate-query-oriented
+Row watches follow source tables. Pair watches follow candidate queries
 
 The candidate query supplies `subject_id` and `input` for candidate pairs:
 
