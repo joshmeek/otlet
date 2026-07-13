@@ -341,6 +341,8 @@ CustomScan uses statement preload semantics. Row-marked queries such as `FOR UPD
 
 A PostgreSQL 18 Index Access Method probe did not improve this boundary. Its build, insert, update, vacuum, ordered scan, bitmap scan, reindex, and restart paths all worked, but scan callbacks had to select heap TIDs from fixed operator keys before PostgreSQL produced the projected source tuple. HOT changes to an unindexed model input bypassed the AM, join views could not be indexed, and PostgreSQL rejected the volatile semantic predicate as an index expression. Otlet therefore keeps ordinary indexes over materialized state and uses CustomScan when the executor needs source tuples, bounded inference, stale policy, receipts, and EXPLAIN counters
 
+A minimal PostgreSQL 18.4 fork did not expose a better executor boundary. Its post-fetch hook filtered ordinary, rescanned, row-locked, and parallel index scans, but bitmap heap and heap-free index-only scans bypassed the hook and returned different rows. EXPLAIN showed no semantic predicate or policy. Matching CustomScan would require more executor patches plus planner, EXPLAIN, receipt, and policy machinery, so Otlet keeps the explicit CustomScan child plan
+
 ## Step 8 - Fail Closed On Stale Rows
 
 Changing a source row makes its materialized semantic state stale
