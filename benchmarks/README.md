@@ -158,6 +158,10 @@ Recent CPU tuning sweep on `qwen35_4b` kept the old default at `41.89 tok/s` as 
 | KV cache type | `q4_0` | no | `25.16` | failed one decision |
 | OpenMP placement | `PROC_BIND=spread`, `PLACES=cores` | no | `9.95` | timed out one smoke case |
 
+A fresh capability and responsiveness pass kept those defaults. The ARM64 host exposes 12 physical and 12 logical CPUs with one hardware thread per core, no NUMA node interface, no container power counter, and no usable unprivileged host energy counter. Linked llama.cpp has native CPU and OpenMP enabled, BLAS disabled, and no linked BLAS library. `PROC_BIND=close PLACES=cores` also stalled the first probe case for more than 107 seconds
+
+Rotated F16/Q8 KV A/B blocks initially showed a Q8 lead, then converged to 37.46 versus 37.31 mean tok/s while both stayed 5/5. Q4 repeated at 4/5 by obeying adversarial row text. F16 remains the default and neither candidate earned a full run. A one-client `pgbench` `SELECT 1` probe measured 38 microseconds p50 and 46 microseconds p95 while idle, 40 and 69 microseconds during cold load plus five judgments, and 39 and 87 microseconds while four infer-now callers filled the bounded queue. All database transactions and judgments completed without swap, faults, PSI events, timeouts, or crashes
+
 Interleaved prompt-prefix probe on `qwen35_4b` now keeps multiple task prefixes in the resident worker. The A/B/A probe used two different inline tasks. Before the bounded multi-prefix cache, the second A decoded the full 424-token prompt again at about `6.7s` prompt decode. After the change, the second A restored 386 prefix tokens, decoded 38 tail tokens, and prompt decode was `1.143s`. The resident worker kept two prefix states using about `130.6 MiB`
 
 Run the default-included set after a harness improvement when you want the shortest publishable check:
