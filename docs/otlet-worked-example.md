@@ -213,18 +213,22 @@ semantic_join_match_contract=true|true
 watch_replace_contract=true|true|true|true|true|true|true|true|true|true
 watch_round_trip_contract=true|true|true|true|true
 watch_import_failure_contract=9|true
+candidate_removed_contract=0|true|candidate_removed|0|0|false|
+candidate_changed_contract=1|true|candidate_changed|0
 semantic_join_stale_contract=4|0|fresh_after_lookup=0|receipts=8|8
 receipt_trace_contract=8|8|8|8
 inference_visibility_status=true|true|true|true|true
 runtime_status_contract=ready|ready|35.71|true|true|true|none|linux_proc_self_status_vmrss_vmsize_sampled_after_worker_run
 planner_1m_contract=estimated|1000000|4.404|true
-performance_ratio_contract=34|43|1.265|15948|469.059
+performance_ratio_contract=38|47|1.237|15948|419.684
 materialization_failure_status_contract=true|true
 invariant_contract=0
 docker_crash_log_scan=ok
 ```
 
 Check these fields in each path: source row identity, job, receipt, output, action, materialization, freshness, and status
+
+The candidate contracts show that removal and identical restoration queue no work. Changed candidate content queues one refresh and stays outside fresh lookup until that work completes
 
 ## Detailed Walkthroughs
 

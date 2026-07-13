@@ -114,7 +114,7 @@ UPDATE 1
 (1 row)
 ```
 
-The trigger marks the previous derived fact stale and leaves model reruns to refresh policy
+The trigger marks the previous derived fact stale and leaves model reruns to refresh policy. A source delete records `source_delete` in `otlet.semantic_dependency_audit`
 
 Plain `mark_stale` row watches treat INSERT as missing semantic state rather than stale semantic state. Exact planning shows the new row as unresolved until refresh or infer-now:
 
@@ -532,6 +532,15 @@ semantic_join_auto_materialized=1
 ```
 
 `pair_sources` installs the row-index stale trigger. Updates to declared source rows mark matching pair materializations through `_otlet_mvcc` dependencies, and `drop_watch` removes the trigger when no row index or pair watch still needs it
+
+Pair refresh reconciles the bounded candidate query. A removed subject gets `candidate_removed`; a subject with changed shaped content gets `candidate_changed`. Removed candidates queue no work. New and changed candidates continue through the existing queue. If the same candidate content returns, Otlet clears the candidate-drift state and reuses its materialization
+
+```sql
+SELECT subject_id, stale, stale_reason, source_dependencies
+FROM otlet.semantic_dependency_audit
+WHERE task_name = 'learning_entity_pair_idx_task'
+ORDER BY subject_id;
+```
 
 Inspect the join index:
 

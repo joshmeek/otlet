@@ -20,7 +20,7 @@ The linked runtime stops after one balanced JSON object. Otlet then requires the
 
 Extension owners can export row and pair watch definitions as `otlet.watch.v1` JSONB and import them through the same validation path as `create_watch`. The document carries configuration and owner-authored SQL without database state or model artifacts
 
-The planner contract covers semantic lookup, fail-closed stale reads, queue refresh, wait, fresh inference, bounded CustomScan infer-now, current-row SQL lookup, cache decisions, and live EXPLAIN vocabulary. SQL exposes cache keys, invalidation reasons, hit/miss counters, size bounds, runtime status, source-dependency stale reasons, queue admission, fair claims, attempt bounds, cancellation, RSS budget failures, malformed-schema failures, and cleanup dry-run evidence
+The planner contract covers semantic lookup, fail-closed stale reads, queue refresh, wait, fresh inference, bounded CustomScan infer-now, current-row SQL lookup, cache decisions, and live EXPLAIN vocabulary. SQL exposes cache keys, invalidation reasons, hit/miss counters, size bounds, runtime status, source-delete and pair-candidate stale reasons, queue admission, fair claims, attempt bounds, cancellation, RSS budget failures, malformed-schema failures, and cleanup dry-run evidence
 
 Run `./scripts/otlet-setup.sh`, then `./scripts/otlet-demo.sh` to prove the contract. Use `benchmarks/run.sh` for SQL-scored model comparisons
 
@@ -31,7 +31,7 @@ Run `./scripts/otlet-setup.sh`, then `./scripts/otlet-demo.sh` to prove the cont
 | 1 | Packaging and security | Active hardening | Maintain a small setup and demo; add release packaging proof |
 | 2 | Output reliability and benchmark truth | Active hardening | Add prompt-template and quant sweeps under the existing quality gates |
 | 3 | Planner, executor, and cache | Active hardening | Add runtime fingerprints, load admission, decoder-batch probes, and EXPLAIN parity |
-| 4 | Semantic freshness | Active hardening | Extend dependency audits to source deletes and candidate-set changes |
+| 4 | Semantic freshness | Implemented contract | Maintain row, pair, delete, candidate, and schema-drift freshness gates |
 | 5 | Action safety | Implemented contract | Maintain the one-table, one-key, one-row `update_row` boundary |
 | 6 | Managed Postgres packaging | Open | Test native workers where providers allow them and a SQL-bound agent where providers block them |
 | 7 | GPU acceleration | Open | Add device policy after the CPU resident-worker path has measured proof |
@@ -43,7 +43,6 @@ Run `./scripts/otlet-setup.sh`, then `./scripts/otlet-demo.sh` to prove the cont
 | --- | --- |
 | Output reliability hardening | Compare prompt templates and quantizations for each model family under one fixture and gate set |
 | Planner, executor, and cache hardening | Align SQL plan rows, semantic status views, runtime fingerprints, CustomScan EXPLAIN, receipts, runtime/cache views, and demo output |
-| Semantic freshness hardening | Extend dependency audit export to source deletes and candidate-set changes |
 | Model residency and timing | Add pre-load memory admission, pressure metrics, and single-context decoder-batch probes before changing slot policy |
 | Persisted cache storage | Add disk-backed cache after a measured workload proves in-process cache misses hurt |
 | Managed Postgres external worker | Build a trusted SQL-bound worker that claims jobs, heartbeats, writes receipts, and fails closed |
@@ -122,7 +121,7 @@ Otlet tracks the source dependencies behind row indexes, semantic joins, candida
 
 Each answer records the source rows read, trusted hash or MVCC identity, candidate set, and reuse/rejection reason for materialized state
 
-Add dependency audit exports for the row, join, delete, candidate-query, and schema-drift decisions that drive stale/fresh state. `otlet.semantic_dependency_audit` returns the latest materialization row per subject with `stale_reason`, hashes, and `source_dependencies`. Delete/candidate-query drift export surfaces remain open
+`otlet.semantic_dependency_audit` returns the latest materialization row per subject with `stale_reason`, hashes, and `source_dependencies`. Row triggers record source updates and deletes. Pair refresh records removed and changed candidates from the bounded candidate query, restores identical returning candidates, and sends changed or new candidates through the existing queue
 
 ## Entity Resolution Packs
 

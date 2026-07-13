@@ -932,6 +932,65 @@ echo "semantic_join_current_row_contract=$join_subject_rows|$join_sql_plan"
 }
 require_regex "$join_sql_plan" '^semantic_join_lookup\|4\|4\|0\|0\|' "Expected semantic join SQL plan lookup with four fresh subjects"
 
+log "Checking pair candidate drift audit"
+candidate_removed_contract="$(psql_exec -qAt -v index_name="$join_index_name" -v task_name="$join_task" <<'SQL'
+BEGIN;
+DELETE FROM public.otlet_demo_vendor_pair
+WHERE pair_id = 'vendor-1001:vendor-314';
+SELECT otlet.refresh_semantic_join_index(:'index_name')::text;
+SELECT stale::text || '|' || COALESCE(stale_reason, '')
+FROM otlet.semantic_dependency_audit
+WHERE task_name = :'task_name'
+  AND subject_id = 'vendor-1001:vendor-314';
+SELECT count(*)::text
+FROM otlet.semantic_join_index_current_rows(:'index_name', false)
+WHERE subject_id = 'vendor-1001:vendor-314';
+INSERT INTO public.otlet_demo_vendor_pair (pair_id, left_id, right_id)
+VALUES ('vendor-1001:vendor-314', 'vendor-1001', 'vendor-314');
+SELECT otlet.refresh_semantic_join_index(:'index_name')::text;
+SELECT stale::text || '|' || COALESCE(stale_reason, '')
+FROM otlet.semantic_dependency_audit
+WHERE task_name = :'task_name'
+  AND subject_id = 'vendor-1001:vendor-314';
+ROLLBACK;
+SQL
+)"
+candidate_removed_refresh="$(sed -n '1p' <<<"$candidate_removed_contract")"
+candidate_removed_audit="$(sed -n '2p' <<<"$candidate_removed_contract")"
+candidate_removed_current="$(sed -n '3p' <<<"$candidate_removed_contract")"
+candidate_restored_refresh="$(sed -n '4p' <<<"$candidate_removed_contract")"
+candidate_restored_audit="$(sed -n '5p' <<<"$candidate_removed_contract")"
+echo "candidate_removed_contract=$candidate_removed_refresh|$candidate_removed_audit|$candidate_removed_current|$candidate_restored_refresh|$candidate_restored_audit"
+[ "$candidate_removed_refresh|$candidate_removed_audit|$candidate_removed_current|$candidate_restored_refresh|$candidate_restored_audit" = "0|true|candidate_removed|0|0|false|" ] || {
+  echo "Expected removed pair audit and zero-work restoration, got $candidate_removed_contract" >&2
+  exit 1
+}
+
+candidate_changed_contract="$(psql_exec -qAt -v index_name="$join_index_name" -v task_name="$join_task" <<'SQL'
+BEGIN;
+UPDATE public.otlet_demo_vendor_pair
+SET right_id = 'vendor-77'
+WHERE pair_id = 'vendor-1001:vendor-314';
+SELECT otlet.refresh_semantic_join_index(:'index_name')::text;
+SELECT stale::text || '|' || COALESCE(stale_reason, '')
+FROM otlet.semantic_dependency_audit
+WHERE task_name = :'task_name'
+  AND subject_id = 'vendor-1001:vendor-314';
+SELECT count(*)::text
+FROM otlet.semantic_join_index_current_rows(:'index_name', true)
+WHERE subject_id = 'vendor-1001:vendor-314';
+ROLLBACK;
+SQL
+)"
+candidate_changed_refresh="$(sed -n '1p' <<<"$candidate_changed_contract")"
+candidate_changed_audit="$(sed -n '2p' <<<"$candidate_changed_contract")"
+candidate_changed_current="$(sed -n '3p' <<<"$candidate_changed_contract")"
+echo "candidate_changed_contract=$candidate_changed_refresh|$candidate_changed_audit|$candidate_changed_current"
+[ "$candidate_changed_refresh|$candidate_changed_audit|$candidate_changed_current" = "1|true|candidate_changed|0" ] || {
+  echo "Expected changed pair audit and one queued refresh, got $candidate_changed_contract" >&2
+  exit 1
+}
+
 log "Checking entity-resolution dependency update"
 join_receipts_before_update="$(psql_exec -qAt -v task_name="$join_task" <<'SQL'
 SELECT count(*)::text

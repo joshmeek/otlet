@@ -804,7 +804,7 @@ row_delete_contract="$(psql_exec -qAt \
 SELECT count(*)::text
 FROM otlet.semantic_index_current_rows(:'watch_name', true);
 SELECT (count(*) FILTER (WHERE stale AND stale_reason = 'source_delete') >= 1)::text
-FROM otlet.semantic_materializations
+FROM otlet.semantic_dependency_audit
 WHERE task_name = :'task_name'
   AND subject_id = 'triage-1';
 SQL

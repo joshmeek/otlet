@@ -695,6 +695,8 @@ CREATE TABLE otlet.semantic_materializations (
   stale_reason text CHECK (stale_reason IN (
     'source_update',
     'source_delete',
+    'candidate_removed',
+    'candidate_changed',
     'contract_changed',
     'schema_drift',
     'manual',
