@@ -583,16 +583,20 @@ const PROMPT_BODY_BEFORE_SCHEMA: &str = "\n\nResponse schema:\n";
 const PROMPT_BODY_BEFORE_INPUT: &str = "\n\nInput:\n";
 const PROMPT_BODY_AFTER_INPUT: &str = "\n\nJSON:\n";
 
+fn prompt_reasoning_prefix(options: &crate::runtime::RuntimeOptions) -> &'static str {
+    if options.reasoning == "off" {
+        "/no_think "
+    } else {
+        ""
+    }
+}
+
 fn prompt_prefix(
     options: &crate::runtime::RuntimeOptions,
     instruction: &str,
     rendered_schema: &str,
 ) -> String {
-    let reasoning = if options.reasoning == "off" {
-        "/no_think "
-    } else {
-        ""
-    };
+    let reasoning = prompt_reasoning_prefix(options);
     format!(
         "{reasoning}{PROMPT_BODY_BEFORE_INSTRUCTION}{instruction}{PROMPT_BODY_BEFORE_SCHEMA}{rendered_schema}{PROMPT_BODY_BEFORE_INPUT}"
     )

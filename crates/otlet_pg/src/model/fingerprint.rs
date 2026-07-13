@@ -20,6 +20,7 @@ fn runtime_fingerprint(
     let batch_threads = linked_batch_threads(options, decode_threads);
     let (kv_type_k, kv_type_v) = fingerprint_kv_types();
     let prompt_template_hash = hash_text_parts(&[
+        prompt_reasoning_prefix(options),
         PROMPT_BODY_BEFORE_INSTRUCTION,
         PROMPT_BODY_BEFORE_SCHEMA,
         PROMPT_BODY_BEFORE_INPUT,
@@ -207,12 +208,19 @@ mod runtime_fingerprint_tests {
         let mut changed_options = crate::runtime::RuntimeOptions::default();
         changed_options.llama_threads = 2;
         let changed = runtime_fingerprint(model, "model-hash", &changed_options);
+        let mut reasoning_on = crate::runtime::RuntimeOptions::default();
+        reasoning_on.reasoning = "on";
+        let reasoning_on = runtime_fingerprint(model, "model-hash", &reasoning_on);
         let mut changed_host = first.document.clone();
         changed_host["host"]["memory_bytes"] = json!(1);
 
         assert_eq!(first.hash, second.hash);
         assert_eq!(first.output_contract_hash, second.output_contract_hash);
         assert_ne!(first.output_contract_hash, changed.output_contract_hash);
+        assert_ne!(
+            first.document["output_contract"]["prompt_template"]["hash"],
+            reasoning_on.document["output_contract"]["prompt_template"]["hash"]
+        );
         assert_ne!(first.hash, hash_json(&changed_host));
         assert_eq!(
             first.output_contract_hash,

@@ -71,11 +71,7 @@ fn shaped_prompt_hashes_for_cache_hit(
         let shaped_text = std::str::from_utf8(shaped_bytes).expect("serde_json writes UTF-8");
         let input_hash = hash_text(shaped_text);
         let (bytes, original_bytes, input_truncated) = shaped_input_meta(input, shaped_bytes.len());
-        let reasoning = if options.reasoning == "off" {
-            "/no_think "
-        } else {
-            ""
-        };
+        let reasoning = prompt_reasoning_prefix(options);
         // Same byte sequence as prompt_prefix(...) + shaped + PROMPT_BODY_AFTER_INPUT.
         let prompt_hash = hash_text_parts(&[
             reasoning,

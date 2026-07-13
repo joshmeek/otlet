@@ -29,7 +29,7 @@ Run `./scripts/otlet-setup.sh`, then `./scripts/otlet-demo.sh` to prove the cont
 | Order | Track | Status | Next work |
 | --- | --- | --- | --- |
 | 1 | Packaging and security | Active hardening | Maintain a small setup and demo; add release packaging proof |
-| 2 | Output reliability and benchmark truth | Active hardening | Add prompt-template and quant sweeps under the existing quality gates |
+| 2 | Output reliability and benchmark truth | Measured default | Maintain the raw `/no_think` Q4_K_M path and existing fast/full gates |
 | 3 | Planner, executor, and cache | Active hardening | Run decoder-batch probes, then close Access Method and fork evidence |
 | 4 | Semantic freshness | Implemented contract | Maintain row, pair, delete, candidate, and schema-drift freshness gates |
 | 5 | Action safety | Implemented contract | Maintain the one-table, one-key, one-row `update_row` boundary |
@@ -41,7 +41,6 @@ Run `./scripts/otlet-setup.sh`, then `./scripts/otlet-demo.sh` to prove the cont
 
 | Track | Next contract |
 | --- | --- |
-| Output reliability hardening | Compare prompt templates and quantizations for each model family under one fixture and gate set |
 | Planner, executor, and cache hardening | Keep SQL plan rows, semantic status views, CustomScan EXPLAIN, receipts, runtime/cache views, and demo output aligned |
 | Model residency and timing | Keep pre-load admission and pressure evidence passing; test single-context decoder batching before changing slot policy |
 | Persisted cache storage | Add disk-backed cache after a measured workload proves in-process cache misses hurt |
@@ -60,7 +59,9 @@ Keep greedy decoding with balanced-object stopping. A same-host native grammar p
 
 Qwen3.5 4B stays the default stable model under the 4B and 4 GB project cap. The fast probe filters smaller candidates before a full benchmark run. MiniStral 3B, Phi-4 mini, SmolLM3 3B, and GLM Edge 4B run faster in CPU quick probes. Each model failed at least one adversarial row-text, numeric-threshold, markdown-fence, or schema gate
 
-Next benchmark work:
+The current Qwen3.5 prompt and quantization contract is measured through one Otlet SQL fixture. The raw `/no_think` prompt passed `5/5` correctness and schema gates. Removing `/no_think` repeated at `4/5` correctness and schema. The GGUF's embedded one-user template is byte-equivalent to the smallest explicit Qwen ChatML wrapper; that form repeated at `0/5` and produced no schema-valid object. Q4_K_M passed `5/5`; same-revision Q5_K_M passed schema but obeyed adversarial row text, fell to `4/5`, used 14.8 percent more model bytes, and decoded more slowly. Neither candidate qualified for a full run, so the raw Q4_K_M default remains unchanged
+
+Benchmark policy:
 
 - Use the five-case quick probe and focused live contracts for runtime-only work. Reserve the 447-job full suite for output-affecting changes, published comparisons, unexplained regressions, and final integration
 - Use interleaved repeated same-host A/B when thermal load or run order can obscure a runtime result
@@ -68,9 +69,6 @@ Next benchmark work:
 - Limit routine benchmark runs to `include_by_default=true`; run candidate, diagnostic, historical, heavy, and blocked rows by request
 - Use `benchmarks/quick_probe.sh` to reject weak candidates before running the full suite
 - Sweep `OTLET_PROBE_LLAMA_THREADS` through `benchmarks/quick_probe.sh` before treating CPU token rates as fixed
-- Compare the current raw prompt with and without `/no_think`, the GGUF chat template, and an explicit family template under one fixture and gate set
-- Run quantization ladders for one base model; use a full-precision or hosted reference to distinguish base-model limits from local format and runtime failures
-- Run prompt, template, quantization, and schema changes against one benchmark fixture
 - Use larger local models as ceiling checks; cap Otlet defaults at 4B active parameters and about 4 GB on disk
 
 ## Planner, Executor, And Cache
@@ -85,7 +83,7 @@ Use measured runtime history for costing: load time, warm generation time, token
 
 The timing split records `tokenize_ms`, `prompt_decode_ms`, `generate_ms`, `finish_sql_ms`, and `materialize_ms`. Use those fields to decide whether prompt decode, SQL finish work, or materialization owns warm-job latency. Worker complete/fail paths stamp `finish_sql_ms` and `materialize_ms` onto receipt `trace_summary`; `inference_receipt_trace_status` and `inference_trace_summary` expose them as nullable columns
 
-Receipts, trace views, runtime status, infer-now EXPLAIN, demo contracts, and benchmark artifacts share one versioned runtime fingerprint. It binds artifact identity and quantization, prompt-template name and hash, linked llama.cpp revision and build flags, effective context, batch, ubatch, KV, mmap, mlock, flash-attention, threads, affinity, NUMA, CPU topology, and memory capacity. The inference cache includes the output-affecting subset while host-capacity observations stay outside cache invalidation
+Receipts, trace views, runtime status, infer-now EXPLAIN, demo contracts, and benchmark artifacts share one versioned runtime fingerprint. It binds artifact identity and quantization, prompt-template name and exact reasoning-prefix/body hash, linked llama.cpp revision and build flags, effective context, batch, ubatch, KV, mmap, mlock, flash-attention, threads, affinity, NUMA, CPU topology, and memory capacity. The inference cache includes the output-affecting subset while host-capacity observations stay outside cache invalidation
 
 Preserve cache-hit performance. A live smoke run completed cached jobs in milliseconds with no generation, so future watch and demo work disables trace mode for cacheable production paths and preserves stable content, contract, and model keys. Cache-hit receipt hashes still match the miss path; they stream the prompt and input bytes without allocating the full prompt string
 

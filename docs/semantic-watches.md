@@ -424,7 +424,7 @@ Custom Scan (Otlet Semantic Source CustomScan) on public.otlet_demo_semantic_ven
   Actual Infer Resolved Rows: 1
   Infer Now Receipts: 1
   Infer Now Trace Receipt Id: 42
-  Infer Now Runtime Fingerprint Hash: d81c5772b768b969
+  Infer Now Runtime Fingerprint Hash: e5797a21096dfddf
 ```
 
 The executor refreshed the stale row with a bounded infer-now budget and a receipt

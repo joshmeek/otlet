@@ -102,7 +102,7 @@ runtime_residency_contract=ready|ready|resident_worker_loaded_model_context|true
 
 The worker keeps the local model/context warm across jobs. SQL can see the slot state, memory sample, context window, cache entries, cache bounds, last cache reason, and latest detailed runtime fingerprint
 
-The full fingerprint describes the artifact, linked build, effective generation settings, CPU placement, and host capacity. Its output-contract hash omits observational host fields and joins content, task contract, and model identity in the inference-cache key:
+The full fingerprint describes the artifact, linked build, effective generation settings, CPU placement, and host capacity. The prompt-template hash covers the exact reasoning prefix and static prompt body. Its output-contract hash omits observational host fields and joins content, task contract, and model identity in the inference-cache key:
 
 ```sql
 SELECT receipt_id,

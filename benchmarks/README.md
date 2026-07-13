@@ -17,6 +17,22 @@ OTLET_PROBE_LIMIT_MODELS=ministral3_3b,qwen35_4b,qwen3_1_7b ./benchmarks/quick_p
 
 Set `OTLET_PROBE_DOWNLOAD=1` when you want the probe to fetch a missing GGUF. Downloads go under `/var/lib/postgresql/otlet-probe-models` and the script removes them on exit unless `OTLET_PROBE_KEEP_MODELS=1`
 
+### Current Qwen3.5 4B prompt and quantization decision
+
+The raw `/no_think` prompt and Q4_K_M artifact remain the defaults. A fresh three-sample control after one warmup passed every five-case correctness and schema gate with median `27.74` mean tok/s, `27.28` steady tok/s, `3158 ms` p95 generation, `1012 ms` p95 TTFT, and `997 ms` p95 prompt decode
+
+Disposable binaries built from the same commit tested the current prompt, the same prompt without `/no_think`, and the GGUF's embedded one-user chat template. The embedded template renders the same byte boundary as the smallest explicit Qwen ChatML wrapper, so those two labels shared one runtime probe
+
+| prompt | correctness | schema | result |
+| --- | ---: | ---: | --- |
+| raw with `/no_think` | `5/5` | `5/5` | keep |
+| raw without `/no_think` | `4/5` | `4/5` | reject |
+| embedded GGUF template / explicit ChatML | `0/5` | `0/5` | reject |
+
+The same-base quantization probe pinned `unsloth/Qwen3.5-4B-GGUF` at `e87f176479d0855a907a41277aca2f8ee7a09523`. Q4_K_M passed `5/5` at `26.13/25.69` mean/steady tok/s. Q5_K_M used 14.8 percent more artifact and runtime-model bytes, loaded in `9841 ms` instead of `5589 ms`, ran at `17.43/17.12` tok/s, and returned `flag` on the adversarial row-text case instead of the evidence-derived `pass`. Q5 stopped at the fast gate, so it did not consume a 447-job full run
+
+These are Otlet SQL-path results for this fixture and host, not general model rankings. Re-run the probe after changing the base model, prompt, runtime, or hardware
+
 Find current Hugging Face GGUF candidates before adding a model row:
 
 ```sh
