@@ -2,7 +2,8 @@ use crate::job::{
     Job, ModelSelectionPolicy, claim_jobs, insert_infer_now_job, model_selection_policy,
 };
 use crate::model::{
-    ModelError, ModelMetrics, ModelRun, clear_task_contract_digests, run_job, run_job_with_model,
+    ModelError, ModelMetrics, ModelPreload, ModelRun, clear_task_contract_digests, preload_model,
+    run_job, run_job_with_model,
 };
 use pgrx::JsonB;
 use pgrx::bgworkers::{BackgroundWorker, SignalWakeFlags};
@@ -37,6 +38,7 @@ pub extern "C-unwind" fn otlet_worker_main(_arg: pgrx::pg_sys::Datum) {
         .checked_sub(SCHEMA_READY_PROBE_INTERVAL)
         .unwrap_or_else(Instant::now);
     let mut schema_probe_due = true;
+    let mut preload_checked = false;
 
     while BackgroundWorker::wait_latch(Some(recovery_interval)) {
         if schema_probe_due || last_schema_probe.elapsed() >= SCHEMA_READY_PROBE_INTERVAL {
@@ -54,6 +56,15 @@ pub extern "C-unwind" fn otlet_worker_main(_arg: pgrx::pg_sys::Datum) {
                 continue;
             }
             schema_probe_due = false;
+        }
+
+        if !preload_checked {
+            preload_checked = true;
+            match BackgroundWorker::transaction(startup_preload_config) {
+                Ok(Some(config)) => run_startup_preload(config),
+                Ok(None) => {}
+                Err(err) => pgrx::warning!("otlet model preload lookup failed: {err}"),
+            }
         }
 
         while let Some(request) = crate::infer_now::take_request() {
@@ -134,6 +145,132 @@ pub extern "C-unwind" fn otlet_worker_main(_arg: pgrx::pg_sys::Datum) {
 
     crate::wake::unregister_worker_latch();
     pgrx::log!("otlet worker stopped");
+}
+
+struct StartupPreload {
+    model_name: String,
+    model: Option<crate::job::JobModel>,
+    runtime_options: Value,
+}
+
+fn startup_preload_config() -> pgrx::spi::Result<Option<StartupPreload>> {
+    pgrx::Spi::connect(|client| {
+        let rows = client.select(
+            "SELECT p.preload_model_name, m.artifact_path, m.artifact_hash, p.default_runtime_options FROM otlet.production_policy p LEFT JOIN otlet.models m ON m.name = p.preload_model_name WHERE p.name = 'default' AND p.preload_model_name IS NOT NULL LIMIT 1",
+            Some(1),
+            &[],
+        )?;
+        if rows.is_empty() {
+            return Ok(None);
+        }
+        let row = rows.first();
+        let model_name = row
+            .get::<String>(1)?
+            .ok_or(pgrx::spi::SpiError::InvalidPosition)?;
+        let artifact_path = row.get::<String>(2)?;
+        let artifact_hash = row.get::<String>(3)?;
+        Ok(Some(StartupPreload {
+            model: artifact_path.map(|artifact_path| crate::job::JobModel {
+                name: model_name.clone(),
+                artifact_path,
+                artifact_hash,
+            }),
+            model_name,
+            runtime_options: row
+                .get::<JsonB>(4)?
+                .ok_or(pgrx::spi::SpiError::InvalidPosition)?
+                .0,
+        }))
+    })
+}
+
+fn run_startup_preload(config: StartupPreload) {
+    let result = config
+        .model
+        .as_ref()
+        .ok_or_else(|| ModelError::new("preload model is not registered"))
+        .and_then(|model| preload_model(model, &config.runtime_options));
+    match result {
+        Ok(preload) => record_model_preload_success(&config.model_name, &preload),
+        Err(err) => record_model_preload_failure(&config.model_name, &err),
+    }
+}
+
+fn record_model_preload_success(model_name: &str, preload: &ModelPreload) {
+    let result: pgrx::spi::Result<()> = BackgroundWorker::transaction(|| {
+        pgrx::Spi::connect_mut(|client| {
+            let args = [
+                model_name.into(),
+                preload.artifact_path.as_str().into(),
+                preload.load_ms.into(),
+                preload.ctx_ms.into(),
+                preload.model_memory_bytes.into(),
+                preload.model_parameters.into(),
+                preload.context_window_tokens.into(),
+                preload.model_device_policy.into(),
+                preload.memory_accounting_policy.into(),
+                preload.worker_process_rss_bytes.into(),
+                preload.worker_process_virtual_bytes.into(),
+                preload.worker_memory_sample_policy.into(),
+                preload.model_fingerprint_hash.as_str().into(),
+                JsonB(preload.memory_trace.clone()).into(),
+            ];
+            client.update(
+                "SELECT otlet.touch_runtime_slot($1, 'ready', 0, NULL)",
+                Some(1),
+                &args[..1],
+            )?;
+            client.update(
+                "UPDATE otlet.runtime_slots SET artifact_path=$2, status='ready', active_jobs=0, loaded_at=now(), last_used_at=now(), last_error=NULL, load_ms=$3, ctx_ms=$4, model_memory_bytes=$5, model_parameters=$6, context_window_tokens=$7, model_device_policy=$8, resident_memory_tracked_bytes=GREATEST($5,0), memory_accounting_policy=$9, worker_process_rss_bytes=$10, worker_process_virtual_bytes=$11, worker_memory_sample_policy=$12 WHERE model_name=$1",
+                Some(1),
+                &args[..12],
+            )?;
+            client.update(
+                "SELECT otlet.record_worker_event('model_preload_succeeded', NULL, 'linked_inproc', 'model preload succeeded', jsonb_build_object('model_name',$1,'artifact_path',$2,'load_ms',$3,'ctx_ms',$4,'model_memory_bytes',$5,'worker_process_rss_bytes',$10,'model_fingerprint_hash',$13,'memory',$14))",
+                Some(1),
+                &args,
+            )?;
+            Ok(())
+        })
+    });
+    if let Err(err) = result {
+        pgrx::warning!("otlet model preload status failed: {err}");
+    }
+}
+
+fn record_model_preload_failure(model_name: &str, error: &ModelError) {
+    let result: pgrx::spi::Result<()> = BackgroundWorker::transaction(|| {
+        pgrx::Spi::connect_mut(|client| {
+            let trace = error
+                .trace_summary
+                .clone()
+                .unwrap_or_else(|| serde_json::json!({}));
+            let args = [
+                model_name.into(),
+                error.message.as_str().into(),
+                JsonB(trace).into(),
+            ];
+            client.update(
+                "SELECT otlet.touch_runtime_slot(m.name, 'error', 0, $2) FROM otlet.models m WHERE m.name=$1",
+                Some(1),
+                &args[..2],
+            )?;
+            client.update(
+                "SELECT otlet.record_worker_event('model_preload_failed', NULL, 'linked_inproc', 'model preload failed', jsonb_build_object('model_name',$1,'error',$2,'trace',$3))",
+                Some(1),
+                &args,
+            )?;
+            Ok(())
+        })
+    });
+    if let Err(err) = result {
+        pgrx::warning!("otlet model preload failure status failed: {err}");
+    }
+    pgrx::warning!(
+        "otlet model preload failed for {}: {}",
+        model_name,
+        error.message
+    );
 }
 
 fn process_infer_now_request(request: crate::infer_now::InferNowRequest) {

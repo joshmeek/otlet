@@ -1,15 +1,69 @@
-fn run_linked(
-    job: &Job,
+pub(crate) struct ModelPreload {
+    pub(crate) artifact_path: String,
+    pub(crate) model_fingerprint_hash: String,
+    pub(crate) load_ms: i64,
+    pub(crate) ctx_ms: i64,
+    pub(crate) model_memory_bytes: i64,
+    pub(crate) model_parameters: i64,
+    pub(crate) context_window_tokens: i64,
+    pub(crate) model_device_policy: &'static str,
+    pub(crate) memory_accounting_policy: &'static str,
+    pub(crate) worker_process_rss_bytes: i64,
+    pub(crate) worker_process_virtual_bytes: i64,
+    pub(crate) worker_memory_sample_policy: &'static str,
+    pub(crate) memory_trace: Value,
+}
+
+pub(crate) fn preload_model(
+    model: &JobModel,
+    runtime_options: &Value,
+) -> Result<ModelPreload, ModelError> {
+    let options = parse_runtime_options(runtime_options).map_err(ModelError::new)?;
+    let model = JobModelRef {
+        name: model.name.as_str(),
+        artifact_path: model.artifact_path.as_str(),
+        artifact_hash: model.artifact_hash.as_deref(),
+    };
+    let model_fingerprint_hash = model_fingerprint_hash(model);
+    let cache = LINKED_CACHE.get_or_init(|| Mutex::new(None));
+    let mut cache = cache
+        .lock()
+        .map_err(|_| ModelError::new("linked llama.cpp cache lock poisoned"))?;
+    let load = ensure_linked_model(&mut cache, model, &options, &model_fingerprint_hash)?;
+    let loaded = cache
+        .as_ref()
+        .ok_or_else(|| ModelError::new("linked llama.cpp cache did not initialize"))?;
+    let memory_after = process_memory_sample();
+    Ok(ModelPreload {
+        artifact_path: loaded.artifact_path.clone(),
+        model_fingerprint_hash: model_fingerprint_hash.to_string(),
+        load_ms: if load.cache_hit { 0 } else { loaded.load_ms },
+        ctx_ms: if load.cache_hit { 0 } else { loaded.ctx_ms },
+        model_memory_bytes: loaded.model_memory_bytes,
+        model_parameters: loaded.model_parameters,
+        context_window_tokens: loaded.context_window_tokens,
+        model_device_policy: loaded.model_device_policy,
+        memory_accounting_policy: loaded.memory_accounting_policy,
+        worker_process_rss_bytes: memory_after.rss_bytes,
+        worker_process_virtual_bytes: memory_after.virtual_bytes,
+        worker_memory_sample_policy: memory_after.policy,
+        memory_trace: build_memory_trace(
+            &load.memory_before,
+            &memory_after,
+            &load.memory_admission,
+            options.max_worker_rss_bytes,
+        ),
+    })
+}
+
+fn ensure_linked_model(
+    cache: &mut Option<LinkedCache>,
     job_model: JobModelRef<'_>,
-    prompt: &str,
-    prompt_prefix: &str,
     options: &crate::runtime::RuntimeOptions,
     model_fingerprint_hash: &str,
-) -> Result<LinkedRun, ModelError> {
+) -> Result<LinkedLoadEvidence, ModelError> {
     use std::ffi::CString;
 
-    let attempt_start = Instant::now();
-    let attempt_deadline = linked_attempt_deadline(attempt_start, job.max_attempt_ms);
     if job_model.artifact_path.starts_with("hf:") {
         return Err(ModelError::new("linked llama.cpp runtime requires a local GGUF artifact path"));
     }
@@ -17,10 +71,6 @@ fn run_linked(
         llama_cpp_sys_4::llama_backend_init();
     });
 
-    let cache = LINKED_CACHE.get_or_init(|| Mutex::new(None));
-    let mut cache = cache
-        .lock()
-        .map_err(|_| ModelError::new("linked llama.cpp cache lock poisoned"))?;
     let cache_hit = cache.as_ref().is_some_and(|cached| {
         cached.artifact_path == job_model.artifact_path
             && cached.model_fingerprint_hash.as_ref() == model_fingerprint_hash
@@ -127,6 +177,32 @@ fn run_linked(
             memory_accounting_policy: LINKED_MEMORY_ACCOUNTING_POLICY,
         });
     }
+
+    Ok(LinkedLoadEvidence {
+        cache_hit,
+        memory_before,
+        memory_admission,
+    })
+}
+
+fn run_linked(
+    job: &Job,
+    job_model: JobModelRef<'_>,
+    prompt: &str,
+    prompt_prefix: &str,
+    options: &crate::runtime::RuntimeOptions,
+    model_fingerprint_hash: &str,
+) -> Result<LinkedRun, ModelError> {
+    let attempt_start = Instant::now();
+    let attempt_deadline = linked_attempt_deadline(attempt_start, job.max_attempt_ms);
+    let cache = LINKED_CACHE.get_or_init(|| Mutex::new(None));
+    let mut cache = cache
+        .lock()
+        .map_err(|_| ModelError::new("linked llama.cpp cache lock poisoned"))?;
+    let load = ensure_linked_model(&mut cache, job_model, options, model_fingerprint_hash)?;
+    let cache_hit = load.cache_hit;
+    let memory_before = load.memory_before;
+    let memory_admission = load.memory_admission;
 
     let cache = cache
         .as_mut()
@@ -991,6 +1067,12 @@ fn validate_linked_token_budget(
 struct LinkedRun {
     raw_output: String,
     metrics: ModelMetrics,
+}
+
+struct LinkedLoadEvidence {
+    cache_hit: bool,
+    memory_before: ProcessMemorySample,
+    memory_admission: ModelLoadAdmission,
 }
 
 struct LinkedCache {

@@ -180,6 +180,14 @@ Fifty qwen35 exact hits measured `4ms` requester p50 and `5ms` p95 before fusion
 
 Failure injection on semantic record insertion left the job complete with one receipt, one output, a `semantic_materialization_failed` event, one healthy worker, and a successful later materialization retry. Failure injection inside `complete_job` previously restarted the worker and left a running lease. The guarded path instead produced one terminal failed job, one failed receipt, zero outputs, one healthy worker, and no crash finding. The full demo and five-case qwen35 probe passed after the change
 
+### Optional startup model preload
+
+`production_policy.preload_model_name` optionally loads one registered local GGUF and its context when the resident worker starts. The default is `NULL`. Preload uses the same model construction, artifact fingerprint, runtime options, RSS budget, system-memory, cgroup, and llama.cpp projection checks as a request. It creates no job or receipt. Success populates `runtime_status` and emits `model_preload_succeeded`; failure emits `model_preload_failed` once for that worker start and leaves the worker available
+
+Three same-host qwen35 restart pairs measured cold first requests at `10.131s`, `10.434s`, and `9.799s`. Preloaded first requests took `5.041s`, `5.545s`, and `5.795s`. Median first-request latency fell from `10.131s` to `5.545s`, or 45.3 percent. The measured preload used `4.994s` model load and `106ms` context construction, held `5.772 GB` worker RSS instead of the `15 MB` cold worker, and removed model load and context time from the first receipt
+
+One-client read latency averaged `0.053ms` during preload with 225,800 transactions and zero failures, compared with `0.051ms` and zero failures while the worker stayed cold. Missing registration, invalid GGUF, unreadable GGUF, and a one-byte RSS budget each produced one failure event, one stable worker PID, and no retry loop. Keep the option unset unless predictable first-request latency is worth resident memory before demand
+
 Run the default-included benchmark model:
 
 ```sh

@@ -6,6 +6,7 @@ SELECT
   p.max_attempts,
   p.max_attempt_ms,
   p.default_runtime_options,
+  p.preload_model_name,
   p.semantic_auto_wait_ms,
   p.semantic_auto_infer_ms,
   p.semantic_auto_max_rows,
