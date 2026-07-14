@@ -36,6 +36,8 @@ AS $$
       j.task_name,
       m.name AS model_name,
       m.artifact_path,
+      selection.cheap_model_name AS policy_cheap_model_name,
+      selection.strong_model_name AS policy_strong_model_name,
       EXISTS (
         SELECT 1
         FROM otlet.runtime_slots s
@@ -49,6 +51,7 @@ AS $$
     FROM otlet.jobs j
     JOIN otlet.tasks t ON t.name = j.task_name
     JOIN otlet.models m ON m.name = t.model_name
+    LEFT JOIN otlet.model_selection_policies selection ON selection.task_name = t.name
     CROSS JOIN policy p
     LEFT JOIN active_model ON active_model.model_name = m.name
     WHERE (
@@ -70,7 +73,9 @@ AS $$
     GROUP BY
       j.task_name,
       m.name,
-      m.artifact_path
+      m.artifact_path,
+      selection.cheap_model_name,
+      selection.strong_model_name
   ),
   selected_task AS (
     SELECT e.*
@@ -89,18 +94,51 @@ AS $$
       e.first_job_id
     LIMIT 1
   ),
-  claimable AS (
+  same_model_tasks AS (
+    SELECT
+      e.*,
+      row_number() OVER (
+        ORDER BY
+          CASE
+            WHEN COALESCE(p.task_cursor, '') = '' THEN 0
+            WHEN e.task_name > p.task_cursor THEN 0
+            ELSE 1
+          END,
+          e.retry_rank,
+          CASE WHEN e.warm_model THEN 0 ELSE 1 END,
+          e.task_name,
+          e.first_created_at,
+          e.first_job_id
+      ) AS task_rank
+    FROM eligible_tasks e
+    JOIN selected_task f
+      ON f.model_name = e.model_name
+     AND f.artifact_path IS NOT DISTINCT FROM e.artifact_path
+     AND f.policy_cheap_model_name IS NOT DISTINCT FROM e.policy_cheap_model_name
+     AND f.policy_strong_model_name IS NOT DISTINCT FROM e.policy_strong_model_name
+    CROSS JOIN policy p
+  ),
+  ranked_candidates AS (
     SELECT
       j.id,
+      j.task_name,
       otlet.effective_job_lease_interval(
         p.default_runtime_options || t.runtime_options,
         p.max_attempt_ms,
         p.job_lease_interval
-      ) AS lease_interval
+      ) AS lease_interval,
+      f.task_rank,
+      row_number() OVER (
+        PARTITION BY j.task_name
+        ORDER BY
+          CASE WHEN j.status IN ('running', 'cancel_requested') AND (j.leased_until IS NULL OR j.leased_until < now()) THEN 0 ELSE 1 END,
+          j.created_at,
+          j.id
+      ) AS task_job_rank
     FROM otlet.jobs j
     JOIN otlet.tasks t ON t.name = j.task_name
     JOIN otlet.models m ON m.name = t.model_name
-    JOIN selected_task f
+    JOIN same_model_tasks f
       ON f.task_name = j.task_name
      AND f.model_name = m.name
      AND f.artifact_path IS NOT DISTINCT FROM m.artifact_path
@@ -117,17 +155,43 @@ AS $$
           AND (j.leased_until IS NULL OR j.leased_until < now())
         )
       )
+  ),
+  claimable AS (
+    SELECT
+      j.id,
+      candidate.task_name,
+      candidate.lease_interval,
+      candidate.task_rank,
+      candidate.task_job_rank
+    FROM otlet.jobs j
+    JOIN ranked_candidates candidate ON candidate.id = j.id
+    CROSS JOIN policy p
+    WHERE (
+        j.status = 'queued'
+        OR (
+          j.status = 'running'
+          AND (j.leased_until IS NULL OR j.leased_until < now())
+          AND j.attempts < p.max_attempts
+        )
+        OR (
+          j.status = 'cancel_requested'
+          AND (j.leased_until IS NULL OR j.leased_until < now())
+        )
+      )
     ORDER BY
-      CASE WHEN j.id = f.first_job_id THEN 0 ELSE 1 END,
-      CASE WHEN j.status IN ('running', 'cancel_requested') AND (j.leased_until IS NULL OR j.leased_until < now()) THEN 0 ELSE 1 END,
-      j.created_at,
-      j.id
+      candidate.task_job_rank,
+      candidate.task_rank
     FOR UPDATE OF j SKIP LOCKED
     LIMIT (SELECT batch_size FROM policy)
   ),
   advance_cursor AS (
     UPDATE otlet.production_policy p
-    SET worker_claim_task_cursor = (SELECT task_name FROM selected_task)
+    SET worker_claim_task_cursor = (
+      SELECT task_name
+      FROM claimable
+      ORDER BY task_job_rank DESC, task_rank DESC
+      LIMIT 1
+    )
     WHERE p.name = 'default'
       AND EXISTS (SELECT 1 FROM claimable)
     RETURNING p.worker_claim_task_cursor
@@ -145,7 +209,10 @@ AS $$
     WHERE j.id = claimable.id
     RETURNING j.*
   )
-  SELECT * FROM updated ORDER BY created_at, id;
+  SELECT updated.*
+  FROM updated
+  JOIN claimable ON claimable.id = updated.id
+  ORDER BY claimable.task_rank, claimable.task_job_rank;
 $$;
 
 CREATE FUNCTION otlet.renew_job_lease(

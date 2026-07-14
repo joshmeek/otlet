@@ -83,6 +83,10 @@ SELECT
   COALESCE((last_batch.detail ->> 'completed_jobs')::bigint, 0) AS last_batch_completed_jobs,
   COALESCE((last_batch.detail ->> 'failed_jobs')::bigint, 0) AS last_batch_failed_jobs,
   COALESCE(last_batch.detail ->> 'task_name', '') AS last_batch_task_name,
+  COALESCE(
+    last_batch.detail -> 'task_names',
+    jsonb_build_array(COALESCE(last_batch.detail ->> 'task_name', ''))
+  ) AS last_batch_task_names,
   last_batch.created_at AS last_batch_at,
   COALESCE(recent_batches.recent_batch_tasks, '[]'::jsonb) AS recent_batch_tasks
 FROM otlet.models m
@@ -101,6 +105,7 @@ LEFT JOIN LATERAL (
   SELECT jsonb_agg(
            jsonb_build_object(
              'task_name', recent.task_name,
+             'task_names', recent.task_names,
              'job_count', recent.job_count,
              'completed_jobs', recent.completed_jobs,
              'failed_jobs', recent.failed_jobs
@@ -112,6 +117,10 @@ LEFT JOIN LATERAL (
       e.id,
       e.created_at,
       COALESCE(e.detail ->> 'task_name', '') AS task_name,
+      COALESCE(
+        e.detail -> 'task_names',
+        jsonb_build_array(COALESCE(e.detail ->> 'task_name', ''))
+      ) AS task_names,
       COALESCE((e.detail ->> 'job_count')::bigint, 0) AS job_count,
       COALESCE((e.detail ->> 'completed_jobs')::bigint, 0) AS completed_jobs,
       COALESCE((e.detail ->> 'failed_jobs')::bigint, 0) AS failed_jobs

@@ -87,24 +87,29 @@ pub extern "C-unwind" fn otlet_worker_main(_arg: pgrx::pg_sys::Datum) {
                 }
             };
 
-            let batch_meta = jobs.first().filter(|_| jobs.len() > 1).map(|job| {
+            let batch_owned = jobs.first().filter(|_| jobs.len() > 1).map(|job| {
+                let mut task_names = jobs
+                    .iter()
+                    .map(|job| job.task_name.clone())
+                    .collect::<Vec<_>>();
+                task_names.sort_unstable();
+                task_names.dedup();
                 (
-                    job.task_name.as_str(),
-                    job.model_name.as_str(),
+                    job.task_name.clone(),
+                    task_names,
+                    job.model_name.clone(),
                     i64::try_from(jobs.len()).unwrap_or(i64::MAX),
                 )
             });
-            // Capture owned names before moving jobs into process_job_batch.
-            let batch_owned =
-                batch_meta.map(|(task, model, count)| (task.to_owned(), model.to_owned(), count));
 
             let batch_start = Instant::now();
             let batch_result = process_job_batch(jobs);
             let batch_ms = millis_since(batch_start);
 
-            if let Some((task_name, model_name, job_count)) = batch_owned {
+            if let Some((task_name, task_names, model_name, job_count)) = batch_owned {
                 record_worker_batch_finished(
                     &task_name,
+                    &task_names,
                     &model_name,
                     job_count,
                     batch_result.completed,
@@ -1299,6 +1304,7 @@ fn record_metrics(job: &Job, model_name: &str, metrics: &ModelMetrics) {
 
 fn record_worker_batch_finished(
     task_name: &str,
+    task_names: &[String],
     model_name: &str,
     job_count: i64,
     completed: i64,
@@ -1312,6 +1318,10 @@ fn record_worker_batch_finished(
                 Option::<i64>::None.into(),
                 "linked_inproc".into(),
                 task_name.into(),
+                JsonB(Value::Array(
+                    task_names.iter().cloned().map(Value::String).collect(),
+                ))
+                .into(),
                 model_name.into(),
                 job_count.into(),
                 completed.into(),
@@ -1320,7 +1330,7 @@ fn record_worker_batch_finished(
                 model_swaps.into(),
             ];
             client.update(
-                "SELECT otlet.record_worker_event('worker_batch_finished', $1, $2, 'worker_batch_finished', jsonb_build_object('task_name', $3, 'model_name', $4, 'job_count', $5, 'completed_jobs', $6, 'failed_jobs', $7, 'batch_ms', $8, 'model_swaps', $9))",
+                "SELECT otlet.record_worker_event('worker_batch_finished', $1, $2, 'worker_batch_finished', jsonb_build_object('task_name', $3, 'task_names', $4, 'model_name', $5, 'job_count', $6, 'completed_jobs', $7, 'failed_jobs', $8, 'batch_ms', $9, 'model_swaps', $10))",
                 Some(1),
                 &args,
             )?;

@@ -248,6 +248,10 @@ SELECT
   e.id AS event_id,
   e.created_at,
   COALESCE(e.detail ->> 'task_name', '') AS task_name,
+  COALESCE(
+    e.detail -> 'task_names',
+    jsonb_build_array(COALESCE(e.detail ->> 'task_name', ''))
+  ) AS task_names,
   COALESCE(e.detail ->> 'model_name', '') AS model_name,
   COALESCE((e.detail ->> 'job_count')::bigint, 0) AS job_count,
   COALESCE((e.detail ->> 'completed_jobs')::bigint, 0) AS completed_jobs,

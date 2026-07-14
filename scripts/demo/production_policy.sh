@@ -326,6 +326,7 @@ DECLARE
   claimed_task text;
   task_model text;
   task_runtime text;
+  batch_task_names jsonb;
   job_row otlet.jobs%ROWTYPE;
   small_task_name text;
 BEGIN
@@ -334,10 +335,14 @@ BEGIN
   FOR batch_no IN 1..4 LOOP
     claimed_count := 0;
     claimed_task := NULL;
+    batch_task_names := '[]'::jsonb;
 
     FOR job_row IN SELECT * FROM otlet.claim_jobs() LOOP
       claimed_count := claimed_count + 1;
       claimed_task := job_row.task_name;
+      IF NOT batch_task_names ? job_row.task_name THEN
+        batch_task_names := batch_task_names || to_jsonb(job_row.task_name);
+      END IF;
       INSERT INTO queue_fairness_claims VALUES (batch_no, job_row.task_name, job_row.id);
       PERFORM otlet.complete_job(
         job_row.id,
@@ -361,6 +366,7 @@ BEGIN
         'worker_batch_finished',
         jsonb_build_object(
           'task_name', claimed_task,
+          'task_names', batch_task_names,
           'model_name', task_model,
           'job_count', claimed_count,
           'completed_jobs', claimed_count,
@@ -385,7 +391,9 @@ WITH params AS (
 summary AS (
   SELECT
     count(*) FILTER (WHERE c.task_name = p.small_task)::bigint AS small_claimed,
-    max(c.batch_no) FILTER (WHERE c.task_name = p.small_task) AS last_small_batch
+    max(c.batch_no) FILTER (WHERE c.task_name = p.small_task) AS last_small_batch,
+    count(*) FILTER (WHERE c.batch_no = 1) = 8
+      AND count(DISTINCT c.task_name) FILTER (WHERE c.batch_no = 1) = 2 AS cross_task_batch
   FROM params p
   LEFT JOIN queue_fairness_claims c ON true
   GROUP BY p.small_task
@@ -401,23 +409,26 @@ visible_batches AS (
       SELECT 1
       FROM status s, params p, jsonb_array_elements(s.recent_batch_tasks) item
       WHERE item ->> 'task_name' = p.big_task
+         OR (item -> 'task_names') ? p.big_task
     ) AS has_big,
     EXISTS (
       SELECT 1
       FROM status s, params p, jsonb_array_elements(s.recent_batch_tasks) item
       WHERE item ->> 'task_name' = p.small_task
+         OR (item -> 'task_names') ? p.small_task
     ) AS has_small
 )
 SELECT (small_claimed = 4)::text || '|' ||
        (last_small_batch <= 2)::text || '|' ||
+       cross_task_batch::text || '|' ||
        (has_big AND has_small)::text
 FROM summary, visible_batches;
 SQL
 )"
 queue_fairness_contract="$(tail -n 1 <<<"$queue_fairness_output")"
 echo "queue_fairness_contract=$queue_fairness_contract"
-[ "$queue_fairness_contract" = "true|true|true" ] || {
-  echo "Expected queue fairness contract true|true|true, got $queue_fairness_contract" >&2
+[ "$queue_fairness_contract" = "true|true|true|true" ] || {
+  echo "Expected queue fairness contract true|true|true|true, got $queue_fairness_contract" >&2
   exit 1
 }
 jobs_status_check_contract="$(

@@ -103,6 +103,18 @@ The paired A/B workload alternated four tasks across qwen3_1_7b and qwen35_4b, q
 
 The candidate median reduced model loads from six to five and load time from 35.940s to 34.583s. Median wall time regressed from 66.059s to 86.740s, and median maximum queue wait regressed from 64.631s to 75.488s. The candidate also passed focused task-turn, continuous-arrival starvation, lease, cancellation, and concurrent-claim checks, but failed the wall-time and queue-wait retention gate. No scheduler code was retained
 
+### Same-model cross-task claims
+
+The task-cursor scheduler at `962dcc49` opened one claim per task even when several one-row tasks used the same model. A five-run model-free fixture compared 1, 4, and 16 direct qwen35 tasks with `worker_claim_batch_size = 8` on PostgreSQL 18.4. No model was loaded or executed
+
+| tasks | task-cursor claims | cross-task claims | task-cursor jobs/claim | cross-task jobs/claim | task-cursor drain | cross-task drain |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 1 | 1 | 1 | 1 | 0.370ms | 0.265ms |
+| 4 | 4 | 1 | 1 | 4 | 0.690ms | 0.435ms |
+| 16 | 16 | 2 | 1 | 8 | 3.264ms | 0.877ms |
+
+The retained claim fills each batch by task round, advances the cursor to the last claimed task, and groups only tasks with the same base model, artifact, and cheap/strong policy models. Two simultaneous claimers took eight unique jobs each from a 16-task queue. Expired running jobs, cancel-requested jobs, per-task FIFO order, model-policy separation, queue caps, and the full demo stayed valid. Batch events now include every claimed task in `task_names`
+
 ### Single-context batching
 
 The current linked llama.cpp API can isolate multiple sequence IDs, KV positions, samplers, JSON stopping, and cancellation in one context. The smallest Otlet prototype still failed the combined throughput and memory gate:
