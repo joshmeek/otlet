@@ -194,6 +194,12 @@ The resident worker keeps the 16 most recently used exact task contracts across 
 
 A release-mode fixture repeated a 100-field schema and 4,000-byte instruction 20,000 times. Clearing the task cache for each simulated one-job batch took `220.824ms`, or `11.041us` per preparation. The bounded cross-batch cache took `63.806ms`, or `3.190us` per preparation, a 71.1 percent reduction. Exact hits perform no new task-contract or prompt-prefix heap construction. The five-case qwen35 probe and full demo passed with prompt identity, contract invalidation, permissions, zero invariant findings, and a clean crash scan
 
+### Static prompt-prefix token reuse
+
+Saved prompt-prefix states already retain the exact prefix token vector. The linked runtime now reuses that vector after matching the resident model, exact prefix hash, and exact prefix bytes instead of tokenizing the static prefix again. It still tokenizes the full prompt and still checks that the cached prefix tokens are its exact leading token sequence before restoring state. Prefix tokens share the existing four-entry, 512 MiB prefix-state lifetime and byte accounting; there is no second token cache
+
+Back-to-back baseline and candidate runs used 30 cache-disabled qwen35 requests per shape. For a 307-token prompt with 298 reusable prefix tokens, tokenization moved from `5ms` p50 and `14.1ms` p95 to `4ms` and `13.1ms`. For a 707-token prompt with 698 reusable prefix tokens, it moved from `7ms` and `13.55ms` to `5ms` and `12.55ms`. All 60 candidate outputs passed schema validation with one prompt hash per shape. A qwen35-to-qwen3 swap saved a new one-entry prefix state with zero reused tokens, proving model changes cannot reuse the previous model's tokens. The five-case qwen35 probe and full demo passed with zero invariant or crash findings
+
 Run the default-included benchmark model:
 
 ```sh
