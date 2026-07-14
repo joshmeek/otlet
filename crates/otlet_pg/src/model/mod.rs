@@ -46,11 +46,13 @@ pub(crate) struct ModelMetrics {
     pub(crate) effective_llama_threads: i64,
     pub(crate) effective_llama_batch_threads: i64,
     pub(crate) generated_tokens: i64,
+    pub(crate) runtime_prepare_ms: i64,
     pub(crate) tokenize_ms: i64,
     pub(crate) prompt_decode_ms: i64,
     pub(crate) first_token_ms: i64,
     pub(crate) ttft_ms: i64,
     pub(crate) generate_ms: i64,
+    pub(crate) postprocess_ms: i64,
     pub(crate) cache_hit: bool,
     pub(crate) inference_cache_hit: bool,
     pub(crate) inference_cache_entries: i64,
@@ -218,6 +220,7 @@ pub(crate) fn run_job_with_model(job: &Job, model: &JobModel) -> Result<ModelRun
 }
 
 fn run_job_with_model_ref(job: &Job, model: JobModelRef<'_>) -> Result<ModelRun, ModelError> {
+    let prepare_started = Instant::now();
     let digests = task_contract_digests(job);
     let options = digests
         .runtime_options
@@ -301,7 +304,9 @@ fn run_job_with_model_ref(job: &Job, model: JobModelRef<'_>) -> Result<ModelRun,
         }
     }
 
-    let (raw_output, mut metrics, context) = if let Some(raw_output) = cache_lookup.raw_output {
+    let (raw_output, mut metrics, context, runtime_prepare_ms) = if let Some(raw_output) =
+        cache_lookup.raw_output
+    {
         // Trusted cache entry already passed schema validation when stored.
         if linked_cancel_requested(job.id)? {
             return Err(ModelError::new("canceled"));
@@ -374,11 +379,13 @@ fn run_job_with_model_ref(job: &Job, model: JobModelRef<'_>) -> Result<ModelRun,
                 effective_llama_threads: 0,
                 effective_llama_batch_threads: 0,
                 generated_tokens: 0,
+                runtime_prepare_ms: 0,
                 tokenize_ms: 0,
                 prompt_decode_ms: 0,
                 first_token_ms: 0,
                 ttft_ms: 0,
                 generate_ms: 0,
+                postprocess_ms: 0,
                 cache_hit: false,
                 inference_cache_hit: true,
                 inference_cache_entries: cache_lookup.stats.entries,
@@ -398,6 +405,7 @@ fn run_job_with_model_ref(job: &Job, model: JobModelRef<'_>) -> Result<ModelRun,
                 stop_reason: "inference_cache_hit",
             },
             context,
+            elapsed_ms(prepare_started),
         )
     } else {
         validate_output_schema(&job.output_schema, &digests.output_schema_hash).map_err(|err| {
@@ -433,6 +441,7 @@ fn run_job_with_model_ref(job: &Job, model: JobModelRef<'_>) -> Result<ModelRun,
             full: shaped_prompt.full,
             prefix: prompt_prefix,
         };
+        let runtime_prepare_ms = elapsed_ms(prepare_started);
         let linked = run_linked(
             job,
             model,
@@ -450,88 +459,56 @@ fn run_job_with_model_ref(job: &Job, model: JobModelRef<'_>) -> Result<ModelRun,
         let mut metrics = linked.metrics;
         metrics.inference_cache_hit = false;
         metrics.inference_cache_invalidation_reason = cache_lookup.reason;
-        (RawOutput::Generated(linked.raw_output), metrics, context)
+        (
+            RawOutput::Generated(linked.raw_output),
+            metrics,
+            context,
+            runtime_prepare_ms,
+        )
     };
+    metrics.runtime_prepare_ms = runtime_prepare_ms;
     let cache_enabled = options.inference_cache && !options.generation_trace;
     let raw_output_hash = hash_text(raw_output.as_str());
-    let trace_summary = generation_trace_summary(&context, &metrics, &raw_output_hash);
+    let postprocess_started = Instant::now();
+
+    macro_rules! fail_postprocess {
+        ($message:expr) => {{
+            metrics.postprocess_ms = elapsed_ms(postprocess_started);
+            let trace_summary = generation_trace_summary(&context, &metrics, &raw_output_hash);
+            return Err(ModelError::with_context(
+                $message,
+                raw_output.into_owned(),
+                &context,
+                trace_summary,
+                raw_output_hash.clone(),
+            )
+            .with_metrics(metrics));
+        }};
+    }
 
     let mut json = match parse_model_json(raw_output.as_str()) {
         Ok(parsed) => parsed,
-        Err(err) => {
-            return Err(ModelError::with_context(
-                err,
-                raw_output.into_owned(),
-                &context,
-                trace_summary,
-                raw_output_hash.clone(),
-            )
-            .with_metrics(metrics));
-        }
+        Err(err) => fail_postprocess!(err),
     };
     let raw_json = raw_output.as_str().trim().to_owned();
     let Some(object) = json.as_object_mut() else {
-        return Err(ModelError::with_context(
-            "model JSON must be an object".to_owned(),
-            raw_output.into_owned(),
-            &context,
-            trace_summary,
-            raw_output_hash.clone(),
-        )
-        .with_metrics(metrics));
+        fail_postprocess!("model JSON must be an object".to_owned());
     };
     if object.keys().any(|key| key != "output" && key != "actions") {
-        return Err(ModelError::with_context(
-            "model JSON has unsupported top-level key".to_owned(),
-            raw_output.into_owned(),
-            &context,
-            trace_summary,
-            raw_output_hash.clone(),
-        )
-        .with_metrics(metrics));
+        fail_postprocess!("model JSON has unsupported top-level key".to_owned());
     }
     let Some(output) = object.remove("output") else {
-        return Err(ModelError::with_context(
-            "model JSON missing output".to_owned(),
-            raw_output.into_owned(),
-            &context,
-            trace_summary,
-            raw_output_hash.clone(),
-        )
-        .with_metrics(metrics));
+        fail_postprocess!("model JSON missing output".to_owned());
     };
     let Some(actions_value) = object.remove("actions") else {
-        return Err(ModelError::with_context(
-            "model JSON missing actions".to_owned(),
-            raw_output.into_owned(),
-            &context,
-            trace_summary,
-            raw_output_hash.clone(),
-        )
-        .with_metrics(metrics));
+        fail_postprocess!("model JSON missing actions".to_owned());
     };
     let actions = match model_actions(actions_value) {
         Ok(actions) => actions,
-        Err(err) => {
-            return Err(ModelError::with_context(
-                err,
-                raw_output.into_owned(),
-                &context,
-                trace_summary,
-                raw_output_hash.clone(),
-            )
-            .with_metrics(metrics));
-        }
+        Err(err) => fail_postprocess!(err),
     };
     if let Err(err) = validate_output(&job.output_schema, &digests.output_schema_hash, &output) {
-        return Err(ModelError::with_context(
-            err,
-            raw_output.into_owned(),
-            &context,
-            trace_summary,
-            raw_output_hash.clone(),
-        )
-        .with_metrics(metrics));
+        fail_postprocess!(err);
     }
     if cache_enabled && !metrics.inference_cache_hit {
         let stats = inference_cache_put(
@@ -546,6 +523,8 @@ fn run_job_with_model_ref(job: &Job, model: JobModelRef<'_>) -> Result<ModelRun,
         metrics.inference_cache_bytes = stats.bytes;
         metrics.inference_cache_evictions = stats.evictions;
         metrics.inference_cache_eviction_reason = stats.eviction_reason;
+        metrics.postprocess_ms = elapsed_ms(postprocess_started);
+        let trace_summary = generation_trace_summary(&context, &metrics, &raw_output_hash);
         return Ok(ModelRun {
             output,
             raw_output: raw_json,
@@ -558,6 +537,8 @@ fn run_job_with_model_ref(job: &Job, model: JobModelRef<'_>) -> Result<ModelRun,
             trace_summary,
         });
     }
+    metrics.postprocess_ms = elapsed_ms(postprocess_started);
+    let trace_summary = generation_trace_summary(&context, &metrics, &raw_output_hash);
     Ok(ModelRun {
         output,
         raw_output: raw_json,

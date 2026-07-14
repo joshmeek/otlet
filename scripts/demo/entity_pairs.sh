@@ -1100,6 +1100,24 @@ echo "receipt_timing_contract=$timing_contract"
   exit 1
 }
 
+stage_timing_contract="$(psql_exec -qAt \
+  -v entity_task="$entity_task" \
+  -v join_task="$join_task" <<'SQL'
+SELECT (count(*) > 0)::text || '|' ||
+       bool_and(accounted_worker_ms > 0)::text || '|' ||
+       bool_and(observed_end_to_end_ms >= queue_wait_ms)::text || '|' ||
+       bool_and(timing_overrun_ms <= 100)::text
+FROM otlet.runtime_stage_timing_status
+WHERE task_name IN (:'entity_task', :'join_task')
+  AND status = 'complete';
+SQL
+)"
+echo "runtime_stage_timing_contract=$stage_timing_contract"
+[ "$stage_timing_contract" = "true|true|true|true" ] || {
+  echo "Expected reconciled runtime stage timing, got $stage_timing_contract" >&2
+  exit 1
+}
+
 visibility_status="$(psql_exec -qAt \
   -v entity_task="$entity_task" \
   -v join_task="$join_task" <<'SQL'
