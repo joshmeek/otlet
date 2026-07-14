@@ -67,6 +67,9 @@ struct OtletSemanticCustomScanState {
     missing_rows: u64,
     inflight_rows: u64,
     queued_refreshes: u64,
+    refresh_queue_skips: u64,
+    refresh_queue_batches: u64,
+    refresh_queue_errors: u64,
     infer_now_batches: u64,
     infer_now_ms: u64,
     infer_now_timeouts: u64,
@@ -196,6 +199,9 @@ struct RuntimeState {
     missing_rows: u64,
     inflight_rows: u64,
     queued_refreshes: u64,
+    refresh_queue_skips: u64,
+    refresh_queue_batches: u64,
+    refresh_queue_errors: u64,
     infer_now_batches: u64,
     infer_now_ms: u64,
     infer_now_timeouts: u64,
@@ -219,6 +225,7 @@ struct RuntimeState {
     infer_trace_detailed_top_k: u64,
     child_plan_rows: u64,
     queued_refresh_subjects: HashSet<String>,
+    pending_refresh_subjects: Vec<String>,
     pending_output_rows: VecDeque<*mut pg_sys::TupleTableSlot>,
 }
 

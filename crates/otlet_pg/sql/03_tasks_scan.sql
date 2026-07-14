@@ -565,3 +565,27 @@ BEGIN
   RETURN queued;
 END;
 $$;
+
+CREATE FUNCTION otlet.run_task_subjects(
+  task_name text,
+  subject_ids text[]
+) RETURNS TABLE(subject_id text, queued boolean)
+LANGUAGE plpgsql
+AS $$
+BEGIN
+  IF cardinality(run_task_subjects.subject_ids) > 64 THEN
+    RAISE EXCEPTION 'otlet.run_task_subjects accepts at most 64 subjects';
+  END IF;
+
+  RETURN QUERY
+  SELECT requested.subject_id,
+         otlet.run_task_subject(run_task_subjects.task_name, requested.subject_id) > 0
+  FROM unnest(COALESCE(run_task_subjects.subject_ids, ARRAY[]::text[])) WITH ORDINALITY
+    AS requested(subject_id, ordinal)
+  WHERE requested.subject_id IS NOT NULL
+  ORDER BY requested.ordinal;
+END;
+$$;
+
+COMMENT ON FUNCTION otlet.run_task_subjects(text, text[]) IS
+  'Queues a bounded subject array in order through the existing per-subject task and admission contract';

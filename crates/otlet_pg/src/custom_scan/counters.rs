@@ -110,6 +110,9 @@ unsafe fn snapshot_runtime_counters(
         (*state).missing_rows = runtime.missing_rows;
         (*state).inflight_rows = runtime.inflight_rows;
         (*state).queued_refreshes = runtime.queued_refreshes;
+        (*state).refresh_queue_skips = runtime.refresh_queue_skips;
+        (*state).refresh_queue_batches = runtime.refresh_queue_batches;
+        (*state).refresh_queue_errors = runtime.refresh_queue_errors;
         (*state).infer_now_batches = runtime.infer_now_batches;
         (*state).infer_now_ms = runtime.infer_now_ms;
         (*state).infer_now_timeouts = runtime.infer_now_timeouts;

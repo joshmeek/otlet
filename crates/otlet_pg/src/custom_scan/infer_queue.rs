@@ -26,41 +26,93 @@ fn with_semantic_slot_input_bytes<R>(
 }
 
 fn queue_refresh_if_allowed(runtime: &mut RuntimeState, subject_id: &str) {
-    if !runtime.allow_refresh || runtime.queued_refresh_subjects.contains(subject_id) {
+    if !runtime.allow_refresh {
         return;
     }
-    match queue_subject_refresh(&runtime.task_name, subject_id) {
-        Ok(true) => {
-            runtime
-                .queued_refresh_subjects
-                .insert(subject_id.to_owned());
-            runtime.queued_refreshes += 1;
-        }
-        Ok(false) => {
-            // Subject already had an active job; remember so we do not re-SPI.
-            runtime
-                .queued_refresh_subjects
-                .insert(subject_id.to_owned());
-        }
-        Err(err) => pgrx::warning!("otlet semantic CustomScan refresh queue failed: {err}"),
+    if runtime.queued_refresh_subjects.contains(subject_id)
+        || runtime
+            .pending_refresh_subjects
+            .iter()
+            .any(|pending| pending == subject_id)
+    {
+        runtime.refresh_queue_skips = runtime.refresh_queue_skips.saturating_add(1);
+        return;
+    }
+    runtime.pending_refresh_subjects.push(subject_id.to_owned());
+    if runtime.pending_refresh_subjects.len() >= CUSTOM_SCAN_REFRESH_BATCH_SIZE {
+        flush_refresh_queue_or_warn(runtime);
     }
 }
 
-fn queue_subject_refresh(task_name: &str, subject_id: &str) -> Result<bool, String> {
+fn flush_refresh_queue_or_warn(runtime: &mut RuntimeState) {
+    if let Err(err) = flush_refresh_queue(runtime) {
+        pgrx::warning!("otlet semantic CustomScan refresh queue failed: {err}");
+    }
+}
+
+fn flush_refresh_queue(runtime: &mut RuntimeState) -> Result<(), String> {
+    if runtime.pending_refresh_subjects.is_empty() {
+        return Ok(());
+    }
+    let subjects = std::mem::replace(
+        &mut runtime.pending_refresh_subjects,
+        Vec::with_capacity(CUSTOM_SCAN_REFRESH_BATCH_SIZE),
+    );
+    runtime.refresh_queue_batches = runtime.refresh_queue_batches.saturating_add(1);
+    let results = match queue_subject_refreshes(&runtime.task_name, &subjects) {
+        Ok(results) => results,
+        Err(err) => {
+            runtime.refresh_queue_errors = runtime
+                .refresh_queue_errors
+                .saturating_add(subjects.len() as u64);
+            return Err(err);
+        }
+    };
+    for (subject_id, queued) in results {
+        runtime.queued_refresh_subjects.insert(subject_id);
+        if queued {
+            runtime.queued_refreshes = runtime.queued_refreshes.saturating_add(1);
+        } else {
+            runtime.refresh_queue_skips = runtime.refresh_queue_skips.saturating_add(1);
+        }
+    }
+    Ok(())
+}
+
+fn queue_subject_refreshes(
+    task_name: &str,
+    subject_ids: &[String],
+) -> Result<Vec<(String, bool)>, String> {
     pgrx::Spi::connect(|client| {
-        let args = [task_name.into(), subject_id.into()];
+        let subject_refs = subject_ids.iter().map(String::as_str).collect::<Vec<_>>();
+        let args = [task_name.into(), subject_refs.as_slice().into()];
         let table = client
             .select(
-                "SELECT otlet.run_task_subject($1, $2)::bigint AS queued",
-                Some(1),
+                "SELECT subject_id, queued FROM otlet.run_task_subjects($1, $2::text[])",
+                Some(subject_ids.len() as i64),
                 &args,
             )
             .map_err(to_string)?;
-        let row = table.first();
-        let Some(queued) = row.get::<i64>(1).map_err(to_string)? else {
-            return Err("otlet.run_task_subject returned null queued count".to_owned());
-        };
-        Ok(queued > 0)
+        let mut results = Vec::with_capacity(table.len());
+        for row in table {
+            let subject_id = row
+                .get::<String>(1)
+                .map_err(to_string)?
+                .ok_or_else(|| "otlet.run_task_subjects returned null subject_id".to_owned())?;
+            let queued = row
+                .get::<bool>(2)
+                .map_err(to_string)?
+                .ok_or_else(|| "otlet.run_task_subjects returned null queued status".to_owned())?;
+            results.push((subject_id, queued));
+        }
+        if results.len() != subject_ids.len() {
+            return Err(format!(
+                "otlet.run_task_subjects returned {} of {} subjects",
+                results.len(),
+                subject_ids.len()
+            ));
+        }
+        Ok(results)
     })
 }
 

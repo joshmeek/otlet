@@ -200,6 +200,22 @@ Saved prompt-prefix states already retain the exact prefix token vector. The lin
 
 Back-to-back baseline and candidate runs used 30 cache-disabled qwen35 requests per shape. For a 307-token prompt with 298 reusable prefix tokens, tokenization moved from `5ms` p50 and `14.1ms` p95 to `4ms` and `13.1ms`. For a 707-token prompt with 698 reusable prefix tokens, it moved from `7ms` and `13.55ms` to `5ms` and `12.55ms`. All 60 candidate outputs passed schema validation with one prompt hash per shape. A qwen35-to-qwen3 swap saved a new one-entry prefix state with zero reused tokens, proving model changes cannot reuse the previous model's tokens. The five-case qwen35 probe and full demo passed with zero invariant or crash findings
 
+### Batched CustomScan refresh enqueue
+
+Queue-refresh CustomScan paths collect at most 64 unique unresolved subjects before one SPI call. The SQL boundary rejects larger arrays and sends each subject through the existing `run_task_subject` source query, input shaping, active-job conflict, model queue cap, suppression event, worker wakeup, and transaction contract. Synchronous wait and infer-now paths are unchanged
+
+Seven same-host model-free runs measured 1, 100, and 1,000 missing subjects with the worker paused and cache disabled. Every run queued the exact requested count
+
+| subjects | scalar p50 | batched p50 | scalar p95 | batched p95 | SPI calls |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | `1.248ms` | `1.146ms` | `10.385ms` | `10.180ms` | 1 to 1 |
+| 100 | `58.980ms` | `54.511ms` | `67.976ms` | `63.748ms` | 100 to 2 |
+| 1,000 | `2332.426ms` | `921.476ms` | `2644.688ms` | `1091.743ms` | 1,000 to 16 |
+
+The 1,000-row EXPLAIN execution fell from `2003.687ms` to `547.072ms`, while shared-buffer hits fell from 5,146,265 to 162,256. EXPLAIN now separates accepted refreshes, skipped subjects, batch calls, and failed subjects
+
+With a queue cap of one, the scan accepted one shaped MVCC-bound job and skipped the other 99 subjects. A second scan suppressed the active subject, rollback and statement cancellation left zero jobs, a forced short SQL result failed all 1,000 subjects closed, and the non-CustomScan `LIMIT 1` plan retained its scalar behavior. An explicit correlated LATERAL rescan crashed the backend at both baseline commit `521571f9` and the candidate, so this change does not claim to repair that existing CustomScan limitation. The full demo passed row and join CustomScan, infer-now, queue suppression, permissions, zero invariant findings, and its crash scan
+
 Run the default-included benchmark model:
 
 ```sh

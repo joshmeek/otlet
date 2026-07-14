@@ -136,6 +136,9 @@ unsafe extern "C-unwind" fn begin_semantic_custom_scan(
             missing_rows: 0,
             inflight_rows: 0,
             queued_refreshes: 0,
+            refresh_queue_skips: 0,
+            refresh_queue_batches: 0,
+            refresh_queue_errors: 0,
             infer_now_batches: 0,
             infer_now_ms: 0,
             infer_now_timeouts: 0,
@@ -161,6 +164,7 @@ unsafe extern "C-unwind" fn begin_semantic_custom_scan(
             queued_refresh_subjects: HashSet::with_capacity(
                 usize::try_from(private.infer_max_rows.max(8)).unwrap_or(8),
             ),
+            pending_refresh_subjects: Vec::with_capacity(CUSTOM_SCAN_REFRESH_BATCH_SIZE),
             pending_output_rows: VecDeque::with_capacity(
                 usize::try_from(private.infer_max_rows)
                     .unwrap_or(0)
@@ -223,9 +227,11 @@ unsafe extern "C-unwind" fn semantic_custom_scan_access(
 
         loop {
             if let Some(slot) = emit_buffered_row(node, runtime) {
+                flush_refresh_queue_or_warn(runtime);
                 return slot;
             }
             let Some(slot) = next_source_slot(node, runtime) else {
+                flush_refresh_queue_or_warn(runtime);
                 return clear_slot((*node).ss.ss_ScanTupleSlot);
             };
             runtime.rows_seen += 1;
@@ -253,6 +259,7 @@ unsafe extern "C-unwind" fn semantic_custom_scan_access(
                     runtime.lookup_rows += 1;
                     record_emitted_freshness_basis(runtime, &subject_id);
                     runtime.rows_returned += 1;
+                    flush_refresh_queue_or_warn(runtime);
                     return slot;
                 }
                 SubjectSemanticState::FreshNonMatch => {
@@ -264,6 +271,7 @@ unsafe extern "C-unwind" fn semantic_custom_scan_access(
                     if let Some(slot) =
                         resolve_stale_or_missing_subject(node, runtime, &subject_id, slot)
                     {
+                        flush_refresh_queue_or_warn(runtime);
                         return slot;
                     }
                 }
@@ -272,6 +280,7 @@ unsafe extern "C-unwind" fn semantic_custom_scan_access(
                     if let Some(slot) =
                         resolve_stale_or_missing_subject(node, runtime, &subject_id, slot)
                     {
+                        flush_refresh_queue_or_warn(runtime);
                         return slot;
                     }
                 }
@@ -280,6 +289,7 @@ unsafe extern "C-unwind" fn semantic_custom_scan_access(
                     if let Some(slot) =
                         resolve_inflight_subject(runtime, &subject_id, slot)
                     {
+                        flush_refresh_queue_or_warn(runtime);
                         return slot;
                     }
                 }
@@ -443,6 +453,7 @@ unsafe extern "C-unwind" fn rescan_semantic_custom_scan(node: *mut pg_sys::Custo
         let state = node.cast::<OtletSemanticCustomScanState>();
         if !(*state).runtime.is_null() {
             let runtime = &mut *(*state).runtime;
+            flush_refresh_queue_or_warn(runtime);
             free_buffered_rows(runtime);
             runtime.rows_seen = 0;
             runtime.rows_returned = 0;
@@ -456,6 +467,9 @@ unsafe extern "C-unwind" fn rescan_semantic_custom_scan(node: *mut pg_sys::Custo
             runtime.missing_rows = 0;
             runtime.inflight_rows = 0;
             runtime.queued_refreshes = 0;
+            runtime.refresh_queue_skips = 0;
+            runtime.refresh_queue_batches = 0;
+            runtime.refresh_queue_errors = 0;
             runtime.infer_now_batches = 0;
             runtime.infer_now_ms = 0;
             runtime.infer_now_timeouts = 0;
@@ -480,6 +494,7 @@ unsafe extern "C-unwind" fn rescan_semantic_custom_scan(node: *mut pg_sys::Custo
             runtime.child_plan_rows = 0;
             runtime.emitted_freshness_basis.clear();
             runtime.queued_refresh_subjects.clear();
+            runtime.pending_refresh_subjects.clear();
             runtime.pending_output_rows.clear();
             if !runtime.child_plan.is_null() {
                 pg_sys::ExecReScan(runtime.child_plan);
@@ -494,6 +509,7 @@ unsafe extern "C-unwind" fn end_semantic_custom_scan(node: *mut pg_sys::CustomSc
         let state = node.cast::<OtletSemanticCustomScanState>();
         if !(*state).runtime.is_null() {
             let runtime = &mut *(*state).runtime;
+            flush_refresh_queue_or_warn(runtime);
             free_buffered_rows(runtime);
             if runtime.owns_child_plan && !runtime.child_plan.is_null() {
                 pg_sys::ExecEndNode(runtime.child_plan);
