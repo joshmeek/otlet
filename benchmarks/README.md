@@ -115,6 +115,23 @@ The task-cursor scheduler at `962dcc49` opened one claim per task even when seve
 
 The retained claim fills each batch by task round, advances the cursor to the last claimed task, and groups only tasks with the same base model, artifact, and cheap/strong policy models. Two simultaneous claimers took eight unique jobs each from a 16-task queue. Expired running jobs, cancel-requested jobs, per-task FIFO order, model-policy separation, queue caps, and the full demo stayed valid. Batch events now include every claimed task in `task_names`
 
+### Bounded fallback window
+
+Increasing the claim batch from 8 to 16 was tested as the smallest way to coalesce adjacent cheap-to-strong work without adding another worker queue. The candidate used only the existing claim, lease, cancellation, and in-batch fallback paths
+
+A rotated three-pair workload queued 16 cache-disabled policy jobs. Every cheap attempt failed schema validation and every strong attempt completed with schema-valid output, forcing the maximum fallback load. Both variants used one resident worker and the same qwen3_1_7b and qwen35_4b runtime fingerprints
+
+| pair | claim batch | model loads | load time | wall time | maximum queue wait |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 8 | 4 | 24.937s | 61.425s | 33.538s |
+| 1 | 16 | 2 | 14.409s | 44.213s | 0.660s |
+| 2 | 8 | 4 | 39.388s | 79.972s | 38.623s |
+| 2 | 16 | 2 | 14.677s | 45.432s | 4.191s |
+| 3 | 16 | 2 | 27.397s | 81.591s | 4.005s |
+| 3 | 8 | 4 | 96.194s | 153.976s | 80.366s |
+
+The median moved from four to two loads, 39.388s to 14.677s of load time, and 79.972s to 45.432s wall time. The larger claim still failed the cancellation gate. In a 16-job direct workload, the last job stayed queued under batch 8 and canceled in 0.000s. Batch 16 claimed it immediately, so cancellation remained requested for 17.213s while the worker processed the preceding jobs. Otlet keeps the default at 8 and adds no cross-batch deferred state
+
 ### Single-context batching
 
 The current linked llama.cpp API can isolate multiple sequence IDs, KV positions, samplers, JSON stopping, and cancellation in one context. The smallest Otlet prototype still failed the combined throughput and memory gate:
