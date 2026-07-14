@@ -29,14 +29,15 @@ The five booleans confirm receipts, numeric token steps, numeric top-k alternati
 Runtime status shows the resident model slot, cache bounds, memory samples, pressure, and last run metrics
 
 ```sql
-SELECT runtime_status || '|' ||
+SELECT 'runtime_status_contract=' ||
+       runtime_status || '|' ||
        slot_state || '|' ||
        COALESCE(tokens_per_second::text, '') || '|' ||
        (COALESCE(inference_cache_entries, 0) <= COALESCE(inference_cache_max_entries, 0))::text || '|' ||
        (COALESCE(inference_cache_max_entries, 0) > 0)::text || '|' ||
        (COALESCE(inference_cache_max_bytes, 0) > 0)::text || '|' ||
        COALESCE(inference_cache_last_eviction_reason, '') || '|' ||
-       COALESCE(worker_memory_sample_policy, '') AS runtime_contract
+       COALESCE(worker_memory_sample_policy, '') AS runtime_status_contract
 FROM otlet.runtime_status
 WHERE model_name = 'qwen3_1_7b'
 LIMIT 1;
@@ -45,7 +46,7 @@ LIMIT 1;
 Representative output from the demo run:
 
 ```text
-runtime_status_contract=ready|ready|40.97|true|true|true|none|linux_proc_self_and_optional_cgroup_v2_memory_pressure_v1
+runtime_status_contract=ready|ready|37.78|true|true|true|none|linux_proc_self_and_optional_cgroup_v2_memory_pressure_v1
 ```
 
 The value reports a ready runtime, a ready model slot, bounded cache entries and byte caps, no recent eviction, and Linux process, system, PSI, and optional cgroup-v2 memory sampling around a worker run. Token rates vary with host state
@@ -179,7 +180,7 @@ FROM otlet.production_status;
 Representative demo output:
 
 ```text
-performance_ratio_contract=34|43|1.265|15948|469.059
+performance_ratio_contract=40|50|1.250|16548|413.700
 ```
 
 ### Step 3c - Materialization Failure Visibility

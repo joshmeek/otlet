@@ -275,13 +275,6 @@ The SQL plan row and CustomScan EXPLAIN share planner terms
 | Warm-job SQL finish | `inference_receipt_trace_status.finish_sql_ms` | `Infer Now Trace Finish Sql Ms` | Optional; stamped inside `complete_job` / `fail_job` |
 | Warm-job materialize | `inference_receipt_trace_status.materialize_ms` | `Infer Now Trace Materialize Ms` | Optional; stamped inside `materialize_completed_semantic_job` |
 
-EXPLAIN line ledger for this pass:
-
-| Surface | Added | Deleted or merged | Net |
-| --- | --- | --- | --- |
-| CustomScan | `Emitted Freshness Basis`, `Infer Now Runtime Fingerprint Hash` | `Preloaded Fresh Subjects` and `Preloaded Freshness Basis` merged into `Preloaded Fresh Subjects / Basis` | +1 |
-| SQL plan row | no EXPLAIN line added; `infer_now_subjects` and `infer_now_ms` now use existing columns | none | 0 |
-
 Captured row-plan excerpt:
 
 ```text
@@ -338,10 +331,6 @@ Custom Scan (Otlet Semantic Source CustomScan) on public.otlet_demo_semantic_ven
 The child scan reads the source table. Otlet strips the semantic predicate from the child plan and evaluates it against preloaded semantic state
 
 CustomScan uses statement preload semantics. Row-marked queries such as `FOR UPDATE` stay on the standard Postgres plan because Otlet blocks the CustomScan planner path when queries include rowmarks; Postgres still owns locking and row recheck behavior. For non-rowmark CustomScan, stale triggers and the next statement pick up concurrent source changes instead of a per-tuple recheck inside that scan
-
-A PostgreSQL 18 Index Access Method probe did not improve this boundary. Its build, insert, update, vacuum, ordered scan, bitmap scan, reindex, and restart paths all worked, but scan callbacks had to select heap TIDs from fixed operator keys before PostgreSQL produced the projected source tuple. HOT changes to an unindexed model input bypassed the AM, PostgreSQL does not index join views, and PostgreSQL rejected the volatile semantic predicate as an index expression. Otlet keeps ordinary indexes over materialized state and uses CustomScan when the executor needs source tuples, bounded inference, stale policy, receipts, and EXPLAIN counters
-
-A minimal PostgreSQL 18.4 fork did not expose a better executor boundary. Its post-fetch hook filtered ordinary, rescanned, row-locked, and parallel index scans, but bitmap heap and heap-free index-only scans bypassed the hook and returned different rows. EXPLAIN showed no semantic predicate or policy. Matching CustomScan would require more executor patches plus planner, EXPLAIN, receipt, and policy machinery, so Otlet keeps the explicit CustomScan child plan
 
 ## Step 8 - Fail Closed On Stale Rows
 

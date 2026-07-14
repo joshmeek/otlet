@@ -148,7 +148,7 @@ Use the smallest ring that covers the changed contract:
 | Prompt, template, quantization, model, decoding, schema acceptance, output selection, or published scores | Comparable quick probe followed by the full suite | Yes |
 | Final integrated runtime state | Complete validation ring | Yes |
 
-A full qwen35 run executes 447 sequential model jobs: 112 direct pair jobs, 110 general reliability jobs, 112 semantic-join jobs, and 113 row-watch jobs. The July 13, 2026 reference run took 51 minutes 33 seconds at `0.1446 jobs/s`. Join replay proves watch-owned worker and materialization behavior. Row watch uses a distinct prompt and schema. Keep those live jobs in the full tier instead of copying earlier outputs into derived state
+A full qwen35 run executes 447 sequential model jobs: 112 direct pair jobs, 110 general reliability jobs, 112 semantic-join jobs, and 113 row-watch jobs. The July 13, 2026 `b1783967979` run took 48 minutes 20 seconds at `0.1542 jobs/s`. Its 340 scored cases reached `0.9882` schema validity, `0.9664` trusted quality, `1.0000` entity accuracy, zero false merges, zero stale leaks, and zero worker crashes. It did not pass the production gate: extraction scored `0.7667`, the hallucinated trusted-action rate was `0.3324`, and the run had one repeat. Join replay covers watch-owned worker and materialization behavior; row watch uses a distinct prompt and schema
 
 Limit routine model search to 4B active parameters and about 4 GB of local artifact size. Qwen3.5 4B stays the stable default until a smaller model passes the fast probe and the full benchmark. MiniStral, Gemma, GLM Edge, Phi mini, and SmolLM stay in comparison lanes
 

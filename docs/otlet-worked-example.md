@@ -1,6 +1,6 @@
 # Otlet Worked Example
 
-Use this learning file as a worked example, following the structure from [this study](https://www.tandfonline.com/doi/full/10.1080/01443410.2023.2273762)
+This worked example follows the learning structure from [this study](https://www.tandfonline.com/doi/full/10.1080/01443410.2023.2273762)
 
 Follow one Docker-backed Otlet entity-resolution loop: leave vendor rows in Postgres tables, select hard candidate pairs in SQL, enqueue durable model work, let the resident worker try a cheap local model and escalate hard rows to a stronger local model, validate `same_entity` / `different_entity` / `unclear`, record typed actions, and preserve receipts
 
@@ -12,11 +12,11 @@ The default storage policy keeps assembled prompts in worker memory and removes 
 
 ## Example Path
 
-Run these steps in order:
+Run the setup and demo first. The remaining steps inspect the state left by that run:
 
-1. Start a local Otlet runtime
+1. Start a local Otlet runtime and run the demo
 2. Inspect the source pairs
-3. Create the task and queue four jobs
+3. Check the four durable jobs
 4. Read the accepted model outputs
 5. Inspect cheap-to-strong model selection
 6. Inspect typed actions and review state
@@ -30,6 +30,7 @@ Run the setup script:
 
 ```sh
 ./scripts/otlet-setup.sh
+./scripts/otlet-demo.sh
 ```
 
 Observed setup output:
@@ -41,19 +42,15 @@ cheap_model_artifact=/var/lib/postgresql/otlet-models/Qwen3-1.7B-Q8_0.gguf
 strong_model_artifact=/var/lib/postgresql/otlet-models/Qwen3.5-4B-Q4_K_M.gguf
 ```
 
-Open `psql` with both local model artifact paths:
+The setup installs the extension and starts one resident worker. The demo registers both models, creates its fixtures and tasks, waits for the model work, and checks each contract
+
+Open `psql` to inspect the completed run:
 
 ```sh
-docker exec -it otlet-postgres sh -lc '
-  cheap_model_artifact="$(find /var/lib/postgresql -name Qwen3-1.7B-Q8_0.gguf -print -quit)"
-  strong_model_artifact="$(find /var/lib/postgresql -name Qwen3.5-4B-Q4_K_M.gguf -print -quit)"
-  psql -U postgres -d postgres \
-    -v cheap_model_artifact="$cheap_model_artifact" \
-    -v strong_model_artifact="$strong_model_artifact"
-'
+docker exec -it otlet-postgres psql -U postgres -d postgres
 ```
 
-Postgres now runs the Otlet worker with both local GGUF artifacts visible inside the container
+The detailed entity-resolution walkthrough shows how to create the same tables and task by hand
 
 ## Step 2 - Inspect The Source Pairs
 
@@ -85,12 +82,19 @@ Observed output:
 
 SQL narrows the work to four candidate pairs before the model sees anything
 
-## Step 3 - Queue Durable Model Work
+## Step 3 - Check Durable Model Work
 
-The long SQL in [entity-resolution-walkthrough.md](entity-resolution-walkthrough.md) registers `qwen3_1_7b`, registers `qwen35_4b`, creates `entity_resolution_demo`, installs cheap-to-strong selection, and queues the four jobs:
+The demo registers `qwen3_1_7b` and `qwen35_4b`, creates `entity_resolution_demo`, installs cheap-to-strong selection, and queues four jobs. Reproduce its compact contract from SQL:
 
 ```sql
-SELECT otlet.run_task('entity_resolution_demo') AS queued_jobs;
+SELECT 'entity_resolution_contract=' ||
+       count(*) FILTER (WHERE status = 'complete')::text || '|' ||
+       max(output->>'match') FILTER (WHERE subject_id = 'vendor-1001:vendor-42') || '|' ||
+       max(output->>'match') FILTER (WHERE subject_id = 'vendor-1001:vendor-77') || '|' ||
+       count(*) FILTER (WHERE receipt_id IS NOT NULL)::text || '|' ||
+       count(*) FILTER (WHERE schema_validation_status = 'passed')::text
+FROM otlet.runs
+WHERE task_name = 'entity_resolution_demo';
 ```
 
 Observed contract output:
@@ -99,7 +103,7 @@ Observed contract output:
 entity_resolution_contract=4|same_entity|different_entity|4|4
 ```
 
-The contract fields report:
+The fields report:
 
 - 4 completed entity-resolution jobs
 - `vendor-1001:vendor-42` resolved as `same_entity`
@@ -129,7 +133,7 @@ Observed output:
 | vendor-1001:vendor-313 | different_entity | high       | Conflicting stable identifiers found.                       |
 | vendor-1001:vendor-314 | different_entity | high       | 4 conflicting stable identifiers found                      |
 | vendor-1001:vendor-42  | same_entity      | high       | Same remittance account and tax ID match                    |
-| vendor-1001:vendor-77  | different_entity | high       | Conflicting stable identifiers indicate different entities. |
+| vendor-1001:vendor-77  | different_entity | high       | Conflicting stable identifiers found.                       |
 +------------------------+------------------+------------+-------------------------------------------------------------+
 (4 rows)
 ```
@@ -189,7 +193,7 @@ source_write_contract=5|fa7672627cd7ab2a22aba2d9d7035815|5|fa7672627cd7ab2a22aba
 
 Otlet stores trusted actions. The application still owns merge authority
 
-The demo also registers a separate five-row table for the bounded `update_row` path. It proves accepted and rejected proposals, type-safe dry run, identical idempotency keys, operator apply, concurrent replay, stale source rejection, disabled-target rejection, protected-column preservation, and hashed receipts:
+The demo also registers a five-row table for the bounded `update_row` path. It checks accepted and rejected proposals, typed dry run, idempotency, operator apply, concurrent replay, stale source rejection, disabled-target rejection, protected columns, and hashed receipts:
 
 ```text
 bounded_proposal_contract=5|3|1|1|1|2|1
@@ -221,11 +225,7 @@ inference_visibility_status=true|true|true|true|true
 direct_ask_runtime_fingerprint_contract=otlet_runtime_fingerprint_v1|true|true|Q4_K_M|otlet_raw_json_worker_v1|94a220cd6|512|8217751552
 preload_admission_contract=failed|model_load_admission_rejected|rejected|true|true|true|true|0|true|true|true|true
 requester_timeout_contract=canceled|true|canceled|canceled|0|0|true|true|true|1|ready|ready
-runtime_status_contract=ready|ready|40.97|true|true|true|none|linux_proc_self_and_optional_cgroup_v2_memory_pressure_v1
 redaction_status_contract=redacted|0|0|0|0|0|true
-planner_1m_contract=estimated|1000000|4.305|true
-performance_ratio_contract=40|50|1.250|16550|413.750
-materialization_failure_status_contract=true|true
 invariant_contract=0
 docker_crash_log_scan=ok
 ```

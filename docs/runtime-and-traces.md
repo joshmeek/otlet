@@ -36,7 +36,7 @@ Representative output from the demo run:
 (8 rows)
 ```
 
-The stricter output/action envelope rejects the cheap model in this run. Rejected attempts stay visible as receipts, all four rows escalate to `qwen35_4b`, and Otlet materializes the accepted output for each job
+The stricter output/action envelope leaves every cheap attempt untrusted in this captured demo. A cheap attempt can finish as `rejected` when its structured output fails the decision contract or `failed` when its output is malformed. Both states remain visible as receipts and escalate to `qwen35_4b`. In this run all four were `rejected`, and Otlet materialized the accepted strong-model output for each job
 
 ## Step 2 - Read The Receipt
 
@@ -65,7 +65,9 @@ Linked llama.cpp uses greedy decoding and stops after one balanced JSON object. 
 ```sql
 SELECT schema_force, decode_constraint, decode_constraint_reason
 FROM otlet.inference_receipt_trace_status
-WHERE receipt_id = 2107;
+WHERE task_name = 'entity_resolution_demo'
+ORDER BY receipt_id DESC
+LIMIT 1;
 ```
 
 Warm-job timing splits `tokenize_ms`, `prompt_decode_ms`, `generate_ms`, `finish_sql_ms`, and `materialize_ms` when present:

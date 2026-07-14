@@ -1,6 +1,16 @@
 # Entity Resolution Walkthrough
 
-Use this SQL walkthrough to expand the entity-resolution path from `docs/otlet-worked-example.md`. Start with `./scripts/otlet-setup.sh`, then paste each section into the `psql` session described there
+Use this SQL walkthrough to build the entity-resolution path from `docs/otlet-worked-example.md` by hand. Start with `./scripts/otlet-setup.sh`, then open `psql` with the model paths printed by setup:
+
+```sh
+docker exec -it otlet-postgres sh -lc '
+  cheap_model_artifact="$(find /var/lib/postgresql -name Qwen3-1.7B-Q8_0.gguf -print -quit)"
+  strong_model_artifact="$(find /var/lib/postgresql -name Qwen3.5-4B-Q4_K_M.gguf -print -quit)"
+  psql -U postgres -d postgres \
+    -v cheap_model_artifact="$cheap_model_artifact" \
+    -v strong_model_artifact="$strong_model_artifact"
+'
+```
 
 Run the sections in order before adapting them. Each section names the state it creates and the output to inspect. Follow-up checks live in [runtime-and-traces.md](runtime-and-traces.md), [semantic-watches.md](semantic-watches.md), and [production-contract.md](production-contract.md)
 
@@ -29,6 +39,7 @@ The Otlet background worker runs `linked_inproc` inference. It loads a local GGU
 ## Step 2 - Create The Source Tables
 
 ```sql
+DROP VIEW IF EXISTS public.otlet_demo_vendor_pair_input;
 DROP TABLE IF EXISTS public.otlet_demo_vendor_pair;
 DROP TABLE IF EXISTS public.otlet_demo_vendor_entity;
 
@@ -73,6 +84,12 @@ SQL selects candidate pairs first, then Otlet judges those pairs. Merge vendors 
 DELETE FROM otlet.worker_events e
 USING otlet.jobs j
 WHERE e.job_id = j.id
+  AND j.task_name = 'entity_resolution_demo';
+
+DELETE FROM otlet.eval_labels l
+USING otlet.actions a, otlet.jobs j
+WHERE l.action_id = a.id
+  AND a.job_id = j.id
   AND j.task_name = 'entity_resolution_demo';
 
 DELETE FROM otlet.semantic_materializations sm
@@ -222,7 +239,12 @@ FROM otlet.create_task(
     "generation_trace": true,
     "generation_trace_max_tokens": 16,
     "generation_trace_top_k": 3
-  }'::jsonb
+  }'::jsonb,
+  '{
+    "evidence_fields": ["candidate_evidence"],
+    "action_id_fields": {"left_id": "left_id", "right_id": "right_id"}
+  }'::jsonb,
+  '{"preset": "entity_resolution_evidence_v1"}'::jsonb
 );
 
 SELECT task_name, cheap_model_name, strong_model_name
@@ -249,15 +271,17 @@ Representative output:
 
 `create_task` registers the model contract and input query
 
-The task has seven parts:
+The task contract includes:
 
 - `task_name` gives the queue and receipt trail a stable name
 - `input_query` converts SQL-selected candidate pairs into `subject_id` and compact `input`
 - `instruction` is the model contract for this task
 - `output_schema` is the JSON schema Otlet enforces before storing output
 - `model_name` chooses the cheap registered local model
-- `model_selection_policies` chooses the stronger registered local model for escalation
 - `runtime_options` bound generation, tracing, and cache behavior
+- `input_shaping` names the evidence and action-ID fields
+- `decision_contract` loads the immutable entity-resolution evidence rules
+- `model_selection_policies` chooses the stronger registered local model for escalation
 
 The schema separates model judgment from database state Otlet stores
 
@@ -287,7 +311,7 @@ Representative output:
 preset_immutability_contract=raised
 ```
 
-If the model returns malformed JSON, missing fields, unknown fields, or values outside the enum, Otlet marks the job failed and keeps the raw evidence. Otlet stores no trusted output or records
+If the model returns malformed JSON, missing fields, unknown fields, or values outside the enum, Otlet marks the job failed and keeps hashes plus any structured rejected candidate allowed by the storage policy. Otlet stores no trusted output or records
 
 ## Step 5 - Enqueue The Jobs
 
@@ -314,18 +338,13 @@ The queue keeps model work out of the client request. SQL shows each job at any 
 
 ```sql
 SELECT
-  id,
-  task_name,
   subject_id,
   status,
   attempts,
-  created_at,
-  started_at,
-  finished_at,
   error
 FROM otlet.jobs
 WHERE task_name = 'entity_resolution_demo'
-ORDER BY id;
+ORDER BY subject_id;
 ```
 
 Wait a moment and run the query again while jobs remain active
@@ -333,14 +352,14 @@ Wait a moment and run the query again while jobs remain active
 Representative output:
 
 ```text
-+------+------------------------+------------------------+----------+----------+-------------------------------+-------------------------------+-------------------------------+-------+
-|  id  |       task_name        |       subject_id       |  status  | attempts |          created_at           |          started_at           |          finished_at          | error |
-+------+------------------------+------------------------+----------+----------+-------------------------------+-------------------------------+-------------------------------+-------+
-| 2104 | entity_resolution_demo | vendor-1001:vendor-313 | complete |        1 | 2026-07-07 14:01:06.063557+00 | 2026-07-07 14:01:06.075946+00 | 2026-07-07 14:02:39.745305+00 |       |
-| 2105 | entity_resolution_demo | vendor-1001:vendor-314 | complete |        1 | 2026-07-07 14:01:06.063557+00 | 2026-07-07 14:01:06.075946+00 | 2026-07-07 14:03:23.793005+00 |       |
-| 2106 | entity_resolution_demo | vendor-1001:vendor-42  | complete |        1 | 2026-07-07 14:01:06.063557+00 | 2026-07-07 14:01:06.075946+00 | 2026-07-07 14:04:10.308073+00 |       |
-| 2107 | entity_resolution_demo | vendor-1001:vendor-77  | complete |        1 | 2026-07-07 14:01:06.063557+00 | 2026-07-07 14:01:06.075946+00 | 2026-07-07 14:04:50.716933+00 |       |
-+------+------------------------+------------------------+----------+----------+-------------------------------+-------------------------------+-------------------------------+-------+
++------------------------+----------+----------+-------+
+|       subject_id       |  status  | attempts | error |
++------------------------+----------+----------+-------+
+| vendor-1001:vendor-313 | complete |        1 |       |
+| vendor-1001:vendor-314 | complete |        1 |       |
+| vendor-1001:vendor-42  | complete |        1 |       |
+| vendor-1001:vendor-77  | complete |        1 |       |
++------------------------+----------+----------+-------+
 (4 rows)
 ```
 
@@ -362,14 +381,14 @@ ORDER BY r.subject_id;
 Representative output:
 
 ```text
-+------------------------+------------------+------------+-------------------------------------------------------------+
-|       subject_id       |      match       | confidence |                           reason                            |
-+------------------------+------------------+------------+-------------------------------------------------------------+
-| vendor-1001:vendor-313 | different_entity | high       | Conflicting stable identifiers found.                       |
-| vendor-1001:vendor-314 | different_entity | high       | 4 conflicting stable identifiers found                      |
-| vendor-1001:vendor-42  | same_entity      | high       | Same remittance account and tax ID match                    |
-| vendor-1001:vendor-77  | different_entity | high       | Conflicting stable identifiers indicate different entities. |
-+------------------------+------------------+------------+-------------------------------------------------------------+
++------------------------+------------------+------------+---------------------------------------------------------------------------------------------------+
+|       subject_id       |      match       | confidence |                                              reason                                               |
++------------------------+------------------+------------+---------------------------------------------------------------------------------------------------+
+| vendor-1001:vendor-313 | different_entity | high       | Conflicting stable identifiers found.                                                             |
+| vendor-1001:vendor-314 | different_entity | high       | Conflicting stable identifiers: different country, tax ID, bank account, and no acquisition note. |
+| vendor-1001:vendor-42  | same_entity      | high       | Same remittance account and tax ID match                                                          |
+| vendor-1001:vendor-77  | different_entity | high       | Different industry and city; no shared identifiers.                                               |
++------------------------+------------------+------------+---------------------------------------------------------------------------------------------------+
 (4 rows)
 ```
 
@@ -433,7 +452,7 @@ Representative output:
 ```sql
 SELECT queue_kind, next_operator_step, task_name, watch_name, subject_id, action_id, receipt_id, source_stale
 FROM otlet.review_queue
-WHERE task_name IN ('entity_resolution_demo', 'demo_entity_resolution_idx_task')
+WHERE task_name = 'entity_resolution_demo'
 ORDER BY created_at, task_name
 LIMIT 5;
 ```
@@ -441,9 +460,11 @@ LIMIT 5;
 Representative output:
 
 ```text
-    queue_kind    | next_operator_step |            task_name            |         watch_name         | subject_id | action_id | receipt_id | source_stale
-------------------+--------------------+---------------------------------+----------------------------+------------+-----------+------------+--------------
- pending_approval | approve            | demo_entity_resolution_idx_task | demo_entity_resolution_idx | vendor-42  |        35 |         85 | f
++------------------+--------------------+------------------------+------------+------------+-----------+------------+--------------+
+|    queue_kind    | next_operator_step |       task_name        | watch_name | subject_id | action_id | receipt_id | source_stale |
++------------------+--------------------+------------------------+------------+------------+-----------+------------+--------------+
+| pending_approval | approve            | entity_resolution_demo |            | vendor-42  |         3 |          7 | f            |
++------------------+--------------------+------------------------+------------+------------+-----------+------------+--------------+
 (1 row)
 ```
 
@@ -461,7 +482,7 @@ WITH target AS (
   FROM otlet.review_queue q
   JOIN otlet.tasks t ON t.name = q.task_name
   WHERE q.action_id IS NOT NULL
-    AND q.task_name IN ('entity_resolution_demo', 'demo_entity_resolution_idx_task')
+    AND q.task_name = 'entity_resolution_demo'
   ORDER BY q.created_at, q.task_name
   LIMIT 1
 ), correction AS (
@@ -479,8 +500,6 @@ WITH target AS (
 )
 SELECT action_id, expected_answer, expected_confidence, expected_action_type, label_source
 FROM correction;
-
-ROLLBACK;
 ```
 
 Representative output:
@@ -488,7 +507,7 @@ Representative output:
 ```text
  action_id | expected_answer | expected_confidence | expected_action_type |   label_source
 -----------+-----------------+---------------------+----------------------+-------------------
-        35 | same_entity     | high                | merge_candidate      | manual_correction
+         3 | same_entity     | high                | merge_candidate      | manual_correction
 (1 row)
 ```
 
@@ -500,6 +519,8 @@ FROM otlet.export_eval_cases(5)
 WHERE label_source = 'manual_correction'
 ORDER BY created_at DESC
 LIMIT 1;
+
+ROLLBACK;
 ```
 
 Representative output:
@@ -507,7 +528,7 @@ Representative output:
 ```text
  action_id | case_kind | expected_answer | expected_action_type | manual_gold
 -----------+-----------+-----------------+----------------------+-------------
-        35 | gold      | same_entity     | merge_candidate      | t
+         3 | gold      | same_entity     | merge_candidate      | t
 (1 row)
 ```
 
