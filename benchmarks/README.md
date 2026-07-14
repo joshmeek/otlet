@@ -86,6 +86,23 @@ The two-worker probes produced overlapping llama.cpp generation from separate Po
 
 ## Measured Runtime Decisions
 
+### Resident-model queue preference
+
+A bounded warm-model scheduler was rejected at commit `0f4081a6`. The candidate identified the resident model from the latest worker-lifetime `model_swap` event and allowed one warm-model claim before returning to strict task-cursor order. The existing retry rank, per-task FIFO order, active-job cap, lease handling, and `SKIP LOCKED` claim stayed in place
+
+The paired A/B workload alternated four tasks across qwen3_1_7b and qwen35_4b, queued two 64-token cache-disabled jobs per task, and claimed one job at a time. All 48 jobs across six runs completed with schema-valid output. Both variants used one resident worker and six decode and batch threads on the same 12-core ARM64 host. The model fingerprint hashes were `7a1b434a2888535d` and `e66bad85956d6d75`; the runtime fingerprint hashes were `ad374ff9a8f1a02c` and `e5797a21096dfddf`
+
+| pair | variant | model loads | load time | wall time | maximum queue wait |
+| ---: | --- | ---: | ---: | ---: | ---: |
+| 1 | task cursor | 6 | 35.940s | 66.059s | 64.631s |
+| 1 | warm preference | 5 | 44.690s | 105.258s | 88.564s |
+| 2 | task cursor | 6 | 41.677s | 80.385s | 78.841s |
+| 2 | warm preference | 5 | 27.506s | 48.115s | 40.468s |
+| 3 | task cursor | 6 | 34.155s | 62.892s | 61.235s |
+| 3 | warm preference | 5 | 34.583s | 86.740s | 75.488s |
+
+The candidate median reduced model loads from six to five and load time from 35.940s to 34.583s. Median wall time regressed from 66.059s to 86.740s, and median maximum queue wait regressed from 64.631s to 75.488s. The candidate also passed focused task-turn, continuous-arrival starvation, lease, cancellation, and concurrent-claim checks, but failed the wall-time and queue-wait retention gate. No scheduler code was retained
+
 ### Single-context batching
 
 The current linked llama.cpp API can isolate multiple sequence IDs, KV positions, samplers, JSON stopping, and cancellation in one context. The smallest Otlet prototype still failed the combined throughput and memory gate:
