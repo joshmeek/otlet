@@ -75,6 +75,81 @@ echo "attempt_timeout_clamp_contract=$attempt_timeout_clamp_contract"
   exit 1
 }
 
+requester_timeout_before="$(psql_exec -qAt <<'SQL'
+SELECT (s ->> 'timeouts') || '|' || (s ->> 'abort_requests')
+FROM (SELECT otlet.worker_infer_now_state() AS s) state;
+SQL
+)"
+IFS='|' read -r requester_timeouts_before requester_aborts_before <<<"$requester_timeout_before"
+requester_timeout_error=""
+if requester_timeout_error="$(psql_exec -qAt -v model_name="$strong_model_name" <<'SQL' 2>&1
+SELECT * FROM otlet.ask(
+  :'model_name',
+  'Return one JSON object only with top-level output and actions. output has status equal ok. actions is empty. No markdown.',
+  jsonb_build_object('payload', repeat('request timeout ', 300)),
+  '{"type":"object","required":["status"],"additionalProperties":false,"properties":{"status":{"enum":["ok"]}}}'::jsonb,
+  '{"max_tokens":512,"reasoning":"off","inference_cache":false}'::jsonb,
+  500
+);
+SQL
+)"; then
+  echo "Expected requester timeout smoke to fail closed" >&2
+  exit 1
+fi
+require_contains "$requester_timeout_error" "otlet ask worker is busy" "Expected requester timeout smoke to report no synchronous result"
+requester_timeout_job_id="$(psql_exec -qAt -c "SELECT otlet.worker_infer_now_state() ->> 'last_cancel_job_id';")"
+[ -n "$requester_timeout_job_id" ] && [ "$requester_timeout_job_id" != "0" ] || {
+  echo "Expected requester timeout smoke to identify the canceled job" >&2
+  exit 1
+}
+for _ in $(seq 1 300); do
+  requester_timeout_status="$(psql_exec -qAt -v job_id="$requester_timeout_job_id" <<'SQL'
+SELECT status FROM otlet.jobs WHERE id = :'job_id'::bigint;
+SQL
+)"
+  case "$requester_timeout_status" in
+    canceled|failed|complete) break ;;
+  esac
+  sleep 0.2
+done
+requester_timeout_contract="$(psql_exec -qAt \
+  -v job_id="$requester_timeout_job_id" \
+  -v model_name="$strong_model_name" \
+  -v timeouts_before="$requester_timeouts_before" \
+  -v aborts_before="$requester_aborts_before" <<'SQL'
+WITH infer AS (
+  SELECT otlet.worker_infer_now_state() AS state
+), job_row AS (
+  SELECT * FROM otlet.jobs WHERE id = :'job_id'::bigint
+), receipt_row AS (
+  SELECT * FROM otlet.inference_receipts
+  WHERE job_id = :'job_id'::bigint
+  ORDER BY id DESC
+  LIMIT 1
+)
+SELECT j.status || '|' ||
+       (j.error = 'infer-now timeout requested job cancellation')::text || '|' ||
+       r.status || '|' || r.selection_reason || '|' ||
+       (SELECT count(*) FROM otlet.outputs WHERE job_id = j.id)::text || '|' ||
+       (SELECT count(*) FROM otlet.actions WHERE job_id = j.id)::text || '|' ||
+       ((infer.state ->> 'timeouts')::bigint > :'timeouts_before'::bigint)::text || '|' ||
+       ((infer.state ->> 'abort_requests')::bigint > :'aborts_before'::bigint)::text || '|' ||
+       ((infer.state ->> 'last_cancel_job_id')::bigint = j.id)::text || '|' ||
+       rs.resident_worker_count::text || '|' ||
+       COALESCE(rs.runtime_status, '') || '|' ||
+       COALESCE(rs.slot_state, '')
+FROM job_row j
+JOIN receipt_row r ON r.job_id = j.id
+CROSS JOIN infer
+JOIN otlet.runtime_status rs ON rs.model_name = :'model_name';
+SQL
+)"
+echo "requester_timeout_contract=$requester_timeout_contract"
+[ "$requester_timeout_contract" = "canceled|true|canceled|canceled|0|0|true|true|true|1|ready|ready" ] || {
+  echo "Expected requester timeout to leave no late output and one healthy worker, got $requester_timeout_contract" >&2
+  exit 1
+}
+
 malformed_schema_task="malformed_schema_worker_demo"
 cleanup_task "$malformed_schema_task"
 psql_exec -v task_name="$malformed_schema_task" -v model_name="$strong_model_name" >/dev/null <<'SQL'
@@ -182,6 +257,98 @@ SQL
 echo "rss_budget_worker_contract=$rss_budget_contract"
 [ "$rss_budget_contract" = "failed|true|failed|failed|direct_attempt_failed|failed|worker_rss_budget_exceeded|0|ready|ready" ] || {
   echo "Expected RSS budget hit to produce a clean failed receipt and healthy worker, got $rss_budget_contract" >&2
+  exit 1
+}
+
+preload_admission_task="preload_admission_demo"
+cleanup_task "$preload_admission_task"
+preload_instruction='Return one JSON object only with top-level output and actions. output has one key ok set to true. actions is an empty array. No markdown.'
+preload_schema='{"type":"object","required":["ok"],"additionalProperties":false,"properties":{"ok":{"type":"boolean"}}}'
+psql_exec -qAt \
+  -v model_name="$cheap_model_name" \
+  -v instruction="$preload_instruction" \
+  -v output_schema="$preload_schema" >/dev/null <<'SQL'
+SELECT output FROM otlet.ask(
+  :'model_name',
+  :'instruction',
+  '{}'::jsonb,
+  :'output_schema'::jsonb,
+  '{"max_tokens":32,"reasoning":"off","inference_cache":false}'::jsonb,
+  30000
+);
+SQL
+preload_worker_pid_before="$(psql_exec -qAt -c "SELECT pid FROM pg_stat_activity WHERE backend_type = 'otlet worker' LIMIT 1;")"
+preload_swaps_before="$(psql_exec -qAt -c "SELECT count(*) FROM otlet.worker_events WHERE event_type = 'model_swap';")"
+psql_exec \
+  -v task_name="$preload_admission_task" \
+  -v model_name="$strong_model_name" \
+  -v instruction="$preload_instruction" \
+  -v output_schema="$preload_schema" >/dev/null <<'SQL'
+SELECT otlet.create_task(
+  :'task_name',
+  $source$
+    SELECT 'preload-admission-1'::text AS subject_id, '{}'::jsonb AS input
+  $source$::text,
+  :'instruction',
+  :'output_schema'::jsonb,
+  :'model_name',
+  '{"max_tokens":32,"reasoning":"off","inference_cache":false,"max_worker_rss_bytes":7200000000}'::jsonb
+);
+SELECT otlet.run_task(:'task_name');
+SQL
+wait_task_failed "$preload_admission_task" 1 240 1
+preload_admission_contract="$(psql_exec -qAt \
+  -v task_name="$preload_admission_task" <<'SQL'
+WITH evidence AS (
+  SELECT s.*, j.status AS job_status
+  FROM otlet.inference_receipt_trace_status s
+  JOIN otlet.jobs j ON j.id = s.job_id
+  WHERE s.task_name = :'task_name'
+  ORDER BY s.receipt_id DESC
+  LIMIT 1
+)
+SELECT job_status || '|' ||
+       COALESCE(stop_reason, '') || '|' ||
+       COALESCE(model_load_admission_decision, '') || '|' ||
+       (model_load_admission_reason = 'llama_projected_model_kv_batch_exceeds_headroom')::text || '|' ||
+       (model_load_allowed_additional_bytes < jsonb_extract_path_text(memory_evidence, 'admission', 'projected_total_bytes')::bigint)::text || '|' ||
+       (worker_process_rss_bytes > 0)::text || '|' ||
+       (system_memory_available_bytes > 0)::text || '|' ||
+       (SELECT count(*) FROM otlet.outputs WHERE job_id = evidence.job_id)::text
+FROM evidence;
+SQL
+)"
+preload_rejection_event="$(psql_exec -qAt \
+  -v task_name="$preload_admission_task" <<'SQL'
+SELECT (count(*) = 1)::text
+FROM otlet.worker_events e
+JOIN otlet.jobs j ON j.id = e.job_id
+WHERE j.task_name = :'task_name'
+  AND e.event_type = 'model_admission_rejected';
+SQL
+)"
+preload_resident_reuse="$(psql_exec -qAt \
+  -v model_name="$cheap_model_name" \
+  -v instruction="$preload_instruction" \
+  -v output_schema="$preload_schema" <<'SQL'
+SELECT output ->> 'ok' FROM otlet.ask(
+  :'model_name',
+  :'instruction',
+  '{}'::jsonb,
+  :'output_schema'::jsonb,
+  '{"max_tokens":32,"reasoning":"off","inference_cache":false}'::jsonb,
+  30000
+);
+SQL
+)"
+preload_worker_pid_after="$(psql_exec -qAt -c "SELECT pid FROM pg_stat_activity WHERE backend_type = 'otlet worker' LIMIT 1;")"
+preload_swaps_after="$(psql_exec -qAt -c "SELECT count(*) FROM otlet.worker_events WHERE event_type = 'model_swap';")"
+preload_pid_preserved="$([ "$preload_worker_pid_before" = "$preload_worker_pid_after" ] && echo true || echo false)"
+preload_swap_preserved="$([ "$preload_swaps_before" = "$preload_swaps_after" ] && echo true || echo false)"
+preload_admission_contract="$preload_admission_contract|$preload_rejection_event|$preload_resident_reuse|$preload_pid_preserved|$preload_swap_preserved"
+echo "preload_admission_contract=$preload_admission_contract"
+[ "$preload_admission_contract" = "failed|model_load_admission_rejected|rejected|true|true|true|true|0|true|true|true|true" ] || {
+  echo "Expected pre-load rejection to preserve the resident model and worker, got $preload_admission_contract" >&2
   exit 1
 }
 
@@ -424,16 +591,14 @@ INSERT INTO output_envelope_cases (subject_id, expected_error, raw_output)
 VALUES
   (
     'markdown-fence',
-    $err$invalid model JSON: markdown fences are not allowed: ```json
-{"output":{"status":"ok"},"actions":[]}
-```$err$,
+    'invalid model JSON: markdown fences are not allowed',
     $raw$```json
 {"output":{"status":"ok"},"actions":[]}
 ```$raw$
   ),
   (
     'extra-top-level',
-    'model JSON unsupported top-level key: extra',
+    'model JSON has unsupported top-level key',
     '{"output":{"status":"ok"},"actions":[],"extra":true}'
   ),
   (
@@ -472,16 +637,14 @@ WITH cases(subject_id, expected_error, raw_output) AS (
   VALUES
     (
       'markdown-fence',
-      $err$invalid model JSON: markdown fences are not allowed: ```json
-{"output":{"status":"ok"},"actions":[]}
-```$err$,
+      'invalid model JSON: markdown fences are not allowed',
       $raw$```json
 {"output":{"status":"ok"},"actions":[]}
 ```$raw$
     ),
     (
       'extra-top-level',
-      'model JSON unsupported top-level key: extra',
+      'model JSON has unsupported top-level key',
       '{"output":{"status":"ok"},"actions":[],"extra":true}'
     ),
     (
@@ -512,7 +675,7 @@ SELECT count(*) FILTER (WHERE subject_id = 'markdown-fence' AND job_error = expe
        count(*) FILTER (WHERE subject_id = 'extra-top-level' AND job_error = expected_error AND receipt_error = expected_error)::text || '|' ||
        count(*) FILTER (WHERE subject_id = 'non-object-action' AND job_error = expected_error AND receipt_error = expected_error)::text || '|' ||
        bool_and(job_status = 'failed' AND receipt_status = 'failed' AND selection_status = 'failed' AND schema_validation_status = 'failed')::text || '|' ||
-       bool_and(raw_output = expected_raw_output AND raw_output_hash = md5(expected_raw_output))::text || '|' ||
+       bool_and(raw_output IS NULL AND raw_output_hash = md5(expected_raw_output))::text || '|' ||
        (SELECT count(*) FROM otlet.outputs WHERE job_id IN (SELECT job_id FROM rows))::text || '|' ||
        (SELECT count(*) FROM otlet.actions WHERE job_id IN (SELECT job_id FROM rows))::text
 FROM rows;
@@ -571,7 +734,7 @@ SELECT (SELECT count(*) FROM otlet.outputs WHERE job_id = j.id)::text || '|' ||
        COALESCE((SELECT status || '|' || COALESCE(error, '') FROM otlet.actions WHERE job_id = j.id ORDER BY id DESC LIMIT 1), '') || '|' ||
        (SELECT count(*) FROM otlet.records r JOIN otlet.actions a ON a.id = r.action_id WHERE a.job_id = j.id)::text || '|' ||
        COALESCE((
-         SELECT (r.raw_output = '{"output":{"status":"ok"},"actions":[{"type":"invented_action","body":{"subject_id":"hallucinated-action-1","text":"no record"}}]}' AND
+         SELECT (r.raw_output IS NULL AND
                  r.raw_output_hash = md5('{"output":{"status":"ok"},"actions":[{"type":"invented_action","body":{"subject_id":"hallucinated-action-1","text":"no record"}}]}'))::text
          FROM otlet.inference_receipts r
          WHERE r.job_id = j.id

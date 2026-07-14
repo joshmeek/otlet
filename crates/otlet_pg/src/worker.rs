@@ -847,6 +847,29 @@ fn accept_attempt_with_model(
     if let Some(metrics) = metrics {
         record_metrics(job, model_name, metrics);
     }
+    match crate::infer_now::persist_timeout_cancel(job.id) {
+        Ok(true) => {
+            let err = ModelError::new("canceled");
+            return (
+                fail_attempt_with_model(job, model_name, &err, selection_role, "canceled"),
+                false,
+            );
+        }
+        Ok(false) => {}
+        Err(message) => {
+            let err = ModelError::new(message);
+            return (
+                fail_attempt_with_model(
+                    job,
+                    model_name,
+                    &err,
+                    selection_role,
+                    "infer_now_timeout_cancel_failed",
+                ),
+                false,
+            );
+        }
+    }
     let result: pgrx::spi::Result<bool> = BackgroundWorker::transaction(|| {
         pgrx::Spi::connect_mut(|client| {
             let args = [
@@ -920,6 +943,7 @@ fn accept_attempt_with_model(
 fn record_model_attempt_receipt_with_model(
     job: &Job,
     model_name: &str,
+    output: Option<&serde_json::Value>,
     raw_output: Option<&str>,
     prompt_hash: Option<&str>,
     input_hash: Option<&str>,
@@ -938,6 +962,7 @@ fn record_model_attempt_receipt_with_model(
             let args = [
                 job.id.into(),
                 model_name.into(),
+                output.cloned().map(JsonB).into(),
                 raw_output.into(),
                 prompt_hash.into(),
                 input_hash.into(),
@@ -951,7 +976,7 @@ fn record_model_attempt_receipt_with_model(
                 error.into(),
             ];
             client.update(
-                "SELECT otlet.record_model_attempt($1, $2, raw_output => $3, prompt_hash => $4, input_hash => $5, output_schema_hash => $6, raw_output_hash => $7, trace_summary => $8, schema_validation_status => $9, selection_role => $10, selection_status => $11, selection_reason => $12, error => $13)",
+                "SELECT otlet.record_model_attempt($1, $2, output => $3, raw_output => $4, prompt_hash => $5, input_hash => $6, output_schema_hash => $7, raw_output_hash => $8, trace_summary => $9, schema_validation_status => $10, selection_role => $11, selection_status => $12, selection_reason => $13, error => $14)",
                 Some(1),
                 &args,
             )?;
@@ -976,6 +1001,7 @@ fn record_rejected_attempt_with_model(
     selection_reason: &str,
 ) -> bool {
     let ModelRun {
+        output,
         raw_output,
         prompt_hash,
         input_hash,
@@ -988,6 +1014,7 @@ fn record_rejected_attempt_with_model(
     record_model_attempt_receipt_with_model(
         job,
         model_name,
+        Some(&output),
         Some(&raw_output),
         Some(&prompt_hash),
         Some(&input_hash),
@@ -1017,9 +1044,10 @@ fn reject_direct_attempt(job: &Job, run: ModelRun, selection_reason: &str) -> bo
                 run.raw_output_hash.as_str().into(),
                 JsonB(run.trace_summary.clone()).into(),
                 job.model_name.as_str().into(),
+                JsonB(run.output.clone()).into(),
             ];
             client.update(
-                "SELECT otlet.fail_job($1, $2, $3, $4, $5, $6, $7, schema_validation_status => 'passed', trace_summary => $8, model_name => $9, selection_role => 'direct', selection_status => 'rejected', selection_reason => 'direct_rejected_by_decision_contract')",
+                "SELECT otlet.fail_job($1, $2, $3, $4, $5, $6, $7, schema_validation_status => 'passed', trace_summary => $8, model_name => $9, selection_role => 'direct', selection_status => 'rejected', selection_reason => 'direct_rejected_by_decision_contract', candidate_output => $10)",
                 Some(1),
                 &args,
             )?;
@@ -1064,6 +1092,7 @@ fn record_failed_model_attempt_with_model(
     record_model_attempt_receipt_with_model(
         job,
         model_name,
+        None,
         err.raw_output.as_deref(),
         err.prompt_hash.as_deref(),
         err.input_hash.as_deref(),
@@ -1142,6 +1171,14 @@ fn fail_attempt_with_model(
     selection_reason: &str,
 ) -> bool {
     let metrics = err.metrics.as_ref().map(|m| m.as_ref());
+    let rejected_memory = err.trace_summary.as_ref().and_then(|trace| {
+        (trace
+            .pointer("/memory/admission/decision")
+            .and_then(Value::as_str)
+            == Some("rejected"))
+        .then(|| trace.get("memory").cloned())
+        .flatten()
+    });
     if let Some(metrics) = metrics {
         // Metrics are best effort and must not roll back terminal job state
         record_metrics(job, model_name, metrics);
@@ -1169,6 +1206,19 @@ fn fail_attempt_with_model(
                 Some(1),
                 &args,
             )?;
+            if let Some(memory) = &rejected_memory {
+                let event_args = [
+                    job.id.into(),
+                    job.task_name.as_str().into(),
+                    model_name.into(),
+                    JsonB(memory.clone()).into(),
+                ];
+                client.update(
+                    "SELECT otlet.record_worker_event('model_admission_rejected', $1, 'linked_inproc', 'model load rejected before tensor allocation', jsonb_build_object('task_name', $2, 'model_name', $3, 'memory', $4))",
+                    Some(1),
+                    &event_args,
+                )?;
+            }
             Ok(())
         })
     });
@@ -1231,9 +1281,10 @@ fn record_metrics(job: &Job, model_name: &str, metrics: &ModelMetrics) {
                     metrics.model_memory_bytes.into(),
                     metrics.worker_process_rss_bytes.into(),
                     metrics.worker_memory_budget_bytes.into(),
+                    JsonB(metrics.memory_trace.clone()).into(),
                 ];
                 client.update(
-                    "SELECT otlet.record_worker_event('model_swap', $1, $2, 'model residency changed', jsonb_build_object('task_name', $3, 'model_name', $4, 'artifact_path', $5, 'load_ms', $6, 'model_memory_bytes', $7, 'worker_process_rss_bytes', $8, 'worker_memory_budget_bytes', $9))",
+                    "SELECT otlet.record_worker_event('model_swap', $1, $2, 'model residency changed', jsonb_build_object('task_name', $3, 'model_name', $4, 'artifact_path', $5, 'load_ms', $6, 'model_memory_bytes', $7, 'worker_process_rss_bytes', $8, 'worker_memory_budget_bytes', $9, 'memory', $10))",
                     Some(1),
                     &event_args,
                 )?;

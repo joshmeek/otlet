@@ -17,7 +17,8 @@ CREATE TABLE otlet.production_policy (
   trace_detail_retention interval NOT NULL DEFAULT interval '7 days',
   eval_label_retention interval NOT NULL DEFAULT interval '90 days',
   delete_stale_materialization_retention interval NOT NULL DEFAULT interval '30 days',
-  rejected_receipt_raw_output_retention interval NOT NULL DEFAULT interval '7 days',
+  sensitive_evidence_mode text NOT NULL DEFAULT 'redacted',
+  sensitive_evidence_retention interval NOT NULL DEFAULT interval '7 days',
   failed_job_retention interval NOT NULL DEFAULT interval '30 days',
   CHECK (name = 'default'),
   CHECK (stale_policy IN (
@@ -36,7 +37,8 @@ CREATE TABLE otlet.production_policy (
   CHECK (job_lease_interval <= interval '1 hour'),
   CHECK (eval_label_retention >= interval '1 day'),
   CHECK (delete_stale_materialization_retention >= interval '1 day'),
-  CHECK (rejected_receipt_raw_output_retention >= interval '1 day'),
+  CHECK (sensitive_evidence_mode IN ('redacted', 'diagnostic')),
+  CHECK (sensitive_evidence_retention >= interval '1 day'),
   CHECK (failed_job_retention >= interval '1 day')
 );
 
@@ -391,7 +393,6 @@ CREATE TABLE otlet.jobs (
   attempts int NOT NULL DEFAULT 0,
   leased_until timestamptz,
   error text,
-  raw_output text,
   created_at timestamptz NOT NULL DEFAULT now(),
   started_at timestamptz,
   finished_at timestamptz,
@@ -438,6 +439,7 @@ CREATE TABLE otlet.inference_receipts (
   output_schema_hash text,
   raw_output_hash text,
   raw_output text,
+  candidate_output jsonb,
   prompt_tokens bigint,
   generated_tokens bigint,
   generate_ms bigint,
@@ -452,7 +454,8 @@ CREATE TABLE otlet.inference_receipts (
   UNIQUE (job_id, attempt_index),
   CHECK (attempt_index > 0),
   CHECK (selection_role IN ('direct', 'cheap', 'strong')),
-  CHECK (selection_status IN ('accepted', 'rejected', 'failed'))
+  CHECK (selection_status IN ('accepted', 'rejected', 'failed')),
+  CHECK (candidate_output IS NULL OR jsonb_typeof(candidate_output) = 'object')
 );
 
 CREATE INDEX inference_receipts_task_model_role_finished_idx
@@ -465,9 +468,10 @@ WHERE status = 'complete'
   AND schema_validation_status = 'passed'
   AND COALESCE(generate_ms, 0) > 0;
 
-CREATE INDEX inference_receipts_rejected_retention_idx
+CREATE INDEX inference_receipts_sensitive_evidence_retention_idx
 ON otlet.inference_receipts (finished_at, id)
-WHERE selection_status = 'rejected' AND raw_output IS NOT NULL;
+WHERE raw_output IS NOT NULL
+   OR trace_summary #>> '{detailed_trace,chosen_text}' IS NOT NULL;
 
 CREATE INDEX inference_receipts_trace_steps_finished_idx
 ON otlet.inference_receipts (finished_at, id)
@@ -480,7 +484,7 @@ WHERE selection_role = 'direct'
   AND selection_status = 'rejected'
   AND selection_reason = 'direct_rejected_by_decision_contract'
   AND schema_validation_status = 'passed'
-  AND NULLIF(raw_output, '') IS NOT NULL;
+  AND candidate_output IS NOT NULL;
 
 CREATE TABLE otlet.worker_events (
   id bigserial PRIMARY KEY,
@@ -512,7 +516,6 @@ CREATE TABLE otlet.outputs (
   job_id bigint NOT NULL REFERENCES otlet.jobs(id),
   receipt_id bigint NOT NULL UNIQUE REFERENCES otlet.inference_receipts(id),
   output jsonb NOT NULL,
-  raw_output text NOT NULL,
   created_at timestamptz NOT NULL DEFAULT now()
 );
 
@@ -538,7 +541,20 @@ VALUES
   ('merge_candidate', true, false, false),
   ('new_entity', false, false, false),
   ('review_flag', false, false, false),
-  ('note', false, true, true);
+  ('note', false, true, true),
+  ('update_row', true, false, true);
+
+CREATE TABLE otlet.action_targets (
+  name text PRIMARY KEY CHECK (name ~ '^[a-z0-9][a-z0-9_-]*$'),
+  target_table regclass NOT NULL,
+  identity_column name NOT NULL,
+  allowed_columns name[] NOT NULL,
+  enabled boolean NOT NULL DEFAULT true,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  CHECK (cardinality(allowed_columns) BETWEEN 1 AND 16),
+  CHECK (NOT identity_column = ANY(allowed_columns))
+);
 
 CREATE TABLE otlet.actions (
   id bigserial PRIMARY KEY,
@@ -555,6 +571,7 @@ CREATE TABLE otlet.actions (
   subject_id text,
   source_hash text,
   content_hash text,
+  idempotency_key text,
   error text,
   review_reason text,
   created_at timestamptz NOT NULL DEFAULT now(),
@@ -563,7 +580,8 @@ CREATE TABLE otlet.actions (
   CHECK (status IN ('proposed', 'complete', 'rejected', 'approved', 'applied')),
   CHECK (approval_status IN ('not_required', 'required', 'approved', 'rejected')),
   CHECK (dry_run_status IN ('not_run', 'passed', 'failed')),
-  CHECK (apply_status IN ('not_applicable', 'applied', 'failed'))
+  CHECK (apply_status IN ('not_applicable', 'applied', 'replayed', 'failed')),
+  CHECK (action_type <> 'update_row' OR idempotency_key IS NOT NULL OR status = 'rejected')
 );
 
 CREATE INDEX actions_job_id_idx
@@ -577,6 +595,36 @@ CREATE INDEX actions_review_queue_idx
 ON otlet.actions (created_at, id)
 WHERE (approval_status = 'required' AND status = 'proposed')
    OR (action_type = 'review_flag' AND status <> 'rejected');
+
+CREATE TABLE otlet.action_execution_receipts (
+  id bigserial PRIMARY KEY,
+  action_id bigint NOT NULL REFERENCES otlet.actions(id) ON DELETE CASCADE,
+  idempotency_key text NOT NULL,
+  mode text NOT NULL CHECK (mode IN ('dry_run', 'apply')),
+  status text NOT NULL CHECK (status IN ('passed', 'applied', 'replayed', 'failed')),
+  target_name text NOT NULL,
+  target_table text NOT NULL,
+  identity_hash text NOT NULL,
+  changed_columns name[] NOT NULL,
+  affected_rows bigint NOT NULL DEFAULT 0 CHECK (affected_rows BETWEEN 0 AND 1),
+  before_hash text,
+  result_hash text,
+  error text,
+  replay_of_receipt_id bigint REFERENCES otlet.action_execution_receipts(id),
+  created_at timestamptz NOT NULL DEFAULT now(),
+  CHECK ((status = 'failed') = (error IS NOT NULL)),
+  CHECK ((status = 'replayed') = (replay_of_receipt_id IS NOT NULL))
+);
+
+CREATE INDEX action_execution_receipts_action_created_idx
+ON otlet.action_execution_receipts (action_id, created_at DESC, id DESC);
+
+CREATE INDEX action_execution_receipts_key_status_idx
+ON otlet.action_execution_receipts (idempotency_key, status, id DESC);
+
+CREATE UNIQUE INDEX action_execution_receipts_one_apply_idx
+ON otlet.action_execution_receipts (idempotency_key)
+WHERE mode = 'apply' AND status = 'applied';
 
 CREATE TABLE otlet.records (
   id bigserial PRIMARY KEY,
@@ -647,6 +695,8 @@ CREATE TABLE otlet.semantic_materializations (
   stale_reason text CHECK (stale_reason IN (
     'source_update',
     'source_delete',
+    'candidate_removed',
+    'candidate_changed',
     'contract_changed',
     'schema_drift',
     'manual',

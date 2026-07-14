@@ -406,6 +406,7 @@ unsafe fn explain_runtime_trace(runtime: &RuntimeState, es: *mut pg_sys::Explain
         finish_sql_ms: runtime.infer_trace_finish_sql_ms,
         materialize_ms: runtime.infer_trace_materialize_ms,
         version: nonempty_str(&runtime.infer_trace_version),
+        runtime_fingerprint_hash: nonempty_str(&runtime.infer_trace_runtime_fingerprint_hash),
         probability_status: nonempty_str(&runtime.infer_trace_probability_status),
         schema_force: nonempty_str(&runtime.infer_trace_schema_force),
         detailed_status: nonempty_str(&runtime.infer_trace_detailed_status),
@@ -431,6 +432,9 @@ unsafe fn explain_state_trace(
             finish_sql_ms: (*state).infer_trace_finish_sql_ms,
             materialize_ms: (*state).infer_trace_materialize_ms,
             version: pg_cstr_str((*state).infer_trace_version),
+            runtime_fingerprint_hash: pg_cstr_str(
+                (*state).infer_trace_runtime_fingerprint_hash,
+            ),
             probability_status: pg_cstr_str((*state).infer_trace_probability_status),
             schema_force: pg_cstr_str((*state).infer_trace_schema_force),
             detailed_status: pg_cstr_str((*state).infer_trace_detailed_status),
@@ -466,6 +470,11 @@ unsafe fn explain_infer_now_trace(trace: &InferNowTraceExplain<'_>, es: *mut pg_
             explain_counter("Infer Now Trace Materialize Ms", trace.materialize_ms, es);
         }
         explain_optional_text("Infer Now Trace Version", trace.version, es);
+        explain_optional_text(
+            "Infer Now Runtime Fingerprint Hash",
+            trace.runtime_fingerprint_hash,
+            es,
+        );
         explain_optional_text("Infer Now Probability Status", trace.probability_status, es);
         explain_optional_text("Infer Now Schema Force", trace.schema_force, es);
         explain_optional_text("Infer Now Detailed Trace Status", trace.detailed_status, es);

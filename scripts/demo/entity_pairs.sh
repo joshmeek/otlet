@@ -277,7 +277,7 @@ action_contract="$(psql_exec -qAt -v task_name="$entity_task" <<'SQL'
 WITH schema_check AS (
   SELECT string_agg(action_type, '|' ORDER BY action_type) AS value
   FROM otlet.action_type_schemas
-  WHERE action_type IN ('merge_candidate', 'new_entity', 'note', 'review_flag')
+  WHERE action_type IN ('merge_candidate', 'new_entity', 'note', 'review_flag', 'update_row')
 ), type_check AS (
   SELECT COALESCE(string_agg(DISTINCT action_type, '|' ORDER BY action_type), '') AS value
   FROM otlet.action_status
@@ -299,7 +299,7 @@ WITH schema_check AS (
 ), applyable_check AS (
   SELECT string_agg(action_type || ':' || applyable::text, '|' ORDER BY action_type) AS value
   FROM otlet.action_type_schemas
-  WHERE action_type IN ('create_record', 'merge_candidate', 'new_entity', 'note', 'review_flag')
+  WHERE action_type IN ('create_record', 'merge_candidate', 'new_entity', 'note', 'review_flag', 'update_row')
 )
 SELECT concat_ws(E'\n',
   'action_schema_contract=' || schema_check.value,
@@ -312,11 +312,11 @@ FROM schema_check, type_check, status_check, failed_check, applyable_check;
 SQL
 )"
 printf '%s\n' "$action_contract"
-require_contains "$action_contract" "action_schema_contract=merge_candidate|new_entity|note|review_flag" "Expected built-in action schemas"
+require_contains "$action_contract" "action_schema_contract=merge_candidate|new_entity|note|review_flag|update_row" "Expected built-in action schemas"
 require_contains "$action_contract" "action_type_contract=merge_candidate|new_entity" "Expected entity-resolution merge_candidate and new_entity actions"
 require_contains "$action_contract" "action_status_contract=4|4|4|0" "Expected four trusted valid entity actions"
 require_contains "$action_contract" "failed_attempt_action_contract=0" "Expected failed/rejected attempts to create no actions"
-require_contains "$action_contract" "action_applyable_contract=create_record:true|merge_candidate:false|new_entity:false|note:true|review_flag:false" "Expected applyable metadata to be schema-driven"
+require_contains "$action_contract" "action_applyable_contract=create_record:true|merge_candidate:false|new_entity:false|note:true|review_flag:false|update_row:true" "Expected applyable metadata to be schema-driven"
 
 merge_action_id="$(psql_exec -qAt -v task_name="$entity_task" <<'SQL'
 SELECT min(action_id)
@@ -744,6 +744,146 @@ echo "semantic_join_match_contract=$join_match_contract"
   echo "Expected semantic join matches, got $join_match_contract" >&2
   exit 1
 }
+
+log "Checking watch definition portability"
+watch_replace_contract="$(psql_exec -qAt \
+  -v row_watch="$numeric_triage_watch" \
+  -v pair_watch="$join_index_name" <<'SQL'
+BEGIN;
+CREATE TEMP TABLE watch_portability_definitions AS
+SELECT name, otlet.export_watch(name) AS definition
+FROM (VALUES (:'row_watch'), (:'pair_watch')) names(name);
+CREATE TEMP TABLE watch_portability_before AS
+SELECT
+  (SELECT string_agg(c.oid::text || ':' || t.tgname, '|' ORDER BY c.oid, t.tgname)
+   FROM pg_catalog.pg_trigger t
+   JOIN pg_catalog.pg_class c ON c.oid = t.tgrelid
+   WHERE NOT t.tgisinternal AND t.tgname LIKE 'otlet_%') AS trigger_signature,
+  (SELECT count(*) FROM otlet.semantic_index_current_rows(:'row_watch', true)) AS row_count,
+  otlet.semantic_join_matches(:'pair_watch', 'vendor-1001:vendor-42', '{"match":"same_entity"}'::jsonb) AS pair_same,
+  otlet.semantic_join_matches(:'pair_watch', 'vendor-1001:vendor-77', '{"match":"different_entity"}'::jsonb) AS pair_different;
+WITH imported AS MATERIALIZED (
+  SELECT otlet.import_watch(definition, true)
+  FROM watch_portability_definitions
+)
+SELECT
+  (SELECT count(*) = 2 FROM imported)::text || '|' ||
+  (SELECT bool_and(otlet.export_watch(name) = definition) FROM watch_portability_definitions)::text || '|' ||
+  (
+    (SELECT array_agg(key ORDER BY key)
+     FROM jsonb_object_keys((SELECT definition FROM watch_portability_definitions WHERE name = :'row_watch')) key)
+    =
+    (SELECT array_agg(key ORDER BY key)
+     FROM jsonb_object_keys((SELECT definition FROM watch_portability_definitions WHERE name = :'pair_watch')) key)
+  )::text || '|' ||
+  (SELECT bool_and(definition ->> 'format' = 'otlet.watch.v1') FROM watch_portability_definitions)::text || '|' ||
+  (SELECT bool_and(NOT definition ?| ARRAY['task_name','created_at','updated_at','artifact_path','jobs','receipts']) FROM watch_portability_definitions)::text || '|' ||
+  (SELECT bool_and(definition::text NOT LIKE '%Payment exceeds the declared approval threshold%') FROM watch_portability_definitions)::text || '|' ||
+  ((SELECT trigger_signature FROM watch_portability_before) =
+   (SELECT string_agg(c.oid::text || ':' || t.tgname, '|' ORDER BY c.oid, t.tgname)
+    FROM pg_catalog.pg_trigger t
+    JOIN pg_catalog.pg_class c ON c.oid = t.tgrelid
+    WHERE NOT t.tgisinternal AND t.tgname LIKE 'otlet_%'))::text || '|' ||
+  ((SELECT row_count FROM watch_portability_before) =
+   (SELECT count(*) FROM otlet.semantic_index_current_rows(:'row_watch', true)))::text || '|' ||
+  ((SELECT pair_same FROM watch_portability_before) =
+   otlet.semantic_join_matches(:'pair_watch', 'vendor-1001:vendor-42', '{"match":"same_entity"}'::jsonb))::text || '|' ||
+  ((SELECT pair_different FROM watch_portability_before) =
+   otlet.semantic_join_matches(:'pair_watch', 'vendor-1001:vendor-77', '{"match":"different_entity"}'::jsonb))::text;
+ROLLBACK;
+SQL
+)"
+echo "watch_replace_contract=$watch_replace_contract"
+[ "$watch_replace_contract" = "true|true|true|true|true|true|true|true|true|true" ] || {
+  echo "Expected watch replacement to preserve definitions, triggers, and lookup behavior, got $watch_replace_contract" >&2
+  exit 1
+}
+
+watch_round_trip_contract="$(psql_exec -qAt \
+  -v row_watch="$numeric_triage_watch" \
+  -v pair_watch="$join_index_name" <<'SQL'
+BEGIN;
+CREATE TEMP TABLE watch_round_trip_definitions AS
+SELECT name, otlet.export_watch(name) AS definition
+FROM (VALUES (:'row_watch'), (:'pair_watch')) names(name);
+CREATE TEMP TABLE watch_round_trip_triggers AS
+SELECT string_agg(c.oid::text || ':' || t.tgname, '|' ORDER BY c.oid, t.tgname) AS signature
+FROM pg_catalog.pg_trigger t
+JOIN pg_catalog.pg_class c ON c.oid = t.tgrelid
+WHERE NOT t.tgisinternal AND t.tgname LIKE 'otlet_%';
+DO $body$
+DECLARE item record;
+BEGIN
+  FOR item IN SELECT * FROM watch_round_trip_definitions ORDER BY name LOOP
+    PERFORM otlet.drop_watch(item.name);
+    PERFORM otlet.import_watch(item.definition);
+  END LOOP;
+END
+$body$;
+SELECT
+  (SELECT bool_and(otlet.export_watch(name) = definition) FROM watch_round_trip_definitions)::text || '|' ||
+  (SELECT count(*) = 2 FROM otlet.watches WHERE name IN (:'row_watch', :'pair_watch'))::text || '|' ||
+  (SELECT count(*) = 2 FROM otlet.tasks t JOIN otlet.watches w ON w.task_name = t.name WHERE w.name IN (:'row_watch', :'pair_watch'))::text || '|' ||
+  ((SELECT count(*) FROM otlet.semantic_indexes WHERE name IN (:'row_watch', :'pair_watch')) +
+   (SELECT count(*) FROM otlet.semantic_join_indexes WHERE name IN (:'row_watch', :'pair_watch')) = 2)::text || '|' ||
+  ((SELECT signature FROM watch_round_trip_triggers) =
+   (SELECT string_agg(c.oid::text || ':' || t.tgname, '|' ORDER BY c.oid, t.tgname)
+    FROM pg_catalog.pg_trigger t
+    JOIN pg_catalog.pg_class c ON c.oid = t.tgrelid
+    WHERE NOT t.tgisinternal AND t.tgname LIKE 'otlet_%'))::text;
+ROLLBACK;
+SQL
+)"
+echo "watch_round_trip_contract=$watch_round_trip_contract"
+[ "$watch_round_trip_contract" = "true|true|true|true|true" ] || {
+  echo "Expected row and pair watch definitions to round trip, got $watch_round_trip_contract" >&2
+  exit 1
+}
+
+watch_import_failure_contract="$(psql_exec -qAt \
+  -v row_watch="$numeric_triage_watch" \
+  -v pair_watch="$join_index_name" <<'SQL'
+BEGIN;
+CREATE FUNCTION pg_temp.expect_watch_import_error(definition jsonb, replace_existing boolean, expected text)
+RETURNS boolean LANGUAGE plpgsql AS $function$
+DECLARE actual text;
+BEGIN
+  BEGIN
+    PERFORM otlet.import_watch(definition, replace_existing);
+  EXCEPTION WHEN OTHERS THEN
+    GET STACKED DIAGNOSTICS actual = MESSAGE_TEXT;
+    IF position(expected IN actual) = 0 THEN
+      RAISE EXCEPTION 'expected %, got %', expected, actual;
+    END IF;
+    RETURN true;
+  END;
+  RAISE EXCEPTION 'expected import error containing %', expected;
+END
+$function$;
+WITH definitions AS (
+  SELECT otlet.export_watch(:'row_watch') AS row_definition,
+         otlet.export_watch(:'pair_watch') AS pair_definition
+), checks AS (
+  SELECT pg_temp.expect_watch_import_error('null'::jsonb, false, 'must be a JSON object') AS ok FROM definitions
+  UNION ALL SELECT pg_temp.expect_watch_import_error(row_definition || '{"format":"otlet.watch.v2"}', false, 'format must be otlet.watch.v1') FROM definitions
+  UNION ALL SELECT pg_temp.expect_watch_import_error(row_definition || '{"extra":true}', false, 'unsupported key extra') FROM definitions
+  UNION ALL SELECT pg_temp.expect_watch_import_error(row_definition - 'model_name', false, 'missing key model_name') FROM definitions
+  UNION ALL SELECT pg_temp.expect_watch_import_error(row_definition || '{"model_name":"missing_model"}', false, 'model missing_model does not exist') FROM definitions
+  UNION ALL SELECT pg_temp.expect_watch_import_error(row_definition || '{"table_name":"public.missing_table"}', true, 'table public.missing_table does not exist') FROM definitions
+  UNION ALL SELECT pg_temp.expect_watch_import_error(row_definition || '{"subject_column":"missing_column"}', true, 'subject column missing_column does not exist') FROM definitions
+  UNION ALL SELECT pg_temp.expect_watch_import_error(pair_definition || jsonb_build_object('candidate_query', 'SELECT broken'), true, 'column "broken" does not exist') FROM definitions
+  UNION ALL SELECT pg_temp.expect_watch_import_error(row_definition, false, 'already exists') FROM definitions
+)
+SELECT count(*)::text || '|' || bool_and(ok)::text FROM checks;
+ROLLBACK;
+SQL
+)"
+echo "watch_import_failure_contract=$watch_import_failure_contract"
+[ "$watch_import_failure_contract" = "9|true" ] || {
+  echo "Expected nine watch import failures to roll back cleanly, got $watch_import_failure_contract" >&2
+  exit 1
+}
+
 join_customscan_plan="$(
   psql_exec -P border=2 -P null='' -v index_name="$join_index_name" <<'SQL'
 EXPLAIN (ANALYZE, VERBOSE, COSTS, SUMMARY OFF, TIMING OFF)
@@ -791,6 +931,65 @@ echo "semantic_join_current_row_contract=$join_subject_rows|$join_sql_plan"
   exit 1
 }
 require_regex "$join_sql_plan" '^semantic_join_lookup\|4\|4\|0\|0\|' "Expected semantic join SQL plan lookup with four fresh subjects"
+
+log "Checking pair candidate drift audit"
+candidate_removed_contract="$(psql_exec -qAt -v index_name="$join_index_name" -v task_name="$join_task" <<'SQL'
+BEGIN;
+DELETE FROM public.otlet_demo_vendor_pair
+WHERE pair_id = 'vendor-1001:vendor-314';
+SELECT otlet.refresh_semantic_join_index(:'index_name')::text;
+SELECT stale::text || '|' || COALESCE(stale_reason, '')
+FROM otlet.semantic_dependency_audit
+WHERE task_name = :'task_name'
+  AND subject_id = 'vendor-1001:vendor-314';
+SELECT count(*)::text
+FROM otlet.semantic_join_index_current_rows(:'index_name', false)
+WHERE subject_id = 'vendor-1001:vendor-314';
+INSERT INTO public.otlet_demo_vendor_pair (pair_id, left_id, right_id)
+VALUES ('vendor-1001:vendor-314', 'vendor-1001', 'vendor-314');
+SELECT otlet.refresh_semantic_join_index(:'index_name')::text;
+SELECT stale::text || '|' || COALESCE(stale_reason, '')
+FROM otlet.semantic_dependency_audit
+WHERE task_name = :'task_name'
+  AND subject_id = 'vendor-1001:vendor-314';
+ROLLBACK;
+SQL
+)"
+candidate_removed_refresh="$(sed -n '1p' <<<"$candidate_removed_contract")"
+candidate_removed_audit="$(sed -n '2p' <<<"$candidate_removed_contract")"
+candidate_removed_current="$(sed -n '3p' <<<"$candidate_removed_contract")"
+candidate_restored_refresh="$(sed -n '4p' <<<"$candidate_removed_contract")"
+candidate_restored_audit="$(sed -n '5p' <<<"$candidate_removed_contract")"
+echo "candidate_removed_contract=$candidate_removed_refresh|$candidate_removed_audit|$candidate_removed_current|$candidate_restored_refresh|$candidate_restored_audit"
+[ "$candidate_removed_refresh|$candidate_removed_audit|$candidate_removed_current|$candidate_restored_refresh|$candidate_restored_audit" = "0|true|candidate_removed|0|0|false|" ] || {
+  echo "Expected removed pair audit and zero-work restoration, got $candidate_removed_contract" >&2
+  exit 1
+}
+
+candidate_changed_contract="$(psql_exec -qAt -v index_name="$join_index_name" -v task_name="$join_task" <<'SQL'
+BEGIN;
+UPDATE public.otlet_demo_vendor_pair
+SET right_id = 'vendor-77'
+WHERE pair_id = 'vendor-1001:vendor-314';
+SELECT otlet.refresh_semantic_join_index(:'index_name')::text;
+SELECT stale::text || '|' || COALESCE(stale_reason, '')
+FROM otlet.semantic_dependency_audit
+WHERE task_name = :'task_name'
+  AND subject_id = 'vendor-1001:vendor-314';
+SELECT count(*)::text
+FROM otlet.semantic_join_index_current_rows(:'index_name', true)
+WHERE subject_id = 'vendor-1001:vendor-314';
+ROLLBACK;
+SQL
+)"
+candidate_changed_refresh="$(sed -n '1p' <<<"$candidate_changed_contract")"
+candidate_changed_audit="$(sed -n '2p' <<<"$candidate_changed_contract")"
+candidate_changed_current="$(sed -n '3p' <<<"$candidate_changed_contract")"
+echo "candidate_changed_contract=$candidate_changed_refresh|$candidate_changed_audit|$candidate_changed_current"
+[ "$candidate_changed_refresh|$candidate_changed_audit|$candidate_changed_current" = "1|true|candidate_changed|0" ] || {
+  echo "Expected changed pair audit and one queued refresh, got $candidate_changed_contract" >&2
+  exit 1
+}
 
 log "Checking entity-resolution dependency update"
 join_receipts_before_update="$(psql_exec -qAt -v task_name="$join_task" <<'SQL'
@@ -923,11 +1122,14 @@ SELECT worker_events::text || '|' ||
        token_alternative_rows::text || '|' ||
        eval_labels::text || '|' ||
        delete_stale_materializations::text || '|' ||
-       rejected_receipt_raw_outputs::text || '|' ||
+       sensitive_raw_outputs::text || '|' ||
+       sensitive_chosen_texts::text || '|' ||
+       sensitive_token_texts::text || '|' ||
+       sensitive_alternative_token_texts::text || '|' ||
        failed_canceled_jobs::text || '|' ||
        dry_run::text
 FROM otlet.cleanup_policy_state(true);
 SQL
 )"
 echo "cleanup_policy_dry_run=$cleanup_dry_run"
-require_regex "$cleanup_dry_run" '^[0-9]+\|[0-9]+\|[0-9]+\|[0-9]+\|[0-9]+\|[0-9]+\|[0-9]+\|true$' "Expected cleanup dry run counts ending in true"
+require_regex "$cleanup_dry_run" '^[0-9]+\|[0-9]+\|[0-9]+\|[0-9]+\|[0-9]+\|[0-9]+\|[0-9]+\|[0-9]+\|[0-9]+\|[0-9]+\|true$' "Expected cleanup dry run counts ending in true"

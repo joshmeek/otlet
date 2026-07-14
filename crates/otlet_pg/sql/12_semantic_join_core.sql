@@ -1,3 +1,142 @@
+CREATE FUNCTION otlet.semantic_join_refresh_inputs(
+  index_name text
+) RETURNS TABLE (
+  subject_id text,
+  input jsonb
+)
+LANGUAGE plpgsql
+VOLATILE
+AS $$
+DECLARE
+  index_row otlet.semantic_join_indexes%ROWTYPE;
+  current_contract_hash text;
+  current_input_shaping jsonb := '{}'::jsonb;
+BEGIN
+  SELECT *
+  INTO index_row
+  FROM otlet.semantic_join_indexes sji
+  WHERE sji.name = semantic_join_refresh_inputs.index_name;
+
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'otlet semantic join index % does not exist', semantic_join_refresh_inputs.index_name;
+  END IF;
+
+  SELECT
+    otlet.task_contract_hash(
+      t.instruction,
+      t.output_schema,
+      t.model_name,
+      t.runtime_options,
+      t.input_shaping,
+      t.decision_contract
+    ),
+    t.input_shaping
+  INTO current_contract_hash, current_input_shaping
+  FROM otlet.tasks t
+  WHERE t.name = index_row.task_name;
+
+  RETURN QUERY EXECUTE format(
+    $sql$
+      WITH current_inputs AS MATERIALIZED (
+        SELECT
+          candidate.subject_id,
+          candidate.input,
+          otlet.semantic_content_hash(candidate.input, %6$L::jsonb) AS content_hash
+        FROM (
+          SELECT subject_id::text AS subject_id, input::jsonb AS input
+          FROM (%1$s) otlet_join_candidate
+          ORDER BY subject_id
+          LIMIT %2$s
+        ) candidate
+      ),
+      candidate_materializations AS (
+        SELECT
+          sm.id,
+          sm.content_hash AS material_content_hash,
+          sm.contract_hash AS material_contract_hash,
+          sm.stale_reason,
+          ci.subject_id AS current_subject_id,
+          ci.content_hash AS current_content_hash,
+          (
+            sm.stale_reason IS NULL
+            OR sm.stale_reason IN (
+              'source_update',
+              'content_revalidation_pending',
+              'candidate_removed',
+              'candidate_changed'
+            )
+          ) AS replace_reason
+        FROM current_inputs ci
+        FULL JOIN otlet.semantic_materializations sm
+          ON sm.task_name = %3$L
+         AND sm.record_type = %4$L
+         AND sm.subject_id = ci.subject_id
+        WHERE ci.subject_id IS NOT NULL
+           OR (sm.task_name = %3$L AND sm.record_type = %4$L)
+      ),
+      candidate_states AS (
+        SELECT
+          id,
+          CASE
+            WHEN current_subject_id IS NULL AND replace_reason THEN 'candidate_removed'
+            WHEN current_content_hash IS DISTINCT FROM material_content_hash AND replace_reason THEN 'candidate_changed'
+            WHEN current_content_hash IS NOT DISTINCT FROM material_content_hash
+              AND stale_reason IN ('candidate_removed', 'candidate_changed') THEN 'candidate_restored'
+            ELSE NULL
+          END AS transition
+        FROM candidate_materializations
+        WHERE id IS NOT NULL
+      ),
+      reconciled AS (
+        UPDATE otlet.semantic_materializations sm
+        SET stale = state.transition <> 'candidate_restored',
+            stale_reason = CASE
+              WHEN state.transition = 'candidate_restored' THEN NULL
+              ELSE state.transition
+            END,
+            freshness_basis = CASE
+              WHEN state.transition = 'candidate_restored' THEN 'content_hash_match'
+              ELSE sm.freshness_basis
+            END,
+            updated_at = now()
+        FROM candidate_states state
+        WHERE sm.id = state.id
+          AND state.transition IS NOT NULL
+          AND (
+            sm.stale IS DISTINCT FROM (state.transition <> 'candidate_restored')
+            OR sm.stale_reason IS DISTINCT FROM CASE
+              WHEN state.transition = 'candidate_restored' THEN NULL
+              ELSE state.transition
+            END
+        )
+        RETURNING sm.id
+      ),
+      matched_inputs AS (
+        SELECT DISTINCT current_subject_id AS subject_id
+        FROM candidate_materializations
+        WHERE current_subject_id IS NOT NULL
+          AND material_content_hash = current_content_hash
+          AND material_contract_hash = %5$L
+      )
+      SELECT ci.subject_id, ci.input
+      FROM current_inputs ci
+      WHERE NOT EXISTS (
+        SELECT 1
+        FROM matched_inputs matched
+        WHERE matched.subject_id = ci.subject_id
+      )
+      ORDER BY ci.subject_id
+    $sql$,
+    index_row.candidate_query,
+    index_row.max_candidate_rows,
+    index_row.task_name,
+    index_row.record_type,
+    current_contract_hash,
+    current_input_shaping
+  );
+END;
+$$;
+
 CREATE FUNCTION otlet.create_watch_pair_index(
   index_name text,
   candidate_query text,
@@ -17,7 +156,6 @@ DECLARE
   semantic_record_type text := COALESCE(record_type, index_name);
   semantic_task_name text := index_name || '_task';
   bounded_rows integer := GREATEST(1, LEAST(COALESCE(max_candidate_rows, 1000), 100000));
-  current_contract_hash text := otlet.task_contract_hash(instruction, output_schema, model_name, runtime_options, input_shaping, decision_contract);
   wrapped_query text;
 BEGIN
   IF index_name !~ '^[a-z0-9][a-z0-9_-]*$' THEN
@@ -34,36 +172,8 @@ BEGIN
   );
 
   wrapped_query := format(
-    $query$
-      SELECT subject_id, input
-      FROM (
-        SELECT
-          shaped.subject_id,
-          shaped.input,
-          otlet.semantic_content_hash(shaped.input, %6$L::jsonb) AS content_hash
-        FROM (
-          SELECT subject_id::text AS subject_id, input::jsonb AS input
-          FROM (%1$s) otlet_join_candidate
-          ORDER BY subject_id
-          LIMIT %2$s
-        ) shaped
-      ) otlet_join_input
-      WHERE NOT EXISTS (
-        SELECT 1
-        FROM otlet.semantic_materializations sm
-        WHERE sm.task_name = %3$L
-          AND sm.record_type = %4$L
-          AND sm.subject_id = otlet_join_input.subject_id
-          AND sm.content_hash = otlet_join_input.content_hash
-          AND sm.contract_hash = %5$L
-      )
-    $query$,
-    candidate_query,
-    bounded_rows,
-    semantic_task_name,
-    semantic_record_type,
-    current_contract_hash,
-    input_shaping
+    'SELECT subject_id, input FROM otlet.semantic_join_refresh_inputs(%L)',
+    index_name
   );
 
   PERFORM otlet.create_task(

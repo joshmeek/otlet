@@ -24,6 +24,8 @@ fn inference_cache_contract_key(context: &RunContext) -> u64 {
     hash_bytes_parts_u64(&[
         b"contract=",
         context.inference_cache_contract_hash.as_bytes(),
+        b"|runtime_output_contract=",
+        context.runtime_output_contract_hash.as_bytes(),
     ])
 }
 

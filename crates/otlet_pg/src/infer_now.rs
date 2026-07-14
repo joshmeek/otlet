@@ -14,12 +14,14 @@ const INPUT_CAP: usize = 8192;
 const ERROR_CAP: usize = 512;
 const MAX_WAIT_MS: u32 = 30_000;
 const INFER_NOW_SLOTS: usize = 4;
+const TIMEOUT_CANCEL_REASON: &str = "infer-now timeout requested job cancellation";
 pub(crate) const INFER_NOW_ADMISSION_POLICY: &str = "bounded_shared_memory_infer_queue_4_slots";
 
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct InferNowSlot {
     state: u32,
+    timeout_cancel_pending: bool,
     request_id: u64,
     requester_latch: usize,
     last_job_id: i64,
@@ -45,6 +47,7 @@ impl Default for InferNowSlot {
     fn default() -> Self {
         Self {
             state: STATE_IDLE,
+            timeout_cancel_pending: false,
             request_id: 0,
             requester_latch: 0,
             last_job_id: 0,
@@ -230,6 +233,46 @@ pub(crate) fn snapshot() -> InferNowSnapshot {
     }
 }
 
+pub(crate) fn persist_timeout_cancel(job_id: i64) -> Result<bool, String> {
+    let requested = {
+        let state = INFER_NOW_STATE.share();
+        state.slots.iter().any(|slot| {
+            timeout_cancel_matches(slot.timeout_cancel_pending, slot.last_job_id, job_id)
+        })
+    };
+    if !requested {
+        return Ok(false);
+    }
+
+    let result: pgrx::spi::Result<Option<String>> =
+        pgrx::bgworkers::BackgroundWorker::transaction(|| {
+            pgrx::Spi::connect_mut(|client| {
+                let args = [job_id.into(), TIMEOUT_CANCEL_REASON.into()];
+                let rows = client.select(
+                    "SELECT status FROM otlet.cancel_job($1, $2) LIMIT 1",
+                    Some(1),
+                    &args,
+                )?;
+                rows.first().get::<String>(1)
+            })
+        });
+
+    match result {
+        Ok(Some(status)) if matches!(status.as_str(), "cancel_requested" | "canceled") => Ok(true),
+        Ok(Some(status)) => Err(format!(
+            "infer-now timeout cancel reached terminal status {status} for job_id={job_id}"
+        )),
+        Ok(None) => Err(format!(
+            "infer-now timeout cancel affected no rows for job_id={job_id}"
+        )),
+        Err(err) => Err(format!("infer-now timeout cancel failed: {err}")),
+    }
+}
+
+const fn timeout_cancel_matches(pending: bool, slot_job_id: i64, job_id: i64) -> bool {
+    pending && job_id > 0 && slot_job_id == job_id
+}
+
 pub(crate) fn queue_snapshot() -> InferNowQueueSnapshot {
     let state = INFER_NOW_STATE.share();
     let mut requested_slots = 0usize;
@@ -403,6 +446,7 @@ fn submit_infer_now_text(
         let slot = &mut state.slots[slot_index];
         slot.request_id = request_id;
         slot.state = STATE_REQUESTED;
+        slot.timeout_cancel_pending = false;
         slot.requester_latch = unsafe { pg_sys::MyLatch as usize };
         slot.last_job_id = 0;
         slot.last_elapsed_ms = 0;
@@ -650,10 +694,8 @@ fn wait_for_request(request_id: u64, timeout_ms: u32) -> Result<Option<Completed
                         cancel_job_id = state.slots[slot_index].last_job_id;
                         state.abort_requests = state.abort_requests.saturating_add(1);
                         state.last_cancel_job_id = cancel_job_id;
-                        write_error(
-                            &mut state.slots[slot_index],
-                            "infer-now timeout requested job cancellation",
-                        );
+                        state.slots[slot_index].timeout_cancel_pending = true;
+                        write_error(&mut state.slots[slot_index], TIMEOUT_CANCEL_REASON);
                     }
                 }
             }
@@ -661,7 +703,7 @@ fn wait_for_request(request_id: u64, timeout_ms: u32) -> Result<Option<Completed
                 && let Err(err) = cancel_job(cancel_job_id)
             {
                 pgrx::warning!("otlet infer-now timeout cancel failed: {err}");
-                force_cancel_requested(cancel_job_id, "infer-now timeout requested cancellation");
+                force_cancel_requested(cancel_job_id, TIMEOUT_CANCEL_REASON);
             }
             return Ok(None);
         }
@@ -683,10 +725,7 @@ fn wait_for_request(request_id: u64, timeout_ms: u32) -> Result<Option<Completed
 
 fn cancel_job(job_id: i64) -> Result<(), String> {
     pgrx::Spi::connect_mut(|client| {
-        let args = [
-            job_id.into(),
-            "infer-now timeout requested cancellation".into(),
-        ];
+        let args = [job_id.into(), TIMEOUT_CANCEL_REASON.into()];
         let table = client
             .select(
                 "SELECT id FROM otlet.cancel_job($1, $2) LIMIT 1",
@@ -795,5 +834,18 @@ const fn infer_queue_state_label(
         "done"
     } else {
         "idle"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::timeout_cancel_matches;
+
+    #[test]
+    fn timeout_cancel_matches_only_the_recorded_job() {
+        assert!(timeout_cancel_matches(true, 42, 42));
+        assert!(!timeout_cancel_matches(true, 42, 41));
+        assert!(!timeout_cancel_matches(false, 42, 42));
+        assert!(!timeout_cancel_matches(true, 0, 0));
     }
 }

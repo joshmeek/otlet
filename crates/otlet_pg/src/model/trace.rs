@@ -20,6 +20,10 @@ fn generation_trace_summary(
         "runtime_options_hash": context.runtime_options_hash,
         "runtime_options_status": context.runtime_options_status,
         "model_fingerprint_hash": context.model_fingerprint_hash.as_ref(),
+        "runtime_fingerprint_version": RUNTIME_FINGERPRINT_VERSION,
+        "runtime_fingerprint_hash": context.runtime_fingerprint_hash,
+        "runtime_output_contract_hash": context.runtime_output_contract_hash,
+        "runtime_fingerprint": context.runtime_fingerprint,
         "raw_output_hash": raw_output_hash,
         "prompt_tokens": metrics.prompt_tokens,
         "prompt_cached_tokens_before": metrics.prompt_cached_tokens_before,
@@ -69,13 +73,7 @@ fn generation_trace_summary(
             "eviction_reason": metrics.inference_cache_eviction_reason,
             "invalidation_reason": metrics.inference_cache_invalidation_reason
         },
-        "memory": {
-            "model_device_policy": metrics.model_device_policy,
-            "memory_accounting_policy": metrics.memory_accounting_policy,
-            "worker_memory_sample_policy": metrics.worker_memory_sample_policy,
-            "worker_memory_budget_bytes": metrics.worker_memory_budget_bytes,
-            "worker_memory_budget_policy": metrics.worker_memory_budget_policy
-        },
+        "memory": metrics.memory_trace,
         "input_shaping": {
             "shaped_input_bytes": context.shaped_input_bytes,
             "original_shaped_input_bytes": context.original_shaped_input_bytes,

@@ -454,6 +454,17 @@ perform_cleanup() {
     append_kv "$cleanup_tsv" model_artifact_bytes_removed "$removed_bytes"
   fi
 
+  if [[ "$sensitive_mode_enabled" = "1" ]]; then
+    psql_exec >/dev/null <<'SQL'
+UPDATE otlet.production_policy
+SET sensitive_evidence_mode = 'redacted'
+WHERE name = 'default';
+SELECT * FROM otlet.cleanup_policy_state(false);
+SQL
+    sensitive_mode_enabled=0
+    append_kv "$cleanup_tsv" sensitive_evidence_mode_restored redacted
+  fi
+
   append_kv "$cleanup_tsv" sql_cleanup_policy "$keep_sql_state"
   append_kv "$cleanup_tsv" model_cleanup_policy "$keep_models"
   append_kv "$cleanup_tsv" downloaded_path_count "$(wc -l < "$downloaded_paths" | tr -d ' ')"

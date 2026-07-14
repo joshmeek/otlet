@@ -138,7 +138,6 @@ AS $$
         attempts = attempts + 1,
         leased_until = now() + claimable.lease_interval,
         error = CASE WHEN j.status = 'cancel_requested' THEN j.error ELSE NULL END,
-        raw_output = NULL,
         started_at = now(),
         finished_at = NULL
     FROM claimable
@@ -213,6 +212,88 @@ BEGIN
 END;
 $$;
 
+CREATE FUNCTION otlet.redact_trace_summary(
+  trace_summary jsonb,
+  sensitive_evidence_mode text
+) RETURNS jsonb
+LANGUAGE plpgsql
+IMMUTABLE
+PARALLEL SAFE
+AS $$
+DECLARE
+  result jsonb := COALESCE(redact_trace_summary.trace_summary, '{}'::jsonb);
+  detail jsonb;
+  redacted_steps jsonb;
+BEGIN
+  IF jsonb_typeof(result) IS DISTINCT FROM 'object' THEN
+    RAISE EXCEPTION 'otlet trace summary must be a JSON object';
+  END IF;
+  IF redact_trace_summary.sensitive_evidence_mode NOT IN ('redacted', 'diagnostic') THEN
+    RAISE EXCEPTION 'otlet sensitive evidence mode must be redacted or diagnostic';
+  END IF;
+
+  result := result - ARRAY[
+    'prompt',
+    'prompt_text',
+    'input',
+    'input_text',
+    'source_row',
+    'raw_output'
+  ];
+
+  detail := CASE
+    WHEN jsonb_typeof(result -> 'detailed_trace') = 'object'
+      THEN result -> 'detailed_trace'
+    ELSE '{}'::jsonb
+  END;
+
+  IF redact_trace_summary.sensitive_evidence_mode = 'redacted' THEN
+    SELECT COALESCE(jsonb_agg(
+      CASE
+        WHEN jsonb_typeof(step.value) = 'object' THEN
+          (step.value - 'token_text') ||
+          CASE
+            WHEN jsonb_typeof(step.value -> 'top_alternatives') = 'array' THEN
+              jsonb_build_object(
+                'top_alternatives',
+                (
+                  SELECT COALESCE(jsonb_agg(
+                    CASE
+                      WHEN jsonb_typeof(alt.value) = 'object' THEN alt.value - 'token_text'
+                      ELSE alt.value
+                    END
+                    ORDER BY alt.ordinality
+                  ), '[]'::jsonb)
+                  FROM jsonb_array_elements(step.value -> 'top_alternatives')
+                    WITH ORDINALITY AS alt(value, ordinality)
+                )
+              )
+            ELSE '{}'::jsonb
+          END
+        ELSE step.value
+      END
+      ORDER BY step.ordinality
+    ), '[]'::jsonb)
+    INTO redacted_steps
+    FROM jsonb_array_elements(
+      CASE
+        WHEN jsonb_typeof(detail -> 'steps') = 'array' THEN detail -> 'steps'
+        ELSE '[]'::jsonb
+      END
+    ) WITH ORDINALITY AS step(value, ordinality);
+
+    detail := jsonb_set(detail - 'chosen_text', '{steps}', redacted_steps, true);
+  END IF;
+
+  detail := detail || jsonb_build_object(
+    'text_storage', redact_trace_summary.sensitive_evidence_mode,
+    'redaction_version', 1
+  );
+
+  RETURN jsonb_set(result, '{detailed_trace}', detail, true);
+END;
+$$;
+
 CREATE FUNCTION otlet.record_model_attempt(
   job_id bigint,
   model_name text,
@@ -241,6 +322,8 @@ DECLARE
   model_row otlet.models%ROWTYPE;
   next_attempt int;
   actual_selection_status text := COALESCE(record_model_attempt.selection_status, 'accepted');
+  policy_mode text;
+  stored_trace_summary jsonb;
 BEGIN
   SELECT j.id, j.task_name, j.subject_id, j.started_at, j.created_at
   INTO job_row.id, job_row.task_name, job_row.subject_id, job_row.started_at, job_row.created_at
@@ -258,6 +341,13 @@ BEGIN
   WHERE name = job_row.task_name;
   IF NOT FOUND THEN
     RAISE EXCEPTION 'otlet task % does not exist', job_row.task_name;
+  END IF;
+  SELECT sensitive_evidence_mode
+  INTO policy_mode
+  FROM otlet.production_policy
+  WHERE name = 'default';
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'otlet default production policy does not exist';
   END IF;
   SELECT name, artifact_path, artifact_hash
   INTO model_row.name, model_row.artifact_path, model_row.artifact_hash
@@ -284,6 +374,11 @@ BEGIN
      AND record_model_attempt.schema_validation_status NOT IN ('passed', 'failed', 'not_run') THEN
     RAISE EXCEPTION 'otlet record_model_attempt schema_validation_status must be passed, failed, or not_run';
   END IF;
+
+  stored_trace_summary := otlet.redact_trace_summary(
+    COALESCE(record_model_attempt.trace_summary, '{}'::jsonb),
+    policy_mode
+  );
 
   -- Prefer index-ordered peek over max() aggregate on (job_id, attempt_index).
   SELECT COALESCE((
@@ -314,6 +409,7 @@ BEGIN
     output_schema_hash,
     raw_output_hash,
     raw_output,
+    candidate_output,
     prompt_tokens,
     generated_tokens,
     generate_ms,
@@ -342,13 +438,14 @@ BEGIN
     record_model_attempt.input_hash,
     record_model_attempt.output_schema_hash,
     COALESCE(record_model_attempt.raw_output_hash, md5(COALESCE(record_model_attempt.raw_output, ''))),
-    record_model_attempt.raw_output,
+    CASE WHEN policy_mode = 'diagnostic' THEN record_model_attempt.raw_output ELSE NULL END,
+    CASE WHEN actual_selection_status = 'rejected' THEN record_model_attempt.output ELSE NULL END,
     NULLIF(record_model_attempt.trace_summary ->> 'prompt_tokens', '')::bigint,
     NULLIF(record_model_attempt.trace_summary ->> 'generated_tokens', '')::bigint,
     NULLIF(record_model_attempt.trace_summary ->> 'generate_ms', '')::bigint,
     NULLIF(record_model_attempt.trace_summary ->> 'tokens_per_second', '')::numeric,
-    COALESCE(record_model_attempt.schema_validation_status, record_model_attempt.trace_summary ->> 'schema_validation_status'),
-    COALESCE(record_model_attempt.trace_summary, '{}'::jsonb),
+    COALESCE(record_model_attempt.schema_validation_status, stored_trace_summary ->> 'schema_validation_status'),
+    stored_trace_summary,
     COALESCE(record_model_attempt.started_at, job_row.started_at, job_row.created_at, now()),
     COALESCE(
       record_model_attempt.receipt_status,
@@ -363,12 +460,11 @@ BEGIN
   RETURNING * INTO saved_receipt;
 
   IF actual_selection_status = 'accepted' AND record_model_attempt.output IS NOT NULL THEN
-    INSERT INTO otlet.outputs (job_id, receipt_id, output, raw_output)
+    INSERT INTO otlet.outputs (job_id, receipt_id, output)
     VALUES (
       job_row.id,
       saved_receipt.id,
-      record_model_attempt.output,
-      COALESCE(record_model_attempt.raw_output, '')
+      record_model_attempt.output
     )
     RETURNING * INTO saved_output;
   END IF;
@@ -429,7 +525,6 @@ BEGIN
   SET status = 'canceled',
       leased_until = NULL,
       error = COALESCE(job_row.error, 'canceled'),
-      raw_output = finish_canceled_job.raw_output,
       cancel_requested_at = COALESCE(job_row.cancel_requested_at, now()),
       finished_at = now()
   WHERE id = job_row.id
@@ -674,7 +769,8 @@ CREATE FUNCTION otlet.fail_job(
   model_name text DEFAULT NULL,
   selection_role text DEFAULT 'direct',
   selection_status text DEFAULT 'failed',
-  selection_reason text DEFAULT NULL
+  selection_reason text DEFAULT NULL,
+  candidate_output jsonb DEFAULT NULL
 ) RETURNS SETOF otlet.jobs
 LANGUAGE plpgsql
 AS $$
@@ -742,7 +838,6 @@ BEGIN
   SET status = 'failed',
       leased_until = NULL,
       error = fail_job.error,
-      raw_output = fail_job.raw_output,
       finished_at = now()
   WHERE id = fail_job.job_id
   RETURNING * INTO saved_job;
@@ -752,6 +847,7 @@ BEGIN
   FROM otlet.record_model_attempt(
     saved_job.id,
     model_row.name,
+    output => fail_job.candidate_output,
     raw_output => fail_job.raw_output,
     prompt_hash => fail_job.prompt_hash,
     input_hash => fail_job.input_hash,
@@ -813,7 +909,7 @@ DECLARE
   canceled_swept bigint := 0;
 BEGIN
   FOR job_row IN
-    SELECT j.id, j.task_name, j.raw_output, j.started_at, j.created_at, j.error
+    SELECT j.id, j.task_name, j.started_at, j.created_at, j.error
     FROM otlet.jobs j
     CROSS JOIN otlet.production_policy p
     WHERE p.name = 'default'
@@ -857,7 +953,6 @@ BEGIN
     SET status = 'failed',
         leased_until = NULL,
         error = 'job lease expired after max attempts',
-        raw_output = COALESCE(job_row.raw_output, ''),
         finished_at = now()
     WHERE id = job_row.id
     RETURNING * INTO job_row;
@@ -865,8 +960,7 @@ BEGIN
     PERFORM otlet.record_model_attempt(
       job_row.id,
       model_row.name,
-      raw_output => COALESCE(job_row.raw_output, ''),
-      raw_output_hash => md5(COALESCE(job_row.raw_output, '')),
+      raw_output_hash => md5(''),
       trace_summary => jsonb_build_object('schema_validation_status', 'not_run'),
       schema_validation_status => 'not_run',
       started_at => COALESCE(job_row.started_at, job_row.created_at, now()),

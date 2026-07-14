@@ -34,7 +34,7 @@ pub(crate) struct ModelMetrics {
     pub(crate) worker_process_virtual_bytes: i64,
     pub(crate) worker_memory_sample_policy: &'static str,
     pub(crate) worker_memory_budget_bytes: i64,
-    pub(crate) worker_memory_budget_policy: &'static str,
+    pub(crate) memory_trace: Value,
     pub(crate) prompt_tokens: i64,
     pub(crate) prompt_cached_tokens_before: i64,
     pub(crate) prompt_reused_tokens: i64,
@@ -155,6 +155,13 @@ impl ModelError {
         self.metrics = Some(Box::new(metrics));
         self
     }
+
+    fn with_memory_trace(mut self, memory_trace: Value) -> Self {
+        if let Some(Value::Object(trace)) = &mut self.trace_summary {
+            trace.insert("memory".to_owned(), memory_trace);
+        }
+        self
+    }
 }
 
 struct RunContext {
@@ -164,6 +171,9 @@ struct RunContext {
     runtime_options_hash: String,
     runtime_options_status: Value,
     model_fingerprint_hash: Arc<str>,
+    runtime_fingerprint: Value,
+    runtime_fingerprint_hash: String,
+    runtime_output_contract_hash: String,
     decision_contract_hash: String,
     decision_preset_name: String,
     decision_preset_contract_hash: String,
@@ -214,6 +224,7 @@ fn run_job_with_model_ref(job: &Job, model: JobModelRef<'_>) -> Result<ModelRun,
         .as_ref()
         .map_err(|err| ModelError::new(err.clone()))?;
     let model_fingerprint_hash = model_fingerprint_hash(model);
+    let runtime_fingerprint = runtime_fingerprint(model, &model_fingerprint_hash, options);
     // Cache keys use content/contract/model digests only — look up before
     // allocating shaped JSON or prompt strings. Hits stream the same hashes.
     let cache_probe = RunContext {
@@ -223,12 +234,15 @@ fn run_job_with_model_ref(job: &Job, model: JobModelRef<'_>) -> Result<ModelRun,
         runtime_options_hash: digests.runtime_options_hash.clone(),
         runtime_options_status: digests.runtime_options_status.clone(),
         model_fingerprint_hash: Arc::clone(&model_fingerprint_hash),
+        runtime_fingerprint: runtime_fingerprint.document,
+        runtime_fingerprint_hash: runtime_fingerprint.hash,
+        runtime_output_contract_hash: runtime_fingerprint.output_contract_hash,
         decision_contract_hash: digests.decision_contract_hash.clone(),
         decision_preset_name: digests.decision_preset_name.clone(),
         decision_preset_contract_hash: digests.decision_preset_contract_hash.clone(),
         input_content_hash: job.input_content_hash.clone(),
         inference_cache_contract_hash: digests.inference_cache_contract_hash.clone(),
-        inference_cache_key_basis: "content_hash_contract_hash_model_fingerprint",
+        inference_cache_key_basis: "content_hash_contract_hash_runtime_output_contract_hash_model_fingerprint",
         cache_key: 0,
         content_cache_key: 0,
         contract_cache_key: 0,
@@ -312,19 +326,27 @@ fn run_job_with_model_ref(job: &Job, model: JobModelRef<'_>) -> Result<ModelRun,
             input_truncated,
             ..cache_probe
         };
-        // Cache hits skip /proc sampling unless an RSS budget is configured.
-        // Generation path still enforces the budget before decode.
         let worker_memory = if options.max_worker_rss_bytes > 0 {
             let sample = process_memory_sample();
             enforce_worker_rss_budget(&sample, options.max_worker_rss_bytes)?;
             sample
         } else {
             ProcessMemorySample {
-                rss_bytes: 0,
-                virtual_bytes: 0,
                 policy: "skipped_on_inference_cache_hit_no_rss_budget",
+                ..ProcessMemorySample::default()
             }
         };
+        let memory_admission = ModelLoadAdmission::not_required(
+            "inference_cache_hit",
+            options.max_worker_rss_bytes,
+            &worker_memory,
+        );
+        let memory_trace = build_memory_trace(
+            &worker_memory,
+            &worker_memory,
+            &memory_admission,
+            options.max_worker_rss_bytes,
+        );
         (
             RawOutput::Cached(raw_output),
             ModelMetrics {
@@ -340,9 +362,7 @@ fn run_job_with_model_ref(job: &Job, model: JobModelRef<'_>) -> Result<ModelRun,
                 worker_process_virtual_bytes: worker_memory.virtual_bytes,
                 worker_memory_sample_policy: worker_memory.policy,
                 worker_memory_budget_bytes: u64_to_i64_saturating(options.max_worker_rss_bytes),
-                worker_memory_budget_policy: worker_memory_budget_policy(
-                    options.max_worker_rss_bytes,
-                ),
+                memory_trace,
                 prompt_tokens: 0,
                 prompt_cached_tokens_before: 0,
                 prompt_reused_tokens: 0,
@@ -460,13 +480,9 @@ fn run_job_with_model_ref(job: &Job, model: JobModelRef<'_>) -> Result<ModelRun,
         )
         .with_metrics(metrics));
     };
-    if let Some(extra_key) = object
-        .keys()
-        .find(|key| *key != "output" && *key != "actions")
-        .cloned()
-    {
+    if object.keys().any(|key| key != "output" && key != "actions") {
         return Err(ModelError::with_context(
-            format!("model JSON unsupported top-level key: {extra_key}"),
+            "model JSON has unsupported top-level key".to_owned(),
             raw_output.into_owned(),
             &context,
             trace_summary,
@@ -567,16 +583,20 @@ const PROMPT_BODY_BEFORE_SCHEMA: &str = "\n\nResponse schema:\n";
 const PROMPT_BODY_BEFORE_INPUT: &str = "\n\nInput:\n";
 const PROMPT_BODY_AFTER_INPUT: &str = "\n\nJSON:\n";
 
+fn prompt_reasoning_prefix(options: &crate::runtime::RuntimeOptions) -> &'static str {
+    if options.reasoning == "off" {
+        "/no_think "
+    } else {
+        ""
+    }
+}
+
 fn prompt_prefix(
     options: &crate::runtime::RuntimeOptions,
     instruction: &str,
     rendered_schema: &str,
 ) -> String {
-    let reasoning = if options.reasoning == "off" {
-        "/no_think "
-    } else {
-        ""
-    };
+    let reasoning = prompt_reasoning_prefix(options);
     format!(
         "{reasoning}{PROMPT_BODY_BEFORE_INSTRUCTION}{instruction}{PROMPT_BODY_BEFORE_SCHEMA}{rendered_schema}{PROMPT_BODY_BEFORE_INPUT}"
     )
@@ -640,3 +660,4 @@ include!("trace.rs");
 include!("linked.rs");
 include!("cache.rs");
 include!("output.rs");
+include!("fingerprint.rs");

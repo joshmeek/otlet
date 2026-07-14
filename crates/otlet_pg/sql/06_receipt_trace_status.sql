@@ -14,6 +14,7 @@ SELECT
   r.status,
   r.error,
   o.output,
+  r.candidate_output,
   r.raw_output,
   r.raw_output_hash,
   r.prompt_tokens,
@@ -48,25 +49,27 @@ SELECT
   j.cancel_requested_at,
   o.id AS output_id,
   o.output,
-  COALESCE(o.raw_output, accepted.raw_output, j.raw_output) AS raw_output,
-  accepted.id AS receipt_id,
+  latest.candidate_output,
+  COALESCE(o.output, latest.candidate_output) AS diagnostic_output,
+  COALESCE(accepted.raw_output, latest.raw_output) AS raw_output,
+  COALESCE(accepted.id, latest.id) AS receipt_id,
   accepted.id AS accepted_receipt_id,
-  accepted.model_name,
+  COALESCE(accepted.model_name, latest.model_name) AS model_name,
   accepted.model_name AS accepted_model_name,
-  accepted.runtime_name,
-  accepted.prompt_hash,
-  accepted.input_hash,
-  accepted.output_schema_hash,
-  accepted.raw_output_hash,
-  accepted.prompt_tokens,
-  accepted.generated_tokens,
-  accepted.generate_ms,
-  accepted.tokens_per_second,
-  accepted.schema_validation_status,
-  accepted.trace_summary,
-  accepted.selection_role AS model_selection_role,
-  accepted.selection_status AS model_selection_status,
-  accepted.selection_reason AS model_selection_reason,
+  COALESCE(accepted.runtime_name, latest.runtime_name) AS runtime_name,
+  COALESCE(accepted.prompt_hash, latest.prompt_hash) AS prompt_hash,
+  COALESCE(accepted.input_hash, latest.input_hash) AS input_hash,
+  COALESCE(accepted.output_schema_hash, latest.output_schema_hash) AS output_schema_hash,
+  COALESCE(accepted.raw_output_hash, latest.raw_output_hash) AS raw_output_hash,
+  COALESCE(accepted.prompt_tokens, latest.prompt_tokens) AS prompt_tokens,
+  COALESCE(accepted.generated_tokens, latest.generated_tokens) AS generated_tokens,
+  COALESCE(accepted.generate_ms, latest.generate_ms) AS generate_ms,
+  COALESCE(accepted.tokens_per_second, latest.tokens_per_second) AS tokens_per_second,
+  COALESCE(accepted.schema_validation_status, latest.schema_validation_status) AS schema_validation_status,
+  COALESCE(accepted.trace_summary, latest.trace_summary) AS trace_summary,
+  COALESCE(accepted.selection_role, latest.selection_role) AS model_selection_role,
+  COALESCE(accepted.selection_status, latest.selection_status) AS model_selection_status,
+  COALESCE(accepted.selection_reason, latest.selection_reason) AS model_selection_reason,
   COALESCE(attempts.model_attempt_count, 0)::bigint AS model_attempt_count,
   COALESCE(attempts.escalated, false) AS escalated,
   j.created_at AS job_created_at,
@@ -75,7 +78,14 @@ SELECT
 FROM otlet.jobs j
 LEFT JOIN receipt_attempts attempts ON attempts.job_id = j.id
 LEFT JOIN otlet.outputs o ON o.job_id = j.id
-LEFT JOIN otlet.inference_receipts accepted ON accepted.id = o.receipt_id;
+LEFT JOIN otlet.inference_receipts accepted ON accepted.id = o.receipt_id
+LEFT JOIN LATERAL (
+  SELECT r.*
+  FROM otlet.inference_receipts r
+  WHERE r.job_id = j.id
+  ORDER BY r.attempt_index DESC, r.id DESC
+  LIMIT 1
+) latest ON true;
 
 CREATE VIEW otlet.action_status AS
 SELECT
@@ -89,6 +99,8 @@ SELECT
   a.approval_status,
   a.dry_run_status,
   a.apply_status,
+  a.payload #>> '{body,target}' AS target_name,
+  a.idempotency_key,
   a.source_table,
   a.source_hash,
   a.content_hash,
@@ -100,11 +112,26 @@ SELECT
   (o.id IS NOT NULL AND r.selection_status = 'accepted') AS trusted_output,
   a.created_at,
   a.approved_at,
-  a.applied_at
+  a.applied_at,
+  execution.id AS execution_receipt_id,
+  execution.mode AS execution_mode,
+  execution.status AS execution_status,
+  execution.affected_rows AS execution_affected_rows,
+  execution.before_hash AS execution_before_hash,
+  execution.result_hash AS execution_result_hash,
+  execution.error AS execution_error,
+  execution.replay_of_receipt_id
 FROM otlet.actions a
 JOIN otlet.jobs j ON j.id = a.job_id
 LEFT JOIN otlet.outputs o ON o.id = a.output_id
-LEFT JOIN otlet.inference_receipts r ON r.id = a.receipt_id;
+LEFT JOIN otlet.inference_receipts r ON r.id = a.receipt_id
+LEFT JOIN LATERAL (
+  SELECT er.*
+  FROM otlet.action_execution_receipts er
+  WHERE er.action_id = a.id
+  ORDER BY er.created_at DESC, er.id DESC
+  LIMIT 1
+) execution ON true;
 
 CREATE VIEW otlet.eval_label_status AS
 SELECT
@@ -140,9 +167,19 @@ CREATE VIEW otlet.review_queue AS
 WITH action_items AS (
   SELECT
     CASE
+      WHEN a.action_type = 'update_row' AND a.dry_run_status = 'not_run' THEN 'pending_dry_run'
       WHEN a.approval_status = 'required' AND a.status = 'proposed' THEN 'pending_approval'
+      WHEN a.action_type = 'update_row' AND a.status = 'approved' THEN 'ready_to_apply'
       ELSE 'review_flag'
     END AS queue_kind,
+    CASE
+      WHEN a.action_type = 'update_row' AND a.dry_run_status = 'not_run' THEN 'dry_run'
+      WHEN a.action_type = 'update_row' AND a.dry_run_status = 'failed' THEN 'review_failure'
+      WHEN a.action_type = 'update_row' AND a.status = 'proposed' THEN 'approve'
+      WHEN a.action_type = 'update_row' AND a.status = 'approved' THEN 'apply'
+      WHEN a.approval_status = 'required' AND a.status = 'proposed' THEN 'approve'
+      ELSE 'review'
+    END AS next_operator_step,
     j.task_name,
     w.name AS watch_name,
     j.subject_id AS job_subject_id,
@@ -153,6 +190,16 @@ WITH action_items AS (
     a.action_type,
     a.status AS action_status,
     a.approval_status,
+    a.dry_run_status,
+    a.apply_status,
+    a.idempotency_key,
+    execution.id AS execution_receipt_id,
+    execution.mode AS execution_mode,
+    execution.status AS execution_status,
+    execution.affected_rows AS execution_affected_rows,
+    execution.before_hash AS execution_before_hash,
+    execution.result_hash AS execution_result_hash,
+    execution.error AS execution_error,
     a.review_reason,
     o.output,
     a.source_table,
@@ -173,6 +220,13 @@ WITH action_items AS (
   LEFT JOIN otlet.watches w ON w.task_name = j.task_name
   LEFT JOIN otlet.outputs o ON o.id = a.output_id
   LEFT JOIN LATERAL (
+    SELECT er.*
+    FROM otlet.action_execution_receipts er
+    WHERE er.action_id = a.id
+    ORDER BY er.created_at DESC, er.id DESC
+    LIMIT 1
+  ) execution ON true
+  LEFT JOIN LATERAL (
     SELECT sm.content_hash, sm.stale
     FROM otlet.semantic_materializations sm
     WHERE sm.task_name = j.task_name
@@ -190,6 +244,11 @@ WITH action_items AS (
         a.action_type = 'review_flag'
         AND a.status <> 'rejected'
       )
+      OR (
+        a.action_type = 'update_row'
+        AND a.status = 'approved'
+        AND a.apply_status NOT IN ('applied', 'replayed')
+      )
     )
     AND NOT EXISTS (
       SELECT 1
@@ -201,6 +260,7 @@ WITH action_items AS (
 abstention_items AS (
   SELECT
     'abstention_output'::text AS queue_kind,
+    'review'::text AS next_operator_step,
     j.task_name,
     w.name AS watch_name,
     j.subject_id AS job_subject_id,
@@ -211,6 +271,16 @@ abstention_items AS (
     NULL::text AS action_type,
     NULL::text AS action_status,
     NULL::text AS approval_status,
+    NULL::text AS dry_run_status,
+    NULL::text AS apply_status,
+    NULL::text AS idempotency_key,
+    NULL::bigint AS execution_receipt_id,
+    NULL::text AS execution_mode,
+    NULL::text AS execution_status,
+    NULL::bigint AS execution_affected_rows,
+    NULL::text AS execution_before_hash,
+    NULL::text AS execution_result_hash,
+    NULL::text AS execution_error,
     NULL::text AS review_reason,
     o.output,
     r.trace_summary #>> '{mvcc,table}' AS source_table,
@@ -254,6 +324,7 @@ abstention_items AS (
 direct_rejected_items AS (
   SELECT
     'direct_rejected_output'::text AS queue_kind,
+    'review'::text AS next_operator_step,
     j.task_name,
     w.name AS watch_name,
     j.subject_id AS job_subject_id,
@@ -264,8 +335,18 @@ direct_rejected_items AS (
     NULL::text AS action_type,
     NULL::text AS action_status,
     NULL::text AS approval_status,
+    NULL::text AS dry_run_status,
+    NULL::text AS apply_status,
+    NULL::text AS idempotency_key,
+    NULL::bigint AS execution_receipt_id,
+    NULL::text AS execution_mode,
+    NULL::text AS execution_status,
+    NULL::bigint AS execution_affected_rows,
+    NULL::text AS execution_before_hash,
+    NULL::text AS execution_result_hash,
+    NULL::text AS execution_error,
     NULL::text AS review_reason,
-    r.raw_output::jsonb -> 'output' AS output,
+    r.candidate_output AS output,
     r.trace_summary #>> '{mvcc,table}' AS source_table,
     COALESCE(r.trace_summary #>> '{mvcc,source_hash}', md5((r.trace_summary -> 'mvcc')::text)) AS source_hash,
     hashed.content_hash,
@@ -298,7 +379,7 @@ direct_rejected_items AS (
     AND r.selection_status = 'rejected'
     AND r.selection_reason = 'direct_rejected_by_decision_contract'
     AND r.schema_validation_status = 'passed'
-    AND NULLIF(r.raw_output, '') IS NOT NULL
+    AND r.candidate_output IS NOT NULL
     AND NOT EXISTS (
       SELECT 1
       FROM otlet.eval_labels l
@@ -308,6 +389,7 @@ direct_rejected_items AS (
 )
 SELECT
   queue_kind,
+  next_operator_step,
   task_name,
   watch_name,
   job_subject_id,
@@ -318,6 +400,16 @@ SELECT
   action_type,
   action_status,
   approval_status,
+  dry_run_status,
+  apply_status,
+  idempotency_key,
+  execution_receipt_id,
+  execution_mode,
+  execution_status,
+  execution_affected_rows,
+  execution_before_hash,
+  execution_result_hash,
+  execution_error,
   review_reason,
   output,
   source_table,
@@ -330,6 +422,7 @@ FROM action_items
 UNION ALL
 SELECT
   queue_kind,
+  next_operator_step,
   task_name,
   watch_name,
   job_subject_id,
@@ -340,6 +433,16 @@ SELECT
   action_type,
   action_status,
   approval_status,
+  dry_run_status,
+  apply_status,
+  idempotency_key,
+  execution_receipt_id,
+  execution_mode,
+  execution_status,
+  execution_affected_rows,
+  execution_before_hash,
+  execution_result_hash,
+  execution_error,
   review_reason,
   output,
   source_table,
@@ -352,6 +455,7 @@ FROM abstention_items
 UNION ALL
 SELECT
   queue_kind,
+  next_operator_step,
   task_name,
   watch_name,
   job_subject_id,
@@ -362,6 +466,16 @@ SELECT
   action_type,
   action_status,
   approval_status,
+  dry_run_status,
+  apply_status,
+  idempotency_key,
+  execution_receipt_id,
+  execution_mode,
+  execution_status,
+  execution_affected_rows,
+  execution_before_hash,
+  execution_result_hash,
+  execution_error,
   review_reason,
   output,
   source_table,
@@ -527,6 +641,10 @@ SELECT
   r.schema_validation_status,
   trace.summary ->> 'trace_version' AS trace_version,
   trace.summary AS trace_summary,
+  trace.summary ->> 'runtime_fingerprint_version' AS runtime_fingerprint_version,
+  trace.summary ->> 'runtime_fingerprint_hash' AS runtime_fingerprint_hash,
+  trace.summary ->> 'runtime_output_contract_hash' AS runtime_output_contract_hash,
+  trace.summary -> 'runtime_fingerprint' AS runtime_fingerprint,
   COALESCE(
     NULLIF(trace.summary #>> '{decision,preset_name}', ''),
     NULLIF(trace.summary ->> 'decision_preset_name', '')
@@ -549,6 +667,7 @@ SELECT
   trace.summary -> 'detailed_trace' ->> 'status' AS detailed_trace_status,
   trace.summary -> 'detailed_trace' ->> 'trace_contract' AS detailed_trace_contract,
   trace.summary -> 'detailed_trace' ->> 'storage_policy' AS detailed_trace_storage_policy,
+  trace.summary -> 'detailed_trace' ->> 'text_storage' AS detailed_trace_text_storage,
   trace.summary -> 'detailed_trace' ->> 'logprob_policy' AS detailed_trace_logprob_policy,
   CASE
     WHEN jsonb_typeof(trace.summary #> '{detailed_trace,max_tokens}') = 'number'
@@ -620,11 +739,15 @@ SELECT
     ELSE NULL
   END AS model_memory_bytes,
   CASE
+    WHEN jsonb_typeof(trace.summary #> '{memory,after,process_rss_bytes}') = 'number'
+      THEN (trace.summary #>> '{memory,after,process_rss_bytes}')::bigint
     WHEN jsonb_typeof(trace.summary -> 'worker_process_rss_bytes') = 'number'
       THEN (trace.summary ->> 'worker_process_rss_bytes')::bigint
     ELSE NULL
   END AS worker_process_rss_bytes,
   CASE
+    WHEN jsonb_typeof(trace.summary #> '{memory,after,process_virtual_bytes}') = 'number'
+      THEN (trace.summary #>> '{memory,after,process_virtual_bytes}')::bigint
     WHEN jsonb_typeof(trace.summary -> 'worker_process_virtual_bytes') = 'number'
       THEN (trace.summary ->> 'worker_process_virtual_bytes')::bigint
     ELSE NULL
@@ -638,6 +761,75 @@ SELECT
     ELSE NULL
   END AS worker_memory_budget_bytes,
   COALESCE(trace.summary #>> '{memory,worker_memory_budget_policy}', trace.summary ->> 'worker_memory_budget_policy') AS worker_memory_budget_policy,
+  trace.summary -> 'memory' AS memory_evidence,
+  CASE
+    WHEN jsonb_typeof(trace.summary #> '{memory,after,process_swap_bytes}') = 'number'
+      THEN (trace.summary #>> '{memory,after,process_swap_bytes}')::bigint
+    ELSE NULL
+  END AS worker_process_swap_bytes,
+  CASE
+    WHEN jsonb_typeof(trace.summary #> '{memory,after,system_memory_available_bytes}') = 'number'
+      THEN (trace.summary #>> '{memory,after,system_memory_available_bytes}')::bigint
+    ELSE NULL
+  END AS system_memory_available_bytes,
+  CASE
+    WHEN jsonb_typeof(trace.summary #> '{memory,after,system_swap_free_bytes}') = 'number'
+      THEN (trace.summary #>> '{memory,after,system_swap_free_bytes}')::bigint
+    ELSE NULL
+  END AS system_swap_free_bytes,
+  CASE
+    WHEN jsonb_typeof(trace.summary #> '{memory,delta,process_major_faults}') = 'number'
+      THEN (trace.summary #>> '{memory,delta,process_major_faults}')::bigint
+    ELSE NULL
+  END AS worker_major_faults,
+  CASE
+    WHEN jsonb_typeof(trace.summary #> '{memory,delta,process_read_bytes}') = 'number'
+      THEN (trace.summary #>> '{memory,delta,process_read_bytes}')::bigint
+    ELSE NULL
+  END AS worker_read_bytes,
+  CASE
+    WHEN jsonb_typeof(trace.summary #> '{memory,delta,memory_pressure_some_total_us}') = 'number'
+      THEN (trace.summary #>> '{memory,delta,memory_pressure_some_total_us}')::bigint
+    ELSE NULL
+  END AS memory_pressure_some_us,
+  CASE
+    WHEN jsonb_typeof(trace.summary #> '{memory,delta,memory_pressure_full_total_us}') = 'number'
+      THEN (trace.summary #>> '{memory,delta,memory_pressure_full_total_us}')::bigint
+    ELSE NULL
+  END AS memory_pressure_full_us,
+  CASE
+    WHEN jsonb_typeof(trace.summary #> '{memory,after,cgroup_memory_current_bytes}') = 'number'
+      THEN (trace.summary #>> '{memory,after,cgroup_memory_current_bytes}')::bigint
+    ELSE NULL
+  END AS cgroup_memory_current_bytes,
+  CASE
+    WHEN jsonb_typeof(trace.summary #> '{memory,after,cgroup_memory_max_bytes}') = 'number'
+      THEN (trace.summary #>> '{memory,after,cgroup_memory_max_bytes}')::bigint
+    ELSE NULL
+  END AS cgroup_memory_max_bytes,
+  CASE
+    WHEN jsonb_typeof(trace.summary #> '{memory,delta,cgroup_memory_high_events}') = 'number'
+      THEN (trace.summary #>> '{memory,delta,cgroup_memory_high_events}')::bigint
+    ELSE NULL
+  END AS cgroup_memory_high_events,
+  CASE
+    WHEN jsonb_typeof(trace.summary #> '{memory,delta,cgroup_memory_oom_events}') = 'number'
+      THEN (trace.summary #>> '{memory,delta,cgroup_memory_oom_events}')::bigint
+    ELSE NULL
+  END AS cgroup_memory_oom_events,
+  CASE
+    WHEN jsonb_typeof(trace.summary #> '{memory,delta,cgroup_memory_oom_kill_events}') = 'number'
+      THEN (trace.summary #>> '{memory,delta,cgroup_memory_oom_kill_events}')::bigint
+    ELSE NULL
+  END AS cgroup_memory_oom_kill_events,
+  trace.summary #>> '{memory,admission,decision}' AS model_load_admission_decision,
+  trace.summary #>> '{memory,admission,reason}' AS model_load_admission_reason,
+  trace.summary #>> '{memory,admission,policy}' AS model_load_admission_policy,
+  CASE
+    WHEN jsonb_typeof(trace.summary #> '{memory,admission,allowed_additional_bytes}') = 'number'
+      THEN (trace.summary #>> '{memory,admission,allowed_additional_bytes}')::bigint
+    ELSE NULL
+  END AS model_load_allowed_additional_bytes,
   COALESCE(trace.summary ->> 'model_cache_hit', 'false')::boolean AS model_cache_hit,
   COALESCE(trace.summary ->> 'inference_cache_hit', 'false')::boolean AS inference_cache_hit,
   COALESCE(trace.summary #>> '{cache,key_basis}', trace.summary ->> 'inference_cache_key_basis') AS inference_cache_key_basis,

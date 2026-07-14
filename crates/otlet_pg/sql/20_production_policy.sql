@@ -16,7 +16,8 @@ SELECT
   p.trace_detail_retention,
   p.eval_label_retention,
   p.delete_stale_materialization_retention,
-  p.rejected_receipt_raw_output_retention,
+  p.sensitive_evidence_mode,
+  p.sensitive_evidence_retention,
   p.failed_job_retention
 FROM otlet.production_policy p
 WHERE p.name = 'default';
@@ -346,8 +347,66 @@ BEGIN
       'apply_status', a.apply_status
     )
   FROM otlet.actions a
-  WHERE a.apply_status = 'applied'
+  WHERE a.apply_status IN ('applied', 'replayed')
     AND a.approval_status IS DISTINCT FROM 'approved';
+
+  RETURN QUERY
+  SELECT
+    'applied_updates_have_execution_receipts'::text,
+    'action'::text,
+    a.id::text,
+    jsonb_build_object(
+      'status', a.status,
+      'apply_status', a.apply_status,
+      'idempotency_key_present', a.idempotency_key IS NOT NULL
+    )
+  FROM otlet.actions a
+  WHERE a.action_type = 'update_row'
+    AND a.status = 'applied'
+    AND NOT EXISTS (
+      SELECT 1
+      FROM otlet.action_execution_receipts er
+      WHERE er.action_id = a.id
+        AND er.mode = 'apply'
+        AND er.status IN ('applied', 'replayed')
+    );
+
+  RETURN QUERY
+  SELECT
+    'successful_execution_receipts_have_applied_actions'::text,
+    'action_execution_receipt'::text,
+    er.id::text,
+    jsonb_build_object(
+      'action_id', er.action_id,
+      'receipt_status', er.status,
+      'action_status', a.status
+    )
+  FROM otlet.action_execution_receipts er
+  LEFT JOIN otlet.actions a ON a.id = er.action_id
+  WHERE er.mode = 'apply'
+    AND er.status IN ('applied', 'replayed')
+    AND (a.id IS NULL OR a.status IS DISTINCT FROM 'applied');
+
+  RETURN QUERY
+  SELECT
+    'update_actions_have_bounded_identity'::text,
+    'action'::text,
+    a.id::text,
+    jsonb_build_object(
+      'source_table_present', a.source_table IS NOT NULL,
+      'subject_id_present', a.subject_id IS NOT NULL,
+      'idempotency_key_present', a.idempotency_key IS NOT NULL,
+      'target_present', NULLIF(a.payload #>> '{body,target}', '') IS NOT NULL
+    )
+  FROM otlet.actions a
+  WHERE a.action_type = 'update_row'
+    AND a.status <> 'rejected'
+    AND (
+      a.source_table IS NULL
+      OR a.subject_id IS NULL
+      OR a.idempotency_key IS NULL
+      OR NULLIF(a.payload #>> '{body,target}', '') IS NULL
+    );
 
   RETURN QUERY
   SELECT
@@ -376,6 +435,22 @@ BEGIN
   FROM otlet.inference_receipts r
   WHERE r.status = 'complete'
     AND r.schema_validation_status IS DISTINCT FROM 'passed';
+
+  RETURN QUERY
+  SELECT
+    'sensitive_storage_matches_policy'::text,
+    'redaction_policy'::text,
+    s.policy_name,
+    jsonb_build_object(
+      'sensitive_evidence_mode', s.sensitive_evidence_mode,
+      'raw_output_rows', s.raw_output_rows,
+      'chosen_text_rows', s.chosen_text_rows,
+      'token_text_values', s.token_text_values,
+      'alternative_token_text_values', s.alternative_token_text_values,
+      'overdue_sensitive_rows', s.overdue_sensitive_rows
+    )
+  FROM otlet.redaction_policy_status s
+  WHERE NOT s.storage_compliant;
 
   RETURN QUERY
   SELECT
@@ -673,6 +748,13 @@ materialization_failures AS (
     max(created_at) AS semantic_materialization_last_failed_at
   FROM otlet.worker_events
   WHERE event_type = 'semantic_materialization_failed'
+),
+action_execution AS (
+  SELECT
+    count(*) FILTER (WHERE mode = 'apply' AND status = 'applied')::bigint AS applied_actions,
+    count(*) FILTER (WHERE mode = 'apply' AND status = 'replayed')::bigint AS replayed_actions,
+    count(*) FILTER (WHERE status = 'failed')::bigint AS failed_action_executions
+  FROM otlet.action_execution_receipts
 )
 SELECT
   p.name AS policy_name,
@@ -722,6 +804,9 @@ SELECT
   trace.max_detailed_trace_top_k,
   materialization_failures.semantic_materialization_failed_events,
   materialization_failures.semantic_materialization_last_failed_at,
+  action_execution.applied_actions,
+  action_execution.replayed_actions,
+  action_execution.failed_action_executions,
   (q.expired_running_jobs = 0) AS no_expired_running_jobs,
   (r.complete_without_schema_pass = 0) AS complete_receipts_are_schema_validated,
   (s.materializations_without_source_hash = 0) AS materializations_have_source_hashes,
@@ -737,6 +822,7 @@ CROSS JOIN semantic_state s
 CROSS JOIN runtime
 CROSS JOIN trace
 CROSS JOIN materialization_failures
+CROSS JOIN action_execution
 WHERE p.name = 'default';
 
 CREATE FUNCTION otlet.cleanup_policy_state(
@@ -747,7 +833,10 @@ CREATE FUNCTION otlet.cleanup_policy_state(
   token_alternative_rows bigint,
   eval_labels bigint,
   delete_stale_materializations bigint,
-  rejected_receipt_raw_outputs bigint,
+  sensitive_raw_outputs bigint,
+  sensitive_chosen_texts bigint,
+  sensitive_token_texts bigint,
+  sensitive_alternative_token_texts bigint,
   failed_canceled_jobs bigint,
   dry_run boolean
 )
@@ -758,14 +847,18 @@ DECLARE
   trace_retention interval;
   eval_retention interval;
   delete_stale_retention interval;
-  rejected_raw_output_retention interval;
+  sensitive_mode text;
+  sensitive_retention interval;
   failed_job_retention_interval interval;
   worker_count bigint := 0;
   token_count bigint := 0;
   alternative_count bigint := 0;
   eval_count bigint := 0;
   delete_stale_count bigint := 0;
-  rejected_raw_output_count bigint := 0;
+  sensitive_raw_output_count bigint := 0;
+  sensitive_chosen_text_count bigint := 0;
+  sensitive_token_text_count bigint := 0;
+  sensitive_alternative_text_count bigint := 0;
   failed_canceled_job_count bigint := 0;
   deleted_worker_count bigint := 0;
 BEGIN
@@ -774,14 +867,16 @@ BEGIN
     trace_detail_retention,
     eval_label_retention,
     delete_stale_materialization_retention,
-    rejected_receipt_raw_output_retention,
+    sensitive_evidence_mode,
+    sensitive_evidence_retention,
     failed_job_retention
   INTO
     worker_retention,
     trace_retention,
     eval_retention,
     delete_stale_retention,
-    rejected_raw_output_retention,
+    sensitive_mode,
+    sensitive_retention,
     failed_job_retention_interval
   FROM otlet.production_policy
   WHERE name = 'default';
@@ -879,12 +974,48 @@ BEGIN
     AND sm.stale_reason = 'source_delete'
     AND sm.updated_at < now() - delete_stale_retention;
 
-  SELECT count(*)
-  INTO rejected_raw_output_count
+  SELECT
+    count(*) FILTER (WHERE r.raw_output IS NOT NULL),
+    count(*) FILTER (WHERE r.trace_summary #>> '{detailed_trace,chosen_text}' IS NOT NULL)
+  INTO sensitive_raw_output_count, sensitive_chosen_text_count
   FROM otlet.inference_receipts r
-  WHERE r.selection_status = 'rejected'
-    AND r.raw_output IS NOT NULL
-    AND r.finished_at < now() - rejected_raw_output_retention;
+  WHERE sensitive_mode = 'redacted'
+     OR r.finished_at < now() - sensitive_retention;
+
+  SELECT count(*)
+  INTO sensitive_token_text_count
+  FROM otlet.inference_receipts r
+  CROSS JOIN LATERAL jsonb_array_elements(
+    CASE
+      WHEN jsonb_typeof(r.trace_summary #> '{detailed_trace,steps}') = 'array'
+        THEN r.trace_summary #> '{detailed_trace,steps}'
+      ELSE '[]'::jsonb
+    END
+  ) step(value)
+  WHERE (sensitive_mode = 'redacted' OR r.finished_at < now() - sensitive_retention)
+    AND jsonb_typeof(step.value) = 'object'
+    AND step.value ? 'token_text';
+
+  SELECT count(*)
+  INTO sensitive_alternative_text_count
+  FROM otlet.inference_receipts r
+  CROSS JOIN LATERAL jsonb_array_elements(
+    CASE
+      WHEN jsonb_typeof(r.trace_summary #> '{detailed_trace,steps}') = 'array'
+        THEN r.trace_summary #> '{detailed_trace,steps}'
+      ELSE '[]'::jsonb
+    END
+  ) step(value)
+  CROSS JOIN LATERAL jsonb_array_elements(
+    CASE
+      WHEN jsonb_typeof(step.value -> 'top_alternatives') = 'array'
+        THEN step.value -> 'top_alternatives'
+      ELSE '[]'::jsonb
+    END
+  ) alt(value)
+  WHERE (sensitive_mode = 'redacted' OR r.finished_at < now() - sensitive_retention)
+    AND jsonb_typeof(alt.value) = 'object'
+    AND alt.value ? 'token_text';
 
   IF NOT cleanup_policy_state.requested_dry_run THEN
     WITH event_candidates AS (
@@ -921,7 +1052,12 @@ BEGIN
     SET trace_summary = jsonb_set(
       jsonb_set(
         jsonb_set(
-          jsonb_set(r.trace_summary, '{detailed_trace,steps}', '[]'::jsonb, true),
+          jsonb_set(
+            otlet.redact_trace_summary(r.trace_summary, 'redacted'),
+            '{detailed_trace,steps}',
+            '[]'::jsonb,
+            true
+          ),
           '{detailed_trace,chosen_token_ids}',
           '[]'::jsonb,
           true
@@ -947,10 +1083,15 @@ BEGIN
       AND sm.updated_at < now() - delete_stale_retention;
 
     UPDATE otlet.inference_receipts r
-    SET raw_output = NULL
-    WHERE r.selection_status = 'rejected'
-      AND r.raw_output IS NOT NULL
-      AND r.finished_at < now() - rejected_raw_output_retention;
+    SET raw_output = NULL,
+        trace_summary = otlet.redact_trace_summary(r.trace_summary, 'redacted')
+    WHERE (sensitive_mode = 'redacted' OR r.finished_at < now() - sensitive_retention)
+      AND (
+        r.raw_output IS NOT NULL
+        OR r.trace_summary #>> '{detailed_trace,chosen_text}' IS NOT NULL
+        OR jsonb_path_exists(r.trace_summary, '$.detailed_trace.steps[*].token_text')
+        OR jsonb_path_exists(r.trace_summary, '$.detailed_trace.steps[*].top_alternatives[*].token_text')
+      );
   END IF;
 
   RETURN QUERY SELECT
@@ -959,7 +1100,10 @@ BEGIN
     alternative_count,
     eval_count,
     delete_stale_count,
-    rejected_raw_output_count,
+    sensitive_raw_output_count,
+    sensitive_chosen_text_count,
+    sensitive_token_text_count,
+    sensitive_alternative_text_count,
     failed_canceled_job_count,
     cleanup_policy_state.requested_dry_run;
 END;

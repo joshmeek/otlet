@@ -125,6 +125,8 @@ unsafe fn snapshot_runtime_counters(
         (*state).infer_trace_finish_sql_ms = runtime.infer_trace_finish_sql_ms;
         (*state).infer_trace_materialize_ms = runtime.infer_trace_materialize_ms;
         (*state).infer_trace_version = pg_cstr(&runtime.infer_trace_version);
+        (*state).infer_trace_runtime_fingerprint_hash =
+            pg_cstr(&runtime.infer_trace_runtime_fingerprint_hash);
         (*state).infer_trace_probability_status = pg_cstr(&runtime.infer_trace_probability_status);
         (*state).infer_trace_schema_force = pg_cstr(&runtime.infer_trace_schema_force);
         (*state).infer_trace_detailed_status = pg_cstr(&runtime.infer_trace_detailed_status);

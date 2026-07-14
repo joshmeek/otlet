@@ -4,6 +4,10 @@ Use this guide to extend the direct entity-resolution walkthrough into reusable 
 
 The vendor-pair demo covers the end-to-end path. Smaller learning tables isolate each transfer pattern
 
+This administrative walkthrough runs as the extension owner because it creates watches, reads raw status and receipt views, and changes source fixtures. Auditors use the redacted exports; action reviewers receive the operator capability described in [production-contract.md](production-contract.md)
+
+Watch jobs keep active source input owner-only. Derived receipts follow the same redacted storage policy as direct jobs: hashes and numeric traces remain, while assembled prompts, raw model text, and token text stay out of production storage
+
 ## Step 1 - Choose Direct Task Or Semantic Index
 
 The direct task path gives you the shortest way to learn Otlet
@@ -43,7 +47,7 @@ Representative output:
 ```text
  otlet_base_tables
 -------------------
-                18
+                20
 (1 row)
 ```
 
@@ -110,7 +114,7 @@ UPDATE 1
 (1 row)
 ```
 
-The trigger marks the previous derived fact stale and leaves model reruns to refresh policy
+The trigger marks the previous derived fact stale and leaves model reruns to refresh policy. A source delete records `source_delete` in `otlet.semantic_dependency_audit`
 
 Plain `mark_stale` row watches treat INSERT as missing semantic state rather than stale semantic state. Exact planning shows the new row as unresolved until refresh or infer-now:
 
@@ -267,15 +271,9 @@ The SQL plan row and CustomScan EXPLAIN share planner terms
 | Child plan attachment | (none) | `Child Plan Attached` | Counter; `1` once begin-scan attaches the Postgres child plan |
 | Source tuple path | (none) | `Source Tuple Provider` | Matches executor context; row scans report `child_plan_execprocnode`, joins report `child_subquery_join_execprocnode` |
 | Predicate owner | (none) | `Semantic Predicate Owner` | Fixed owner: `otlet_customscan_executor` |
+| Runtime identity | `inference_receipt_trace_status.runtime_fingerprint_hash` | `Infer Now Runtime Fingerprint Hash` | Same infer-now receipt fingerprint |
 | Warm-job SQL finish | `inference_receipt_trace_status.finish_sql_ms` | `Infer Now Trace Finish Sql Ms` | Optional; stamped inside `complete_job` / `fail_job` |
 | Warm-job materialize | `inference_receipt_trace_status.materialize_ms` | `Infer Now Trace Materialize Ms` | Optional; stamped inside `materialize_completed_semantic_job` |
-
-EXPLAIN line ledger for this pass:
-
-| Surface | Added | Deleted or merged | Net |
-| --- | --- | --- | --- |
-| CustomScan | `Emitted Freshness Basis` | `Preloaded Fresh Subjects` and `Preloaded Freshness Basis` merged into `Preloaded Fresh Subjects / Basis` | 0 |
-| SQL plan row | no EXPLAIN line added; `infer_now_subjects` and `infer_now_ms` now use existing columns | none | 0 |
 
 Captured row-plan excerpt:
 
@@ -419,6 +417,7 @@ Custom Scan (Otlet Semantic Source CustomScan) on public.otlet_demo_semantic_ven
   Actual Infer Resolved Rows: 1
   Infer Now Receipts: 1
   Infer Now Trace Receipt Id: 42
+  Infer Now Runtime Fingerprint Hash: e5797a21096dfddf
 ```
 
 The executor refreshed the stale row with a bounded infer-now budget and a receipt
@@ -451,7 +450,7 @@ Receipts carry executor provenance because one model task can run from the worke
 
 ## Step 10 - Build A Pair Watch
 
-Row watches are source-table-oriented. Pair watches are candidate-query-oriented
+Row watches follow source tables. Pair watches follow candidate queries
 
 The candidate query supplies `subject_id` and `input` for candidate pairs:
 
@@ -529,6 +528,15 @@ semantic_join_auto_materialized=1
 
 `pair_sources` installs the row-index stale trigger. Updates to declared source rows mark matching pair materializations through `_otlet_mvcc` dependencies, and `drop_watch` removes the trigger when no row index or pair watch still needs it
 
+Pair refresh reconciles the bounded candidate query. A removed subject gets `candidate_removed`; a subject with changed shaped content gets `candidate_changed`. Removed candidates queue no work. New and changed candidates continue through the existing queue. If the same candidate content returns, Otlet clears the candidate-drift state and reuses its materialization
+
+```sql
+SELECT subject_id, stale, stale_reason, source_dependencies
+FROM otlet.semantic_dependency_audit
+WHERE task_name = 'learning_entity_pair_idx_task'
+ORDER BY subject_id;
+```
+
 Inspect the join index:
 
 ```sql
@@ -571,3 +579,69 @@ semantic_join_match_contract=true
 ```
 
 Use explicit JSON predicates for row and join semantic filters
+
+## Step 12 - Move A Watch Definition
+
+The extension owner can export a row or pair watch as configuration-only JSONB:
+
+```sql
+SELECT jsonb_pretty(otlet.export_watch('learning_entity_pair_idx'));
+```
+
+`otlet.watch.v1` uses the same fields as `otlet.create_watch(...)`. The shortened values below show the key and type contract; export keeps the full instruction, schema, and candidate query
+
+```json
+{
+  "format": "otlet.watch.v1",
+  "name": "learning_entity_pair_idx",
+  "kind": "pair",
+  "instruction": "Compare one candidate pair",
+  "output_schema": {},
+  "model_name": "qwen3_1_7b",
+  "table_name": null,
+  "subject_column": null,
+  "candidate_query": "SELECT subject_id, input FROM public.learning_entity_pair_input",
+  "record_type": "learning_entity_pair",
+  "runtime_options": {},
+  "selection_policy": {},
+  "trigger_policy": {"on_change": "mark_stale"},
+  "action_types": [],
+  "stale_policy": "refresh_then_fail_closed",
+  "input_shaping": {},
+  "decision_contract": {},
+  "max_candidate_rows": 10,
+  "input_columns": null,
+  "pair_sources": [
+    {"table": "public.learning_entity", "subject_column": "id"}
+  ]
+}
+```
+
+The document contains watch configuration and owner-authored candidate SQL. It excludes model paths, source rows, jobs, outputs, actions, receipts, labels, traces, materializations, trigger names, timestamps, and counters
+
+Import requires the referenced model, tables, and columns to exist. The function rejects an existing watch unless the owner requests replacement:
+
+```sql
+SELECT otlet.export_watch('learning_entity_pair_idx') AS watch_definition \gset
+
+SELECT otlet.drop_watch('learning_entity_pair_idx');
+
+SELECT name, kind
+FROM otlet.import_watch(:'watch_definition'::jsonb);
+
+SELECT name, kind
+FROM otlet.import_watch(
+  :'watch_definition'::jsonb,
+  replace_existing => true
+);
+```
+
+Import validates `otlet.watch.v1`, resolves database dependencies, and calls `otlet.create_watch(...)`. A failed import rolls back its statement and leaves an existing watch unchanged
+
+The Docker demo proves replacement, drop/import round trip, lookup preservation, trigger preservation, and nine rejected documents:
+
+```text
+watch_replace_contract=true|true|true|true|true|true|true|true|true|true
+watch_round_trip_contract=true|true|true|true|true
+watch_import_failure_contract=9|true
+```

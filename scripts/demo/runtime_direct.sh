@@ -32,7 +32,10 @@ FROM asked
 \gset direct_ask_
 SELECT 'direct_ask_contract=' || :'direct_ask_route' || '|' || :'direct_ask_job_id' || '|' || :'direct_ask_receipt_id';
 SELECT 'direct_ask_receipt_contract=' || s.model_name || '|' || s.status || '|' ||
-       s.schema_validation_status || '|' || s.detailed_trace_captured_tokens::text
+       s.schema_validation_status || '|' || s.detailed_trace_captured_tokens::text || '|' ||
+       COALESCE(s.schema_force, '') || '|' || COALESCE(s.decode_constraint, '') || '|' ||
+       COALESCE(s.decode_constraint_reason, '') || '|' ||
+       COALESCE(jsonb_extract_path_text(s.trace_summary, 'probability_summary', 'method'), '')
 FROM otlet.inference_receipt_trace_status s
 WHERE s.receipt_id = :'direct_ask_receipt_id'::bigint;
 SELECT 'direct_ask_cache_contract=' || s.inference_cache_hit::text || '|' ||
@@ -42,18 +45,32 @@ SELECT 'direct_ask_cache_contract=' || s.inference_cache_hit::text || '|' ||
        COALESCE(s.inference_cache_eviction_reason, '')
 FROM otlet.inference_receipt_trace_status s
 WHERE s.receipt_id = :'direct_ask_receipt_id'::bigint;
+SELECT 'direct_ask_runtime_fingerprint_contract=' ||
+       s.runtime_fingerprint_version || '|' ||
+       (s.runtime_fingerprint_hash = rs.runtime_fingerprint_hash)::text || '|' ||
+       (s.runtime_output_contract_hash = rs.runtime_output_contract_hash)::text || '|' ||
+       (s.runtime_fingerprint -> 'artifact' ->> 'quantization') || '|' ||
+       jsonb_extract_path_text(s.runtime_fingerprint, 'output_contract', 'prompt_template', 'name') || '|' ||
+       jsonb_extract_path_text(s.runtime_fingerprint, 'output_contract', 'llama_cpp', 'revision') || '|' ||
+       jsonb_extract_path_text(s.runtime_fingerprint, 'output_contract', 'context', 'batch_tokens') || '|' ||
+       jsonb_extract_path_text(s.runtime_fingerprint, 'host', 'memory_bytes')
+FROM otlet.inference_receipt_trace_status s
+JOIN otlet.runtime_status rs ON rs.model_name = s.model_name
+WHERE s.receipt_id = :'direct_ask_receipt_id'::bigint;
 SQL
 )"
 printf '%s\n' "$direct_ask_output"
 direct_ask_contract="$(sed -n 's/^direct_ask_contract=//p' <<<"$direct_ask_output")"
 direct_ask_receipt_contract="$(sed -n 's/^direct_ask_receipt_contract=//p' <<<"$direct_ask_output")"
 direct_ask_cache_contract="$(sed -n 's/^direct_ask_cache_contract=//p' <<<"$direct_ask_output")"
+direct_ask_runtime_fingerprint_contract="$(sed -n 's/^direct_ask_runtime_fingerprint_contract=//p' <<<"$direct_ask_output")"
 require_regex "$direct_ask_contract" '^review_payment\|[1-9][0-9]*\|[1-9][0-9]*$' "Expected direct ask to return review_payment with job and receipt ids"
-require_regex "$direct_ask_receipt_contract" "^$strong_model_name\\|complete\\|passed\\|[1-9][0-9]*$" "Expected direct ask receipt evidence"
-[ "$direct_ask_cache_contract" = "false|disabled_for_generation_trace|content_hash_contract_hash_model_fingerprint|true|none" ] || {
+require_regex "$direct_ask_receipt_contract" "^$strong_model_name\\|complete\\|passed\\|[1-9][0-9]*\\|post_generation_json_schema_validation\\|greedy_with_balanced_json_object_stop_post_generation_schema_check\\|balanced_json_stop_prevents_trailing_prose_schema_failures_stay_receipts_only\\|chosen_token_softmax_from_llama_logits$" "Expected direct ask decode and validation evidence"
+[ "$direct_ask_cache_contract" = "false|disabled_for_generation_trace|content_hash_contract_hash_runtime_output_contract_hash_model_fingerprint|true|none" ] || {
   echo "Expected direct ask trace to make cache-disabled-under-generation-trace explicit, got $direct_ask_cache_contract" >&2
   exit 1
 }
+require_regex "$direct_ask_runtime_fingerprint_contract" '^otlet_runtime_fingerprint_v1\|true\|true\|Q4_K_M\|otlet_raw_json_worker_v1\|94a220cd6\|512\|[1-9][0-9]*$' "Expected receipt and runtime status to share one complete runtime fingerprint"
 
 log "Checking opt-in direct decision contract gate"
 direct_gate_jobs_completed_before="$(psql_value -v model_name="$strong_model_name" <<'SQL'

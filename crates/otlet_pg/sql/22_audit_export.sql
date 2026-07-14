@@ -3,9 +3,54 @@
 -- otlet.redaction_policy_status for the active withheld-field contract.
 
 CREATE VIEW otlet.redaction_policy_status AS
+WITH policy AS (
+  SELECT sensitive_evidence_mode, sensitive_evidence_retention
+  FROM otlet.production_policy
+  WHERE name = 'default'
+),
+observed AS (
+  SELECT
+    count(*) FILTER (WHERE r.raw_output IS NOT NULL)::bigint AS raw_output_rows,
+    count(*) FILTER (
+      WHERE r.trace_summary #>> '{detailed_trace,chosen_text}' IS NOT NULL
+    )::bigint AS chosen_text_rows,
+    COALESCE(sum(jsonb_array_length(jsonb_path_query_array(
+      r.trace_summary,
+      '$.detailed_trace.steps[*].token_text'
+    ))), 0)::bigint AS token_text_values,
+    COALESCE(sum(jsonb_array_length(jsonb_path_query_array(
+      r.trace_summary,
+      '$.detailed_trace.steps[*].top_alternatives[*].token_text'
+    ))), 0)::bigint AS alternative_token_text_values,
+    count(*) FILTER (
+      WHERE (
+        p.sensitive_evidence_mode = 'redacted'
+        OR r.finished_at < now() - p.sensitive_evidence_retention
+      )
+      AND (
+        r.raw_output IS NOT NULL
+        OR r.trace_summary #>> '{detailed_trace,chosen_text}' IS NOT NULL
+        OR jsonb_path_exists(r.trace_summary, '$.detailed_trace.steps[*].token_text')
+        OR jsonb_path_exists(r.trace_summary, '$.detailed_trace.steps[*].top_alternatives[*].token_text')
+      )
+    )::bigint AS overdue_sensitive_rows
+  FROM otlet.inference_receipts r
+  CROSS JOIN policy p
+)
 SELECT
-  'default_withhold_sensitive'::text AS policy_name,
-  1::integer AS policy_version,
+  'stored_sensitive_evidence'::text AS policy_name,
+  2::integer AS policy_version,
+  'hash_only'::text AS assembled_prompt_storage,
+  p.sensitive_evidence_mode,
+  p.sensitive_evidence_retention,
+  (p.sensitive_evidence_mode = 'diagnostic') AS raw_output_allowed_at_write,
+  (p.sensitive_evidence_mode = 'diagnostic') AS token_text_allowed_at_write,
+  o.raw_output_rows,
+  o.chosen_text_rows,
+  o.token_text_values,
+  o.alternative_token_text_values,
+  o.overdue_sensitive_rows,
+  (o.overdue_sensitive_rows = 0) AS storage_compliant,
   false AS prompts_visible,
   false AS raw_output_visible,
   false AS token_steps_visible,
@@ -21,11 +66,15 @@ SELECT
   ARRAY[
     'otlet.audit_receipt_export',
     'otlet.audit_review_export',
+    'otlet.audit_action_execution_export',
     'otlet.audit_eval_label_export',
     'otlet.semantic_dependency_audit',
-    'otlet.worker_batch_timing_status'
+    'otlet.worker_batch_timing_status',
+    'otlet.access_policy_status'
   ]::text[] AS export_views,
-  'Audit export views omit prompts, raw_output, token detail, and full trace_summary. Use inference_receipt_trace_status only when those fields are required.'::text AS notes;
+  'Assembled prompts are hash-only. Audit exports omit job input, raw output, candidate output, token detail, and full trace summaries. Task configuration and active job input remain owner-only.'::text AS notes
+FROM policy p
+CROSS JOIN observed o;
 
 CREATE VIEW otlet.audit_receipt_export AS
 SELECT
@@ -85,6 +134,7 @@ FROM otlet.inference_receipt_trace_status s;
 CREATE VIEW otlet.audit_review_export AS
 SELECT
   q.queue_kind,
+  q.next_operator_step,
   q.task_name,
   q.watch_name,
   q.job_subject_id,
@@ -95,6 +145,16 @@ SELECT
   q.action_type,
   q.action_status,
   q.approval_status,
+  q.dry_run_status,
+  q.apply_status,
+  md5(q.idempotency_key) AS idempotency_key_hash,
+  q.execution_receipt_id,
+  q.execution_mode,
+  q.execution_status,
+  q.execution_affected_rows,
+  q.execution_before_hash,
+  q.execution_result_hash,
+  q.execution_error,
   q.review_reason,
   q.source_table,
   q.source_hash,
@@ -103,6 +163,36 @@ SELECT
   q.source_stale,
   q.created_at
 FROM otlet.review_queue q;
+
+CREATE VIEW otlet.audit_action_execution_export AS
+SELECT
+  er.id AS execution_receipt_id,
+  er.action_id,
+  a.job_id,
+  a.receipt_id AS inference_receipt_id,
+  j.task_name,
+  a.subject_id,
+  a.action_type,
+  a.status AS action_status,
+  a.approval_status,
+  a.dry_run_status,
+  a.apply_status,
+  md5(er.idempotency_key) AS idempotency_key_hash,
+  er.mode,
+  er.status,
+  er.target_name,
+  er.target_table,
+  er.identity_hash,
+  er.changed_columns,
+  er.affected_rows,
+  er.before_hash,
+  er.result_hash,
+  er.error,
+  er.replay_of_receipt_id,
+  er.created_at
+FROM otlet.action_execution_receipts er
+JOIN otlet.actions a ON a.id = er.action_id
+JOIN otlet.jobs j ON j.id = a.job_id;
 
 CREATE VIEW otlet.audit_eval_label_export AS
 SELECT

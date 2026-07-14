@@ -632,11 +632,11 @@ SQL
 row_visible_fresh_before="$(head -n 1 <<<"$row_visible_stale_contract")"
 row_visible_source_update="$(sed -n '2p' <<<"$row_visible_stale_contract")"
 row_visible_predicate_match="$(sed -n '3p' <<<"$row_visible_stale_contract")"
-row_visible_fdw_rows="$(sed -n '4p' <<<"$row_visible_stale_contract")"
+row_visible_current_rows="$(sed -n '4p' <<<"$row_visible_stale_contract")"
 row_pending_reason="$(sed -n '5p' <<<"$row_visible_stale_contract")"
-echo "row_visible_update_stale_contract=$row_visible_fresh_before|$row_visible_source_update|$row_visible_predicate_match|$row_visible_fdw_rows"
-[ "$row_visible_fresh_before|$row_visible_source_update|$row_visible_predicate_match|$row_visible_fdw_rows" = "0|true|false|0" ] || {
-  echo "Expected visible row update to fail closed across lookup surfaces, got $row_visible_fresh_before|$row_visible_source_update|$row_visible_predicate_match|$row_visible_fdw_rows" >&2
+echo "row_visible_update_stale_contract=$row_visible_fresh_before|$row_visible_source_update|$row_visible_predicate_match|$row_visible_current_rows"
+[ "$row_visible_fresh_before|$row_visible_source_update|$row_visible_predicate_match|$row_visible_current_rows" = "0|true|false|0" ] || {
+  echo "Expected visible row update to fail closed across lookup surfaces, got $row_visible_fresh_before|$row_visible_source_update|$row_visible_predicate_match|$row_visible_current_rows" >&2
   exit 1
 }
 echo "row_content_revalidation_pending_contract=$row_pending_reason"
@@ -699,7 +699,8 @@ row_cache_revert_contract="$(psql_exec -qAt \
 SELECT inference_cache_hit::text || '|' ||
        COALESCE(inference_cache_reason, '') || '|' ||
        COALESCE(inference_cache_key_basis, '') || '|' ||
-       COALESCE(inference_cache_eviction_reason, '')
+       COALESCE(inference_cache_eviction_reason, '') || '|' ||
+       COALESCE(decode_constraint, '')
 FROM otlet.inference_receipt_trace_status
 WHERE task_name = :'task_name'
   AND subject_id = 'triage-1'
@@ -713,7 +714,7 @@ SQL
 row_cache_revert_trace="$(head -n 1 <<<"$row_cache_revert_contract")"
 row_cache_revert_fresh="$(tail -n 1 <<<"$row_cache_revert_contract")"
 echo "row_cache_revert_contract=$row_cache_revert_trace|fresh=$row_cache_revert_fresh"
-[ "$row_cache_revert_trace|$row_cache_revert_fresh" = "true|hit|content_hash_contract_hash_model_fingerprint|none|1" ] || {
+[ "$row_cache_revert_trace|$row_cache_revert_fresh" = "true|hit|content_hash_contract_hash_runtime_output_contract_hash_model_fingerprint|none|greedy_with_balanced_json_object_stop_post_generation_schema_check|1" ] || {
   echo "Expected reverted row content to hit inference cache and remain fresh, got $row_cache_revert_trace|$row_cache_revert_fresh" >&2
   exit 1
 }
@@ -771,7 +772,7 @@ LIMIT 1;
 SQL
 )"
 echo "row_contract_cache_contract=$row_contract_cache_contract"
-[ "$row_contract_cache_contract" = "false|contract_changed|content_hash_contract_hash_model_fingerprint" ] || {
+[ "$row_contract_cache_contract" = "false|contract_changed|content_hash_contract_hash_runtime_output_contract_hash_model_fingerprint" ] || {
   echo "Expected contract edit to miss inference cache with contract_changed reason, got $row_contract_cache_contract" >&2
   exit 1
 }
@@ -803,7 +804,7 @@ row_delete_contract="$(psql_exec -qAt \
 SELECT count(*)::text
 FROM otlet.semantic_index_current_rows(:'watch_name', true);
 SELECT (count(*) FILTER (WHERE stale AND stale_reason = 'source_delete') >= 1)::text
-FROM otlet.semantic_materializations
+FROM otlet.semantic_dependency_audit
 WHERE task_name = :'task_name'
   AND subject_id = 'triage-1';
 SQL

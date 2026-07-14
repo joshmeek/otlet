@@ -582,6 +582,7 @@ fn finish_infer_now_success_spi(
         .infer_trace_materialize_ms
         .saturating_add(provenance.materialize_ms);
     runtime.infer_trace_version = provenance.trace_version;
+    runtime.infer_trace_runtime_fingerprint_hash = provenance.runtime_fingerprint_hash;
     runtime.infer_trace_probability_status = provenance.probability_status;
     runtime.infer_trace_schema_force = provenance.schema_force;
     runtime.infer_trace_detailed_status = provenance.detailed_trace_status;

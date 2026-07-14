@@ -2,6 +2,8 @@
 
 Use this after the entity-resolution walkthrough queues work. It inspects model selection, receipts, runtime status, trace visibility, retries, cancellation, and failed-run evidence
 
+These diagnostic queries run as the extension owner because they expose receipt, structured output, error, and numeric token state. Raw model output and token text appear when the owner enables bounded diagnostic storage. Auditors use `otlet.audit_receipt_export` and the other redacted exports granted by `otlet.grant_auditor_access(...)`
+
 ## Step 1 - Inspect Model Selection Attempts
 
 ```sql
@@ -34,7 +36,7 @@ Representative output from the demo run:
 (8 rows)
 ```
 
-The stricter output/action envelope rejects the cheap model in this run. Rejected attempts stay visible as receipts, every row escalates to `qwen35_4b`, and Otlet materializes the accepted output for each job
+The stricter output/action envelope leaves every cheap attempt untrusted in this captured demo. A cheap attempt can finish as `rejected` when its structured output fails the decision contract or `failed` when its output is malformed. Both states remain visible as receipts and escalate to `qwen35_4b`. In this run all four were `rejected`, and Otlet materialized the accepted strong-model output for each job
 
 ## Step 2 - Read The Receipt
 
@@ -56,7 +58,17 @@ receipt_attempt_contract=8|4|4|4
 
 A receipt records evidence for one model run. A candidate pair can have multiple receipts when model selection escalates
 
-Each receipt links the model, artifact, runtime options, prompt hash, input hash, output schema hash, raw output hash, validation status, timing, token counts, memory summary, and trace summary
+Each receipt links the model, artifact, runtime options, prompt hash, input hash, output schema hash, raw-output hash, runtime fingerprint, validation status, timing, token counts, memory summary, and trace summary. Otlet does not persist the assembled prompt
+
+Linked llama.cpp uses greedy decoding and stops after one balanced JSON object. Otlet then requires the common `output` plus `actions` envelope and runs the task JSON Schema, action schema, decision contract, and selection policy. Inspect the decode and validation contract through the receipt:
+
+```sql
+SELECT schema_force, decode_constraint, decode_constraint_reason
+FROM otlet.inference_receipt_trace_status
+WHERE task_name = 'entity_resolution_demo'
+ORDER BY receipt_id DESC
+LIMIT 1;
+```
 
 Warm-job timing splits `tokenize_ms`, `prompt_decode_ms`, `generate_ms`, `finish_sql_ms`, and `materialize_ms` when present:
 
@@ -90,11 +102,45 @@ Representative output:
 runtime_residency_contract=ready|ready|resident_worker_loaded_model_context|true|true
 ```
 
-The worker keeps the local model/context warm across jobs. SQL can see the slot state, memory sample, context window, cache entries, cache bounds, and the last cache reason
+The worker keeps the local model/context warm across jobs. SQL can see the slot state, memory sample, context window, cache entries, cache bounds, last cache reason, and latest detailed runtime fingerprint
+
+The full fingerprint describes the artifact, linked build, effective generation settings, CPU placement, and host capacity. The prompt-template hash covers the exact reasoning prefix and static prompt body. Its output-contract hash omits observational host fields and joins content, task contract, and model identity in the inference-cache key:
+
+```sql
+SELECT receipt_id,
+       runtime_fingerprint_version,
+       runtime_fingerprint_hash,
+       runtime_output_contract_hash,
+       runtime_fingerprint -> 'artifact' ->> 'quantization' AS quantization,
+       runtime_fingerprint #>> '{output_contract,prompt_template,name}' AS prompt_template
+FROM otlet.inference_receipt_trace_status
+WHERE runtime_fingerprint_hash IS NOT NULL
+ORDER BY receipt_id DESC
+LIMIT 1;
+```
 
 SQL shows whether the model loaded, is busy, failed, cached, or went over budget
 
-The inference-output cache stores schema-valid raw model output before Otlet applies selection trust. Accepted abstentions and rejected-but-valid attempts may reuse cached bytes; invalid JSON/schema failures stay out of the cache. The receipt still records accepted/rejected/failed status, and the cache key basis stays content hash + contract hash + model fingerprint
+Generated runs record `memory_evidence` before and after the model path. Typed receipt and runtime-status columns expose process RSS and swap, system available memory and swap, major-fault and file-read deltas, PSI totals, supported cgroup-v2 usage and events, and the model-load admission decision. With an explicit RSS budget, a cache miss loads llama.cpp metadata without tensor allocation and projects model, KV, and prompt-decode workspace bytes. Otlet rejects the load when that total exceeds worker-budget, system, or finite cgroup headroom. The current resident model stays usable
+
+```sql
+SELECT model_load_admission_decision,
+       model_load_admission_reason,
+       worker_process_rss_bytes,
+       worker_process_swap_bytes,
+       system_memory_available_bytes,
+       worker_major_faults,
+       worker_read_bytes,
+       memory_pressure_some_us,
+       cgroup_memory_oom_events
+FROM otlet.inference_receipt_trace_status
+ORDER BY receipt_id DESC
+LIMIT 1;
+```
+
+The inference-output cache stores schema-valid raw model output before Otlet applies selection trust. Accepted abstentions and rejected-but-valid attempts may reuse cached bytes; invalid JSON/schema failures stay out of the cache. The receipt still records accepted/rejected/failed status, and the cache key basis is content hash + contract hash + runtime output-contract hash + model fingerprint
+
+The process-local cache holds at most 512 entries or 8 MiB. Otlet does not persist it. The fresh demo and a stable restart probe showed no eviction pressure or repeated restart misses. Persisting exact raw envelopes would cross the default hash-only stored-evidence boundary, while parsed trusted output survives through outputs and semantic materializations
 
 ```sql
 SELECT task_name,
@@ -118,7 +164,7 @@ The task enabled bounded generation tracing:
 }
 ```
 
-Otlet stores a bounded trace summary on each receipt
+Otlet stores a bounded trace summary on each receipt. Under the default policy, token IDs, ranks, probabilities, and logprobs remain available while token text stays null
 
 Check the bounded token trace:
 
@@ -145,7 +191,7 @@ Otlet records:
 - Receipt, row identity, input hash, and schema hash attached to the trace
 - Resident model cache and inference-output cache use
 
-Token and top-k limits bound trace retention
+Token and top-k limits bound trace retention. `otlet.redaction_policy_status` reports whether any raw output or token text violates the active policy
 
 ## Step 5 - Check The Whole Chain
 
@@ -186,7 +232,7 @@ Check these rows:
 
 - `otlet.jobs.status = 'failed'`
 - `otlet.jobs.error` contains the validation or parse failure
-- `otlet.jobs.raw_output` keeps raw model text for inspection
+- the latest receipt keeps a raw-output hash without raw model text under the default policy
 - `otlet.outputs` has no validated row
 - `otlet.actions` has no trusted row from a failed model attempt
 - `otlet.records` has no row
@@ -292,6 +338,14 @@ Representative output:
 
 Otlet records a receipt for canceled work and preserves model-run evidence
 
+A synchronous infer-now caller can time out while the worker decodes. The requester records a shared abort marker, and the worker calls `otlet.cancel_job` before it can accept output. The caller's failed transaction cannot roll back that worker-owned cancellation
+
+The demo requires the canceled job and receipt, zero outputs and actions, a recorded timeout and abort, the canceled job ID, and one healthy worker:
+
+```text
+requester_timeout_contract=canceled|true|canceled|canceled|0|0|true|true|true|1|ready|ready
+```
+
 ## Step 9 - Understand Retry And Failed-Run Evidence
 
 Otlet leaves failed jobs visible. A failed job is terminal, so you can requeue that task and subject
@@ -309,10 +363,19 @@ The example creates one synthetic failed job, then lets `run_task` enqueue a sec
 The worker claims the second job and rejects the output against the strict JSON contract:
 
 ```sql
-SELECT id, subject_id, status, attempts, error, raw_output IS NOT NULL AS has_raw_output
-FROM otlet.jobs
-WHERE task_name = 'learning_retry_task'
-ORDER BY id;
+SELECT j.id, j.subject_id, j.status, j.attempts, j.error,
+       (r.raw_output_hash IS NOT NULL) AS has_raw_output_hash,
+       (r.raw_output IS NOT NULL) AS has_diagnostic_raw_output
+FROM otlet.jobs j
+LEFT JOIN LATERAL (
+  SELECT receipt.raw_output_hash, receipt.raw_output
+  FROM otlet.inference_receipts receipt
+  WHERE receipt.job_id = j.id
+  ORDER BY receipt.attempt_index DESC, receipt.id DESC
+  LIMIT 1
+) r ON true
+WHERE j.task_name = 'learning_retry_task'
+ORDER BY j.id;
 
 SELECT id AS receipt_id, job_id, task_name, subject_id, status, schema_validation_status, error
 FROM otlet.inference_receipts
@@ -323,20 +386,20 @@ ORDER BY id;
 Representative output:
 
 ```text
- id | subject_id | status | attempts |                                                                                                                                           error                                                                                                                                            | has_raw_output
-----+------------+--------+----------+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+----------------
- 11 | 1          | failed |        1 | learning example synthetic failure                                                                                                                                                                                                                                                         | t
- 12 | 1          | failed |        1 | invalid model JSON: The input is a single row of data. The output must be a JSON object with "output" and "actions" keys, and "actions" must be an array. The output must not have any markdown. The output must not have any prose. The output must not have any other keys than "output" | t
+ id | subject_id | status | attempts |                      error                       | has_raw_output_hash | has_diagnostic_raw_output
+----+------------+--------+----------+--------------------------------------------------+---------------------+---------------------------
+ 11 | 1          | failed |        1 | learning example synthetic failure               | t                   | f
+ 12 | 1          | failed |        1 | invalid model JSON: expected value at line 1 column 1 | t               | f
 (2 rows)
 
- receipt_id | job_id |      task_name      | subject_id | status | schema_validation_status |                                                                                                                                           error
-------------+--------+---------------------+------------+--------+--------------------------+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ receipt_id | job_id |      task_name      | subject_id | status | schema_validation_status |                      error
+------------+--------+---------------------+------------+--------+--------------------------+--------------------------------------------------
          11 |     11 | learning_retry_task | 1          | failed |                          | learning example synthetic failure
-         12 |     12 | learning_retry_task | 1          | failed |                          | invalid model JSON: The input is a single row of data. The output must be a JSON object with "output" and "actions" keys, and "actions" must be an array. The output must not have any markdown. The output must not have any prose. The output must not have any other keys than "output"
+         12 |     12 | learning_retry_task | 1          | failed | failed                   | invalid model JSON: expected value at line 1 column 1
 (2 rows)
 ```
 
-Failure records the raw output, error, and attempt receipt
+Failure records a raw-output hash, a non-sensitive error, and an attempt receipt. Enable diagnostic mode when you need bounded raw text inside the database
 
 ## Step 10 - Check Worker Events And Receipt Statuses
 

@@ -16,6 +16,7 @@ token_counts AS (
   SELECT
     receipt_id,
     count(*)::bigint AS token_steps,
+    count(*) FILTER (WHERE value ? 'token_text')::bigint AS token_text_steps,
     count(*) FILTER (
       WHERE jsonb_typeof(value -> 'chosen_logprob') = 'number'
         AND jsonb_typeof(value -> 'chosen_probability') = 'number'
@@ -27,6 +28,7 @@ alternative_counts AS (
   SELECT
     steps.receipt_id,
     count(*)::bigint AS top_k_alternatives,
+    count(*) FILTER (WHERE alt.value ? 'token_text')::bigint AS top_k_text_alternatives,
     count(*) FILTER (
       WHERE jsonb_typeof(alt.value -> 'logprob') = 'number'
         AND jsonb_typeof(alt.value -> 'probability') = 'number'
@@ -64,6 +66,8 @@ per_receipt AS (
     r.error,
     trace.summary -> 'detailed_trace' ->> 'status' AS detailed_trace_status,
     trace.summary -> 'detailed_trace' ->> 'trace_contract' AS detailed_trace_contract,
+    trace.summary -> 'detailed_trace' ->> 'text_storage' AS detailed_trace_text_storage,
+    (trace.summary #>> '{detailed_trace,chosen_text}' IS NOT NULL) AS has_chosen_text,
     CASE
       WHEN jsonb_typeof(trace.summary #> '{detailed_trace,captured_tokens}') = 'number'
         THEN (trace.summary #>> '{detailed_trace,captured_tokens}')::bigint
@@ -92,8 +96,10 @@ per_receipt AS (
       ELSE 0::bigint
     END AS chosen_token_ids,
     COALESCE(tok.token_steps, 0)::bigint AS token_steps,
+    COALESCE(tok.token_text_steps, 0)::bigint AS token_text_steps,
     COALESCE(tok.token_logprob_steps, 0)::bigint AS token_logprob_steps,
     COALESCE(alt.top_k_alternatives, 0)::bigint AS top_k_alternatives,
+    COALESCE(alt.top_k_text_alternatives, 0)::bigint AS top_k_text_alternatives,
     COALESCE(alt.top_k_logprob_alternatives, 0)::bigint AS top_k_logprob_alternatives,
     (output_jobs.job_id IS NOT NULL) AS has_output,
     (action_jobs.job_id IS NOT NULL) AS has_action,
@@ -119,13 +125,17 @@ SELECT
       AND detailed_trace_contract = 'receipt_trace_v2_bounded_token_steps'
   )::bigint AS detailed_trace_receipts,
   COALESCE(sum(token_steps), 0)::bigint AS token_steps,
+  COALESCE(sum(token_text_steps), 0)::bigint AS token_text_steps,
   COALESCE(sum(token_logprob_steps), 0)::bigint AS token_logprob_steps,
   COALESCE(sum(top_k_alternatives), 0)::bigint AS top_k_alternatives,
+  COALESCE(sum(top_k_text_alternatives), 0)::bigint AS top_k_text_alternatives,
   COALESCE(sum(top_k_logprob_alternatives), 0)::bigint AS top_k_logprob_alternatives,
   count(*) FILTER (
     WHERE chosen_token_ids > 0
       AND chosen_token_ids = detailed_trace_captured_tokens
   )::bigint AS chosen_token_id_receipts,
+  count(*) FILTER (WHERE has_chosen_text)::bigint AS chosen_text_receipts,
+  count(*) FILTER (WHERE detailed_trace_text_storage = 'redacted')::bigint AS redacted_text_receipts,
   count(*) FILTER (WHERE has_output)::bigint AS output_linked_receipts,
   count(*) FILTER (WHERE has_action)::bigint AS action_linked_receipts,
   count(*) FILTER (

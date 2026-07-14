@@ -46,6 +46,8 @@ CREATE FUNCTION otlet.label_action(
   label_source text DEFAULT NULL
 ) RETURNS SETOF otlet.eval_labels
 LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, otlet, pg_temp
 AS $$
 DECLARE
   action_row otlet.actions%ROWTYPE;
@@ -200,6 +202,8 @@ CREATE FUNCTION otlet.correct_action(
   reason text DEFAULT NULL
 ) RETURNS SETOF otlet.eval_labels
 LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, otlet, pg_temp
 AS $$
 DECLARE
   rejected_action otlet.actions%ROWTYPE;

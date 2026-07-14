@@ -25,6 +25,37 @@ fn run_linked(
         cached.artifact_path == job_model.artifact_path
             && cached.model_fingerprint_hash.as_ref() == model_fingerprint_hash
     });
+    let memory_before = process_memory_sample();
+    let memory_admission = if cache_hit {
+        ModelLoadAdmission::not_required(
+            "resident_model_reused",
+            options.max_worker_rss_bytes,
+            &memory_before,
+        )
+    } else {
+        linked_model_load_admission(job_model.artifact_path, options, &memory_before)
+    };
+    if memory_admission.rejected() {
+        let memory_after = process_memory_sample();
+        let memory_trace = build_memory_trace(
+            &memory_before,
+            &memory_after,
+            &memory_admission,
+            options.max_worker_rss_bytes,
+        );
+        return Err(ModelError::clean_failure(
+            format!(
+                "linked model load admission rejected: reason={} artifact_bytes={} allowed_additional_bytes={} max_worker_rss_bytes={}",
+                memory_admission.reason,
+                memory_admission.artifact_bytes,
+                memory_admission.allowed_additional_bytes,
+                options.max_worker_rss_bytes
+            ),
+            "model_load_admission_before_tensor_load",
+            "model_load_admission_rejected",
+        )
+        .with_memory_trace(memory_trace));
+    }
 
     if !cache_hit {
         let model_path = CString::new(job_model.artifact_path.as_bytes())
@@ -122,7 +153,16 @@ fn run_linked(
 
     if options.max_worker_rss_bytes > 0 {
         let resident_memory = process_memory_sample();
-        enforce_worker_rss_budget(&resident_memory, options.max_worker_rss_bytes)?;
+        if let Err(err) =
+            enforce_worker_rss_budget(&resident_memory, options.max_worker_rss_bytes)
+        {
+            return Err(err.with_memory_trace(build_memory_trace(
+                &memory_before,
+                &resident_memory,
+                &memory_admission,
+                options.max_worker_rss_bytes,
+            )));
+        }
     }
 
     if linked_cancel_requested(job.id)? {
@@ -329,7 +369,20 @@ fn run_linked(
         0
     };
     let worker_memory = process_memory_sample();
-    enforce_worker_rss_budget(&worker_memory, options.max_worker_rss_bytes)?;
+    if let Err(err) = enforce_worker_rss_budget(&worker_memory, options.max_worker_rss_bytes) {
+        return Err(err.with_memory_trace(build_memory_trace(
+            &memory_before,
+            &worker_memory,
+            &memory_admission,
+            options.max_worker_rss_bytes,
+        )));
+    }
+    let memory_trace = build_memory_trace(
+        &memory_before,
+        &worker_memory,
+        &memory_admission,
+        options.max_worker_rss_bytes,
+    );
     let output = String::from_utf8(output).map_err(|err| {
         ModelError::new(format!(
             "linked llama.cpp output was not valid UTF-8: {}",
@@ -353,7 +406,7 @@ fn run_linked(
             worker_process_virtual_bytes: worker_memory.virtual_bytes,
             worker_memory_sample_policy: worker_memory.policy,
             worker_memory_budget_bytes: u64_to_i64_saturating(options.max_worker_rss_bytes),
-            worker_memory_budget_policy: worker_memory_budget_policy(options.max_worker_rss_bytes),
+            memory_trace,
             prompt_tokens: usize_to_i64_saturating(tokens.len()),
             prompt_cached_tokens_before: usize_to_i64_saturating(prompt_cached_tokens_before),
             prompt_reused_tokens: usize_to_i64_saturating(prompt_reused_tokens),
@@ -383,6 +436,140 @@ fn run_linked(
             detailed_trace: detailed_trace.summary(stop_reason),
             stop_reason,
         },
+    })
+}
+
+fn linked_model_load_admission(
+    artifact_path: &str,
+    options: &crate::runtime::RuntimeOptions,
+    sample: &ProcessMemorySample,
+) -> ModelLoadAdmission {
+    let artifact_bytes = fs::metadata(artifact_path)
+        .ok()
+        .map(|metadata| u64_to_i64_saturating(metadata.len()))
+        .unwrap_or(0);
+    let worker_budget_bytes = u64_to_i64_saturating(options.max_worker_rss_bytes);
+    let worker_budget_headroom_bytes = worker_budget_bytes
+        .saturating_sub(sample.rss_bytes)
+        .max(0);
+    let cgroup_headroom_bytes = cgroup_memory_headroom(sample);
+    let mut admission = ModelLoadAdmission {
+        decision: "not_required",
+        reason: "unbounded_worker_rss_reporting_only",
+        policy: "linked_llama_no_alloc_model_kv_batch_projection_v1",
+        artifact_bytes,
+        worker_budget_bytes,
+        worker_budget_headroom_bytes,
+        system_available_headroom_bytes: sample.system_memory_available_bytes,
+        cgroup_headroom_bytes,
+        allowed_additional_bytes: 0,
+        projected_model_bytes: 0,
+        projected_context_kv_bytes: 0,
+        projected_batch_compute_bytes: 0,
+        projected_total_bytes: 0,
+        llama_projected_fit: false,
+    };
+    if options.max_worker_rss_bytes == 0 {
+        return admission;
+    }
+    admission.decision = "rejected";
+    if !sample.supports_preload_admission() {
+        admission.reason = "required_linux_memory_sample_unavailable";
+        return admission;
+    }
+    if artifact_bytes <= 0 {
+        admission.reason = "model_artifact_metadata_unavailable";
+        return admission;
+    }
+    if worker_budget_headroom_bytes <= 0 {
+        admission.reason = "current_worker_rss_meets_or_exceeds_budget";
+        return admission;
+    }
+    let mut allowed_additional_bytes = worker_budget_headroom_bytes
+        .min(sample.system_memory_available_bytes)
+        .min(sample.system_memory_total_bytes);
+    if sample.cgroup_memory_max_bytes > 0 {
+        allowed_additional_bytes = allowed_additional_bytes.min(cgroup_headroom_bytes);
+    }
+    admission.allowed_additional_bytes = allowed_additional_bytes.max(0);
+    if admission.allowed_additional_bytes < artifact_bytes {
+        admission.reason = "artifact_floor_exceeds_available_headroom";
+        return admission;
+    }
+
+    let projection = linked_model_load_projection(artifact_path, artifact_bytes);
+    let Ok(projection) = projection else {
+        admission.reason = "llama_projection_error";
+        return admission;
+    };
+    admission.projected_model_bytes = projection.model_bytes;
+    admission.projected_context_kv_bytes = projection.context_kv_bytes;
+    admission.projected_batch_compute_bytes = projection.batch_compute_bytes;
+    admission.projected_total_bytes = projection.total_bytes;
+    admission.llama_projected_fit = projection.total_bytes <= admission.allowed_additional_bytes;
+    if admission.llama_projected_fit {
+        admission.decision = "allowed";
+        admission.reason = "llama_projected_model_kv_batch_fit";
+    } else {
+        admission.reason = "llama_projected_model_kv_batch_exceeds_headroom";
+    }
+    admission
+}
+
+struct LinkedModelLoadProjection {
+    model_bytes: i64,
+    context_kv_bytes: i64,
+    batch_compute_bytes: i64,
+    total_bytes: i64,
+}
+
+fn linked_model_load_projection(
+    artifact_path: &str,
+    artifact_bytes: i64,
+) -> Result<LinkedModelLoadProjection, ()> {
+    let model_path = std::ffi::CString::new(artifact_path.as_bytes()).map_err(|_| ())?;
+    let mut model_params = unsafe { llama_cpp_sys_4::llama_model_default_params() };
+    model_params.n_gpu_layers = 0;
+    model_params.no_alloc = true;
+    model_params.use_mmap = false;
+    model_params.use_mlock = false;
+    let model_ptr = unsafe {
+        llama_cpp_sys_4::llama_model_load_from_file(model_path.as_ptr(), model_params)
+    };
+    if model_ptr.is_null() {
+        return Err(());
+    }
+    let model = LinkedModel { ptr: model_ptr };
+    let model_bytes = artifact_bytes.max(u64_to_i64_saturating(unsafe {
+        llama_cpp_sys_4::llama_model_size(model.ptr)
+    }));
+    let layers = i64::from(unsafe { llama_cpp_sys_4::llama_model_n_layer(model.ptr) }).max(1);
+    let embedding = i64::from(unsafe { llama_cpp_sys_4::llama_model_n_embd(model.ptr) }).max(1);
+    let heads = i64::from(unsafe { llama_cpp_sys_4::llama_model_n_head(model.ptr) }).max(1);
+    let kv_heads =
+        i64::from(unsafe { llama_cpp_sys_4::llama_model_n_head_kv(model.ptr) }).max(1);
+    let head_width = embedding.saturating_add(heads - 1) / heads;
+    // Two f16-sized K/V buffers, conservative for the supported q8/q4 settings
+    let context_kv_bytes = 2_i64
+        .saturating_mul(layers)
+        .saturating_mul(i64::from(LINKED_CONTEXT_WINDOW_TOKENS))
+        .saturating_mul(head_width)
+        .saturating_mul(kv_heads)
+        .saturating_mul(2);
+    // Estimate prompt-decode workspace as one f32 activation plane per layer
+    let batch_compute_bytes = layers
+        .saturating_mul(usize_to_i64_saturating(linked_prompt_ubatch_tokens(
+            linked_prompt_batch_tokens(),
+        )))
+        .saturating_mul(embedding)
+        .saturating_mul(4);
+    Ok(LinkedModelLoadProjection {
+        model_bytes,
+        context_kv_bytes,
+        batch_compute_bytes,
+        total_bytes: model_bytes
+            .saturating_add(context_kv_bytes)
+            .saturating_add(batch_compute_bytes),
     })
 }
 
@@ -1254,6 +1441,12 @@ mod tests {
 }
 
 fn linked_cancel_requested(job_id: i64) -> Result<bool, ModelError> {
+    match crate::infer_now::persist_timeout_cancel(job_id) {
+        Ok(true) => return Ok(true),
+        Ok(false) => {}
+        Err(err) => return Err(ModelError::new(err)),
+    }
+
     let result: pgrx::spi::Result<Result<bool, ModelError>> =
         pgrx::bgworkers::BackgroundWorker::transaction(|| {
             // Read-only probe — use select so the plan stays non-volatile.

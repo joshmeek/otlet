@@ -1,6 +1,7 @@
 production_policy_contract="$(psql_exec -qAt <<'SQL'
 SELECT name || '|' || stale_policy || '|' || max_attempts::text || '|' ||
-       max_attempt_ms::text || '|' || worker_claim_batch_size::text
+       max_attempt_ms::text || '|' || worker_claim_batch_size::text || '|' ||
+       sensitive_evidence_mode
 FROM otlet.production_policy_status;
 SQL
 )"
@@ -75,7 +76,7 @@ echo "lease_fence_contract=$lease_fence_contract"
   echo "Expected claim-attempt fencing and timeout-aware lease renewal, got $lease_fence_contract" >&2
   exit 1
 }
-[ "$production_policy_contract" = "default|refresh_then_fail_closed|3|300000|8" ] || {
+[ "$production_policy_contract" = "default|refresh_then_fail_closed|3|300000|8|redacted" ] || {
   echo "Expected default production policy, got $production_policy_contract" >&2
   exit 1
 }
