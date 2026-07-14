@@ -188,6 +188,12 @@ Three same-host qwen35 restart pairs measured cold first requests at `10.131s`, 
 
 One-client read latency averaged `0.053ms` during preload with 225,800 transactions and zero failures, compared with `0.051ms` and zero failures while the worker stayed cold. Missing registration, invalid GGUF, unreadable GGUF, and a one-byte RSS budget each produced one failure event, one stable worker PID, and no retry loop. Keep the option unset unless predictable first-request latency is worth resident memory before demand
 
+### Cross-batch task-contract cache
+
+The resident worker keeps the 16 most recently used exact task contracts across claim batches. A hit reuses parsed runtime options, contract hashes, status JSON, rendered schema, and the static prompt prefix without retaining source input, shaped prompts, raw output, or evidence. Instruction, schema, runtime options, input shaping, decision contract, configured model, artifact path, or artifact hash changes force a miss. A worker restart clears the cache
+
+A release-mode fixture repeated a 100-field schema and 4,000-byte instruction 20,000 times. Clearing the task cache for each simulated one-job batch took `220.824ms`, or `11.041us` per preparation. The bounded cross-batch cache took `63.806ms`, or `3.190us` per preparation, a 71.1 percent reduction. Exact hits perform no new task-contract or prompt-prefix heap construction. The five-case qwen35 probe and full demo passed with prompt identity, contract invalidation, permissions, zero invariant findings, and a clean crash scan
+
 Run the default-included benchmark model:
 
 ```sh

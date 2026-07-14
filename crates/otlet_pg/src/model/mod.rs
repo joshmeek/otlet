@@ -418,7 +418,7 @@ fn run_job_with_model_ref(job: &Job, model: JobModelRef<'_>) -> Result<ModelRun,
         let rendered_schema =
             cached_rendered_schema(&job.output_schema, &digests.output_schema_hash);
         let prompt_prefix = cached_prompt_prefix(
-            &job.task_name,
+            &digests,
             options,
             &digests.instruction,
             rendered_schema.as_ref(),

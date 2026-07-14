@@ -2,8 +2,7 @@ use crate::job::{
     Job, ModelSelectionPolicy, claim_jobs, insert_infer_now_job, model_selection_policy,
 };
 use crate::model::{
-    ModelError, ModelMetrics, ModelPreload, ModelRun, clear_task_contract_digests, preload_model,
-    run_job, run_job_with_model,
+    ModelError, ModelMetrics, ModelPreload, ModelRun, preload_model, run_job, run_job_with_model,
 };
 use pgrx::JsonB;
 use pgrx::bgworkers::{BackgroundWorker, SignalWakeFlags};
@@ -511,7 +510,6 @@ impl BatchProcessResult {
 fn process_job_batch(jobs: Vec<Job>) -> BatchProcessResult {
     // One transaction for the whole claim batch: mark_job_started is warn-only
     // and must stay outside the policy-lookup txn (SPI errors abort that txn).
-    clear_task_contract_digests();
     mark_jobs_started(&jobs);
     let mut batch = BatchProcessResult::default();
     let mut policy_cache = ModelSelectionPolicyCache::default();
@@ -563,7 +561,6 @@ fn process_job_batch(jobs: Vec<Job>) -> BatchProcessResult {
 }
 
 fn process_job(job: Job) -> JobProcessResult {
-    clear_task_contract_digests();
     let mut policy_cache = ModelSelectionPolicyCache::default();
     let mut result = process_job_deferred(&job, &mut policy_cache, false);
     if let Some(reason) = result.strong_fallback.take() {

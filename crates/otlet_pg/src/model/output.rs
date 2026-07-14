@@ -725,6 +725,119 @@ fn parse_model_json(raw_output: &str) -> Result<Value, String> {
 mod output_tests {
     use super::*;
 
+    fn contract_test_job() -> Job {
+        let properties = (0..8)
+            .map(|index| (format!("field_{index}"), json!({"type": "string"})))
+            .collect::<serde_json::Map<_, _>>();
+        Job {
+            id: 1,
+            task_name: "contract_test".to_owned(),
+            subject_id: "subject".to_owned(),
+            instruction: "classify the record ".repeat(8),
+            output_schema: json!({"type": "object", "properties": properties}),
+            input: json!({"value": "test"}),
+            input_content_hash: "content".to_owned(),
+            artifact_path: "/tmp/model.gguf".to_owned(),
+            artifact_hash: Some("artifact".to_owned()),
+            model_name: "test_model".to_owned(),
+            runtime_options: json!({"reasoning": "off"}),
+            input_shaping: json!({"include": ["value"]}),
+            decision_contract: json!({"answer_field": "decision"}),
+            max_attempt_ms: 30_000,
+            claim_attempt: 1,
+        }
+    }
+
+    #[test]
+    fn task_contract_cache_requires_exact_identity() {
+        let job = contract_test_job();
+        let digests = Arc::new(build_task_contract_digests(&job));
+        let mut cache = TaskContractCache::new();
+        cache.insert(&job, Arc::clone(&digests));
+        assert!(Arc::ptr_eq(&cache.get(&job).unwrap(), &digests));
+
+        let mut changed = contract_test_job();
+        changed.runtime_options = json!({"reasoning": "on"});
+        assert!(cache.get(&changed).is_none());
+        changed = contract_test_job();
+        changed.output_schema = json!({"type": "string"});
+        assert!(cache.get(&changed).is_none());
+        changed = contract_test_job();
+        changed.input_shaping = json!({"include": ["other"]});
+        assert!(cache.get(&changed).is_none());
+        changed = contract_test_job();
+        changed.decision_contract = json!({"answer_field": "other"});
+        assert!(cache.get(&changed).is_none());
+        changed = contract_test_job();
+        changed.instruction.push_str(" changed");
+        assert!(cache.get(&changed).is_none());
+        changed = contract_test_job();
+        changed.model_name = "other_model".to_owned();
+        assert!(cache.get(&changed).is_none());
+        changed = contract_test_job();
+        changed.artifact_path = "/tmp/other.gguf".to_owned();
+        assert!(cache.get(&changed).is_none());
+        changed = contract_test_job();
+        changed.artifact_hash = Some("other_artifact".to_owned());
+        assert!(cache.get(&changed).is_none());
+    }
+
+    #[test]
+    fn task_contract_cache_bounds_entries_and_preserves_lru_order() {
+        let mut cache = TaskContractCache::new();
+        for index in 0..TASK_CONTRACT_CACHE_MAX_ENTRIES {
+            let mut job = contract_test_job();
+            job.task_name = format!("task_{index}");
+            let digests = Arc::new(build_task_contract_digests(&job));
+            cache.insert(&job, digests);
+        }
+        let mut first = contract_test_job();
+        first.task_name = "task_0".to_owned();
+        assert!(cache.get(&first).is_some());
+
+        let mut overflow = contract_test_job();
+        overflow.task_name = "task_overflow".to_owned();
+        let digests = Arc::new(build_task_contract_digests(&overflow));
+        cache.insert(&overflow, digests);
+
+        assert_eq!(cache.entries.len(), TASK_CONTRACT_CACHE_MAX_ENTRIES);
+        assert!(cache.entries.iter().any(|entry| entry.task_name == "task_0"));
+        assert!(!cache.entries.iter().any(|entry| entry.task_name == "task_1"));
+        assert!(
+            cache
+                .entries
+                .iter()
+                .any(|entry| entry.task_name == "task_overflow")
+        );
+    }
+
+    #[test]
+    fn task_contract_cache_reuses_prefix_and_invalid_option_result() {
+        let mut job = contract_test_job();
+        let digests = build_task_contract_digests(&job);
+        let rendered = cached_rendered_schema(&job.output_schema, &digests.output_schema_hash);
+        let first = cached_prompt_prefix(
+            &digests,
+            digests.runtime_options.as_ref().unwrap(),
+            &digests.instruction,
+            &rendered,
+        );
+        let second = cached_prompt_prefix(
+            &digests,
+            digests.runtime_options.as_ref().unwrap(),
+            &digests.instruction,
+            &rendered,
+        );
+        assert!(Arc::ptr_eq(&first, &second));
+
+        job.runtime_options = json!({"threads": "invalid"});
+        let invalid = Arc::new(build_task_contract_digests(&job));
+        assert!(invalid.runtime_options.is_err());
+        let mut cache = TaskContractCache::new();
+        cache.insert(&job, Arc::clone(&invalid));
+        assert!(cache.get(&job).unwrap().runtime_options.is_err());
+    }
+
     #[test]
     fn shaped_model_prompt_preserves_prompt_hashes_and_metadata() {
         let input = json!({
@@ -828,86 +941,149 @@ struct TaskContractDigests {
     decision_preset_name: String,
     decision_preset_contract_hash: String,
     inference_cache_contract_hash: String,
+    prompt_prefix: OnceLock<Arc<str>>,
+}
+
+const TASK_CONTRACT_CACHE_MAX_ENTRIES: usize = 16;
+
+struct TaskContractCacheEntry {
+    task_name: String,
+    instruction: String,
+    output_schema: Value,
+    runtime_options: Value,
+    input_shaping: Value,
+    decision_contract: Value,
+    model_name: String,
+    artifact_path: String,
+    artifact_hash: Option<String>,
+    digests: Arc<TaskContractDigests>,
+}
+
+impl TaskContractCacheEntry {
+    fn matches(&self, job: &Job) -> bool {
+        self.task_name == job.task_name
+            && self.instruction == job.instruction
+            && self.output_schema == job.output_schema
+            && self.runtime_options == job.runtime_options
+            && self.input_shaping == job.input_shaping
+            && self.decision_contract == job.decision_contract
+            && self.model_name == job.model_name
+            && self.artifact_path == job.artifact_path
+            && self.artifact_hash == job.artifact_hash
+    }
+}
+
+struct TaskContractCache {
+    entries: Vec<TaskContractCacheEntry>,
+}
+
+impl TaskContractCache {
+    fn new() -> Self {
+        Self {
+            entries: Vec::with_capacity(TASK_CONTRACT_CACHE_MAX_ENTRIES),
+        }
+    }
+
+    fn get(&mut self, job: &Job) -> Option<Arc<TaskContractDigests>> {
+        let index = self.entries.iter().position(|entry| entry.matches(job))?;
+        let entry = self.entries.remove(index);
+        let digests = Arc::clone(&entry.digests);
+        self.entries.insert(0, entry);
+        Some(digests)
+    }
+
+    fn insert(&mut self, job: &Job, digests: Arc<TaskContractDigests>) {
+        self.entries
+            .retain(|entry| entry.task_name != job.task_name);
+        self.entries.insert(
+            0,
+            TaskContractCacheEntry {
+                task_name: job.task_name.clone(),
+                instruction: job.instruction.clone(),
+                output_schema: job.output_schema.clone(),
+                runtime_options: job.runtime_options.clone(),
+                input_shaping: job.input_shaping.clone(),
+                decision_contract: job.decision_contract.clone(),
+                model_name: job.model_name.clone(),
+                artifact_path: job.artifact_path.clone(),
+                artifact_hash: job.artifact_hash.clone(),
+                digests,
+            },
+        );
+        if self.entries.len() > TASK_CONTRACT_CACHE_MAX_ENTRIES {
+            self.entries.pop();
+        }
+    }
 }
 
 thread_local! {
-    // Batch-lifetime only: cleared at the start of each process_job(_batch).
-    // Avoids re-hashing identical per-task contract fields across claim drains.
-    static TASK_CONTRACT_DIGESTS: RefCell<HashMap<String, Arc<TaskContractDigests>>> =
-        RefCell::new(HashMap::with_capacity(4));
-    // Same lifetime: reuse the large static prompt prefix across jobs of one task.
-    static TASK_PROMPT_PREFIXES: RefCell<HashMap<String, Arc<str>>> =
-        RefCell::new(HashMap::with_capacity(4));
-}
-
-pub(crate) fn clear_task_contract_digests() {
-    TASK_CONTRACT_DIGESTS.with(|cell| cell.borrow_mut().clear());
-    TASK_PROMPT_PREFIXES.with(|cell| cell.borrow_mut().clear());
+    // Worker-lifetime exact-contract LRU; stores no job input or model output
+    static TASK_CONTRACT_DIGESTS: RefCell<TaskContractCache> =
+        RefCell::new(TaskContractCache::new());
 }
 
 fn cached_prompt_prefix(
-    task_name: &str,
+    digests: &TaskContractDigests,
     options: &crate::runtime::RuntimeOptions,
     instruction: &str,
     rendered_schema: &str,
 ) -> Arc<str> {
-    TASK_PROMPT_PREFIXES.with(|cell| {
-        let mut map = cell.borrow_mut();
-        if let Some(cached) = map.get(task_name) {
-            return Arc::clone(cached);
-        }
-        let prefix = Arc::<str>::from(prompt_prefix(options, instruction, rendered_schema));
-        map.insert(task_name.to_owned(), Arc::clone(&prefix));
-        prefix
-    })
+    Arc::clone(digests.prompt_prefix.get_or_init(|| {
+        Arc::from(prompt_prefix(options, instruction, rendered_schema))
+    }))
 }
 
 fn task_contract_digests(job: &Job) -> Arc<TaskContractDigests> {
     TASK_CONTRACT_DIGESTS.with(|cell| {
-        let mut map = cell.borrow_mut();
-        if let Some(cached) = map.get(&job.task_name) {
-            return Arc::clone(cached);
+        let mut cache = cell.borrow_mut();
+        if let Some(cached) = cache.get(job) {
+            return cached;
         }
-        let instruction = effective_instruction(&job.instruction, &job.decision_contract);
-        let runtime_options = parse_runtime_options(&job.runtime_options);
-        let instruction_hash = hash_text(&instruction);
-        let output_schema_hash = hash_json(&job.output_schema);
-        let runtime_options_hash = hash_json(&job.runtime_options);
-        let runtime_options_status = runtime_option_status(&job.runtime_options);
-        let input_shaping_hash = hash_json(&job.input_shaping);
-        let decision_contract_hash = hash_json(&job.decision_contract);
-        let decision_preset_name = job
-            .decision_contract
-            .get("preset")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_owned();
-        let decision_preset_contract_hash = job
-            .decision_contract
-            .get("preset_contract_hash")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_owned();
-        let inference_cache_contract_hash = inference_cache_contract_hash(
-            job,
-            &instruction_hash,
-            &output_schema_hash,
-            &runtime_options_hash,
-            &input_shaping_hash,
-            &decision_contract_hash,
-        );
-        let digests = Arc::new(TaskContractDigests {
-            instruction,
-            runtime_options,
-            output_schema_hash,
-            runtime_options_hash,
-            runtime_options_status,
-            decision_contract_hash,
-            decision_preset_name,
-            decision_preset_contract_hash,
-            inference_cache_contract_hash,
-        });
-        map.insert(job.task_name.clone(), Arc::clone(&digests));
+        let digests = Arc::new(build_task_contract_digests(job));
+        cache.insert(job, Arc::clone(&digests));
         digests
     })
+}
+
+fn build_task_contract_digests(job: &Job) -> TaskContractDigests {
+    let instruction = effective_instruction(&job.instruction, &job.decision_contract);
+    let runtime_options = parse_runtime_options(&job.runtime_options);
+    let instruction_hash = hash_text(&instruction);
+    let output_schema_hash = hash_json(&job.output_schema);
+    let runtime_options_hash = hash_json(&job.runtime_options);
+    let runtime_options_status = runtime_option_status(&job.runtime_options);
+    let input_shaping_hash = hash_json(&job.input_shaping);
+    let decision_contract_hash = hash_json(&job.decision_contract);
+    let decision_preset_name = job
+        .decision_contract
+        .get("preset")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    let decision_preset_contract_hash = job
+        .decision_contract
+        .get("preset_contract_hash")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    let inference_cache_contract_hash = inference_cache_contract_hash(
+        job,
+        &instruction_hash,
+        &output_schema_hash,
+        &runtime_options_hash,
+        &input_shaping_hash,
+        &decision_contract_hash,
+    );
+    TaskContractDigests {
+        instruction,
+        runtime_options,
+        output_schema_hash,
+        runtime_options_hash,
+        runtime_options_status,
+        decision_contract_hash,
+        decision_preset_name,
+        decision_preset_contract_hash,
+        inference_cache_contract_hash,
+        prompt_prefix: OnceLock::new(),
+    }
 }
