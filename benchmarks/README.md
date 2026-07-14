@@ -164,6 +164,14 @@ One stable qwen35 row measured a `9.452s` enabled miss, a `0.503s` exact hit, a 
 
 No installed workload records eviction followed by a repeated-identity miss, and the 447-job full benchmark disables inference caching to measure live generation. A durable cache would persist exact raw envelopes despite the default hash-only evidence policy and duplicate trusted state already kept in outputs and semantic materializations. Otlet adds no disk cache
 
+### Cache-hit completion path
+
+The earlier `0.503s` exact-hit result included a 500 ms shell polling interval. Runtime-stage timing on commit `f57dea7d` found no corresponding completion cost. Ten direct qwen35 exact hits measured `3ms` requester p50 and `10.05ms` p95. Ten supported queued `run_task` hits measured `11.5ms` end-to-end p50 and `25.7ms` p95, including `5ms` median queue wait and `7.5ms` median worker time. Exact hits for row-watch and pair-watch tasks completed in `16ms` and `6ms`, including semantic materialization
+
+A real worker restart cleared the cache. The next identical request missed in `13.857s`, including `6.311s` model load, `262ms` context creation, `5.679s` prompt decode, and `1.474s` generation; the following exact hit took `8ms`. Disabling the cache kept the generation path and reported `disabled` instead of a hit
+
+Cache insertion remains after raw-envelope parsing, action parsing, and schema validation. Hits repeat those checks and require the full content, contract, runtime-output, and model identity before accepting cached bytes. Successful completion already writes the job, receipt, output, actions, runtime slot, and event in one SQL transition. Removing validation or merging fault-isolated metrics and materialization work would weaken the contract to optimize noise, so Otlet retains the existing path
+
 Run the default-included benchmark model:
 
 ```sh
