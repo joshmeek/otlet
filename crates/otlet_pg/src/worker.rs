@@ -846,7 +846,6 @@ fn accept_attempt_with_model(
     selection_reason: &str,
 ) -> (bool, bool) {
     // Keep telemetry separate so a metric error cannot roll back completion
-    // Materialization also stays separate from the accepted job transaction
     // Returns (completed, semantic_materialized).
     let metrics = run.metrics.as_ref();
     if let Some(metrics) = metrics {
@@ -875,42 +874,65 @@ fn accept_attempt_with_model(
             );
         }
     }
-    let result: pgrx::spi::Result<bool> = BackgroundWorker::transaction(|| {
-        pgrx::Spi::connect_mut(|client| {
-            let args = [
-                job.id.into(),
-                JsonB(run.output).into(),
-                run.raw_output.as_str().into(),
-                JsonB(run.actions).into(),
-                run.prompt_hash.as_str().into(),
-                run.input_hash.as_str().into(),
-                run.output_schema_hash.as_str().into(),
-                run.raw_output_hash.as_str().into(),
-                JsonB(run.trace_summary).into(),
-                model_name.into(),
-                selection_role.into(),
-                selection_reason.into(),
-            ];
-            let rows = client.select(
-                "SELECT id FROM otlet.complete_job($1, $2, $3, $4, $5, $6, $7, $8, trace_summary => $9, model_name => $10, selection_role => $11, selection_reason => $12) LIMIT 1",
+    let result: pgrx::spi::Result<(bool, bool, Option<String>, Option<String>)> =
+        BackgroundWorker::transaction(|| {
+            pgrx::Spi::connect_mut(|client| {
+                let args = [
+                    job.id.into(),
+                    JsonB(run.output).into(),
+                    run.raw_output.as_str().into(),
+                    JsonB(run.actions).into(),
+                    run.prompt_hash.as_str().into(),
+                    run.input_hash.as_str().into(),
+                    run.output_schema_hash.as_str().into(),
+                    run.raw_output_hash.as_str().into(),
+                    JsonB(run.trace_summary).into(),
+                    model_name.into(),
+                    selection_role.into(),
+                    selection_reason.into(),
+                ];
+                let rows = client.select(
+                "SELECT output_id, semantic_materialized, completion_error, materialization_error FROM otlet.complete_and_materialize_job($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) LIMIT 1",
                 Some(1),
                 &args,
             )?;
-            if rows.first().get::<i64>(1)?.is_none() {
-                return Ok(false);
-            }
-            Ok(true)
-        })
-    });
+                let row = rows.first();
+                Ok((
+                    row.get::<i64>(1)?.is_some(),
+                    row.get::<bool>(2)?.unwrap_or(false),
+                    row.get::<String>(3)?,
+                    row.get::<String>(4)?,
+                ))
+            })
+        });
 
     match result {
-        Ok(true) => {
-            let semantic_materialized =
-                materialize_completed_semantic_job_with_model(job, model_name);
+        Ok((true, semantic_materialized, _, materialization_error)) => {
+            if let Some(error) = &materialization_error {
+                pgrx::warning!(
+                    "otlet semantic materialization failed for job {}: {}",
+                    job.id,
+                    error
+                );
+            }
             pgrx::log!("otlet worker completed job {}", job.id);
             (true, semantic_materialized)
         }
-        Ok(false) => {
+        Ok((false, _, Some(error), _)) => {
+            pgrx::warning!("otlet worker complete failed: {error}");
+            let model_err = ModelError::new(format!("complete_job failed: {error}"));
+            (
+                fail_attempt_with_model(
+                    job,
+                    model_name,
+                    &model_err,
+                    selection_role,
+                    "complete_job_spi_failed",
+                ),
+                false,
+            )
+        }
+        Ok((false, _, None, _)) => {
             pgrx::warning!(
                 "otlet worker complete produced no output row for job {}",
                 job.id
@@ -1346,49 +1368,6 @@ fn millis_since(start: Instant) -> i64 {
     i64::try_from(start.elapsed().as_millis()).unwrap_or(i64::MAX)
 }
 
-fn materialize_completed_semantic_job_with_model(job: &Job, model_name: &str) -> bool {
-    let result: pgrx::spi::Result<()> = BackgroundWorker::transaction(|| {
-        pgrx::Spi::connect_mut(|client| {
-            let args = [job.id.into()];
-            client.update(
-                "SELECT otlet.materialize_completed_semantic_job($1)",
-                Some(1),
-                &args,
-            )?;
-            Ok(())
-        })
-    });
-    if let Err(err) = result {
-        record_semantic_materialization_failed(job, model_name, &err.to_string());
-        return false;
-    }
-    true
-}
-
-fn record_semantic_materialization_failed(job: &Job, model_name: &str, error: &str) {
-    let result: pgrx::spi::Result<()> = BackgroundWorker::transaction(|| {
-        pgrx::Spi::connect_mut(|client| {
-            let args = [
-                job.id.into(),
-                "linked_inproc".into(),
-                job.task_name.as_str().into(),
-                job.subject_id.as_str().into(),
-                model_name.into(),
-                error.into(),
-            ];
-            client.update(
-                "SELECT otlet.record_worker_event('semantic_materialization_failed', $1, $2, 'otlet semantic materialization failed', jsonb_build_object('task_name', $3, 'subject_id', $4, 'model_name', $5, 'error', $6))",
-                Some(1),
-                &args,
-            )?;
-            Ok(())
-        })
-    });
-    if let Err(err) = result {
-        pgrx::warning!("otlet semantic materialization failure event failed: {err}");
-    }
-}
-
 fn materialize_infer_now_subject(task_name: &str, subject_id: &str) -> pgrx::spi::Result<i64> {
     BackgroundWorker::transaction(|| {
         pgrx::Spi::connect_mut(|client| {
@@ -1416,7 +1395,7 @@ fn materialize_infer_now_subject(task_name: &str, subject_id: &str) -> pgrx::spi
 fn otlet_schema_ready() -> pgrx::spi::Result<bool> {
     pgrx::Spi::connect(|client| {
         let rows = client.select(
-            "SELECT to_regprocedure('otlet.claim_jobs()') IS NOT NULL AND to_regprocedure('otlet.materialize_completed_semantic_job(bigint)') IS NOT NULL",
+            "SELECT to_regprocedure('otlet.claim_jobs()') IS NOT NULL AND to_regprocedure('otlet.materialize_completed_semantic_job(bigint)') IS NOT NULL AND to_regprocedure('otlet.complete_and_materialize_job(bigint,jsonb,text,jsonb,text,text,text,text,jsonb,text,text,text)') IS NOT NULL",
             Some(1),
             &[],
         )?;

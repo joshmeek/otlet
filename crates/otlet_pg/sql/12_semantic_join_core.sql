@@ -508,3 +508,86 @@ BEGIN
   RETURN total_refreshed;
 END;
 $$;
+
+CREATE FUNCTION otlet.complete_and_materialize_job(
+  job_id bigint,
+  output jsonb,
+  raw_output text,
+  actions jsonb,
+  prompt_hash text,
+  input_hash text,
+  output_schema_hash text,
+  raw_output_hash text,
+  trace_summary jsonb,
+  model_name text,
+  selection_role text,
+  selection_reason text
+) RETURNS TABLE (
+  output_id bigint,
+  semantic_materialized boolean,
+  completion_error text,
+  materialization_error text
+)
+LANGUAGE plpgsql
+AS $$
+BEGIN
+  BEGIN
+    SELECT completed.id
+    INTO output_id
+    FROM otlet.complete_job(
+      complete_and_materialize_job.job_id,
+      complete_and_materialize_job.output,
+      complete_and_materialize_job.raw_output,
+      complete_and_materialize_job.actions,
+      complete_and_materialize_job.prompt_hash,
+      complete_and_materialize_job.input_hash,
+      complete_and_materialize_job.output_schema_hash,
+      complete_and_materialize_job.raw_output_hash,
+      trace_summary => complete_and_materialize_job.trace_summary,
+      model_name => complete_and_materialize_job.model_name,
+      selection_role => complete_and_materialize_job.selection_role,
+      selection_reason => complete_and_materialize_job.selection_reason
+    )
+    AS completed
+    LIMIT 1;
+  EXCEPTION WHEN OTHERS THEN
+    completion_error := SQLERRM;
+    RETURN NEXT;
+    RETURN;
+  END;
+
+  IF output_id IS NULL THEN
+    RETURN NEXT;
+    RETURN;
+  END IF;
+
+  BEGIN
+    PERFORM otlet.materialize_completed_semantic_job(
+      complete_and_materialize_job.job_id
+    );
+    semantic_materialized := true;
+  EXCEPTION WHEN OTHERS THEN
+    materialization_error := SQLERRM;
+    BEGIN
+      PERFORM otlet.record_worker_event(
+        'semantic_materialization_failed',
+        j.id,
+        'linked_inproc',
+        'otlet semantic materialization failed',
+        jsonb_build_object(
+          'task_name', j.task_name,
+          'subject_id', j.subject_id,
+          'model_name', complete_and_materialize_job.model_name,
+          'error', materialization_error
+        )
+      )
+      FROM otlet.jobs j
+      WHERE j.id = complete_and_materialize_job.job_id;
+    EXCEPTION WHEN OTHERS THEN
+      NULL;
+    END;
+  END;
+
+  RETURN NEXT;
+END;
+$$;

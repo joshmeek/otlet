@@ -172,6 +172,14 @@ A real worker restart cleared the cache. The next identical request missed in `1
 
 Cache insertion remains after raw-envelope parsing, action parsing, and schema validation. Hits repeat those checks and require the full content, contract, runtime-output, and model identity before accepting cached bytes. Successful completion already writes the job, receipt, output, actions, runtime slot, and event in one SQL transition. Removing validation or merging fault-isolated metrics and materialization work would weaken the contract to optimize noise, so Otlet retains the existing path
 
+### Worker lifecycle transaction fusion
+
+An accepted attempt previously used three transactions after model execution: runtime metrics, job completion, and semantic materialization. Otlet now keeps best-effort metrics independent and runs completion plus materialization in one transaction. Materialization has its own guarded subtransaction, so its failure rolls back semantic writes without erasing the completed job, receipt, output, actions, runtime slot, or completion event
+
+Fifty qwen35 exact hits measured `4ms` requester p50 and `5ms` p95 before fusion, then `3ms` p50 and `4ms` p95 after fusion. Median worker time fell from `3ms` to `2ms`. The accepted-success boundary fell from three transactions to two without moving lease renewal, cancellation, failed-attempt, or metrics recovery boundaries
+
+Failure injection on semantic record insertion left the job complete with one receipt, one output, a `semantic_materialization_failed` event, one healthy worker, and a successful later materialization retry. Failure injection inside `complete_job` previously restarted the worker and left a running lease. The guarded path instead produced one terminal failed job, one failed receipt, zero outputs, one healthy worker, and no crash finding. The full demo and five-case qwen35 probe passed after the change
+
 Run the default-included benchmark model:
 
 ```sh
