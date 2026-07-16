@@ -9,6 +9,7 @@ use std::ptr;
 
 const CUSTOM_SCAN_NAME: &[u8] = b"Otlet Semantic Source CustomScan\0";
 const CUSTOM_PRIVATE_MARKER: &str = "__otlet_semantic_source_custom_scan_json_v1__";
+const CUSTOM_SCAN_REFRESH_BATCH_SIZE: usize = 64;
 macro_rules! explain_scan_counters {
     ($source:expr, $last_error:expr, $estimated_model_cost_ms:expr, $es:expr) => {{
         let source = $source;
@@ -37,6 +38,9 @@ macro_rules! explain_scan_counters {
         explain_counter("Actual Missing Subjects", source.missing_rows, $es);
         explain_counter("Actual In Flight Subjects", source.inflight_rows, $es);
         explain_counter("Queued Refreshes", source.queued_refreshes, $es);
+        explain_counter("Refresh Queue Skips", source.refresh_queue_skips, $es);
+        explain_counter("Refresh Queue Batches", source.refresh_queue_batches, $es);
+        explain_counter("Refresh Queue Errors", source.refresh_queue_errors, $es);
         explain_counter("Infer Now Batches", source.infer_now_batches, $es);
         explain_counter("Infer Now Elapsed Ms", source.infer_now_ms, $es);
         explain_counter("Infer Now Timeouts", source.infer_now_timeouts, $es);

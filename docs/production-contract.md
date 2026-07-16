@@ -86,7 +86,17 @@ preload_admission_contract=failed|model_load_admission_rejected|rejected|true|tr
 
 ## Step 3 - Inspect Production Policy
 
-The production policy row and status views expose SQL state under `otlet`: `production_policy_status`, `production_status`, `model_queue_status`, `worker_throughput_status`, and `cleanup_policy_state(true)`
+The production policy row and status views expose SQL state under `otlet`: `production_policy_status`, `production_status`, `model_queue_status`, `worker_throughput_status`, and `cleanup_policy_state(true)`. Cross-task batch entries expose every claimed task through `task_names`
+
+The resident worker can preload one registered local model and context at startup. The default is unset. Configure the model, then restart the Postgres worker process:
+
+```sql
+UPDATE otlet.production_policy
+SET preload_model_name = 'qwen35_4b'
+WHERE name = 'default';
+```
+
+Preload applies `default_runtime_options`, including `max_worker_rss_bytes`, and uses the normal artifact, fingerprint, memory, cgroup, and RSS admission checks. It creates no job or receipt. Inspect the ready slot in `otlet.runtime_status` and the latest `model_preload_succeeded` or `model_preload_failed` row in `otlet.worker_events`. Set `preload_model_name = NULL` and restart to restore the cold default
 
 Queue caps are admission-time controls. Rows enter `otlet.jobs` through `run_task`, watch refresh, semantic refresh, or `ask`; direct inserts are internal/testing-only and can bypass admission accounting. `verify_invariants()` returns one row per violation. The demo requires `SELECT count(*) FROM otlet.verify_invariants()` to return `0` (`invariant_contract=0`). The `queued_jobs_within_model_cap` check reports models whose queued depth exceeds `max_queued_jobs_per_model`
 

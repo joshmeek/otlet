@@ -86,6 +86,52 @@ The two-worker probes produced overlapping llama.cpp generation from separate Po
 
 ## Measured Runtime Decisions
 
+### Resident-model queue preference
+
+A bounded warm-model scheduler was rejected at commit `0f4081a6`. The candidate identified the resident model from the latest worker-lifetime `model_swap` event and allowed one warm-model claim before returning to strict task-cursor order. The existing retry rank, per-task FIFO order, active-job cap, lease handling, and `SKIP LOCKED` claim stayed in place
+
+The paired A/B workload alternated four tasks across qwen3_1_7b and qwen35_4b, queued two 64-token cache-disabled jobs per task, and claimed one job at a time. All 48 jobs across six runs completed with schema-valid output. Both variants used one resident worker and six decode and batch threads on the same 12-core ARM64 host. The model fingerprint hashes were `7a1b434a2888535d` and `e66bad85956d6d75`; the runtime fingerprint hashes were `ad374ff9a8f1a02c` and `e5797a21096dfddf`
+
+| pair | variant | model loads | load time | wall time | maximum queue wait |
+| ---: | --- | ---: | ---: | ---: | ---: |
+| 1 | task cursor | 6 | 35.940s | 66.059s | 64.631s |
+| 1 | warm preference | 5 | 44.690s | 105.258s | 88.564s |
+| 2 | task cursor | 6 | 41.677s | 80.385s | 78.841s |
+| 2 | warm preference | 5 | 27.506s | 48.115s | 40.468s |
+| 3 | task cursor | 6 | 34.155s | 62.892s | 61.235s |
+| 3 | warm preference | 5 | 34.583s | 86.740s | 75.488s |
+
+The candidate median reduced model loads from six to five and load time from 35.940s to 34.583s. Median wall time regressed from 66.059s to 86.740s, and median maximum queue wait regressed from 64.631s to 75.488s. The candidate also passed focused task-turn, continuous-arrival starvation, lease, cancellation, and concurrent-claim checks, but failed the wall-time and queue-wait retention gate. No scheduler code was retained
+
+### Same-model cross-task claims
+
+The task-cursor scheduler at `962dcc49` opened one claim per task even when several one-row tasks used the same model. A five-run model-free fixture compared 1, 4, and 16 direct qwen35 tasks with `worker_claim_batch_size = 8` on PostgreSQL 18.4. No model was loaded or executed
+
+| tasks | task-cursor claims | cross-task claims | task-cursor jobs/claim | cross-task jobs/claim | task-cursor drain | cross-task drain |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 1 | 1 | 1 | 1 | 0.370ms | 0.265ms |
+| 4 | 4 | 1 | 1 | 4 | 0.690ms | 0.435ms |
+| 16 | 16 | 2 | 1 | 8 | 3.264ms | 0.877ms |
+
+The retained claim fills each batch by task round, advances the cursor to the last claimed task, and groups only tasks with the same base model, artifact, and cheap/strong policy models. Two simultaneous claimers took eight unique jobs each from a 16-task queue. Expired running jobs, cancel-requested jobs, per-task FIFO order, model-policy separation, queue caps, and the full demo stayed valid. Batch events now include every claimed task in `task_names`
+
+### Bounded fallback window
+
+Increasing the claim batch from 8 to 16 was tested as the smallest way to coalesce adjacent cheap-to-strong work without adding another worker queue. The candidate used only the existing claim, lease, cancellation, and in-batch fallback paths
+
+A rotated three-pair workload queued 16 cache-disabled policy jobs. Every cheap attempt failed schema validation and every strong attempt completed with schema-valid output, forcing the maximum fallback load. Both variants used one resident worker and the same qwen3_1_7b and qwen35_4b runtime fingerprints
+
+| pair | claim batch | model loads | load time | wall time | maximum queue wait |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 8 | 4 | 24.937s | 61.425s | 33.538s |
+| 1 | 16 | 2 | 14.409s | 44.213s | 0.660s |
+| 2 | 8 | 4 | 39.388s | 79.972s | 38.623s |
+| 2 | 16 | 2 | 14.677s | 45.432s | 4.191s |
+| 3 | 16 | 2 | 27.397s | 81.591s | 4.005s |
+| 3 | 8 | 4 | 96.194s | 153.976s | 80.366s |
+
+The median moved from four to two loads, 39.388s to 14.677s of load time, and 79.972s to 45.432s wall time. The larger claim still failed the cancellation gate. In a 16-job direct workload, the last job stayed queued under batch 8 and canceled in 0.000s. Batch 16 claimed it immediately, so cancellation remained requested for 17.213s while the worker processed the preceding jobs. Otlet keeps the default at 8 and adds no cross-batch deferred state
+
 ### Single-context batching
 
 The current linked llama.cpp API can isolate multiple sequence IDs, KV positions, samplers, JSON stopping, and cancellation in one context. The smallest Otlet prototype still failed the combined throughput and memory gate:
@@ -117,6 +163,58 @@ Otlet keeps the process-local inference-output cache. The fresh demo produced 13
 One stable qwen35 row measured a `9.452s` enabled miss, a `0.503s` exact hit, a `3.189s` cache-disabled warm run, and a `15.310s` miss after restart. These four runs produced the same schema-valid raw-output and runtime-contract hashes. A second cold miss under one-client `SELECT 1` load completed while 444,899 database transactions ran with zero failures at `47us` p50 and `100us` p95
 
 No installed workload records eviction followed by a repeated-identity miss, and the 447-job full benchmark disables inference caching to measure live generation. A durable cache would persist exact raw envelopes despite the default hash-only evidence policy and duplicate trusted state already kept in outputs and semantic materializations. Otlet adds no disk cache
+
+### Cache-hit completion path
+
+The earlier `0.503s` exact-hit result included a 500 ms shell polling interval. Runtime-stage timing on commit `f57dea7d` found no corresponding completion cost. Ten direct qwen35 exact hits measured `3ms` requester p50 and `10.05ms` p95. Ten supported queued `run_task` hits measured `11.5ms` end-to-end p50 and `25.7ms` p95, including `5ms` median queue wait and `7.5ms` median worker time. Exact hits for row-watch and pair-watch tasks completed in `16ms` and `6ms`, including semantic materialization
+
+A real worker restart cleared the cache. The next identical request missed in `13.857s`, including `6.311s` model load, `262ms` context creation, `5.679s` prompt decode, and `1.474s` generation; the following exact hit took `8ms`. Disabling the cache kept the generation path and reported `disabled` instead of a hit
+
+Cache insertion remains after raw-envelope parsing, action parsing, and schema validation. Hits repeat those checks and require the full content, contract, runtime-output, and model identity before accepting cached bytes. Successful completion already writes the job, receipt, output, actions, runtime slot, and event in one SQL transition. Removing validation or merging fault-isolated metrics and materialization work would weaken the contract to optimize noise, so Otlet retains the existing path
+
+### Worker lifecycle transaction fusion
+
+An accepted attempt previously used three transactions after model execution: runtime metrics, job completion, and semantic materialization. Otlet now keeps best-effort metrics independent and runs completion plus materialization in one transaction. Materialization has its own guarded subtransaction, so its failure rolls back semantic writes without erasing the completed job, receipt, output, actions, runtime slot, or completion event
+
+Fifty qwen35 exact hits measured `4ms` requester p50 and `5ms` p95 before fusion, then `3ms` p50 and `4ms` p95 after fusion. Median worker time fell from `3ms` to `2ms`. The accepted-success boundary fell from three transactions to two without moving lease renewal, cancellation, failed-attempt, or metrics recovery boundaries
+
+Failure injection on semantic record insertion left the job complete with one receipt, one output, a `semantic_materialization_failed` event, one healthy worker, and a successful later materialization retry. Failure injection inside `complete_job` previously restarted the worker and left a running lease. The guarded path instead produced one terminal failed job, one failed receipt, zero outputs, one healthy worker, and no crash finding. The full demo and five-case qwen35 probe passed after the change
+
+### Optional startup model preload
+
+`production_policy.preload_model_name` optionally loads one registered local GGUF and its context when the resident worker starts. The default is `NULL`. Preload uses the same model construction, artifact fingerprint, runtime options, RSS budget, system-memory, cgroup, and llama.cpp projection checks as a request. It creates no job or receipt. Success populates `runtime_status` and emits `model_preload_succeeded`; failure emits `model_preload_failed` once for that worker start and leaves the worker available
+
+Three same-host qwen35 restart pairs measured cold first requests at `10.131s`, `10.434s`, and `9.799s`. Preloaded first requests took `5.041s`, `5.545s`, and `5.795s`. Median first-request latency fell from `10.131s` to `5.545s`, or 45.3 percent. The measured preload used `4.994s` model load and `106ms` context construction, held `5.772 GB` worker RSS instead of the `15 MB` cold worker, and removed model load and context time from the first receipt
+
+One-client read latency averaged `0.053ms` during preload with 225,800 transactions and zero failures, compared with `0.051ms` and zero failures while the worker stayed cold. Missing registration, invalid GGUF, unreadable GGUF, and a one-byte RSS budget each produced one failure event, one stable worker PID, and no retry loop. Keep the option unset unless predictable first-request latency is worth resident memory before demand
+
+### Cross-batch task-contract cache
+
+The resident worker keeps the 16 most recently used exact task contracts across claim batches. A hit reuses parsed runtime options, contract hashes, status JSON, rendered schema, and the static prompt prefix without retaining source input, shaped prompts, raw output, or evidence. Instruction, schema, runtime options, input shaping, decision contract, configured model, artifact path, or artifact hash changes force a miss. A worker restart clears the cache
+
+A release-mode fixture repeated a 100-field schema and 4,000-byte instruction 20,000 times. Clearing the task cache for each simulated one-job batch took `220.824ms`, or `11.041us` per preparation. The bounded cross-batch cache took `63.806ms`, or `3.190us` per preparation, a 71.1 percent reduction. Exact hits perform no new task-contract or prompt-prefix heap construction. The five-case qwen35 probe and full demo passed with prompt identity, contract invalidation, permissions, zero invariant findings, and a clean crash scan
+
+### Static prompt-prefix token reuse
+
+Saved prompt-prefix states already retain the exact prefix token vector. The linked runtime now reuses that vector after matching the resident model, exact prefix hash, and exact prefix bytes instead of tokenizing the static prefix again. It still tokenizes the full prompt and still checks that the cached prefix tokens are its exact leading token sequence before restoring state. Prefix tokens share the existing four-entry, 512 MiB prefix-state lifetime and byte accounting; there is no second token cache
+
+Back-to-back baseline and candidate runs used 30 cache-disabled qwen35 requests per shape. For a 307-token prompt with 298 reusable prefix tokens, tokenization moved from `5ms` p50 and `14.1ms` p95 to `4ms` and `13.1ms`. For a 707-token prompt with 698 reusable prefix tokens, it moved from `7ms` and `13.55ms` to `5ms` and `12.55ms`. All 60 candidate outputs passed schema validation with one prompt hash per shape. A qwen35-to-qwen3 swap saved a new one-entry prefix state with zero reused tokens, proving model changes cannot reuse the previous model's tokens. The five-case qwen35 probe and full demo passed with zero invariant or crash findings
+
+### Batched CustomScan refresh enqueue
+
+Queue-refresh CustomScan paths collect at most 64 unique unresolved subjects before one SPI call. The SQL boundary rejects larger arrays and sends each subject through the existing `run_task_subject` source query, input shaping, active-job conflict, model queue cap, suppression event, worker wakeup, and transaction contract. Synchronous wait and infer-now paths are unchanged
+
+Seven same-host model-free runs measured 1, 100, and 1,000 missing subjects with the worker paused and cache disabled. Every run queued the exact requested count
+
+| subjects | scalar p50 | batched p50 | scalar p95 | batched p95 | SPI calls |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | `1.248ms` | `1.146ms` | `10.385ms` | `10.180ms` | 1 to 1 |
+| 100 | `58.980ms` | `54.511ms` | `67.976ms` | `63.748ms` | 100 to 2 |
+| 1,000 | `2332.426ms` | `921.476ms` | `2644.688ms` | `1091.743ms` | 1,000 to 16 |
+
+The 1,000-row EXPLAIN execution fell from `2003.687ms` to `547.072ms`, while shared-buffer hits fell from 5,146,265 to 162,256. EXPLAIN now separates accepted refreshes, skipped subjects, batch calls, and failed subjects
+
+With a queue cap of one, the scan accepted one shaped MVCC-bound job and skipped the other 99 subjects. A second scan suppressed the active subject, rollback and statement cancellation left zero jobs, a forced short SQL result failed all 1,000 subjects closed, and the non-CustomScan `LIMIT 1` plan retained its scalar behavior. An explicit correlated LATERAL rescan crashed the backend at both baseline commit `521571f9` and the candidate, so this change does not claim to repair that existing CustomScan limitation. The full demo passed row and join CustomScan, infer-now, queue suppression, permissions, zero invariant findings, and its crash scan
 
 Run the default-included benchmark model:
 

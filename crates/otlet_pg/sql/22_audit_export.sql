@@ -95,8 +95,12 @@ SELECT
   s.generated_tokens,
   s.generate_ms,
   s.tokens_per_second,
+  s.runtime_prepare_ms,
+  s.model_load_ms,
+  s.model_context_ms,
   s.tokenize_ms,
   s.prompt_decode_ms,
+  s.postprocess_ms,
   s.first_token_ms,
   s.ttft_ms,
   s.finish_sql_ms,
@@ -244,6 +248,10 @@ SELECT
   e.id AS event_id,
   e.created_at,
   COALESCE(e.detail ->> 'task_name', '') AS task_name,
+  COALESCE(
+    e.detail -> 'task_names',
+    jsonb_build_array(COALESCE(e.detail ->> 'task_name', ''))
+  ) AS task_names,
   COALESCE(e.detail ->> 'model_name', '') AS model_name,
   COALESCE((e.detail ->> 'job_count')::bigint, 0) AS job_count,
   COALESCE((e.detail ->> 'completed_jobs')::bigint, 0) AS completed_jobs,

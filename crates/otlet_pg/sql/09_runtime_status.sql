@@ -92,7 +92,15 @@ SELECT
   COALESCE((infer.s ->> 'error_cap')::bigint, 0) AS infer_now_error_cap_bytes,
   length(COALESCE(infer.s ->> 'error', ''))::bigint AS infer_now_error_bytes,
   COALESCE((infer.s ->> 'max_wait_ms')::bigint, 0) AS infer_now_max_wait_ms,
-  COALESCE((infer.s ->> 'last_elapsed_ms')::bigint, 0) AS infer_now_last_elapsed_ms
+  COALESCE((infer.s ->> 'last_elapsed_ms')::bigint, 0) AS infer_now_last_elapsed_ms,
+  COALESCE((infer.s ->> 'last_start_latency_ms')::bigint, 0) AS infer_now_last_start_latency_ms,
+  COALESCE((infer.s ->> 'last_worker_run_ms')::bigint, 0) AS infer_now_last_worker_run_ms,
+  GREATEST(
+    COALESCE((infer.s ->> 'last_elapsed_ms')::bigint, 0)
+      - COALESCE((infer.s ->> 'last_start_latency_ms')::bigint, 0)
+      - COALESCE((infer.s ->> 'last_worker_run_ms')::bigint, 0),
+    0
+  ) AS infer_now_last_delivery_ms
 FROM otlet.models m
 LEFT JOIN otlet.runtime_slots s ON s.model_name = m.name
 LEFT JOIN infer_state infer ON true

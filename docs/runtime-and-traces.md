@@ -70,16 +70,26 @@ ORDER BY receipt_id DESC
 LIMIT 1;
 ```
 
-Warm-job timing splits `tokenize_ms`, `prompt_decode_ms`, `generate_ms`, `finish_sql_ms`, and `materialize_ms` when present:
+Receipt timing splits runtime preparation, model load, context creation, tokenization, prompt decode, generation, validation and post-processing, finish SQL, and semantic materialization. `otlet.runtime_stage_timing_status` aggregates every attempt for a job and leaves unmeasured worker work in `worker_overhead_ms`:
 
 ```sql
-SELECT 'timing_split_contract=' ||
-       count(*) FILTER (WHERE finish_sql_ms IS NOT NULL)::text || '|' ||
-       count(*) FILTER (WHERE materialize_ms IS NOT NULL)::text
-FROM otlet.inference_trace_summary
+SELECT subject_id,
+       model_attempts,
+       queue_wait_ms,
+       runtime_prepare_ms,
+       model_load_ms + model_context_ms + tokenize_ms
+         + prompt_decode_ms + generate_ms AS model_ms,
+       postprocess_ms,
+       finish_sql_ms,
+       materialize_ms,
+       worker_overhead_ms,
+       observed_end_to_end_ms
+FROM otlet.runtime_stage_timing_status
 WHERE task_name = 'entity_resolution_demo'
-  AND status = 'complete';
+ORDER BY subject_id;
 ```
+
+`reconciliation_delta_ms` is observed worker time minus the recorded stages. A positive value is worker and transaction overhead. `timing_overrun_ms` exposes timer rounding or a broken timing boundary instead of hiding it
 
 Otlet stores receipts when jobs fail because failures produce evidence too
 
@@ -103,6 +113,8 @@ runtime_residency_contract=ready|ready|resident_worker_loaded_model_context|true
 ```
 
 The worker keeps the local model/context warm across jobs. SQL can see the slot state, memory sample, context window, cache entries, cache bounds, last cache reason, and latest detailed runtime fingerprint
+
+`otlet.runtime_status` also reports the latest infer-now request split as start latency, worker time, and requester delivery time through `infer_now_last_start_latency_ms`, `infer_now_last_worker_run_ms`, and `infer_now_last_delivery_ms`
 
 The full fingerprint describes the artifact, linked build, effective generation settings, CPU placement, and host capacity. The prompt-template hash covers the exact reasoning prefix and static prompt body. Its output-contract hash omits observational host fields and joins content, task contract, and model identity in the inference-cache key:
 

@@ -1,15 +1,69 @@
-fn run_linked(
-    job: &Job,
+pub(crate) struct ModelPreload {
+    pub(crate) artifact_path: String,
+    pub(crate) model_fingerprint_hash: String,
+    pub(crate) load_ms: i64,
+    pub(crate) ctx_ms: i64,
+    pub(crate) model_memory_bytes: i64,
+    pub(crate) model_parameters: i64,
+    pub(crate) context_window_tokens: i64,
+    pub(crate) model_device_policy: &'static str,
+    pub(crate) memory_accounting_policy: &'static str,
+    pub(crate) worker_process_rss_bytes: i64,
+    pub(crate) worker_process_virtual_bytes: i64,
+    pub(crate) worker_memory_sample_policy: &'static str,
+    pub(crate) memory_trace: Value,
+}
+
+pub(crate) fn preload_model(
+    model: &JobModel,
+    runtime_options: &Value,
+) -> Result<ModelPreload, ModelError> {
+    let options = parse_runtime_options(runtime_options).map_err(ModelError::new)?;
+    let model = JobModelRef {
+        name: model.name.as_str(),
+        artifact_path: model.artifact_path.as_str(),
+        artifact_hash: model.artifact_hash.as_deref(),
+    };
+    let model_fingerprint_hash = model_fingerprint_hash(model);
+    let cache = LINKED_CACHE.get_or_init(|| Mutex::new(None));
+    let mut cache = cache
+        .lock()
+        .map_err(|_| ModelError::new("linked llama.cpp cache lock poisoned"))?;
+    let load = ensure_linked_model(&mut cache, model, &options, &model_fingerprint_hash)?;
+    let loaded = cache
+        .as_ref()
+        .ok_or_else(|| ModelError::new("linked llama.cpp cache did not initialize"))?;
+    let memory_after = process_memory_sample();
+    Ok(ModelPreload {
+        artifact_path: loaded.artifact_path.clone(),
+        model_fingerprint_hash: model_fingerprint_hash.to_string(),
+        load_ms: if load.cache_hit { 0 } else { loaded.load_ms },
+        ctx_ms: if load.cache_hit { 0 } else { loaded.ctx_ms },
+        model_memory_bytes: loaded.model_memory_bytes,
+        model_parameters: loaded.model_parameters,
+        context_window_tokens: loaded.context_window_tokens,
+        model_device_policy: loaded.model_device_policy,
+        memory_accounting_policy: loaded.memory_accounting_policy,
+        worker_process_rss_bytes: memory_after.rss_bytes,
+        worker_process_virtual_bytes: memory_after.virtual_bytes,
+        worker_memory_sample_policy: memory_after.policy,
+        memory_trace: build_memory_trace(
+            &load.memory_before,
+            &memory_after,
+            &load.memory_admission,
+            options.max_worker_rss_bytes,
+        ),
+    })
+}
+
+fn ensure_linked_model(
+    cache: &mut Option<LinkedCache>,
     job_model: JobModelRef<'_>,
-    prompt: &str,
-    prompt_prefix: &str,
     options: &crate::runtime::RuntimeOptions,
     model_fingerprint_hash: &str,
-) -> Result<LinkedRun, ModelError> {
+) -> Result<LinkedLoadEvidence, ModelError> {
     use std::ffi::CString;
 
-    let attempt_start = Instant::now();
-    let attempt_deadline = linked_attempt_deadline(attempt_start, job.max_attempt_ms);
     if job_model.artifact_path.starts_with("hf:") {
         return Err(ModelError::new("linked llama.cpp runtime requires a local GGUF artifact path"));
     }
@@ -17,10 +71,6 @@ fn run_linked(
         llama_cpp_sys_4::llama_backend_init();
     });
 
-    let cache = LINKED_CACHE.get_or_init(|| Mutex::new(None));
-    let mut cache = cache
-        .lock()
-        .map_err(|_| ModelError::new("linked llama.cpp cache lock poisoned"))?;
     let cache_hit = cache.as_ref().is_some_and(|cached| {
         cached.artifact_path == job_model.artifact_path
             && cached.model_fingerprint_hash.as_ref() == model_fingerprint_hash
@@ -128,6 +178,32 @@ fn run_linked(
         });
     }
 
+    Ok(LinkedLoadEvidence {
+        cache_hit,
+        memory_before,
+        memory_admission,
+    })
+}
+
+fn run_linked(
+    job: &Job,
+    job_model: JobModelRef<'_>,
+    prompt: &str,
+    prompt_prefix: &str,
+    options: &crate::runtime::RuntimeOptions,
+    model_fingerprint_hash: &str,
+) -> Result<LinkedRun, ModelError> {
+    let attempt_start = Instant::now();
+    let attempt_deadline = linked_attempt_deadline(attempt_start, job.max_attempt_ms);
+    let cache = LINKED_CACHE.get_or_init(|| Mutex::new(None));
+    let mut cache = cache
+        .lock()
+        .map_err(|_| ModelError::new("linked llama.cpp cache lock poisoned"))?;
+    let load = ensure_linked_model(&mut cache, job_model, options, model_fingerprint_hash)?;
+    let cache_hit = load.cache_hit;
+    let memory_before = load.memory_before;
+    let memory_admission = load.memory_admission;
+
     let cache = cache
         .as_mut()
         .ok_or_else(|| ModelError::new("linked llama.cpp cache did not initialize"))?;
@@ -138,11 +214,21 @@ fn run_linked(
     }
     let tokenize_start = Instant::now();
     let tokens = tokenize_linked(cache.vocab, prompt)?;
-    // Skip prefix tokenization when the string cannot be a prefix of the prompt.
-    let prompt_prefix_tokens = if !prompt_prefix.is_empty() && prompt.starts_with(prompt_prefix) {
-        tokenize_linked(cache.vocab, prompt_prefix)?
+    let prompt_prefix_hash = if !prompt_prefix.is_empty() && prompt.starts_with(prompt_prefix) {
+        Some(hash_text(prompt_prefix))
     } else {
-        Vec::new()
+        None
+    };
+    let prompt_prefix_tokens = if let Some(hash) = prompt_prefix_hash.as_deref() {
+        if let Some(tokens) =
+            linked_cached_prompt_prefix_tokens(&mut cache.prompt_prefix_states, hash, prompt_prefix)
+        {
+            tokens
+        } else {
+            Arc::from(tokenize_linked(cache.vocab, prompt_prefix)?)
+        }
+    } else {
+        Arc::from(Vec::new())
     };
     let tokenize_ms = elapsed_ms(tokenize_start);
     if tokens.is_empty() {
@@ -196,9 +282,11 @@ fn run_linked(
     let mut prompt_prefix_state_bytes = 0_i64;
     let prefix_reusable = linked_prompt_prefix_reusable(&tokens, &prompt_prefix_tokens);
     if prefix_reusable {
-        let prompt_prefix_hash = hash_text(prompt_prefix);
+        let prompt_prefix_hash = prompt_prefix_hash
+            .as_deref()
+            .expect("reusable prompt prefix has a hash");
         if let Some(state_bytes) =
-            linked_restore_prompt_prefix_state(cache, &prompt_prefix_hash, &prompt_prefix_tokens)
+            linked_restore_prompt_prefix_state(cache, prompt_prefix_hash, &prompt_prefix_tokens)
         {
             prompt_reused_tokens = prompt_prefix_tokens.len();
             prompt_decoded_tokens = tokens.len().saturating_sub(prompt_reused_tokens);
@@ -229,8 +317,12 @@ fn run_linked(
                 &mut cancel_probe,
                 false,
             )?;
-            let saved_prefix =
-                linked_save_prompt_prefix_state(cache, &prompt_prefix_hash, &prompt_prefix_tokens);
+            let saved_prefix = linked_save_prompt_prefix_state(
+                cache,
+                prompt_prefix_hash,
+                prompt_prefix,
+                Arc::clone(&prompt_prefix_tokens),
+            );
             prompt_reuse_strategy = saved_prefix.strategy;
             prompt_prefix_state_bytes = usize_to_i64_saturating(saved_prefix.state_bytes);
             linked_decode_prompt_tokens(
@@ -414,15 +506,19 @@ fn run_linked(
             prompt_reuse_strategy,
             prompt_prefix_state_bytes,
             prompt_prefix_cache_entries: usize_to_i64_saturating(cache.prompt_prefix_states.len()),
-            prompt_prefix_cache_bytes: usize_to_i64_saturating(linked_prompt_prefix_cache_bytes(cache)),
+            prompt_prefix_cache_bytes: usize_to_i64_saturating(
+                linked_prompt_prefix_cache_bytes(&cache.prompt_prefix_states),
+            ),
             effective_llama_threads: i64::from(decode_threads),
             effective_llama_batch_threads: i64::from(batch_threads),
             generated_tokens,
+            runtime_prepare_ms: 0,
             tokenize_ms,
             prompt_decode_ms,
             first_token_ms,
             ttft_ms,
             generate_ms,
+            postprocess_ms: 0,
             cache_hit,
             inference_cache_hit: false,
             inference_cache_entries: 0,
@@ -779,6 +875,22 @@ fn linked_prompt_prefix_reusable(
     !prefix_tokens.is_empty() && prefix_tokens.len() < tokens.len() && tokens.starts_with(prefix_tokens)
 }
 
+fn linked_cached_prompt_prefix_tokens(
+    states: &mut Vec<PromptPrefixState>,
+    prompt_prefix_hash: &str,
+    prompt_prefix: &str,
+) -> Option<Arc<[llama_cpp_sys_4::llama_token]>> {
+    let index = states.iter().position(|entry| {
+        entry.hash == prompt_prefix_hash && entry.prefix.as_ref() == prompt_prefix
+    })?;
+    let tokens = Arc::clone(&states[index].tokens);
+    if index != 0 {
+        let entry = states.remove(index);
+        states.insert(0, entry);
+    }
+    Some(tokens)
+}
+
 fn linked_restore_prompt_prefix_state(
     cache: &mut LinkedCache,
     prompt_prefix_hash: &str,
@@ -789,7 +901,7 @@ fn linked_restore_prompt_prefix_state(
         .iter()
         .position(|entry| {
             entry.hash == prompt_prefix_hash
-                && entry.tokens == prompt_prefix_tokens
+                && entry.tokens.as_ref() == prompt_prefix_tokens
                 && !entry.state.is_empty()
         })?;
 
@@ -828,7 +940,8 @@ struct SavedPromptPrefix {
 fn linked_save_prompt_prefix_state(
     cache: &mut LinkedCache,
     prompt_prefix_hash: &str,
-    prompt_prefix_tokens: &[llama_cpp_sys_4::llama_token],
+    prompt_prefix: &str,
+    prompt_prefix_tokens: Arc<[llama_cpp_sys_4::llama_token]>,
 ) -> SavedPromptPrefix {
     let state_size =
         unsafe { llama_cpp_sys_4::llama_state_seq_get_size(cache.context.ptr, 0) };
@@ -869,11 +982,12 @@ fn linked_save_prompt_prefix_state(
         0,
         PromptPrefixState {
             hash: prompt_prefix_hash.to_owned(),
-            tokens: prompt_prefix_tokens.to_vec(),
+            prefix: Arc::from(prompt_prefix),
+            tokens: prompt_prefix_tokens,
             state,
         },
     );
-    linked_evict_prompt_prefix_states(cache);
+    linked_evict_prompt_prefix_states(&mut cache.prompt_prefix_states);
     SavedPromptPrefix {
         strategy: "prefix_state_saved",
         state_bytes: state_size,
@@ -886,21 +1000,27 @@ fn linked_remove_prompt_prefix_state(cache: &mut LinkedCache, prompt_prefix_hash
         .retain(|entry| entry.hash != prompt_prefix_hash);
 }
 
-fn linked_evict_prompt_prefix_states(cache: &mut LinkedCache) {
-    while cache.prompt_prefix_states.len() > LINKED_PROMPT_PREFIX_STATE_MAX_ENTRIES
-        || linked_prompt_prefix_cache_bytes(cache) > LINKED_PROMPT_PREFIX_STATE_MAX_BYTES
+fn linked_evict_prompt_prefix_states(states: &mut Vec<PromptPrefixState>) {
+    while states.len() > LINKED_PROMPT_PREFIX_STATE_MAX_ENTRIES
+        || linked_prompt_prefix_cache_bytes(states) > LINKED_PROMPT_PREFIX_STATE_MAX_BYTES
     {
-        if cache.prompt_prefix_states.pop().is_none() {
+        if states.pop().is_none() {
             break;
         }
     }
 }
 
-fn linked_prompt_prefix_cache_bytes(cache: &LinkedCache) -> usize {
-    cache
-        .prompt_prefix_states
+fn linked_prompt_prefix_cache_bytes(states: &[PromptPrefixState]) -> usize {
+    states
         .iter()
-        .map(|entry| entry.state.len())
+        .map(|entry| {
+            entry
+                .tokens
+                .len()
+                .saturating_mul(std::mem::size_of::<llama_cpp_sys_4::llama_token>())
+                .saturating_add(entry.prefix.len())
+                .saturating_add(entry.state.len())
+        })
         .sum()
 }
 
@@ -991,6 +1111,12 @@ struct LinkedRun {
     metrics: ModelMetrics,
 }
 
+struct LinkedLoadEvidence {
+    cache_hit: bool,
+    memory_before: ProcessMemorySample,
+    memory_admission: ModelLoadAdmission,
+}
+
 struct LinkedCache {
     artifact_path: String,
     model_fingerprint_hash: Arc<str>,
@@ -1016,7 +1142,8 @@ unsafe impl Send for LinkedCache {}
 
 struct PromptPrefixState {
     hash: String,
-    tokens: Vec<llama_cpp_sys_4::llama_token>,
+    prefix: Arc<str>,
+    tokens: Arc<[llama_cpp_sys_4::llama_token]>,
     state: Vec<u8>,
 }
 
@@ -1372,10 +1499,68 @@ impl JsonCompletion {
 #[cfg(test)]
 mod tests {
     use super::{
-        CancelProbe, JsonCompletion, linked_attempt_deadline, linked_attempt_timed_out,
-        trim_model_output,
+        CancelProbe, JsonCompletion, PromptPrefixState, linked_attempt_deadline,
+        linked_attempt_timed_out, linked_cached_prompt_prefix_tokens,
+        linked_evict_prompt_prefix_states, linked_prompt_prefix_cache_bytes, trim_model_output,
     };
+    use crate::model::LINKED_PROMPT_PREFIX_STATE_MAX_ENTRIES;
+    use std::mem::size_of;
+    use std::sync::Arc;
     use std::time::{Duration, Instant};
+
+    fn prompt_prefix_state(hash: &str, prefix: &str, tokens: &[i32]) -> PromptPrefixState {
+        PromptPrefixState {
+            hash: hash.to_owned(),
+            prefix: Arc::from(prefix),
+            tokens: Arc::from(tokens),
+            state: vec![0],
+        }
+    }
+
+    #[test]
+    fn prompt_prefix_token_cache_requires_exact_prefix_and_preserves_tokens() {
+        let expected = Arc::<[i32]>::from([1, 2, 3]);
+        let mut states = vec![
+            prompt_prefix_state("other", "other prefix", &[9]),
+            PromptPrefixState {
+                hash: "wanted".to_owned(),
+                prefix: Arc::from("exact prefix"),
+                tokens: Arc::clone(&expected),
+                state: vec![0],
+            },
+        ];
+
+        let hit = linked_cached_prompt_prefix_tokens(&mut states, "wanted", "exact prefix")
+            .expect("exact prefix should hit");
+        assert!(Arc::ptr_eq(&hit, &expected));
+        assert_eq!(hit.as_ref(), [1, 2, 3]);
+        assert_eq!(states[0].prefix.as_ref(), "exact prefix");
+        assert!(linked_cached_prompt_prefix_tokens(&mut states, "wanted", "collision").is_none());
+        assert!(linked_cached_prompt_prefix_tokens(&mut states, "changed", "exact prefix").is_none());
+    }
+
+    #[test]
+    fn prompt_prefix_token_cache_uses_existing_entry_and_byte_bounds() {
+        let mut states = (0..=LINKED_PROMPT_PREFIX_STATE_MAX_ENTRIES)
+            .map(|index| {
+                prompt_prefix_state(
+                    &format!("hash_{index}"),
+                    &format!("prefix_{index}"),
+                    &[index as i32],
+                )
+            })
+            .collect::<Vec<_>>();
+        let expected_bytes: usize = states
+            .iter()
+            .map(|entry| entry.prefix.len() + entry.tokens.len() * size_of::<i32>() + 1)
+            .sum();
+        assert_eq!(linked_prompt_prefix_cache_bytes(&states), expected_bytes);
+
+        linked_evict_prompt_prefix_states(&mut states);
+        assert_eq!(states.len(), LINKED_PROMPT_PREFIX_STATE_MAX_ENTRIES);
+        assert_eq!(states[0].hash, "hash_0");
+        assert_eq!(states.last().unwrap().hash, "hash_3");
+    }
 
     #[test]
     fn json_completion_accepts_utf8_split_across_pieces() {

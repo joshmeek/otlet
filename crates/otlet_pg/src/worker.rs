@@ -2,7 +2,7 @@ use crate::job::{
     Job, ModelSelectionPolicy, claim_jobs, insert_infer_now_job, model_selection_policy,
 };
 use crate::model::{
-    ModelError, ModelMetrics, ModelRun, clear_task_contract_digests, run_job, run_job_with_model,
+    ModelError, ModelMetrics, ModelPreload, ModelRun, preload_model, run_job, run_job_with_model,
 };
 use pgrx::JsonB;
 use pgrx::bgworkers::{BackgroundWorker, SignalWakeFlags};
@@ -37,6 +37,7 @@ pub extern "C-unwind" fn otlet_worker_main(_arg: pgrx::pg_sys::Datum) {
         .checked_sub(SCHEMA_READY_PROBE_INTERVAL)
         .unwrap_or_else(Instant::now);
     let mut schema_probe_due = true;
+    let mut preload_checked = false;
 
     while BackgroundWorker::wait_latch(Some(recovery_interval)) {
         if schema_probe_due || last_schema_probe.elapsed() >= SCHEMA_READY_PROBE_INTERVAL {
@@ -54,6 +55,15 @@ pub extern "C-unwind" fn otlet_worker_main(_arg: pgrx::pg_sys::Datum) {
                 continue;
             }
             schema_probe_due = false;
+        }
+
+        if !preload_checked {
+            preload_checked = true;
+            match BackgroundWorker::transaction(startup_preload_config) {
+                Ok(Some(config)) => run_startup_preload(config),
+                Ok(None) => {}
+                Err(err) => pgrx::warning!("otlet model preload lookup failed: {err}"),
+            }
         }
 
         while let Some(request) = crate::infer_now::take_request() {
@@ -87,24 +97,29 @@ pub extern "C-unwind" fn otlet_worker_main(_arg: pgrx::pg_sys::Datum) {
                 }
             };
 
-            let batch_meta = jobs.first().filter(|_| jobs.len() > 1).map(|job| {
+            let batch_owned = jobs.first().filter(|_| jobs.len() > 1).map(|job| {
+                let mut task_names = jobs
+                    .iter()
+                    .map(|job| job.task_name.clone())
+                    .collect::<Vec<_>>();
+                task_names.sort_unstable();
+                task_names.dedup();
                 (
-                    job.task_name.as_str(),
-                    job.model_name.as_str(),
+                    job.task_name.clone(),
+                    task_names,
+                    job.model_name.clone(),
                     i64::try_from(jobs.len()).unwrap_or(i64::MAX),
                 )
             });
-            // Capture owned names before moving jobs into process_job_batch.
-            let batch_owned =
-                batch_meta.map(|(task, model, count)| (task.to_owned(), model.to_owned(), count));
 
             let batch_start = Instant::now();
             let batch_result = process_job_batch(jobs);
             let batch_ms = millis_since(batch_start);
 
-            if let Some((task_name, model_name, job_count)) = batch_owned {
+            if let Some((task_name, task_names, model_name, job_count)) = batch_owned {
                 record_worker_batch_finished(
                     &task_name,
+                    &task_names,
                     &model_name,
                     job_count,
                     batch_result.completed,
@@ -129,6 +144,132 @@ pub extern "C-unwind" fn otlet_worker_main(_arg: pgrx::pg_sys::Datum) {
 
     crate::wake::unregister_worker_latch();
     pgrx::log!("otlet worker stopped");
+}
+
+struct StartupPreload {
+    model_name: String,
+    model: Option<crate::job::JobModel>,
+    runtime_options: Value,
+}
+
+fn startup_preload_config() -> pgrx::spi::Result<Option<StartupPreload>> {
+    pgrx::Spi::connect(|client| {
+        let rows = client.select(
+            "SELECT p.preload_model_name, m.artifact_path, m.artifact_hash, p.default_runtime_options FROM otlet.production_policy p LEFT JOIN otlet.models m ON m.name = p.preload_model_name WHERE p.name = 'default' AND p.preload_model_name IS NOT NULL LIMIT 1",
+            Some(1),
+            &[],
+        )?;
+        if rows.is_empty() {
+            return Ok(None);
+        }
+        let row = rows.first();
+        let model_name = row
+            .get::<String>(1)?
+            .ok_or(pgrx::spi::SpiError::InvalidPosition)?;
+        let artifact_path = row.get::<String>(2)?;
+        let artifact_hash = row.get::<String>(3)?;
+        Ok(Some(StartupPreload {
+            model: artifact_path.map(|artifact_path| crate::job::JobModel {
+                name: model_name.clone(),
+                artifact_path,
+                artifact_hash,
+            }),
+            model_name,
+            runtime_options: row
+                .get::<JsonB>(4)?
+                .ok_or(pgrx::spi::SpiError::InvalidPosition)?
+                .0,
+        }))
+    })
+}
+
+fn run_startup_preload(config: StartupPreload) {
+    let result = config
+        .model
+        .as_ref()
+        .ok_or_else(|| ModelError::new("preload model is not registered"))
+        .and_then(|model| preload_model(model, &config.runtime_options));
+    match result {
+        Ok(preload) => record_model_preload_success(&config.model_name, &preload),
+        Err(err) => record_model_preload_failure(&config.model_name, &err),
+    }
+}
+
+fn record_model_preload_success(model_name: &str, preload: &ModelPreload) {
+    let result: pgrx::spi::Result<()> = BackgroundWorker::transaction(|| {
+        pgrx::Spi::connect_mut(|client| {
+            let args = [
+                model_name.into(),
+                preload.artifact_path.as_str().into(),
+                preload.load_ms.into(),
+                preload.ctx_ms.into(),
+                preload.model_memory_bytes.into(),
+                preload.model_parameters.into(),
+                preload.context_window_tokens.into(),
+                preload.model_device_policy.into(),
+                preload.memory_accounting_policy.into(),
+                preload.worker_process_rss_bytes.into(),
+                preload.worker_process_virtual_bytes.into(),
+                preload.worker_memory_sample_policy.into(),
+                preload.model_fingerprint_hash.as_str().into(),
+                JsonB(preload.memory_trace.clone()).into(),
+            ];
+            client.update(
+                "SELECT otlet.touch_runtime_slot($1, 'ready', 0, NULL)",
+                Some(1),
+                &args[..1],
+            )?;
+            client.update(
+                "UPDATE otlet.runtime_slots SET artifact_path=$2, status='ready', active_jobs=0, loaded_at=now(), last_used_at=now(), last_error=NULL, load_ms=$3, ctx_ms=$4, model_memory_bytes=$5, model_parameters=$6, context_window_tokens=$7, model_device_policy=$8, resident_memory_tracked_bytes=GREATEST($5,0), memory_accounting_policy=$9, worker_process_rss_bytes=$10, worker_process_virtual_bytes=$11, worker_memory_sample_policy=$12 WHERE model_name=$1",
+                Some(1),
+                &args[..12],
+            )?;
+            client.update(
+                "SELECT otlet.record_worker_event('model_preload_succeeded', NULL, 'linked_inproc', 'model preload succeeded', jsonb_build_object('model_name',$1,'artifact_path',$2,'load_ms',$3,'ctx_ms',$4,'model_memory_bytes',$5,'worker_process_rss_bytes',$10,'model_fingerprint_hash',$13,'memory',$14))",
+                Some(1),
+                &args,
+            )?;
+            Ok(())
+        })
+    });
+    if let Err(err) = result {
+        pgrx::warning!("otlet model preload status failed: {err}");
+    }
+}
+
+fn record_model_preload_failure(model_name: &str, error: &ModelError) {
+    let result: pgrx::spi::Result<()> = BackgroundWorker::transaction(|| {
+        pgrx::Spi::connect_mut(|client| {
+            let trace = error
+                .trace_summary
+                .clone()
+                .unwrap_or_else(|| serde_json::json!({}));
+            let args = [
+                model_name.into(),
+                error.message.as_str().into(),
+                JsonB(trace).into(),
+            ];
+            client.update(
+                "SELECT otlet.touch_runtime_slot(m.name, 'error', 0, $2) FROM otlet.models m WHERE m.name=$1",
+                Some(1),
+                &args[..2],
+            )?;
+            client.update(
+                "SELECT otlet.record_worker_event('model_preload_failed', NULL, 'linked_inproc', 'model preload failed', jsonb_build_object('model_name',$1,'error',$2,'trace',$3))",
+                Some(1),
+                &args,
+            )?;
+            Ok(())
+        })
+    });
+    if let Err(err) = result {
+        pgrx::warning!("otlet model preload failure status failed: {err}");
+    }
+    pgrx::warning!(
+        "otlet model preload failed for {}: {}",
+        model_name,
+        error.message
+    );
 }
 
 fn process_infer_now_request(request: crate::infer_now::InferNowRequest) {
@@ -369,7 +510,6 @@ impl BatchProcessResult {
 fn process_job_batch(jobs: Vec<Job>) -> BatchProcessResult {
     // One transaction for the whole claim batch: mark_job_started is warn-only
     // and must stay outside the policy-lookup txn (SPI errors abort that txn).
-    clear_task_contract_digests();
     mark_jobs_started(&jobs);
     let mut batch = BatchProcessResult::default();
     let mut policy_cache = ModelSelectionPolicyCache::default();
@@ -421,7 +561,6 @@ fn process_job_batch(jobs: Vec<Job>) -> BatchProcessResult {
 }
 
 fn process_job(job: Job) -> JobProcessResult {
-    clear_task_contract_digests();
     let mut policy_cache = ModelSelectionPolicyCache::default();
     let mut result = process_job_deferred(&job, &mut policy_cache, false);
     if let Some(reason) = result.strong_fallback.take() {
@@ -841,7 +980,6 @@ fn accept_attempt_with_model(
     selection_reason: &str,
 ) -> (bool, bool) {
     // Keep telemetry separate so a metric error cannot roll back completion
-    // Materialization also stays separate from the accepted job transaction
     // Returns (completed, semantic_materialized).
     let metrics = run.metrics.as_ref();
     if let Some(metrics) = metrics {
@@ -870,42 +1008,65 @@ fn accept_attempt_with_model(
             );
         }
     }
-    let result: pgrx::spi::Result<bool> = BackgroundWorker::transaction(|| {
-        pgrx::Spi::connect_mut(|client| {
-            let args = [
-                job.id.into(),
-                JsonB(run.output).into(),
-                run.raw_output.as_str().into(),
-                JsonB(run.actions).into(),
-                run.prompt_hash.as_str().into(),
-                run.input_hash.as_str().into(),
-                run.output_schema_hash.as_str().into(),
-                run.raw_output_hash.as_str().into(),
-                JsonB(run.trace_summary).into(),
-                model_name.into(),
-                selection_role.into(),
-                selection_reason.into(),
-            ];
-            let rows = client.select(
-                "SELECT id FROM otlet.complete_job($1, $2, $3, $4, $5, $6, $7, $8, trace_summary => $9, model_name => $10, selection_role => $11, selection_reason => $12) LIMIT 1",
+    let result: pgrx::spi::Result<(bool, bool, Option<String>, Option<String>)> =
+        BackgroundWorker::transaction(|| {
+            pgrx::Spi::connect_mut(|client| {
+                let args = [
+                    job.id.into(),
+                    JsonB(run.output).into(),
+                    run.raw_output.as_str().into(),
+                    JsonB(run.actions).into(),
+                    run.prompt_hash.as_str().into(),
+                    run.input_hash.as_str().into(),
+                    run.output_schema_hash.as_str().into(),
+                    run.raw_output_hash.as_str().into(),
+                    JsonB(run.trace_summary).into(),
+                    model_name.into(),
+                    selection_role.into(),
+                    selection_reason.into(),
+                ];
+                let rows = client.select(
+                "SELECT output_id, semantic_materialized, completion_error, materialization_error FROM otlet.complete_and_materialize_job($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) LIMIT 1",
                 Some(1),
                 &args,
             )?;
-            if rows.first().get::<i64>(1)?.is_none() {
-                return Ok(false);
-            }
-            Ok(true)
-        })
-    });
+                let row = rows.first();
+                Ok((
+                    row.get::<i64>(1)?.is_some(),
+                    row.get::<bool>(2)?.unwrap_or(false),
+                    row.get::<String>(3)?,
+                    row.get::<String>(4)?,
+                ))
+            })
+        });
 
     match result {
-        Ok(true) => {
-            let semantic_materialized =
-                materialize_completed_semantic_job_with_model(job, model_name);
+        Ok((true, semantic_materialized, _, materialization_error)) => {
+            if let Some(error) = &materialization_error {
+                pgrx::warning!(
+                    "otlet semantic materialization failed for job {}: {}",
+                    job.id,
+                    error
+                );
+            }
             pgrx::log!("otlet worker completed job {}", job.id);
             (true, semantic_materialized)
         }
-        Ok(false) => {
+        Ok((false, _, Some(error), _)) => {
+            pgrx::warning!("otlet worker complete failed: {error}");
+            let model_err = ModelError::new(format!("complete_job failed: {error}"));
+            (
+                fail_attempt_with_model(
+                    job,
+                    model_name,
+                    &model_err,
+                    selection_role,
+                    "complete_job_spi_failed",
+                ),
+                false,
+            )
+        }
+        Ok((false, _, None, _)) => {
             pgrx::warning!(
                 "otlet worker complete produced no output row for job {}",
                 job.id
@@ -1299,6 +1460,7 @@ fn record_metrics(job: &Job, model_name: &str, metrics: &ModelMetrics) {
 
 fn record_worker_batch_finished(
     task_name: &str,
+    task_names: &[String],
     model_name: &str,
     job_count: i64,
     completed: i64,
@@ -1312,6 +1474,10 @@ fn record_worker_batch_finished(
                 Option::<i64>::None.into(),
                 "linked_inproc".into(),
                 task_name.into(),
+                JsonB(Value::Array(
+                    task_names.iter().cloned().map(Value::String).collect(),
+                ))
+                .into(),
                 model_name.into(),
                 job_count.into(),
                 completed.into(),
@@ -1320,7 +1486,7 @@ fn record_worker_batch_finished(
                 model_swaps.into(),
             ];
             client.update(
-                "SELECT otlet.record_worker_event('worker_batch_finished', $1, $2, 'worker_batch_finished', jsonb_build_object('task_name', $3, 'model_name', $4, 'job_count', $5, 'completed_jobs', $6, 'failed_jobs', $7, 'batch_ms', $8, 'model_swaps', $9))",
+                "SELECT otlet.record_worker_event('worker_batch_finished', $1, $2, 'worker_batch_finished', jsonb_build_object('task_name', $3, 'task_names', $4, 'model_name', $5, 'job_count', $6, 'completed_jobs', $7, 'failed_jobs', $8, 'batch_ms', $9, 'model_swaps', $10))",
                 Some(1),
                 &args,
             )?;
@@ -1334,49 +1500,6 @@ fn record_worker_batch_finished(
 
 fn millis_since(start: Instant) -> i64 {
     i64::try_from(start.elapsed().as_millis()).unwrap_or(i64::MAX)
-}
-
-fn materialize_completed_semantic_job_with_model(job: &Job, model_name: &str) -> bool {
-    let result: pgrx::spi::Result<()> = BackgroundWorker::transaction(|| {
-        pgrx::Spi::connect_mut(|client| {
-            let args = [job.id.into()];
-            client.update(
-                "SELECT otlet.materialize_completed_semantic_job($1)",
-                Some(1),
-                &args,
-            )?;
-            Ok(())
-        })
-    });
-    if let Err(err) = result {
-        record_semantic_materialization_failed(job, model_name, &err.to_string());
-        return false;
-    }
-    true
-}
-
-fn record_semantic_materialization_failed(job: &Job, model_name: &str, error: &str) {
-    let result: pgrx::spi::Result<()> = BackgroundWorker::transaction(|| {
-        pgrx::Spi::connect_mut(|client| {
-            let args = [
-                job.id.into(),
-                "linked_inproc".into(),
-                job.task_name.as_str().into(),
-                job.subject_id.as_str().into(),
-                model_name.into(),
-                error.into(),
-            ];
-            client.update(
-                "SELECT otlet.record_worker_event('semantic_materialization_failed', $1, $2, 'otlet semantic materialization failed', jsonb_build_object('task_name', $3, 'subject_id', $4, 'model_name', $5, 'error', $6))",
-                Some(1),
-                &args,
-            )?;
-            Ok(())
-        })
-    });
-    if let Err(err) = result {
-        pgrx::warning!("otlet semantic materialization failure event failed: {err}");
-    }
 }
 
 fn materialize_infer_now_subject(task_name: &str, subject_id: &str) -> pgrx::spi::Result<i64> {
@@ -1406,7 +1529,7 @@ fn materialize_infer_now_subject(task_name: &str, subject_id: &str) -> pgrx::spi
 fn otlet_schema_ready() -> pgrx::spi::Result<bool> {
     pgrx::Spi::connect(|client| {
         let rows = client.select(
-            "SELECT to_regprocedure('otlet.claim_jobs()') IS NOT NULL AND to_regprocedure('otlet.materialize_completed_semantic_job(bigint)') IS NOT NULL",
+            "SELECT to_regprocedure('otlet.claim_jobs()') IS NOT NULL AND to_regprocedure('otlet.materialize_completed_semantic_job(bigint)') IS NOT NULL AND to_regprocedure('otlet.complete_and_materialize_job(bigint,jsonb,text,jsonb,text,text,text,text,jsonb,text,text,text)') IS NOT NULL",
             Some(1),
             &[],
         )?;

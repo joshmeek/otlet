@@ -604,6 +604,21 @@ SELECT
   r.generate_ms,
   r.tokens_per_second,
   CASE
+    WHEN jsonb_typeof(trace.summary -> 'runtime_prepare_ms') = 'number'
+      THEN (trace.summary ->> 'runtime_prepare_ms')::bigint
+    ELSE NULL
+  END AS runtime_prepare_ms,
+  CASE
+    WHEN jsonb_typeof(trace.summary -> 'model_load_ms') = 'number'
+      THEN (trace.summary ->> 'model_load_ms')::bigint
+    ELSE NULL
+  END AS model_load_ms,
+  CASE
+    WHEN jsonb_typeof(trace.summary -> 'model_context_ms') = 'number'
+      THEN (trace.summary ->> 'model_context_ms')::bigint
+    ELSE NULL
+  END AS model_context_ms,
+  CASE
     WHEN jsonb_typeof(trace.summary -> 'tokenize_ms') = 'number'
       THEN (trace.summary ->> 'tokenize_ms')::bigint
     ELSE NULL
@@ -613,6 +628,11 @@ SELECT
       THEN (trace.summary ->> 'prompt_decode_ms')::bigint
     ELSE NULL
   END AS prompt_decode_ms,
+  CASE
+    WHEN jsonb_typeof(trace.summary -> 'postprocess_ms') = 'number'
+      THEN (trace.summary ->> 'postprocess_ms')::bigint
+    ELSE NULL
+  END AS postprocess_ms,
   CASE
     WHEN jsonb_typeof(trace.summary -> 'finish_sql_ms') = 'number'
       THEN (trace.summary ->> 'finish_sql_ms')::bigint
@@ -879,6 +899,99 @@ CROSS JOIN LATERAL (
 ) trace
 LEFT JOIN otlet.outputs o ON o.receipt_id = r.id
 LEFT JOIN latest_materialization materialization ON materialization.receipt_id = r.id;
+
+CREATE VIEW otlet.runtime_stage_timing_status AS
+WITH attempt_timing AS (
+  SELECT
+    s.job_id,
+    count(*)::bigint AS model_attempts,
+    max(s.receipt_finished_at) AS last_receipt_finished_at,
+    bool_or(s.inference_cache_hit) AS inference_cache_hit,
+    array_agg(DISTINCT s.model_name ORDER BY s.model_name) AS model_names,
+    COALESCE(sum(s.runtime_prepare_ms), 0)::bigint AS runtime_prepare_ms,
+    COALESCE(sum(s.model_load_ms), 0)::bigint AS model_load_ms,
+    COALESCE(sum(s.model_context_ms), 0)::bigint AS model_context_ms,
+    COALESCE(sum(s.tokenize_ms), 0)::bigint AS tokenize_ms,
+    COALESCE(sum(s.prompt_decode_ms), 0)::bigint AS prompt_decode_ms,
+    COALESCE(sum(s.generate_ms), 0)::bigint AS generate_ms,
+    COALESCE(sum(s.postprocess_ms), 0)::bigint AS postprocess_ms,
+    COALESCE(sum(s.finish_sql_ms), 0)::bigint AS finish_sql_ms,
+    COALESCE(sum(s.materialize_ms), 0)::bigint AS materialize_ms
+  FROM otlet.inference_receipt_trace_status s
+  GROUP BY s.job_id
+),
+stage_totals AS (
+  SELECT
+    j.id AS job_id,
+    j.task_name,
+    j.subject_id,
+    j.status,
+    j.attempts AS claim_attempts,
+    COALESCE(a.model_attempts, 0)::bigint AS model_attempts,
+    COALESCE(a.model_names, ARRAY[]::text[]) AS model_names,
+    COALESCE(a.inference_cache_hit, false) AS inference_cache_hit,
+    j.created_at,
+    j.started_at,
+    j.finished_at,
+    a.last_receipt_finished_at,
+    CASE
+      WHEN j.started_at IS NULL THEN NULL
+      ELSE GREATEST(
+        0,
+        CEIL(EXTRACT(epoch FROM (j.started_at - j.created_at)) * 1000)::bigint
+      )
+    END AS queue_wait_ms,
+    CASE
+      WHEN j.started_at IS NULL
+        OR COALESCE(a.last_receipt_finished_at, j.finished_at) IS NULL
+        THEN NULL
+      ELSE GREATEST(
+        0,
+        CEIL(EXTRACT(
+          epoch FROM (COALESCE(a.last_receipt_finished_at, j.finished_at) - j.started_at)
+        ) * 1000)::bigint
+      ) + COALESCE(a.finish_sql_ms, 0) + COALESCE(a.materialize_ms, 0)
+    END AS observed_worker_ms,
+    COALESCE(a.runtime_prepare_ms, 0) AS runtime_prepare_ms,
+    COALESCE(a.model_load_ms, 0) AS model_load_ms,
+    COALESCE(a.model_context_ms, 0) AS model_context_ms,
+    COALESCE(a.tokenize_ms, 0) AS tokenize_ms,
+    COALESCE(a.prompt_decode_ms, 0) AS prompt_decode_ms,
+    COALESCE(a.generate_ms, 0) AS generate_ms,
+    COALESCE(a.postprocess_ms, 0) AS postprocess_ms,
+    COALESCE(a.finish_sql_ms, 0) AS finish_sql_ms,
+    COALESCE(a.materialize_ms, 0) AS materialize_ms,
+    COALESCE(a.runtime_prepare_ms, 0)
+      + COALESCE(a.model_load_ms, 0)
+      + COALESCE(a.model_context_ms, 0)
+      + COALESCE(a.tokenize_ms, 0)
+      + COALESCE(a.prompt_decode_ms, 0)
+      + COALESCE(a.generate_ms, 0)
+      + COALESCE(a.postprocess_ms, 0)
+      + COALESCE(a.finish_sql_ms, 0)
+      + COALESCE(a.materialize_ms, 0) AS accounted_worker_ms
+  FROM otlet.jobs j
+  LEFT JOIN attempt_timing a ON a.job_id = j.id
+)
+SELECT
+  s.*,
+  CASE
+    WHEN s.queue_wait_ms IS NULL OR s.observed_worker_ms IS NULL THEN NULL
+    ELSE s.queue_wait_ms + s.observed_worker_ms
+  END AS observed_end_to_end_ms,
+  CASE
+    WHEN s.observed_worker_ms IS NULL THEN NULL
+    ELSE s.observed_worker_ms - s.accounted_worker_ms
+  END AS reconciliation_delta_ms,
+  CASE
+    WHEN s.observed_worker_ms IS NULL THEN NULL
+    ELSE GREATEST(s.observed_worker_ms - s.accounted_worker_ms, 0)
+  END AS worker_overhead_ms,
+  CASE
+    WHEN s.observed_worker_ms IS NULL THEN NULL
+    ELSE GREATEST(s.accounted_worker_ms - s.observed_worker_ms, 0)
+  END AS timing_overrun_ms
+FROM stage_totals s;
 
 CREATE VIEW otlet.task_inference_cache_status AS
 WITH receipt_cache AS MATERIALIZED (
