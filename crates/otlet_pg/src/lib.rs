@@ -10,104 +10,194 @@ mod runtime;
 mod wake;
 mod worker;
 
-pgrx::extension_sql_file!("../sql/01_schema.sql", name = "schema", bootstrap);
+pgrx::extension_sql_file!("../sql/010_core_schema.sql", name = "schema", bootstrap);
 pgrx::extension_sql_file!(
-    "../sql/02_runtime_models.sql",
-    name = "runtime_models",
+    "../sql/020_identity_contract.sql",
+    name = "identity_contract",
     requires = ["schema"]
 );
 pgrx::extension_sql_file!(
-    "../sql/03_tasks_scan.sql",
+    "../sql/030_action_schema.sql",
+    name = "action_schema",
+    requires = ["identity_contract"]
+);
+pgrx::extension_sql_file!(
+    "../sql/040_semantic_schema.sql",
+    name = "semantic_schema",
+    requires = ["action_schema"]
+);
+pgrx::extension_sql_file!(
+    "../sql/050_runtime_models.sql",
+    name = "runtime_models",
+    requires = ["semantic_schema"]
+);
+pgrx::extension_sql_file!(
+    "../sql/060_tasks_scan.sql",
     name = "tasks_scan",
     requires = ["runtime_models"]
 );
 pgrx::extension_sql_file!(
-    "../sql/04_runtime_health.sql",
+    "../sql/070_runtime_health.sql",
     name = "runtime_health",
     requires = ["tasks_scan"]
 );
 pgrx::extension_sql_file!(
-    "../sql/05_jobs_lifecycle.sql",
-    name = "jobs_lifecycle",
+    "../sql/080_job_claims.sql",
+    name = "job_claims",
     requires = ["runtime_health"]
 );
 pgrx::extension_sql_file!(
-    "../sql/05_actions_review.sql",
-    name = "actions_review",
-    requires = ["jobs_lifecycle"]
+    "../sql/090_job_attempts.sql",
+    name = "job_attempts",
+    requires = ["job_claims"]
 );
 pgrx::extension_sql_file!(
-    "../sql/05_eval_labels.sql",
+    "../sql/100_job_cancellation.sql",
+    name = "job_cancellation",
+    requires = ["job_attempts"]
+);
+pgrx::extension_sql_file!(
+    "../sql/110_job_terminal_recovery.sql",
+    name = "job_terminal_recovery",
+    requires = ["job_cancellation"]
+);
+pgrx::extension_sql_file!(
+    "../sql/120_action_contract.sql",
+    name = "action_contract",
+    requires = ["job_terminal_recovery"]
+);
+pgrx::extension_sql_file!(
+    "../sql/130_action_completion_review.sql",
+    name = "action_completion_review",
+    requires = ["action_contract"]
+);
+pgrx::extension_sql_file!(
+    "../sql/140_action_execution.sql",
+    name = "action_execution",
+    requires = ["action_completion_review"]
+);
+pgrx::extension_sql_file!(
+    "../sql/150_eval_labels.sql",
     name = "eval_labels",
-    requires = ["actions_review"]
+    requires = ["action_execution"]
 );
 pgrx::extension_sql_file!(
-    "../sql/06_receipt_trace_status.sql",
-    name = "receipt_trace_status",
+    "../sql/160_action_review_status.sql",
+    name = "action_review_status",
     requires = ["eval_labels"]
 );
 pgrx::extension_sql_file!(
-    "../sql/07_trace_tokens.sql",
-    name = "trace_tokens",
-    requires = ["receipt_trace_status"]
+    "../sql/170_inference_receipt_status.sql",
+    name = "inference_receipt_status",
+    requires = ["action_review_status"]
 );
 pgrx::extension_sql_file!(
-    "../sql/08_trace_visibility.sql",
+    "../sql/180_runtime_cache_status.sql",
+    name = "runtime_cache_status",
+    requires = ["inference_receipt_status"]
+);
+pgrx::extension_sql_file!(
+    "../sql/190_trace_tokens.sql",
+    name = "trace_tokens",
+    requires = ["runtime_cache_status"]
+);
+pgrx::extension_sql_file!(
+    "../sql/200_trace_visibility.sql",
     name = "trace_visibility",
     requires = ["trace_tokens"]
 );
 pgrx::extension_sql_file!(
-    "../sql/09_runtime_status.sql",
+    "../sql/210_runtime_status.sql",
     name = "runtime_status",
     requires = ["trace_visibility"]
 );
 pgrx::extension_sql_file!(
-    "../sql/10_semantic_stale.sql",
+    "../sql/220_semantic_stale.sql",
     name = "semantic_stale",
     requires = ["runtime_status"]
 );
 pgrx::extension_sql_file!(
-    "../sql/11_semantic_index.sql",
-    name = "semantic_index",
+    "../sql/230_semantic_index_admin.sql",
+    name = "semantic_index_admin",
     requires = ["semantic_stale"]
 );
 pgrx::extension_sql_file!(
-    "../sql/12_semantic_join_core.sql",
-    name = "semantic_join_core",
-    requires = ["semantic_index"]
+    "../sql/240_semantic_materialization.sql",
+    name = "semantic_materialization",
+    requires = ["semantic_index_admin"]
 );
 pgrx::extension_sql_file!(
-    "../sql/13_semantic_join_plan.sql",
-    name = "semantic_join_plan",
+    "../sql/250_semantic_reads.sql",
+    name = "semantic_reads",
+    requires = ["semantic_materialization"]
+);
+pgrx::extension_sql_file!(
+    "../sql/260_semantic_join_core.sql",
+    name = "semantic_join_core",
+    requires = ["semantic_reads"]
+);
+pgrx::extension_sql_file!(
+    "../sql/270_semantic_join_reads.sql",
+    name = "semantic_join_reads",
     requires = ["semantic_join_core"]
 );
 pgrx::extension_sql_file!(
-    "../sql/17_semantic_predicates.sql",
+    "../sql/280_semantic_cost.sql",
+    name = "semantic_cost",
+    requires = ["semantic_join_reads"]
+);
+pgrx::extension_sql_file!(
+    "../sql/290_semantic_join_plan.sql",
+    name = "semantic_join_plan",
+    requires = ["semantic_cost"]
+);
+pgrx::extension_sql_file!(
+    "../sql/300_semantic_predicates.sql",
     name = "semantic_predicates",
     requires = ["semantic_join_plan"]
 );
 pgrx::extension_sql_file!(
-    "../sql/18_semantic_status_plan.sql",
+    "../sql/310_semantic_status_plan.sql",
     name = "semantic_status_plan",
     requires = ["semantic_predicates"]
 );
 pgrx::extension_sql_file!(
-    "../sql/20_production_policy.sql",
-    name = "production_policy",
+    "../sql/320_queue_policy_status.sql",
+    name = "queue_policy_status",
     requires = ["semantic_status_plan"]
 );
 pgrx::extension_sql_file!(
-    "../sql/21_watches.sql",
-    name = "watches",
-    requires = ["production_policy"]
+    "../sql/330_invariants.sql",
+    name = "invariants",
+    requires = ["queue_policy_status"]
 );
 pgrx::extension_sql_file!(
-    "../sql/22_audit_export.sql",
+    "../sql/340_production_status.sql",
+    name = "production_status",
+    requires = ["invariants"]
+);
+pgrx::extension_sql_file!(
+    "../sql/350_cleanup_policy.sql",
+    name = "cleanup_policy",
+    requires = ["production_status"]
+);
+pgrx::extension_sql_file!(
+    "../sql/360_watch_lifecycle.sql",
+    name = "watch_lifecycle",
+    requires = ["cleanup_policy"]
+);
+pgrx::extension_sql_file!(
+    "../sql/370_watch_portability_status.sql",
+    name = "watch_portability_status",
+    requires = ["watch_lifecycle"]
+);
+pgrx::extension_sql_file!(
+    "../sql/380_audit_export.sql",
     name = "audit_export",
-    requires = ["watches"]
+    requires = ["watch_portability_status"]
 );
 pgrx::extension_sql_file!(
-    "../sql/23_permissions.sql",
+    "../sql/390_permissions.sql",
     name = "permissions",
     requires = ["audit_export"]
 );

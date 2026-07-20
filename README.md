@@ -42,6 +42,8 @@ Entity resolution uses a cheap local model for the first pass and a stronger loc
 ./scripts/otlet-setup.sh
 ```
 
+Rerunning setup reuses the PostgreSQL volume and model artifacts while rebuilding Otlet extension state; user tables stay in place. When the container or image changes, setup clears persisted preload state before reinstalling the extension
+
 ```sql
 SELECT name
 FROM otlet.register_model('qwen3_1_7b', '/var/lib/postgresql/otlet-models/Qwen3-1.7B-Q8_0.gguf')
