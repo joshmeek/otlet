@@ -133,6 +133,7 @@ include!("source_validation.rs");
 include!("semantic_state.rs");
 include!("counters.rs");
 include!("infer_queue.rs");
+include!("infer_prefetch.rs");
 include!("infer_provenance.rs");
 include!("slot_input.rs");
 include!("policy.rs");
