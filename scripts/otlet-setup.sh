@@ -40,18 +40,24 @@ log() {
   printf '[%s] %s\n' "$(date '+%H:%M:%S')" "$*"
 }
 
-wait_ready() {
+wait_ready_for() {
+  local target_container="$1"
+
   for _ in {1..60}; do
-    docker exec "$container" pg_isready -U postgres >/dev/null 2>&1 && return
-    if [ "$(docker inspect -f '{{.State.Running}}' "$container" 2>/dev/null || echo false)" != "true" ]; then
-      docker logs --tail 80 "$container" >&2 || true
-      exit 1
+    docker exec "$target_container" pg_isready -U postgres >/dev/null 2>&1 && return
+    if [ "$(docker inspect -f '{{.State.Running}}' "$target_container" 2>/dev/null || echo false)" != "true" ]; then
+      docker logs --tail 80 "$target_container" >&2 || true
+      return 1
     fi
     sleep 1
   done
 
-  docker logs --tail 80 "$container" >&2 || true
-  exit 1
+  docker logs --tail 80 "$target_container" >&2 || true
+  return 1
+}
+
+wait_ready() {
+  wait_ready_for "$container"
 }
 
 wait_worker() {
@@ -76,6 +82,73 @@ wait_worker() {
 
 psql_exec() {
   docker exec "$container" psql -U postgres -d postgres -v ON_ERROR_STOP=1 "$@"
+}
+
+append_optional_env() {
+  local name="$1"
+  local value="$2"
+
+  if [ -n "$value" ]; then
+    container_env_args+=(-e "$name=$value")
+  fi
+}
+
+volume_has_database() {
+  docker volume inspect "$volume" >/dev/null 2>&1 || return 1
+  docker run --rm \
+    --entrypoint sh \
+    -v "$volume:/var/lib/postgresql:ro" \
+    "$image" \
+    -c 'find /var/lib/postgresql -type f -name PG_VERSION -print -quit | grep -q .'
+}
+
+reset_persisted_preload() {
+  local recovery_container="${container}-preload-reset"
+
+  if docker container inspect "$recovery_container" >/dev/null 2>&1; then
+    log "Removing stale preload recovery container $recovery_container"
+    docker rm -f "$recovery_container" >/dev/null
+  fi
+
+  log "Resetting persisted Postgres preload state"
+  docker run -d \
+    --name "$recovery_container" \
+    -e POSTGRES_PASSWORD="$password" \
+    -v "$volume:/var/lib/postgresql" \
+    "$image" \
+    postgres -c "shared_preload_libraries=" >/dev/null
+
+  if ! wait_ready_for "$recovery_container"; then
+    docker rm -f "$recovery_container" >/dev/null
+    return 1
+  fi
+
+  if ! docker exec "$recovery_container" psql -U postgres -d postgres -v ON_ERROR_STOP=1 \
+    -c "ALTER SYSTEM RESET shared_preload_libraries;" >/dev/null; then
+    docker logs --tail 80 "$recovery_container" >&2 || true
+    docker rm -f "$recovery_container" >/dev/null
+    return 1
+  fi
+
+  docker rm -f "$recovery_container" >/dev/null
+}
+
+prepare_volume_for_new_container() {
+  if volume_has_database; then
+    reset_persisted_preload
+  fi
+}
+
+create_container() {
+  docker run -d \
+    --name "$container" \
+    "${container_env_args[@]}" \
+    -p "127.0.0.1:$port:5432" \
+    -v "$volume:/var/lib/postgresql" \
+    -v "$PWD:/work:ro" \
+    -v otlet-cargo-target:/target \
+    -w /work \
+    "$image" >/dev/null
 }
 
 ensure_model() {
@@ -119,8 +192,28 @@ ensure_model() {
   printf '%s/%s\n' "$model_dir" "$model_file"
 }
 
+container_env_args=(
+  -e "POSTGRES_PASSWORD=$password"
+  -e CARGO_TARGET_DIR=/target
+  -e "OTLET_WORKER_COUNT=$worker_count"
+)
+append_optional_env OTLET_LLAMA_THREADS "$llama_threads"
+append_optional_env OTLET_LLAMA_BATCH_THREADS "$llama_batch_threads"
+append_optional_env OTLET_LLAMA_BATCH_TOKENS "$llama_batch_tokens"
+append_optional_env OTLET_LLAMA_UBATCH_TOKENS "$llama_ubatch_tokens"
+append_optional_env OTLET_LLAMA_MMAP "$llama_mmap"
+append_optional_env OTLET_LLAMA_MLOCK "$llama_mlock"
+append_optional_env OTLET_LLAMA_FLASH_ATTN "$llama_flash_attn"
+append_optional_env OTLET_LLAMA_NO_PERF "$llama_no_perf"
+append_optional_env OTLET_LLAMA_KV_TYPE "$llama_kv_type"
+append_optional_env OTLET_LLAMA_KV_TYPE_K "$llama_kv_type_k"
+append_optional_env OTLET_LLAMA_KV_TYPE_V "$llama_kv_type_v"
+append_optional_env OMP_PROC_BIND "$omp_proc_bind"
+append_optional_env OMP_PLACES "$omp_places"
+append_optional_env GOMP_CPU_AFFINITY "$gomp_cpu_affinity"
+
 log "Building Postgres image $image"
-docker build -t "$image" -f docker/postgres/Dockerfile .
+docker build --provenance=false -t "$image" -f docker/postgres/Dockerfile .
 image_id="$(docker image inspect -f '{{.Id}}' "$image")"
 
 container_exists=false
@@ -164,9 +257,6 @@ if docker container inspect "$container" >/dev/null 2>&1; then
   done <<<"$container_env"
   if [ "$container_image_id" != "$image_id" ] || [ "$container_worker_count" != "$worker_count" ] || [ "$container_llama_threads" != "$llama_threads" ] || [ "$container_llama_batch_threads" != "$llama_batch_threads" ] || [ "$container_llama_batch_tokens" != "$llama_batch_tokens" ] || [ "$container_llama_ubatch_tokens" != "$llama_ubatch_tokens" ] || [ "$container_llama_mmap" != "$llama_mmap" ] || [ "$container_llama_mlock" != "$llama_mlock" ] || [ "$container_llama_flash_attn" != "$llama_flash_attn" ] || [ "$container_llama_no_perf" != "$llama_no_perf" ] || [ "$container_llama_kv_type" != "$llama_kv_type" ] || [ "$container_llama_kv_type_k" != "$llama_kv_type_k" ] || [ "$container_llama_kv_type_v" != "$llama_kv_type_v" ] || [ "$container_omp_proc_bind" != "$omp_proc_bind" ] || [ "$container_omp_places" != "$omp_places" ] || [ "$container_gomp_cpu_affinity" != "$gomp_cpu_affinity" ]; then
     log "Replacing stale container image or llama.cpp setting"
-    docker start "$container" >/dev/null 2>&1 || true
-    docker exec "$container" psql -U postgres -d postgres \
-      -c "ALTER SYSTEM RESET shared_preload_libraries;" >/dev/null 2>&1 || true
     docker rm -f "$container" >/dev/null
     container_exists=false
   fi
@@ -174,37 +264,19 @@ fi
 
 if [ "$container_exists" = false ]; then
   log "Creating container $container"
-  docker run -d \
-    --name "$container" \
-    -e POSTGRES_PASSWORD="$password" \
-    -e CARGO_TARGET_DIR=/target \
-    -e OTLET_WORKER_COUNT="$worker_count" \
-    -e OTLET_LLAMA_THREADS="$llama_threads" \
-    -e OTLET_LLAMA_BATCH_THREADS="$llama_batch_threads" \
-    -e OTLET_LLAMA_BATCH_TOKENS="$llama_batch_tokens" \
-    -e OTLET_LLAMA_UBATCH_TOKENS="$llama_ubatch_tokens" \
-    -e OTLET_LLAMA_MMAP="$llama_mmap" \
-    -e OTLET_LLAMA_MLOCK="$llama_mlock" \
-    -e OTLET_LLAMA_FLASH_ATTN="$llama_flash_attn" \
-    -e OTLET_LLAMA_NO_PERF="$llama_no_perf" \
-    -e OTLET_LLAMA_KV_TYPE="$llama_kv_type" \
-    -e OTLET_LLAMA_KV_TYPE_K="$llama_kv_type_k" \
-    -e OTLET_LLAMA_KV_TYPE_V="$llama_kv_type_v" \
-    -e OMP_PROC_BIND="$omp_proc_bind" \
-    -e OMP_PLACES="$omp_places" \
-    -e GOMP_CPU_AFFINITY="$gomp_cpu_affinity" \
-    -p "127.0.0.1:$port:5432" \
-    -v "$volume:/var/lib/postgresql" \
-    -v "$PWD:/work:ro" \
-    -v otlet-cargo-target:/target \
-    -w /work \
-    "$image" >/dev/null
+  prepare_volume_for_new_container
+  create_container
+  wait_ready
 else
   log "Starting container $container"
-  docker start "$container" >/dev/null
+  if ! docker start "$container" >/dev/null || ! wait_ready; then
+    log "Recreating container after failed startup"
+    docker rm -f "$container" >/dev/null
+    prepare_volume_for_new_container
+    create_container
+    wait_ready
+  fi
 fi
-
-wait_ready
 
 psql_exec -c "ALTER DATABASE postgres REFRESH COLLATION VERSION;" >/dev/null
 
@@ -213,8 +285,7 @@ if docker exec "$container" sh -lc 'test -d /target/llama-cmake-cache && grep -q
   log "Clearing stale llama.cpp build so OpenMP/native flags take effect"
   docker exec "$container" rm -rf /target/llama-cmake-cache
 fi
-docker exec "$container" psql -U postgres -d postgres \
-  -c "ALTER SYSTEM RESET shared_preload_libraries;" >/dev/null 2>&1 || true
+psql_exec -c "ALTER SYSTEM RESET shared_preload_libraries;" >/dev/null
 docker restart "$container" >/dev/null
 wait_ready
 
