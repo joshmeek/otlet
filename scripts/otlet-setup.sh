@@ -142,6 +142,7 @@ prepare_volume_for_new_container() {
 create_container() {
   docker run -d \
     --name "$container" \
+    --label "otlet.setup.config=$container_config_signature" \
     "${container_env_args[@]}" \
     -p "127.0.0.1:$port:5432" \
     -v "$volume:/var/lib/postgresql" \
@@ -211,6 +212,7 @@ append_optional_env OTLET_LLAMA_KV_TYPE_V "$llama_kv_type_v"
 append_optional_env OMP_PROC_BIND "$omp_proc_bind"
 append_optional_env OMP_PLACES "$omp_places"
 append_optional_env GOMP_CPU_AFFINITY "$gomp_cpu_affinity"
+container_config_signature="$(printf '%s\0' "${container_env_args[@]}" | cksum | awk '{print $1 "-" $2}')"
 
 log "Building Postgres image $image"
 docker build --provenance=false -t "$image" -f docker/postgres/Dockerfile .
@@ -220,42 +222,8 @@ container_exists=false
 if docker container inspect "$container" >/dev/null 2>&1; then
   container_exists=true
   container_image_id="$(docker inspect -f '{{.Image}}' "$container")"
-  container_env="$(docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$container")"
-  container_worker_count=""
-  container_llama_threads=""
-  container_llama_batch_threads=""
-  container_llama_batch_tokens=""
-  container_llama_ubatch_tokens=""
-  container_llama_mmap=""
-  container_llama_mlock=""
-  container_llama_flash_attn=""
-  container_llama_no_perf=""
-  container_llama_kv_type=""
-  container_llama_kv_type_k=""
-  container_llama_kv_type_v=""
-  container_omp_proc_bind=""
-  container_omp_places=""
-  container_gomp_cpu_affinity=""
-  while IFS='=' read -r key value; do
-    case "$key" in
-      OTLET_WORKER_COUNT) container_worker_count="$value" ;;
-      OTLET_LLAMA_THREADS) container_llama_threads="$value" ;;
-      OTLET_LLAMA_BATCH_THREADS) container_llama_batch_threads="$value" ;;
-      OTLET_LLAMA_BATCH_TOKENS) container_llama_batch_tokens="$value" ;;
-      OTLET_LLAMA_UBATCH_TOKENS) container_llama_ubatch_tokens="$value" ;;
-      OTLET_LLAMA_MMAP) container_llama_mmap="$value" ;;
-      OTLET_LLAMA_MLOCK) container_llama_mlock="$value" ;;
-      OTLET_LLAMA_FLASH_ATTN) container_llama_flash_attn="$value" ;;
-      OTLET_LLAMA_NO_PERF) container_llama_no_perf="$value" ;;
-      OTLET_LLAMA_KV_TYPE) container_llama_kv_type="$value" ;;
-      OTLET_LLAMA_KV_TYPE_K) container_llama_kv_type_k="$value" ;;
-      OTLET_LLAMA_KV_TYPE_V) container_llama_kv_type_v="$value" ;;
-      OMP_PROC_BIND) container_omp_proc_bind="$value" ;;
-      OMP_PLACES) container_omp_places="$value" ;;
-      GOMP_CPU_AFFINITY) container_gomp_cpu_affinity="$value" ;;
-    esac
-  done <<<"$container_env"
-  if [ "$container_image_id" != "$image_id" ] || [ "$container_worker_count" != "$worker_count" ] || [ "$container_llama_threads" != "$llama_threads" ] || [ "$container_llama_batch_threads" != "$llama_batch_threads" ] || [ "$container_llama_batch_tokens" != "$llama_batch_tokens" ] || [ "$container_llama_ubatch_tokens" != "$llama_ubatch_tokens" ] || [ "$container_llama_mmap" != "$llama_mmap" ] || [ "$container_llama_mlock" != "$llama_mlock" ] || [ "$container_llama_flash_attn" != "$llama_flash_attn" ] || [ "$container_llama_no_perf" != "$llama_no_perf" ] || [ "$container_llama_kv_type" != "$llama_kv_type" ] || [ "$container_llama_kv_type_k" != "$llama_kv_type_k" ] || [ "$container_llama_kv_type_v" != "$llama_kv_type_v" ] || [ "$container_omp_proc_bind" != "$omp_proc_bind" ] || [ "$container_omp_places" != "$omp_places" ] || [ "$container_gomp_cpu_affinity" != "$gomp_cpu_affinity" ]; then
+  container_config_signature_actual="$(docker inspect -f '{{index .Config.Labels "otlet.setup.config"}}' "$container")"
+  if [ "$container_image_id" != "$image_id" ] || [ "$container_config_signature_actual" != "$container_config_signature" ]; then
     log "Replacing stale container image or llama.cpp setting"
     docker rm -f "$container" >/dev/null
     container_exists=false

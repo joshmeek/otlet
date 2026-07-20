@@ -1,8 +1,3 @@
-container_path_exists() {
-  local path="$1"
-  docker exec "$container" sh -lc "test -e $(sh_quote "$path")"
-}
-
 container_file_size() {
   local path="$1"
   docker exec "$container" sh -lc "stat -Lc%s $(sh_quote "$path") 2>/dev/null || echo 0"
