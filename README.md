@@ -155,6 +155,8 @@ The full demo checks row and pair watches, candidate drift, CustomScan freshness
 
 Build the reproducible pgrx package, machine-readable SBOM, RustSec report, supported-matrix result, and exact release identity with [the release evidence command](docs/release-evidence.md)
 
+Prove a fresh disposable install, worker lifecycle, database restart, upgrade failure rollback, startup recovery, and crash-log safety with [the release lifecycle command](docs/release-lifecycle.md)
+
 ## Docs
 
 Start with [the worked example](docs/otlet-worked-example.md)

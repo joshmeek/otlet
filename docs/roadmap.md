@@ -8,17 +8,13 @@ Otlet runs local model judgment through Postgres contracts. New work must preser
 
 | Priority | Track | Next proof |
 | --- | --- | --- |
-| 1 | Release | Lifecycle checks |
+| 1 | Admission | Candidate-query preflight, timeouts, and queued-input byte limits |
 | 2 | Portable runtime | One SQL-only install and reference worker for Postgres hosts that block native workers |
 | 3 | Trust and evidence | Fenced writes, database-side validation, bounded evidence, retention, and redacted export |
 | 4 | Packs and decisions | Versioned workload packs, evaluation gates, review state, and replay-safe actions |
 | 5 | GPU and research | Device support or reopened research only after a measured trigger |
 
 Each change needs SQL-visible state, a closed failure mode, and demo, conformance, or benchmark proof
-
-## Release
-
-- prove install, restart, upgrade preflight, rollback, and crash-log checks
 
 ## Portable Runtime
 
