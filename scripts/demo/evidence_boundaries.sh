@@ -364,6 +364,7 @@ SELECT
      UNION ALL SELECT to_jsonb(copy_row) FROM otlet.retention_copy_status copy_row
      UNION ALL SELECT to_jsonb(receipt_row) FROM otlet.audit_receipt_export receipt_row
      UNION ALL SELECT to_jsonb(review_row) FROM otlet.audit_review_export review_row
+     UNION ALL SELECT to_jsonb(review_event_row) FROM otlet.audit_review_event_export review_event_row
    ) surfaces)::text;
 ROLLBACK;
 SQL

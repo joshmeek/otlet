@@ -85,6 +85,7 @@ SELECT (SELECT count(*) = 1 FROM otlet.redaction_policy_status)::text || '|' ||
        (SELECT count(*) = 1 FROM otlet.access_policy_status)::text || '|' ||
        (SELECT count(*) > 0 FROM otlet.audit_receipt_export)::text || '|' ||
        (SELECT count(*) > 0 FROM otlet.audit_review_export)::text || '|' ||
+       (SELECT count(*) > 0 FROM otlet.audit_review_event_export)::text || '|' ||
        (SELECT count(*) > 0 FROM otlet.audit_action_execution_export)::text || '|' ||
        (SELECT count(*) > 0 FROM otlet.audit_eval_label_export)::text || '|' ||
        (SELECT count(*) > 0 FROM otlet.action_workflow_policy_status)::text || '|' ||
@@ -98,7 +99,7 @@ ROLLBACK;
 SQL
 )"
 echo "auditor_read_contract=$auditor_read_contract"
-[ "$auditor_read_contract" = "true|true|true|true|true|true|true|true|true|true|true|true|true" ] || {
+[ "$auditor_read_contract" = "true|true|true|true|true|true|true|true|true|true|true|true|true|true" ] || {
   echo "Expected auditor access to all redacted exports, got $auditor_read_contract" >&2
   exit 1
 }
@@ -107,6 +108,7 @@ expect_permission_denied "$permission_auditor_role" "SELECT count(*) FROM otlet.
 expect_permission_denied "$permission_auditor_role" "SELECT count(*) FROM otlet.jobs" "auditor jobs table read"
 expect_permission_denied "$permission_auditor_role" "SELECT count(*) FROM otlet.outputs" "auditor outputs table read"
 expect_permission_denied "$permission_auditor_role" "SELECT count(*) FROM otlet.actions" "auditor actions table read"
+expect_permission_denied "$permission_auditor_role" "SELECT count(*) FROM otlet.review_events" "auditor review event table read"
 expect_permission_denied "$permission_auditor_role" "SELECT count(*) FROM otlet.action_targets" "auditor action target read"
 expect_permission_denied "$permission_auditor_role" "SELECT count(*) FROM otlet.action_workflow_policies" "auditor action workflow policy read"
 expect_permission_denied "$permission_auditor_role" "SELECT count(*) FROM otlet.retention_holds" "auditor retention hold table read"
@@ -120,6 +122,8 @@ expect_permission_denied "$permission_auditor_role" "SELECT * FROM otlet.approve
 expect_permission_denied "$permission_auditor_role" "SELECT * FROM otlet.reject_action(0)" "auditor action rejection"
 expect_permission_denied "$permission_auditor_role" "SELECT * FROM otlet.label_action(0)" "auditor action labeling"
 expect_permission_denied "$permission_auditor_role" "SELECT * FROM otlet.correct_action(0)" "auditor action correction"
+expect_permission_denied "$permission_auditor_role" "SELECT * FROM otlet.defer_action(0)" "auditor action deferral"
+expect_permission_denied "$permission_auditor_role" "SELECT * FROM otlet.abstain_review(0)" "auditor review abstention"
 expect_permission_denied "$permission_auditor_role" "SELECT * FROM otlet.dry_run_action(0)" "auditor action dry run"
 expect_permission_denied "$permission_auditor_role" "SELECT * FROM otlet.apply_action(0)" "auditor action apply"
 expect_permission_denied "$permission_auditor_role" "SELECT otlet.register_model('denied', '/tmp/denied', repeat('0', 64), jsonb_build_object('sha256', repeat('0', 64), 'bytes', 24, 'source', 'denied', 'revision', 'denied', 'quantization', 'denied', 'license', 'denied'))" "auditor model registration"
@@ -396,6 +400,7 @@ expect_permission_denied "$permission_operator_role" "SELECT count(*) FROM otlet
 expect_permission_denied "$permission_operator_role" "SELECT count(*) FROM otlet.cleanup_runs" "operator cleanup run table read"
 expect_permission_denied "$permission_operator_role" "SELECT count(*) FROM otlet.evidence_cleanup_receipts" "operator cleanup receipt table read"
 expect_permission_denied "$permission_operator_role" "SELECT count(*) FROM otlet.action_execution_receipts" "operator action execution receipt read"
+expect_permission_denied "$permission_operator_role" "SELECT count(*) FROM otlet.review_events" "operator review event table read"
 expect_permission_denied "$permission_operator_role" "UPDATE public.otlet_demo_bounded_actions SET review_state = review_state WHERE false" "operator direct target update"
 expect_permission_denied "$permission_operator_role" "INSERT INTO otlet.eval_labels DEFAULT VALUES" "operator direct eval label insert"
 expect_permission_denied "$permission_operator_role" "DELETE FROM otlet.inference_receipts WHERE false" "operator direct receipt delete"
@@ -435,6 +440,7 @@ WITH table_grants AS (
             'access_policy_status',
             'audit_receipt_export',
             'audit_review_export',
+            'audit_review_event_export',
             'audit_action_execution_export',
             'audit_eval_label_export',
             'action_workflow_policy_status',
@@ -471,6 +477,8 @@ WITH table_grants AS (
           'reject_action',
           'label_action',
           'correct_action',
+          'defer_action',
+          'abstain_review',
           'dry_run_action',
           'apply_action'
         )
@@ -491,6 +499,8 @@ WITH table_grants AS (
           'otlet.reject_action(bigint,text,text)'::regprocedure,
           'otlet.label_action(bigint,text,text,text,text,text)'::regprocedure,
           'otlet.correct_action(bigint,jsonb,text)'::regprocedure,
+          'otlet.defer_action(bigint,text)'::regprocedure,
+          'otlet.abstain_review(bigint,text)'::regprocedure,
           'otlet.dry_run_action(bigint)'::regprocedure,
           'otlet.apply_action(bigint)'::regprocedure,
           'otlet.grant_auditor_access(regrole)'::regprocedure,
@@ -531,14 +541,16 @@ CROSS JOIN definer_status;
 SQL
 )"
 echo "permission_catalog_contract=$permission_catalog_contract"
-[ "$permission_catalog_contract" = "false|0|0|0|13|3|13|9|0|0|0|0|8|8|0|true" ] || {
+[ "$permission_catalog_contract" = "false|0|0|0|14|3|14|11|0|0|0|0|10|10|0|true" ] || {
   echo "Expected exact public, auditor, operator, and owner ACLs, got $permission_catalog_contract" >&2
   exit 1
 }
 
-permission_contract="public=0/0/0|auditor=13/3|operator=13/9|definer=8/8|positive=7|denied=$permission_denied_count"
+source "$demo_dir/review_provenance.sh"
+
+permission_contract="public=0/0/0|auditor=14/3|operator=14/11|definer=10/10|positive=7|denied=$permission_denied_count"
 echo "permission_contract=$permission_contract"
-[ "$permission_contract" = "public=0/0/0|auditor=13/3|operator=13/9|definer=8/8|positive=7|denied=64" ] || {
+[ "$permission_contract" = "public=0/0/0|auditor=14/3|operator=14/11|definer=10/10|positive=7|denied=69" ] || {
   echo "Expected complete permission contract, got $permission_contract" >&2
   exit 1
 }

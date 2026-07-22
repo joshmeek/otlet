@@ -353,6 +353,12 @@ abstention_items AS (
       WHERE l.output_id = o.id
         AND l.label_source = 'manual_correction'
     )
+    AND NOT EXISTS (
+      SELECT 1
+      FROM otlet.review_events event
+      WHERE event.output_id = o.id
+        AND event.outcome = 'abstain'
+    )
 ),
 direct_rejected_items AS (
   SELECT
@@ -418,6 +424,12 @@ direct_rejected_items AS (
       FROM otlet.eval_labels l
       WHERE l.receipt_id = r.id
         AND l.label_source = 'manual_correction'
+    )
+    AND NOT EXISTS (
+      SELECT 1
+      FROM otlet.review_events event
+      WHERE event.receipt_id = r.id
+        AND event.outcome = 'abstain'
     )
 )
 SELECT
@@ -519,3 +531,49 @@ SELECT
   created_at
 FROM direct_rejected_items
 ORDER BY created_at, task_name, job_subject_id, queue_kind;
+
+CREATE FUNCTION otlet.defer_action(
+  action_id bigint,
+  reason text DEFAULT NULL
+) RETURNS SETOF otlet.review_events
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, otlet, pg_temp
+AS $$
+BEGIN
+  PERFORM 1
+  FROM otlet.review_queue queue
+  WHERE queue.action_id = defer_action.action_id;
+  IF NOT FOUND THEN
+    RETURN;
+  END IF;
+
+  RETURN QUERY
+  SELECT *
+  FROM otlet.record_review_event('defer', defer_action.action_id, NULL, defer_action.reason);
+END;
+$$;
+
+CREATE FUNCTION otlet.abstain_review(
+  receipt_id bigint,
+  reason text DEFAULT NULL
+) RETURNS SETOF otlet.review_events
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, otlet, pg_temp
+AS $$
+BEGIN
+  PERFORM 1
+  FROM otlet.review_queue queue
+  WHERE queue.receipt_id = abstain_review.receipt_id
+    AND queue.action_id IS NULL
+    AND queue.queue_kind IN ('abstention_output', 'direct_rejected_output');
+  IF NOT FOUND THEN
+    RETURN;
+  END IF;
+
+  RETURN QUERY
+  SELECT *
+  FROM otlet.record_review_event('abstain', NULL, abstain_review.receipt_id, abstain_review.reason);
+END;
+$$;

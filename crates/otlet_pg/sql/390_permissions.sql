@@ -5,6 +5,8 @@ WITH operator_functions(oid) AS (
     'otlet.reject_action(bigint,text,text)'::regprocedure::oid,
     'otlet.label_action(bigint,text,text,text,text,text)'::regprocedure::oid,
     'otlet.correct_action(bigint,jsonb,text)'::regprocedure::oid,
+    'otlet.defer_action(bigint,text)'::regprocedure::oid,
+    'otlet.abstain_review(bigint,text)'::regprocedure::oid,
     'otlet.dry_run_action(bigint)'::regprocedure::oid,
     'otlet.apply_action(bigint)'::regprocedure::oid
   ])
@@ -87,6 +89,7 @@ BEGIN
     'otlet.access_policy_status, '
     'otlet.audit_receipt_export, '
     'otlet.audit_review_export, '
+    'otlet.audit_review_event_export, '
     'otlet.audit_action_execution_export, '
     'otlet.audit_eval_label_export, '
     'otlet.action_workflow_policy_status, '
@@ -127,7 +130,7 @@ BEGIN
 
   PERFORM otlet.grant_auditor_access(grant_operator_access.target_role);
   EXECUTE pg_catalog.format(
-    'GRANT USAGE ON TYPE otlet.actions, otlet.eval_labels TO %I',
+    'GRANT USAGE ON TYPE otlet.actions, otlet.eval_labels, otlet.review_events TO %I',
     role_name
   );
   EXECUTE pg_catalog.format(
@@ -136,6 +139,8 @@ BEGIN
     'otlet.reject_action(bigint, text, text), '
     'otlet.label_action(bigint, text, text, text, text, text), '
     'otlet.correct_action(bigint, jsonb, text), '
+    'otlet.defer_action(bigint, text), '
+    'otlet.abstain_review(bigint, text), '
     'otlet.dry_run_action(bigint), '
     'otlet.apply_action(bigint) TO %I',
     role_name

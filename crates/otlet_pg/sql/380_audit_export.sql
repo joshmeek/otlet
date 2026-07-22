@@ -86,6 +86,7 @@ SELECT
   ARRAY[
     'otlet.audit_receipt_export',
     'otlet.audit_review_export',
+    'otlet.audit_review_event_export',
     'otlet.audit_action_execution_export',
     'otlet.audit_eval_label_export',
     'otlet.action_workflow_policy_status',
@@ -236,6 +237,33 @@ SELECT
   q.created_at
 FROM otlet.review_queue q
 LEFT JOIN otlet.actions a ON a.id = q.action_id;
+
+CREATE VIEW otlet.audit_review_event_export AS
+SELECT
+  id AS review_event_id,
+  outcome,
+  reviewer_identity,
+  reviewer_role,
+  reason,
+  job_id,
+  task_name,
+  subject_id,
+  action_id,
+  output_id,
+  receipt_id,
+  source_table,
+  source_hash,
+  content_hash,
+  current_content_hash,
+  source_freshness,
+  model_name,
+  model_artifact_hash,
+  prompt_hash,
+  output_schema_hash,
+  output_hash,
+  runtime_fingerprint_hash,
+  reviewed_at
+FROM otlet.review_events;
 
 CREATE VIEW otlet.audit_action_execution_export AS
 SELECT

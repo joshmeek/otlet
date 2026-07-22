@@ -208,7 +208,8 @@ bounded_queue_contract=4|1
 bounded_execution_contract=approved|bounded apply|1|DO_NOT_TOUCH_SENTINEL|pending||0|DO_NOT_TOUCH_SENTINEL|1|2|2|0
 action_authority_contract=true|true|true|true|true|true|true|true|true|true
 retention_contract=true|true|true|true|true|true|true|true|true
-permission_contract=public=0/0/0|auditor=13/3|operator=13/9|definer=8/8|positive=7|denied=64
+review_provenance_contract=true|true|true|true|true|true|true|true|true|true|true
+permission_contract=public=0/0/0|auditor=14/3|operator=14/11|definer=10/10|positive=7|denied=69
 ```
 
 Otlet changes `row-1` once and preserves its protected sentinel. `row-3` stays unchanged. The authority proof rejects a forged destination, recommendation-only policy, unevaluated and adversarial policies, missing approval, and stale source state before proving one bounded mutation

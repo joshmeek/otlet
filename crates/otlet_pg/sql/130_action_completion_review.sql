@@ -411,6 +411,135 @@ BEGIN
 END;
 $$;
 
+CREATE FUNCTION otlet.record_review_event(
+  outcome text,
+  action_id bigint,
+  receipt_id bigint,
+  reason text
+) RETURNS otlet.review_events
+LANGUAGE plpgsql
+SET search_path = pg_catalog, otlet, pg_temp
+AS $$
+DECLARE
+  actual_outcome text := lower(COALESCE(record_review_event.outcome, ''));
+  actual_reason text := COALESCE(NULLIF(btrim(record_review_event.reason), ''), actual_outcome);
+  role_setting text := current_setting('role', true);
+  reviewer_role_name text;
+  target record;
+  current_hash text;
+  freshness text;
+  saved otlet.review_events%ROWTYPE;
+BEGIN
+  IF actual_outcome NOT IN ('approve', 'reject', 'correct', 'defer', 'abstain') THEN
+    RAISE EXCEPTION 'otlet review outcome % is not supported', record_review_event.outcome;
+  END IF;
+  IF num_nonnulls(record_review_event.action_id, record_review_event.receipt_id) <> 1 THEN
+    RAISE EXCEPTION 'otlet review event requires exactly one action or receipt target';
+  END IF;
+  IF octet_length(actual_reason) > 8192 THEN
+    RAISE EXCEPTION 'otlet review reason exceeds 8192 bytes';
+  END IF;
+
+  SELECT
+    a.id AS action_id,
+    COALESCE(a.output_id, o.id) AS output_id,
+    r.id AS receipt_id,
+    j.id AS job_id,
+    j.task_name,
+    j.subject_id,
+    COALESCE(a.source_table, r.trace_summary #>> '{mvcc,table}') AS source_table,
+    COALESCE(
+      a.source_hash,
+      r.trace_summary #>> '{mvcc,source_hash}',
+      md5((r.trace_summary -> 'mvcc')::text)
+    ) AS source_hash,
+    COALESCE(a.content_hash, otlet.semantic_content_hash(j.input, t.input_shaping)) AS content_hash,
+    r.model_name,
+    r.model_artifact_hash,
+    r.prompt_hash,
+    COALESCE(r.output_schema_hash, md5(t.output_schema::text)) AS output_schema_hash,
+    COALESCE(r.raw_output_hash, md5(COALESCE(o.output, r.candidate_output, 'null'::jsonb)::text)) AS output_hash,
+    r.trace_summary ->> 'runtime_fingerprint_hash' AS runtime_fingerprint_hash
+  INTO target
+  FROM otlet.inference_receipts r
+  JOIN otlet.jobs j ON j.id = r.job_id
+  JOIN otlet.tasks t ON t.name = j.task_name
+  LEFT JOIN otlet.actions a ON a.id = record_review_event.action_id
+  LEFT JOIN otlet.outputs o ON o.receipt_id = r.id
+  WHERE r.id = COALESCE(a.receipt_id, record_review_event.receipt_id)
+    AND (record_review_event.action_id IS NULL OR a.id IS NOT NULL);
+
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'otlet review target does not exist';
+  END IF;
+
+  current_hash := otlet.current_task_subject_content_hash(target.task_name, target.subject_id);
+  freshness := CASE
+    WHEN target.content_hash IS NULL OR current_hash IS NULL THEN 'unavailable'
+    WHEN target.content_hash = current_hash THEN 'fresh'
+    ELSE 'stale'
+  END;
+  IF role_setting IS NULL OR role_setting = 'none' THEN
+    reviewer_role_name := session_user;
+  ELSE
+    SELECT rolname
+    INTO reviewer_role_name
+    FROM pg_catalog.pg_roles
+    WHERE oid = role_setting::regrole;
+  END IF;
+
+  INSERT INTO otlet.review_events (
+    outcome,
+    reviewer_identity,
+    reviewer_role,
+    reason,
+    job_id,
+    task_name,
+    subject_id,
+    action_id,
+    output_id,
+    receipt_id,
+    source_table,
+    source_hash,
+    content_hash,
+    current_content_hash,
+    source_freshness,
+    model_name,
+    model_artifact_hash,
+    prompt_hash,
+    output_schema_hash,
+    output_hash,
+    runtime_fingerprint_hash
+  )
+  VALUES (
+    actual_outcome,
+    session_user,
+    reviewer_role_name,
+    actual_reason,
+    target.job_id,
+    target.task_name,
+    target.subject_id,
+    target.action_id,
+    target.output_id,
+    target.receipt_id,
+    target.source_table,
+    target.source_hash,
+    target.content_hash,
+    current_hash,
+    freshness,
+    target.model_name,
+    target.model_artifact_hash,
+    target.prompt_hash,
+    target.output_schema_hash,
+    target.output_hash,
+    target.runtime_fingerprint_hash
+  )
+  RETURNING * INTO saved;
+
+  RETURN saved;
+END;
+$$;
+
 CREATE FUNCTION otlet.approve_action(
   action_id bigint,
   review_reason text DEFAULT NULL
@@ -434,6 +563,12 @@ BEGIN
   RETURNING * INTO action_row;
 
   IF FOUND THEN
+    PERFORM otlet.record_review_event(
+      'approve',
+      action_row.id,
+      NULL,
+      approve_action.review_reason
+    );
     RETURN NEXT action_row;
   END IF;
 END;
@@ -461,6 +596,12 @@ BEGIN
   RETURNING * INTO action_row;
 
   IF FOUND THEN
+    PERFORM otlet.record_review_event(
+      'reject',
+      action_row.id,
+      NULL,
+      COALESCE(NULLIF(reject_action.review_reason, ''), reject_action.reason)
+    );
     RETURN NEXT action_row;
   END IF;
 END;

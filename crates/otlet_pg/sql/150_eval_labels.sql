@@ -209,12 +209,14 @@ DECLARE
   rejected_action otlet.actions%ROWTYPE;
   correction jsonb := COALESCE(correct_action.corrected, '{}'::jsonb);
 BEGIN
-  SELECT *
-  INTO rejected_action
-  FROM otlet.reject_action(
-    correct_action.action_id,
-    COALESCE(NULLIF(correct_action.reason, ''), 'manual correction')
-  );
+  UPDATE otlet.actions
+  SET status = 'rejected',
+      approval_status = 'rejected',
+      error = COALESCE(NULLIF(correct_action.reason, ''), 'manual correction'),
+      review_reason = COALESCE(NULLIF(correct_action.reason, ''), 'manual correction')
+  WHERE id = correct_action.action_id
+    AND status <> 'applied'
+  RETURNING * INTO rejected_action;
 
   IF NOT FOUND THEN
     RETURN;
@@ -240,6 +242,13 @@ BEGIN
     ),
     reason => correct_action.reason,
     label_source => 'manual_correction'
+  );
+
+  PERFORM otlet.record_review_event(
+    'correct',
+    rejected_action.id,
+    NULL,
+    correct_action.reason
   );
 END;
 $$;

@@ -337,6 +337,7 @@ SELECT (SELECT count(*) FROM otlet.redaction_policy_status)::text || '|' ||
        (SELECT raw_output_rows = 0 AND token_text_values = 0 AND alternative_token_text_values = 0 FROM otlet.redaction_policy_status)::text || '|' ||
        (SELECT count(*) > 0 FROM otlet.audit_receipt_export)::text || '|' ||
        (SELECT count(*) > 0 FROM otlet.audit_review_export)::text || '|' ||
+       (SELECT count(*) > 0 FROM otlet.audit_review_event_export)::text || '|' ||
        (SELECT count(*) > 0 FROM otlet.audit_eval_label_export)::text || '|' ||
        (SELECT count(*) > 0 FROM otlet.semantic_dependency_audit)::text || '|' ||
        (SELECT count(*) > 0 FROM otlet.operational_event_log)::text || '|' ||
@@ -351,7 +352,7 @@ SELECT (SELECT count(*) FROM otlet.redaction_policy_status)::text || '|' ||
 SQL
 )"
 echo "audit_export_contract=$audit_export_contract"
-[ "$audit_export_contract" = "1|true|true|true|true|true|true|true|true|true" ] || {
+[ "$audit_export_contract" = "1|true|true|true|true|true|true|true|true|true|true" ] || {
   echo "Expected audit export surfaces and redaction withholdings, got $audit_export_contract" >&2
   exit 1
 }

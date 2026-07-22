@@ -20,7 +20,7 @@ docker exec -it otlet-postgres sh -lc '
 
 Run the sections in order before adapting them. Each section names the state it creates and the output to inspect. Follow-up checks live in [runtime-and-traces.md](runtime-and-traces.md), [semantic-watches.md](semantic-watches.md), and [production-contract.md](production-contract.md)
 
-The setup and inspection sections run as the extension owner. A delegated reviewer reads `otlet.audit_review_export` and receives `otlet.grant_operator_access(...)` before using the action review functions. Raw `otlet.review_queue`, task configuration, receipts, and trace state remain owner-only
+The setup and inspection sections run as the extension owner. A delegated reviewer reads `otlet.audit_review_export` and `otlet.audit_review_event_export`, then receives `otlet.grant_operator_access(...)` before using the action review functions. Raw `otlet.review_queue`, task configuration, receipts, and trace state remain owner-only
 
 Receipts keep prompt and raw-output hashes under the default storage policy. Accepted output and rejected structured candidates remain available without persisting the assembled prompt or raw model text
 
@@ -685,6 +685,11 @@ SELECT dry_run_status FROM otlet.dry_run_action(:action_id);
 SELECT approval_status FROM otlet.approve_action(:action_id, 'reviewed source evidence');
 SELECT apply_status FROM otlet.apply_action(:action_id);
 SELECT apply_status FROM otlet.apply_action(:action_id);
+
+SELECT outcome, reviewer_identity, reviewer_role, source_freshness, receipt_id
+FROM otlet.audit_review_event_export
+WHERE action_id = :action_id
+ORDER BY review_event_id;
 ```
 
-The first apply updates one row and stores before/after hashes. The second returns `replayed`, writes no row, and links to the original receipt. If the source row, target registration, schema, or privileges changed after dry run, apply fails closed. `correct_action` still means reject plus eval label; a corrected executable write is a new proposal with a new dry run and approval
+The first apply updates one row and stores before/after hashes. The second returns `replayed`, writes no row, and links to the original receipt. Approval records the database login and active reviewer role without caller-supplied identity. If the source row, target registration, schema, or privileges changed after dry run, apply fails closed. `correct_action` still means reject plus eval label; a corrected executable write is a new proposal with a new dry run and approval

@@ -289,7 +289,7 @@ SELECT count(*) FROM otlet.verify_invariants();
 
 Contract: `0` (demo prints `invariant_contract=0`). The suite fails closed on expired or NULL leases for `running` and `cancel_requested` jobs, complete receipts without schema pass, sensitive evidence that violates the active storage policy, materializations missing `source_hash`, and error runtime slots. `production_status` and `verify_invariants` name the receipt invariant `complete_receipts_are_schema_validated`; throughput views use `completed_jobs` and `last_batch_completed_jobs`. Step 6 of `docs/semantic-watches.md` anchors the planner vocabulary for `selected_path` / `Planner Selected Path` and `freshness_basis`
 
-Operators query redacted, read-only projections through `otlet.audit_receipt_export`, `otlet.audit_review_export`, `otlet.audit_action_execution_export`, `otlet.audit_eval_label_export`, `otlet.semantic_dependency_audit`, `otlet.operational_event_log`, and `otlet.worker_batch_timing_status`. `otlet.redaction_policy_status` lists withheld fields
+Operators query redacted, read-only projections through `otlet.audit_receipt_export`, `otlet.audit_review_export`, `otlet.audit_review_event_export`, `otlet.audit_action_execution_export`, `otlet.audit_eval_label_export`, `otlet.semantic_dependency_audit`, `otlet.operational_event_log`, and `otlet.worker_batch_timing_status`. `otlet.redaction_policy_status` lists withheld fields
 
 ## Step 4 - Grant Role-Scoped Access
 
@@ -311,6 +311,7 @@ The auditor capability grants these redacted policy and audit views:
 - `otlet.access_policy_status`
 - `otlet.audit_receipt_export`
 - `otlet.audit_review_export`
+- `otlet.audit_review_event_export`
 - `otlet.audit_action_execution_export`
 - `otlet.audit_eval_label_export`
 - `otlet.action_workflow_policy_status`
@@ -327,10 +328,24 @@ The grant also includes three pure JSON hashing helpers required by `audit_revie
 - `otlet.reject_action`
 - `otlet.label_action`
 - `otlet.correct_action`
+- `otlet.defer_action`
+- `otlet.abstain_review`
 - `otlet.dry_run_action`
 - `otlet.apply_action`
 
-The six operator functions run as the extension owner with `search_path` fixed to `pg_catalog, otlet, pg_temp`. Operators receive no direct table writes. The owner alone registers targets and workflow policies, disables them, and imports or exports watches. Watch exports contain instructions, policies, schemas, source identifiers, and owner-authored candidate SQL, so auditor and operator roles cannot read or import them
+The eight operator functions run as the extension owner with `search_path` fixed to `pg_catalog, otlet, pg_temp`. Operators receive no direct table writes. The owner alone registers targets and workflow policies, disables them, and imports or exports watches. Watch exports contain instructions, policies, schemas, source identifiers, and owner-authored candidate SQL, so auditor and operator roles cannot read or import them
+
+Approval, rejection, correction, deferral, and abstention append immutable rows to `otlet.review_events`. Otlet derives `reviewer_identity` from `session_user` and `reviewer_role` from the active `SET ROLE` state; none of the review functions accepts either value from the caller. Each event snapshots its reason, timestamp, source freshness, and links to the job, action or output, receipt, model artifact, prompt, schema, runtime, and output identities
+
+`otlet.defer_action(...)` leaves the action in the review queue. `otlet.abstain_review(...)` records the final review of an abstention or directly rejected output and removes that item from the queue. Inspect the append-only audit projection without raw source rows:
+
+```sql
+SELECT outcome, reviewer_identity, reviewer_role, reason,
+       source_freshness, action_id, output_id, receipt_id,
+       model_name, prompt_hash, output_schema_hash, reviewed_at
+FROM otlet.audit_review_event_export
+ORDER BY review_event_id;
+```
 
 An action target must be an ordinary non-partitioned table without RLS, use one primary-key column, and list each writable non-key column. A row-watch task must also allow `update_row` and bind that action to the target with `otlet.register_action_workflow_policy(...)`. The policy starts recommendation-only and unevaluated unless the owner explicitly marks it `bounded_mutation` and `evaluated`. Otlet snapshots the task, target, source namespace, and authority hashes, then revalidates them during dry run and apply
 
@@ -342,10 +357,11 @@ Check the installed policy:
 SELECT * FROM otlet.access_policy_status;
 ```
 
-The demo proves the catalog ACLs, 13 auditor views, nine operator function grants, seven successful operator paths, and 64 denied paths:
+The demo proves the catalog ACLs, 14 auditor views, 11 operator function grants, seven existing operator paths, and 69 denied paths. It separately proves all five review outcomes through the delegated operator role:
 
 ```text
-permission_contract=public=0/0/0|auditor=13/3|operator=13/9|definer=8/8|positive=7|denied=64
+review_provenance_contract=true|true|true|true|true|true|true|true|true|true|true
+permission_contract=public=0/0/0|auditor=14/3|operator=14/11|definer=10/10|positive=7|denied=69
 ```
 
 Your application still owns these deployment boundaries:
