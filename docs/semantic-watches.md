@@ -584,24 +584,27 @@ semantic_join_match_contract=true
 
 Use explicit JSON predicates for row and join semantic filters
 
-## Step 12 - Move A Watch Definition
+## Step 12 - Version A Watch Pack
 
-The extension owner can export a row or pair watch as configuration-only JSONB:
+The extension owner can export a row or pair watch as an `otlet.watch.v1` JSONB document:
 
 ```sql
 SELECT jsonb_pretty(otlet.export_watch('learning_entity_pair_idx'));
 ```
 
-`otlet.watch.v1` uses the same fields as `otlet.create_watch(...)`. The shortened values below show the key and type contract; export keeps the full instruction, schema, and candidate query
+The pack keeps SQL and JSON Schema as ordinary document fields. The shortened values below show the field contract; export keeps the full instruction, schema, candidate query, and verified model identity
 
 ```json
 {
   "format": "otlet.watch.v1",
   "name": "learning_entity_pair_idx",
   "kind": "pair",
+  "content_digest": "e2a4fd1f9d6943d73cb3c201e22f1817",
+  "version_metadata": {"version": "1.0.0"},
   "instruction": "Compare one candidate pair",
   "output_schema": {},
   "model_name": "qwen3_1_7b",
+  "model_artifact_identity": {},
   "table_name": null,
   "subject_column": null,
   "candidate_query": "SELECT subject_id, input FROM public.learning_entity_pair_input",
@@ -617,11 +620,36 @@ SELECT jsonb_pretty(otlet.export_watch('learning_entity_pair_idx'));
   "input_columns": null,
   "pair_sources": [
     {"table": "public.learning_entity", "subject_column": "id"}
-  ]
+  ],
+  "fixtures": [],
+  "labels": [],
+  "expected_receipts": [],
+  "evaluation_gates": {}
 }
 ```
 
-The document contains watch configuration and owner-authored candidate SQL. It excludes model paths, source rows, jobs, outputs, actions, receipts, labels, traces, materializations, trigger names, timestamps, and counters
+The document contains watch configuration, owner-authored candidate SQL, fixtures, labels, expected receipt shapes, evaluation gates, and a digest of canonical content. It excludes model paths, source rows, jobs, runtime outputs, runtime actions, runtime receipts, traces, materializations, trigger names, and counters. Store the JSON in an ordinary file; Otlet adds no workflow language or pack registry
+
+Lint and dry run use the same validator as import and do not change the watch or its version history:
+
+```sql
+SELECT valid, content_digest
+FROM otlet.lint_watch_pack(:'watch_definition'::jsonb);
+
+SELECT jsonb_pretty(
+  otlet.dry_run_watch_pack(:'watch_definition'::jsonb)
+);
+```
+
+Canonical validation sorts unordered pack fields before calculating the digest. Object key order and fixture or label order do not create a false change. Compare two packs by semantic top-level field:
+
+```sql
+SELECT field_name, change_type, before_value, after_value
+FROM otlet.diff_watch_packs(
+  :'before_definition'::jsonb,
+  :'after_definition'::jsonb
+);
+```
 
 Import requires the referenced model, tables, and columns to exist. The function rejects an existing watch unless the owner requests replacement:
 
@@ -640,11 +668,29 @@ FROM otlet.import_watch(
 );
 ```
 
-Import validates `otlet.watch.v1`, resolves database dependencies, and calls `otlet.create_watch(...)`. A failed import rolls back its statement and leaves an existing watch unchanged
+Import validates `otlet.watch.v1`, preflights bounded candidate SQL, resolves database dependencies, and calls `otlet.create_watch(...)`. Each successful import appends an immutable version and moves the current head. A failed import rolls back its statement and leaves the watch and history unchanged
 
-The Docker demo proves replacement, drop/import round trip, lookup preservation, trigger preservation, and nine rejected documents:
+Inspect history and restore an exact prior pack through the same import contract:
+
+```sql
+SELECT version_number, content_digest, current_version, version_metadata
+FROM otlet.watch_pack_history
+WHERE watch_name = 'learning_entity_pair_idx'
+ORDER BY version_number;
+
+SELECT name, kind
+FROM otlet.rollback_watch_pack(
+  'learning_entity_pair_idx',
+  version_number => 1
+);
+```
+
+Rollback appends a new version with the restored canonical content. Prior rows remain immutable, so the history records both the superseded pack and the rollback
+
+The Docker demo proves nonmutating lint, canonical dry run, stable semantic diff, immutable history, exact rollback, replacement, drop/import round trip, lookup preservation, trigger preservation, and ten rejected documents:
 
 ```text
+watch_pack_contract=true|true|true|true|true|true|true|true|true|true|true|true|true
 watch_replace_contract=true|true|true|true|true|true|true|true|true|true
 watch_import_failure_contract=10|true
 watch_round_trip_contract=true|true|true|true|true

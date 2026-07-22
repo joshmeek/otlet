@@ -224,7 +224,8 @@ semantic_join_lookup_contract=4|1|3
 semantic_join_match_contract=true|true
 watch_replace_contract=true|true|true|true|true|true|true|true|true|true
 watch_round_trip_contract=true|true|true|true|true
-watch_import_failure_contract=9|true
+watch_import_failure_contract=10|true
+watch_pack_contract=true|true|true|true|true|true|true|true|true|true|true|true|true
 candidate_removed_contract=0|true|candidate_removed|0|0|false|
 candidate_changed_contract=1|true|candidate_changed|0
 semantic_join_stale_contract=4|0|fresh_after_lookup=0|receipts=8|8

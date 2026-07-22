@@ -112,6 +112,50 @@ CREATE TABLE otlet.watches (
   )
 );
 
+CREATE TABLE otlet.watch_pack_versions (
+  id bigserial PRIMARY KEY,
+  watch_name text NOT NULL CHECK (watch_name ~ '^[a-z0-9][a-z0-9_-]*$'),
+  version_number integer NOT NULL CHECK (version_number > 0),
+  content_digest text NOT NULL CHECK (content_digest ~ '^[0-9a-f]{32}$'),
+  definition jsonb NOT NULL CHECK (
+    jsonb_typeof(definition) = 'object'
+    AND definition ->> 'format' = 'otlet.watch.v1'
+    AND definition ->> 'name' = watch_name
+    AND definition ->> 'content_digest' = content_digest
+  ),
+  created_by text NOT NULL DEFAULT session_user,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (watch_name, version_number),
+  UNIQUE (watch_name, id)
+);
+
+CREATE INDEX watch_pack_versions_watch_created_idx
+ON otlet.watch_pack_versions (watch_name, version_number DESC, id DESC);
+
+CREATE TABLE otlet.watch_pack_heads (
+  watch_name text PRIMARY KEY CHECK (watch_name ~ '^[a-z0-9][a-z0-9_-]*$'),
+  version_id bigint NOT NULL UNIQUE,
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  FOREIGN KEY (watch_name, version_id)
+    REFERENCES otlet.watch_pack_versions(watch_name, id)
+);
+
+CREATE FUNCTION otlet.reject_watch_pack_version_change() RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+BEGIN
+  RAISE EXCEPTION 'otlet watch pack history is immutable';
+END;
+$$;
+
+CREATE TRIGGER watch_pack_versions_immutable
+BEFORE UPDATE OR DELETE ON otlet.watch_pack_versions
+FOR EACH ROW EXECUTE FUNCTION otlet.reject_watch_pack_version_change();
+
+CREATE TRIGGER watch_pack_versions_no_truncate
+BEFORE TRUNCATE ON otlet.watch_pack_versions
+FOR EACH STATEMENT EXECUTE FUNCTION otlet.reject_watch_pack_version_change();
+
 CREATE FUNCTION otlet.source_fields_are_allowed(
   input jsonb,
   input_shaping jsonb

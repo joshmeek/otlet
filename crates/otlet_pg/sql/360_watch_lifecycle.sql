@@ -115,6 +115,9 @@ BEGIN
   DELETE FROM otlet.watches w
   WHERE w.name = watch_row.name;
 
+  DELETE FROM otlet.watch_pack_heads head
+  WHERE head.watch_name = watch_row.name;
+
   IF watch_row.kind = 'row' AND watch_row.semantic_index_name IS NOT NULL THEN
     PERFORM otlet.drop_watch_row_index(watch_row.semantic_index_name);
   ELSIF watch_row.kind = 'pair' AND watch_row.semantic_join_index_name IS NOT NULL THEN
@@ -494,6 +497,9 @@ BEGIN
       );
     END LOOP;
   END IF;
+
+  DELETE FROM otlet.watch_pack_heads head
+  WHERE head.watch_name = saved.name;
 
   RETURN saved;
 END;
