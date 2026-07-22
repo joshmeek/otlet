@@ -132,14 +132,37 @@ ffi_sweep_safety_contract=1|failed|job lease expired after max attempts|failed|f
 Representative output from the demo contract:
 
 ```text
-production_policy_contract=default|refresh_then_fail_closed|3|300000|8|redacted
+production_policy_contract=default|refresh_then_fail_closed|3|300000|8|redacted|30 days
 production_status_contract=true|true|true|true
 model_queue_status_contract=queue_accepting|0|0
 throughput_status_contract=queue_accepting|0|0|4|4|0
 cleanup_policy_dry_run=0|0|0|0|0|0|0|0|0|0|true
 ```
 
-### Step 3a - Inspect Stored Evidence Redaction
+### Step 3a - Apply Evidence Retention
+
+`terminal_evidence_retention` covers complete, failed, and canceled jobs after their actions reach a terminal state. Cleanup removes job input, structured output, action and correction payloads, receipt payloads, linked events, record bodies, and materializations. It keeps structural rows needed by linked audit state and writes a per-job hash receipt first. Cleanup may then prune unreferenced failed or canceled skeletons
+
+Place a job hold before cleanup when legal, incident, or evaluation work must retain its payload:
+
+```sql
+SELECT * FROM otlet.place_retention_hold(:job_id, 'legal hold 2026-07');
+SELECT * FROM otlet.cleanup_policy_state(true);
+SELECT * FROM otlet.release_retention_hold(:hold_id, 'matter closed');
+SELECT * FROM otlet.cleanup_policy_state(false);
+```
+
+Dry run writes no cleanup receipt. Applied cleanup writes one `cleanup_runs` row and one `evidence_cleanup_receipts` row per job before removing payloads. `cleanup_receipt_status` exposes policy, counts, candidate digest, requester, and timing. `retention_hold_status` keeps hold and release identity, timestamps, and reason hashes without exposing reason text
+
+Cleanup applies to active Otlet tables. PostgreSQL can reclaim deleted table payloads after vacuum, and the cleanup writes WAL. Your existing WAL segments, replicas, physical backups, snapshots, restored databases, and point-in-time recovery windows can retain earlier copies until their infrastructure retention expires. Use `retention_copy_status` to inspect those boundaries. Coordinate backup expiry and replica policy when a deletion request requires every recoverable copy to age out
+
+The canary proof covers input, output, action, correction, trace, event, label, record, and materialization payloads:
+
+```text
+retention_contract=true|true|true|true|true|true|true|true|true
+```
+
+### Step 3b - Inspect Stored Evidence Redaction
 
 Otlet keeps assembled prompts in worker memory and stores `prompt_hash` on receipts. The `redacted` production default stores raw-output hashes, structured accepted output, structured rejected candidates, token IDs, probabilities, and timing. It removes raw model text, reconstructed chosen text, and token text before receipt insertion
 
@@ -291,6 +314,9 @@ The auditor capability grants these redacted policy and audit views:
 - `otlet.audit_action_execution_export`
 - `otlet.audit_eval_label_export`
 - `otlet.action_workflow_policy_status`
+- `otlet.cleanup_receipt_status`
+- `otlet.retention_hold_status`
+- `otlet.retention_copy_status`
 - `otlet.semantic_dependency_audit`
 - `otlet.operational_event_log`
 - `otlet.worker_batch_timing_status`
@@ -316,15 +342,16 @@ Check the installed policy:
 SELECT * FROM otlet.access_policy_status;
 ```
 
-The demo proves the catalog ACLs, ten auditor views, nine operator function grants, seven successful operator paths, and 54 denied paths:
+The demo proves the catalog ACLs, 13 auditor views, nine operator function grants, seven successful operator paths, and 64 denied paths:
 
 ```text
-permission_contract=public=0/0/0|auditor=10/3|operator=10/9|definer=8/8|positive=7|denied=54
+permission_contract=public=0/0/0|auditor=13/3|operator=13/9|definer=8/8|positive=7|denied=64
 ```
 
 Your application still owns these deployment boundaries:
 
 - add RLS or schema isolation if multiple tenants share the database
-- schedule `otlet.cleanup_policy_state(false)` for worker-event, trace-detail, diagnostic evidence, stale materialization, and unreferenced failed/canceled job pruning
+- schedule `otlet.cleanup_policy_state(false)` for terminal evidence, worker events, trace detail, diagnostic evidence, stale materializations, and unreferenced failed or canceled jobs
+- align backup, snapshot, replica, restore, and point-in-time recovery retention with deletion obligations
 - allow action types your application has code to interpret
 - decide which users inherit the auditor and operator roles

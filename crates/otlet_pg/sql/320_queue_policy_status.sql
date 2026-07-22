@@ -34,6 +34,7 @@ SELECT
   p.delete_stale_materialization_retention,
   p.sensitive_evidence_mode,
   p.sensitive_evidence_retention,
+  p.terminal_evidence_retention,
   p.failed_job_retention
 FROM otlet.production_policy p
 WHERE p.name = 'default';

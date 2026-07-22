@@ -35,6 +35,7 @@ CREATE TABLE otlet.production_policy (
   delete_stale_materialization_retention interval NOT NULL DEFAULT interval '30 days',
   sensitive_evidence_mode text NOT NULL DEFAULT 'redacted',
   sensitive_evidence_retention interval NOT NULL DEFAULT interval '7 days',
+  terminal_evidence_retention interval NOT NULL DEFAULT interval '30 days',
   failed_job_retention interval NOT NULL DEFAULT interval '30 days',
   CHECK (name = 'default'),
   CHECK (stale_policy IN (
@@ -71,6 +72,7 @@ CREATE TABLE otlet.production_policy (
   CHECK (delete_stale_materialization_retention >= interval '1 day'),
   CHECK (sensitive_evidence_mode IN ('redacted', 'diagnostic')),
   CHECK (sensitive_evidence_retention >= interval '1 day'),
+  CHECK (terminal_evidence_retention >= interval '1 day'),
   CHECK (failed_job_retention >= interval '1 day')
 );
 
