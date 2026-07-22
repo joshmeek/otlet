@@ -66,11 +66,19 @@ fn submit_infer_now_with_inline_task(
     runtime_options: &Value,
     input: &Value,
 ) -> Result<Option<SubmittedInferNow>, String> {
+    let mut source_fields = input
+        .as_object()
+        .ok_or_else(|| "infer-now input must be a JSON object".to_owned())?
+        .keys()
+        .cloned()
+        .collect::<Vec<_>>();
+    source_fields.sort();
     let inline_task_text = serde_json::to_string(&json!({
         "model_name": model_name,
         "instruction": instruction,
         "output_schema": output_schema,
-        "runtime_options": runtime_options
+        "runtime_options": runtime_options,
+        "input_shaping": {"source_fields": source_fields}
     }))
     .map_err(|err| err.to_string())?;
     let input_text = serde_json::to_string(input).map_err(|err| err.to_string())?;

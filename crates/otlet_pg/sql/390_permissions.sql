@@ -90,6 +90,7 @@ BEGIN
     'otlet.audit_action_execution_export, '
     'otlet.audit_eval_label_export, '
     'otlet.semantic_dependency_audit, '
+    'otlet.operational_event_log, '
     'otlet.worker_batch_timing_status TO %I',
     role_name
   );

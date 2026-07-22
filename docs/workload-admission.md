@@ -29,6 +29,6 @@ COMMIT;
 
 Otlet rejects a pair refresh when the timeout is zero or exceeds `candidate_query_statement_timeout_ms`. A timed-out query creates no jobs
 
-`input_shaping.max_shaped_input_bytes` accepts integers from 1 through 1 MiB. Row and pair watches, imported `otlet.watch.v1` definitions, direct tasks, and the shared `admit_task_input` database path use the same task and admission checks. `ask` keeps its stricter 8 KiB shared-memory input cap
+`input_shaping.source_fields` is the top-level source-field allowlist. A missing list becomes empty. `input_shaping.max_shaped_input_bytes` accepts integers from 1 through 1 MiB. Row and pair watches, imported `otlet.watch.v1` definitions, direct tasks, and the shared `admit_task_input` database path use the same task and admission checks. `ask` keeps its stricter 8 KiB shared-memory input cap
 
 Capacity rejection records a debounced `queue_admission_suppressed` event with a stable reason such as `row_cap`, `input_byte_cap`, `queue_depth_cap`, `model_queued_input_byte_cap`, or `total_queued_input_byte_cap`

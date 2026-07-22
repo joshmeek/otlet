@@ -149,7 +149,8 @@ BEGIN
     'Return JSON only.',
     '{"type":"object","required":["match","confidence"],"additionalProperties":false,"properties":{"match":{"enum":["same_entity","different_entity"]},"confidence":{"enum":["high"]}}}'::jsonb,
     model_name_value,
-    '{"max_tokens":32,"reasoning":"off","inference_cache":false}'::jsonb
+    '{"max_tokens":32,"reasoning":"off","inference_cache":false}'::jsonb,
+    '{"source_fields":["action_ids"]}'::jsonb
   );
 
   INSERT INTO otlet.jobs (task_name, subject_id, input, status, attempts, started_at, leased_until)
@@ -324,4 +325,3 @@ require_contains "$row_fresh_customscan_plan" "Actual Fresh Subjects: 1" "Expect
 require_contains "$row_fresh_customscan_plan" "Actual Stale Subjects: 0" "Expected fresh CustomScan stale count"
 require_contains "$row_fresh_customscan_plan" "Infer Now Batches: 0" "Expected fresh CustomScan zero infer-now"
 require_contains "$row_fresh_customscan_plan" "Infer Now Receipts: 0" "Expected fresh CustomScan zero infer-now receipts"
-

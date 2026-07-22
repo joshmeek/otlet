@@ -329,6 +329,7 @@ SELECT (SELECT count(*) FROM otlet.redaction_policy_status)::text || '|' ||
        (SELECT count(*) > 0 FROM otlet.audit_review_export)::text || '|' ||
        (SELECT count(*) > 0 FROM otlet.audit_eval_label_export)::text || '|' ||
        (SELECT count(*) > 0 FROM otlet.semantic_dependency_audit)::text || '|' ||
+       (SELECT count(*) > 0 FROM otlet.operational_event_log)::text || '|' ||
        (SELECT count(*) > 0 FROM otlet.worker_batch_timing_status)::text || '|' ||
        (SELECT NOT EXISTS (
           SELECT 1
@@ -340,7 +341,7 @@ SELECT (SELECT count(*) FROM otlet.redaction_policy_status)::text || '|' ||
 SQL
 )"
 echo "audit_export_contract=$audit_export_contract"
-[ "$audit_export_contract" = "1|true|true|true|true|true|true|true|true" ] || {
+[ "$audit_export_contract" = "1|true|true|true|true|true|true|true|true|true" ] || {
   echo "Expected audit export surfaces and redaction withholdings, got $audit_export_contract" >&2
   exit 1
 }

@@ -84,12 +84,13 @@ SELECT (SELECT count(*) = 1 FROM otlet.redaction_policy_status)::text || '|' ||
        (SELECT count(*) > 0 FROM otlet.audit_action_execution_export)::text || '|' ||
        (SELECT count(*) > 0 FROM otlet.audit_eval_label_export)::text || '|' ||
        (SELECT count(*) > 0 FROM otlet.semantic_dependency_audit)::text || '|' ||
+       (SELECT count(*) > 0 FROM otlet.operational_event_log)::text || '|' ||
        (SELECT count(*) > 0 FROM otlet.worker_batch_timing_status)::text;
 ROLLBACK;
 SQL
 )"
 echo "auditor_read_contract=$auditor_read_contract"
-[ "$auditor_read_contract" = "true|true|true|true|true|true|true|true" ] || {
+[ "$auditor_read_contract" = "true|true|true|true|true|true|true|true|true" ] || {
   echo "Expected auditor access to all redacted exports, got $auditor_read_contract" >&2
   exit 1
 }
@@ -413,6 +414,7 @@ WITH table_grants AS (
             'audit_action_execution_export',
             'audit_eval_label_export',
             'semantic_dependency_audit',
+            'operational_event_log',
             'worker_batch_timing_status'
           )
         )
@@ -501,14 +503,14 @@ CROSS JOIN definer_status;
 SQL
 )"
 echo "permission_catalog_contract=$permission_catalog_contract"
-[ "$permission_catalog_contract" = "false|0|0|0|8|3|8|9|0|0|0|0|8|8|0|true" ] || {
+[ "$permission_catalog_contract" = "false|0|0|0|9|3|9|9|0|0|0|0|8|8|0|true" ] || {
   echo "Expected exact public, auditor, operator, and owner ACLs, got $permission_catalog_contract" >&2
   exit 1
 }
 
-permission_contract="public=0/0/0|auditor=8/3|operator=8/9|definer=8/8|positive=7|denied=$permission_denied_count"
+permission_contract="public=0/0/0|auditor=9/3|operator=9/9|definer=8/8|positive=7|denied=$permission_denied_count"
 echo "permission_contract=$permission_contract"
-[ "$permission_contract" = "public=0/0/0|auditor=8/3|operator=8/9|definer=8/8|positive=7|denied=48" ] || {
+[ "$permission_contract" = "public=0/0/0|auditor=9/3|operator=9/9|definer=8/8|positive=7|denied=48" ] || {
   echo "Expected complete permission contract, got $permission_contract" >&2
   exit 1
 }

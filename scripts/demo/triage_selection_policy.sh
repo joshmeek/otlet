@@ -38,7 +38,7 @@ SELECT otlet.create_watch(
   '{"on_change":"mark_stale_and_enqueue"}'::jsonb,
   ARRAY['review_flag'],
   'refresh_then_fail_closed',
-  '{}'::jsonb,
+  '{"source_fields":["row"]}'::jsonb,
   '{"preset":"row_triage_decision_v1"}'::jsonb
 );
 
@@ -189,7 +189,7 @@ SELECT otlet.create_task(
   '{"type":"object","required":["decision","confidence"],"additionalProperties":false,"properties":{"decision":{"enum":["skip"]},"confidence":{"enum":["medium"]}}}'::jsonb,
   :'model_name',
   '{"max_tokens":64,"reasoning":"off","inference_cache":false}'::jsonb,
-  '{}'::jsonb,
+  '{"source_fields":["row"]}'::jsonb,
   '{"answer_field":"decision","abstain_values":["skip"],"confidence_field":"confidence","accepted_confidence":["high"]}'::jsonb
 );
 SELECT otlet.run_task(:'task_name');

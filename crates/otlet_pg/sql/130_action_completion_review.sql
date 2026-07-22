@@ -22,9 +22,17 @@ DECLARE
   job_row otlet.jobs%ROWTYPE;
   task_row otlet.tasks%ROWTYPE;
   model_row otlet.models%ROWTYPE;
+  policy otlet.production_policy%ROWTYPE;
   action jsonb;
   action_payload jsonb;
   action_body jsonb;
+  stored_action_payload jsonb;
+  stored_action_body jsonb;
+  action_redacted_fields text[] := ARRAY[]::text[];
+  protected_fields text[] := ARRAY[
+    'id', 'subject_id', 'entity_id', 'left_id', 'right_id', 'type', 'body',
+    'match', 'confidence', 'action_type', 'record_type', 'target', 'identity', 'changes'
+  ];
   saved_action_id bigint;
   action_error text;
   action_type_name text;
@@ -50,12 +58,19 @@ BEGIN
     RETURN;
   END IF;
 
-  SELECT t.model_name, t.input_shaping
-  INTO task_row.model_name, task_row.input_shaping
+  SELECT t.model_name, t.input_shaping, t.decision_contract
+  INTO task_row.model_name, task_row.input_shaping, task_row.decision_contract
   FROM otlet.tasks t
   WHERE t.name = job_row.task_name;
   IF NOT FOUND THEN
     RAISE EXCEPTION 'otlet task % does not exist', job_row.task_name;
+  END IF;
+  SELECT *
+  INTO policy
+  FROM otlet.production_policy
+  WHERE name = 'default';
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'otlet default production policy does not exist';
   END IF;
   SELECT m.name
   INTO model_row.name
@@ -86,6 +101,36 @@ BEGIN
      IS DISTINCT FROM 'passed' THEN
     RAISE EXCEPTION 'otlet complete_job requires schema_validation_status passed';
   END IF;
+  IF octet_length(COALESCE(complete_job.raw_output, '')) > policy.max_raw_output_bytes THEN
+    RAISE EXCEPTION 'otlet raw output exceeds evidence byte limit';
+  END IF;
+  IF octet_length(COALESCE(complete_job.output, 'null'::jsonb)::text) > policy.max_structured_output_bytes THEN
+    RAISE EXCEPTION 'otlet structured output exceeds evidence byte limit';
+  END IF;
+  IF octet_length(COALESCE(complete_job.trace_summary, '{}'::jsonb)::text) > policy.max_trace_bytes THEN
+    RAISE EXCEPTION 'otlet trace exceeds evidence byte limit';
+  END IF;
+  IF jsonb_array_length(COALESCE(complete_job.actions, '[]'::jsonb)) > policy.max_actions_per_job THEN
+    RAISE EXCEPTION 'otlet actions exceed per-job evidence count limit';
+  END IF;
+  IF EXISTS (
+    SELECT 1
+    FROM jsonb_array_elements(COALESCE(complete_job.actions, '[]'::jsonb)) action(value)
+    WHERE octet_length(action.value::text) > policy.max_action_bytes
+  ) THEN
+    RAISE EXCEPTION 'otlet action exceeds evidence byte limit';
+  END IF;
+
+  SELECT COALESCE(array_agg(field_name ORDER BY field_name), ARRAY[]::text[])
+  INTO action_redacted_fields
+  FROM jsonb_array_elements_text(
+    COALESCE(task_row.decision_contract -> 'redact_action_fields', '[]'::jsonb)
+  ) fields(field_name);
+  SELECT protected_fields || COALESCE(array_agg(field_name ORDER BY field_name), ARRAY[]::text[])
+  INTO protected_fields
+  FROM jsonb_array_elements_text(
+    COALESCE(task_row.decision_contract -> 'identity_fields', '[]'::jsonb)
+  ) fields(field_name);
 
   IF job_row.status = 'cancel_requested' THEN
     PERFORM 1
@@ -228,6 +273,16 @@ BEGIN
         otlet.semantic_content_hash(job_row.input, task_row.input_shaping)
       );
     END IF;
+    stored_action_payload := otlet.redact_jsonb_fields(
+      action_payload,
+      action_redacted_fields,
+      protected_fields
+    );
+    stored_action_body := CASE
+      WHEN jsonb_typeof(stored_action_payload -> 'body') = 'object'
+        THEN stored_action_payload -> 'body'
+      ELSE '{}'::jsonb
+    END;
 
     INSERT INTO otlet.actions (
       job_id,
@@ -249,7 +304,7 @@ BEGIN
       saved_output.id,
       saved_receipt.id,
       action_type_name,
-      action_payload,
+      stored_action_payload,
       action_status,
       action_approval_status,
       action_subject_id,
@@ -269,7 +324,7 @@ BEGIN
         WHEN action_type_name = 'note' THEN COALESCE(NULLIF(action_payload ->> 'record_type', ''), 'note')
         ELSE action_payload ->> 'record_type'
       END;
-      action_record_body := action_body;
+      action_record_body := stored_action_body;
 
       INSERT INTO otlet.records (action_id, record_type, subject_id, body)
       VALUES (
@@ -282,13 +337,22 @@ BEGIN
   END LOOP;
 
   UPDATE otlet.inference_receipts r
-  SET trace_summary = r.trace_summary || jsonb_build_object(
-    'finish_sql_ms',
-    GREATEST(
-      0,
-      CEIL(EXTRACT(epoch FROM (clock_timestamp() - finish_started)) * 1000)
-    )::bigint
-  )
+  SET trace_summary = r.trace_summary
+    || jsonb_build_object(
+      'finish_sql_ms',
+      GREATEST(
+        0,
+        CEIL(EXTRACT(epoch FROM (clock_timestamp() - finish_started)) * 1000)
+      )::bigint
+    )
+    || jsonb_build_object(
+      'evidence_redaction',
+      COALESCE(r.trace_summary -> 'evidence_redaction', '{}'::jsonb)
+      || jsonb_build_object(
+        'actions', cardinality(action_redacted_fields) > 0,
+        'action_field_count', cardinality(action_redacted_fields)
+      )
+    )
   WHERE r.id = saved_receipt.id;
 
   RETURN NEXT saved_output;
@@ -378,4 +442,3 @@ BEGIN
   FOR UPDATE OF a;
 END;
 $$;
-

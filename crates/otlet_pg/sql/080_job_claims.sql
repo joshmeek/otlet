@@ -14,6 +14,26 @@ AS $$
     WHERE name = 'default'
     FOR UPDATE
   ),
+  invalid_claim_input AS MATERIALIZED (
+    SELECT j.id
+    FROM otlet.jobs j
+    JOIN otlet.tasks t ON t.name = j.task_name
+    WHERE j.status IN ('queued', 'running', 'cancel_requested')
+      AND NOT otlet.source_fields_are_allowed(j.input, t.input_shaping)
+    ORDER BY j.created_at, j.id
+    FOR UPDATE OF j SKIP LOCKED
+    LIMIT (SELECT batch_size FROM policy)
+  ),
+  rejected_claim_input AS (
+    UPDATE otlet.jobs j
+    SET status = 'failed',
+        leased_until = NULL,
+        error = 'source field allowlist violation',
+        finished_at = now()
+    FROM invalid_claim_input invalid
+    WHERE j.id = invalid.id
+    RETURNING j.id
+  ),
   active_model AS (
     SELECT
       t.model_name,
@@ -70,6 +90,7 @@ AS $$
         COALESCE(active_model.running_jobs, 0)
         + COALESCE(active_model.cancel_requested_jobs, 0)
       ) < m.max_active_jobs
+      AND otlet.source_fields_are_allowed(j.input, t.input_shaping)
     GROUP BY
       j.task_name,
       m.name,
@@ -155,6 +176,7 @@ AS $$
           AND (j.leased_until IS NULL OR j.leased_until < now())
         )
       )
+      AND otlet.source_fields_are_allowed(j.input, t.input_shaping)
   ),
   claimable AS (
     SELECT
@@ -177,6 +199,12 @@ AS $$
           j.status = 'cancel_requested'
           AND (j.leased_until IS NULL OR j.leased_until < now())
         )
+      )
+      AND EXISTS (
+        SELECT 1
+        FROM otlet.tasks t
+        WHERE t.name = j.task_name
+          AND otlet.source_fields_are_allowed(j.input, t.input_shaping)
       )
     ORDER BY
       candidate.task_job_rank,
@@ -212,6 +240,7 @@ AS $$
   SELECT updated.*
   FROM updated
   JOIN claimable ON claimable.id = updated.id
+  CROSS JOIN (SELECT count(*) FROM rejected_claim_input) rejected
   ORDER BY claimable.task_rank, claimable.task_job_rank;
 $$;
 
@@ -278,4 +307,3 @@ BEGIN
   );
 END;
 $$;
-

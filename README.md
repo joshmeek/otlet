@@ -72,7 +72,7 @@ FROM otlet.create_task(
   }',
   model_name => 'qwen3_1_7b',
   runtime_options => '{"max_tokens":256,"reasoning":"off","inference_cache":true,"generation_trace":true,"generation_trace_max_tokens":16,"generation_trace_top_k":3}',
-  input_shaping => '{"evidence_fields":["candidate_evidence"],"action_id_fields":{"left_id":"left_id","right_id":"right_id"}}',
+  input_shaping => '{"source_fields":["_otlet_mvcc","action_ids","candidate_evidence","evidence_counts"],"evidence_fields":["candidate_evidence"],"action_id_fields":{"left_id":"left_id","right_id":"right_id"}}',
   decision_contract => '{"preset":"entity_resolution_evidence_v1"}'
 );
 

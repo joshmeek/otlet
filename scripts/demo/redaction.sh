@@ -16,13 +16,14 @@ EXCEPTION WHEN check_violation THEN
   INSERT INTO redaction_mode_constraint VALUES (true);
 END;
 $$;
-INSERT INTO otlet.tasks (name, input_query, instruction, output_schema, model_name)
+INSERT INTO otlet.tasks (name, input_query, instruction, output_schema, model_name, input_shaping)
 VALUES (
   'redaction_contract',
   'SELECT NULL::text AS subject_id, ''{}''::jsonb AS input WHERE false',
   'PROMPT-SENTINEL-🙂-DO-NOT-STORE',
   '{"type":"object"}'::jsonb,
-  :'model_name'
+  :'model_name',
+  '{"source_fields":["secret"]}'::jsonb
 );
 INSERT INTO otlet.jobs (task_name, subject_id, input, status, attempts, started_at)
 VALUES (

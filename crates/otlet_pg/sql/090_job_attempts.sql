@@ -106,9 +106,16 @@ DECLARE
   job_row otlet.jobs%ROWTYPE;
   task_row otlet.tasks%ROWTYPE;
   model_row otlet.models%ROWTYPE;
+  policy otlet.production_policy%ROWTYPE;
   next_attempt int;
   actual_selection_status text := COALESCE(record_model_attempt.selection_status, 'accepted');
   policy_mode text;
+  output_redacted_fields text[] := ARRAY[]::text[];
+  protected_fields text[] := ARRAY[
+    'id', 'subject_id', 'entity_id', 'left_id', 'right_id', 'type', 'body',
+    'match', 'confidence', 'action_type', 'record_type', 'target', 'identity', 'changes'
+  ];
+  stored_output jsonb;
   stored_trace_summary jsonb;
 BEGIN
   SELECT j.id, j.task_name, j.subject_id, j.started_at, j.created_at
@@ -121,20 +128,21 @@ BEGIN
     RAISE EXCEPTION 'otlet job % does not exist', record_model_attempt.job_id;
   END IF;
 
-  SELECT runtime_options
-  INTO task_row.runtime_options
+  SELECT runtime_options, decision_contract
+  INTO task_row.runtime_options, task_row.decision_contract
   FROM otlet.tasks
   WHERE name = job_row.task_name;
   IF NOT FOUND THEN
     RAISE EXCEPTION 'otlet task % does not exist', job_row.task_name;
   END IF;
-  SELECT sensitive_evidence_mode
-  INTO policy_mode
+  SELECT *
+  INTO policy
   FROM otlet.production_policy
   WHERE name = 'default';
   IF NOT FOUND THEN
     RAISE EXCEPTION 'otlet default production policy does not exist';
   END IF;
+  policy_mode := policy.sensitive_evidence_mode;
   SELECT name, artifact_path, artifact_hash, artifact_identity
   INTO model_row.name, model_row.artifact_path, model_row.artifact_hash, model_row.artifact_identity
   FROM otlet.models
@@ -160,10 +168,44 @@ BEGIN
      AND record_model_attempt.schema_validation_status NOT IN ('passed', 'failed', 'not_run') THEN
     RAISE EXCEPTION 'otlet record_model_attempt schema_validation_status must be passed, failed, or not_run';
   END IF;
+  IF octet_length(COALESCE(record_model_attempt.raw_output, '')) > policy.max_raw_output_bytes THEN
+    RAISE EXCEPTION 'otlet raw output exceeds evidence byte limit';
+  END IF;
+  IF octet_length(COALESCE(record_model_attempt.output, 'null'::jsonb)::text) > policy.max_structured_output_bytes THEN
+    RAISE EXCEPTION 'otlet structured output exceeds evidence byte limit';
+  END IF;
+  IF octet_length(COALESCE(record_model_attempt.trace_summary, '{}'::jsonb)::text) > policy.max_trace_bytes THEN
+    RAISE EXCEPTION 'otlet trace exceeds evidence byte limit';
+  END IF;
+  IF octet_length(COALESCE(record_model_attempt.error, '')) > policy.max_error_bytes THEN
+    RAISE EXCEPTION 'otlet receipt error exceeds evidence byte limit';
+  END IF;
+
+  SELECT COALESCE(array_agg(field_name ORDER BY field_name), ARRAY[]::text[])
+  INTO output_redacted_fields
+  FROM jsonb_array_elements_text(
+    COALESCE(task_row.decision_contract -> 'redact_output_fields', '[]'::jsonb)
+  ) fields(field_name);
+  SELECT protected_fields || COALESCE(array_agg(field_name ORDER BY field_name), ARRAY[]::text[])
+  INTO protected_fields
+  FROM jsonb_array_elements_text(
+    COALESCE(task_row.decision_contract -> 'identity_fields', '[]'::jsonb)
+  ) fields(field_name);
+  stored_output := otlet.redact_jsonb_fields(
+    record_model_attempt.output,
+    output_redacted_fields,
+    protected_fields
+  );
 
   stored_trace_summary := otlet.redact_trace_summary(
     COALESCE(record_model_attempt.trace_summary, '{}'::jsonb),
     policy_mode
+  ) || jsonb_build_object(
+    'evidence_redaction',
+    jsonb_build_object(
+      'structured_output', cardinality(output_redacted_fields) > 0,
+      'structured_output_field_count', cardinality(output_redacted_fields)
+    )
   );
 
   -- Prefer index-ordered peek over max() aggregate on (job_id, attempt_index).
@@ -227,7 +269,7 @@ BEGIN
     record_model_attempt.output_schema_hash,
     COALESCE(record_model_attempt.raw_output_hash, md5(COALESCE(record_model_attempt.raw_output, ''))),
     CASE WHEN policy_mode = 'diagnostic' THEN record_model_attempt.raw_output ELSE NULL END,
-    CASE WHEN actual_selection_status = 'rejected' THEN record_model_attempt.output ELSE NULL END,
+    CASE WHEN actual_selection_status = 'rejected' THEN stored_output ELSE NULL END,
     NULLIF(record_model_attempt.trace_summary ->> 'prompt_tokens', '')::bigint,
     NULLIF(record_model_attempt.trace_summary ->> 'generated_tokens', '')::bigint,
     NULLIF(record_model_attempt.trace_summary ->> 'generate_ms', '')::bigint,
@@ -247,12 +289,12 @@ BEGIN
   )
   RETURNING * INTO saved_receipt;
 
-  IF actual_selection_status = 'accepted' AND record_model_attempt.output IS NOT NULL THEN
+  IF actual_selection_status = 'accepted' AND stored_output IS NOT NULL THEN
     INSERT INTO otlet.outputs (job_id, receipt_id, output)
     VALUES (
       job_row.id,
       saved_receipt.id,
-      record_model_attempt.output
+      stored_output
     )
     RETURNING * INTO saved_output;
   END IF;

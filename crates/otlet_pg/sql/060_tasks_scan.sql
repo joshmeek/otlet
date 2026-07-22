@@ -56,6 +56,7 @@ DECLARE
   preset_name text;
   preset_contract jsonb;
   preset_contract_hash text;
+  contract_field text;
   saved_task otlet.tasks%ROWTYPE;
 BEGIN
   IF jsonb_typeof(actual_runtime_options) IS DISTINCT FROM 'object' THEN
@@ -64,6 +65,31 @@ BEGIN
   IF jsonb_typeof(actual_input_shaping) IS DISTINCT FROM 'object' THEN
     RAISE EXCEPTION 'otlet input_shaping must be a JSON object';
   END IF;
+  IF NOT actual_input_shaping ? 'source_fields' THEN
+    actual_input_shaping := jsonb_set(actual_input_shaping, '{source_fields}', '[]'::jsonb, true);
+  END IF;
+  IF jsonb_typeof(actual_input_shaping -> 'source_fields') IS DISTINCT FROM 'array'
+     OR jsonb_array_length(actual_input_shaping -> 'source_fields') > 64
+     OR EXISTS (
+       SELECT 1
+       FROM jsonb_array_elements(actual_input_shaping -> 'source_fields') source_field(value)
+       WHERE jsonb_typeof(source_field.value) IS DISTINCT FROM 'string'
+          OR NULLIF(source_field.value #>> '{}', '') IS NULL
+          OR octet_length(source_field.value #>> '{}') > 128
+     ) THEN
+    RAISE EXCEPTION 'otlet input_shaping.source_fields must contain at most 64 non-empty field names';
+  END IF;
+  SELECT jsonb_set(
+    actual_input_shaping,
+    '{source_fields}',
+    COALESCE(jsonb_agg(source_field ORDER BY source_field), '[]'::jsonb),
+    true
+  )
+  INTO actual_input_shaping
+  FROM (
+    SELECT DISTINCT value AS source_field
+    FROM jsonb_array_elements_text(actual_input_shaping -> 'source_fields') source_field(value)
+  ) normalized;
   IF actual_input_shaping ? 'max_shaped_input_bytes'
      AND (
        jsonb_typeof(actual_input_shaping -> 'max_shaped_input_bytes') IS DISTINCT FROM 'number'
@@ -74,6 +100,41 @@ BEGIN
   END IF;
   IF jsonb_typeof(actual_decision_contract) IS DISTINCT FROM 'object' THEN
     RAISE EXCEPTION 'otlet decision_contract must be a JSON object';
+  END IF;
+  FOREACH contract_field IN ARRAY ARRAY['redact_output_fields', 'redact_action_fields', 'identity_fields'] LOOP
+    IF actual_decision_contract ? contract_field
+       AND (
+         jsonb_typeof(actual_decision_contract -> contract_field) IS DISTINCT FROM 'array'
+         OR jsonb_array_length(actual_decision_contract -> contract_field) > 64
+         OR EXISTS (
+           SELECT 1
+           FROM jsonb_array_elements(actual_decision_contract -> contract_field) item(value)
+           WHERE jsonb_typeof(item.value) IS DISTINCT FROM 'string'
+              OR NULLIF(item.value #>> '{}', '') IS NULL
+              OR octet_length(item.value #>> '{}') > 128
+         )
+       ) THEN
+      RAISE EXCEPTION 'otlet decision_contract.% must contain at most 64 non-empty field names', contract_field;
+    END IF;
+  END LOOP;
+  IF EXISTS (
+    SELECT 1
+    FROM jsonb_array_elements_text(
+      COALESCE(actual_decision_contract -> 'redact_output_fields', '[]'::jsonb)
+      || COALESCE(actual_decision_contract -> 'redact_action_fields', '[]'::jsonb)
+    ) redacted(field_name)
+    WHERE redacted.field_name = ANY(ARRAY[
+      'id', 'subject_id', 'entity_id', 'left_id', 'right_id', 'type', 'body',
+      'match', 'confidence', 'action_type', 'record_type', 'target', 'identity', 'changes'
+    ])
+       OR redacted.field_name IN (
+         SELECT identity.field_name
+         FROM jsonb_array_elements_text(
+           COALESCE(actual_decision_contract -> 'identity_fields', '[]'::jsonb)
+         ) identity(field_name)
+       )
+  ) THEN
+    RAISE EXCEPTION 'otlet evidence redaction cannot target identity or control fields';
   END IF;
   IF actual_runtime_options ? 'max_attempt_ms'
      AND (
@@ -179,11 +240,18 @@ DECLARE
   direct_subject_id text;
   completed_job_id bigint;
 BEGIN
+  IF jsonb_typeof(actual_input) IS DISTINCT FROM 'object' THEN
+    RAISE EXCEPTION 'otlet ask input must be a JSON object';
+  END IF;
   direct_task_name := 'ask_' || substr(md5(
     ask.model_name || chr(10) ||
     ask.instruction || chr(10) ||
     actual_schema::text || chr(10) ||
-    actual_options::text
+    actual_options::text || chr(10) ||
+    (
+      SELECT COALESCE(jsonb_agg(input_field ORDER BY input_field), '[]'::jsonb)::text
+      FROM jsonb_object_keys(actual_input) input_field
+    )
   ), 1, 24);
   direct_subject_id := 'ask_' || substr(md5(
     clock_timestamp()::text || chr(10) ||

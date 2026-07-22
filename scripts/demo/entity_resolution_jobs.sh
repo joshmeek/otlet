@@ -156,7 +156,7 @@ SELECT otlet.create_task(
   }'::jsonb,
   :'cheap_model_name',
   '{"max_tokens":256,"reasoning":"off","inference_cache":true,"generation_trace":true,"generation_trace_max_tokens":16,"generation_trace_top_k":3}'::jsonb,
-  '{"evidence_fields":["candidate_evidence"],"action_id_fields":{"left_id":"left_id","right_id":"right_id"}}'::jsonb,
+  '{"source_fields":["_otlet_mvcc","action_ids","candidate_evidence","evidence_counts"],"evidence_fields":["candidate_evidence"],"action_id_fields":{"left_id":"left_id","right_id":"right_id"}}'::jsonb,
   '{"preset":"entity_resolution_evidence_v1"}'::jsonb
 );
 
@@ -272,4 +272,3 @@ echo "accepted_output_anomalies=$accepted_output_anomalies"
   echo "Expected exactly one accepted output per completed job" >&2
   exit 1
 }
-

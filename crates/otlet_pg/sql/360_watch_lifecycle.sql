@@ -255,6 +255,13 @@ BEGIN
     FROM pg_class c
     JOIN pg_namespace n ON n.oid = c.relnamespace
     WHERE c.oid = create_watch.table_name;
+
+    actual_input_shaping := jsonb_set(
+      actual_input_shaping,
+      '{source_fields}',
+      '["_otlet_mvcc","row","table"]'::jsonb,
+      true
+    );
   ELSE
     actual_pair_sources := '[]'::jsonb;
 
@@ -479,4 +486,3 @@ BEGIN
   RETURN saved;
 END;
 $$;
-

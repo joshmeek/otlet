@@ -265,6 +265,7 @@ FROM otlet.create_task(
     "generation_trace_top_k": 3
   }'::jsonb,
   '{
+    "source_fields": ["_otlet_mvcc", "action_ids", "candidate_evidence", "evidence_counts"],
     "evidence_fields": ["candidate_evidence"],
     "action_id_fields": {"left_id": "left_id", "right_id": "right_id"}
   }'::jsonb,
@@ -303,7 +304,7 @@ The task contract includes:
 - `output_schema` is the JSON schema Otlet enforces before storing output
 - `model_name` chooses the cheap registered local model
 - `runtime_options` bound generation, tracing, and cache behavior
-- `input_shaping` names the evidence and action-ID fields
+- `input_shaping` allowlists source fields and names the evidence and action-ID fields
 - `decision_contract` loads the immutable entity-resolution evidence rules
 - `model_selection_policies` chooses the stronger registered local model for escalation
 

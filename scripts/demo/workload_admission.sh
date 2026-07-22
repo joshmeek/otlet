@@ -161,7 +161,8 @@ SELECT otlet.create_task(
     'SELECT i::text AS subject_id, jsonb_build_object(''value'', i) AS input FROM generate_series(1, 3) AS g(i)',
     'Admission row cap',
     '{"type":"object"}'::jsonb,
-    :'model_name'
+    :'model_name',
+    input_shaping => '{"source_fields":["value"]}'::jsonb
   );
 UPDATE otlet.production_policy
 SET max_admission_rows = 2,
@@ -195,7 +196,8 @@ SELECT otlet.create_task(
     'SELECT ''large''::text AS subject_id, jsonb_build_object(''payload'', repeat(''x'', 100)) AS input',
     'Admission input cap',
     '{"type":"object"}'::jsonb,
-    :'model_name'
+    :'model_name',
+    input_shaping => '{"source_fields":["payload"]}'::jsonb
   );
 UPDATE otlet.production_policy
 SET max_input_bytes_per_job = 64
@@ -228,7 +230,8 @@ SELECT otlet.create_task(
     'SELECT i::text AS subject_id, jsonb_build_object(''payload'', repeat(''x'', 50)) AS input FROM generate_series(1, 2) AS g(i)',
     'Admission model byte cap',
     '{"type":"object"}'::jsonb,
-    :'model_name'
+    :'model_name',
+    input_shaping => '{"source_fields":["payload"]}'::jsonb
   );
 UPDATE otlet.production_policy
 SET max_input_bytes_per_job = 1000,
@@ -263,7 +266,8 @@ SELECT otlet.create_task(
     NULL,
     'Existing total bytes',
     '{"type":"object"}'::jsonb,
-    :'strong_model_name'
+    :'strong_model_name',
+    input_shaping => '{"source_fields":["payload"]}'::jsonb
   );
 CREATE TEMP TABLE admission_total_candidate_created AS
 SELECT otlet.create_task(
@@ -271,7 +275,8 @@ SELECT otlet.create_task(
     'SELECT ''candidate''::text AS subject_id, jsonb_build_object(''payload'', repeat(''y'', 90)) AS input',
     'Candidate total bytes',
     '{"type":"object"}'::jsonb,
-    :'cheap_model_name'
+    :'cheap_model_name',
+    input_shaping => '{"source_fields":["payload"]}'::jsonb
   );
 UPDATE otlet.production_policy
 SET max_input_bytes_per_job = 200,

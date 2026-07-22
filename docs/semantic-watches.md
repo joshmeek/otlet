@@ -498,6 +498,7 @@ FROM otlet.create_watch(
   $$,
   record_type => 'learning_entity_pair',
   runtime_options => '{"max_tokens":160,"reasoning":"off"}'::jsonb,
+  input_shaping => '{"source_fields":["_otlet_mvcc","left","right"]}'::jsonb,
   trigger_policy => '{"on_change":"mark_stale"}'::jsonb,
   max_candidate_rows => 10,
   pair_sources => '[{"table":"public.learning_entity","subject_column":"id"}]'::jsonb
@@ -610,7 +611,7 @@ SELECT jsonb_pretty(otlet.export_watch('learning_entity_pair_idx'));
   "trigger_policy": {"on_change": "mark_stale"},
   "action_types": [],
   "stale_policy": "refresh_then_fail_closed",
-  "input_shaping": {},
+  "input_shaping": {"source_fields": ["_otlet_mvcc", "left", "right"]},
   "decision_contract": {},
   "max_candidate_rows": 10,
   "input_columns": null,

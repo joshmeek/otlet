@@ -287,7 +287,8 @@ FROM otlet.create_task(
   'Return exactly this JSON object: {"output":{"status":"ok"},"actions":[]}',
   '{"type":"object","required":["status"],"additionalProperties":false,"properties":{"status":{"enum":["ok"]}}}'::jsonb,
   'qwen3_1_7b',
-  '{"max_tokens":64,"reasoning":"off"}'::jsonb
+  '{"max_tokens":64,"reasoning":"off"}'::jsonb,
+  '{"source_fields":["id","note"]}'::jsonb
 );
 ```
 
@@ -314,7 +315,8 @@ FROM otlet.create_task(
   'Lifecycle task used to show queued cancellation',
   '{"type":"object","required":["status"],"additionalProperties":false,"properties":{"status":{"enum":["ok"]}}}'::jsonb,
   'qwen3_1_7b',
-  '{}'::jsonb
+  '{}'::jsonb,
+  '{"source_fields":["kind"]}'::jsonb
 );
 
 INSERT INTO otlet.jobs (task_name, subject_id, input)

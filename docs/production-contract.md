@@ -178,6 +178,49 @@ SELECT * FROM otlet.cleanup_policy_state(false);
 COMMIT;
 ```
 
+Every task also has an explicit top-level source-field allowlist in `input_shaping.source_fields`. A missing allowlist becomes an empty array, so `{}` is the only admitted input until the owner names fields. `create_task`, `run_task`, `admit_task_input`, watch refresh, direct job insertion, and claim all enforce the same contract. Row watches store their selected column list when the watch is created; a later table column does not enter model input by accident
+
+```sql
+SELECT name, input_shaping -> 'source_fields' AS source_fields
+FROM otlet.tasks
+ORDER BY name;
+```
+
+The production policy bounds each stored evidence family before a write can commit:
+
+```sql
+SELECT max_raw_output_bytes,
+       max_structured_output_bytes,
+       max_actions_per_job,
+       max_action_bytes,
+       max_trace_bytes,
+       max_error_bytes,
+       max_event_message_bytes,
+       max_event_detail_bytes,
+       max_receipt_bytes
+FROM otlet.production_policy_status;
+```
+
+Oversized evidence raises an error before output, action, event, or receipt storage. Use `decision_contract.redact_output_fields` and `decision_contract.redact_action_fields` for recursive structured redaction. `identity_fields` names workload-specific identifiers that redaction must preserve; Otlet also protects its built-in action and control identifiers
+
+```sql
+SELECT otlet.create_task(
+  task_name => 'redacted_review',
+  input_query => NULL,
+  instruction => 'Return a review decision',
+  output_schema => '{"type":"object"}',
+  model_name => 'qwen3_1_7b',
+  input_shaping => '{"source_fields":["case_id","note"]}',
+  decision_contract => '{
+    "redact_output_fields":["note"],
+    "redact_action_fields":["reason"],
+    "identity_fields":["case_id"]
+  }'
+);
+```
+
+`otlet.operational_event_log` exposes event type, task and model identity, status, reason, counts, timing, byte limits, and redaction state without the raw event message or detail document. Auditor exports add structured and action redaction state without exposing job input, source rows, raw model text, or full traces
+
 ### Step 3b - Performance Ratios
 
 `production_status` exposes trusted-output and model-work ratios. The demo prints them as one contract line:
@@ -223,7 +266,7 @@ SELECT count(*) FROM otlet.verify_invariants();
 
 Contract: `0` (demo prints `invariant_contract=0`). The suite fails closed on expired or NULL leases for `running` and `cancel_requested` jobs, complete receipts without schema pass, sensitive evidence that violates the active storage policy, materializations missing `source_hash`, and error runtime slots. `production_status` and `verify_invariants` name the receipt invariant `complete_receipts_are_schema_validated`; throughput views use `completed_jobs` and `last_batch_completed_jobs`. Step 6 of `docs/semantic-watches.md` anchors the planner vocabulary for `selected_path` / `Planner Selected Path` and `freshness_basis`
 
-Operators query redacted, read-only projections through `otlet.audit_receipt_export`, `otlet.audit_review_export`, `otlet.audit_action_execution_export`, `otlet.audit_eval_label_export`, `otlet.semantic_dependency_audit`, and `otlet.worker_batch_timing_status`. `otlet.redaction_policy_status` lists withheld fields
+Operators query redacted, read-only projections through `otlet.audit_receipt_export`, `otlet.audit_review_export`, `otlet.audit_action_execution_export`, `otlet.audit_eval_label_export`, `otlet.semantic_dependency_audit`, `otlet.operational_event_log`, and `otlet.worker_batch_timing_status`. `otlet.redaction_policy_status` lists withheld fields
 
 ## Step 4 - Grant Role-Scoped Access
 
@@ -248,6 +291,7 @@ The auditor capability grants these redacted policy and audit views:
 - `otlet.audit_action_execution_export`
 - `otlet.audit_eval_label_export`
 - `otlet.semantic_dependency_audit`
+- `otlet.operational_event_log`
 - `otlet.worker_batch_timing_status`
 
 The grant also includes three pure JSON hashing helpers required by `audit_review_export`; those helpers read no database rows. The operator capability includes auditor access plus these functions:
@@ -271,10 +315,10 @@ Check the installed policy:
 SELECT * FROM otlet.access_policy_status;
 ```
 
-The demo proves the catalog ACLs, eight auditor views, nine operator function grants, seven successful operator paths, and 48 denied paths:
+The demo proves the catalog ACLs, nine auditor views, nine operator function grants, seven successful operator paths, and 48 denied paths:
 
 ```text
-permission_contract=public=0/0/0|auditor=8/3|operator=8/9|definer=8/8|positive=7|denied=48
+permission_contract=public=0/0/0|auditor=9/3|operator=9/9|definer=8/8|positive=7|denied=48
 ```
 
 Your application still owns these deployment boundaries:

@@ -217,7 +217,8 @@ SELECT otlet.create_task(
   'Return JSON only: {"output":{"status":"ok"},"actions":[]}',
   '{"type":"object","required":["status"],"additionalProperties":false,"properties":{"status":{"enum":["ok"]}}}'::jsonb,
   :'model_name',
-  '{"max_tokens":4096,"reasoning":"off","inference_cache":false}'::jsonb
+  '{"max_tokens":4096,"reasoning":"off","inference_cache":false}'::jsonb,
+  '{"source_fields":["payload"]}'::jsonb
 );
 SELECT otlet.run_task(:'task_name');
 SQL

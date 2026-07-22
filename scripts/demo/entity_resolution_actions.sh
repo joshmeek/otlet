@@ -152,7 +152,8 @@ BEGIN
     'Return JSON only.',
     '{"type":"object","required":["match","confidence"],"additionalProperties":false,"properties":{"match":{"enum":["same_entity","different_entity"]},"confidence":{"enum":["high"]}}}'::jsonb,
     model_name_value,
-    '{"max_tokens":32,"reasoning":"off","inference_cache":false}'::jsonb
+    '{"max_tokens":32,"reasoning":"off","inference_cache":false}'::jsonb,
+    '{"source_fields":["action_ids"]}'::jsonb
   );
 
   INSERT INTO otlet.jobs (task_name, subject_id, input, status, attempts, started_at, leased_until)
@@ -299,4 +300,3 @@ echo "dry_run_source_identity_contract=$dry_run_source_identity_contract"
   echo "Expected dry-run source identity failure after edit and pass after revert, got $dry_run_source_identity_contract" >&2
   exit 1
 }
-

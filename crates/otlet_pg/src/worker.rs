@@ -482,7 +482,8 @@ fn ensure_inline_task(request: &crate::infer_now::InferNowRequest) -> Result<(),
                          COALESCE((SELECT t->>'instruction' FROM src), ''), \
                          COALESCE((SELECT t->'output_schema' FROM src), '{\"type\":\"object\"}'::jsonb), \
                          COALESCE((SELECT t->>'model_name' FROM src), ''), \
-                         COALESCE((SELECT t->'runtime_options' FROM src), '{}'::jsonb) \
+                         COALESCE((SELECT t->'runtime_options' FROM src), '{}'::jsonb), \
+                         COALESCE((SELECT t->'input_shaping' FROM src), '{\"source_fields\":[]}'::jsonb) \
                        )::text \
                      ) \
                      ELSE NULL \

@@ -115,7 +115,7 @@ SELECT otlet.create_task(
   }'::jsonb,
   :'model_name',
   '{"max_tokens":96,"reasoning":"off","inference_cache":false}'::jsonb,
-  '{}'::jsonb,
+  '{"source_fields":["row"]}'::jsonb,
   '{"answer_field":"decision","abstain_values":["unclear"],"confidence_field":"confidence","accepted_confidence":["high"],"enforce_on_direct":true}'::jsonb
 );
 
@@ -175,7 +175,7 @@ WITH params AS (
       }
     }'::jsonb AS output_schema,
     '{"max_tokens":256,"reasoning":"off","inference_cache":false}'::jsonb AS runtime_options,
-    '{"evidence_fields":["candidate_evidence"],"action_id_fields":{"left_id":"left_id","right_id":"right_id"}}'::jsonb AS input_shaping
+    '{"source_fields":["candidate_evidence","left_id","right_id"],"evidence_fields":["candidate_evidence"],"action_id_fields":{"left_id":"left_id","right_id":"right_id"}}'::jsonb AS input_shaping
 )
 SELECT otlet.create_task(
   :'preset_task',
@@ -215,7 +215,7 @@ WITH params AS (
       }
     }'::jsonb AS output_schema,
     '{"max_tokens":256,"reasoning":"off","inference_cache":false}'::jsonb AS runtime_options,
-    '{"evidence_fields":["candidate_evidence"],"action_id_fields":{"left_id":"left_id","right_id":"right_id"}}'::jsonb AS input_shaping
+    '{"source_fields":["candidate_evidence","left_id","right_id"],"evidence_fields":["candidate_evidence"],"action_id_fields":{"left_id":"left_id","right_id":"right_id"}}'::jsonb AS input_shaping
 )
 SELECT otlet.create_task(
   :'direct_task',
@@ -289,7 +289,7 @@ SELECT otlet.create_task(
   output_schema,
   :'model_name',
   runtime_options,
-  '{}'::jsonb,
+  '{"source_fields":["_otlet_mvcc","row"]}'::jsonb,
   '{"answer_field":"status","abstain_values":[],"confidence_field":"confidence","accepted_confidence":["high"]}'::jsonb
 )
 FROM params;
@@ -310,7 +310,7 @@ SELECT otlet.create_task(
   output_schema,
   :'model_name',
   runtime_options,
-  '{}'::jsonb,
+  '{"source_fields":["row"]}'::jsonb,
   '{"answer_field":"status","abstain_values":[],"confidence_field":"confidence","accepted_confidence":["high"]}'::jsonb
 )
 FROM params;
@@ -325,7 +325,7 @@ SELECT otlet.create_task(
   '{"type":"object","required":["status","confidence"],"additionalProperties":false,"properties":{"status":{"enum":["truncated"]},"confidence":{"enum":["high"]}}}'::jsonb,
   :'model_name',
   '{"max_tokens":64,"reasoning":"off","inference_cache":false}'::jsonb,
-  '{"max_shaped_input_bytes":256}'::jsonb,
+  '{"source_fields":["row"],"max_shaped_input_bytes":256}'::jsonb,
   '{"answer_field":"status","abstain_values":["truncated"],"confidence_field":"confidence","accepted_confidence":["high"]}'::jsonb
 );
 
