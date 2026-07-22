@@ -330,7 +330,7 @@ Custom Scan (Otlet Semantic Source CustomScan) on public.otlet_demo_semantic_ven
 
 The child scan reads the source table. Otlet strips the semantic predicate from the child plan and evaluates it against preloaded semantic state
 
-CustomScan uses statement preload semantics. Row-marked queries such as `FOR UPDATE` stay on the standard Postgres plan because Otlet blocks the CustomScan planner path when queries include rowmarks; Postgres still owns locking and row recheck behavior. For non-rowmark CustomScan, stale triggers and the next statement pick up concurrent source changes instead of a per-tuple recheck inside that scan
+CustomScan uses statement preload semantics. Row-marked queries such as `FOR UPDATE` and correlated `LATERAL` relations stay on the standard Postgres plan. Otlet blocks CustomScan for both shapes so Postgres owns locking, parameter propagation, rescans, and row rechecks. For supported CustomScan plans, stale triggers and the next statement pick up concurrent source changes instead of a per-tuple recheck inside that scan
 
 ## Step 8 - Fail Closed On Stale Rows
 
