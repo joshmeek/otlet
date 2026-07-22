@@ -440,6 +440,8 @@ Failure records a raw-output hash, a non-sensitive error, and an attempt receipt
 
 Events show worker behavior. Receipts show model behavior
 
+The portable worker emits one `preflight_passed` event before model load or claims. A failed explicit `--preflight` emits `preflight_failed` with one stable dependency code and no connection string, credential, prompt, or source value
+
 ```sql
 SELECT event_type, count(*)
 FROM otlet.worker_events e

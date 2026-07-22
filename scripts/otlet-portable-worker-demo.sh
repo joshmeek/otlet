@@ -55,6 +55,8 @@ start_recovery_worker() {
     -e "OTLET_MODEL_NAME=$model_name" \
     -e "OTLET_MODEL_PATH=$model_artifact" \
     -e "OTLET_MODEL_SHA256=$model_sha256" \
+    -e OTLET_PORTABLE_REQUIRE_TLS=0 \
+    -e OTLET_PORTABLE_EGRESS_MODE=deny_model_providers \
     -e OTLET_PORTABLE_POLL_MS=100 \
     -e OTLET_PORTABLE_RENEW_MS=250 \
     -e "OTLET_LLAMA_THREADS=${OTLET_LLAMA_THREADS:-4}" \
@@ -234,6 +236,8 @@ if ! docker exec \
   -e "OTLET_MODEL_NAME=$model_name" \
   -e "OTLET_MODEL_PATH=$model_artifact" \
   -e "OTLET_MODEL_SHA256=$model_sha256" \
+  -e OTLET_PORTABLE_REQUIRE_TLS=0 \
+  -e OTLET_PORTABLE_EGRESS_MODE=deny_model_providers \
   -e OTLET_PORTABLE_ONCE=1 \
   -e "OTLET_LLAMA_THREADS=${OTLET_LLAMA_THREADS:-4}" \
   "$container" /target/release/otlet_worker --once >"$worker_log" 2>&1; then

@@ -2,8 +2,9 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::ffi::CString;
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
+use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{
@@ -46,6 +47,10 @@ struct Config {
     poll_interval: Duration,
     renew_interval: Duration,
     once: bool,
+    preflight_only: bool,
+    require_tls: bool,
+    runtime_dir: PathBuf,
+    egress_mode: String,
 }
 
 impl Config {
@@ -67,6 +72,7 @@ impl Config {
             .clamp(100, 60_000);
         let once = std::env::args().any(|arg| arg == "--once")
             || env_bool("OTLET_PORTABLE_ONCE").unwrap_or(false);
+        let preflight_only = std::env::args().any(|arg| arg == "--preflight");
         let renew_ms = std::env::var("OTLET_PORTABLE_RENEW_MS")
             .ok()
             .map(|value| value.parse::<u64>())
@@ -87,6 +93,17 @@ impl Config {
             poll_interval: Duration::from_millis(poll_ms),
             renew_interval: Duration::from_millis(renew_ms),
             once,
+            preflight_only,
+            require_tls: env_bool_default("OTLET_PORTABLE_REQUIRE_TLS", true)?,
+            runtime_dir: PathBuf::from(
+                std::env::var("OTLET_PORTABLE_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".to_owned()),
+            ),
+            egress_mode: std::env::var("OTLET_PORTABLE_EGRESS_MODE").map_err(|_| {
+                coded(
+                    "egress_policy_missing",
+                    "OTLET_PORTABLE_EGRESS_MODE is required",
+                )
+            })?,
         })
     }
 }
@@ -162,7 +179,7 @@ impl Database {
         let model_status = model_status.map_or_else(|| "NULL".to_owned(), sql_text);
         let error_code = error_code.map_or_else(|| "NULL".to_owned(), sql_text);
         let sql = format!(
-            "SELECT desired_state FROM otlet.portable_worker_heartbeat({}, {}, {}, {}, {}, {});\n",
+            "SELECT desired_state, registered_model_name FROM otlet.portable_worker_heartbeat({}, {}, {}, {}, {}, {});\n",
             sql_text(&config.worker_id),
             config.protocol_version,
             sql_text(&config.runtime_identity_hash),
@@ -172,11 +189,69 @@ impl Database {
         );
         let rows = self.query(&sql)?;
         match rows.as_slice() {
-            [state] => Ok(state.clone()),
+            [row] => {
+                let Some((state, model_name)) = row.split_once('|') else {
+                    return Err(coded(
+                        "database_contract_invalid",
+                        "portable heartbeat returned an invalid row",
+                    ));
+                };
+                if model_name != config.model_name {
+                    return Err(coded(
+                        "model_not_allowlisted",
+                        "portable worker is registered for another model",
+                    ));
+                }
+                Ok(state.to_owned())
+            }
             _ => Err(format!(
                 "portable heartbeat returned unexpected state: {rows:?}"
             )),
         }
+    }
+
+    fn preflight_contract(&self, config: &Config) -> Result<(), String> {
+        let sql = format!(
+            "WITH rpc AS (\
+               SELECT count(*) AS functions, \
+                      count(*) FILTER (WHERE p.prosecdef) AS definers, \
+                      count(*) FILTER (WHERE p.proconfig @> ARRAY['search_path=pg_catalog, otlet, pg_temp']) AS fixed_paths, \
+                      count(*) FILTER (WHERE pg_catalog.has_function_privilege(current_user, p.oid, 'EXECUTE')) AS executable \
+               FROM pg_catalog.pg_proc p \
+               JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace \
+               WHERE n.nspname = 'otlet' \
+                 AND p.proname IN (\
+                   'portable_claim_jobs', 'portable_renew_job', 'portable_record_attempt', \
+                   'portable_complete_job', 'portable_fail_job', 'portable_cancel_job', \
+                   'portable_worker_heartbeat'\
+                 )\
+             ), protocol AS (\
+               SELECT count(*) AS compatible \
+               FROM otlet.portable_protocol_status \
+               WHERE protocol_version = {} AND status = 'active'\
+             ) \
+             SELECT rpc.functions, rpc.definers, rpc.fixed_paths, rpc.executable, protocol.compatible \
+             FROM rpc CROSS JOIN protocol;\n",
+            config.protocol_version
+        );
+        match self.query(&sql)?.as_slice() {
+            [row] if row == "7|7|7|7|1" => Ok(()),
+            [row] if row.ends_with("|0") => Err(coded(
+                "protocol_incompatible",
+                "portable protocol version is not active",
+            )),
+            _ => Err(coded(
+                "database_contract_missing",
+                "portable worker functions or grants are incomplete",
+            )),
+        }
+    }
+
+    fn tls_active(&self) -> Result<bool, String> {
+        let rows = self.query(
+            "SELECT ssl::text FROM pg_catalog.pg_stat_ssl WHERE pid = pg_catalog.pg_backend_pid();\n",
+        )?;
+        Ok(rows.as_slice() == ["true"])
     }
 
     fn claim(&self, config: &Config) -> Result<Vec<Claim>, String> {
@@ -975,16 +1050,179 @@ fn runtime_identity() -> Value {
     })
 }
 
+fn deployment_preflight(database: &Database, config: &Config) -> Result<String, String> {
+    if config.egress_mode != "deny_model_providers" {
+        return Err(coded(
+            "egress_policy_invalid",
+            "OTLET_PORTABLE_EGRESS_MODE must be deny_model_providers",
+        ));
+    }
+    check_runtime_dir(&config.runtime_dir)?;
+    check_database_endpoint(&config.database_url)?;
+    if config.require_tls {
+        check_tls_parameters(&config.database_url)?;
+    }
+
+    let desired = database.heartbeat(config, "starting", Some("verifying"), None)?;
+    database.preflight_contract(config)?;
+    if config.require_tls && !database.tls_active()? {
+        return Err(coded(
+            "tls_not_active",
+            "database connection did not negotiate TLS",
+        ));
+    }
+
+    let actual_hash = sha256_file(&config.model_path)
+        .map_err(|_| coded("model_artifact_unreadable", "local GGUF is not readable"))?;
+    if actual_hash != config.model_sha256 {
+        return Err(coded(
+            "model_hash_mismatch",
+            "local GGUF SHA-256 does not match OTLET_MODEL_SHA256",
+        ));
+    }
+    Ok(desired)
+}
+
+fn check_database_endpoint(database_url: &str) -> Result<(), String> {
+    let (host, port) = database_endpoint(database_url)?;
+    let addresses: Vec<_> = (host.as_str(), port)
+        .to_socket_addrs()
+        .map_err(|_| coded("dns_resolution_failed", "database hostname did not resolve"))?
+        .collect();
+    if addresses.is_empty() {
+        return Err(coded(
+            "dns_resolution_failed",
+            "database hostname did not resolve",
+        ));
+    }
+    if addresses
+        .iter()
+        .any(|address| TcpStream::connect_timeout(address, Duration::from_secs(2)).is_ok())
+    {
+        Ok(())
+    } else {
+        Err(coded(
+            "database_unreachable",
+            "database TCP endpoint is unreachable",
+        ))
+    }
+}
+
+fn database_endpoint(database_url: &str) -> Result<(String, u16), String> {
+    let rest = database_url
+        .strip_prefix("postgresql://")
+        .or_else(|| database_url.strip_prefix("postgres://"))
+        .ok_or_else(|| {
+            coded(
+                "database_url_invalid",
+                "OTLET_DATABASE_URL must use postgres:// or postgresql://",
+            )
+        })?;
+    let authority = rest.split(['/', '?']).next().unwrap_or_default();
+    let endpoint = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, value)| value);
+    if endpoint.is_empty() {
+        return Err(coded(
+            "database_url_invalid",
+            "OTLET_DATABASE_URL has no database host",
+        ));
+    }
+    if let Some(bracketed) = endpoint.strip_prefix('[') {
+        let Some((host, suffix)) = bracketed.split_once(']') else {
+            return Err(coded(
+                "database_url_invalid",
+                "OTLET_DATABASE_URL has an invalid IPv6 host",
+            ));
+        };
+        let port = suffix
+            .strip_prefix(':')
+            .map(str::parse::<u16>)
+            .transpose()
+            .map_err(|_| coded("database_url_invalid", "database port is invalid"))?
+            .unwrap_or(5432);
+        return Ok((host.to_owned(), port));
+    }
+    let (host, port) = match endpoint.rsplit_once(':') {
+        Some((host, port)) if !host.contains(':') => (
+            host,
+            port.parse::<u16>()
+                .map_err(|_| coded("database_url_invalid", "database port is invalid"))?,
+        ),
+        _ => (endpoint, 5432),
+    };
+    if host.is_empty() {
+        return Err(coded(
+            "database_url_invalid",
+            "OTLET_DATABASE_URL has no database host",
+        ));
+    }
+    Ok((host.to_owned(), port))
+}
+
+fn check_tls_parameters(database_url: &str) -> Result<(), String> {
+    if connection_parameter(database_url, "sslmode") != Some("verify-full") {
+        return Err(coded(
+            "tls_mode_invalid",
+            "OTLET_DATABASE_URL must set sslmode=verify-full",
+        ));
+    }
+    let Some(root_cert) = connection_parameter(database_url, "sslrootcert") else {
+        return Err(coded(
+            "tls_ca_missing",
+            "OTLET_DATABASE_URL must set sslrootcert",
+        ));
+    };
+    File::open(root_cert)
+        .map(|_| ())
+        .map_err(|_| coded("tls_ca_unreadable", "database CA file is not readable"))
+}
+
+fn connection_parameter<'a>(database_url: &'a str, name: &str) -> Option<&'a str> {
+    database_url.split_once('?')?.1.split('&').find_map(|part| {
+        let (key, value) = part.split_once('=')?;
+        (key == name && !value.is_empty()).then_some(value)
+    })
+}
+
+fn check_runtime_dir(runtime_dir: &Path) -> Result<(), String> {
+    if !runtime_dir.is_dir() {
+        return Err(coded(
+            "runtime_path_unwritable",
+            "portable runtime directory does not exist",
+        ));
+    }
+    let probe = runtime_dir.join(format!(
+        ".otlet-preflight-{}-{}",
+        std::process::id(),
+        timestamp_ms()
+    ));
+    let result = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&probe)
+        .and_then(|mut file| file.write_all(b"otlet preflight\n"))
+        .and_then(|()| std::fs::remove_file(&probe));
+    result.map_err(|_| {
+        let _ = std::fs::remove_file(&probe);
+        coded(
+            "runtime_path_unwritable",
+            "portable runtime directory is not writable",
+        )
+    })
+}
+
 fn main() {
     if std::env::args().any(|arg| arg == "--print-runtime-identity") {
         println!("{}", runtime_identity());
         return;
     }
+    let preflight_only = std::env::args().any(|arg| arg == "--preflight");
     if let Err(error) = run() {
         eprintln!(
             "{}",
             json!({
-                "event": "worker_error",
+                "event": if preflight_only { "preflight_failed" } else { "worker_error" },
                 "reason": error_code(&error),
                 "timestamp_ms": timestamp_ms()
             })
@@ -1000,33 +1238,17 @@ fn run() -> Result<(), String> {
         psql: config.psql.clone(),
     };
     let mut database_unavailable = false;
-    let desired = heartbeat_until_available(
-        &database,
-        &config,
-        "starting",
-        Some("verifying"),
-        &mut database_unavailable,
-    )?;
+    let desired =
+        deployment_preflight_until_available(&database, &config, &mut database_unavailable)?;
     if desired == "draining" {
-        database.heartbeat(&config, "drained", Some("unverified"), None)?;
+        database.heartbeat(&config, "drained", Some("verified"), None)?;
         log_worker("worker_drained", &config, None);
         return Ok(());
     }
-    let actual_hash = match sha256_file(&config.model_path) {
-        Ok(hash) => hash,
-        Err(error) => {
-            let _ = database.heartbeat(
-                &config,
-                "error",
-                Some("error"),
-                Some("model_artifact_unreadable"),
-            );
-            return Err(error);
-        }
-    };
-    if actual_hash != config.model_sha256 {
-        let _ = database.heartbeat(&config, "error", Some("error"), Some("model_hash_mismatch"));
-        return Err("local GGUF SHA-256 does not match OTLET_MODEL_SHA256".to_owned());
+    log_preflight(&config);
+    if config.preflight_only {
+        database.heartbeat(&config, "stopped", Some("verified"), None)?;
+        return Ok(());
     }
     heartbeat_until_available(
         &database,
@@ -1106,6 +1328,40 @@ fn run() -> Result<(), String> {
     Ok(())
 }
 
+fn deployment_preflight_until_available(
+    database: &Database,
+    config: &Config,
+    unavailable: &mut bool,
+) -> Result<String, String> {
+    loop {
+        match deployment_preflight(database, config) {
+            Ok(desired) => {
+                if *unavailable {
+                    log_worker("database_recovered", config, None);
+                    *unavailable = false;
+                }
+                return Ok(desired);
+            }
+            Err(error)
+                if !config.once
+                    && !config.preflight_only
+                    && is_preflight_connection_error(&error) =>
+            {
+                if !*unavailable {
+                    log_worker("database_unavailable", config, Some(error_code(&error)));
+                    *unavailable = true;
+                }
+                thread::sleep(config.poll_interval);
+            }
+            Err(error) => {
+                let reason = error_code(&error);
+                let _ = database.heartbeat(config, "error", Some("error"), Some(reason));
+                return Err(error);
+            }
+        }
+    }
+}
+
 fn heartbeat_until_available(
     database: &Database,
     config: &Config,
@@ -1165,6 +1421,21 @@ fn log_worker(event: &str, config: &Config, reason: Option<&str>) {
     );
 }
 
+fn log_preflight(config: &Config) {
+    eprintln!(
+        "{}",
+        json!({
+            "event": "preflight_passed",
+            "worker_id": config.worker_id,
+            "model_name": config.model_name,
+            "protocol_version": config.protocol_version,
+            "tls_required": config.require_tls,
+            "egress_mode": config.egress_mode,
+            "timestamp_ms": timestamp_ms()
+        })
+    );
+}
+
 fn timestamp_ms() -> u128 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1209,6 +1480,22 @@ fn env_bool(name: &str) -> Option<bool> {
     }
 }
 
+fn env_bool_default(name: &str, default: bool) -> Result<bool, String> {
+    match std::env::var(name) {
+        Ok(_) => env_bool(name).ok_or_else(|| {
+            coded(
+                "configuration_invalid",
+                &format!("{name} must be a boolean"),
+            )
+        }),
+        Err(std::env::VarError::NotPresent) => Ok(default),
+        Err(_) => Err(coded(
+            "configuration_invalid",
+            &format!("{name} is not valid UTF-8"),
+        )),
+    }
+}
+
 fn is_sha256(value: &str) -> bool {
     value.len() == 64
         && value
@@ -1241,8 +1528,38 @@ fn is_claim_loss(error: &str) -> bool {
         || error.contains("identity is not authorized")
 }
 
-fn error_code(error: &str) -> &'static str {
-    if is_connection_error(error) {
+fn is_preflight_connection_error(error: &str) -> bool {
+    is_connection_error(error)
+        || matches!(
+            error_code(error),
+            "database_unreachable" | "dns_resolution_failed" | "database_unavailable"
+        )
+}
+
+fn coded(code: &str, message: &str) -> String {
+    format!("otlet_error:{code}:{message}")
+}
+
+fn error_code(error: &str) -> &str {
+    let lower = error.to_ascii_lowercase();
+    if let Some((code, _)) = error
+        .strip_prefix("otlet_error:")
+        .and_then(|value| value.split_once(':'))
+    {
+        code
+    } else if lower.contains("password authentication failed") {
+        "credentials_rejected"
+    } else if lower.contains("certificate") || lower.contains("ssl") {
+        "tls_verification_failed"
+    } else if lower.contains("identity is not authorized") {
+        "runtime_not_allowlisted"
+    } else if lower.contains("protocol version") && lower.contains("incompatible") {
+        "protocol_incompatible"
+    } else if lower.contains("permission denied") {
+        "database_contract_denied"
+    } else if lower.contains("could not start psql") {
+        "psql_unavailable"
+    } else if is_connection_error(error) {
         "database_unavailable"
     } else if is_claim_loss(error) {
         "claim_lost"
@@ -1285,6 +1602,51 @@ mod tests {
         let error = "psql failed: connection to server failed: Connection refused";
         assert!(is_connection_error(error));
         assert_eq!(error_code(error), "database_unavailable");
+    }
+
+    #[test]
+    fn database_urls_yield_dns_endpoint_and_tls_settings() {
+        let url = "postgresql://worker:secret@database.example:6432/app?sslmode=verify-full&sslrootcert=/run/ca.crt";
+        assert_eq!(
+            database_endpoint(url),
+            Ok(("database.example".to_owned(), 6432))
+        );
+        assert_eq!(connection_parameter(url, "sslmode"), Some("verify-full"));
+        assert_eq!(
+            connection_parameter(url, "sslrootcert"),
+            Some("/run/ca.crt")
+        );
+    }
+
+    #[test]
+    fn database_urls_support_defaults_and_bracketed_ipv6() {
+        assert_eq!(
+            database_endpoint("postgres://database.example/app"),
+            Ok(("database.example".to_owned(), 5432))
+        );
+        assert_eq!(
+            database_endpoint("postgresql://worker@[2001:db8::1]:6432/app"),
+            Ok(("2001:db8::1".to_owned(), 6432))
+        );
+        assert_eq!(
+            error_code(&database_endpoint("https://database/app").unwrap_err()),
+            "database_url_invalid"
+        );
+    }
+
+    #[test]
+    fn explicit_preflight_codes_survive_redaction() {
+        assert_eq!(
+            error_code(&coded(
+                "model_hash_mismatch",
+                "configured digest did not match"
+            )),
+            "model_hash_mismatch"
+        );
+        assert_eq!(
+            error_code("psql: SSL error: certificate verify failed"),
+            "tls_verification_failed"
+        );
     }
 
     #[test]

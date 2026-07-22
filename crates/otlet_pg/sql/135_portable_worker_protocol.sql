@@ -45,7 +45,7 @@ CREATE TABLE otlet.portable_workers (
     )
   ),
   model_status text NOT NULL DEFAULT 'unverified' CHECK (
-    model_status IN ('unverified', 'verifying', 'loading', 'ready', 'error')
+    model_status IN ('unverified', 'verifying', 'verified', 'loading', 'ready', 'error')
   ),
   last_error_code text CHECK (
     last_error_code IS NULL OR last_error_code ~ '^[a-z0-9][a-z0-9_.-]{0,127}$'
@@ -342,7 +342,7 @@ CREATE FUNCTION otlet.portable_worker_heartbeat(
   reported_state text,
   model_status text DEFAULT NULL,
   error_code text DEFAULT NULL
-) RETURNS TABLE (desired_state text)
+) RETURNS TABLE (desired_state text, registered_model_name text)
 LANGUAGE plpgsql
 SECURITY DEFINER
 SET search_path = pg_catalog, otlet, pg_temp
@@ -357,7 +357,7 @@ BEGIN
   END IF;
   IF portable_worker_heartbeat.model_status IS NOT NULL
      AND portable_worker_heartbeat.model_status NOT IN (
-       'unverified', 'verifying', 'loading', 'ready', 'error'
+       'unverified', 'verifying', 'verified', 'loading', 'ready', 'error'
      ) THEN
     RAISE EXCEPTION 'otlet portable worker model status is invalid';
   END IF;
@@ -383,7 +383,7 @@ BEGIN
       END,
       updated_at = now()
   WHERE w.worker_id = worker_row.worker_id
-  RETURNING w.desired_state INTO desired_state;
+  RETURNING w.desired_state, w.model_name INTO desired_state, registered_model_name;
   RETURN NEXT;
 END;
 $$;

@@ -43,19 +43,34 @@ The worker role receives schema usage, one protocol compatibility view, and seve
 ## Run One Worker
 
 ```sh
-export OTLET_DATABASE_URL='postgresql://otlet_worker:replace-me@database.example:5432/app?sslmode=verify-full'
+export OTLET_DATABASE_URL='postgresql://otlet_worker:replace-me@database.example:5432/app?sslmode=verify-full&sslrootcert=/run/secrets/database-ca.pem'
 export OTLET_PORTABLE_WORKER_ID='customer-vpc-worker'
 export OTLET_PORTABLE_PROTOCOL_VERSION='1'
 export OTLET_PORTABLE_RUNTIME_IDENTITY_HASH='registered-runtime-identity-sha256'
 export OTLET_MODEL_NAME='qwen35_4b'
 export OTLET_MODEL_PATH='/models/Qwen3.5-4B-Q4_K_M.gguf'
 export OTLET_MODEL_SHA256='registered-model-sha256'
+export OTLET_PORTABLE_RUNTIME_DIR='/tmp'
+export OTLET_PORTABLE_REQUIRE_TLS='1'
+export OTLET_PORTABLE_EGRESS_MODE='deny_model_providers'
 export OTLET_PORTABLE_RENEW_MS='1000'
 
 otlet_worker
 ```
 
-The process verifies the GGUF digest before loading it. PostgreSQL assembles the exact prompt from the shaped snapshot and task contract, then recomputes and validates the terminal identities, schema result, output, actions, and receipt lineage
+The process runs deployment preflight before it can claim work, then verifies the GGUF digest before loading it. PostgreSQL assembles the exact prompt from the shaped snapshot and task contract, then recomputes and validates the terminal identities, schema result, output, actions, and receipt lineage
+
+## Run Deployment Preflight
+
+Run the same image, mounts, network, and environment with `--preflight` before starting the supervised worker:
+
+```sh
+otlet_worker --preflight
+```
+
+A passing preflight resolves and reaches the database, negotiates hostname-verified TLS with the configured CA, authenticates the dedicated role, checks all seven worker RPCs and the exact protocol version, verifies the runtime and model registrations, hashes the local GGUF, probes the runtime directory, and requires the declared `deny_model_providers` egress policy. It exits before loading llama.cpp or claiming a job
+
+Failures are one-line JSON with a stable reason such as `dns_resolution_failed`, `database_unreachable`, `tls_verification_failed`, `credentials_rejected`, `database_contract_missing`, `protocol_incompatible`, `runtime_not_allowlisted`, `model_not_allowlisted`, `model_hash_mismatch`, or `runtime_path_unwritable`. The deployment must enforce the declared egress policy; the worker has no remote model client to test
 
 ## Pause, Drain, And Recover
 
@@ -93,3 +108,11 @@ After `./scripts/otlet-setup.sh` has placed the demo GGUF in Docker, run:
 ```
 
 The script creates a disposable SQL-only database, builds the worker, runs real local inference, and checks trusted receipt lineage. It also proves pause, resume, cancellation, claim loss, process restart, database restart, reclaim, duplicate delivery, drain, source denial, and redacted structured logs before dropping the database and role
+
+Run the isolated deployment-preflight proof separately:
+
+```sh
+./scripts/otlet-portable-preflight-demo.sh
+```
+
+It starts a TLS-enabled disposable PostgreSQL on an internal-only Docker network, proves a valid configuration leaves a queued job unclaimed, then breaks DNS, reachability, TLS, credentials, grants, protocol, runtime identity, model registration, artifact access, runtime storage, egress declaration, and client availability one dependency at a time
