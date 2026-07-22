@@ -687,6 +687,40 @@ FROM otlet.rollback_watch_pack(
 
 Rollback appends a new version with the restored canonical content. Prior rows remain immutable, so the history records both the superseded pack and the rollback
 
+### Evaluate a pack version
+
+Portable labels use workload and case keys, task and subject identity, expected answer and action, and a positive case weight. They do not contain a source row. Export rows can be aggregated to JSON and imported directly:
+
+```sql
+SELECT jsonb_agg(to_jsonb(c)) AS cases
+FROM otlet.export_eval_cases(10000) c
+WHERE workload_name = 'entity_resolution_release' \gset
+
+SELECT otlet.import_eval_cases(:'cases'::jsonb);
+```
+
+Evaluate a candidate against a named baseline with exact receipt and pack identities:
+
+```sql
+SELECT gate_status
+FROM otlet.evaluate_workload(
+  'entity_resolution_v2',
+  'entity_resolution_release',
+  'entity_resolution_v1',
+  '{
+    "model_name":"qwen35_4b",
+    "prompt_version":"prompt-sha256-v2",
+    "schema_version":"schema-sha256-v2",
+    "runtime_version":"runtime-fingerprint-v2",
+    "pack_name":"learning_entity_pair_idx",
+    "pack_version":2
+  }'::jsonb,
+  '{"max_quality_regression":0.01,"max_latency_regression_ms":250}'::jsonb
+);
+```
+
+`otlet.workload_evaluation_status` exposes the weighted metrics, normalized thresholds, per-metric results, baseline deltas, and model, prompt, schema, runtime, and pack change flags. Evaluation rows are immutable
+
 The Docker demo proves nonmutating lint, canonical dry run, stable semantic diff, immutable history, exact rollback, replacement, drop/import round trip, lookup preservation, trigger preservation, and ten rejected documents:
 
 ```text
@@ -694,4 +728,5 @@ watch_pack_contract=true|true|true|true|true|true|true|true|true|true|true|true|
 watch_replace_contract=true|true|true|true|true|true|true|true|true|true
 watch_import_failure_contract=10|true
 watch_round_trip_contract=true|true|true|true|true
+workload_evaluation_contract=true|true|true|true|true|true|true|true|true
 ```

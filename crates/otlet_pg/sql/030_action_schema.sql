@@ -154,6 +154,10 @@ CREATE TABLE otlet.eval_labels (
   action_id bigint REFERENCES otlet.actions(id),
   output_id bigint REFERENCES otlet.outputs(id),
   receipt_id bigint REFERENCES otlet.inference_receipts(id),
+  workload_name text,
+  case_key text,
+  case_weight numeric NOT NULL DEFAULT 1 CHECK (case_weight > 0),
+  task_name text,
   source_table text,
   subject_id text NOT NULL,
   source_hash text,
@@ -187,6 +191,45 @@ WHERE label_source = 'manual_correction' AND receipt_id IS NOT NULL;
 
 CREATE INDEX eval_labels_created_at_idx
 ON otlet.eval_labels (created_at, id);
+
+CREATE UNIQUE INDEX eval_labels_workload_case_idx
+ON otlet.eval_labels (workload_name, case_key)
+WHERE workload_name IS NOT NULL
+  AND case_key IS NOT NULL
+  AND action_id IS NULL
+  AND output_id IS NULL
+  AND receipt_id IS NULL;
+
+CREATE TABLE otlet.workload_evaluation_runs (
+  name text PRIMARY KEY CHECK (name ~ '^[a-z0-9][a-z0-9_-]*$'),
+  workload_name text NOT NULL CHECK (NULLIF(workload_name, '') IS NOT NULL),
+  baseline_name text REFERENCES otlet.workload_evaluation_runs(name),
+  identity jsonb NOT NULL CHECK (jsonb_typeof(identity) = 'object'),
+  metrics jsonb NOT NULL CHECK (jsonb_typeof(metrics) = 'object'),
+  thresholds jsonb NOT NULL CHECK (jsonb_typeof(thresholds) = 'object'),
+  gate_results jsonb NOT NULL CHECK (jsonb_typeof(gate_results) = 'object'),
+  gate_status text NOT NULL CHECK (gate_status IN ('passed', 'failed')),
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE INDEX workload_evaluation_runs_workload_created_idx
+ON otlet.workload_evaluation_runs (workload_name, created_at DESC, name);
+
+CREATE FUNCTION otlet.reject_workload_evaluation_run_change() RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+BEGIN
+  RAISE EXCEPTION 'otlet workload evaluation history is immutable';
+END;
+$$;
+
+CREATE TRIGGER workload_evaluation_runs_immutable
+BEFORE UPDATE OR DELETE ON otlet.workload_evaluation_runs
+FOR EACH ROW EXECUTE FUNCTION otlet.reject_workload_evaluation_run_change();
+
+CREATE TRIGGER workload_evaluation_runs_no_truncate
+BEFORE TRUNCATE ON otlet.workload_evaluation_runs
+FOR EACH STATEMENT EXECUTE FUNCTION otlet.reject_workload_evaluation_run_change();
 
 CREATE TABLE otlet.review_events (
   id bigserial PRIMARY KEY,

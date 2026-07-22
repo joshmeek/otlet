@@ -82,9 +82,14 @@ pgrx::extension_sql_file!(
     requires = ["action_execution"]
 );
 pgrx::extension_sql_file!(
+    "../sql/155_workload_evaluation.sql",
+    name = "workload_evaluation",
+    requires = ["eval_labels"]
+);
+pgrx::extension_sql_file!(
     "../sql/160_action_review_status.sql",
     name = "action_review_status",
-    requires = ["eval_labels"]
+    requires = ["workload_evaluation"]
 );
 pgrx::extension_sql_file!(
     "../sql/170_inference_receipt_status.sql",

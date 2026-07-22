@@ -164,6 +164,9 @@ BEGIN
     action_id,
     output_id,
     receipt_id,
+    workload_name,
+    case_key,
+    task_name,
     source_table,
     subject_id,
     source_hash,
@@ -177,6 +180,9 @@ BEGIN
     action_row.id,
     action_row.output_id,
     action_row.receipt_id,
+    task_row.name,
+    'action:' || action_row.id::text,
+    task_row.name,
     COALESCE(action_row.source_table, receipt_trace #>> '{mvcc,table}'),
     COALESCE(action_row.subject_id, ''),
     COALESCE(
@@ -259,6 +265,10 @@ RETURNS TABLE (
   fixture_source text,
   case_kind text,
   manual_gold boolean,
+  workload_name text,
+  case_key text,
+  case_weight numeric,
+  task_name text,
   source_table text,
   subject_id text,
   source_hash text,
@@ -288,6 +298,10 @@ AS $$
       ELSE 'gold'
     END,
     l.label_source = 'manual_correction',
+    COALESCE(l.workload_name, j.task_name, 'unassigned'),
+    COALESCE(l.case_key, 'label:' || l.id::text),
+    l.case_weight,
+    COALESCE(l.task_name, j.task_name),
     l.source_table,
     l.subject_id,
     l.source_hash,
@@ -302,7 +316,8 @@ AS $$
     l.created_at
   FROM otlet.eval_labels l
   LEFT JOIN otlet.actions a ON a.id = l.action_id
-  LEFT JOIN otlet.jobs j ON j.id = a.job_id
+  LEFT JOIN otlet.inference_receipts r ON r.id = l.receipt_id
+  LEFT JOIN otlet.jobs j ON j.id = COALESCE(a.job_id, r.job_id)
   LEFT JOIN otlet.tasks t ON t.name = j.task_name
   LEFT JOIN LATERAL (
     SELECT
@@ -335,4 +350,80 @@ AS $$
   ) declared ON true
   ORDER BY l.created_at DESC, l.id DESC
   LIMIT GREATEST(0, LEAST(COALESCE(max_rows, 1000), 100000));
+$$;
+
+CREATE FUNCTION otlet.import_eval_cases(cases jsonb) RETURNS bigint
+LANGUAGE plpgsql
+SET search_path = pg_catalog, otlet, pg_temp
+AS $$
+DECLARE
+  item jsonb;
+  inserted bigint := 0;
+  row_count bigint;
+BEGIN
+  IF jsonb_typeof(import_eval_cases.cases) IS DISTINCT FROM 'array' THEN
+    RAISE EXCEPTION 'otlet evaluation cases must be a JSON array';
+  END IF;
+  IF jsonb_array_length(import_eval_cases.cases) > 10000 THEN
+    RAISE EXCEPTION 'otlet evaluation case import exceeds 10000 rows';
+  END IF;
+
+  FOR item IN SELECT value FROM jsonb_array_elements(import_eval_cases.cases) LOOP
+    IF jsonb_typeof(item) IS DISTINCT FROM 'object'
+       OR NULLIF(item ->> 'workload_name', '') IS NULL
+       OR NULLIF(item ->> 'case_key', '') IS NULL
+       OR NULLIF(item ->> 'task_name', '') IS NULL
+       OR NULLIF(item ->> 'subject_id', '') IS NULL
+       OR NULLIF(item ->> 'expected_answer', '') IS NULL
+       OR NULLIF(item ->> 'expected_confidence', '') IS NULL
+       OR NULLIF(item ->> 'expected_action_type', '') IS NULL THEN
+      RAISE EXCEPTION 'otlet evaluation case is missing a required field';
+    END IF;
+    IF jsonb_typeof(COALESCE(item -> 'case_weight', '1'::jsonb)) <> 'number'
+       OR (COALESCE(item ->> 'case_weight', '1'))::numeric <= 0 THEN
+      RAISE EXCEPTION 'otlet evaluation case weight must be positive';
+    END IF;
+
+    INSERT INTO otlet.eval_labels (
+      workload_name,
+      case_key,
+      case_weight,
+      task_name,
+      source_table,
+      subject_id,
+      source_hash,
+      expected_answer,
+      expected_confidence,
+      expected_action_type,
+      label_source,
+      reason
+    )
+    VALUES (
+      item ->> 'workload_name',
+      item ->> 'case_key',
+      COALESCE(item ->> 'case_weight', '1')::numeric,
+      item ->> 'task_name',
+      NULLIF(item ->> 'source_table', ''),
+      item ->> 'subject_id',
+      NULLIF(item ->> 'source_hash', ''),
+      item ->> 'expected_answer',
+      item ->> 'expected_confidence',
+      item ->> 'expected_action_type',
+      COALESCE(NULLIF(item ->> 'label_source', ''), 'manual_correction'),
+      NULLIF(item ->> 'reason', '')
+    )
+    ON CONFLICT (workload_name, case_key)
+      WHERE workload_name IS NOT NULL
+        AND case_key IS NOT NULL
+        AND action_id IS NULL
+        AND output_id IS NULL
+        AND receipt_id IS NULL
+    DO NOTHING;
+
+    GET DIAGNOSTICS row_count = ROW_COUNT;
+    inserted := inserted + row_count;
+  END LOOP;
+
+  RETURN inserted;
+END;
 $$;

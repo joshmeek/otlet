@@ -289,7 +289,7 @@ SELECT count(*) FROM otlet.verify_invariants();
 
 Contract: `0` (demo prints `invariant_contract=0`). The suite fails closed on expired or NULL leases for `running` and `cancel_requested` jobs, complete receipts without schema pass, sensitive evidence that violates the active storage policy, materializations missing `source_hash`, and error runtime slots. `production_status` and `verify_invariants` name the receipt invariant `complete_receipts_are_schema_validated`; throughput views use `completed_jobs` and `last_batch_completed_jobs`. Step 6 of `docs/semantic-watches.md` anchors the planner vocabulary for `selected_path` / `Planner Selected Path` and `freshness_basis`
 
-Operators query redacted, read-only projections through `otlet.audit_receipt_export`, `otlet.audit_review_export`, `otlet.audit_review_event_export`, `otlet.audit_action_execution_export`, `otlet.audit_eval_label_export`, `otlet.semantic_dependency_audit`, `otlet.operational_event_log`, and `otlet.worker_batch_timing_status`. `otlet.redaction_policy_status` lists withheld fields
+Operators query redacted, read-only projections through `otlet.audit_receipt_export`, `otlet.audit_review_export`, `otlet.audit_review_event_export`, `otlet.audit_action_execution_export`, `otlet.audit_eval_label_export`, `otlet.audit_workload_evaluation_export`, `otlet.semantic_dependency_audit`, `otlet.operational_event_log`, and `otlet.worker_batch_timing_status`. `otlet.redaction_policy_status` lists withheld fields
 
 ## Step 4 - Grant Role-Scoped Access
 
@@ -314,6 +314,7 @@ The auditor capability grants these redacted policy and audit views:
 - `otlet.audit_review_event_export`
 - `otlet.audit_action_execution_export`
 - `otlet.audit_eval_label_export`
+- `otlet.audit_workload_evaluation_export`
 - `otlet.action_workflow_policy_status`
 - `otlet.cleanup_receipt_status`
 - `otlet.retention_hold_status`
@@ -347,6 +348,21 @@ FROM otlet.audit_review_event_export
 ORDER BY review_event_id;
 ```
 
+Evaluation labels carry a workload name, stable case key, task name, and positive case weight. `otlet.export_eval_cases(...)` returns those fields with source identity hashes but no source row. The owner can import the returned JSON rows into another database with `otlet.import_eval_cases(...)`; existing workload and case keys are left unchanged
+
+`otlet.evaluate_workload(...)` selects accepted receipts by model, prompt, schema, and runtime identity, then binds the result to an immutable pack version. It calculates weighted coverage, answer quality, abstention, action quality, generation latency, and review delay. Pack gates supply defaults and call-time thresholds override them. A named baseline adds regression deltas and identity-change flags
+
+```sql
+SELECT gate_status, quality, abstention, action_quality,
+       latency_ms, reviewer_time_ms,
+       quality_regression, model_changed, prompt_changed,
+       schema_changed, runtime_changed, pack_changed
+FROM otlet.workload_evaluation_status
+WHERE name = 'candidate_v2';
+```
+
+Each threshold and per-metric pass result is a typed column in `otlet.workload_evaluation_status`. Raw snapshots remain append-only in `otlet.workload_evaluation_runs`; auditors use `otlet.audit_workload_evaluation_export`
+
 An action target must be an ordinary non-partitioned table without RLS, use one primary-key column, and list each writable non-key column. A row-watch task must also allow `update_row` and bind that action to the target with `otlet.register_action_workflow_policy(...)`. The policy starts recommendation-only and unevaluated unless the owner explicitly marks it `bounded_mutation` and `evaluated`. Otlet snapshots the task, target, source namespace, and authority hashes, then revalidates them during dry run and apply
 
 Raw targets, execution receipts, outputs, source evidence, trace summaries, token traces, worker functions, model registration, watch administration, cleanup, and the grant helpers stay owner-only. Auditors see execution mode, status, hashes, changed-column names, affected-row count, and replay linkage through `otlet.audit_action_execution_export`. They do not see target row values
@@ -357,11 +373,11 @@ Check the installed policy:
 SELECT * FROM otlet.access_policy_status;
 ```
 
-The demo proves the catalog ACLs, 14 auditor views, 11 operator function grants, seven existing operator paths, and 69 denied paths. It separately proves all five review outcomes through the delegated operator role:
+The demo proves the catalog ACLs, 15 auditor views, 11 operator function grants, seven existing operator paths, and 75 denied paths. It separately proves all five review outcomes through the delegated operator role:
 
 ```text
 review_provenance_contract=true|true|true|true|true|true|true|true|true|true|true
-permission_contract=public=0/0/0|auditor=14/3|operator=14/11|definer=10/10|positive=7|denied=69
+permission_contract=public=0/0/0|auditor=15/3|operator=15/11|definer=10/10|positive=7|denied=75
 ```
 
 Your application still owns these deployment boundaries:

@@ -172,6 +172,10 @@ SELECT
   l.action_id,
   l.output_id,
   l.receipt_id,
+  COALESCE(l.workload_name, l.task_name, j.task_name, r.task_name) AS workload_name,
+  COALESCE(l.case_key, 'label:' || l.id::text) AS case_key,
+  l.case_weight,
+  COALESCE(l.task_name, j.task_name, r.task_name) AS task_name,
   l.source_table,
   l.subject_id,
   l.source_hash,
@@ -191,10 +195,10 @@ SELECT
   l.created_at
 FROM otlet.eval_labels l
 LEFT JOIN otlet.actions a ON a.id = l.action_id
-LEFT JOIN otlet.jobs j ON j.id = a.job_id
-LEFT JOIN otlet.tasks t ON t.name = j.task_name
-LEFT JOIN otlet.outputs o ON o.id = l.output_id
-LEFT JOIN otlet.inference_receipts r ON r.id = l.receipt_id;
+LEFT JOIN otlet.inference_receipts r ON r.id = l.receipt_id
+LEFT JOIN otlet.jobs j ON j.id = COALESCE(a.job_id, r.job_id)
+LEFT JOIN otlet.tasks t ON t.name = COALESCE(l.task_name, j.task_name, r.task_name)
+LEFT JOIN otlet.outputs o ON o.id = l.output_id;
 
 CREATE VIEW otlet.review_queue AS
 WITH action_items AS (
