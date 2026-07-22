@@ -157,6 +157,8 @@ Build the reproducible pgrx package, machine-readable SBOM, RustSec report, supp
 
 Prove a fresh disposable install, worker lifecycle, database restart, upgrade failure rollback, startup recovery, and crash-log safety with [the release lifecycle command](docs/release-lifecycle.md)
 
+Run native and portable equivalence, the complete failure matrix, lifecycle recovery, invariants, and final crash-log checks with [the runtime conformance command](docs/runtime-conformance.md)
+
 Configure all-or-nothing row, input-byte, queue-byte, candidate-plan, and candidate-timeout limits with [the workload admission contract](docs/workload-admission.md)
 
 Run Otlet against a standard PostgreSQL service that cannot load the native worker with [the portable worker](portable/README.md). Its real-model smoke test creates a disposable SQL-only database and completes one job through the same trusted receipt state
@@ -170,6 +172,7 @@ Start with [the worked example](docs/otlet-worked-example.md)
 - [Semantic watches](docs/semantic-watches.md)
 - [Production contract](docs/production-contract.md)
 - [Trust conformance](docs/trust-conformance.md)
+- [Runtime conformance](docs/runtime-conformance.md)
 - [Portable worker](portable/README.md)
 - [Model benchmarks](benchmarks/README.md)
 - [Roadmap](docs/roadmap.md)

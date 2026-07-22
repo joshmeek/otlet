@@ -1,115 +1,47 @@
 # Otlet roadmap
 
-This file lists unshipped library work. The other docs describe the current system
+This file lists unshipped library work. The shipped system is documented by the production contract, portable worker guide, release lifecycle, and runtime conformance suite
 
-Otlet runs local model judgment through Postgres contracts. New work must preserve SQL-visible state, bounded resources, source freshness, validated output, review, actions, and receipts
+## Active work
 
-## Priorities
+No feature track is active after the 24-part execution pass
 
-| Priority | Track | Next proof |
-| --- | --- | --- |
-| 1 | Trust and evidence | Source allowlists, bounded and redacted evidence, retention, and adversarial conformance |
-| 2 | Portable runtime | One SQL-only install and reference worker for Postgres hosts that block native workers |
-| 3 | Portable safety | Fenced writes, database-side validation, recovery, deployment preflight, and database-health controls |
-| 4 | Packs and decisions | Versioned workload packs, evaluation gates, review state, and replay-safe actions |
-| 5 | GPU and research | Device support or reopened research only after a measured trigger |
+New work needs a measured trigger, SQL-visible state, a closed failure mode, and executable proof. Keep source freshness, bounded resources, PostgreSQL-owned validation, review state, action authority, receipts, and deployment recovery intact
 
-Each change needs SQL-visible state, a closed failure mode, and demo, conformance, or benchmark proof
+## Known limits
 
-## Portable Runtime
+- release and runtime evidence targets PostgreSQL 18 on Linux
+- native execution requires a host that can load the extension and resident background worker
+- the reference portable deployment uses one supervised worker, one database, and one local GGUF model
+- the conformance ring proves database restart and recovery, not a multi-node failover product
+- credential rotation proof covers PostgreSQL authentication; infrastructure still owns secret rollout and connection draining
+- CPU execution is the supported runtime; no GPU scheduling or CPU fallback matrix ships in core
+- signed decision bundles are local artifacts; applications own transport and receiver integration
+- backup, snapshot, replica, restore, and point-in-time-recovery deletion remain deployment responsibilities
+- bounded performance smoke detects obvious regression but does not replace hardware-specific throughput, latency, memory, energy, and database-responsiveness measurement
 
-Use the native background worker where Postgres permits it. Add one external worker where the host blocks native code
+## Closed research
 
-The portable path must:
+These tracks stay closed until their recorded trigger changes:
 
-- use the same task, job, receipt, review, action, evaluation, and freshness state
-- keep source rows in the primary database and avoid a second database
-- claim a bounded evidence snapshot instead of reading source tables
-- version the worker RPC protocol, publish compatibility rules, and allowlist runtime identities
-- use a claim token on renew, attempt, complete, fail, and cancel
-- reject expired claims and make duplicate completion harmless
-- let Postgres recompute identities and validate output and actions
-- expose fixed-search-path `SECURITY DEFINER` RPCs with no direct table writes
-- use separate installer, worker, reviewer, auditor, and action roles with verified TLS
-- preflight DNS, TLS, roles, required functions, and egress-denied operation
-- reuse the database admission contract for every portable claim path
-- run local GGUF inference without a required remote model API
-- keep application queries independent of a live worker
-
-Start with one worker, one database, and one model. The conformance suite must cover worker loss, full queues, stale claims, duplicate writes, database restart or failover, credential rotation, malformed output, stale rows, upgrade, and rollback
-
-Track queue, memory, connections, disk, WAL, storage, autovacuum, and application latency. Pause claims when configured database-health limits fail
-
-## Trust And Evidence
-
-Treat source text, model files, model output, identifiers, and imported configuration as untrusted input
-
-- document native and portable threat models
-- allowlist source fields, model paths, action types, and action targets
-- bound input, output, token, trace, cache, queue, evidence, and memory use
-- test prompt injection, secret canaries, Unicode, malicious identifiers, oversized fields, and malformed artifacts
-- prevent model text from choosing action authority or target identity
-- keep adversarial or unevaluated cases recommendation-only
-- apply retention to inputs, outputs, actions, corrections, traces, events, labels, and materializations
-- support structured-output redaction, cleanup dry runs, retention holds, and cleanup receipts
-- account for storage, WAL, backup, restore, and point-in-time-recovery copies
-- document deletion limits for backups and point-in-time recovery
-- expose structured logs, metrics, permission state, and redaction state without raw source text by default
-- test where a sensitive canary appears and when cleanup removes it from active state
-- export a complete decision trace and add signed manifests for future tamper evidence
-
-JSON Schema constrains structure. Evaluation and review still determine semantic correctness
-
-## Packs And Decisions
-
-Use `otlet.watch.v1` for portable workload configuration. Keep SQL, JSON Schema, and ordinary files as the authoring surface
-
-Each pack contains bounded candidate SQL, prompts, schemas, model policy, fixtures, labels, expected receipts, version metadata, digests, and benchmark gates. SQL import, lint, dry run, diff, export, and rollback complete the lifecycle
-
-Ship one entity-resolution pack with vendor, account, and catalog-item fixtures. Add other workloads only when they reuse the same contracts
-
-Keep review state in SQL:
-
-- reviewer identity, role, reason, timestamp, and freshness state
-- approve, reject, correct, defer, and abstain outcomes
-- review history and deterministic links to source identity, receipt, output, action, model, prompt, and schema
-- label import and export without required source-row export
-- workload-weighted quality, abstention, action, latency, and reviewer-time metrics
-- baseline comparisons and regression gates for model, prompt, schema, runtime, and pack changes
-
-Keep recommendation-only operation as the default. Mutation or export requires target allowlists, a fresh source-state check, dry-run evidence, approval, replay checks, execution receipts, receiver-enforced idempotency, authenticated destination acknowledgement, and reconciliation
-
-Provide SQL and CSV export plus a signed recommendation envelope. Leave network delivery outside the library
-
-Do not add a plugin system, registry process, custom workflow language, or connector catalog
-
-## GPU And Deferred Research
-
-A GPU path must preserve the worker and SQL contracts. Report device policy, memory, throughput, energy when available, database responsiveness, crash behavior, cancellation, and CPU fallback
-
-Reopen measured research only when its trigger changes:
-
-| Avenue | Trigger |
+| Avenue | Reopen trigger |
 | --- | --- |
-| Single-context batching | llama.cpp or memory changes remove the throughput and RSS tradeoff |
-| Multi-model residency | Two useful contexts fit with Postgres headroom |
-| Speculative decode | Compatible draft heads and safe caller hooks exist |
-| Persisted cache | Restart or eviction misses consume material workload time |
-| PostgreSQL core changes | A required planner or executor contract has no extension hook |
-| New CPU paths | Hardware exposes a distinct BLAS, NUMA, SMT, or energy condition |
-
-Any reopened path must preserve correctness, trusted quality, memory bounds, database responsiveness, and crash behavior
+| GPU execution and device scheduling | A supported deployment needs it and can preserve the worker, receipt, quality, memory, cancellation, and fallback contracts |
+| Single-context batching | llama.cpp or memory behavior removes the throughput and RSS tradeoff |
+| Multi-model residency and scheduling | Two useful contexts fit with measured PostgreSQL headroom |
+| Speculative decoding | Compatible draft heads and safe caller hooks exist |
+| Persisted inference cache | Restart or eviction misses consume material workload time |
+| PostgreSQL core patches or a maintained fork | A required planner or executor contract has no extension hook |
+| New CPU execution paths | Hardware exposes a distinct BLAS, NUMA, SMT, or energy condition |
+| Provider matrices and remote model APIs | A concrete deployment cannot use the local native or portable runtime |
+| Plugin systems, registry processes, custom workflow languages, and connector catalogs | Repeated shipped workloads cannot use SQL, JSON Schema, watch packs, and application-owned delivery |
+| Built-in network delivery | Receiver reconciliation cannot remain an application transport concern |
 
 ## Boundaries
 
-- local inference runs through the resident worker or SQL-bound reference worker
-- source rows stay in user tables
-- derived state stays under `otlet`
-- Postgres validates trusted output and action contracts
-- portable writes require live claim fencing
-- user-table writes require typed actions, approval, fresh source state, and receipts
-- review and evaluation state remain SQL-visible
-- SQL selects candidates before model judgment
-- normal application queries do not wait for inference
-- EXPLAIN and status views expose model work
+- source rows stay in user tables and derived state stays under `otlet`
+- PostgreSQL validates trusted output, action contracts, portable results, and claim fencing
+- mutation requires workflow authority, fresh source state, dry-run evidence, approval, replay checks, and execution receipts
+- export requires content-addressed decision evidence, external signing keys, receiver idempotency, authenticated acknowledgement, and reconciliation
+- normal application queries remain independent of a live worker
 - no second database or required remote model API enters the core path

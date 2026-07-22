@@ -51,7 +51,7 @@ fi
 max_worker_rss_bytes="$(printf '%s' "$max_worker_rss_bytes" | sed 's/^0*//')"
 max_worker_rss_bytes="${max_worker_rss_bytes:-0}"
 if [ "${#max_worker_rss_bytes}" -gt 14 ] ||
-  { [ "${#max_worker_rss_bytes}" -eq 14 ] && [[ "$max_worker_rss_bytes" > 70368744177664 ]]; }; then
+  { [ "${#max_worker_rss_bytes}" -eq 14 ] && [ "$max_worker_rss_bytes" -gt 70368744177664 ]; }; then
   echo "OTLET_MAX_WORKER_RSS_BYTES must be between 0 and 70368744177664" >&2
   exit 1
 fi
