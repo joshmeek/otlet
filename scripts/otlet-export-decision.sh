@@ -131,6 +131,20 @@ FROM otlet.decision_trace_export
 WHERE receipt_id = :'receipt_id'::bigint;
 SQL
 )"
+destinations="$(psql_value -v receipt_id="$receipt_id" <<'SQL'
+SELECT COALESCE(jsonb_agg(jsonb_build_object(
+  'destination', destination.destination,
+  'idempotency_key', destination.idempotency_key,
+  'recommendation_id', destination.recommendation_id,
+  'state', destination.state
+) ORDER BY destination.destination), '[]'::jsonb)
+FROM otlet.destination_reconciliation_status destination
+JOIN otlet.decision_trace_export trace ON trace.receipt_id = destination.receipt_id
+WHERE destination.receipt_id = :'receipt_id'::bigint
+  AND destination.recommendation_id = trace.recommendation_id
+  AND destination.decision_trace_sha256 = trace.decision_trace_sha256;
+SQL
+)"
 : >"$host_tmp/manifest.rows"
 for path in decision.csv decision.sql; do
   file="$output_dir/$path"
@@ -154,12 +168,14 @@ jq -S -c -n \
   --arg signing_key_sha256 "$signing_key_sha256" \
   --argjson receipt_id "$receipt_id" \
   --argjson recommendation "$recommendation" \
+  --argjson destinations "$destinations" \
   '{
     format: $format,
     receipt_id: $receipt_id,
     manifest_sha256: $manifest_sha256,
     signing_key_sha256: $signing_key_sha256,
-    recommendation: $recommendation
+    recommendation: $recommendation,
+    destinations: $destinations
   }' >"$output_dir/recommendation-envelope.json"
 
 openssl pkeyutl \

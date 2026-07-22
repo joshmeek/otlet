@@ -355,6 +355,7 @@ The auditor capability grants these redacted policy and audit views:
 - `otlet.audit_eval_label_export`
 - `otlet.audit_workload_evaluation_export`
 - `otlet.decision_trace_export`
+- `otlet.destination_reconciliation_status`
 - `otlet.action_workflow_policy_status`
 - `otlet.cleanup_receipt_status`
 - `otlet.retention_hold_status`
@@ -393,6 +394,32 @@ The bundle contains `decision.sql`, `decision.csv`, `audit-manifest.json`, `reco
 
 The exporter writes one local directory and performs no destination delivery. Keep the private key in an external secret store or signing service, distribute the public key through a trusted channel, and let a separate delivery process move verified bundles
 
+## Destination reconciliation
+
+Register one destination against the frozen recommendation identity before delivery:
+
+```sql
+SELECT *
+FROM otlet.register_destination_export(42, 'erp-production');
+```
+
+The returned `sha256:` idempotency key is stable for that recommendation and destination. It also appears in the signed recommendation envelope. The envelope includes only destinations registered against its exact recommendation identity. Retain that bundle for delivery retries; if later review or action evidence changes the recommendation identity, export the new recommendation before registering another destination. The receiver must enforce the key so a retry returns its first execution result instead of applying the recommendation again
+
+Receivers return canonical `otlet.destination-acknowledgement.v1` JSON signed with Ed25519. `scripts/otlet-record-destination-ack.sh` verifies the signature against a trusted public key before calling the bounded database function. PostgreSQL records the authenticated session identity, active role, public-key fingerprint, payload hash, signature hash, destination execution receipt, and replay decision. The private key and public-key material stay outside evidence tables
+
+Grant only the acknowledgement function to a dedicated authenticated database role when the recorder should not connect as the extension owner:
+
+```sql
+GRANT USAGE ON SCHEMA otlet TO otlet_destination_receiver;
+GRANT EXECUTE ON FUNCTION otlet.record_destination_acknowledgement(
+  text, text, text, text, text, text, text, text, text, text, text
+) TO otlet_destination_receiver;
+```
+
+`otlet.destination_reconciliation_status` tracks `exported`, `received`, `applied`, `rejected`, and `unknown`. Use `mark_destination_unknown(...)` after an ambiguous or timed-out delivery. Exact acknowledgement retries are harmless, conflicts fail, and an applied replay must point to the original acknowledgement and destination execution receipt. Missing acknowledgements remain visible through `acknowledgement_pending`
+
+This contract has no destination catalog, connector abstraction, network client, or delivery scheduler. Application infrastructure owns transport and receiver-specific behavior
+
 Approval, rejection, correction, deferral, and abstention append immutable rows to `otlet.review_events`. Otlet derives `reviewer_identity` from `session_user` and `reviewer_role` from the active `SET ROLE` state; none of the review functions accepts either value from the caller. Each event snapshots its reason, timestamp, source freshness, and links to the job, action or output, receipt, model artifact, prompt, schema, runtime, and output identities
 
 `otlet.defer_action(...)` leaves the action in the review queue. `otlet.abstain_review(...)` records the final review of an abstention or directly rejected output and removes that item from the queue. Inspect the append-only audit projection without raw source rows:
@@ -430,11 +457,11 @@ Check the installed policy:
 SELECT * FROM otlet.access_policy_status;
 ```
 
-The demo proves the catalog ACLs, 15 auditor views, 11 operator function grants, seven existing operator paths, and 75 denied paths. It separately proves all five review outcomes through the delegated operator role:
+The demo proves the catalog ACLs, 22 auditor views, 11 operator function grants, seven existing operator paths, 19 exact security-definer functions, seven portable RPCs, and 77 denied paths. It separately proves all five review outcomes through the delegated operator role:
 
 ```text
 review_provenance_contract=true|true|true|true|true|true|true|true|true|true|true
-permission_contract=public=0/0/0|auditor=15/3|operator=15/11|definer=10/10|positive=7|denied=75
+permission_contract=public=0/0/0|auditor=22/3|operator=22/11|definer=19/19|portable=7/7/7|positive=7|denied=77
 ```
 
 Your application still owns these deployment boundaries:

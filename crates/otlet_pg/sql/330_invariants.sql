@@ -471,6 +471,49 @@ BEGIN
 
   RETURN QUERY
   SELECT
+    'destination_state_matches_latest_acknowledgement'::text,
+    'destination_export'::text,
+    export.id::text,
+    jsonb_build_object(
+      'destination', export.destination,
+      'export_state', export.state,
+      'acknowledgement_state', latest.acknowledgement_state
+    )
+  FROM otlet.destination_exports export
+  JOIN LATERAL (
+    SELECT acknowledgement.acknowledgement_state
+    FROM otlet.destination_acknowledgements acknowledgement
+    WHERE acknowledgement.destination_export_id = export.id
+    ORDER BY acknowledgement.id DESC
+    LIMIT 1
+  ) latest ON true
+  WHERE export.state IS DISTINCT FROM latest.acknowledgement_state;
+
+  RETURN QUERY
+  SELECT
+    'destination_replays_link_to_applied_acknowledgements'::text,
+    'destination_acknowledgement'::text,
+    replay.id::text,
+    jsonb_build_object(
+      'destination_export_id', replay.destination_export_id,
+      'acknowledgement_id', replay.acknowledgement_id,
+      'replay_of_acknowledgement_id', replay.replay_of_acknowledgement_id,
+      'destination_execution_receipt_id', replay.destination_execution_receipt_id
+    )
+  FROM otlet.destination_acknowledgements replay
+  LEFT JOIN otlet.destination_acknowledgements source
+    ON source.destination_export_id = replay.destination_export_id
+   AND source.acknowledgement_id = replay.replay_of_acknowledgement_id
+  WHERE replay.replay_decision = 'duplicate_replay'
+    AND (
+      source.id IS NULL
+      OR source.acknowledgement_state <> 'applied'
+      OR source.destination_execution_receipt_id
+        IS DISTINCT FROM replay.destination_execution_receipt_id
+    );
+
+  RETURN QUERY
+  SELECT
     'materializations_have_source_hashes'::text,
     'materialization'::text,
     sm.id::text,

@@ -100,6 +100,8 @@ Worker heartbeats report process RSS, and the shared database-health gate pauses
 
 Accepted portable receipts also appear in `otlet.decision_trace_export`. Run `scripts/otlet-export-decision.sh` from the repository host to create a local signed SQL and CSV bundle; signing keys remain outside the database and network delivery remains a separate deployment concern
 
+Register each outbound receiver with `otlet.register_destination_export(...)`, then inspect `otlet.destination_reconciliation_status`. The signed envelope carries the stable receiver idempotency key. `scripts/otlet-record-destination-ack.sh` verifies signed receiver acknowledgements before recording their state, execution receipt, and replay decision
+
 See [the customer-VPC example](../examples/customer-vpc-portable-worker/README.md) for a small container deployment and [the production contract](../docs/production-contract.md) for the trust boundary
 
 ## Run The Real Smoke Test

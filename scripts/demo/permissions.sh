@@ -90,6 +90,7 @@ SELECT (SELECT count(*) = 1 FROM otlet.redaction_policy_status)::text || '|' ||
        (SELECT count(*) > 0 FROM otlet.audit_eval_label_export)::text || '|' ||
        (SELECT count(*) >= 0 FROM otlet.audit_workload_evaluation_export)::text || '|' ||
        (SELECT count(*) > 0 FROM otlet.decision_trace_export)::text || '|' ||
+       (SELECT count(*) >= 0 FROM otlet.destination_reconciliation_status)::text || '|' ||
        (SELECT count(*) > 0 FROM otlet.action_workflow_policy_status)::text || '|' ||
        (SELECT count(*) >= 0 FROM otlet.cleanup_receipt_status)::text || '|' ||
        (SELECT count(*) >= 0 FROM otlet.retention_hold_status)::text || '|' ||
@@ -106,7 +107,7 @@ ROLLBACK;
 SQL
 )"
 echo "auditor_read_contract=$auditor_read_contract"
-[ "$auditor_read_contract" = "true|true|true|true|true|true|true|true|true|true|true|true|true|true|true|true|true|true|true|true|true" ] || {
+[ "$auditor_read_contract" = "true|true|true|true|true|true|true|true|true|true|true|true|true|true|true|true|true|true|true|true|true|true" ] || {
   echo "Expected auditor access to all redacted exports, got $auditor_read_contract" >&2
   exit 1
 }
@@ -460,6 +461,7 @@ WITH table_grants AS (
             'audit_eval_label_export',
             'audit_workload_evaluation_export',
             'decision_trace_export',
+            'destination_reconciliation_status',
             'action_workflow_policy_status',
             'cleanup_receipt_status',
             'retention_hold_status',
@@ -527,7 +529,8 @@ WITH table_grants AS (
           'otlet.apply_action(bigint)'::regprocedure,
           'otlet.grant_auditor_access(regrole)'::regprocedure,
           'otlet.grant_operator_access(regrole)'::regprocedure,
-          'otlet.grant_portable_worker_access(regrole)'::regprocedure
+          'otlet.grant_portable_worker_access(regrole)'::regprocedure,
+          'otlet.record_destination_acknowledgement(text,text,text,text,text,text,text,text,text,text,text)'::regprocedure
         )
         AND p.proname NOT IN (
           'portable_claim_jobs',
@@ -576,16 +579,16 @@ CROSS JOIN definer_status;
 SQL
 )"
 echo "permission_catalog_contract=$permission_catalog_contract"
-[ "$permission_catalog_contract" = "false|0|0|0|21|3|21|11|0|0|0|0|18|18|0|7|7|7|true" ] || {
+[ "$permission_catalog_contract" = "false|0|0|0|22|3|22|11|0|0|0|0|19|19|0|7|7|7|true" ] || {
   echo "Expected exact public, auditor, operator, and owner ACLs, got $permission_catalog_contract" >&2
   exit 1
 }
 
 source "$demo_dir/review_provenance.sh"
 
-permission_contract="public=0/0/0|auditor=21/3|operator=21/11|definer=18/18|portable=7/7/7|positive=7|denied=$permission_denied_count"
+permission_contract="public=0/0/0|auditor=22/3|operator=22/11|definer=19/19|portable=7/7/7|positive=7|denied=$permission_denied_count"
 echo "permission_contract=$permission_contract"
-[ "$permission_contract" = "public=0/0/0|auditor=21/3|operator=21/11|definer=18/18|portable=7/7/7|positive=7|denied=77" ] || {
+[ "$permission_contract" = "public=0/0/0|auditor=22/3|operator=22/11|definer=19/19|portable=7/7/7|positive=7|denied=77" ] || {
   echo "Expected complete permission contract, got $permission_contract" >&2
   exit 1
 }

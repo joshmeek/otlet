@@ -118,6 +118,7 @@ BEGIN
     'otlet.audit_eval_label_export, '
     'otlet.audit_workload_evaluation_export, '
     'otlet.decision_trace_export, '
+    'otlet.destination_reconciliation_status, '
     'otlet.action_workflow_policy_status, '
     'otlet.cleanup_receipt_status, '
     'otlet.retention_hold_status, '

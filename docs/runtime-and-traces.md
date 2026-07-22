@@ -444,6 +444,8 @@ The portable worker emits one `preflight_passed` event before model load or clai
 
 `otlet.decision_trace_export` is the content-addressed export surface for accepted receipts. `decision_trace_sha256` covers the canonical identity trace and identifies its compact recommendation. Actions include payload hashes and ordered execution-receipt identities; reviews include reviewer, freshness, and evidence hashes without reason text
 
+`otlet.destination_reconciliation_status` links that recommendation identity to each receiver-enforced idempotency key, authenticated acknowledgement, destination execution receipt, and replay decision. `acknowledgement_pending` keeps both never-acknowledged exports and explicitly unknown deliveries visible
+
 Database health is a separate live surface:
 
 ```sql

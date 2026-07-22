@@ -24,6 +24,7 @@ BEGIN;
 \ir ../crates/otlet_pg/sql/160_action_review_status.sql
 \ir ../crates/otlet_pg/sql/170_inference_receipt_status.sql
 \ir ../crates/otlet_pg/sql/175_decision_exports.sql
+\ir ../crates/otlet_pg/sql/177_destination_reconciliation.sql
 \ir ../crates/otlet_pg/sql/385_portable_permissions.sql
 \ir permissions.sql
 COMMIT;

@@ -122,9 +122,14 @@ pgrx::extension_sql_file!(
     requires = ["inference_receipt_status"]
 );
 pgrx::extension_sql_file!(
+    "../sql/177_destination_reconciliation.sql",
+    name = "destination_reconciliation",
+    requires = ["decision_exports"]
+);
+pgrx::extension_sql_file!(
     "../sql/180_runtime_cache_status.sql",
     name = "runtime_cache_status",
-    requires = ["decision_exports"]
+    requires = ["destination_reconciliation"]
 );
 pgrx::extension_sql_file!(
     "../sql/190_trace_tokens.sql",

@@ -75,13 +75,21 @@ jq -e \
   --arg manifest_sha256 "$manifest_sha256" \
   --arg signing_key_sha256 "$signing_key_sha256" \
   --argjson receipt_id "$receipt_id" '
+  .recommendation.recommendation_id as $recommendation_id |
   .format == "otlet.signed-recommendation.v1" and
   .receipt_id == $receipt_id and
   .recommendation.receipt_id == $receipt_id and
   .manifest_sha256 == $manifest_sha256 and
   .signing_key_sha256 == $signing_key_sha256 and
   .recommendation.format == "otlet.recommendation.v1" and
-  .recommendation.recommendation_id == ("sha256:" + .recommendation.decision_trace_sha256)
+  .recommendation.recommendation_id == ("sha256:" + .recommendation.decision_trace_sha256) and
+  (.destinations | type == "array") and
+  all(.destinations[];
+    .recommendation_id == $recommendation_id and
+    (.destination | test("^[a-z0-9][a-z0-9_.-]{0,127}$")) and
+    (.idempotency_key | test("^sha256:[0-9a-f]{64}$")) and
+    (.state == "exported" or .state == "received" or .state == "applied" or .state == "rejected" or .state == "unknown")
+  )
 ' "$envelope" >/dev/null || {
   echo "Recommendation envelope contract is invalid" >&2
   exit 1
