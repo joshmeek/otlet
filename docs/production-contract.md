@@ -96,7 +96,7 @@ SET preload_model_name = 'qwen35_4b'
 WHERE name = 'default';
 ```
 
-Preload applies `default_runtime_options`, including `max_worker_rss_bytes`, and uses the normal artifact, fingerprint, memory, cgroup, and RSS admission checks. It creates no job or receipt. Inspect the ready slot in `otlet.runtime_status` and the latest `model_preload_succeeded` or `model_preload_failed` row in `otlet.worker_events`. Set `preload_model_name = NULL` and restart to restore the cold default
+Preload applies `default_runtime_options`, including the default 8 GiB `max_worker_rss_bytes`, and uses the normal artifact, fingerprint, memory, cgroup, and RSS admission checks. Set `OTLET_MAX_WORKER_RSS_BYTES` during setup or update the policy to override it; an explicit `0` disables RSS enforcement. Preload creates no job or receipt. Inspect the ready slot in `otlet.runtime_status` and the latest `model_preload_succeeded` or `model_preload_failed` row in `otlet.worker_events`. Set `preload_model_name = NULL` and restart to restore the cold default
 
 Queue caps are admission-time controls. Rows enter `otlet.jobs` through `run_task`, watch refresh, semantic refresh, or `ask`; direct inserts are internal/testing-only and can bypass admission accounting. `verify_invariants()` returns one row per violation. The demo requires `SELECT count(*) FROM otlet.verify_invariants()` to return `0` (`invariant_contract=0`). The `queued_jobs_within_model_cap` check reports models whose queued depth exceeds `max_queued_jobs_per_model`
 
@@ -104,7 +104,9 @@ Claimed jobs use `otlet.effective_job_lease_interval(...)`, which covers the tas
 
 Otlet debounces suppressed queue-admission events per task and reason for one minute, so a full queue stays visible without flooding `worker_events`. `production_status` exposes `semantic_materialization_failed_events` and `semantic_materialization_last_failed_at`. Nonzero `max_worker_rss_bytes` budgets require Linux RSS, total-memory, and available-memory samples. A cache miss also requires artifact metadata and a no-allocation llama.cpp projection; missing evidence or insufficient headroom rejects the load before tensor allocation. Cleanup can prune old failed or canceled jobs after outputs, actions, eval labels, and receipts no longer reference them
 
-The resident worker attaches to the `postgres` database. Supporting worker registration across multiple databases requires separate shared-memory and latch routing
+The resident worker attaches to `OTLET_DATABASE`, which defaults to `postgres`. One PostgreSQL cluster runs Otlet against one database because cross-database worker registration requires separate shared-memory and latch routing. Setup refuses an Otlet installation in a second database and checks the target database, extension files, model files, schema access, runtime role, and memory budget before enabling the worker
+
+Before claiming jobs, the worker validates `default_runtime_options`. It records `worker_started` with the database, role, and memory budget on success. Invalid policy records `worker_startup_failed`, leaves queued jobs untouched, and retries the preflight at a bounded interval
 
 Native llama.cpp faults bypass Rust's error boundary. Otlet contains them through Postgres worker restart and lease recovery. Otlet trusts no partial model output, and `otlet.sweep_expired_jobs()` fails expired running jobs that reached the attempt limit with a receipt. The demo scans container logs and prints `docker_crash_log_scan=ok` when the run contains no worker crash, panic, assertion, or terminated server process
 

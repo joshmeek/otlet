@@ -10,7 +10,7 @@ require_container() {
 }
 
 psql_exec() {
-  docker exec -i "$container" psql -U postgres -d postgres -v ON_ERROR_STOP=1 "$@"
+  docker exec -i "$container" psql -U postgres -d "$database" -v ON_ERROR_STOP=1 "$@"
 }
 
 psql_value() {

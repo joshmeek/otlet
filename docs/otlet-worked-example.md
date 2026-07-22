@@ -37,12 +37,14 @@ Observed setup output:
 
 ```text
 postgres_url=postgres://postgres:postgres@127.0.0.1:55432/postgres
+database=postgres
 worker_count=1
+max_worker_rss_bytes=8589934592
 cheap_model_artifact=/var/lib/postgresql/otlet-models/Qwen3-1.7B-Q8_0.gguf
 strong_model_artifact=/var/lib/postgresql/otlet-models/Qwen3.5-4B-Q4_K_M.gguf
 ```
 
-The setup installs the extension and starts one resident worker. The demo registers both models, creates its fixtures and tasks, waits for the model work, and checks each contract
+The setup installs the extension and starts one resident worker. Set `OTLET_DATABASE` to use another database and `OTLET_MAX_WORKER_RSS_BYTES` to override the default 8 GiB worker RSS budget. The demo registers both models, creates its fixtures and tasks, waits for the model work, and checks each contract
 
 Open `psql` to inspect the completed run:
 

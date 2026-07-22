@@ -1,5 +1,10 @@
 use serde_json::{Value, json};
 
+#[cfg(target_os = "linux")]
+const DEFAULT_MAX_WORKER_RSS_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+#[cfg(not(target_os = "linux"))]
+const DEFAULT_MAX_WORKER_RSS_BYTES: u64 = 0;
+
 const SUPPORTED_RUNTIME_OPTIONS: &[&str] = &[
     "reasoning",
     "max_tokens",
@@ -31,7 +36,7 @@ impl Default for RuntimeOptions {
             reasoning: "off",
             max_tokens: 512,
             inference_cache: true,
-            max_worker_rss_bytes: 0,
+            max_worker_rss_bytes: DEFAULT_MAX_WORKER_RSS_BYTES,
             generation_trace: false,
             generation_trace_max_tokens: 64,
             generation_trace_top_k: 5,
@@ -188,4 +193,19 @@ pub(crate) fn runtime_option_status(value: &Value) -> Value {
         "unsupported": ["temperature", "connect_timeout_ms", "request_timeout_ms"],
         "ignored": []
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn worker_memory_has_a_bounded_default_and_explicit_disable() {
+        let defaults = parse_runtime_options(&json!({})).expect("default options must parse");
+        assert_eq!(defaults.max_worker_rss_bytes, DEFAULT_MAX_WORKER_RSS_BYTES);
+
+        let disabled = parse_runtime_options(&json!({"max_worker_rss_bytes": 0}))
+            .expect("explicit disable must parse");
+        assert_eq!(disabled.max_worker_rss_bytes, 0);
+    }
 }

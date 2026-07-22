@@ -2,6 +2,7 @@
 set -euo pipefail
 
 container="${OTLET_PG_CONTAINER:-otlet-postgres}"
+database="${OTLET_DATABASE:-postgres}"
 cheap_model_name="${OTLET_CHEAP_MODEL_NAME:-qwen3_1_7b}"
 strong_model_name="${OTLET_STRONG_MODEL_NAME:-qwen35_4b}"
 strong_alias_model_name="${OTLET_STRONG_ALIAS_MODEL_NAME:-qwen35_4b_policy_alias}"
