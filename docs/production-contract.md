@@ -354,6 +354,7 @@ The auditor capability grants these redacted policy and audit views:
 - `otlet.audit_action_execution_export`
 - `otlet.audit_eval_label_export`
 - `otlet.audit_workload_evaluation_export`
+- `otlet.decision_trace_export`
 - `otlet.action_workflow_policy_status`
 - `otlet.cleanup_receipt_status`
 - `otlet.retention_hold_status`
@@ -375,6 +376,22 @@ The grant also includes three pure JSON hashing helpers required by `audit_revie
 - `otlet.apply_action`
 
 The eight operator functions run as the extension owner with `search_path` fixed to `pg_catalog, otlet, pg_temp`. Operators receive no direct table writes. The owner alone registers targets and workflow policies, disables them, and imports or exports watches. Watch exports contain instructions, policies, schemas, source identifiers, and owner-authored candidate SQL, so auditor and operator roles cannot read or import them
+
+## Signed decision exports
+
+`otlet.decision_trace_export` joins each accepted receipt to its source, task, model, prompt, schema, runtime, output, review, action, freshness, and execution identities. It exports hashes and bounded audit fields, not source rows, prompts, model output, action payloads, review reasons, credentials, or signing material
+
+Generate a deterministic SQL and CSV bundle for one receipt with an Ed25519 key stored outside PostgreSQL:
+
+```sh
+openssl genpkey -algorithm ED25519 -out /secure/otlet-signing-key.pem
+./scripts/otlet-export-decision.sh 42 /secure/exports/receipt-42 /secure/otlet-signing-key.pem
+./scripts/otlet-verify-decision-export.sh /secure/exports/receipt-42
+```
+
+The bundle contains `decision.sql`, `decision.csv`, `audit-manifest.json`, `recommendation-envelope.json`, its detached signature, and the public verification key. The manifest uses SHA-256 file identities and the signed envelope binds the manifest, recommendation, and public-key identity. Re-exporting unchanged database evidence with the same key produces identical bytes
+
+The exporter writes one local directory and performs no destination delivery. Keep the private key in an external secret store or signing service, distribute the public key through a trusted channel, and let a separate delivery process move verified bundles
 
 Approval, rejection, correction, deferral, and abstention append immutable rows to `otlet.review_events`. Otlet derives `reviewer_identity` from `session_user` and `reviewer_role` from the active `SET ROLE` state; none of the review functions accepts either value from the caller. Each event snapshots its reason, timestamp, source freshness, and links to the job, action or output, receipt, model artifact, prompt, schema, runtime, and output identities
 

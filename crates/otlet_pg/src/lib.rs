@@ -117,9 +117,14 @@ pgrx::extension_sql_file!(
     requires = ["action_review_status"]
 );
 pgrx::extension_sql_file!(
+    "../sql/175_decision_exports.sql",
+    name = "decision_exports",
+    requires = ["inference_receipt_status"]
+);
+pgrx::extension_sql_file!(
     "../sql/180_runtime_cache_status.sql",
     name = "runtime_cache_status",
-    requires = ["inference_receipt_status"]
+    requires = ["decision_exports"]
 );
 pgrx::extension_sql_file!(
     "../sql/190_trace_tokens.sql",

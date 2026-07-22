@@ -442,6 +442,8 @@ Events show worker behavior. Receipts show model behavior
 
 The portable worker emits one `preflight_passed` event before model load or claims. A failed explicit `--preflight` emits `preflight_failed` with one stable dependency code and no connection string, credential, prompt, or source value
 
+`otlet.decision_trace_export` is the content-addressed export surface for accepted receipts. `decision_trace_sha256` covers the canonical identity trace and identifies its compact recommendation. Actions include payload hashes and ordered execution-receipt identities; reviews include reviewer, freshness, and evidence hashes without reason text
+
 Database health is a separate live surface:
 
 ```sql
