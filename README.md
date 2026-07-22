@@ -159,6 +159,8 @@ Prove a fresh disposable install, worker lifecycle, database restart, upgrade fa
 
 Configure all-or-nothing row, input-byte, queue-byte, candidate-plan, and candidate-timeout limits with [the workload admission contract](docs/workload-admission.md)
 
+Run Otlet against a standard PostgreSQL service that cannot load the native worker with [the portable worker](portable/README.md). Its real-model smoke test creates a disposable SQL-only database and completes one job through the same trusted receipt state
+
 ## Docs
 
 Start with [the worked example](docs/otlet-worked-example.md)
@@ -168,6 +170,7 @@ Start with [the worked example](docs/otlet-worked-example.md)
 - [Semantic watches](docs/semantic-watches.md)
 - [Production contract](docs/production-contract.md)
 - [Trust conformance](docs/trust-conformance.md)
+- [Portable worker](portable/README.md)
 - [Model benchmarks](benchmarks/README.md)
 - [Roadmap](docs/roadmap.md)
 

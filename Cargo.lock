@@ -933,6 +933,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "otlet_worker"
+version = "0.1.0"
+dependencies = [
+ "llama-cpp-sys-4",
+ "serde",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
 name = "outref"
 version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"

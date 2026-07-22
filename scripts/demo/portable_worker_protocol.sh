@@ -42,7 +42,8 @@ trap cleanup_portable_protocol EXIT
 psql_exec -qAt \
   -v worker_role="$portable_worker_role" \
   -v unauthorized_role="$portable_unauthorized_role" \
-  -v worker_id="$portable_worker_id" <<'SQL' >/dev/null
+  -v worker_id="$portable_worker_id" \
+  -v model_name="$strong_model_name" <<'SQL' >/dev/null
 SELECT format(
   'CREATE ROLE %I NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS',
   :'worker_role'
@@ -57,6 +58,7 @@ SELECT otlet.register_portable_worker(
   :'worker_id',
   :'worker_role'::regrole,
   1,
+  :'model_name',
   'reference-worker',
   '0.1.0',
   '{"engine":"llama.cpp","build":"demo","transport":"postgres"}'::jsonb

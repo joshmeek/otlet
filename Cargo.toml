@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/otlet_pg"]
+members = ["crates/otlet_pg", "crates/otlet_worker"]
 
 [profile.release]
 opt-level = 3

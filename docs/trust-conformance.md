@@ -44,13 +44,15 @@ The suite expects rejection, bounded evidence, no apply receipt, worker availabi
 
 ## Portable Runtime Threats
 
-The database protocol accepts shaped snapshots and fenced writes only from an enabled runtime identity bound to the invoking worker role. The reference external worker and deployment preflight are not shipped yet. They must close these remaining threats before release:
+The database protocol accepts shaped snapshots and fenced writes only from an enabled runtime identity bound to the invoking worker role. The reference external worker verifies one registered local GGUF, uses the database-built prompt, and returns every claimed result through a fenced RPC. It has no source-table grant or remote model API
+
+Item 20 adds the deployment preflight needed to close these remaining threats before release:
 
 - stolen or replayed worker credentials
 - claim replay after lease expiry or failover
 - intercepted database traffic or permissive egress
 
-The database already enforces the runtime allowlist, exact protocol compatibility, fixed-search-path `SECURITY DEFINER` RPCs, a claim fence on every write, database-recomputed identity, idempotent terminal state, and no direct table grants. Deployment still requires verified TLS, credential rotation, egress policy, and preflight
+The database enforces the runtime allowlist, exact protocol compatibility, fixed-search-path `SECURITY DEFINER` RPCs, a claim fence on every write, database-recomputed identity, idempotent terminal state, and no direct table grants. The worker verifies the local artifact digest before loading llama.cpp. Deployment still requires verified TLS, credential rotation, egress policy, and preflight
 
 ## Stable Decisions
 

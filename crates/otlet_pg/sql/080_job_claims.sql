@@ -1,10 +1,16 @@
 -- Atomic queue claim for the resident worker; returns zero rows when no work exists
-CREATE FUNCTION otlet.claim_jobs() RETURNS SETOF otlet.jobs
+CREATE FUNCTION otlet.claim_jobs(
+  requested_model_name text DEFAULT NULL,
+  requested_limit integer DEFAULT NULL
+) RETURNS SETOF otlet.jobs
 LANGUAGE sql
 AS $$
   WITH policy AS (
     SELECT
-      worker_claim_batch_size AS batch_size,
+      CASE
+        WHEN claim_jobs.requested_limit IS NULL THEN worker_claim_batch_size
+        ELSE LEAST(worker_claim_batch_size, GREATEST(claim_jobs.requested_limit, 1))
+      END AS batch_size,
       worker_claim_task_cursor AS task_cursor,
       max_attempts,
       max_attempt_ms,
@@ -19,6 +25,10 @@ AS $$
     FROM otlet.jobs j
     JOIN otlet.tasks t ON t.name = j.task_name
     WHERE j.status IN ('queued', 'running', 'cancel_requested')
+      AND (
+        claim_jobs.requested_model_name IS NULL
+        OR t.model_name = claim_jobs.requested_model_name
+      )
       AND NOT otlet.source_fields_are_allowed(j.input, t.input_shaping)
     ORDER BY j.created_at, j.id
     FOR UPDATE OF j SKIP LOCKED
@@ -91,6 +101,10 @@ AS $$
         COALESCE(active_model.running_jobs, 0)
         + COALESCE(active_model.cancel_requested_jobs, 0)
       ) < m.max_active_jobs
+      AND (
+        claim_jobs.requested_model_name IS NULL
+        OR t.model_name = claim_jobs.requested_model_name
+      )
       AND otlet.source_fields_are_allowed(j.input, t.input_shaping)
     GROUP BY
       j.task_name,

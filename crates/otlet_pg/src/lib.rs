@@ -217,9 +217,14 @@ pgrx::extension_sql_file!(
     requires = ["watch_portability_status"]
 );
 pgrx::extension_sql_file!(
+    "../sql/385_portable_permissions.sql",
+    name = "portable_permissions",
+    requires = ["audit_export"]
+);
+pgrx::extension_sql_file!(
     "../sql/390_permissions.sql",
     name = "permissions",
-    requires = ["audit_export"]
+    requires = ["portable_permissions"]
 );
 
 #[allow(non_snake_case)]

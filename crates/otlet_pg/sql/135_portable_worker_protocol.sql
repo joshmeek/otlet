@@ -21,6 +21,7 @@ CREATE TABLE otlet.portable_workers (
   worker_id text PRIMARY KEY CHECK (worker_id ~ '^[a-z0-9][a-z0-9_-]{0,62}$'),
   database_role_oid oid NOT NULL,
   protocol_version integer NOT NULL REFERENCES otlet.portable_protocol_versions(protocol_version),
+  model_name text NOT NULL REFERENCES otlet.models(name),
   runtime_name text NOT NULL CHECK (runtime_name ~ '^[a-z0-9][a-z0-9_.-]{0,127}$'),
   runtime_version text NOT NULL CHECK (
     btrim(runtime_version) <> '' AND octet_length(runtime_version) <= 128
@@ -79,6 +80,7 @@ CREATE FUNCTION otlet.register_portable_worker(
   worker_id text,
   target_role regrole,
   protocol_version integer,
+  model_name text,
   runtime_name text,
   runtime_version text,
   runtime_identity jsonb
@@ -130,6 +132,7 @@ BEGIN
     worker_id,
     database_role_oid,
     protocol_version,
+    model_name,
     runtime_name,
     runtime_version,
     runtime_identity,
@@ -139,6 +142,7 @@ BEGIN
     register_portable_worker.worker_id,
     register_portable_worker.target_role::oid,
     register_portable_worker.protocol_version,
+    register_portable_worker.model_name,
     register_portable_worker.runtime_name,
     register_portable_worker.runtime_version,
     register_portable_worker.runtime_identity,
@@ -147,6 +151,7 @@ BEGIN
   ON CONFLICT ON CONSTRAINT portable_workers_pkey DO UPDATE
   SET database_role_oid = EXCLUDED.database_role_oid,
       protocol_version = EXCLUDED.protocol_version,
+      model_name = EXCLUDED.model_name,
       runtime_name = EXCLUDED.runtime_name,
       runtime_version = EXCLUDED.runtime_version,
       runtime_identity = EXCLUDED.runtime_identity,
@@ -283,7 +288,8 @@ $$;
 CREATE FUNCTION otlet.portable_claim_jobs(
   requested_worker_id text,
   requested_protocol_version integer,
-  requested_runtime_identity_hash text
+  requested_runtime_identity_hash text,
+  requested_claim_limit integer DEFAULT NULL
 ) RETURNS TABLE (
   protocol_version integer,
   worker_id text,
@@ -299,6 +305,8 @@ CREATE FUNCTION otlet.portable_claim_jobs(
   runtime_options jsonb,
   decision_contract jsonb,
   input_snapshot jsonb,
+  prompt text,
+  prompt_hash text,
   model_policy jsonb,
   evidence_limits jsonb
 )
@@ -314,6 +322,10 @@ DECLARE
   saved_claim otlet.portable_claims%ROWTYPE;
   selected_model_policy jsonb;
 BEGIN
+  IF portable_claim_jobs.requested_claim_limit IS NOT NULL
+     AND portable_claim_jobs.requested_claim_limit NOT BETWEEN 1 AND 128 THEN
+    RAISE EXCEPTION 'otlet portable claim limit must be between 1 and 128';
+  END IF;
   worker_row := otlet.authorized_portable_worker(
     portable_claim_jobs.requested_worker_id,
     portable_claim_jobs.requested_protocol_version,
@@ -321,7 +333,10 @@ BEGIN
   );
   SELECT p.* INTO policy_row FROM otlet.production_policy p WHERE p.name = 'default';
 
-  FOR claimed_job IN SELECT * FROM otlet.claim_jobs() LOOP
+  FOR claimed_job IN
+    SELECT *
+    FROM otlet.claim_jobs(worker_row.model_name, portable_claim_jobs.requested_claim_limit)
+  LOOP
     UPDATE otlet.portable_claims c
     SET status = 'replaced',
         finished_at = now()
@@ -398,6 +413,14 @@ BEGIN
     runtime_options := policy_row.default_runtime_options || task_row.runtime_options;
     decision_contract := task_row.decision_contract;
     input_snapshot := otlet.semantic_shaped_input(claimed_job.input, task_row.input_shaping);
+    prompt := otlet.portable_prompt_text(
+      task_row.instruction,
+      task_row.output_schema,
+      input_snapshot,
+      runtime_options,
+      task_row.decision_contract
+    );
+    prompt_hash := otlet.portable_text_hash(prompt);
     model_policy := selected_model_policy;
     evidence_limits := jsonb_build_object(
       'max_input_bytes', policy_row.max_input_bytes_per_job,
@@ -771,6 +794,7 @@ SELECT
   w.worker_id,
   pg_catalog.pg_get_userbyid(w.database_role_oid) AS database_role,
   w.protocol_version,
+  w.model_name,
   w.runtime_name,
   w.runtime_version,
   w.runtime_identity_hash,
@@ -786,6 +810,7 @@ GROUP BY
   w.worker_id,
   w.database_role_oid,
   w.protocol_version,
+  w.model_name,
   w.runtime_name,
   w.runtime_version,
   w.runtime_identity_hash,
