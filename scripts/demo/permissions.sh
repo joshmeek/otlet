@@ -42,18 +42,22 @@ SELECT otlet.grant_operator_access('$permission_operator_role'::regrole);
 SELECT otlet.grant_operator_access('$permission_operator_role'::regrole);
 SQL
 
-permission_apply_action_id="$(psql_value -v task_name="$row_triage_task" <<'SQL'
+permission_apply_action_id="$(psql_value -v task_name="$bounded_action_task" <<'SQL'
 SELECT min(a.id)
 FROM otlet.actions a
 JOIN otlet.jobs j ON j.id = a.job_id
-JOIN otlet.action_type_schemas s ON s.action_type = a.action_type
-WHERE s.applyable
-  AND a.action_type = 'create_record'
+WHERE a.action_type = 'update_row'
+  AND a.authority_mode = 'bounded_mutation'
+  AND a.evaluation_status = 'evaluated'
+  AND a.status = 'approved'
+  AND a.approval_status = 'approved'
+  AND a.dry_run_status = 'passed'
+  AND a.apply_status = 'not_applicable'
   AND j.task_name = :'task_name';
 SQL
 )"
 [ -n "$permission_apply_action_id" ] || {
-  echo "Expected an applyable create_record action for permission proof" >&2
+  echo "Expected an approved bounded update for permission proof" >&2
   exit 1
 }
 
@@ -83,6 +87,7 @@ SELECT (SELECT count(*) = 1 FROM otlet.redaction_policy_status)::text || '|' ||
        (SELECT count(*) > 0 FROM otlet.audit_review_export)::text || '|' ||
        (SELECT count(*) > 0 FROM otlet.audit_action_execution_export)::text || '|' ||
        (SELECT count(*) > 0 FROM otlet.audit_eval_label_export)::text || '|' ||
+       (SELECT count(*) > 0 FROM otlet.action_workflow_policy_status)::text || '|' ||
        (SELECT count(*) > 0 FROM otlet.semantic_dependency_audit)::text || '|' ||
        (SELECT count(*) > 0 FROM otlet.operational_event_log)::text || '|' ||
        (SELECT count(*) > 0 FROM otlet.worker_batch_timing_status)::text;
@@ -90,7 +95,7 @@ ROLLBACK;
 SQL
 )"
 echo "auditor_read_contract=$auditor_read_contract"
-[ "$auditor_read_contract" = "true|true|true|true|true|true|true|true|true" ] || {
+[ "$auditor_read_contract" = "true|true|true|true|true|true|true|true|true|true" ] || {
   echo "Expected auditor access to all redacted exports, got $auditor_read_contract" >&2
   exit 1
 }
@@ -100,6 +105,7 @@ expect_permission_denied "$permission_auditor_role" "SELECT count(*) FROM otlet.
 expect_permission_denied "$permission_auditor_role" "SELECT count(*) FROM otlet.outputs" "auditor outputs table read"
 expect_permission_denied "$permission_auditor_role" "SELECT count(*) FROM otlet.actions" "auditor actions table read"
 expect_permission_denied "$permission_auditor_role" "SELECT count(*) FROM otlet.action_targets" "auditor action target read"
+expect_permission_denied "$permission_auditor_role" "SELECT count(*) FROM otlet.action_workflow_policies" "auditor action workflow policy read"
 expect_permission_denied "$permission_auditor_role" "SELECT count(*) FROM otlet.action_execution_receipts" "auditor action execution receipt read"
 expect_permission_denied "$permission_auditor_role" "SELECT count(*) FROM otlet.inference_receipt_trace_status" "auditor raw receipt view read"
 expect_permission_denied "$permission_auditor_role" "SELECT count(*) FROM otlet.inference_receipt_token_trace" "auditor token trace read"
@@ -114,6 +120,8 @@ expect_permission_denied "$permission_auditor_role" "SELECT otlet.register_model
 expect_permission_denied "$permission_auditor_role" "SELECT otlet.drop_watch('denied')" "auditor watch administration"
 expect_permission_denied "$permission_auditor_role" "SELECT otlet.register_action_target('denied', 'public.otlet_demo_bounded_actions'::regclass, 'id', ARRAY['review_state']::name[])" "auditor action target registration"
 expect_permission_denied "$permission_auditor_role" "SELECT otlet.disable_action_target('$bounded_action_target')" "auditor action target disable"
+expect_permission_denied "$permission_auditor_role" "SELECT otlet.register_action_workflow_policy('$bounded_action_task', 'update_row', '$bounded_action_target')" "auditor action workflow policy registration"
+expect_permission_denied "$permission_auditor_role" "SELECT otlet.disable_action_workflow_policy('$bounded_action_task', 'update_row')" "auditor action workflow policy disable"
 expect_permission_denied "$permission_auditor_role" "SELECT * FROM otlet.cancel_job(0)" "auditor job cancellation"
 expect_permission_denied "$permission_auditor_role" "SELECT * FROM otlet.cleanup_policy_state(true)" "auditor cleanup"
 expect_permission_denied "$permission_auditor_role" "SELECT otlet.export_watch('$numeric_triage_watch')" "auditor watch export"
@@ -375,6 +383,7 @@ SQL
 
 expect_permission_denied "$permission_operator_role" "UPDATE otlet.actions SET status = status WHERE false" "operator direct action update"
 expect_permission_denied "$permission_operator_role" "SELECT count(*) FROM otlet.action_targets" "operator action target read"
+expect_permission_denied "$permission_operator_role" "SELECT count(*) FROM otlet.action_workflow_policies" "operator action workflow policy read"
 expect_permission_denied "$permission_operator_role" "SELECT count(*) FROM otlet.action_execution_receipts" "operator action execution receipt read"
 expect_permission_denied "$permission_operator_role" "UPDATE public.otlet_demo_bounded_actions SET review_state = review_state WHERE false" "operator direct target update"
 expect_permission_denied "$permission_operator_role" "INSERT INTO otlet.eval_labels DEFAULT VALUES" "operator direct eval label insert"
@@ -387,6 +396,8 @@ expect_permission_denied "$permission_operator_role" "SELECT otlet.create_task('
 expect_permission_denied "$permission_operator_role" "SELECT otlet.drop_watch('denied')" "operator watch administration"
 expect_permission_denied "$permission_operator_role" "SELECT otlet.register_action_target('denied', 'public.otlet_demo_bounded_actions'::regclass, 'id', ARRAY['review_state']::name[])" "operator action target registration"
 expect_permission_denied "$permission_operator_role" "SELECT otlet.disable_action_target('$bounded_action_target')" "operator action target disable"
+expect_permission_denied "$permission_operator_role" "SELECT otlet.register_action_workflow_policy('$bounded_action_task', 'update_row', '$bounded_action_target')" "operator action workflow policy registration"
+expect_permission_denied "$permission_operator_role" "SELECT otlet.disable_action_workflow_policy('$bounded_action_task', 'update_row')" "operator action workflow policy disable"
 expect_permission_denied "$permission_operator_role" "SELECT * FROM otlet.claim_jobs()" "operator job claim"
 expect_permission_denied "$permission_operator_role" "SELECT * FROM otlet.complete_job(0, '{}'::jsonb, '')" "operator job completion"
 expect_permission_denied "$permission_operator_role" "SELECT * FROM otlet.fail_job(0, 'denied')" "operator job failure"
@@ -413,6 +424,7 @@ WITH table_grants AS (
             'audit_review_export',
             'audit_action_execution_export',
             'audit_eval_label_export',
+            'action_workflow_policy_status',
             'semantic_dependency_audit',
             'operational_event_log',
             'worker_batch_timing_status'
@@ -503,14 +515,14 @@ CROSS JOIN definer_status;
 SQL
 )"
 echo "permission_catalog_contract=$permission_catalog_contract"
-[ "$permission_catalog_contract" = "false|0|0|0|9|3|9|9|0|0|0|0|8|8|0|true" ] || {
+[ "$permission_catalog_contract" = "false|0|0|0|10|3|10|9|0|0|0|0|8|8|0|true" ] || {
   echo "Expected exact public, auditor, operator, and owner ACLs, got $permission_catalog_contract" >&2
   exit 1
 }
 
-permission_contract="public=0/0/0|auditor=9/3|operator=9/9|definer=8/8|positive=7|denied=$permission_denied_count"
+permission_contract="public=0/0/0|auditor=10/3|operator=10/9|definer=8/8|positive=7|denied=$permission_denied_count"
 echo "permission_contract=$permission_contract"
-[ "$permission_contract" = "public=0/0/0|auditor=9/3|operator=9/9|definer=8/8|positive=7|denied=48" ] || {
+[ "$permission_contract" = "public=0/0/0|auditor=10/3|operator=10/9|definer=8/8|positive=7|denied=54" ] || {
   echo "Expected complete permission contract, got $permission_contract" >&2
   exit 1
 }

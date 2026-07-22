@@ -206,10 +206,11 @@ bounded_proposal_contract=5|3|1|1|1|2|1
 bounded_dry_run_contract=4|1|4|1
 bounded_queue_contract=4|1
 bounded_execution_contract=approved|bounded apply|1|DO_NOT_TOUCH_SENTINEL|pending||0|DO_NOT_TOUCH_SENTINEL|1|2|2|0
-permission_contract=public=0/0/0|auditor=8/3|operator=8/9|definer=8/8|positive=7|denied=48
+action_authority_contract=true|true|true|true|true|true|true|true|true|true
+permission_contract=public=0/0/0|auditor=10/3|operator=10/9|definer=8/8|positive=7|denied=54
 ```
 
-Otlet changes `row-1` once and preserves its protected sentinel. `row-3` stays unchanged. The two replay receipts affect zero rows, and the two rejected apply attempts affect zero rows
+Otlet changes `row-1` once and preserves its protected sentinel. `row-3` stays unchanged. The authority proof rejects a forged destination, recommendation-only policy, unevaluated and adversarial policies, missing approval, and stale source state before proving one bounded mutation
 
 ## Step 7 - Check Semantic And Production Paths
 

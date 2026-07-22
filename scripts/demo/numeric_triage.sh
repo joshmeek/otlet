@@ -150,7 +150,8 @@ BEGIN
     '{"type":"object","required":["match","confidence"],"additionalProperties":false,"properties":{"match":{"enum":["same_entity","different_entity"]},"confidence":{"enum":["high"]}}}'::jsonb,
     model_name_value,
     '{"max_tokens":32,"reasoning":"off","inference_cache":false}'::jsonb,
-    '{"source_fields":["action_ids"]}'::jsonb
+    '{"source_fields":["action_ids"]}'::jsonb,
+    '{"action_types":["merge_candidate"]}'::jsonb
   );
 
   INSERT INTO otlet.jobs (task_name, subject_id, input, status, attempts, started_at, leased_until)

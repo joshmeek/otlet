@@ -178,6 +178,84 @@ BEGIN
 
   RETURN QUERY
   SELECT
+    'workflow_actions_match_task_allowlist'::text,
+    'action'::text,
+    a.id::text,
+    jsonb_build_object(
+      'task_name', j.task_name,
+      'action_type', a.action_type,
+      'status', a.status
+    )
+  FROM otlet.actions a
+  JOIN otlet.jobs j ON j.id = a.job_id
+  JOIN otlet.tasks t ON t.name = j.task_name
+  WHERE a.authority_origin = 'workflow'
+    AND a.status <> 'rejected'
+    AND NOT COALESCE(t.decision_contract -> 'action_types', '[]'::jsonb) ? a.action_type;
+
+  RETURN QUERY
+  SELECT
+    'accepted_updates_match_workflow_authority'::text,
+    'action'::text,
+    a.id::text,
+    jsonb_build_object(
+      'task_name', j.task_name,
+      'target_name', a.target_name,
+      'subject_namespace', a.subject_namespace,
+      'authority_error', otlet.action_workflow_policy_error(
+        j.task_name,
+        a.action_type,
+        a.authority_policy_hash,
+        a.target_name,
+        a.subject_namespace,
+        false
+      )
+    )
+  FROM otlet.actions a
+  JOIN otlet.jobs j ON j.id = a.job_id
+  WHERE a.action_type = 'update_row'
+    AND a.status <> 'rejected'
+    AND (
+      a.authority_origin <> 'workflow'
+      OR otlet.action_workflow_policy_error(
+        j.task_name,
+        a.action_type,
+        a.authority_policy_hash,
+        a.target_name,
+        a.subject_namespace,
+        false
+      ) IS NOT NULL
+    );
+
+  RETURN QUERY
+  SELECT
+    'applied_updates_have_mutation_authority'::text,
+    'action'::text,
+    a.id::text,
+    jsonb_build_object(
+      'authority_origin', a.authority_origin,
+      'authority_mode', a.authority_mode,
+      'evaluation_status', a.evaluation_status,
+      'target_name', a.target_name,
+      'payload_target', a.payload #>> '{body,target}'
+    )
+  FROM otlet.actions a
+  WHERE a.action_type = 'update_row'
+    AND a.apply_status IN ('applied', 'replayed')
+    AND (
+      a.authority_origin <> 'workflow'
+      OR a.authority_mode <> 'bounded_mutation'
+      OR a.evaluation_status <> 'evaluated'
+      OR a.authority_policy_hash !~ '^[0-9a-f]{32}$'
+      OR a.target_name IS NULL
+      OR a.subject_namespace IS NULL
+      OR a.payload #>> '{body,target}' IS DISTINCT FROM a.target_name
+      OR a.dry_run_status <> 'passed'
+      OR a.approval_status <> 'approved'
+    );
+
+  RETURN QUERY
+  SELECT
     'applied_updates_have_execution_receipts'::text,
     'action'::text,
     a.id::text,

@@ -166,6 +166,43 @@ BEGIN
       );
   END IF;
 
+  IF NOT actual_decision_contract ? 'action_types' THEN
+    actual_decision_contract := jsonb_set(actual_decision_contract, '{action_types}', '[]'::jsonb, true);
+  END IF;
+  IF jsonb_typeof(actual_decision_contract -> 'action_types') IS DISTINCT FROM 'array'
+     OR jsonb_array_length(actual_decision_contract -> 'action_types') > 64
+     OR EXISTS (
+       SELECT 1
+       FROM jsonb_array_elements(actual_decision_contract -> 'action_types') action_type(value)
+       WHERE jsonb_typeof(action_type.value) IS DISTINCT FROM 'string'
+          OR NULLIF(action_type.value #>> '{}', '') IS NULL
+          OR octet_length(action_type.value #>> '{}') > 128
+     ) THEN
+    RAISE EXCEPTION 'otlet decision_contract.action_types must contain at most 64 non-empty action types';
+  END IF;
+  IF EXISTS (
+    SELECT 1
+    FROM jsonb_array_elements_text(actual_decision_contract -> 'action_types') action_type(value)
+    WHERE NOT EXISTS (
+      SELECT 1
+      FROM otlet.action_type_schemas schema
+      WHERE schema.action_type = action_type.value
+    )
+  ) THEN
+    RAISE EXCEPTION 'otlet decision_contract.action_types contains an unsupported action type';
+  END IF;
+  SELECT jsonb_set(
+    actual_decision_contract,
+    '{action_types}',
+    COALESCE(jsonb_agg(action_type ORDER BY action_type), '[]'::jsonb),
+    true
+  )
+  INTO actual_decision_contract
+  FROM (
+    SELECT DISTINCT value AS action_type
+    FROM jsonb_array_elements_text(actual_decision_contract -> 'action_types') action_type(value)
+  ) normalized;
+
   INSERT INTO otlet.tasks (
     name,
     input_query,

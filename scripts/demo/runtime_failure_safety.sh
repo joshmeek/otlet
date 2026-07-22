@@ -341,7 +341,7 @@ FROM job_row j;
 SQL
 )"
 echo "hallucinated_action_safety_contract=$hallucinated_action_contract"
-[ "$hallucinated_action_contract" = "1|rejected|unsupported action type|0|true" ] || {
+[ "$hallucinated_action_contract" = "1|rejected|action type invented_action is not allowed by workflow|0|true" ] || {
   echo "Expected hallucinated action type to be rejected without a record, got $hallucinated_action_contract" >&2
   exit 1
 }

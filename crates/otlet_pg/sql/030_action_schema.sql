@@ -13,11 +13,11 @@ INSERT INTO otlet.action_type_schemas (
   applyable
 )
 VALUES
-  ('create_record', false, true, true),
+  ('create_record', false, true, false),
   ('merge_candidate', true, false, false),
   ('new_entity', false, false, false),
   ('review_flag', false, false, false),
-  ('note', false, true, true),
+  ('note', false, true, false),
   ('update_row', true, false, true);
 
 CREATE TABLE otlet.action_targets (
@@ -32,12 +32,41 @@ CREATE TABLE otlet.action_targets (
   CHECK (NOT identity_column = ANY(allowed_columns))
 );
 
+CREATE TABLE otlet.action_workflow_policies (
+  task_name text NOT NULL REFERENCES otlet.tasks(name) ON DELETE CASCADE,
+  action_type text NOT NULL REFERENCES otlet.action_type_schemas(action_type),
+  target_name text NOT NULL REFERENCES otlet.action_targets(name),
+  subject_namespace text NOT NULL,
+  authority_mode text NOT NULL DEFAULT 'recommendation_only',
+  evaluation_status text NOT NULL DEFAULT 'unevaluated',
+  task_contract_hash text NOT NULL,
+  target_contract_hash text NOT NULL,
+  policy_hash text NOT NULL,
+  enabled boolean NOT NULL DEFAULT true,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (task_name, action_type),
+  CHECK (action_type = 'update_row'),
+  CHECK (NULLIF(subject_namespace, '') IS NOT NULL),
+  CHECK (authority_mode IN ('recommendation_only', 'bounded_mutation')),
+  CHECK (evaluation_status IN ('unevaluated', 'evaluated', 'adversarial')),
+  CHECK (task_contract_hash ~ '^[0-9a-f]{32}$'),
+  CHECK (target_contract_hash ~ '^[0-9a-f]{32}$'),
+  CHECK (policy_hash ~ '^[0-9a-f]{32}$')
+);
+
 CREATE TABLE otlet.actions (
   id bigserial PRIMARY KEY,
   job_id bigint NOT NULL REFERENCES otlet.jobs(id),
   output_id bigint REFERENCES otlet.outputs(id),
   receipt_id bigint REFERENCES otlet.inference_receipts(id),
   action_type text NOT NULL,
+  authority_origin text NOT NULL,
+  authority_mode text NOT NULL,
+  evaluation_status text NOT NULL,
+  authority_policy_hash text NOT NULL,
+  subject_namespace text NOT NULL,
+  target_name text REFERENCES otlet.action_targets(name),
   payload jsonb NOT NULL CHECK (jsonb_typeof(payload) = 'object'),
   status text NOT NULL DEFAULT 'proposed',
   approval_status text NOT NULL DEFAULT 'not_required',
@@ -54,6 +83,11 @@ CREATE TABLE otlet.actions (
   approved_at timestamptz,
   applied_at timestamptz,
   CHECK (status IN ('proposed', 'complete', 'rejected', 'approved', 'applied')),
+  CHECK (authority_origin IN ('workflow', 'system')),
+  CHECK (authority_mode IN ('recommendation_only', 'bounded_mutation')),
+  CHECK (evaluation_status IN ('unevaluated', 'evaluated', 'adversarial')),
+  CHECK (authority_policy_hash ~ '^[0-9a-f]{32}$'),
+  CHECK (NULLIF(subject_namespace, '') IS NOT NULL),
   CHECK (approval_status IN ('not_required', 'required', 'approved', 'rejected')),
   CHECK (dry_run_status IN ('not_run', 'passed', 'failed')),
   CHECK (apply_status IN ('not_applicable', 'applied', 'replayed', 'failed')),
@@ -153,4 +187,3 @@ WHERE label_source = 'manual_correction' AND receipt_id IS NOT NULL;
 
 CREATE INDEX eval_labels_created_at_idx
 ON otlet.eval_labels (created_at, id);
-

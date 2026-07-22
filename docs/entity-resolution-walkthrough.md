@@ -623,10 +623,10 @@ Representative output:
 ```text
    action_type   | requires_approval | creates_record | applyable
 -----------------+-------------------+----------------+-----------
- create_record   | f                 | t              | t
+ create_record   | f                 | t              | f
  merge_candidate | t                 | f              | f
  new_entity      | f                 | f              | f
- note            | f                 | t              | t
+ note            | f                 | t              | f
  review_flag     | f                 | f              | f
  update_row      | t                 | f              | t
 (6 rows)
@@ -637,7 +637,7 @@ Representative output:
 (1 row)
 ```
 
-Otlet enforces write authority through the action catalog. The model can request an action; Otlet decides which action types can become database state. Otlet stores unsupported actions as rejected evidence when they arrive with an accepted output. `otlet.action_status` shows approval, dry-run, and apply state
+Otlet enforces write authority through the task contract and action catalog. Each task has an `action_types` allowlist. Presets and watches set it when actions are expected; an omitted allowlist rejects every model action. `create_record`, `note`, and the decision actions remain recommendation state inside Otlet. Only `update_row` exposes an application-table write path. `otlet.action_status` shows its authority, approval, dry-run, and apply state
 
 Otlet exposes one source-table write action: `update_row`. The extension owner registers one ordinary table, its sole primary key, and the columns Otlet may update:
 
@@ -648,7 +648,17 @@ SELECT otlet.register_action_target(
   'id',
   ARRAY['review_state', 'review_reason']::name[]
 );
+
+SELECT otlet.register_action_workflow_policy(
+  'review_items_watch_task',
+  'update_row',
+  'review_items',
+  'bounded_mutation',
+  'evaluated'
+);
 ```
+
+The policy derives the destination and subject namespace from the registered row watch and target. Recommendation-only is the default. Mutation requires an evaluated bounded policy, a current task and target contract, a fresh source row, a passing dry run, approval, replay checks, and an execution receipt. An adversarial or unevaluated workflow cannot mutate rows
 
 The model-authored action contains data, not SQL:
 
@@ -666,7 +676,7 @@ The model-authored action contains data, not SQL:
 }
 ```
 
-The identity must equal the job subject, the target must equal the modeled source table, and the target registration must list each changed key. Version one supports one ordinary table, one single-column primary key, one row, and at most 16 changed columns. It rejects raw SQL, predicates, expressions, joins, generated columns, identity columns, partitions, foreign tables, views, temporary tables, Otlet tables, and RLS targets
+The identity must equal the job subject and the target registration must list each changed key. The stored target comes from workflow policy, not model text; a different model-proposed target rejects the action. Version one supports one ordinary table, one single-column primary key, one row, and at most 16 changed columns. It rejects raw SQL, predicates, expressions, joins, generated columns, identity columns, partitions, foreign tables, views, temporary tables, Otlet tables, and RLS targets
 
 Review the typed result before approval, then apply it:
 

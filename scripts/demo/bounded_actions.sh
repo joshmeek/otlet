@@ -49,6 +49,14 @@ SELECT otlet.create_watch(
   '{}'
 );
 
+SELECT otlet.register_action_workflow_policy(
+  :'watch_name' || '_task',
+  'update_row',
+  :'target_name',
+  'bounded_mutation',
+  'evaluated'
+);
+
 DO $body$
 DECLARE
   proposal record;
@@ -215,7 +223,7 @@ SELECT
   count(*) FILTER (WHERE a.status = 'proposed')::text || '|' ||
   count(*) FILTER (WHERE a.status = 'rejected')::text || '|' ||
   count(*) FILTER (WHERE a.error = 'update_row column is not allowed')::text || '|' ||
-  count(*) FILTER (WHERE a.error = 'unknown action target')::text || '|' ||
+  count(*) FILTER (WHERE a.error = 'update_row target does not match workflow authority')::text || '|' ||
   count(*) FILTER (WHERE a.error = 'update_row identity must match job subject_id')::text || '|' ||
   count(*) FILTER (
     WHERE payload #>> '{body,changes,review_reason}' = 'bounded apply'

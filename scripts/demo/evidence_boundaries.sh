@@ -296,7 +296,8 @@ CREATE TEMP TABLE evidence_redaction_task AS SELECT otlet.create_task(
   decision_contract => '{
     "redact_output_fields":["sensitive_note"],
     "redact_action_fields":["reason","sensitive_note"],
-    "identity_fields":["case_id"]
+    "identity_fields":["case_id"],
+    "action_types":["review_flag"]
   }'::jsonb
 );
 INSERT INTO otlet.jobs (task_name, subject_id, input, status, attempts, started_at)

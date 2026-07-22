@@ -75,7 +75,7 @@ action_allowlist_contract="$(psql_exec -qAt -v task_name="$action_allowlist_task
 SELECT count(*) FILTER (
          WHERE action_type = 'note'
            AND status = 'rejected'
-           AND error = 'action type note is not allowed by watch'
+           AND error = 'action type note is not allowed by workflow'
        )::text || '|' ||
        count(*) FILTER (WHERE action_type = 'note' AND output_id IS NOT NULL AND receipt_id IS NOT NULL)::text || '|' ||
        (

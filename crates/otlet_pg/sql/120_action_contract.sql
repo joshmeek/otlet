@@ -180,6 +180,259 @@ BEGIN
 END;
 $$;
 
+CREATE FUNCTION otlet.current_task_contract_hash(task_name text) RETURNS text
+LANGUAGE sql
+STABLE
+AS $$
+  SELECT otlet.task_contract_hash(
+    t.instruction,
+    t.output_schema,
+    t.model_name,
+    t.runtime_options,
+    t.input_shaping,
+    t.decision_contract
+  )
+  FROM otlet.tasks t
+  WHERE t.name = $1;
+$$;
+
+CREATE FUNCTION otlet.action_target_contract_hash(target_name text) RETURNS text
+LANGUAGE sql
+STABLE
+AS $$
+  SELECT md5(otlet.semantic_canonical_jsonb(jsonb_build_object(
+    'name', t.name,
+    'target_table', t.target_table::oid,
+    'identity_column', t.identity_column,
+    'allowed_columns', to_jsonb(ARRAY(
+      SELECT column_name::text
+      FROM unnest(t.allowed_columns) column_name
+      ORDER BY column_name
+    )),
+    'enabled', t.enabled
+  ))::text)
+  FROM otlet.action_targets t
+  WHERE t.name = $1;
+$$;
+
+CREATE FUNCTION otlet.default_action_authority_hash(
+  task_name text,
+  action_type text
+) RETURNS text
+LANGUAGE sql
+STABLE
+AS $$
+  SELECT md5(otlet.semantic_canonical_jsonb(jsonb_build_object(
+    'task_name', $1,
+    'action_type', $2,
+    'task_contract_hash', otlet.current_task_contract_hash($1),
+    'authority_mode', 'recommendation_only',
+    'evaluation_status', 'unevaluated'
+  ))::text);
+$$;
+
+CREATE FUNCTION otlet.register_action_workflow_policy(
+  task_name text,
+  action_type text,
+  target_name text,
+  authority_mode text DEFAULT 'recommendation_only',
+  evaluation_status text DEFAULT 'unevaluated'
+) RETURNS otlet.action_workflow_policies
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  task_row otlet.tasks%ROWTYPE;
+  watch_row otlet.watches%ROWTYPE;
+  target_row otlet.action_targets%ROWTYPE;
+  saved otlet.action_workflow_policies%ROWTYPE;
+  task_hash text;
+  target_hash text;
+  policy_hash text;
+  target_error text;
+BEGIN
+  SELECT * INTO task_row
+  FROM otlet.tasks t
+  WHERE t.name = register_action_workflow_policy.task_name;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'otlet task % does not exist', register_action_workflow_policy.task_name;
+  END IF;
+  IF register_action_workflow_policy.action_type <> 'update_row' THEN
+    RAISE EXCEPTION 'otlet bounded workflow authority only supports update_row';
+  END IF;
+  IF NOT COALESCE(task_row.decision_contract -> 'action_types', '[]'::jsonb)
+    ? register_action_workflow_policy.action_type THEN
+    RAISE EXCEPTION 'otlet action type % is not allowed by task %',
+      register_action_workflow_policy.action_type,
+      register_action_workflow_policy.task_name;
+  END IF;
+  IF register_action_workflow_policy.authority_mode NOT IN ('recommendation_only', 'bounded_mutation') THEN
+    RAISE EXCEPTION 'otlet action authority mode must be recommendation_only or bounded_mutation';
+  END IF;
+  IF register_action_workflow_policy.evaluation_status NOT IN ('unevaluated', 'evaluated', 'adversarial') THEN
+    RAISE EXCEPTION 'otlet action evaluation status must be unevaluated, evaluated, or adversarial';
+  END IF;
+
+  SELECT * INTO watch_row
+  FROM otlet.watches w
+  WHERE w.task_name = register_action_workflow_policy.task_name
+    AND w.kind = 'row';
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'otlet bounded workflow authority requires a row watch';
+  END IF;
+
+  SELECT * INTO target_row
+  FROM otlet.action_targets t
+  WHERE t.name = register_action_workflow_policy.target_name;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'otlet action target % does not exist', register_action_workflow_policy.target_name;
+  END IF;
+  target_error := otlet.action_target_validation_error(register_action_workflow_policy.target_name);
+  IF target_error IS NOT NULL THEN
+    RAISE EXCEPTION 'otlet %', target_error;
+  END IF;
+  IF target_row.target_table::oid IS DISTINCT FROM to_regclass(watch_row.source_table)::oid THEN
+    RAISE EXCEPTION 'otlet action target must match the workflow source table';
+  END IF;
+
+  task_hash := otlet.current_task_contract_hash(register_action_workflow_policy.task_name);
+  target_hash := otlet.action_target_contract_hash(register_action_workflow_policy.target_name);
+  policy_hash := md5(otlet.semantic_canonical_jsonb(jsonb_build_object(
+    'task_name', register_action_workflow_policy.task_name,
+    'action_type', register_action_workflow_policy.action_type,
+    'target_name', register_action_workflow_policy.target_name,
+    'subject_namespace', watch_row.source_table,
+    'authority_mode', register_action_workflow_policy.authority_mode,
+    'evaluation_status', register_action_workflow_policy.evaluation_status,
+    'task_contract_hash', task_hash,
+    'target_contract_hash', target_hash
+  ))::text);
+
+  INSERT INTO otlet.action_workflow_policies (
+    task_name,
+    action_type,
+    target_name,
+    subject_namespace,
+    authority_mode,
+    evaluation_status,
+    task_contract_hash,
+    target_contract_hash,
+    policy_hash,
+    enabled
+  )
+  VALUES (
+    register_action_workflow_policy.task_name,
+    register_action_workflow_policy.action_type,
+    register_action_workflow_policy.target_name,
+    watch_row.source_table,
+    register_action_workflow_policy.authority_mode,
+    register_action_workflow_policy.evaluation_status,
+    task_hash,
+    target_hash,
+    policy_hash,
+    true
+  )
+  ON CONFLICT ON CONSTRAINT action_workflow_policies_pkey DO UPDATE
+  SET target_name = EXCLUDED.target_name,
+      subject_namespace = EXCLUDED.subject_namespace,
+      authority_mode = EXCLUDED.authority_mode,
+      evaluation_status = EXCLUDED.evaluation_status,
+      task_contract_hash = EXCLUDED.task_contract_hash,
+      target_contract_hash = EXCLUDED.target_contract_hash,
+      policy_hash = EXCLUDED.policy_hash,
+      enabled = true,
+      updated_at = now()
+  RETURNING * INTO saved;
+
+  RETURN saved;
+END;
+$$;
+
+CREATE FUNCTION otlet.disable_action_workflow_policy(
+  task_name text,
+  action_type text
+) RETURNS otlet.action_workflow_policies
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  saved otlet.action_workflow_policies%ROWTYPE;
+BEGIN
+  UPDATE otlet.action_workflow_policies p
+  SET enabled = false,
+      updated_at = now()
+  WHERE p.task_name = disable_action_workflow_policy.task_name
+    AND p.action_type = disable_action_workflow_policy.action_type
+  RETURNING * INTO saved;
+
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'otlet action workflow policy does not exist';
+  END IF;
+  RETURN saved;
+END;
+$$;
+
+CREATE FUNCTION otlet.action_workflow_policy_error(
+  task_name text,
+  action_type text,
+  authority_policy_hash text,
+  target_name text,
+  subject_namespace text,
+  require_mutation boolean DEFAULT false
+) RETURNS text
+LANGUAGE plpgsql
+STABLE
+AS $$
+DECLARE
+  task_row otlet.tasks%ROWTYPE;
+  policy_row otlet.action_workflow_policies%ROWTYPE;
+  target_error text;
+BEGIN
+  SELECT * INTO task_row
+  FROM otlet.tasks t
+  WHERE t.name = action_workflow_policy_error.task_name;
+  IF NOT FOUND THEN
+    RETURN 'action task does not exist';
+  END IF;
+  IF NOT COALESCE(task_row.decision_contract -> 'action_types', '[]'::jsonb)
+    ? action_workflow_policy_error.action_type THEN
+    RETURN 'action type is not allowed by workflow';
+  END IF;
+
+  SELECT * INTO policy_row
+  FROM otlet.action_workflow_policies p
+  WHERE p.task_name = action_workflow_policy_error.task_name
+    AND p.action_type = action_workflow_policy_error.action_type;
+  IF NOT FOUND THEN
+    RETURN 'action has no registered workflow authority';
+  ELSIF NOT policy_row.enabled THEN
+    RETURN 'action workflow authority is disabled';
+  ELSIF policy_row.task_contract_hash IS DISTINCT FROM otlet.current_task_contract_hash(policy_row.task_name) THEN
+    RETURN 'action workflow task contract changed';
+  ELSIF policy_row.target_contract_hash IS DISTINCT FROM otlet.action_target_contract_hash(policy_row.target_name) THEN
+    RETURN 'action workflow target contract changed';
+  ELSIF policy_row.policy_hash IS DISTINCT FROM action_workflow_policy_error.authority_policy_hash THEN
+    RETURN 'action workflow authority changed';
+  ELSIF policy_row.target_name IS DISTINCT FROM action_workflow_policy_error.target_name THEN
+    RETURN 'action target does not match workflow authority';
+  ELSIF policy_row.subject_namespace IS DISTINCT FROM action_workflow_policy_error.subject_namespace THEN
+    RETURN 'action subject namespace does not match workflow authority';
+  END IF;
+
+  target_error := otlet.action_target_validation_error(policy_row.target_name);
+  IF target_error IS NOT NULL THEN
+    RETURN target_error;
+  END IF;
+  IF action_workflow_policy_error.require_mutation
+     AND policy_row.authority_mode <> 'bounded_mutation' THEN
+    RETURN 'action workflow is recommendation only';
+  ELSIF action_workflow_policy_error.require_mutation
+     AND policy_row.evaluation_status <> 'evaluated' THEN
+    RETURN 'action workflow is not evaluated for mutation';
+  END IF;
+
+  RETURN NULL;
+END;
+$$;
+
 CREATE FUNCTION otlet.update_row_idempotency_key(
   action_body jsonb,
   source_content_hash text
@@ -439,4 +692,3 @@ BEGIN
   RETURN NULL;
 END;
 $$;
-

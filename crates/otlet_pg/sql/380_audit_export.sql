@@ -88,6 +88,7 @@ SELECT
     'otlet.audit_review_export',
     'otlet.audit_action_execution_export',
     'otlet.audit_eval_label_export',
+    'otlet.action_workflow_policy_status',
     'otlet.semantic_dependency_audit',
     'otlet.operational_event_log',
     'otlet.worker_batch_timing_status',
@@ -205,6 +206,12 @@ SELECT
   q.output_id,
   q.receipt_id,
   q.action_type,
+  a.authority_origin,
+  a.authority_mode,
+  a.evaluation_status,
+  a.authority_policy_hash,
+  a.subject_namespace,
+  a.target_name,
   q.action_status,
   q.approval_status,
   q.dry_run_status,
@@ -224,7 +231,8 @@ SELECT
   q.current_content_hash,
   q.source_stale,
   q.created_at
-FROM otlet.review_queue q;
+FROM otlet.review_queue q
+LEFT JOIN otlet.actions a ON a.id = q.action_id;
 
 CREATE VIEW otlet.audit_action_execution_export AS
 SELECT
@@ -235,6 +243,11 @@ SELECT
   j.task_name,
   a.subject_id,
   a.action_type,
+  a.authority_origin,
+  a.authority_mode,
+  a.evaluation_status,
+  a.authority_policy_hash,
+  a.subject_namespace,
   a.status AS action_status,
   a.approval_status,
   a.dry_run_status,

@@ -95,11 +95,16 @@ SELECT
   j.subject_id AS job_subject_id,
   a.subject_id,
   a.action_type,
+  a.authority_origin,
+  a.authority_mode,
+  a.evaluation_status,
+  a.authority_policy_hash,
+  a.subject_namespace,
   a.status,
   a.approval_status,
   a.dry_run_status,
   a.apply_status,
-  a.payload #>> '{body,target}' AS target_name,
+  a.target_name,
   a.idempotency_key,
   a.source_table,
   a.source_hash,
@@ -132,6 +137,34 @@ LEFT JOIN LATERAL (
   ORDER BY er.created_at DESC, er.id DESC
   LIMIT 1
 ) execution ON true;
+
+CREATE VIEW otlet.action_workflow_policy_status AS
+SELECT
+  p.task_name,
+  p.action_type,
+  p.target_name,
+  p.subject_namespace,
+  p.authority_mode,
+  p.evaluation_status,
+  p.policy_hash,
+  p.task_contract_hash,
+  p.target_contract_hash,
+  p.enabled,
+  p.task_contract_hash IS NOT DISTINCT FROM otlet.current_task_contract_hash(p.task_name)
+    AS task_contract_current,
+  p.target_contract_hash IS NOT DISTINCT FROM otlet.action_target_contract_hash(p.target_name)
+    AS target_contract_current,
+  otlet.action_target_validation_error(p.target_name) AS target_error,
+  p.enabled
+    AND p.authority_mode = 'bounded_mutation'
+    AND p.evaluation_status = 'evaluated'
+    AND p.task_contract_hash IS NOT DISTINCT FROM otlet.current_task_contract_hash(p.task_name)
+    AND p.target_contract_hash IS NOT DISTINCT FROM otlet.action_target_contract_hash(p.target_name)
+    AND otlet.action_target_validation_error(p.target_name) IS NULL
+    AS mutation_authorized,
+  p.created_at,
+  p.updated_at
+FROM otlet.action_workflow_policies p;
 
 CREATE VIEW otlet.eval_label_status AS
 SELECT
@@ -486,4 +519,3 @@ SELECT
   created_at
 FROM direct_rejected_items
 ORDER BY created_at, task_name, job_subject_id, queue_kind;
-

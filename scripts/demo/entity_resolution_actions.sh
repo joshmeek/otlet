@@ -41,7 +41,7 @@ require_contains "$action_contract" "action_schema_contract=merge_candidate|new_
 require_contains "$action_contract" "action_type_contract=merge_candidate|new_entity" "Expected entity-resolution merge_candidate and new_entity actions"
 require_contains "$action_contract" "action_status_contract=4|4|4|0" "Expected four trusted valid entity actions"
 require_contains "$action_contract" "failed_attempt_action_contract=0" "Expected failed/rejected attempts to create no actions"
-require_contains "$action_contract" "action_applyable_contract=create_record:true|merge_candidate:false|new_entity:false|note:true|review_flag:false|update_row:true" "Expected applyable metadata to be schema-driven"
+require_contains "$action_contract" "action_applyable_contract=create_record:false|merge_candidate:false|new_entity:false|note:false|review_flag:false|update_row:true" "Expected only bounded row updates to expose an apply path"
 
 merge_action_id="$(psql_exec -qAt -v task_name="$entity_task" <<'SQL'
 SELECT min(action_id)
@@ -153,7 +153,8 @@ BEGIN
     '{"type":"object","required":["match","confidence"],"additionalProperties":false,"properties":{"match":{"enum":["same_entity","different_entity"]},"confidence":{"enum":["high"]}}}'::jsonb,
     model_name_value,
     '{"max_tokens":32,"reasoning":"off","inference_cache":false}'::jsonb,
-    '{"source_fields":["action_ids"]}'::jsonb
+    '{"source_fields":["action_ids"]}'::jsonb,
+    '{"action_types":["merge_candidate"]}'::jsonb
   );
 
   INSERT INTO otlet.jobs (task_name, subject_id, input, status, attempts, started_at, leased_until)

@@ -25,6 +25,7 @@ DECLARE
   policy otlet.production_policy%ROWTYPE;
   action jsonb;
   action_payload jsonb;
+  action_validation_payload jsonb;
   action_body jsonb;
   stored_action_payload jsonb;
   stored_action_body jsonb;
@@ -38,14 +39,19 @@ DECLARE
   action_type_name text;
   action_status text;
   action_approval_status text;
-  action_rejected_by_watch boolean;
   action_subject_id text;
   action_requires_approval boolean;
   action_creates_record boolean;
   action_record_type text;
   action_record_body jsonb;
   action_idempotency_key text;
-  has_action_type_restriction boolean := false;
+  workflow_policy otlet.action_workflow_policies%ROWTYPE;
+  authority_mode text;
+  authority_evaluation_status text;
+  authority_policy_hash text;
+  authority_subject_namespace text;
+  authority_target_name text;
+  proposed_target_name text;
   finish_started timestamptz := clock_timestamp();
 BEGIN
   SELECT * INTO job_row
@@ -200,15 +206,6 @@ BEGIN
     )
   );
 
-  -- One probe for the job's task: skip per-action watch scans when unrestricted.
-  SELECT EXISTS (
-    SELECT 1
-    FROM otlet.watches w
-    WHERE w.task_name = job_row.task_name
-      AND cardinality(w.action_types) > 0
-  )
-  INTO has_action_type_restriction;
-
   FOR action IN SELECT value FROM jsonb_array_elements(COALESCE(complete_job.actions, '[]'::jsonb)) LOOP
     action_payload := CASE
       WHEN jsonb_typeof(action) = 'object' THEN action
@@ -219,34 +216,67 @@ BEGIN
       ELSE '{}'::jsonb
     END;
     action_type_name := COALESCE(NULLIF(action ->> 'type', ''), 'invalid');
-    action_error := otlet.action_validation_error(action, complete_job.output, job_row.subject_id, job_row.input);
-    action_rejected_by_watch := false;
+    authority_mode := 'recommendation_only';
+    authority_evaluation_status := 'unevaluated';
+    authority_policy_hash := otlet.default_action_authority_hash(job_row.task_name, action_type_name);
+    authority_subject_namespace := 'task:' || job_row.task_name;
+    authority_target_name := NULL;
+    SELECT * INTO workflow_policy
+    FROM otlet.action_workflow_policies p
+    WHERE p.task_name = job_row.task_name
+      AND p.action_type = action_type_name
+      AND p.enabled;
+    IF FOUND THEN
+      authority_mode := workflow_policy.authority_mode;
+      authority_evaluation_status := workflow_policy.evaluation_status;
+      authority_policy_hash := workflow_policy.policy_hash;
+      authority_subject_namespace := workflow_policy.subject_namespace;
+      authority_target_name := workflow_policy.target_name;
+    END IF;
+
+    action_error := CASE
+      WHEN NOT COALESCE(task_row.decision_contract -> 'action_types', '[]'::jsonb) ? action_type_name
+        THEN 'action type ' || action_type_name || ' is not allowed by workflow'
+      ELSE NULL
+    END;
+    action_validation_payload := action_payload;
+    IF action_type_name = 'update_row' THEN
+      proposed_target_name := NULLIF(action_body ->> 'target', '');
+      IF authority_target_name IS NULL THEN
+        action_error := COALESCE(action_error, 'update_row requires registered workflow authority');
+      ELSE
+        IF proposed_target_name IS NOT NULL
+           AND proposed_target_name IS DISTINCT FROM authority_target_name THEN
+          action_error := COALESCE(action_error, 'update_row target does not match workflow authority');
+        END IF;
+        action_validation_payload := jsonb_set(
+          action_validation_payload,
+          '{body,target}',
+          to_jsonb(authority_target_name),
+          true
+        );
+        action_payload := action_validation_payload;
+        action_body := action_payload -> 'body';
+      END IF;
+    END IF;
+    IF action_error IS NULL THEN
+      action_error := otlet.action_validation_error(
+        action_validation_payload,
+        complete_job.output,
+        job_row.subject_id,
+        job_row.input
+      );
+    END IF;
     action_requires_approval := false;
     action_creates_record := false;
     action_idempotency_key := NULL;
     IF action_error IS NULL THEN
       SELECT
-        CASE
-          WHEN has_action_type_restriction THEN EXISTS (
-            SELECT 1
-            FROM otlet.watches w
-            WHERE w.task_name = job_row.task_name
-              AND cardinality(w.action_types) > 0
-              AND NOT action_type_name = ANY(w.action_types)
-          )
-          ELSE false
-        END,
         COALESCE(s.requires_approval, false),
         COALESCE(s.creates_record, false)
-      INTO action_rejected_by_watch, action_requires_approval, action_creates_record
+      INTO action_requires_approval, action_creates_record
       FROM (SELECT 1) seed
       LEFT JOIN otlet.action_type_schemas s ON s.action_type = action_type_name;
-
-      IF action_rejected_by_watch THEN
-        action_error := 'action type ' || action_type_name || ' is not allowed by watch';
-        action_requires_approval := false;
-        action_creates_record := false;
-      END IF;
     END IF;
     action_subject_id := COALESCE(
       NULLIF(action_payload ->> 'subject_id', ''),
@@ -289,6 +319,12 @@ BEGIN
       output_id,
       receipt_id,
       action_type,
+      authority_origin,
+      authority_mode,
+      evaluation_status,
+      authority_policy_hash,
+      subject_namespace,
+      target_name,
       payload,
       status,
       approval_status,
@@ -304,6 +340,12 @@ BEGIN
       saved_output.id,
       saved_receipt.id,
       action_type_name,
+      'workflow',
+      authority_mode,
+      authority_evaluation_status,
+      authority_policy_hash,
+      authority_subject_namespace,
+      authority_target_name,
       stored_action_payload,
       action_status,
       action_approval_status,
@@ -419,9 +461,11 @@ RETURNS TABLE (
   action_row otlet.actions,
   schema_row otlet.action_type_schemas,
   job_row otlet.jobs,
+  task_name text,
   output_body jsonb,
   current_content_hash text,
-  validation_error text
+  validation_error text,
+  authority_error text
 )
 LANGUAGE plpgsql
 AS $$
@@ -431,9 +475,22 @@ BEGIN
     a,
     s,
     j,
+    j.task_name,
     o.output,
     otlet.current_task_subject_content_hash(j.task_name, j.subject_id),
-    otlet.action_validation_error(a.payload, o.output, j.subject_id, j.input)
+    otlet.action_validation_error(a.payload, o.output, j.subject_id, j.input),
+    CASE
+      WHEN a.authority_origin = 'workflow' AND a.action_type = 'update_row' THEN
+        otlet.action_workflow_policy_error(
+          j.task_name,
+          a.action_type,
+          a.authority_policy_hash,
+          a.target_name,
+          a.subject_namespace,
+          false
+        )
+      ELSE NULL
+    END
   FROM otlet.actions a
   JOIN otlet.jobs j ON j.id = a.job_id
   LEFT JOIN otlet.action_type_schemas s ON s.action_type = a.action_type
