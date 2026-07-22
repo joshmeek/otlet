@@ -146,10 +146,6 @@ BEGIN
   IF COALESCE(complete_job.selection_status, 'accepted') <> 'accepted' THEN
     RAISE EXCEPTION 'otlet complete_job requires selection_status accepted';
   END IF;
-  IF COALESCE(complete_job.trace_summary ->> 'schema_validation_status', 'not_run')
-     IS DISTINCT FROM 'passed' THEN
-    RAISE EXCEPTION 'otlet complete_job requires schema_validation_status passed';
-  END IF;
   IF octet_length(COALESCE(complete_job.raw_output, '')) > policy.max_raw_output_bytes THEN
     RAISE EXCEPTION 'otlet raw output exceeds evidence byte limit';
   END IF;
@@ -189,7 +185,7 @@ BEGIN
       complete_job.prompt_hash,
       complete_job.input_hash,
       complete_job.output_schema_hash,
-      COALESCE(complete_job.raw_output_hash, md5(complete_job.raw_output)),
+      COALESCE(complete_job.raw_output_hash, otlet.portable_text_hash(COALESCE(complete_job.raw_output, ''))),
       complete_job.started_at,
       true,
       model_row.name,
@@ -209,14 +205,18 @@ BEGIN
     prompt_hash => complete_job.prompt_hash,
     input_hash => complete_job.input_hash,
     output_schema_hash => complete_job.output_schema_hash,
-    raw_output_hash => COALESCE(complete_job.raw_output_hash, md5(complete_job.raw_output)),
+    raw_output_hash => COALESCE(
+      complete_job.raw_output_hash,
+      otlet.portable_text_hash(COALESCE(complete_job.raw_output, ''))
+    ),
     started_at => complete_job.started_at,
     trace_summary => complete_job.trace_summary,
     selection_role => COALESCE(complete_job.selection_role, 'direct'),
     selection_status => COALESCE(complete_job.selection_status, 'accepted'),
     selection_reason => complete_job.selection_reason,
     error => NULL,
-    expected_claim_token => complete_job.expected_claim_token
+    expected_claim_token => complete_job.expected_claim_token,
+    actions => complete_job.actions
   );
 
   UPDATE otlet.jobs
@@ -399,11 +399,13 @@ BEGIN
       action_status,
       action_approval_status,
       action_subject_id,
-      complete_job.trace_summary #>> '{mvcc,table}',
       COALESCE(
-        complete_job.trace_summary #>> '{mvcc,source_hash}',
-        md5((complete_job.trace_summary -> 'mvcc')::text)
+        job_row.input #>> '{_otlet_mvcc,table}',
+        job_row.input #>> '{otlet_mvcc,table}',
+        job_row.input #>> '{_otlet_mvcc,semantic_join_index}',
+        job_row.input #>> '{otlet_mvcc,semantic_join_index}'
       ),
+      saved_receipt.source_identity_hash,
       otlet.semantic_content_hash(job_row.input, task_row.input_shaping),
       action_idempotency_key,
       action_error

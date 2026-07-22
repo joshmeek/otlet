@@ -314,7 +314,7 @@ CREATE TEMP TABLE evidence_redaction_completed AS SELECT count(*)
 FROM otlet.complete_job(
   :redaction_id,
   '{"match":"unclear","case_id":"case-1","sensitive_note":"SENSITIVE-FIXTURE-OUTPUT"}'::jsonb,
-  'SENSITIVE-FIXTURE-RAW',
+  '{"output":{"match":"unclear","case_id":"case-1","sensitive_note":"SENSITIVE-FIXTURE-OUTPUT"},"actions":[{"type":"review_flag","body":{"left_id":"left-1","right_id":"right-1","reason":"SENSITIVE-FIXTURE-REASON","sensitive_note":"SENSITIVE-FIXTURE-ACTION"}}]}',
   '[{
     "type":"review_flag",
     "body":{

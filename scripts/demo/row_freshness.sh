@@ -249,7 +249,7 @@ SELECT otlet.fail_job(
   NULL,
   NULL,
   md5('{"type":"object","required":["decision","confidence","reason"]}'),
-  md5('not json'),
+  otlet.portable_text_hash('not json'),
   now(),
   'failed',
   '{"schema_validation_status":"failed"}'::jsonb,
@@ -268,7 +268,7 @@ SELECT j.status || '|' ||
        r.status || '|' ||
        r.selection_status || '|' ||
        r.schema_validation_status || '|' ||
-       (r.raw_output_hash = md5('not json'))::text || '|' ||
+       (r.raw_output_hash = otlet.portable_text_hash('not json'))::text || '|' ||
        (SELECT count(*) FROM otlet.outputs WHERE job_id = j.id)::text || '|' ||
        (SELECT count(*) FROM otlet.actions WHERE job_id = j.id)::text || '|' ||
        (

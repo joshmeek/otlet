@@ -116,7 +116,7 @@ BEGIN
     PERFORM * FROM otlet.complete_job(
       first_claim.job_id,
       '{"decision":"keep"}',
-      '{"decision":"keep"}',
+      '{"output":{"decision":"keep"},"actions":[]}',
       trace_summary => '{"schema_validation_status":"passed"}',
       expected_claim_token => first_claim.token
     );
@@ -139,7 +139,7 @@ BEGIN
   FROM otlet.complete_job(
     second_claim.job_id,
     '{"decision":"keep"}',
-    '{"decision":"keep"}',
+    '{"output":{"decision":"keep"},"actions":[]}',
     trace_summary => '{"schema_validation_status":"passed"}',
     expected_claim_token => second_claim.token
   );
@@ -147,7 +147,7 @@ BEGIN
   FROM otlet.complete_job(
     second_claim.job_id,
     '{"decision":"keep"}',
-    '{"decision":"keep"}',
+    '{"output":{"decision":"keep"},"actions":[]}',
     trace_summary => '{"schema_validation_status":"passed"}',
     expected_claim_token => second_claim.token
   );
@@ -162,7 +162,7 @@ BEGIN
     PERFORM * FROM otlet.complete_job(
       second_claim.job_id,
       '{"decision":"keep"}',
-      '{"decision":"keep"}',
+      '{"output":{"decision":"keep"},"actions":[]}',
       trace_summary => '{"schema_validation_status":"passed"}'
     );
     RAISE EXCEPTION 'tokenless completion retry succeeded';
@@ -176,7 +176,7 @@ BEGIN
     PERFORM * FROM otlet.complete_job(
       second_claim.job_id,
       '{"decision":"drop"}',
-      '{"decision":"drop"}',
+      '{"output":{"decision":"drop"},"actions":[]}',
       trace_summary => '{"schema_validation_status":"passed"}',
       expected_claim_token => second_claim.token
     );

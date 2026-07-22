@@ -173,7 +173,7 @@ SELECT otlet.complete_job(
   NULL,
   NULL,
   NULL,
-  md5('{"output":{"decision":"pass","confidence":"high","reason":"colon subject"},"actions":[]}'),
+  otlet.portable_text_hash('{"output":{"decision":"pass","confidence":"high","reason":"colon subject"},"actions":[]}'),
   now(),
   '{"schema_validation_status":"passed"}'::jsonb,
   :'model_name',

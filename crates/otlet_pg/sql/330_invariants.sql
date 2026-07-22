@@ -352,6 +352,40 @@ BEGIN
 
   RETURN QUERY
   SELECT
+    'complete_receipts_have_portable_identities'::text,
+    'receipt'::text,
+    r.id::text,
+    jsonb_build_object(
+      'job_id', r.job_id,
+      'task_identity_hash', r.task_identity_hash,
+      'source_identity_hash', r.source_identity_hash,
+      'model_identity_hash', r.model_identity_hash,
+      'runtime_options_hash', r.runtime_options_hash,
+      'prompt_hash', r.prompt_hash,
+      'input_hash', r.input_hash,
+      'output_schema_hash', r.output_schema_hash,
+      'output_hash', r.output_hash,
+      'actions_hash', r.actions_hash,
+      'validation_version', r.trace_summary #>> '{portable_validation,version}'
+    )
+  FROM otlet.inference_receipts r
+  WHERE r.status = 'complete'
+    AND (
+      r.task_identity_hash IS NULL
+      OR r.source_identity_hash IS NULL
+      OR r.model_identity_hash IS NULL
+      OR r.runtime_options_hash IS NULL
+      OR r.prompt_hash IS NULL
+      OR r.input_hash IS NULL
+      OR r.output_schema_hash IS NULL
+      OR r.output_hash IS NULL
+      OR r.actions_hash IS NULL
+      OR r.trace_summary #>> '{portable_validation,version}'
+        IS DISTINCT FROM 'otlet_portable_validation_v1'
+    );
+
+  RETURN QUERY
+  SELECT
     'sensitive_storage_matches_policy'::text,
     'redaction_policy'::text,
     s.policy_name,

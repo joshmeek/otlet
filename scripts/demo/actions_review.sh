@@ -65,7 +65,7 @@ SELECT otlet.complete_job(
   output => '{"decision":"flag","confidence":"high","reason":"allowlist smoke"}'::jsonb,
   raw_output => '{"output":{"decision":"flag","confidence":"high","reason":"allowlist smoke"},"actions":[{"type":"note","body":{"subject_id":"allow-1","text":"not allowed"}}]}',
   actions => '[{"type":"note","body":{"subject_id":"allow-1","text":"not allowed"}}]'::jsonb,
-  raw_output_hash => md5('{"output":{"decision":"flag","confidence":"high","reason":"allowlist smoke"},"actions":[{"type":"note","body":{"subject_id":"allow-1","text":"not allowed"}}]}'),
+  raw_output_hash => otlet.portable_text_hash('{"output":{"decision":"flag","confidence":"high","reason":"allowlist smoke"},"actions":[{"type":"note","body":{"subject_id":"allow-1","text":"not allowed"}}]}'),
   started_at => now(),
   trace_summary => '{"schema_validation_status":"passed"}'::jsonb,
   model_name => :'model_name',

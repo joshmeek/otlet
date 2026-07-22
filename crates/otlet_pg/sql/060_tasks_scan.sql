@@ -57,8 +57,17 @@ DECLARE
   preset_contract jsonb;
   preset_contract_hash text;
   contract_field text;
+  schema_error text;
   saved_task otlet.tasks%ROWTYPE;
 BEGIN
+  SELECT report.error
+  INTO schema_error
+  FROM otlet.json_schema_support_report(create_task.output_schema) report
+  ORDER BY report.schema_path, report.keyword
+  LIMIT 1;
+  IF schema_error IS NOT NULL THEN
+    RAISE EXCEPTION 'otlet output schema is unsupported: %', schema_error;
+  END IF;
   IF jsonb_typeof(actual_runtime_options) IS DISTINCT FROM 'object' THEN
     RAISE EXCEPTION 'otlet runtime_options must be a JSON object';
   END IF;

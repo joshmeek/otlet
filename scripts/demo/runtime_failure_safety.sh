@@ -81,7 +81,7 @@ JOIN otlet.runtime_status rs
 SQL
 )"
 echo "cancel_decode_worker_contract=$cancel_decode_contract"
-[ "$cancel_decode_contract" = "canceled|true|canceled|failed|canceled||0|ready|ready" ] || {
+[ "$cancel_decode_contract" = "canceled|true|canceled|failed|canceled|not_run|0|ready|ready" ] || {
   echo "Expected mid-decode cancel to produce a clean canceled receipt and healthy worker, got $cancel_decode_contract" >&2
   exit 1
 }
@@ -113,7 +113,7 @@ SELECT otlet.fail_job(
   NULL,
   NULL,
   NULL,
-  md5('not json'),
+  otlet.portable_text_hash('not json'),
   now(),
   'failed',
   '{"schema_validation_status":"failed"}'::jsonb,
@@ -218,7 +218,7 @@ SELECT otlet.fail_job(
   NULL,
   NULL,
   NULL,
-  md5(cases.raw_output),
+  otlet.portable_text_hash(cases.raw_output),
   now(),
   'failed',
   '{}'::jsonb,
@@ -275,7 +275,7 @@ SELECT count(*) FILTER (WHERE subject_id = 'markdown-fence' AND job_error = expe
        count(*) FILTER (WHERE subject_id = 'extra-top-level' AND job_error = expected_error AND receipt_error = expected_error)::text || '|' ||
        count(*) FILTER (WHERE subject_id = 'non-object-action' AND job_error = expected_error AND receipt_error = expected_error)::text || '|' ||
        bool_and(job_status = 'failed' AND receipt_status = 'failed' AND selection_status = 'failed' AND schema_validation_status = 'failed')::text || '|' ||
-       bool_and(raw_output IS NULL AND raw_output_hash = md5(expected_raw_output))::text || '|' ||
+       bool_and(raw_output IS NULL AND raw_output_hash = otlet.portable_text_hash(expected_raw_output))::text || '|' ||
        (SELECT count(*) FROM otlet.outputs WHERE job_id IN (SELECT job_id FROM rows))::text || '|' ||
        (SELECT count(*) FROM otlet.actions WHERE job_id IN (SELECT job_id FROM rows))::text
 FROM rows;
@@ -315,7 +315,7 @@ SELECT otlet.complete_job(
   NULL,
   NULL,
   NULL,
-  md5('{"output":{"status":"ok"},"actions":[{"type":"invented_action","body":{"subject_id":"hallucinated-action-1","text":"no record"}}]}'),
+  otlet.portable_text_hash('{"output":{"status":"ok"},"actions":[{"type":"invented_action","body":{"subject_id":"hallucinated-action-1","text":"no record"}}]}'),
   now(),
   '{"schema_validation_status":"passed"}'::jsonb,
   :'model_name',
@@ -336,7 +336,7 @@ SELECT (SELECT count(*) FROM otlet.outputs WHERE job_id = j.id)::text || '|' ||
        (SELECT count(*) FROM otlet.records r JOIN otlet.actions a ON a.id = r.action_id WHERE a.job_id = j.id)::text || '|' ||
        COALESCE((
          SELECT (r.raw_output IS NULL AND
-                 r.raw_output_hash = md5('{"output":{"status":"ok"},"actions":[{"type":"invented_action","body":{"subject_id":"hallucinated-action-1","text":"no record"}}]}'))::text
+                 r.raw_output_hash = otlet.portable_text_hash('{"output":{"status":"ok"},"actions":[{"type":"invented_action","body":{"subject_id":"hallucinated-action-1","text":"no record"}}]}'))::text
          FROM otlet.inference_receipts r
          WHERE r.job_id = j.id
          ORDER BY r.id DESC

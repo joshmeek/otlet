@@ -47,9 +47,14 @@ pgrx::extension_sql_file!(
     requires = ["runtime_health"]
 );
 pgrx::extension_sql_file!(
+    "../sql/085_portable_schema.sql",
+    name = "portable_schema",
+    requires = ["job_claims"]
+);
+pgrx::extension_sql_file!(
     "../sql/090_job_attempts.sql",
     name = "job_attempts",
-    requires = ["job_claims"]
+    requires = ["portable_schema"]
 );
 pgrx::extension_sql_file!(
     "../sql/100_job_cancellation.sql",
@@ -67,9 +72,14 @@ pgrx::extension_sql_file!(
     requires = ["job_terminal_recovery"]
 );
 pgrx::extension_sql_file!(
+    "../sql/125_portable_result_validation.sql",
+    name = "portable_result_validation",
+    requires = ["action_contract"]
+);
+pgrx::extension_sql_file!(
     "../sql/130_action_completion_review.sql",
     name = "action_completion_review",
-    requires = ["action_contract"]
+    requires = ["portable_result_validation"]
 );
 pgrx::extension_sql_file!(
     "../sql/140_action_execution.sql",

@@ -207,7 +207,10 @@ BEGIN
     prompt_hash => fail_job.prompt_hash,
     input_hash => fail_job.input_hash,
     output_schema_hash => fail_job.output_schema_hash,
-    raw_output_hash => COALESCE(fail_job.raw_output_hash, md5(COALESCE(fail_job.raw_output, ''))),
+    raw_output_hash => COALESCE(
+      fail_job.raw_output_hash,
+      otlet.portable_text_hash(COALESCE(fail_job.raw_output, ''))
+    ),
     started_at => fail_job.started_at,
     trace_summary => COALESCE(fail_job.trace_summary, '{}'::jsonb),
     schema_validation_status => fail_job.schema_validation_status,
@@ -327,7 +330,7 @@ BEGIN
     PERFORM otlet.fail_job(
       job_row.id,
       'job lease expired after max attempts',
-      raw_output_hash => md5(''),
+      raw_output_hash => otlet.portable_text_hash(''),
       trace_summary => jsonb_build_object('schema_validation_status', 'not_run'),
       schema_validation_status => 'not_run',
       started_at => COALESCE(job_row.started_at, job_row.created_at, now()),

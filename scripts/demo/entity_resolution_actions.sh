@@ -179,7 +179,7 @@ BEGIN
     NULL,
     NULL,
     NULL,
-    md5('{"output":{"match":"same_entity","confidence":"high"},"actions":[{"type":"merge_candidate","body":{"left_id":"posthoc-left","right_id":"posthoc-right","confidence":"high","reason":"same"}}]}'),
+    otlet.portable_text_hash('{"output":{"match":"same_entity","confidence":"high"},"actions":[{"type":"merge_candidate","body":{"left_id":"posthoc-left","right_id":"posthoc-right","confidence":"high","reason":"same"}}]}'),
     now(),
     '{"schema_validation_status":"passed"}'::jsonb,
     model_name_value,

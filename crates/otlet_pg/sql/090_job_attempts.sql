@@ -97,7 +97,8 @@ CREATE FUNCTION otlet.record_model_attempt(
   selection_reason text DEFAULT NULL,
   error text DEFAULT NULL,
   receipt_status text DEFAULT NULL,
-  expected_claim_token text DEFAULT NULL
+  expected_claim_token text DEFAULT NULL,
+  actions jsonb DEFAULT NULL
 ) RETURNS otlet.inference_receipts
 LANGUAGE plpgsql
 AS $$
@@ -119,6 +120,13 @@ DECLARE
   stored_output jsonb;
   stored_trace_summary jsonb;
   expected_model_name text;
+  portable_identity jsonb;
+  schema_error text;
+  authoritative_schema_status text;
+  actual_raw_output_hash text;
+  actual_output_schema_hash text;
+  actual_runtime_options_hash text;
+  actual_model_identity_hash text;
 BEGIN
   SELECT j.*
   INTO job_row
@@ -138,8 +146,8 @@ BEGIN
     RAISE EXCEPTION 'otlet job claim is stale';
   END IF;
 
-  SELECT t.model_name, t.runtime_options, t.decision_contract
-  INTO task_row.model_name, task_row.runtime_options, task_row.decision_contract
+  SELECT t.model_name, t.runtime_options, t.decision_contract, t.output_schema
+  INTO task_row.model_name, task_row.runtime_options, task_row.decision_contract, task_row.output_schema
   FROM otlet.tasks t
   WHERE t.name = job_row.task_name;
   IF NOT FOUND THEN
@@ -209,6 +217,50 @@ BEGIN
     RAISE EXCEPTION 'otlet receipt error exceeds evidence byte limit';
   END IF;
 
+  actual_raw_output_hash := otlet.portable_text_hash(COALESCE(record_model_attempt.raw_output, ''));
+  IF record_model_attempt.raw_output IS NOT NULL
+     AND record_model_attempt.raw_output_hash IS NOT NULL
+     AND record_model_attempt.raw_output_hash IS DISTINCT FROM actual_raw_output_hash THEN
+    RAISE EXCEPTION 'otlet record_model_attempt raw output hash is forged';
+  END IF;
+  actual_output_schema_hash := otlet.portable_json_hash(task_row.output_schema);
+  actual_runtime_options_hash := otlet.portable_json_hash(
+    policy.default_runtime_options || task_row.runtime_options
+  );
+  actual_model_identity_hash := otlet.portable_json_hash(jsonb_build_object(
+    'name', model_row.name,
+    'artifact_hash', model_row.artifact_hash,
+    'artifact_identity', model_row.artifact_identity
+  ));
+
+  IF actual_selection_status = 'accepted' THEN
+    portable_identity := otlet.validate_portable_result(
+      job_row.id,
+      record_model_attempt.output,
+      record_model_attempt.raw_output,
+      COALESCE(record_model_attempt.actions, '[]'::jsonb),
+      model_row.name,
+      record_model_attempt.selection_role,
+      record_model_attempt.prompt_hash,
+      record_model_attempt.input_hash,
+      record_model_attempt.output_schema_hash,
+      record_model_attempt.raw_output_hash,
+      record_model_attempt.trace_summary
+    );
+    authoritative_schema_status := 'passed';
+  ELSIF record_model_attempt.output IS NOT NULL THEN
+    schema_error := otlet.json_schema_validation_error(
+      task_row.output_schema,
+      record_model_attempt.output
+    );
+    authoritative_schema_status := CASE WHEN schema_error IS NULL THEN 'passed' ELSE 'failed' END;
+  ELSE
+    authoritative_schema_status := CASE
+      WHEN record_model_attempt.schema_validation_status = 'failed' THEN 'failed'
+      ELSE 'not_run'
+    END;
+  END IF;
+
   SELECT COALESCE(array_agg(field_name ORDER BY field_name), ARRAY[]::text[])
   INTO output_redacted_fields
   FROM jsonb_array_elements_text(
@@ -234,7 +286,13 @@ BEGIN
       'structured_output', cardinality(output_redacted_fields) > 0,
       'structured_output_field_count', cardinality(output_redacted_fields)
     )
-  );
+  ) || jsonb_build_object(
+    'schema_validation_status', authoritative_schema_status,
+    'schema_force', 'postgres_portable_json_schema_validation'
+  ) || CASE
+    WHEN portable_identity IS NULL THEN '{}'::jsonb
+    ELSE jsonb_build_object('portable_validation', portable_identity)
+  END;
 
   -- Prefer index-ordered peek over max() aggregate on (job_id, attempt_index).
   SELECT COALESCE((
@@ -261,9 +319,15 @@ BEGIN
     runtime_name,
     runtime_endpoint,
     runtime_options,
+    task_identity_hash,
+    source_identity_hash,
+    model_identity_hash,
+    runtime_options_hash,
     prompt_hash,
     input_hash,
     output_schema_hash,
+    output_hash,
+    actions_hash,
     raw_output_hash,
     raw_output,
     candidate_output,
@@ -291,18 +355,24 @@ BEGIN
     model_row.artifact_identity,
     'linked_inproc',
     'linked',
-    task_row.runtime_options,
-    record_model_attempt.prompt_hash,
-    record_model_attempt.input_hash,
-    record_model_attempt.output_schema_hash,
-    COALESCE(record_model_attempt.raw_output_hash, md5(COALESCE(record_model_attempt.raw_output, ''))),
+    policy.default_runtime_options || task_row.runtime_options,
+    portable_identity ->> 'task_identity_hash',
+    portable_identity ->> 'source_identity_hash',
+    COALESCE(portable_identity ->> 'model_identity_hash', actual_model_identity_hash),
+    COALESCE(portable_identity ->> 'runtime_options_hash', actual_runtime_options_hash),
+    COALESCE(portable_identity ->> 'prompt_hash', record_model_attempt.prompt_hash),
+    COALESCE(portable_identity ->> 'input_hash', record_model_attempt.input_hash),
+    actual_output_schema_hash,
+    portable_identity ->> 'output_hash',
+    portable_identity ->> 'actions_hash',
+    actual_raw_output_hash,
     CASE WHEN policy_mode = 'diagnostic' THEN record_model_attempt.raw_output ELSE NULL END,
     CASE WHEN actual_selection_status = 'rejected' THEN stored_output ELSE NULL END,
     NULLIF(record_model_attempt.trace_summary ->> 'prompt_tokens', '')::bigint,
     NULLIF(record_model_attempt.trace_summary ->> 'generated_tokens', '')::bigint,
     NULLIF(record_model_attempt.trace_summary ->> 'generate_ms', '')::bigint,
     NULLIF(record_model_attempt.trace_summary ->> 'tokens_per_second', '')::numeric,
-    COALESCE(record_model_attempt.schema_validation_status, stored_trace_summary ->> 'schema_validation_status'),
+    authoritative_schema_status,
     stored_trace_summary,
     COALESCE(record_model_attempt.started_at, job_row.started_at, job_row.created_at, now()),
     COALESCE(

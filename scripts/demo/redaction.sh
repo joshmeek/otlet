@@ -43,7 +43,7 @@ FROM otlet.record_model_attempt(
   :'model_name',
   output => '{"status":"review"}'::jsonb,
   raw_output => 'RAW-SENTINEL-🙂-DO-NOT-STORE',
-  raw_output_hash => md5('RAW-SENTINEL-🙂-DO-NOT-STORE'),
+  raw_output_hash => otlet.portable_text_hash('RAW-SENTINEL-🙂-DO-NOT-STORE'),
   prompt_hash => md5('PROMPT-SENTINEL-🙂-DO-NOT-STORE'),
   trace_summary => '{
     "schema_validation_status":"passed",
@@ -78,7 +78,7 @@ FROM otlet.record_model_attempt(
 SELECT assembled_prompt_storage || '|' ||
        (SELECT ok FROM redaction_mode_constraint)::text || '|' ||
        (r.raw_output IS NULL)::text || '|' ||
-       (r.raw_output_hash = md5('RAW-SENTINEL-🙂-DO-NOT-STORE'))::text || '|' ||
+       (r.raw_output_hash = otlet.portable_text_hash('RAW-SENTINEL-🙂-DO-NOT-STORE'))::text || '|' ||
        (r.candidate_output = '{"status":"review"}'::jsonb)::text || '|' ||
        (r.trace_summary #>> '{detailed_trace,chosen_text}' IS NULL)::text || '|' ||
        (NOT jsonb_path_exists(r.trace_summary, '$.detailed_trace.steps[*].token_text'))::text || '|' ||
@@ -166,7 +166,7 @@ FROM otlet.record_model_attempt(
   :'model_name',
   output => '{"status":"review"}'::jsonb,
   raw_output => 'DIAGNOSTIC-RAW-SENTINEL',
-  raw_output_hash => md5('DIAGNOSTIC-RAW-SENTINEL'),
+  raw_output_hash => otlet.portable_text_hash('DIAGNOSTIC-RAW-SENTINEL'),
   trace_summary => '{
     "schema_validation_status":"passed",
     "prompt":"DIAGNOSTIC-PROMPT-SENTINEL",
@@ -224,7 +224,7 @@ SELECT (SELECT sensitive_raw_outputs = 1
                AND NOT dry_run
         FROM redaction_old_apply)::text || '|' ||
        (SELECT raw_output IS NULL
-               AND raw_output_hash = md5('DIAGNOSTIC-RAW-SENTINEL')
+               AND raw_output_hash = otlet.portable_text_hash('DIAGNOSTIC-RAW-SENTINEL')
                AND candidate_output = '{"status":"review"}'::jsonb
                AND trace_summary #>> '{detailed_trace,chosen_text}' IS NULL
                AND NOT jsonb_path_exists(trace_summary, '$.detailed_trace.steps[*].token_text')
@@ -268,7 +268,7 @@ FROM otlet.record_model_attempt(
   :young_id,
   :'model_name',
   raw_output => 'YOUNG-DIAGNOSTIC-RAW',
-  raw_output_hash => md5('YOUNG-DIAGNOSTIC-RAW'),
+  raw_output_hash => otlet.portable_text_hash('YOUNG-DIAGNOSTIC-RAW'),
   trace_summary => '{"detailed_trace":{"chosen_text":"YOUNG-CHOSEN","steps":[{"token_id":9,"token_text":"YOUNG-TOKEN"}]}}'::jsonb,
   selection_status => 'failed',
   selection_reason => 'redaction_mode_switch_contract',

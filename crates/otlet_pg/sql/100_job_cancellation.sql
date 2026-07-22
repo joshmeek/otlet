@@ -89,7 +89,10 @@ BEGIN
     prompt_hash => finish_canceled_job.prompt_hash,
     input_hash => finish_canceled_job.input_hash,
     output_schema_hash => finish_canceled_job.output_schema_hash,
-    raw_output_hash => COALESCE(finish_canceled_job.raw_output_hash, md5(COALESCE(finish_canceled_job.raw_output, ''))),
+    raw_output_hash => COALESCE(
+      finish_canceled_job.raw_output_hash,
+      otlet.portable_text_hash(COALESCE(finish_canceled_job.raw_output, ''))
+    ),
     started_at => finish_canceled_job.started_at,
     selection_status => 'failed',
     selection_reason => 'canceled',

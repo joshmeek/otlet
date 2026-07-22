@@ -58,7 +58,7 @@ receipt_attempt_contract=8|4|4|4
 
 A receipt records evidence for one model run. A candidate pair can have multiple receipts when model selection escalates
 
-Each receipt links the model, verified artifact SHA-256 and provenance, runtime options, prompt hash, input hash, output schema hash, raw-output hash, runtime fingerprint, validation status, timing, token counts, memory summary, and trace summary. Otlet does not persist the assembled prompt
+Each accepted receipt links PostgreSQL-recomputed SHA-256 identities for the task, source snapshot, model, effective runtime options, prompt, input, output schema, raw output, structured output, and actions. It also records verified artifact provenance, the detailed runtime fingerprint, validation status, timing, token counts, memory summary, and trace summary. Otlet does not persist the assembled prompt
 
 ```sql
 SELECT receipt_id,
@@ -70,7 +70,7 @@ ORDER BY receipt_id DESC
 LIMIT 1;
 ```
 
-Linked llama.cpp uses greedy decoding and stops after one balanced JSON object. Otlet then requires the common `output` plus `actions` envelope and runs the task JSON Schema, action schema, decision contract, and selection policy. Inspect the decode and validation contract through the receipt:
+Linked llama.cpp uses greedy decoding and stops after one balanced JSON object. PostgreSQL parses that envelope again, requires the submitted output and actions to match it, validates the supported task JSON Schema subset, recomputes the portable identities, and applies the action, freshness, decision, and selection contracts. The worker's validation flag cannot authorize output. Inspect the decode and validation contract through the receipt:
 
 ```sql
 SELECT schema_force, decode_constraint, decode_constraint_reason

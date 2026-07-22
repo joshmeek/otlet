@@ -51,6 +51,7 @@ register_models
 source "$demo_dir/model_artifact_trust.sh"
 source "$demo_dir/production_policy.sh"
 source "$demo_dir/job_fencing.sh"
+source "$demo_dir/portable_result_validation.sh"
 source "$demo_dir/evidence_retention.sh"
 source "$demo_dir/workload_admission.sh"
 source "$demo_dir/evidence_boundaries.sh"
