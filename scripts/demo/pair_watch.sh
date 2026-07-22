@@ -40,7 +40,7 @@ FROM otlet.create_watch(
 );
 SQL
 
-queued="$(psql_exec -qAt -v index_name="$join_index_name" <<'SQL'
+queued="$(psql_candidate_exec -qAt -v index_name="$join_index_name" <<'SQL'
 SELECT otlet.refresh_semantic_join_index(:'index_name');
 SQL
 )"
@@ -167,4 +167,3 @@ echo "semantic_join_match_contract=$join_match_contract"
   echo "Expected semantic join matches, got $join_match_contract" >&2
   exit 1
 }
-

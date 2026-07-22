@@ -157,6 +157,8 @@ DECLARE
   semantic_task_name text := index_name || '_task';
   bounded_rows integer := GREATEST(1, LEAST(COALESCE(max_candidate_rows, 1000), 100000));
   wrapped_query text;
+  candidate_plan jsonb;
+  candidate_plan_cost numeric;
 BEGIN
   IF index_name !~ '^[a-z0-9][a-z0-9_-]*$' THEN
     RAISE EXCEPTION 'otlet semantic join index name % must be a simple identifier', index_name;
@@ -166,10 +168,9 @@ BEGIN
     RAISE EXCEPTION 'otlet semantic join index name % creates invalid task name %', index_name, semantic_task_name;
   END IF;
 
-  EXECUTE format(
-    'SELECT subject_id::text, input::jsonb FROM (%s) otlet_join_candidate LIMIT 0',
-    candidate_query
-  );
+  SELECT preflight.candidate_plan, preflight.candidate_plan_cost
+  INTO candidate_plan, candidate_plan_cost
+  FROM otlet.preflight_candidate_query(candidate_query) preflight;
 
   wrapped_query := format(
     'SELECT subject_id, input FROM otlet.semantic_join_refresh_inputs(%L)',
@@ -194,6 +195,9 @@ BEGIN
     record_type,
     model_name,
     max_candidate_rows,
+    candidate_plan,
+    candidate_plan_cost,
+    candidate_preflight_at,
     updated_at
   )
   VALUES (
@@ -203,6 +207,9 @@ BEGIN
     semantic_record_type,
     model_name,
     bounded_rows,
+    candidate_plan,
+    candidate_plan_cost,
+    now(),
     now()
   )
   ON CONFLICT (name) DO UPDATE
@@ -211,6 +218,9 @@ BEGIN
         record_type = EXCLUDED.record_type,
         model_name = EXCLUDED.model_name,
         max_candidate_rows = EXCLUDED.max_candidate_rows,
+        candidate_plan = EXCLUDED.candidate_plan,
+        candidate_plan_cost = EXCLUDED.candidate_plan_cost,
+        candidate_preflight_at = EXCLUDED.candidate_preflight_at,
         updated_at = now()
   RETURNING * INTO saved;
 

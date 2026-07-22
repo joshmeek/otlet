@@ -157,6 +157,8 @@ Build the reproducible pgrx package, machine-readable SBOM, RustSec report, supp
 
 Prove a fresh disposable install, worker lifecycle, database restart, upgrade failure rollback, startup recovery, and crash-log safety with [the release lifecycle command](docs/release-lifecycle.md)
 
+Configure all-or-nothing row, input-byte, queue-byte, candidate-plan, and candidate-timeout limits with [the workload admission contract](docs/workload-admission.md)
+
 ## Docs
 
 Start with [the worked example](docs/otlet-worked-example.md)

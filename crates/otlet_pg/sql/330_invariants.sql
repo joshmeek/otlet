@@ -110,6 +110,59 @@ BEGIN
 
   RETURN QUERY
   SELECT
+    'queued_input_bytes_within_model_cap'::text,
+    'model'::text,
+    q.model_name,
+    jsonb_build_object(
+      'queued_input_bytes', q.queued_input_bytes,
+      'max_queued_input_bytes_per_model', q.max_queued_input_bytes_per_model
+    )
+  FROM (
+    SELECT
+      m.name AS model_name,
+      COALESCE(sum(octet_length(j.input::text)), 0)::bigint AS queued_input_bytes,
+      p.max_queued_input_bytes_per_model
+    FROM otlet.production_policy p
+    CROSS JOIN otlet.models m
+    LEFT JOIN otlet.tasks t ON t.model_name = m.name
+    LEFT JOIN otlet.jobs j ON j.task_name = t.name AND j.status = 'queued'
+    GROUP BY m.name, p.max_queued_input_bytes_per_model
+  ) q
+  WHERE q.queued_input_bytes > q.max_queued_input_bytes_per_model;
+
+  RETURN QUERY
+  SELECT
+    'total_queued_input_bytes_within_cap'::text,
+    'queue'::text,
+    p.name,
+    jsonb_build_object(
+      'queued_input_bytes', q.queued_input_bytes,
+      'max_queued_input_bytes_total', p.max_queued_input_bytes_total
+    )
+  FROM otlet.production_policy p
+  CROSS JOIN LATERAL (
+    SELECT COALESCE(sum(octet_length(j.input::text)), 0)::bigint AS queued_input_bytes
+    FROM otlet.jobs j
+    WHERE j.status = 'queued'
+  ) q
+  WHERE q.queued_input_bytes > p.max_queued_input_bytes_total;
+
+  RETURN QUERY
+  SELECT
+    'queued_input_within_per_job_cap'::text,
+    'job'::text,
+    j.id::text,
+    jsonb_build_object(
+      'input_bytes', octet_length(j.input::text),
+      'max_input_bytes_per_job', p.max_input_bytes_per_job
+    )
+  FROM otlet.jobs j
+  CROSS JOIN otlet.production_policy p
+  WHERE j.status = 'queued'
+    AND octet_length(j.input::text) > p.max_input_bytes_per_job;
+
+  RETURN QUERY
+  SELECT
     'no_applied_action_without_approval'::text,
     'action'::text,
     a.id::text,
@@ -461,4 +514,3 @@ BEGIN
   END LOOP;
 END;
 $$;
-

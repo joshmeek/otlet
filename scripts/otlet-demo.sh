@@ -50,6 +50,7 @@ register_models
 
 source "$demo_dir/model_artifact_trust.sh"
 source "$demo_dir/production_policy.sh"
+source "$demo_dir/workload_admission.sh"
 source "$demo_dir/runtime_timeouts.sh"
 source "$demo_dir/runtime_admission.sh"
 source "$demo_dir/runtime_failure_safety.sh"

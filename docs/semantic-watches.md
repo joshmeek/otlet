@@ -503,8 +503,11 @@ FROM otlet.create_watch(
   pair_sources => '[{"table":"public.learning_entity","subject_column":"id"}]'::jsonb
 );
 
+BEGIN;
+SET LOCAL statement_timeout = '2000ms';
 SELECT 'semantic_join_refresh_queued=' ||
        otlet.refresh_semantic_join_index('learning_entity_pair_idx')::text;
+COMMIT;
 ```
 
 Use the semantic-index wait loop, or run `./scripts/otlet-demo.sh` for the compact proof. Then inspect the automatic materialization:

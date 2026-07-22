@@ -64,6 +64,14 @@ BEGIN
   IF jsonb_typeof(actual_input_shaping) IS DISTINCT FROM 'object' THEN
     RAISE EXCEPTION 'otlet input_shaping must be a JSON object';
   END IF;
+  IF actual_input_shaping ? 'max_shaped_input_bytes'
+     AND (
+       jsonb_typeof(actual_input_shaping -> 'max_shaped_input_bytes') IS DISTINCT FROM 'number'
+       OR (actual_input_shaping ->> 'max_shaped_input_bytes') !~ '^[1-9][0-9]*$'
+       OR (actual_input_shaping ->> 'max_shaped_input_bytes')::numeric > 1048576
+     ) THEN
+    RAISE EXCEPTION 'otlet input_shaping.max_shaped_input_bytes must be an integer between 1 and 1048576';
+  END IF;
   IF jsonb_typeof(actual_decision_contract) IS DISTINCT FROM 'object' THEN
     RAISE EXCEPTION 'otlet decision_contract must be a JSON object';
   END IF;
@@ -318,6 +326,80 @@ BEGIN
 END;
 $$;
 
+CREATE FUNCTION otlet.preflight_candidate_query(candidate_query text)
+RETURNS TABLE (
+  candidate_plan jsonb,
+  candidate_plan_cost numeric,
+  statement_timeout_ms integer
+)
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  policy otlet.production_policy%ROWTYPE;
+BEGIN
+  IF NULLIF(btrim(preflight_candidate_query.candidate_query), '') IS NULL THEN
+    RAISE EXCEPTION 'otlet candidate query is required';
+  END IF;
+
+  SELECT *
+  INTO policy
+  FROM otlet.production_policy
+  WHERE name = 'default';
+
+  BEGIN
+    EXECUTE format(
+      'EXPLAIN (FORMAT JSON) SELECT subject_id::text, input::jsonb FROM (%s) otlet_candidate',
+      preflight_candidate_query.candidate_query
+    ) INTO candidate_plan;
+  EXCEPTION WHEN OTHERS THEN
+    RAISE EXCEPTION 'otlet candidate query EXPLAIN failed: %', SQLERRM;
+  END;
+
+  candidate_plan_cost := (candidate_plan #>> '{0,Plan,Total Cost}')::numeric;
+  statement_timeout_ms := policy.candidate_query_statement_timeout_ms;
+  IF candidate_plan_cost > policy.max_candidate_query_cost THEN
+    RAISE EXCEPTION 'otlet candidate query plan cost % exceeds limit %',
+      candidate_plan_cost,
+      policy.max_candidate_query_cost;
+  END IF;
+
+  RETURN NEXT;
+END;
+$$;
+
+CREATE FUNCTION otlet.require_candidate_query_timeout(task_name text)
+RETURNS integer
+LANGUAGE plpgsql
+STABLE
+AS $$
+DECLARE
+  timeout_limit integer;
+  timeout_ms integer;
+BEGIN
+  SELECT p.candidate_query_statement_timeout_ms
+  INTO timeout_limit
+  FROM otlet.semantic_join_indexes sji
+  CROSS JOIN otlet.production_policy p
+  WHERE sji.task_name = require_candidate_query_timeout.task_name
+    AND p.name = 'default';
+
+  IF NOT FOUND THEN
+    RETURN 0;
+  END IF;
+
+  timeout_ms := round(EXTRACT(epoch FROM current_setting('statement_timeout')::interval) * 1000)::integer;
+  IF timeout_ms <= 0 OR timeout_ms > timeout_limit THEN
+    RAISE EXCEPTION 'otlet candidate query requires statement_timeout between 1 ms and % ms', timeout_limit
+      USING HINT = format(
+        'Run SET LOCAL statement_timeout = %L before the refresh statement',
+        timeout_limit || 'ms'
+      );
+  END IF;
+
+  RETURN timeout_ms;
+END;
+$$;
+
 CREATE FUNCTION otlet.available_model_queue_slots(model_name text)
 RETURNS integer
 LANGUAGE sql
@@ -343,13 +425,15 @@ CREATE FUNCTION otlet.record_queue_admission_suppressed(
   suppressed_model_name text,
   suppressed_subject_id text DEFAULT NULL,
   suppressed_queued_jobs bigint DEFAULT NULL,
-  suppressed_queue_slots integer DEFAULT NULL
+  suppressed_queue_slots integer DEFAULT NULL,
+  suppressed_reason text DEFAULT 'queue_depth_cap',
+  suppressed_input_bytes bigint DEFAULT NULL,
+  suppressed_limit_bytes bigint DEFAULT NULL
 ) RETURNS boolean
 LANGUAGE plpgsql
 AS $$
 DECLARE
   inserted bigint := 0;
-  suppressed_reason text := 'queue_cap';
   suppressed_detail jsonb;
 BEGIN
   suppressed_detail := jsonb_strip_nulls(jsonb_build_object(
@@ -358,7 +442,9 @@ BEGIN
     'model_name', suppressed_model_name,
     'reason', suppressed_reason,
     'queued_jobs', suppressed_queued_jobs,
-    'queue_slots', suppressed_queue_slots
+    'queue_slots', suppressed_queue_slots,
+    'input_bytes', suppressed_input_bytes,
+    'limit_bytes', suppressed_limit_bytes
   ));
 
   INSERT INTO otlet.worker_events (event_type, message, detail)
@@ -383,18 +469,101 @@ BEGIN
 END;
 $$;
 
+CREATE FUNCTION otlet.admit_task_input(
+  task_name text,
+  subject_id text,
+  input jsonb
+) RETURNS boolean
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  task_model_name text;
+  input_bytes bigint := octet_length(admit_task_input.input::text);
+  policy otlet.production_policy%ROWTYPE;
+  queued_jobs bigint;
+  model_queued_bytes bigint;
+  total_queued_bytes bigint;
+  inserted bigint := 0;
+  rejection_reason text;
+  rejection_limit bigint;
+BEGIN
+  SELECT t.model_name
+  INTO task_model_name
+  FROM otlet.tasks t
+  WHERE t.name = admit_task_input.task_name;
+
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'otlet task % does not exist', admit_task_input.task_name;
+  END IF;
+  PERFORM pg_advisory_xact_lock(hashtext('otlet_queue_admission'));
+
+  SELECT *
+  INTO policy
+  FROM otlet.production_policy
+  WHERE name = 'default';
+
+  SELECT
+    count(*) FILTER (WHERE t.model_name = task_model_name),
+    COALESCE(sum(octet_length(j.input::text)) FILTER (WHERE t.model_name = task_model_name), 0),
+    COALESCE(sum(octet_length(j.input::text)), 0)
+  INTO queued_jobs, model_queued_bytes, total_queued_bytes
+  FROM otlet.jobs j
+  JOIN otlet.tasks t ON t.name = j.task_name
+  WHERE j.status = 'queued';
+
+  IF input_bytes > policy.max_input_bytes_per_job THEN
+    rejection_reason := 'input_byte_cap';
+    rejection_limit := policy.max_input_bytes_per_job;
+  ELSIF queued_jobs >= policy.max_queued_jobs_per_model THEN
+    rejection_reason := 'queue_depth_cap';
+    rejection_limit := policy.max_queued_jobs_per_model;
+  ELSIF model_queued_bytes + input_bytes > policy.max_queued_input_bytes_per_model THEN
+    rejection_reason := 'model_queued_input_byte_cap';
+    rejection_limit := policy.max_queued_input_bytes_per_model;
+  ELSIF total_queued_bytes + input_bytes > policy.max_queued_input_bytes_total THEN
+    rejection_reason := 'total_queued_input_byte_cap';
+    rejection_limit := policy.max_queued_input_bytes_total;
+  END IF;
+
+  IF rejection_reason IS NOT NULL THEN
+    PERFORM otlet.record_queue_admission_suppressed(
+      admit_task_input.task_name,
+      task_model_name,
+      admit_task_input.subject_id,
+      queued_jobs,
+      GREATEST(policy.max_queued_jobs_per_model - queued_jobs, 0)::integer,
+      rejection_reason,
+      input_bytes,
+      rejection_limit
+    );
+    RETURN false;
+  END IF;
+
+  INSERT INTO otlet.jobs (task_name, subject_id, input)
+  VALUES (admit_task_input.task_name, admit_task_input.subject_id, admit_task_input.input)
+  ON CONFLICT DO NOTHING;
+  GET DIAGNOSTICS inserted = ROW_COUNT;
+
+  RETURN inserted > 0;
+END;
+$$;
+
 CREATE FUNCTION otlet.run_task(task_name text) RETURNS bigint
 LANGUAGE plpgsql
 AS $$
 DECLARE
   query text;
-  model_name text;
+  task_model_name text;
   queue_slots integer;
-  queued bigint;
-  has_overflow boolean := false;
+  queued bigint := 0;
+  candidate_rows bigint;
+  candidate_bytes bigint;
+  largest_input_bytes bigint;
+  rejection_reason text;
+  rejection_limit bigint;
 BEGIN
   SELECT input_query, tasks.model_name
-  INTO query, model_name
+  INTO query, task_model_name
   FROM otlet.tasks
   WHERE name = task_name;
 
@@ -406,42 +575,76 @@ BEGIN
     RAISE EXCEPTION 'otlet task % has no input_query', task_name;
   END IF;
 
-  PERFORM pg_advisory_xact_lock(hashtext('otlet_queue:' || model_name));
+  PERFORM otlet.require_candidate_query_timeout(run_task.task_name);
+  PERFORM pg_advisory_xact_lock(hashtext('otlet_queue_admission'));
+
   EXECUTE format(
-    'WITH queue_capacity AS (
-       SELECT GREATEST(
-         p.max_queued_jobs_per_model
-           - (
-             SELECT count(*)
-             FROM otlet.jobs j
-             JOIN otlet.tasks queued_tasks ON queued_tasks.name = j.task_name
-             WHERE j.status = ''queued''
-               AND queued_tasks.model_name = %L
-           ),
-         0
-       )::integer AS slots
+    'WITH policy AS (
+       SELECT *
        FROM otlet.production_policy p
        WHERE p.name = ''default''
      ),
+     queue_state AS (
+       SELECT
+         count(*) FILTER (WHERE queued_tasks.model_name = %1$L)::bigint AS model_queued_jobs,
+         COALESCE(sum(octet_length(j.input::text)) FILTER (WHERE queued_tasks.model_name = %1$L), 0)::bigint AS model_queued_bytes,
+         COALESCE(sum(octet_length(j.input::text)), 0)::bigint AS total_queued_bytes
+       FROM otlet.jobs j
+       JOIN otlet.tasks queued_tasks ON queued_tasks.name = j.task_name
+       WHERE j.status = ''queued''
+     ),
      bounded_input AS MATERIALIZED (
-       SELECT subject_id::text AS subject_id, input::jsonb AS input
-       FROM (%s) otlet_input
+       SELECT
+         subject_id::text AS subject_id,
+         input::jsonb AS input,
+         octet_length(input::jsonb::text)::bigint AS input_bytes
+       FROM (%2$s) otlet_input
        WHERE NOT EXISTS (
          SELECT 1
          FROM otlet.jobs active_job
-         WHERE active_job.task_name = %L
+         WHERE active_job.task_name = %3$L
            AND active_job.subject_id = otlet_input.subject_id::text
            AND active_job.status IN (''queued'', ''running'', ''cancel_requested'')
        )
        ORDER BY subject_id
-       LIMIT (SELECT slots + 1 FROM queue_capacity)
+       LIMIT (SELECT max_admission_rows + 1 FROM policy)
+     ),
+     candidate_state AS (
+       SELECT
+         count(*)::bigint AS candidate_rows,
+         COALESCE(sum(input_bytes), 0)::bigint AS candidate_bytes,
+         COALESCE(max(input_bytes), 0)::bigint AS largest_input_bytes
+       FROM bounded_input
+     ),
+     decision AS (
+       SELECT
+         GREATEST(p.max_queued_jobs_per_model - q.model_queued_jobs, 0)::integer AS queue_slots,
+         c.*,
+         CASE
+           WHEN c.candidate_rows > p.max_admission_rows THEN ''row_cap''
+           WHEN c.candidate_rows > GREATEST(p.max_queued_jobs_per_model - q.model_queued_jobs, 0) THEN ''queue_depth_cap''
+           WHEN c.largest_input_bytes > p.max_input_bytes_per_job THEN ''input_byte_cap''
+           WHEN q.model_queued_bytes + c.candidate_bytes > p.max_queued_input_bytes_per_model THEN ''model_queued_input_byte_cap''
+           WHEN q.total_queued_bytes + c.candidate_bytes > p.max_queued_input_bytes_total THEN ''total_queued_input_byte_cap''
+         END AS rejection_reason,
+         CASE
+           WHEN c.candidate_rows > p.max_admission_rows THEN p.max_admission_rows::bigint
+           WHEN c.candidate_rows > GREATEST(p.max_queued_jobs_per_model - q.model_queued_jobs, 0) THEN GREATEST(p.max_queued_jobs_per_model - q.model_queued_jobs, 0)::bigint
+           WHEN c.largest_input_bytes > p.max_input_bytes_per_job THEN p.max_input_bytes_per_job
+           WHEN q.model_queued_bytes + c.candidate_bytes > p.max_queued_input_bytes_per_model THEN p.max_queued_input_bytes_per_model
+           WHEN q.total_queued_bytes + c.candidate_bytes > p.max_queued_input_bytes_total THEN p.max_queued_input_bytes_total
+         END AS rejection_limit
+       FROM policy p
+       CROSS JOIN queue_state q
+       CROSS JOIN candidate_state c
      ),
      inserted AS (
        INSERT INTO otlet.jobs (task_name, subject_id, input)
-       SELECT %L, subject_id, input
-       FROM bounded_input
-       ORDER BY subject_id
-       LIMIT (SELECT slots FROM queue_capacity)
+       SELECT %3$L, pending.subject_id, pending.input
+       FROM bounded_input pending
+       CROSS JOIN decision d
+       WHERE d.rejection_reason IS NULL
+       ORDER BY pending.subject_id
        ON CONFLICT (task_name, subject_id)
        WHERE status IN (''queued'', ''running'', ''cancel_requested'')
        DO NOTHING
@@ -449,23 +652,37 @@ BEGIN
      )
      SELECT
        (SELECT count(*) FROM inserted),
-       (SELECT count(*) FROM bounded_input) > queue_capacity.slots,
-       queue_capacity.slots
-     FROM queue_capacity',
-    model_name,
+       candidate_rows,
+       candidate_bytes,
+       largest_input_bytes,
+       queue_slots,
+       rejection_reason,
+       rejection_limit
+     FROM decision',
+    task_model_name,
     query,
-    task_name,
     task_name
   )
-  INTO queued, has_overflow, queue_slots;
+  INTO queued, candidate_rows, candidate_bytes, largest_input_bytes, queue_slots, rejection_reason, rejection_limit;
 
-  IF has_overflow THEN
+  IF rejection_reason IS NOT NULL THEN
     PERFORM otlet.record_queue_admission_suppressed(
       run_task.task_name,
-      model_name,
-      suppressed_queued_jobs => queued,
-      suppressed_queue_slots => queue_slots
+      task_model_name,
+      suppressed_queued_jobs => candidate_rows,
+      suppressed_queue_slots => queue_slots,
+      suppressed_reason => rejection_reason,
+      suppressed_input_bytes => CASE
+        WHEN rejection_reason = 'input_byte_cap' THEN largest_input_bytes
+        ELSE candidate_bytes
+      END,
+      suppressed_limit_bytes => rejection_limit
     );
+    RETURN 0;
+  END IF;
+
+  IF queued <> candidate_rows THEN
+    RAISE EXCEPTION 'otlet queue admission changed concurrently; no jobs were committed';
   END IF;
 
   IF queued > 0 THEN
@@ -477,7 +694,7 @@ END;
 $$;
 
 COMMENT ON FUNCTION otlet.run_task(text) IS
-  'Queues current task source rows up to the model queue cap. Completed subjects are eligible for a new job on direct rerun; queued, running, and cancel-requested subjects are not duplicated.';
+  'Queues all current bounded task source rows or none. Completed subjects are eligible for a new job on direct rerun; queued, running, and cancel-requested subjects are not duplicated.';
 
 CREATE FUNCTION otlet.run_task_subject(
   task_name text,
@@ -487,13 +704,12 @@ LANGUAGE plpgsql
 AS $$
 DECLARE
   query text;
-  model_name text;
-  queue_slots integer;
-  queued bigint;
-  has_pending boolean := false;
+  pending_input jsonb;
+  pending_rows bigint;
+  queued boolean;
 BEGIN
-  SELECT input_query, tasks.model_name
-  INTO query, model_name
+  SELECT input_query
+  INTO query
   FROM otlet.tasks
   WHERE name = run_task_subject.task_name;
 
@@ -505,64 +721,37 @@ BEGIN
     RAISE EXCEPTION 'otlet task % has no input_query', run_task_subject.task_name;
   END IF;
 
-  PERFORM pg_advisory_xact_lock(hashtext('otlet_queue:' || model_name));
+  PERFORM otlet.require_candidate_query_timeout(run_task_subject.task_name);
   EXECUTE format(
-    'WITH queue_capacity AS (
-       SELECT GREATEST(
-         p.max_queued_jobs_per_model
-           - (
-             SELECT count(*)
-             FROM otlet.jobs j
-             JOIN otlet.tasks queued_tasks ON queued_tasks.name = j.task_name
-             WHERE j.status = ''queued''
-               AND queued_tasks.model_name = %L
-           ),
-         0
-       )::integer AS slots
-       FROM otlet.production_policy p
-       WHERE p.name = ''default''
-     ),
-     pending_input AS MATERIALIZED (
-       SELECT subject_id::text AS subject_id, input::jsonb AS input
-       FROM (%s) otlet_input
-       WHERE subject_id::text = %L
-       LIMIT 1
-     ),
-     inserted AS (
-       INSERT INTO otlet.jobs (task_name, subject_id, input)
-       SELECT %L, subject_id, input
-       FROM pending_input
-       WHERE (SELECT slots FROM queue_capacity) > 0
-       ON CONFLICT (task_name, subject_id)
-       WHERE status IN (''queued'', ''running'', ''cancel_requested'')
-       DO NOTHING
-       RETURNING 1
-     )
-     SELECT
-       (SELECT count(*) FROM inserted),
-       EXISTS (SELECT 1 FROM pending_input),
-       queue_capacity.slots
-     FROM queue_capacity',
-    model_name,
+    'SELECT input::jsonb
+     FROM (%s) otlet_input
+     WHERE subject_id::text = %L
+     LIMIT 1',
     query,
-    run_task_subject.subject_id,
-    run_task_subject.task_name
+    run_task_subject.subject_id
   )
-  INTO queued, has_pending, queue_slots;
+  INTO pending_input;
+  GET DIAGNOSTICS pending_rows = ROW_COUNT;
 
-  IF queue_slots <= 0 AND has_pending THEN
-    PERFORM otlet.record_queue_admission_suppressed(
+  IF pending_rows = 0 THEN
+    RETURN 0;
+  END IF;
+  IF pending_input IS NULL THEN
+    RAISE EXCEPTION 'otlet task % produced null input for subject %',
       run_task_subject.task_name,
-      model_name,
-      run_task_subject.subject_id
-    );
+      run_task_subject.subject_id;
   END IF;
 
-  IF queued > 0 THEN
+  queued := otlet.admit_task_input(
+    run_task_subject.task_name,
+    run_task_subject.subject_id,
+    pending_input
+  );
+  IF queued THEN
     PERFORM otlet.wake_worker();
   END IF;
 
-  RETURN queued;
+  RETURN queued::integer;
 END;
 $$;
 

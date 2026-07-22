@@ -268,8 +268,8 @@ ROLLBACK;
 SQL
 )"
 echo "queue_underfill_contract=$queue_underfill_contract"
-[ "$queue_underfill_contract" = "2|5|1" ] || {
-  echo "Expected queue underfill contract 2|5|1, got $queue_underfill_contract" >&2
+[ "$queue_underfill_contract" = "0|3|1" ] || {
+  echo "Expected all-or-nothing queue contract 0|3|1, got $queue_underfill_contract" >&2
   exit 1
 }
 
@@ -469,7 +469,7 @@ SELECT otlet.create_task(
   :'task_name',
   $source$
     SELECT 'race-' || i::text AS subject_id, '{}'::jsonb AS input
-    FROM generate_series(1, 50) AS g(i)
+    FROM generate_series(1, 5) AS g(i)
   $source$::text,
   'Queue admission race smoke placeholder',
   '{"type":"object","required":["status"],"additionalProperties":false,"properties":{"status":{"enum":["ok"]}}}'::jsonb,

@@ -2,6 +2,7 @@ CREATE VIEW otlet.production_status AS
 WITH queue AS (
   SELECT
     count(*) FILTER (WHERE status = 'queued')::bigint AS queued_jobs,
+    COALESCE(sum(octet_length(input::text)) FILTER (WHERE status = 'queued'), 0)::bigint AS queued_input_bytes,
     count(*) FILTER (WHERE status = 'running')::bigint AS running_jobs,
     count(*) FILTER (WHERE status = 'cancel_requested')::bigint AS cancel_requested_jobs,
     count(*) FILTER (
@@ -69,6 +70,12 @@ SELECT
   p.name AS policy_name,
   p.stale_policy,
   p.max_queued_jobs_per_model,
+  p.max_admission_rows,
+  p.max_input_bytes_per_job,
+  p.max_queued_input_bytes_per_model,
+  p.max_queued_input_bytes_total,
+  p.max_candidate_query_cost,
+  p.candidate_query_statement_timeout_ms,
   p.max_attempts,
   p.max_attempt_ms,
   p.default_runtime_options,
@@ -78,6 +85,7 @@ SELECT
   p.worker_claim_batch_size,
   p.job_lease_interval,
   q.queued_jobs,
+  q.queued_input_bytes,
   q.running_jobs,
   q.cancel_requested_jobs,
   q.expired_running_jobs,
@@ -133,4 +141,3 @@ CROSS JOIN trace
 CROSS JOIN materialization_failures
 CROSS JOIN action_execution
 WHERE p.name = 'default';
-

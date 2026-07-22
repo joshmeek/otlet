@@ -1,5 +1,5 @@
 log "Checking pair strip-key freshness"
-psql_exec \
+psql_candidate_exec \
   -v watch_name="$pair_strip_watch" \
   -v model_name="$strong_model_name" >/dev/null <<'SQL'
 DROP VIEW IF EXISTS public.otlet_demo_pair_strip_input;
@@ -263,4 +263,3 @@ echo "row_correction_contract=$row_correction_contract"
   echo "Expected correction to reject action, write gold label, and remove review queue row, got $row_correction_contract" >&2
   exit 1
 }
-

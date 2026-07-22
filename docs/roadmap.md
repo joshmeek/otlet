@@ -8,9 +8,9 @@ Otlet runs local model judgment through Postgres contracts. New work must preser
 
 | Priority | Track | Next proof |
 | --- | --- | --- |
-| 1 | Admission | Candidate-query preflight, timeouts, and queued-input byte limits |
+| 1 | Trust and evidence | Source allowlists, bounded and redacted evidence, retention, and adversarial conformance |
 | 2 | Portable runtime | One SQL-only install and reference worker for Postgres hosts that block native workers |
-| 3 | Trust and evidence | Fenced writes, database-side validation, bounded evidence, retention, and redacted export |
+| 3 | Portable safety | Fenced writes, database-side validation, recovery, deployment preflight, and database-health controls |
 | 4 | Packs and decisions | Versioned workload packs, evaluation gates, review state, and replay-safe actions |
 | 5 | GPU and research | Device support or reopened research only after a measured trigger |
 
@@ -32,7 +32,7 @@ The portable path must:
 - expose fixed-search-path `SECURITY DEFINER` RPCs with no direct table writes
 - use separate installer, worker, reviewer, auditor, and action roles with verified TLS
 - preflight DNS, TLS, roles, required functions, and egress-denied operation
-- require candidate-query `EXPLAIN`, statement timeout, row, input-byte, queue-depth, and queued-byte caps
+- reuse the database admission contract for every portable claim path
 - run local GGUF inference without a required remote model API
 - keep application queries independent of a live worker
 
