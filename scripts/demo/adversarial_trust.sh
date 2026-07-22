@@ -48,7 +48,8 @@ WITH inserted AS (
     status,
     attempts,
     started_at,
-    leased_until
+    leased_until,
+    claim_token
   )
   VALUES (
     'adversarial_trust_task',
@@ -60,9 +61,10 @@ WITH inserted AS (
     'running',
     1,
     now(),
-    now() + interval '5 minutes'
+    now() + interval '5 minutes',
+    gen_random_uuid()::text
   )
-  RETURNING id
+  RETURNING id, claim_token
 )
 SELECT * FROM inserted;
 
@@ -94,7 +96,7 @@ FROM otlet.complete_job(
   trace_summary => '{"schema_validation_status":"passed"}'::jsonb,
   model_name => :'model_name',
   selection_role => 'strong',
-  expected_claim_attempt => 1
+  expected_claim_token => (SELECT claim_token FROM prompt_injection_job)
 ) \gset prompt_completion_
 
 INSERT INTO adversarial_results
@@ -210,7 +212,8 @@ WITH inserted AS (
     status,
     attempts,
     started_at,
-    leased_until
+    leased_until,
+    claim_token
   )
   VALUES (
     'adversarial_trust_task',
@@ -219,9 +222,10 @@ WITH inserted AS (
     'running',
     1,
     now(),
-    now() + interval '5 minutes'
+    now() + interval '5 minutes',
+    gen_random_uuid()::text
   )
-  RETURNING id
+  RETURNING id, claim_token
 )
 SELECT * FROM inserted;
 
@@ -241,7 +245,7 @@ BEGIN
       actions => '[]'::jsonb,
       trace_summary => '{"schema_validation_status":"passed"}'::jsonb,
       model_name => (SELECT model_name FROM adversarial_params),
-      expected_claim_attempt => 1
+      expected_claim_token => (SELECT claim_token FROM oversized_job)
     );
   EXCEPTION WHEN OTHERS THEN
     rejected := SQLERRM = 'otlet raw output exceeds evidence byte limit';
@@ -303,7 +307,8 @@ WITH inserted AS (
     status,
     attempts,
     started_at,
-    leased_until
+    leased_until,
+    claim_token
   )
   VALUES (
     'adversarial_trust_task',
@@ -312,9 +317,10 @@ WITH inserted AS (
     'running',
     1,
     now(),
-    now() + interval '5 minutes'
+    now() + interval '5 minutes',
+    gen_random_uuid()::text
   )
-  RETURNING id
+  RETURNING id, claim_token
 )
 SELECT * FROM inserted;
 
@@ -332,7 +338,7 @@ BEGIN
       trace_summary => '{"schema_validation_status":"passed"}'::jsonb,
       model_name => (SELECT forged_model_name FROM adversarial_params),
       selection_role => 'strong',
-      expected_claim_attempt => 1
+      expected_claim_token => (SELECT claim_token FROM forged_identity_job)
     );
   EXCEPTION WHEN OTHERS THEN
     rejected := SQLERRM = 'otlet model identity does not match task selection role';
@@ -362,7 +368,8 @@ WITH inserted AS (
     status,
     attempts,
     started_at,
-    leased_until
+    leased_until,
+    claim_token
   )
   VALUES
     (
@@ -372,7 +379,8 @@ WITH inserted AS (
       'running',
       2,
       now(),
-      now() + interval '5 minutes'
+      now() + interval '5 minutes',
+      gen_random_uuid()::text
     ),
     (
       'adversarial_trust_task',
@@ -381,38 +389,44 @@ WITH inserted AS (
       'running',
       1,
       now() - interval '10 minutes',
-      now() - interval '5 minutes'
+      now() - interval '5 minutes',
+      gen_random_uuid()::text
     )
-  RETURNING id, subject_id
+  RETURNING id, subject_id, claim_token
 )
 SELECT * FROM inserted;
 
 DO $body$
 DECLARE
+  completion_rejected boolean := false;
+  failure_rejected boolean := false;
   stale_receipt_rejected boolean := false;
-  completion_rows bigint;
-  failure_rows bigint;
+  expired_rejected boolean := false;
 BEGIN
-  SELECT count(*)
-  INTO completion_rows
-  FROM otlet.complete_job(
-    job_id => (SELECT id FROM stale_claim_jobs WHERE subject_id = 'reclaimed-claim'),
-    output => '{"status":"ok"}'::jsonb,
-    raw_output => '{"output":{"status":"ok"},"actions":[]}',
-    actions => '[]'::jsonb,
-    trace_summary => '{"schema_validation_status":"passed"}'::jsonb,
-    model_name => (SELECT model_name FROM adversarial_params),
-    expected_claim_attempt => 1
-  );
+  BEGIN
+    PERFORM * FROM otlet.complete_job(
+      job_id => (SELECT id FROM stale_claim_jobs WHERE subject_id = 'reclaimed-claim'),
+      output => '{"status":"ok"}'::jsonb,
+      raw_output => '{"output":{"status":"ok"},"actions":[]}',
+      actions => '[]'::jsonb,
+      trace_summary => '{"schema_validation_status":"passed"}'::jsonb,
+      model_name => (SELECT model_name FROM adversarial_params),
+      expected_claim_token => gen_random_uuid()::text
+    );
+  EXCEPTION WHEN OTHERS THEN
+    completion_rejected := SQLERRM = 'otlet job claim is stale';
+  END;
 
-  SELECT count(*)
-  INTO failure_rows
-  FROM otlet.fail_job(
-    job_id => (SELECT id FROM stale_claim_jobs WHERE subject_id = 'reclaimed-claim'),
-    error => 'stale worker failure',
-    model_name => (SELECT model_name FROM adversarial_params),
-    expected_claim_attempt => 1
-  );
+  BEGIN
+    PERFORM * FROM otlet.fail_job(
+      job_id => (SELECT id FROM stale_claim_jobs WHERE subject_id = 'reclaimed-claim'),
+      error => 'stale worker failure',
+      model_name => (SELECT model_name FROM adversarial_params),
+      expected_claim_token => gen_random_uuid()::text
+    );
+  EXCEPTION WHEN OTHERS THEN
+    failure_rejected := SQLERRM = 'otlet job claim is stale';
+  END;
 
   BEGIN
     PERFORM otlet.record_model_attempt(
@@ -420,32 +434,35 @@ BEGIN
       (SELECT model_name FROM adversarial_params),
       selection_status => 'failed',
       error => 'stale worker receipt',
-      expected_claim_attempt => 1
+      expected_claim_token => gen_random_uuid()::text
     );
   EXCEPTION WHEN OTHERS THEN
     stale_receipt_rejected := SQLERRM = 'otlet job claim is stale';
   END;
 
-  SELECT completion_rows + count(*)
-  INTO completion_rows
-  FROM otlet.complete_job(
-    job_id => (SELECT id FROM stale_claim_jobs WHERE subject_id = 'expired-claim'),
-    output => '{"status":"ok"}'::jsonb,
-    raw_output => '{"output":{"status":"ok"},"actions":[]}',
-    actions => '[]'::jsonb,
-    trace_summary => '{"schema_validation_status":"passed"}'::jsonb,
-    model_name => (SELECT model_name FROM adversarial_params),
-    expected_claim_attempt => 1
-  );
+  BEGIN
+    PERFORM * FROM otlet.complete_job(
+      job_id => (SELECT id FROM stale_claim_jobs WHERE subject_id = 'expired-claim'),
+      output => '{"status":"ok"}'::jsonb,
+      raw_output => '{"output":{"status":"ok"},"actions":[]}',
+      actions => '[]'::jsonb,
+      trace_summary => '{"schema_validation_status":"passed"}'::jsonb,
+      model_name => (SELECT model_name FROM adversarial_params),
+      expected_claim_token => (SELECT claim_token FROM stale_claim_jobs WHERE subject_id = 'expired-claim')
+    );
+  EXCEPTION WHEN OTHERS THEN
+    expired_rejected := SQLERRM = 'otlet job claim is stale';
+  END;
 
   INSERT INTO adversarial_results
   SELECT
     8,
     'stale_claim',
     'rejected',
-    completion_rows = 0
-      AND failure_rows = 0
+    completion_rejected
+      AND failure_rejected
       AND stale_receipt_rejected
+      AND expired_rejected
       AND count(*) = 2
       AND bool_and(job.status = 'running')
       AND NOT EXISTS (

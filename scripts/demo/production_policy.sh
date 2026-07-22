@@ -50,16 +50,16 @@ INSERT INTO otlet.jobs (task_name, subject_id, input)
 SELECT :'task_name', 'lease-fence-1', '{}'::jsonb
 FROM created;
 CREATE TEMP TABLE lease_claim AS
-SELECT id, attempts, leased_until
+SELECT id, leased_until, claim_token
 FROM otlet.claim_jobs();
 CREATE TEMP TABLE wrong_renew AS
 SELECT renewed.*
 FROM lease_claim claim
-CROSS JOIN LATERAL otlet.renew_job_lease(claim.id, claim.attempts + 1) renewed;
+CROSS JOIN LATERAL otlet.renew_job_lease(claim.id, gen_random_uuid()::text) renewed;
 CREATE TEMP TABLE current_renew AS
 SELECT renewed.*
 FROM lease_claim claim
-CROSS JOIN LATERAL otlet.renew_job_lease(claim.id, claim.attempts) renewed;
+CROSS JOIN LATERAL otlet.renew_job_lease(claim.id, claim.claim_token) renewed;
 SELECT (SELECT count(*) FROM lease_claim)::text || '|' ||
        (SELECT count(*) FROM wrong_renew)::text || '|' ||
        COALESCE((SELECT status FROM current_renew), '') || '|' ||
@@ -354,7 +354,8 @@ BEGIN
         '{"status":"ok"}'::jsonb,
         '{"output":{"status":"ok"},"actions":[]}',
         '[]'::jsonb,
-        trace_summary => '{"schema_validation_status":"passed","trace_version":"queue_fairness_smoke"}'::jsonb
+        trace_summary => '{"schema_validation_status":"passed","trace_version":"queue_fairness_smoke"}'::jsonb,
+        expected_claim_token => job_row.claim_token
       );
     END LOOP;
 

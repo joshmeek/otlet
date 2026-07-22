@@ -17,7 +17,7 @@ pub(crate) struct Job {
     pub(crate) input_shaping: Value,
     pub(crate) decision_contract: Value,
     pub(crate) max_attempt_ms: i64,
-    pub(crate) claim_attempt: i32,
+    pub(crate) claim_token: String,
 }
 
 pub(crate) struct JobModel {
@@ -67,7 +67,7 @@ macro_rules! job_from_row {
             input_shaping: required_col!($row, JsonB, 13).0,
             decision_contract: required_col!($row, JsonB, 14).0,
             max_attempt_ms: i64::from(required_col!($row, i32, 15)),
-            claim_attempt: required_col!($row, i32, 16),
+            claim_token: required_col!($row, String, 16),
         }
     };
 }
@@ -93,7 +93,7 @@ WITH claimed AS (
     m.name AS model_name,
     p.default_runtime_options,
     p.max_attempt_ms,
-    j.attempts,
+    j.claim_token,
     otlet.semantic_shaped_input(j.input, t.input_shaping) AS shaped_input
   FROM otlet.claim_jobs() j
   JOIN otlet.tasks t ON t.name = j.task_name
@@ -117,7 +117,7 @@ SELECT
   input_shaping,
   decision_contract,
   otlet.effective_task_max_attempt_ms(default_runtime_options || runtime_options, max_attempt_ms),
-  attempts
+  claim_token
 FROM claimed
 	",
             None,
@@ -154,6 +154,7 @@ inserted AS (
     status,
     attempts,
     leased_until,
+    claim_token,
     started_at,
     finished_at
   )
@@ -168,6 +169,7 @@ inserted AS (
       p.max_attempt_ms,
       p.job_lease_interval
     ),
+    gen_random_uuid()::text,
     now(),
     NULL
   FROM policy p
@@ -193,7 +195,7 @@ SELECT
   input_shaping,
   decision_contract,
   otlet.effective_task_max_attempt_ms(default_runtime_options || runtime_options, max_attempt_ms),
-  attempts
+  claim_token
 FROM (
   SELECT
     j.id,
@@ -210,7 +212,7 @@ FROM (
     m.name AS model_name,
     p.default_runtime_options,
     p.max_attempt_ms,
-    j.attempts,
+    j.claim_token,
     otlet.semantic_shaped_input(j.input, t.input_shaping) AS shaped_input
   FROM inserted j
   JOIN otlet.tasks t ON t.name = j.task_name

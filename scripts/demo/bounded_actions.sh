@@ -61,6 +61,7 @@ DO $body$
 DECLARE
   proposal record;
   job_id bigint;
+  claim_token text;
   job_input jsonb;
 BEGIN
   FOR proposal IN
@@ -181,7 +182,8 @@ BEGIN
       status,
       attempts,
       started_at,
-      leased_until
+      leased_until,
+      claim_token
     )
     VALUES (
       'bounded_action_demo_task',
@@ -190,9 +192,10 @@ BEGIN
       'running',
       1,
       now(),
-      now() + interval '5 minutes'
+      now() + interval '5 minutes',
+      gen_random_uuid()::text
     )
-    RETURNING id INTO job_id;
+    RETURNING id, otlet.jobs.claim_token INTO job_id, claim_token;
 
     PERFORM otlet.complete_job(
       job_id => job_id,
@@ -211,7 +214,8 @@ BEGIN
         SELECT model_name
         FROM otlet.tasks
         WHERE name = 'bounded_action_demo_task'
-      )
+      ),
+      expected_claim_token => claim_token
     );
   END LOOP;
 END

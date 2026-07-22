@@ -72,6 +72,7 @@ AS $body$
 DECLARE
   selected_job_id bigint;
   selected_action_id bigint;
+  selected_claim_token text;
   selected_input jsonb;
   proposed_actions jsonb;
 BEGIN
@@ -96,7 +97,8 @@ BEGIN
     status,
     attempts,
     started_at,
-    leased_until
+    leased_until,
+    claim_token
   )
   VALUES (
     'action_authority_demo_task',
@@ -105,9 +107,10 @@ BEGIN
     'running',
     1,
     now(),
-    now() + interval '5 minutes'
+    now() + interval '5 minutes',
+    gen_random_uuid()::text
   )
-  RETURNING id INTO selected_job_id;
+  RETURNING id, claim_token INTO selected_job_id, selected_claim_token;
 
   proposed_actions := jsonb_build_array(jsonb_build_object(
     'type', 'update_row',
@@ -130,7 +133,8 @@ BEGIN
       "schema_validation_status":"passed",
       "mvcc":{"table":"public.otlet_demo_action_authority"}
     }'::jsonb,
-    model_name => (SELECT model_name FROM otlet.tasks WHERE name = 'action_authority_demo_task')
+    model_name => (SELECT model_name FROM otlet.tasks WHERE name = 'action_authority_demo_task'),
+    expected_claim_token => selected_claim_token
   );
 
   SELECT id
@@ -146,6 +150,7 @@ $body$;
 DO $body$
 DECLARE
   selected_job_id bigint;
+  selected_claim_token text;
 BEGIN
   PERFORM otlet.create_task(
     'action_authority_default_task',
@@ -154,9 +159,9 @@ BEGIN
     '{"type":"object"}'::jsonb,
     (SELECT model_name FROM action_authority_params)
   );
-  INSERT INTO otlet.jobs (task_name, subject_id, input, status, attempts, started_at)
-  VALUES ('action_authority_default_task', 'default', '{}'::jsonb, 'running', 1, now())
-  RETURNING id INTO selected_job_id;
+  INSERT INTO otlet.jobs (task_name, subject_id, input, status, attempts, started_at, leased_until, claim_token)
+  VALUES ('action_authority_default_task', 'default', '{}'::jsonb, 'running', 1, now(), now() + interval '5 minutes', gen_random_uuid()::text)
+  RETURNING id, claim_token INTO selected_job_id, selected_claim_token;
   PERFORM otlet.complete_job(
     job_id => selected_job_id,
     output => '{"decision":"review"}'::jsonb,
@@ -164,7 +169,8 @@ BEGIN
     actions => '[{"type":"review_flag","body":{"left_id":"left","right_id":"right","severity":"high","reason":"default"}}]'::jsonb,
     started_at => now(),
     trace_summary => '{"schema_validation_status":"passed"}'::jsonb,
-    model_name => (SELECT model_name FROM action_authority_params)
+    model_name => (SELECT model_name FROM action_authority_params),
+    expected_claim_token => selected_claim_token
   );
 END
 $body$;

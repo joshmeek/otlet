@@ -138,7 +138,7 @@ expect_permission_denied "$permission_auditor_role" "SELECT otlet.register_actio
 expect_permission_denied "$permission_auditor_role" "SELECT otlet.disable_action_workflow_policy('$bounded_action_task', 'update_row')" "auditor action workflow policy disable"
 expect_permission_denied "$permission_auditor_role" "SELECT otlet.place_retention_hold($merge_action_id, 'denied')" "auditor retention hold creation"
 expect_permission_denied "$permission_auditor_role" "SELECT otlet.release_retention_hold(0, 'denied')" "auditor retention hold release"
-expect_permission_denied "$permission_auditor_role" "SELECT * FROM otlet.cancel_job(0)" "auditor job cancellation"
+expect_permission_denied "$permission_auditor_role" "SELECT * FROM otlet.request_job_cancellation(0)" "auditor job cancellation"
 expect_permission_denied "$permission_auditor_role" "SELECT * FROM otlet.cleanup_policy_state(true)" "auditor cleanup"
 expect_permission_denied "$permission_auditor_role" "SELECT otlet.export_watch('$numeric_triage_watch')" "auditor watch export"
 expect_permission_denied "$permission_auditor_role" "SELECT otlet.import_watch('{}'::jsonb)" "auditor watch import"

@@ -235,7 +235,7 @@ fn wait_for_request(request_id: u64, timeout_ms: u32) -> Result<Option<Completed
                 }
             }
             if cancel_job_id > 0
-                && let Err(err) = cancel_job(cancel_job_id)
+                && let Err(err) = request_job_cancellation(cancel_job_id)
             {
                 pgrx::warning!("otlet infer-now timeout cancel failed: {err}");
                 force_cancel_requested(cancel_job_id, TIMEOUT_CANCEL_REASON);
@@ -258,12 +258,12 @@ fn wait_for_request(request_id: u64, timeout_ms: u32) -> Result<Option<Completed
     }
 }
 
-fn cancel_job(job_id: i64) -> Result<(), String> {
+fn request_job_cancellation(job_id: i64) -> Result<(), String> {
     pgrx::Spi::connect_mut(|client| {
         let args = [job_id.into(), TIMEOUT_CANCEL_REASON.into()];
         let table = client
             .select(
-                "SELECT id FROM otlet.cancel_job($1, $2) LIMIT 1",
+                "SELECT id FROM otlet.request_job_cancellation($1, $2) LIMIT 1",
                 Some(1),
                 &args,
             )
@@ -274,15 +274,17 @@ fn cancel_job(job_id: i64) -> Result<(), String> {
             .map_err(|err| err.to_string())?
             .is_some();
         if !canceled {
-            return Err(format!("cancel_job affected no rows for job_id={job_id}"));
+            return Err(format!(
+                "request_job_cancellation affected no rows for job_id={job_id}"
+            ));
         }
         Ok(())
     })
 }
 
 fn force_cancel_requested(job_id: i64, reason: &str) {
-    // Error-path only: when cancel_job SPI fails on infer-now timeout, still
-    // mark cancel_requested so linked_cancel_requested can stop decode.
+    // Emergency fallback marks the cancellation when the requester call fails
+    // The linked worker observes cancel_requested and stops decoding
     let recovery: pgrx::spi::Result<()> = pgrx::Spi::connect_mut(|client| {
         let args = [job_id.into(), reason.into()];
         client.update(

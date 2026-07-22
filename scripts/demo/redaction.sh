@@ -25,14 +25,16 @@ VALUES (
   :'model_name',
   '{"source_fields":["secret"]}'::jsonb
 );
-INSERT INTO otlet.jobs (task_name, subject_id, input, status, attempts, started_at)
+INSERT INTO otlet.jobs (task_name, subject_id, input, status, attempts, started_at, leased_until, claim_token)
 VALUES (
   'redaction_contract',
   'redacted-write',
   '{"secret":"INPUT-SENTINEL-DO-NOT-COPY"}'::jsonb,
   'running',
   1,
-  now()
+  now(),
+  now() + interval '5 minutes',
+  gen_random_uuid()::text
 )
 RETURNING id \gset redacted_
 SELECT id
@@ -70,7 +72,8 @@ FROM otlet.record_model_attempt(
   }'::jsonb,
   schema_validation_status => 'passed',
   selection_status => 'rejected',
-  selection_reason => 'redaction_contract'
+  selection_reason => 'redaction_contract',
+  expected_claim_token => (SELECT claim_token FROM otlet.jobs WHERE id = :redacted_id)
 ) \gset redacted_receipt_
 SELECT assembled_prompt_storage || '|' ||
        (SELECT ok FROM redaction_mode_constraint)::text || '|' ||
@@ -145,14 +148,16 @@ VALUES (
   '{"type":"object"}'::jsonb,
   :'model_name'
 );
-INSERT INTO otlet.jobs (task_name, subject_id, input, status, attempts, started_at)
+INSERT INTO otlet.jobs (task_name, subject_id, input, status, attempts, started_at, leased_until, claim_token)
 VALUES (
   'redaction_diagnostic_contract',
   'diagnostic-old',
   '{}'::jsonb,
   'running',
   1,
-  now()
+  now(),
+  now() + interval '5 minutes',
+  gen_random_uuid()::text
 )
 RETURNING id \gset diagnostic_
 SELECT id
@@ -187,7 +192,8 @@ FROM otlet.record_model_attempt(
   }'::jsonb,
   schema_validation_status => 'passed',
   selection_status => 'rejected',
-  selection_reason => 'redaction_diagnostic_contract'
+  selection_reason => 'redaction_diagnostic_contract',
+  expected_claim_token => (SELECT claim_token FROM otlet.jobs WHERE id = :diagnostic_id)
 ) \gset diagnostic_receipt_
 SELECT (raw_output = 'DIAGNOSTIC-RAW-SENTINEL')::text || '|' ||
        (trace_summary #>> '{detailed_trace,chosen_text}' = 'DIAGNOSTIC-CHOSEN-SENTINEL')::text || '|' ||
@@ -254,8 +260,8 @@ VALUES (
   '{"type":"object"}'::jsonb,
   :'model_name'
 );
-INSERT INTO otlet.jobs (task_name, subject_id, input, status, attempts, started_at)
-VALUES ('redaction_mode_switch_contract', 'young', '{}'::jsonb, 'running', 1, now())
+INSERT INTO otlet.jobs (task_name, subject_id, input, status, attempts, started_at, leased_until, claim_token)
+VALUES ('redaction_mode_switch_contract', 'young', '{}'::jsonb, 'running', 1, now(), now() + interval '5 minutes', gen_random_uuid()::text)
 RETURNING id \gset young_
 SELECT id
 FROM otlet.record_model_attempt(
@@ -265,7 +271,8 @@ FROM otlet.record_model_attempt(
   raw_output_hash => md5('YOUNG-DIAGNOSTIC-RAW'),
   trace_summary => '{"detailed_trace":{"chosen_text":"YOUNG-CHOSEN","steps":[{"token_id":9,"token_text":"YOUNG-TOKEN"}]}}'::jsonb,
   selection_status => 'failed',
-  selection_reason => 'redaction_mode_switch_contract'
+  selection_reason => 'redaction_mode_switch_contract',
+  expected_claim_token => (SELECT claim_token FROM otlet.jobs WHERE id = :young_id)
 ) \gset young_receipt_
 UPDATE otlet.production_policy
 SET sensitive_evidence_mode = 'redacted'

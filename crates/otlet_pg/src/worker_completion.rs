@@ -50,7 +50,7 @@ fn accept_attempt_with_model(
                     model_name.into(),
                     selection_role.into(),
                     selection_reason.into(),
-                    job.claim_attempt.into(),
+                    job.claim_token.as_str().into(),
                 ];
                 let rows = client.select(
                 "SELECT output_id, semantic_materialized, completion_error, materialization_error FROM otlet.complete_and_materialize_job($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) LIMIT 1",
@@ -162,10 +162,10 @@ fn record_model_attempt_receipt_with_model(
                 selection_status.into(),
                 selection_reason.into(),
                 error.into(),
-                job.claim_attempt.into(),
+                job.claim_token.as_str().into(),
             ];
             client.update(
-                "SELECT otlet.record_model_attempt($1, $2, output => $3, raw_output => $4, prompt_hash => $5, input_hash => $6, output_schema_hash => $7, raw_output_hash => $8, trace_summary => $9, schema_validation_status => $10, selection_role => $11, selection_status => $12, selection_reason => $13, error => $14, expected_claim_attempt => $15)",
+                "SELECT otlet.record_model_attempt($1, $2, output => $3, raw_output => $4, prompt_hash => $5, input_hash => $6, output_schema_hash => $7, raw_output_hash => $8, trace_summary => $9, schema_validation_status => $10, selection_role => $11, selection_status => $12, selection_reason => $13, error => $14, expected_claim_token => $15)",
                 Some(1),
                 &args,
             )?;
@@ -234,10 +234,10 @@ fn reject_direct_attempt(job: &Job, run: ModelRun, selection_reason: &str) -> bo
                 JsonB(run.trace_summary.clone()).into(),
                 job.model_name.as_str().into(),
                 JsonB(run.output.clone()).into(),
-                job.claim_attempt.into(),
+                job.claim_token.as_str().into(),
             ];
             client.update(
-                "SELECT otlet.fail_job($1, $2, $3, $4, $5, $6, $7, schema_validation_status => 'passed', trace_summary => $8, model_name => $9, selection_role => 'direct', selection_status => 'rejected', selection_reason => 'direct_rejected_by_decision_contract', candidate_output => $10, expected_claim_attempt => $11)",
+                "SELECT otlet.fail_job($1, $2, $3, $4, $5, $6, $7, schema_validation_status => 'passed', trace_summary => $8, model_name => $9, selection_role => 'direct', selection_status => 'rejected', selection_reason => 'direct_rejected_by_decision_contract', candidate_output => $10, expected_claim_token => $11)",
                 Some(1),
                 &args,
             )?;
@@ -313,14 +313,13 @@ fn fail_attempt_result_with_model(
     result
 }
 
-fn force_terminal_job_failure(job_id: i64, claim_attempt: i32, error: &str) {
-    // Error-path only: when fail_job SPI fails, still terminalize the row so it
-    // cannot stay running with a live lease. No receipt/metrics/events here.
-    // cancel_requested → canceled (matches fail_job → finish_canceled_job);
-    // running → failed.
+fn force_terminal_job_failure(job_id: i64, claim_token: &str, error: &str) {
+    // Emergency fallback terminalizes the row when fail_job SPI fails
+    // No receipt, metric, or event can be recorded through the failing path
+    // A cancel request becomes canceled and other live work becomes failed
     let recovery: pgrx::spi::Result<()> = BackgroundWorker::transaction(|| {
         pgrx::Spi::connect_mut(|client| {
-            let args = [job_id.into(), error.into(), claim_attempt.into()];
+            let args = [job_id.into(), error.into(), claim_token.into()];
             client.update(
                 "UPDATE otlet.jobs \
                  SET status = CASE \
@@ -328,11 +327,16 @@ fn force_terminal_job_failure(job_id: i64, claim_attempt: i32, error: &str) {
                        ELSE 'failed' \
                      END, \
                      leased_until = NULL, \
+                     terminal_claim_token = $3, \
+                     terminal_request_hash = otlet.job_terminal_request_hash( \
+                       'emergency-fail', jsonb_build_array($2) \
+                     ), \
+                     claim_token = NULL, \
                      error = $2, \
                      finished_at = COALESCE(finished_at, now()) \
                  WHERE id = $1 \
                    AND status IN ('running', 'cancel_requested') \
-                   AND attempts = $3 \
+                   AND claim_token = $3 \
                    AND leased_until IS NOT NULL \
                    AND leased_until >= now()",
                 Some(1),
@@ -393,10 +397,10 @@ fn fail_attempt_with_model(
                 model_name.into(),
                 selection_role.into(),
                 selection_reason.into(),
-                job.claim_attempt.into(),
+                job.claim_token.as_str().into(),
             ];
             let rows = client.update(
-                "SELECT otlet.fail_job($1, $2, $3, $4, $5, $6, $7, schema_validation_status => $8, trace_summary => $9, model_name => $10, selection_role => $11, selection_reason => $12, expected_claim_attempt => $13)",
+                "SELECT otlet.fail_job($1, $2, $3, $4, $5, $6, $7, schema_validation_status => $8, trace_summary => $9, model_name => $10, selection_role => $11, selection_reason => $12, expected_claim_token => $13)",
                 Some(1),
                 &args,
             )?;
@@ -422,7 +426,11 @@ fn fail_attempt_with_model(
     if let Err(fail_err) = result {
         pgrx::warning!("otlet worker fail_job call failed: {fail_err}");
         let recovery_error = format!("fail_job_spi_failed: {fail_err}; original: {}", err.message);
-        force_terminal_job_failure(job.id, job.claim_attempt, &recovery_error);
+        force_terminal_job_failure(
+            job.id,
+            job.claim_token.as_str(),
+            &recovery_error,
+        );
     }
     if canceled {
         pgrx::log!("otlet worker canceled job {}", job.id);

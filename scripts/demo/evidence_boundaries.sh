@@ -115,8 +115,8 @@ CREATE TEMP TABLE evidence_bound_task AS SELECT otlet.create_task(
   '{"type":"object"}'::jsonb,
   :'model_name'
 );
-INSERT INTO otlet.jobs (task_name, subject_id, input, status, attempts, started_at)
-VALUES ('evidence_bound_demo', 'bound', '{}'::jsonb, 'running', 1, now())
+INSERT INTO otlet.jobs (task_name, subject_id, input, status, attempts, started_at, leased_until, claim_token)
+VALUES ('evidence_bound_demo', 'bound', '{}'::jsonb, 'running', 1, now(), now() + interval '5 minutes', gen_random_uuid()::text)
 RETURNING id \gset bound_
 
 UPDATE otlet.production_policy SET max_raw_output_bytes = 16 WHERE name = 'default';
@@ -126,7 +126,8 @@ BEGIN
     otlet.jobs.id,
     otlet.tasks.model_name,
     raw_output => repeat('x', 17),
-    selection_status => 'failed'
+    selection_status => 'failed',
+    expected_claim_token => otlet.jobs.claim_token
   )
   FROM otlet.jobs
   JOIN otlet.tasks ON otlet.tasks.name = otlet.jobs.task_name
@@ -145,7 +146,8 @@ BEGIN
     (SELECT id FROM otlet.jobs WHERE task_name = 'evidence_bound_demo'),
     jsonb_build_object('payload', repeat('x', 64)),
     '{}',
-    trace_summary => '{"schema_validation_status":"passed"}'::jsonb
+    trace_summary => '{"schema_validation_status":"passed"}'::jsonb,
+    expected_claim_token => (SELECT claim_token FROM otlet.jobs WHERE task_name = 'evidence_bound_demo')
   );
   INSERT INTO evidence_bound_results VALUES ('structured_output', false);
 EXCEPTION WHEN OTHERS THEN
@@ -165,7 +167,8 @@ BEGIN
       'type', 'review_flag',
       'body', jsonb_build_object('reason', repeat('x', 80))
     )),
-    trace_summary => '{"schema_validation_status":"passed"}'::jsonb
+    trace_summary => '{"schema_validation_status":"passed"}'::jsonb,
+    expected_claim_token => (SELECT claim_token FROM otlet.jobs WHERE task_name = 'evidence_bound_demo')
   );
   INSERT INTO evidence_bound_results VALUES ('action_bytes', false);
 EXCEPTION WHEN OTHERS THEN
@@ -182,7 +185,8 @@ BEGIN
     '{"match":"unclear"}'::jsonb,
     '{}',
     '[{"type":"review_flag","body":{"reason":"review"}}]'::jsonb,
-    trace_summary => '{"schema_validation_status":"passed"}'::jsonb
+    trace_summary => '{"schema_validation_status":"passed"}'::jsonb,
+    expected_claim_token => (SELECT claim_token FROM otlet.jobs WHERE task_name = 'evidence_bound_demo')
   );
   INSERT INTO evidence_bound_results VALUES ('action_count', false);
 EXCEPTION WHEN OTHERS THEN
@@ -198,7 +202,8 @@ BEGIN
     otlet.jobs.id,
     otlet.tasks.model_name,
     trace_summary => jsonb_build_object('trace', repeat('x', 80)),
-    selection_status => 'failed'
+    selection_status => 'failed',
+    expected_claim_token => otlet.jobs.claim_token
   )
   FROM otlet.jobs
   JOIN otlet.tasks ON otlet.tasks.name = otlet.jobs.task_name
@@ -215,7 +220,8 @@ DO $$
 BEGIN
   PERFORM * FROM otlet.fail_job(
     (SELECT id FROM otlet.jobs WHERE task_name = 'evidence_bound_demo'),
-    repeat('x', 17)
+    repeat('x', 17),
+    expected_claim_token => (SELECT claim_token FROM otlet.jobs WHERE task_name = 'evidence_bound_demo')
   );
   INSERT INTO evidence_bound_results VALUES ('error', false);
 EXCEPTION WHEN OTHERS THEN
@@ -255,7 +261,8 @@ BEGIN
   PERFORM otlet.record_model_attempt(
     otlet.jobs.id,
     otlet.tasks.model_name,
-    selection_status => 'failed'
+    selection_status => 'failed',
+    expected_claim_token => otlet.jobs.claim_token
   )
   FROM otlet.jobs
   JOIN otlet.tasks ON otlet.tasks.name = otlet.jobs.task_name
@@ -300,8 +307,8 @@ CREATE TEMP TABLE evidence_redaction_task AS SELECT otlet.create_task(
     "action_types":["review_flag"]
   }'::jsonb
 );
-INSERT INTO otlet.jobs (task_name, subject_id, input, status, attempts, started_at)
-VALUES ('evidence_redaction_demo', 'redaction', '{}'::jsonb, 'running', 1, now())
+INSERT INTO otlet.jobs (task_name, subject_id, input, status, attempts, started_at, leased_until, claim_token)
+VALUES ('evidence_redaction_demo', 'redaction', '{}'::jsonb, 'running', 1, now(), now() + interval '5 minutes', gen_random_uuid()::text)
 RETURNING id \gset redaction_
 CREATE TEMP TABLE evidence_redaction_completed AS SELECT count(*)
 FROM otlet.complete_job(
@@ -321,7 +328,8 @@ FROM otlet.complete_job(
     "schema_validation_status":"passed",
     "input":{"sensitive_note":"SENSITIVE-FIXTURE-TRACE"}
   }'::jsonb,
-  model_name => :'model_name'
+  model_name => :'model_name',
+  expected_claim_token => (SELECT claim_token FROM otlet.jobs WHERE id = :redaction_id)
 );
 DO $$
 BEGIN

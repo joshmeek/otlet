@@ -324,7 +324,7 @@ VALUES ('learning_cancel_task', 'cancel-1', '{"kind":"manual queued job"}'::json
 RETURNING id, task_name, subject_id, status, attempts;
 
 SELECT id, task_name, subject_id, status, error
-FROM otlet.cancel_job(
+FROM otlet.request_job_cancellation(
   (SELECT id FROM otlet.jobs WHERE task_name = 'learning_cancel_task' AND subject_id = 'cancel-1'),
   'learning example cancellation'
 );
@@ -362,7 +362,7 @@ Representative output:
 
 Otlet records a receipt for canceled work and preserves model-run evidence
 
-A synchronous infer-now caller can time out while the worker decodes. The requester records a shared abort marker, and the worker calls `otlet.cancel_job` before it can accept output. The caller's failed transaction cannot roll back that worker-owned cancellation
+A synchronous infer-now caller can time out while the worker decodes. The requester records a shared abort marker and calls `otlet.request_job_cancellation`; the worker then closes the job with its live claim token before it can accept output. The caller's failed transaction cannot roll back that worker-owned cancellation
 
 The demo requires the canceled job and receipt, zero outputs and actions, a recorded timeout and abort, the canceled job ID, and one healthy worker:
 

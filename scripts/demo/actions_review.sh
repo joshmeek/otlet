@@ -38,7 +38,7 @@ SELECT otlet.create_watch(
 );
 
 WITH inserted AS (
-  INSERT INTO otlet.jobs (task_name, subject_id, input, status, attempts, started_at, leased_until)
+  INSERT INTO otlet.jobs (task_name, subject_id, input, status, attempts, started_at, leased_until, claim_token)
   SELECT
     :'watch_name' || '_task',
     src.id,
@@ -55,9 +55,10 @@ WITH inserted AS (
     'running',
     1,
     now(),
-    now() + interval '5 minutes'
+    now() + interval '5 minutes',
+    gen_random_uuid()::text
   FROM public.otlet_demo_action_allowlist src
-  RETURNING id
+  RETURNING id, claim_token
 )
 SELECT otlet.complete_job(
   job_id => id,
@@ -67,7 +68,8 @@ SELECT otlet.complete_job(
   raw_output_hash => md5('{"output":{"decision":"flag","confidence":"high","reason":"allowlist smoke"},"actions":[{"type":"note","body":{"subject_id":"allow-1","text":"not allowed"}}]}'),
   started_at => now(),
   trace_summary => '{"schema_validation_status":"passed"}'::jsonb,
-  model_name => :'model_name'
+  model_name => :'model_name',
+  expected_claim_token => claim_token
 )
 FROM inserted;
 SQL

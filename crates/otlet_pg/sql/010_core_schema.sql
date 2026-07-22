@@ -192,12 +192,18 @@ CREATE TABLE otlet.jobs (
   status text NOT NULL DEFAULT 'queued',
   attempts int NOT NULL DEFAULT 0,
   leased_until timestamptz,
+  claim_token text,
+  terminal_claim_token text,
+  terminal_request_hash text,
   error text,
   created_at timestamptz NOT NULL DEFAULT now(),
   started_at timestamptz,
   finished_at timestamptz,
   cancel_requested_at timestamptz,
-  CHECK (status IN ('queued', 'running', 'complete', 'failed', 'canceled', 'cancel_requested'))
+  CHECK (status IN ('queued', 'running', 'complete', 'failed', 'canceled', 'cancel_requested')),
+  CHECK ((status IN ('running', 'cancel_requested')) = (claim_token IS NOT NULL)),
+  CHECK ((terminal_claim_token IS NULL) = (terminal_request_hash IS NULL)),
+  CHECK (terminal_claim_token IS NULL OR status IN ('complete', 'failed', 'canceled'))
 );
 
 CREATE UNIQUE INDEX jobs_active_subject_idx

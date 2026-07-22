@@ -27,7 +27,7 @@ SQL
 )"
   if [ -n "$cancel_decode_job_id" ]; then
     psql_exec -qAt -v job_id="$cancel_decode_job_id" >/dev/null <<'SQL'
-SELECT count(*) FROM otlet.cancel_job(:'job_id'::bigint, 'demo cancel mid-decode');
+SELECT count(*) FROM otlet.request_job_cancellation(:'job_id'::bigint, 'demo cancel mid-decode');
 SQL
     break
   fi
@@ -101,11 +101,11 @@ SELECT otlet.create_task(
 );
 CREATE TEMP TABLE invalid_json_claim AS
 WITH inserted AS (
-  INSERT INTO otlet.jobs (task_name, subject_id, input, status, attempts, started_at, leased_until)
-  VALUES (:'task_name', 'invalid-json-1', '{}'::jsonb, 'running', 1, now(), now() + interval '5 minutes')
-  RETURNING id
+  INSERT INTO otlet.jobs (task_name, subject_id, input, status, attempts, started_at, leased_until, claim_token)
+  VALUES (:'task_name', 'invalid-json-1', '{}'::jsonb, 'running', 1, now(), now() + interval '5 minutes', gen_random_uuid()::text)
+  RETURNING id, claim_token
 )
-SELECT id FROM inserted;
+SELECT id, claim_token FROM inserted;
 SELECT otlet.fail_job(
   id,
   'invalid model JSON: expected object',
@@ -120,7 +120,9 @@ SELECT otlet.fail_job(
   :'model_name',
   'direct',
   'failed',
-  'invalid_model_json'
+  'invalid_model_json',
+  NULL,
+  claim_token
 )
 FROM invalid_json_claim;
 SQL
@@ -204,10 +206,10 @@ VALUES
   );
 
 WITH inserted AS (
-  INSERT INTO otlet.jobs (task_name, subject_id, input, status, attempts, started_at, leased_until)
-  SELECT :'task_name', subject_id, '{}'::jsonb, 'running', 1, now(), now() + interval '5 minutes'
+  INSERT INTO otlet.jobs (task_name, subject_id, input, status, attempts, started_at, leased_until, claim_token)
+  SELECT :'task_name', subject_id, '{}'::jsonb, 'running', 1, now(), now() + interval '5 minutes', gen_random_uuid()::text
   FROM output_envelope_cases
-  RETURNING id, subject_id
+  RETURNING id, subject_id, claim_token
 )
 SELECT otlet.fail_job(
   inserted.id,
@@ -223,7 +225,9 @@ SELECT otlet.fail_job(
   :'model_name',
   'direct',
   'failed',
-  'output_envelope_contract'
+  'output_envelope_contract',
+  NULL,
+  inserted.claim_token
 )
 FROM inserted
 JOIN output_envelope_cases cases USING (subject_id);
@@ -298,11 +302,11 @@ SELECT otlet.create_task(
 );
 CREATE TEMP TABLE hallucinated_action_claim AS
 WITH inserted AS (
-  INSERT INTO otlet.jobs (task_name, subject_id, input, status, attempts, started_at, leased_until)
-  VALUES (:'task_name', 'hallucinated-action-1', '{}'::jsonb, 'running', 1, now(), now() + interval '5 minutes')
-  RETURNING id
+  INSERT INTO otlet.jobs (task_name, subject_id, input, status, attempts, started_at, leased_until, claim_token)
+  VALUES (:'task_name', 'hallucinated-action-1', '{}'::jsonb, 'running', 1, now(), now() + interval '5 minutes', gen_random_uuid()::text)
+  RETURNING id, claim_token
 )
-SELECT id FROM inserted;
+SELECT id, claim_token FROM inserted;
 SELECT otlet.complete_job(
   id,
   '{"status":"ok"}'::jsonb,
@@ -314,7 +318,8 @@ SELECT otlet.complete_job(
   md5('{"output":{"status":"ok"},"actions":[{"type":"invented_action","body":{"subject_id":"hallucinated-action-1","text":"no record"}}]}'),
   now(),
   '{"schema_validation_status":"passed"}'::jsonb,
-  :'model_name'
+  :'model_name',
+  expected_claim_token => claim_token
 )
 FROM hallucinated_action_claim;
 SQL

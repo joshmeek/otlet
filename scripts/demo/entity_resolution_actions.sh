@@ -136,6 +136,7 @@ DECLARE
   task_name_value text;
   model_name_value text;
   selected_job_id bigint;
+  selected_claim_token text;
   selected_action_id bigint;
   action_state otlet.actions%ROWTYPE;
 BEGIN
@@ -157,7 +158,7 @@ BEGIN
     '{"action_types":["merge_candidate"]}'::jsonb
   );
 
-  INSERT INTO otlet.jobs (task_name, subject_id, input, status, attempts, started_at, leased_until)
+  INSERT INTO otlet.jobs (task_name, subject_id, input, status, attempts, started_at, leased_until, claim_token)
   VALUES (
     task_name_value,
     'posthoc-left:posthoc-right',
@@ -165,9 +166,10 @@ BEGIN
     'running',
     1,
     now(),
-    now() + interval '5 minutes'
+    now() + interval '5 minutes',
+    gen_random_uuid()::text
   )
-  RETURNING id INTO selected_job_id;
+  RETURNING id, claim_token INTO selected_job_id, selected_claim_token;
 
   PERFORM otlet.complete_job(
     selected_job_id,
@@ -180,7 +182,8 @@ BEGIN
     md5('{"output":{"match":"same_entity","confidence":"high"},"actions":[{"type":"merge_candidate","body":{"left_id":"posthoc-left","right_id":"posthoc-right","confidence":"high","reason":"same"}}]}'),
     now(),
     '{"schema_validation_status":"passed"}'::jsonb,
-    model_name_value
+    model_name_value,
+    expected_claim_token => selected_claim_token
   );
 
   SELECT a.id

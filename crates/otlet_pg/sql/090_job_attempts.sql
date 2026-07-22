@@ -97,7 +97,7 @@ CREATE FUNCTION otlet.record_model_attempt(
   selection_reason text DEFAULT NULL,
   error text DEFAULT NULL,
   receipt_status text DEFAULT NULL,
-  expected_claim_attempt integer DEFAULT NULL
+  expected_claim_token text DEFAULT NULL
 ) RETURNS otlet.inference_receipts
 LANGUAGE plpgsql
 AS $$
@@ -130,13 +130,11 @@ BEGIN
     RAISE EXCEPTION 'otlet job % does not exist', record_model_attempt.job_id;
   END IF;
 
-  IF record_model_attempt.expected_claim_attempt IS NOT NULL
-     AND (
-       job_row.attempts IS DISTINCT FROM record_model_attempt.expected_claim_attempt
-       OR job_row.status NOT IN ('running', 'cancel_requested')
-       OR job_row.leased_until IS NULL
-       OR job_row.leased_until < now()
-     ) THEN
+  IF record_model_attempt.expected_claim_token IS NULL
+     OR job_row.claim_token IS DISTINCT FROM record_model_attempt.expected_claim_token
+     OR job_row.status NOT IN ('running', 'cancel_requested')
+     OR job_row.leased_until IS NULL
+     OR job_row.leased_until < now() THEN
     RAISE EXCEPTION 'otlet job claim is stale';
   END IF;
 

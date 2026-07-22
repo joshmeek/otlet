@@ -141,7 +141,7 @@ SELECT otlet.create_watch(
 
 CREATE TEMP TABLE colon_subject_claim AS
 WITH inserted AS (
-  INSERT INTO otlet.jobs (task_name, subject_id, input, status, attempts, started_at, leased_until)
+  INSERT INTO otlet.jobs (task_name, subject_id, input, status, attempts, started_at, leased_until, claim_token)
   SELECT
     :'task_name',
     src.id,
@@ -158,12 +158,13 @@ WITH inserted AS (
     'running',
     1,
     now(),
-    now() + interval '5 minutes'
+    now() + interval '5 minutes',
+    gen_random_uuid()::text
   FROM public.otlet_demo_colon_subject src
   WHERE src.id = 'tenant:colon-fragment-only:1'
-  RETURNING id
+  RETURNING id, claim_token
 )
-SELECT id FROM inserted;
+SELECT id, claim_token FROM inserted;
 SELECT otlet.complete_job(
   id,
   '{"decision":"pass","confidence":"high","reason":"colon subject"}'::jsonb,
@@ -175,7 +176,8 @@ SELECT otlet.complete_job(
   md5('{"output":{"decision":"pass","confidence":"high","reason":"colon subject"},"actions":[]}'),
   now(),
   '{"schema_validation_status":"passed"}'::jsonb,
-  :'model_name'
+  :'model_name',
+  expected_claim_token => claim_token
 )
 FROM colon_subject_claim;
 WITH output_row AS (

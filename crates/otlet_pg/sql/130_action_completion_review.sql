@@ -13,7 +13,7 @@ CREATE FUNCTION otlet.complete_job(
   selection_role text DEFAULT 'direct',
   selection_status text DEFAULT 'accepted',
   selection_reason text DEFAULT NULL,
-  expected_claim_attempt integer DEFAULT NULL
+  expected_claim_token text DEFAULT NULL
 ) RETURNS SETOF otlet.outputs
 LANGUAGE plpgsql
 AS $$
@@ -54,23 +54,57 @@ DECLARE
   authority_target_name text;
   proposed_target_name text;
   finish_started timestamptz := clock_timestamp();
+  request_hash text;
 BEGIN
+  request_hash := otlet.job_terminal_request_hash(
+    'complete',
+    jsonb_build_array(
+      complete_job.output,
+      complete_job.raw_output,
+      complete_job.actions,
+      complete_job.prompt_hash,
+      complete_job.input_hash,
+      complete_job.output_schema_hash,
+      complete_job.raw_output_hash,
+      complete_job.started_at,
+      complete_job.trace_summary,
+      complete_job.model_name,
+      complete_job.selection_role,
+      complete_job.selection_status,
+      complete_job.selection_reason
+    )
+  );
+
   SELECT * INTO job_row
   FROM otlet.jobs
   WHERE id = complete_job.job_id
-    AND status IN ('running', 'cancel_requested')
-    AND (
-      complete_job.expected_claim_attempt IS NULL
-      OR (
-        attempts = complete_job.expected_claim_attempt
-        AND leased_until IS NOT NULL
-        AND leased_until >= now()
-      )
-    )
   FOR UPDATE;
 
   IF NOT FOUND THEN
     RETURN;
+  END IF;
+
+  IF job_row.status IN ('complete', 'failed', 'canceled') THEN
+    IF complete_job.expected_claim_token IS NULL
+       OR job_row.terminal_claim_token IS DISTINCT FROM complete_job.expected_claim_token THEN
+      RAISE EXCEPTION 'otlet job claim is stale';
+    END IF;
+    IF job_row.terminal_request_hash IS DISTINCT FROM request_hash THEN
+      RAISE EXCEPTION 'otlet conflicting terminal retry';
+    END IF;
+    RETURN QUERY
+      SELECT o.*
+      FROM otlet.outputs o
+      WHERE o.job_id = job_row.id;
+    RETURN;
+  END IF;
+
+  IF complete_job.expected_claim_token IS NULL
+     OR job_row.claim_token IS DISTINCT FROM complete_job.expected_claim_token
+     OR job_row.status NOT IN ('running', 'cancel_requested')
+     OR job_row.leased_until IS NULL
+     OR job_row.leased_until < now() THEN
+    RAISE EXCEPTION 'otlet job claim is stale';
   END IF;
 
   SELECT t.model_name, t.input_shaping, t.decision_contract
@@ -159,18 +193,11 @@ BEGIN
       complete_job.started_at,
       true,
       model_row.name,
-      complete_job.expected_claim_attempt
+      complete_job.expected_claim_token,
+      request_hash
     );
     RETURN;
   END IF;
-
-  UPDATE otlet.jobs
-  SET status = 'complete',
-      leased_until = NULL,
-      error = NULL,
-      finished_at = now()
-  WHERE id = complete_job.job_id
-  RETURNING * INTO job_row;
 
   SELECT *
   INTO saved_receipt
@@ -188,8 +215,20 @@ BEGIN
     selection_role => COALESCE(complete_job.selection_role, 'direct'),
     selection_status => COALESCE(complete_job.selection_status, 'accepted'),
     selection_reason => complete_job.selection_reason,
-    error => NULL
+    error => NULL,
+    expected_claim_token => complete_job.expected_claim_token
   );
+
+  UPDATE otlet.jobs
+  SET status = 'complete',
+      leased_until = NULL,
+      claim_token = NULL,
+      terminal_claim_token = complete_job.expected_claim_token,
+      terminal_request_hash = request_hash,
+      error = NULL,
+      finished_at = now()
+  WHERE id = complete_job.job_id
+  RETURNING * INTO job_row;
 
   -- outputs_one_per_job_idx; qualify column vs complete_job.job_id param.
   SELECT *

@@ -150,7 +150,7 @@ mod output_tests {
             input_shaping: json!({"include": ["value"]}),
             decision_contract: json!({"answer_field": "decision"}),
             max_attempt_ms: 30_000,
-            claim_attempt: 1,
+            claim_token: "test-claim-token".to_owned(),
         }
     }
 

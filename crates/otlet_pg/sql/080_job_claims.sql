@@ -28,6 +28,7 @@ AS $$
     UPDATE otlet.jobs j
     SET status = 'failed',
         leased_until = NULL,
+        claim_token = NULL,
         error = 'source field allowlist violation',
         finished_at = now()
     FROM invalid_claim_input invalid
@@ -229,6 +230,9 @@ AS $$
     SET status = CASE WHEN j.status = 'cancel_requested' THEN 'cancel_requested' ELSE 'running' END,
         attempts = attempts + 1,
         leased_until = now() + claimable.lease_interval,
+        claim_token = gen_random_uuid()::text,
+        terminal_claim_token = NULL,
+        terminal_request_hash = NULL,
         error = CASE WHEN j.status = 'cancel_requested' THEN j.error ELSE NULL END,
         started_at = now(),
         finished_at = NULL
@@ -246,7 +250,7 @@ $$;
 
 CREATE FUNCTION otlet.renew_job_lease(
   job_id bigint,
-  expected_attempt integer
+  expected_claim_token text
 ) RETURNS TABLE (
   status text,
   leased_until timestamptz
@@ -262,11 +266,27 @@ AS $$
   FROM otlet.tasks t
   CROSS JOIN otlet.production_policy p
   WHERE j.id = renew_job_lease.job_id
-    AND j.attempts = renew_job_lease.expected_attempt
+    AND j.claim_token = renew_job_lease.expected_claim_token
     AND j.status IN ('running', 'cancel_requested')
+    AND j.leased_until IS NOT NULL
+    AND j.leased_until >= now()
     AND t.name = j.task_name
     AND p.name = 'default'
   RETURNING j.status, j.leased_until;
+$$;
+
+CREATE FUNCTION otlet.job_terminal_request_hash(
+  operation text,
+  request jsonb
+) RETURNS text
+LANGUAGE sql
+IMMUTABLE
+PARALLEL SAFE
+AS $$
+  SELECT encode(
+    sha256(convert_to(job_terminal_request_hash.operation || ':' || job_terminal_request_hash.request::text, 'UTF8')),
+    'hex'
+  )
 $$;
 
 CREATE FUNCTION otlet.mark_job_started(job_id bigint) RETURNS void

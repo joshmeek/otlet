@@ -328,6 +328,16 @@ BEGIN
 
   RETURN QUERY
   SELECT
+    'active_jobs_have_claim_tokens'::text,
+    'job'::text,
+    j.id::text,
+    jsonb_build_object('status', j.status, 'attempts', j.attempts)
+  FROM otlet.jobs j
+  WHERE j.status IN ('running', 'cancel_requested')
+    AND j.claim_token IS NULL;
+
+  RETURN QUERY
+  SELECT
     'complete_receipts_are_schema_validated'::text,
     'receipt'::text,
     r.id::text,

@@ -91,7 +91,7 @@ CREATE FUNCTION otlet.fail_job(
   selection_status text DEFAULT 'failed',
   selection_reason text DEFAULT NULL,
   candidate_output jsonb DEFAULT NULL,
-  expected_claim_attempt integer DEFAULT NULL
+  expected_claim_token text DEFAULT NULL
 ) RETURNS SETOF otlet.jobs
 LANGUAGE plpgsql
 AS $$
@@ -101,23 +101,55 @@ DECLARE
   model_row otlet.models%ROWTYPE;
   saved_receipt_id bigint;
   finish_started timestamptz := clock_timestamp();
+  request_hash text;
 BEGIN
+  request_hash := otlet.job_terminal_request_hash(
+    'fail',
+    jsonb_build_array(
+      fail_job.error,
+      fail_job.raw_output,
+      fail_job.prompt_hash,
+      fail_job.input_hash,
+      fail_job.output_schema_hash,
+      fail_job.raw_output_hash,
+      fail_job.started_at,
+      fail_job.schema_validation_status,
+      fail_job.trace_summary,
+      fail_job.model_name,
+      fail_job.selection_role,
+      fail_job.selection_status,
+      fail_job.selection_reason,
+      fail_job.candidate_output
+    )
+  );
+
   SELECT * INTO saved_job
   FROM otlet.jobs
   WHERE id = fail_job.job_id
-    AND status IN ('running', 'cancel_requested')
-    AND (
-      fail_job.expected_claim_attempt IS NULL
-      OR (
-        attempts = fail_job.expected_claim_attempt
-        AND leased_until IS NOT NULL
-        AND leased_until >= now()
-      )
-    )
   FOR UPDATE;
 
   IF NOT FOUND THEN
     RETURN;
+  END IF;
+
+  IF saved_job.status IN ('complete', 'failed', 'canceled') THEN
+    IF fail_job.expected_claim_token IS NULL
+       OR saved_job.terminal_claim_token IS DISTINCT FROM fail_job.expected_claim_token THEN
+      RAISE EXCEPTION 'otlet job claim is stale';
+    END IF;
+    IF saved_job.terminal_request_hash IS DISTINCT FROM request_hash THEN
+      RAISE EXCEPTION 'otlet conflicting terminal retry';
+    END IF;
+    RETURN NEXT saved_job;
+    RETURN;
+  END IF;
+
+  IF fail_job.expected_claim_token IS NULL
+     OR saved_job.claim_token IS DISTINCT FROM fail_job.expected_claim_token
+     OR saved_job.status NOT IN ('running', 'cancel_requested')
+     OR saved_job.leased_until IS NULL
+     OR saved_job.leased_until < now() THEN
+    RAISE EXCEPTION 'otlet job claim is stale';
   END IF;
 
   SELECT t.model_name
@@ -159,18 +191,11 @@ BEGIN
         fail_job.started_at,
         true,
         model_row.name,
-        fail_job.expected_claim_attempt
+        fail_job.expected_claim_token,
+        request_hash
       );
     RETURN;
   END IF;
-
-  UPDATE otlet.jobs
-  SET status = 'failed',
-      leased_until = NULL,
-      error = fail_job.error,
-      finished_at = now()
-  WHERE id = fail_job.job_id
-  RETURNING * INTO saved_job;
 
   SELECT id
   INTO saved_receipt_id
@@ -189,8 +214,20 @@ BEGIN
     selection_role => COALESCE(fail_job.selection_role, 'direct'),
     selection_status => COALESCE(fail_job.selection_status, 'failed'),
     selection_reason => fail_job.selection_reason,
-    error => fail_job.error
+    error => fail_job.error,
+    expected_claim_token => fail_job.expected_claim_token
   );
+
+  UPDATE otlet.jobs
+  SET status = 'failed',
+      leased_until = NULL,
+      claim_token = NULL,
+      terminal_claim_token = fail_job.expected_claim_token,
+      terminal_request_hash = request_hash,
+      error = fail_job.error,
+      finished_at = now()
+  WHERE id = fail_job.job_id
+  RETURNING * INTO saved_job;
 
   IF saved_receipt_id IS NOT NULL THEN
     UPDATE otlet.inference_receipts r
@@ -258,6 +295,7 @@ BEGIN
       UPDATE otlet.jobs
       SET status = 'failed',
           leased_until = NULL,
+          claim_token = NULL,
           error = 'orphan job: missing task',
           finished_at = now()
       WHERE id = job_row.id;
@@ -272,6 +310,7 @@ BEGIN
       UPDATE otlet.jobs
       SET status = 'failed',
           leased_until = NULL,
+          claim_token = NULL,
           error = 'orphan job: missing model',
           finished_at = now()
       WHERE id = job_row.id;
@@ -280,26 +319,24 @@ BEGIN
     END IF;
 
     UPDATE otlet.jobs
-    SET status = 'failed',
-        leased_until = NULL,
-        error = 'job lease expired after max attempts',
-        finished_at = now()
+    SET leased_until = now() + interval '1 minute',
+        claim_token = gen_random_uuid()::text
     WHERE id = job_row.id
     RETURNING * INTO job_row;
 
-    PERFORM otlet.record_model_attempt(
+    PERFORM otlet.fail_job(
       job_row.id,
-      model_row.name,
+      'job lease expired after max attempts',
       raw_output_hash => md5(''),
       trace_summary => jsonb_build_object('schema_validation_status', 'not_run'),
       schema_validation_status => 'not_run',
       started_at => COALESCE(job_row.started_at, job_row.created_at, now()),
+      model_name => model_row.name,
       selection_status => 'failed',
       selection_reason => 'job_lease_expired_after_max_attempts',
-      error => job_row.error
+      expected_claim_token => job_row.claim_token
     );
 
-    PERFORM otlet.touch_runtime_slot(model_row.name, 'error', 0, job_row.error);
     swept := swept + 1;
   END LOOP;
 
@@ -326,6 +363,7 @@ BEGIN
       UPDATE otlet.jobs
       SET status = 'canceled',
           leased_until = NULL,
+          claim_token = NULL,
           error = COALESCE(job_row.error, 'orphan job: missing task'),
           finished_at = now()
       WHERE id = job_row.id;
@@ -340,6 +378,7 @@ BEGIN
       UPDATE otlet.jobs
       SET status = 'canceled',
           leased_until = NULL,
+          claim_token = NULL,
           error = COALESCE(job_row.error, 'orphan job: missing model'),
           finished_at = now()
       WHERE id = job_row.id;
@@ -347,9 +386,16 @@ BEGIN
       CONTINUE;
     END IF;
 
+    UPDATE otlet.jobs
+    SET leased_until = now() + interval '1 minute',
+        claim_token = gen_random_uuid()::text
+    WHERE id = job_row.id
+    RETURNING * INTO job_row;
+
     PERFORM otlet.finish_canceled_job(
       job_row.id,
-      release_runtime => true
+      release_runtime => true,
+      expected_claim_token => job_row.claim_token
     );
     canceled_swept := canceled_swept + 1;
   END LOOP;
