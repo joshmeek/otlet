@@ -624,11 +624,12 @@ The pack keeps SQL and JSON Schema as ordinary document fields. The shortened va
   "fixtures": [],
   "labels": [],
   "expected_receipts": [],
+  "review_outcomes": [],
   "evaluation_gates": {}
 }
 ```
 
-The document contains watch configuration, owner-authored candidate SQL, fixtures, labels, expected receipt shapes, evaluation gates, and a digest of canonical content. It excludes model paths, source rows, jobs, runtime outputs, runtime actions, runtime receipts, traces, materializations, trigger names, and counters. Store the JSON in an ordinary file; Otlet adds no workflow language or pack registry
+The document contains watch configuration, owner-authored candidate SQL, fixtures, labels, expected receipt shapes, review outcomes, evaluation gates, and a digest of canonical content. It excludes model paths, source rows, jobs, runtime outputs, runtime actions, runtime receipts, traces, materializations, trigger names, and counters. Store the JSON in an ordinary file; Otlet adds no workflow language or pack registry
 
 Lint and dry run use the same validator as import and do not change the watch or its version history:
 

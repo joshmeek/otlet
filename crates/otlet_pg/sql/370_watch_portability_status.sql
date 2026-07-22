@@ -20,7 +20,8 @@ DECLARE
     'record_type', 'runtime_options', 'selection_policy', 'trigger_policy',
     'action_types', 'stale_policy', 'input_shaping', 'decision_contract',
     'max_candidate_rows', 'input_columns', 'pair_sources', 'content_digest',
-    'version_metadata', 'fixtures', 'labels', 'expected_receipts', 'evaluation_gates'
+    'version_metadata', 'fixtures', 'labels', 'expected_receipts', 'review_outcomes',
+    'evaluation_gates'
   ];
   required_keys constant text[] := ARRAY[
     'format', 'name', 'kind', 'instruction', 'output_schema', 'model_name',
@@ -81,6 +82,7 @@ BEGIN
     'fixtures', COALESCE(pack -> 'fixtures', '[]'::jsonb),
     'labels', COALESCE(pack -> 'labels', '[]'::jsonb),
     'expected_receipts', COALESCE(pack -> 'expected_receipts', '[]'::jsonb),
+    'review_outcomes', COALESCE(pack -> 'review_outcomes', '[]'::jsonb),
     'evaluation_gates', COALESCE(pack -> 'evaluation_gates', '{}'::jsonb)
   );
 
@@ -113,7 +115,8 @@ BEGIN
   END LOOP;
 
   FOREACH array_field IN ARRAY ARRAY[
-    'action_types', 'pair_sources', 'fixtures', 'labels', 'expected_receipts'
+    'action_types', 'pair_sources', 'fixtures', 'labels', 'expected_receipts',
+    'review_outcomes'
   ] LOOP
     IF jsonb_typeof(pack -> array_field) IS DISTINCT FROM 'array' THEN
       RAISE EXCEPTION 'otlet watch definition % must be an array', array_field;
@@ -121,10 +124,11 @@ BEGIN
   END LOOP;
   IF jsonb_array_length(pack -> 'fixtures') > 10000
      OR jsonb_array_length(pack -> 'labels') > 10000
-     OR jsonb_array_length(pack -> 'expected_receipts') > 10000 THEN
+     OR jsonb_array_length(pack -> 'expected_receipts') > 10000
+     OR jsonb_array_length(pack -> 'review_outcomes') > 10000 THEN
     RAISE EXCEPTION 'otlet watch pack evidence arrays must contain at most 10000 entries';
   END IF;
-  FOREACH array_field IN ARRAY ARRAY['fixtures', 'labels', 'expected_receipts'] LOOP
+  FOREACH array_field IN ARRAY ARRAY['fixtures', 'labels', 'expected_receipts', 'review_outcomes'] LOOP
     IF EXISTS (
       SELECT 1
       FROM jsonb_array_elements(pack -> array_field) item(value)
@@ -370,6 +374,7 @@ BEGIN
     'fixtures', COALESCE(version.definition -> 'fixtures', '[]'::jsonb),
     'labels', COALESCE(version.definition -> 'labels', '[]'::jsonb),
     'expected_receipts', COALESCE(version.definition -> 'expected_receipts', '[]'::jsonb),
+    'review_outcomes', COALESCE(version.definition -> 'review_outcomes', '[]'::jsonb),
     'evaluation_gates', COALESCE(version.definition -> 'evaluation_gates', '{}'::jsonb)
   )
   INTO definition
@@ -591,6 +596,7 @@ SELECT
   version.definition -> 'fixtures' AS fixtures,
   version.definition -> 'labels' AS labels,
   version.definition -> 'expected_receipts' AS expected_receipts,
+  version.definition -> 'review_outcomes' AS review_outcomes,
   version.definition -> 'evaluation_gates' AS evaluation_gates,
   version.created_by,
   version.created_at

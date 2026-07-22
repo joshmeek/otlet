@@ -350,7 +350,7 @@ ORDER BY review_event_id;
 
 Evaluation labels carry a workload name, stable case key, task name, and positive case weight. `otlet.export_eval_cases(...)` returns those fields with source identity hashes but no source row. The owner can import the returned JSON rows into another database with `otlet.import_eval_cases(...)`; existing workload and case keys are left unchanged
 
-`otlet.evaluate_workload(...)` selects accepted receipts by model, prompt, schema, and runtime identity, then binds the result to an immutable pack version. It calculates weighted coverage, answer quality, abstention, action quality, generation latency, and review delay. Pack gates supply defaults and call-time thresholds override them. A named baseline adds regression deltas and identity-change flags
+`otlet.evaluate_workload(...)` selects accepted receipts by model, prompt template, schema, and runtime identity, then binds the result to an immutable pack version. It calculates weighted coverage, answer quality, abstention, action quality, generation latency, and review delay. Pack gates supply defaults and call-time thresholds override them. A named baseline adds regression deltas and identity-change flags
 
 ```sql
 SELECT gate_status, quality, abstention, action_quality,

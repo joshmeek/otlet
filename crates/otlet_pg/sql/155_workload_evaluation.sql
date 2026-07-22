@@ -174,7 +174,10 @@ BEGIN
       WHERE candidate.task_name = label.task_name
         AND candidate.subject_id = label.subject_id
         AND candidate.model_name = candidate_model
-        AND candidate.prompt_hash = candidate_prompt
+        AND COALESCE(
+          candidate.trace_summary #>> '{runtime_fingerprint,output_contract,prompt_template,hash}',
+          candidate.prompt_hash
+        ) = candidate_prompt
         AND candidate.output_schema_hash = candidate_schema
         AND candidate.trace_summary ->> 'runtime_fingerprint_hash' = candidate_runtime
         AND candidate.selection_status = 'accepted'
