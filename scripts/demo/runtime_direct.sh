@@ -49,6 +49,11 @@ SELECT 'direct_ask_runtime_fingerprint_contract=' ||
        s.runtime_fingerprint_version || '|' ||
        (s.runtime_fingerprint_hash = rs.runtime_fingerprint_hash)::text || '|' ||
        (s.runtime_output_contract_hash = rs.runtime_output_contract_hash)::text || '|' ||
+       (s.model_artifact_hash = rs.artifact_sha256)::text || '|' ||
+       (s.model_artifact_identity = rs.artifact_identity)::text || '|' ||
+       (s.runtime_fingerprint -> 'artifact' ->> 'sha256' = s.model_artifact_hash)::text || '|' ||
+       (s.runtime_fingerprint -> 'artifact' -> 'identity' = s.model_artifact_identity)::text || '|' ||
+       (s.runtime_fingerprint -> 'artifact' ->> 'verification') || '|' ||
        (s.runtime_fingerprint -> 'artifact' ->> 'quantization') || '|' ||
        jsonb_extract_path_text(s.runtime_fingerprint, 'output_contract', 'prompt_template', 'name') || '|' ||
        jsonb_extract_path_text(s.runtime_fingerprint, 'output_contract', 'llama_cpp', 'revision') || '|' ||
@@ -70,7 +75,7 @@ require_regex "$direct_ask_receipt_contract" "^$strong_model_name\\|complete\\|p
   echo "Expected direct ask trace to make cache-disabled-under-generation-trace explicit, got $direct_ask_cache_contract" >&2
   exit 1
 }
-require_regex "$direct_ask_runtime_fingerprint_contract" '^otlet_runtime_fingerprint_v1\|true\|true\|Q4_K_M\|otlet_raw_json_worker_v1\|94a220cd6\|512\|[1-9][0-9]*$' "Expected receipt and runtime status to share one complete runtime fingerprint"
+require_regex "$direct_ask_runtime_fingerprint_contract" '^otlet_runtime_fingerprint_v1\|true\|true\|true\|true\|true\|true\|sha256_verified_before_model_load\|Q4_K_M\|otlet_raw_json_worker_v1\|94a220cd6\|512\|[1-9][0-9]*$' "Expected receipt and runtime status to share one verified model identity and complete runtime fingerprint"
 
 log "Checking opt-in direct decision contract gate"
 direct_gate_jobs_completed_before="$(psql_value -v model_name="$strong_model_name" <<'SQL'

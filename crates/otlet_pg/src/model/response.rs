@@ -143,7 +143,8 @@ mod output_tests {
             input: json!({"value": "test"}),
             input_content_hash: "content".to_owned(),
             artifact_path: "/tmp/model.gguf".to_owned(),
-            artifact_hash: Some("artifact".to_owned()),
+            artifact_hash: "artifact".to_owned(),
+            artifact_identity: json!({"sha256": "artifact", "bytes": 1}),
             model_name: "test_model".to_owned(),
             runtime_options: json!({"reasoning": "off"}),
             input_shaping: json!({"include": ["value"]}),
@@ -183,7 +184,7 @@ mod output_tests {
         changed.artifact_path = "/tmp/other.gguf".to_owned();
         assert!(cache.get(&changed).is_none());
         changed = contract_test_job();
-        changed.artifact_hash = Some("other_artifact".to_owned());
+        changed.artifact_hash = "other_artifact".to_owned();
         assert!(cache.get(&changed).is_none());
     }
 
@@ -335,4 +336,3 @@ mod output_tests {
         assert_eq!(counter_delta(25, 10), 0);
     }
 }
-

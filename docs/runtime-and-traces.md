@@ -58,7 +58,17 @@ receipt_attempt_contract=8|4|4|4
 
 A receipt records evidence for one model run. A candidate pair can have multiple receipts when model selection escalates
 
-Each receipt links the model, artifact, runtime options, prompt hash, input hash, output schema hash, raw-output hash, runtime fingerprint, validation status, timing, token counts, memory summary, and trace summary. Otlet does not persist the assembled prompt
+Each receipt links the model, verified artifact SHA-256 and provenance, runtime options, prompt hash, input hash, output schema hash, raw-output hash, runtime fingerprint, validation status, timing, token counts, memory summary, and trace summary. Otlet does not persist the assembled prompt
+
+```sql
+SELECT receipt_id,
+       model_artifact_hash AS artifact_sha256,
+       model_artifact_identity,
+       runtime_fingerprint -> 'artifact' ->> 'verification' AS verification
+FROM otlet.inference_receipt_trace_status
+ORDER BY receipt_id DESC
+LIMIT 1;
+```
 
 Linked llama.cpp uses greedy decoding and stops after one balanced JSON object. Otlet then requires the common `output` plus `actions` envelope and runs the task JSON Schema, action schema, decision contract, and selection policy. Inspect the decode and validation contract through the receipt:
 

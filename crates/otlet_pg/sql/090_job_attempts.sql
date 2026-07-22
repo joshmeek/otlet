@@ -135,8 +135,8 @@ BEGIN
   IF NOT FOUND THEN
     RAISE EXCEPTION 'otlet default production policy does not exist';
   END IF;
-  SELECT name, artifact_path, artifact_hash
-  INTO model_row.name, model_row.artifact_path, model_row.artifact_hash
+  SELECT name, artifact_path, artifact_hash, artifact_identity
+  INTO model_row.name, model_row.artifact_path, model_row.artifact_hash, model_row.artifact_identity
   FROM otlet.models
   WHERE name = record_model_attempt.model_name;
   IF NOT FOUND THEN
@@ -187,6 +187,7 @@ BEGIN
     model_name,
     model_artifact_path,
     model_artifact_hash,
+    model_artifact_identity,
     runtime_name,
     runtime_endpoint,
     runtime_options,
@@ -217,6 +218,7 @@ BEGIN
     model_row.name,
     model_row.artifact_path,
     model_row.artifact_hash,
+    model_row.artifact_identity,
     'linked_inproc',
     'linked',
     task_row.runtime_options,
@@ -262,4 +264,3 @@ BEGIN
   RETURN saved_receipt;
 END;
 $$;
-

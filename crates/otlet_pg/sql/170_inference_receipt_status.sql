@@ -67,6 +67,9 @@ SELECT
   (o.id IS NOT NULL) AS accepted,
   r.status,
   r.model_name,
+  r.model_artifact_path,
+  r.model_artifact_hash,
+  r.model_artifact_identity,
   r.runtime_name,
   r.prompt_hash,
   r.prompt_tokens,
@@ -410,4 +413,3 @@ CROSS JOIN LATERAL (
 ) trace
 LEFT JOIN otlet.outputs o ON o.receipt_id = r.id
 LEFT JOIN latest_materialization materialization ON materialization.receipt_id = r.id;
-

@@ -12,6 +12,7 @@ BEGIN
     'instruction', t.instruction,
     'output_schema', w.output_schema,
     'model_name', w.model_name,
+    'model_artifact_identity', m.artifact_identity,
     'table_name', w.source_table,
     'subject_column', w.subject_column,
     'candidate_query', w.candidate_query,
@@ -45,6 +46,7 @@ BEGIN
   INTO definition
   FROM otlet.watches w
   JOIN otlet.tasks t ON t.name = w.task_name
+  JOIN otlet.models m ON m.name = w.model_name
   WHERE w.name = export_watch.watch_name;
 
   IF NOT FOUND THEN
@@ -69,6 +71,7 @@ DECLARE
     'instruction',
     'output_schema',
     'model_name',
+    'model_artifact_identity',
     'table_name',
     'subject_column',
     'candidate_query',
@@ -136,7 +139,8 @@ BEGIN
     'selection_policy',
     'trigger_policy',
     'input_shaping',
-    'decision_contract'
+    'decision_contract',
+    'model_artifact_identity'
   ] LOOP
     IF jsonb_typeof(import_watch.definition -> object_field) IS DISTINCT FROM 'object' THEN
       RAISE EXCEPTION 'otlet watch definition % must be an object', object_field;
@@ -190,6 +194,13 @@ BEGIN
   PERFORM 1 FROM otlet.models m WHERE m.name = import_watch.definition ->> 'model_name';
   IF NOT FOUND THEN
     RAISE EXCEPTION 'otlet watch definition model % does not exist', import_watch.definition ->> 'model_name';
+  END IF;
+  PERFORM 1
+  FROM otlet.models m
+  WHERE m.name = import_watch.definition ->> 'model_name'
+    AND m.artifact_identity = import_watch.definition -> 'model_artifact_identity';
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'otlet watch definition model artifact identity does not match registered model %', import_watch.definition ->> 'model_name';
   END IF;
 
   IF EXISTS (SELECT 1 FROM otlet.watches w WHERE w.name = watch_name)

@@ -36,7 +36,7 @@ Otlet ran the model beside the selected rows, validated the JSON, and recorded a
 
 ## Longer Example
 
-Entity resolution uses a cheap local model for the first pass and a stronger local model when the first answer does not meet the decision contract. Start the local runtime, then register both GGUF files:
+Entity resolution uses a cheap local model for the first pass and a stronger local model when the first answer does not meet the decision contract. Start the local runtime:
 
 ```sh
 ./scripts/otlet-setup.sh
@@ -46,21 +46,7 @@ Rerunning setup reuses the PostgreSQL volume and model artifacts while rebuildin
 
 The native worker connects to `postgres` and uses an 8 GiB RSS budget by default. Set `OTLET_DATABASE` to install into another database and `OTLET_MAX_WORKER_RSS_BYTES` to change the budget. An explicit value of `0` disables RSS enforcement. Use a separate PostgreSQL volume for each Otlet database
 
-```sql
-SELECT name
-FROM otlet.register_model('qwen3_1_7b', '/var/lib/postgresql/otlet-models/Qwen3-1.7B-Q8_0.gguf')
-UNION ALL
-SELECT name
-FROM otlet.register_model('qwen35_4b', '/var/lib/postgresql/otlet-models/Qwen3.5-4B-Q4_K_M.gguf');
-```
-
-```text
-    name
-------------
- qwen3_1_7b
- qwen35_4b
-(2 rows)
-```
+The full demo registers both models with a streamed SHA-256 digest, byte size, source, revision, quantization, and license value. Otlet verifies the digest before llama.cpp loads the file and binds the same identity to runtime fingerprints, receipts, status, and watch exports. Set the `OTLET_CHEAP_MODEL_*` and `OTLET_STRONG_MODEL_*` provenance variables when using artifacts other than the demo defaults
 
 An Otlet task reads any SQL query that returns `subject_id` and row-shaped `input`. The [entity-resolution walkthrough](docs/entity-resolution-walkthrough.md) builds `public.otlet_demo_vendor_pair_input` from two application tables. The shortened task call includes the SQL API, output contract, trace settings, input shaping, and decision preset:
 

@@ -16,6 +16,12 @@ SELECT
   m.name AS model_name,
   s.status AS slot_state,
   COALESCE(s.artifact_path, m.artifact_path) AS artifact_path,
+  m.artifact_hash AS artifact_sha256,
+  m.artifact_identity,
+  m.artifact_identity ->> 'source' AS artifact_source,
+  m.artifact_identity ->> 'revision' AS artifact_revision,
+  m.artifact_identity ->> 'quantization' AS artifact_quantization,
+  m.artifact_identity ->> 'license' AS artifact_license,
   artifact_file.artifact_bytes,
   CASE
     WHEN s.artifact_path IS NOT NULL THEN 'resident_worker_loaded_model_context'

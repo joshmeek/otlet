@@ -50,7 +50,18 @@ VALUES ('default');
 CREATE TABLE otlet.models (
   name text PRIMARY KEY,
   artifact_path text NOT NULL,
-  artifact_hash text,
+  artifact_hash text NOT NULL CHECK (artifact_hash ~ '^[0-9a-f]{64}$'),
+  artifact_identity jsonb NOT NULL CHECK (
+    jsonb_typeof(artifact_identity) = 'object'
+    AND artifact_identity ->> 'sha256' = artifact_hash
+    AND jsonb_typeof(artifact_identity -> 'bytes') = 'number'
+    AND artifact_identity ->> 'bytes' ~ '^[1-9][0-9]*$'
+    AND (artifact_identity ->> 'bytes')::numeric <= 9223372036854775807
+    AND NULLIF(artifact_identity ->> 'source', '') IS NOT NULL
+    AND NULLIF(artifact_identity ->> 'revision', '') IS NOT NULL
+    AND NULLIF(artifact_identity ->> 'quantization', '') IS NOT NULL
+    AND NULLIF(artifact_identity ->> 'license', '') IS NOT NULL
+  ),
   max_active_jobs int NOT NULL DEFAULT 1 CHECK (max_active_jobs BETWEEN 1 AND 1024),
   last_used_at timestamptz,
   created_at timestamptz NOT NULL DEFAULT now()
@@ -187,7 +198,8 @@ CREATE TABLE otlet.inference_receipts (
   subject_id text NOT NULL,
   model_name text NOT NULL,
   model_artifact_path text NOT NULL,
-  model_artifact_hash text,
+  model_artifact_hash text NOT NULL,
+  model_artifact_identity jsonb NOT NULL CHECK (jsonb_typeof(model_artifact_identity) = 'object'),
   runtime_name text NOT NULL,
   runtime_endpoint text NOT NULL,
   runtime_options jsonb NOT NULL,

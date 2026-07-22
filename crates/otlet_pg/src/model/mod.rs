@@ -169,6 +169,7 @@ impl ModelError {
 include!("run.rs");
 include!("prompt_contracts.rs");
 include!("trace.rs");
+include!("artifact.rs");
 include!("linked_support.rs");
 include!("linked_load.rs");
 include!("linked_decode.rs");

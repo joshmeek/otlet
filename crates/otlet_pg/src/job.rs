@@ -10,7 +10,8 @@ pub(crate) struct Job {
     pub(crate) input: Value,
     pub(crate) input_content_hash: String,
     pub(crate) artifact_path: String,
-    pub(crate) artifact_hash: Option<String>,
+    pub(crate) artifact_hash: String,
+    pub(crate) artifact_identity: Value,
     pub(crate) model_name: String,
     pub(crate) runtime_options: Value,
     pub(crate) input_shaping: Value,
@@ -22,7 +23,8 @@ pub(crate) struct Job {
 pub(crate) struct JobModel {
     pub(crate) name: String,
     pub(crate) artifact_path: String,
-    pub(crate) artifact_hash: Option<String>,
+    pub(crate) artifact_hash: String,
+    pub(crate) artifact_identity: Value,
 }
 
 pub(crate) struct ModelSelectionPolicy {
@@ -35,7 +37,8 @@ pub(crate) struct ModelSelectionPolicy {
 pub(crate) struct JobModelRef<'a> {
     pub(crate) name: &'a str,
     pub(crate) artifact_path: &'a str,
-    pub(crate) artifact_hash: Option<&'a str>,
+    pub(crate) artifact_hash: &'a str,
+    pub(crate) artifact_identity: &'a Value,
 }
 
 macro_rules! required_col {
@@ -57,13 +60,14 @@ macro_rules! job_from_row {
             input: required_col!($row, JsonB, 6).0,
             input_content_hash: required_col!($row, String, 7),
             artifact_path: required_col!($row, String, 8),
-            artifact_hash: $row.get::<String>(9)?,
-            model_name: required_col!($row, String, 10),
-            runtime_options: required_col!($row, JsonB, 11).0,
-            input_shaping: required_col!($row, JsonB, 12).0,
-            decision_contract: required_col!($row, JsonB, 13).0,
-            max_attempt_ms: i64::from(required_col!($row, i32, 14)),
-            claim_attempt: required_col!($row, i32, 15),
+            artifact_hash: required_col!($row, String, 9),
+            artifact_identity: required_col!($row, JsonB, 10).0,
+            model_name: required_col!($row, String, 11),
+            runtime_options: required_col!($row, JsonB, 12).0,
+            input_shaping: required_col!($row, JsonB, 13).0,
+            decision_contract: required_col!($row, JsonB, 14).0,
+            max_attempt_ms: i64::from(required_col!($row, i32, 15)),
+            claim_attempt: required_col!($row, i32, 16),
         }
     };
 }
@@ -85,6 +89,7 @@ WITH claimed AS (
     t.runtime_options,
     m.artifact_path,
     m.artifact_hash,
+    m.artifact_identity,
     m.name AS model_name,
     p.default_runtime_options,
     p.max_attempt_ms,
@@ -106,6 +111,7 @@ SELECT
   md5(otlet.semantic_canonical_jsonb(shaped_input)::text),
   artifact_path,
   artifact_hash,
+  artifact_identity,
   model_name,
   default_runtime_options || runtime_options,
   input_shaping,
@@ -181,6 +187,7 @@ SELECT
   md5(otlet.semantic_canonical_jsonb(shaped_input)::text),
   artifact_path,
   artifact_hash,
+  artifact_identity,
   model_name,
   default_runtime_options || runtime_options,
   input_shaping,
@@ -199,6 +206,7 @@ FROM (
     t.runtime_options,
     m.artifact_path,
     m.artifact_hash,
+    m.artifact_identity,
     m.name AS model_name,
     p.default_runtime_options,
     p.max_attempt_ms,
@@ -234,9 +242,11 @@ SELECT
   cheap.name,
   cheap.artifact_path,
   cheap.artifact_hash,
+  cheap.artifact_identity,
   strong.name,
   strong.artifact_path,
   strong.artifact_hash,
+  strong.artifact_identity,
   p.accept_field_checks
 FROM otlet.model_selection_policies p
 JOIN otlet.models cheap ON cheap.name = p.cheap_model_name
@@ -256,14 +266,16 @@ WHERE p.task_name = $1
             cheap: JobModel {
                 name: required_col!(row, String, 1),
                 artifact_path: required_col!(row, String, 2),
-                artifact_hash: row.get::<String>(3)?,
+                artifact_hash: required_col!(row, String, 3),
+                artifact_identity: required_col!(row, JsonB, 4).0,
             },
             strong: JobModel {
-                name: required_col!(row, String, 4),
-                artifact_path: required_col!(row, String, 5),
-                artifact_hash: row.get::<String>(6)?,
+                name: required_col!(row, String, 5),
+                artifact_path: required_col!(row, String, 6),
+                artifact_hash: required_col!(row, String, 7),
+                artifact_identity: required_col!(row, JsonB, 8).0,
             },
-            accept_field_checks: required_col!(row, JsonB, 7).0,
+            accept_field_checks: required_col!(row, JsonB, 9).0,
         }))
     })
 }

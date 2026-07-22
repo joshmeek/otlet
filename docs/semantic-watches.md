@@ -642,6 +642,6 @@ The Docker demo proves replacement, drop/import round trip, lookup preservation,
 
 ```text
 watch_replace_contract=true|true|true|true|true|true|true|true|true|true
+watch_import_failure_contract=10|true
 watch_round_trip_contract=true|true|true|true|true
-watch_import_failure_contract=9|true
 ```

@@ -59,8 +59,30 @@ SQL
 register_model() {
   local model_name="$1"
   local artifact_path="$2"
-  psql_exec -v model_name="$model_name" -v artifact_path="$artifact_path" >/dev/null <<'SQL'
-SELECT otlet.register_model(:'model_name', :'artifact_path');
+  local artifact_sha256 artifact_bytes quantization
+  artifact_sha256="$(docker exec "$container" sha256sum "$artifact_path" | awk '{print $1}')"
+  artifact_bytes="$(docker exec "$container" stat -Lc %s "$artifact_path")"
+  quantization="${artifact_path##*-}"
+  quantization="${quantization%.gguf}"
+  psql_exec \
+    -v model_name="$model_name" \
+    -v artifact_path="$artifact_path" \
+    -v artifact_sha256="$artifact_sha256" \
+    -v artifact_bytes="$artifact_bytes" \
+    -v quantization="$quantization" >/dev/null <<'SQL'
+SELECT otlet.register_model(
+  :'model_name',
+  :'artifact_path',
+  :'artifact_sha256',
+  jsonb_build_object(
+    'sha256', :'artifact_sha256',
+    'bytes', :'artifact_bytes'::bigint,
+    'source', :'artifact_path',
+    'revision', 'local',
+    'quantization', :'quantization',
+    'license', 'unknown'
+  )
+);
 SQL
 }
 

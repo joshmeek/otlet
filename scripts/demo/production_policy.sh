@@ -235,8 +235,13 @@ echo "model_queue_status_contract=$model_queue_status_contract"
 
 queue_underfill_contract="$(psql_value <<'SQL'
 BEGIN;
-INSERT INTO otlet.models (name, artifact_path)
-VALUES ('queue_underfill_contract_model', '/tmp/not-used.gguf');
+INSERT INTO otlet.models (name, artifact_path, artifact_hash, artifact_identity)
+VALUES (
+  'queue_underfill_contract_model',
+  '/tmp/not-used.gguf',
+  repeat('0', 64),
+  jsonb_build_object('sha256', repeat('0', 64), 'bytes', 24, 'source', 'smoke', 'revision', 'v1', 'quantization', 'test', 'license', 'test')
+);
 INSERT INTO otlet.tasks (name, input_query, instruction, output_schema, model_name)
 VALUES (
   'queue_underfill_contract_task',

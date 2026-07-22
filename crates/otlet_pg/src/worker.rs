@@ -266,7 +266,7 @@ struct StartupPreload {
 fn startup_preload_config() -> pgrx::spi::Result<Option<StartupPreload>> {
     pgrx::Spi::connect(|client| {
         let rows = client.select(
-            "SELECT p.preload_model_name, m.artifact_path, m.artifact_hash, p.default_runtime_options FROM otlet.production_policy p LEFT JOIN otlet.models m ON m.name = p.preload_model_name WHERE p.name = 'default' AND p.preload_model_name IS NOT NULL LIMIT 1",
+            "SELECT p.preload_model_name, m.artifact_path, m.artifact_hash, m.artifact_identity, p.default_runtime_options FROM otlet.production_policy p LEFT JOIN otlet.models m ON m.name = p.preload_model_name WHERE p.name = 'default' AND p.preload_model_name IS NOT NULL LIMIT 1",
             Some(1),
             &[],
         )?;
@@ -279,15 +279,19 @@ fn startup_preload_config() -> pgrx::spi::Result<Option<StartupPreload>> {
             .ok_or(pgrx::spi::SpiError::InvalidPosition)?;
         let artifact_path = row.get::<String>(2)?;
         let artifact_hash = row.get::<String>(3)?;
+        let artifact_identity = row.get::<JsonB>(4)?.map(|value| value.0);
         Ok(Some(StartupPreload {
-            model: artifact_path.map(|artifact_path| crate::job::JobModel {
-                name: model_name.clone(),
-                artifact_path,
-                artifact_hash,
-            }),
+            model: artifact_path.zip(artifact_hash).zip(artifact_identity).map(
+                |((artifact_path, artifact_hash), artifact_identity)| crate::job::JobModel {
+                    name: model_name.clone(),
+                    artifact_path,
+                    artifact_hash,
+                    artifact_identity,
+                },
+            ),
             model_name,
             runtime_options: row
-                .get::<JsonB>(4)?
+                .get::<JsonB>(5)?
                 .ok_or(pgrx::spi::SpiError::InvalidPosition)?
                 .0,
         }))

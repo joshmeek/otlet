@@ -6,9 +6,15 @@ Use this SQL walkthrough to build the entity-resolution path from `docs/otlet-wo
 docker exec -it otlet-postgres sh -lc '
   cheap_model_artifact="$(find /var/lib/postgresql -name Qwen3-1.7B-Q8_0.gguf -print -quit)"
   strong_model_artifact="$(find /var/lib/postgresql -name Qwen3.5-4B-Q4_K_M.gguf -print -quit)"
+  cheap_model_sha256="$(sha256sum "$cheap_model_artifact" | cut -d " " -f 1)"
+  strong_model_sha256="$(sha256sum "$strong_model_artifact" | cut -d " " -f 1)"
   psql -U postgres -d postgres \
     -v cheap_model_artifact="$cheap_model_artifact" \
-    -v strong_model_artifact="$strong_model_artifact"
+    -v cheap_model_sha256="$cheap_model_sha256" \
+    -v cheap_model_bytes="$(stat -c %s "$cheap_model_artifact")" \
+    -v strong_model_artifact="$strong_model_artifact" \
+    -v strong_model_sha256="$strong_model_sha256" \
+    -v strong_model_bytes="$(stat -c %s "$strong_model_artifact")"
 '
 ```
 
@@ -25,16 +31,34 @@ CREATE EXTENSION IF NOT EXISTS otlet;
 
 SELECT otlet.register_model(
   'qwen3_1_7b',
-  :'cheap_model_artifact'
+  :'cheap_model_artifact',
+  :'cheap_model_sha256',
+  jsonb_build_object(
+    'sha256', :'cheap_model_sha256',
+    'bytes', :'cheap_model_bytes'::bigint,
+    'source', 'https://huggingface.co/Qwen/Qwen3-1.7B-GGUF/resolve/main/Qwen3-1.7B-Q8_0.gguf',
+    'revision', 'main',
+    'quantization', 'Q8_0',
+    'license', 'unknown'
+  )
 );
 
 SELECT otlet.register_model(
   'qwen35_4b',
-  :'strong_model_artifact'
+  :'strong_model_artifact',
+  :'strong_model_sha256',
+  jsonb_build_object(
+    'sha256', :'strong_model_sha256',
+    'bytes', :'strong_model_bytes'::bigint,
+    'source', 'https://huggingface.co/unsloth/Qwen3.5-4B-GGUF/resolve/main/Qwen3.5-4B-Q4_K_M.gguf',
+    'revision', 'main',
+    'quantization', 'Q4_K_M',
+    'license', 'unknown'
+  )
 );
 ```
 
-The Otlet background worker runs `linked_inproc` inference. It loads a local GGUF through in-process llama.cpp and keeps the model resident across jobs. Postgres exposes the queue, source row identity, output validation, receipts, traces, and runtime state through SQL
+The Otlet background worker verifies each registered digest before `linked_inproc` inference. It loads the local GGUF through in-process llama.cpp and keeps the model resident across jobs. Postgres exposes the model identity, queue, source row identity, output validation, receipts, traces, and runtime state through SQL
 
 ## Step 2 - Create The Source Tables
 

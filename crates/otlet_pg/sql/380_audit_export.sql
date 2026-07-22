@@ -89,6 +89,8 @@ SELECT
   s.accepted,
   s.status,
   s.model_name,
+  s.model_artifact_hash AS model_artifact_sha256,
+  s.model_artifact_identity,
   s.runtime_name,
   s.prompt_hash,
   s.prompt_tokens,
