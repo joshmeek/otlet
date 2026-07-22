@@ -93,6 +93,8 @@ SELECT
   p.semantic_auto_max_rows,
   p.worker_claim_batch_size,
   p.job_lease_interval,
+  health.claims_allowed AS database_health_claims_allowed,
+  health.failed_checks AS database_health_failed_checks,
   q.queued_jobs,
   q.queued_input_bytes,
   q.running_jobs,
@@ -149,4 +151,5 @@ CROSS JOIN runtime
 CROSS JOIN trace
 CROSS JOIN materialization_failures
 CROSS JOIN action_execution
+CROSS JOIN otlet.database_health_status health
 WHERE p.name = 'default';

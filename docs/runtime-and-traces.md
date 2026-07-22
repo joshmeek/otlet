@@ -442,6 +442,24 @@ Events show worker behavior. Receipts show model behavior
 
 The portable worker emits one `preflight_passed` event before model load or claims. A failed explicit `--preflight` emits `preflight_failed` with one stable dependency code and no connection string, credential, prompt, or source value
 
+Database health is a separate live surface:
+
+```sql
+SELECT queued_jobs,
+       worker_process_rss_bytes,
+       database_connections,
+       database_size_bytes,
+       wal_bytes_since_reset,
+       otlet_storage_bytes,
+       dead_tuples,
+       application_latency_ms,
+       claims_allowed,
+       failed_checks
+FROM otlet.database_health_status;
+```
+
+Native memory comes from the resident runtime slot while its worker is present. Portable memory comes from heartbeats sampled within the last two minutes. Configure an application-latency limit only when an owner-side monitor records representative query latency through `record_application_latency(...)`
+
 ```sql
 SELECT event_type, count(*)
 FROM otlet.worker_events e

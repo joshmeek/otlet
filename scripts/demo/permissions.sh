@@ -96,6 +96,7 @@ SELECT (SELECT count(*) = 1 FROM otlet.redaction_policy_status)::text || '|' ||
        (SELECT count(*) > 0 FROM otlet.semantic_dependency_audit)::text || '|' ||
        (SELECT count(*) > 0 FROM otlet.operational_event_log)::text || '|' ||
        (SELECT count(*) > 0 FROM otlet.worker_batch_timing_status)::text || '|' ||
+       (SELECT count(*) = 1 FROM otlet.database_health_status)::text || '|' ||
        (SELECT count(*) = 1 FROM otlet.portable_protocol_status)::text || '|' ||
        (SELECT count(*) >= 0 FROM otlet.portable_worker_status)::text || '|' ||
        (SELECT count(*) >= 0 FROM otlet.portable_claim_status)::text || '|' ||
@@ -104,7 +105,7 @@ ROLLBACK;
 SQL
 )"
 echo "auditor_read_contract=$auditor_read_contract"
-[ "$auditor_read_contract" = "true|true|true|true|true|true|true|true|true|true|true|true|true|true|true|true|true|true|true" ] || {
+[ "$auditor_read_contract" = "true|true|true|true|true|true|true|true|true|true|true|true|true|true|true|true|true|true|true|true" ] || {
   echo "Expected auditor access to all redacted exports, got $auditor_read_contract" >&2
   exit 1
 }
@@ -464,6 +465,7 @@ WITH table_grants AS (
             'semantic_dependency_audit',
             'operational_event_log',
             'worker_batch_timing_status',
+            'database_health_status',
             'portable_protocol_status',
             'portable_worker_status',
             'portable_claim_status',
@@ -572,16 +574,16 @@ CROSS JOIN definer_status;
 SQL
 )"
 echo "permission_catalog_contract=$permission_catalog_contract"
-[ "$permission_catalog_contract" = "false|0|0|0|19|3|19|11|0|0|0|0|18|18|0|7|7|7|true" ] || {
+[ "$permission_catalog_contract" = "false|0|0|0|20|3|20|11|0|0|0|0|18|18|0|7|7|7|true" ] || {
   echo "Expected exact public, auditor, operator, and owner ACLs, got $permission_catalog_contract" >&2
   exit 1
 }
 
 source "$demo_dir/review_provenance.sh"
 
-permission_contract="public=0/0/0|auditor=19/3|operator=19/11|definer=18/18|portable=7/7/7|positive=7|denied=$permission_denied_count"
+permission_contract="public=0/0/0|auditor=20/3|operator=20/11|definer=18/18|portable=7/7/7|positive=7|denied=$permission_denied_count"
 echo "permission_contract=$permission_contract"
-[ "$permission_contract" = "public=0/0/0|auditor=19/3|operator=19/11|definer=18/18|portable=7/7/7|positive=7|denied=77" ] || {
+[ "$permission_contract" = "public=0/0/0|auditor=20/3|operator=20/11|definer=18/18|portable=7/7/7|positive=7|denied=77" ] || {
   echo "Expected complete permission contract, got $permission_contract" >&2
   exit 1
 }

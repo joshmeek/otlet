@@ -179,13 +179,14 @@ impl Database {
         let model_status = model_status.map_or_else(|| "NULL".to_owned(), sql_text);
         let error_code = error_code.map_or_else(|| "NULL".to_owned(), sql_text);
         let sql = format!(
-            "SELECT desired_state, registered_model_name FROM otlet.portable_worker_heartbeat({}, {}, {}, {}, {}, {});\n",
+            "SELECT desired_state, registered_model_name FROM otlet.portable_worker_heartbeat({}, {}, {}, {}, {}, {}, {});\n",
             sql_text(&config.worker_id),
             config.protocol_version,
             sql_text(&config.runtime_identity_hash),
             sql_text(state),
             model_status,
-            error_code
+            error_code,
+            process_rss_bytes()
         );
         let rows = self.query(&sql)?;
         match rows.as_slice() {
@@ -1459,6 +1460,22 @@ fn sha256_file(path: &Path) -> Result<String, String> {
     Ok(format!("{:x}", digest.finalize()))
 }
 
+fn process_rss_bytes() -> u64 {
+    let Ok(status) = std::fs::read_to_string("/proc/self/status") else {
+        return 0;
+    };
+    rss_bytes_from_status(&status).unwrap_or(0)
+}
+
+fn rss_bytes_from_status(status: &str) -> Option<u64> {
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix("VmRSS:"))
+        .and_then(|value| value.split_whitespace().next())
+        .and_then(|value| value.parse::<u64>().ok())
+        .and_then(|value| value.checked_mul(1024))
+}
+
 fn sql_text(value: &str) -> String {
     let mut hex = String::with_capacity(value.len() * 2);
     for byte in value.as_bytes() {
@@ -1647,6 +1664,13 @@ mod tests {
             error_code("psql: SSL error: certificate verify failed"),
             "tls_verification_failed"
         );
+    }
+
+    #[test]
+    fn linux_rss_samples_are_converted_from_kibibytes() {
+        let status = "Name:\totlet_worker\nVmRSS:\t1234 kB\n";
+        assert_eq!(rss_bytes_from_status(status), Some(1_263_616));
+        assert_eq!(rss_bytes_from_status("Name:\totlet_worker\n"), None);
     }
 
     #[test]

@@ -42,9 +42,14 @@ pgrx::extension_sql_file!(
     requires = ["tasks_scan"]
 );
 pgrx::extension_sql_file!(
+    "../sql/075_database_health.sql",
+    name = "database_health",
+    requires = ["runtime_health"]
+);
+pgrx::extension_sql_file!(
     "../sql/080_job_claims.sql",
     name = "job_claims",
-    requires = ["runtime_health"]
+    requires = ["database_health"]
 );
 pgrx::extension_sql_file!(
     "../sql/085_portable_schema.sql",

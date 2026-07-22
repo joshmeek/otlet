@@ -93,9 +93,10 @@ Inspect the process, model, queue, and lease state without exposing prompt text 
 ```sql
 SELECT * FROM otlet.portable_worker_status;
 SELECT * FROM otlet.portable_claim_status ORDER BY claim_id DESC;
+SELECT * FROM otlet.database_health_status;
 ```
 
-Worker logs are one-line JSON events with IDs and bounded reason codes. llama.cpp diagnostics and raw prompt or source evidence are not written to the worker log
+Worker heartbeats report process RSS, and the shared database-health gate pauses new claims when an owner-configured limit fails. Existing claims retain their lease and cancellation behavior. Worker logs are one-line JSON events with IDs and bounded reason codes. llama.cpp diagnostics and raw prompt or source evidence are not written to the worker log
 
 See [the customer-VPC example](../examples/customer-vpc-portable-worker/README.md) for a small container deployment and [the production contract](../docs/production-contract.md) for the trust boundary
 

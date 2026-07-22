@@ -61,6 +61,10 @@ CREATE TABLE otlet.portable_workers (
 CREATE UNIQUE INDEX portable_workers_role_runtime_idx
 ON otlet.portable_workers (database_role_oid, runtime_identity_hash);
 
+ALTER TABLE otlet.portable_worker_process_samples
+ADD CONSTRAINT portable_worker_process_samples_worker_fk
+FOREIGN KEY (worker_id) REFERENCES otlet.portable_workers(worker_id) ON DELETE CASCADE;
+
 CREATE TABLE otlet.portable_claims (
   id bigserial PRIMARY KEY,
   job_id bigint NOT NULL REFERENCES otlet.jobs(id) ON DELETE CASCADE,
@@ -341,7 +345,8 @@ CREATE FUNCTION otlet.portable_worker_heartbeat(
   requested_runtime_identity_hash text,
   reported_state text,
   model_status text DEFAULT NULL,
-  error_code text DEFAULT NULL
+  error_code text DEFAULT NULL,
+  worker_process_rss_bytes bigint DEFAULT 0
 ) RETURNS TABLE (desired_state text, registered_model_name text)
 LANGUAGE plpgsql
 SECURITY DEFINER
@@ -365,6 +370,9 @@ BEGIN
      AND portable_worker_heartbeat.error_code !~ '^[a-z0-9][a-z0-9_.-]{0,127}$' THEN
     RAISE EXCEPTION 'otlet portable worker error code is invalid';
   END IF;
+  IF portable_worker_heartbeat.worker_process_rss_bytes NOT BETWEEN 0 AND 70368744177664 THEN
+    RAISE EXCEPTION 'otlet portable worker RSS sample is invalid';
+  END IF;
 
   worker_row := otlet.authorized_portable_worker(
     portable_worker_heartbeat.requested_worker_id,
@@ -384,6 +392,23 @@ BEGIN
       updated_at = now()
   WHERE w.worker_id = worker_row.worker_id
   RETURNING w.desired_state, w.model_name INTO desired_state, registered_model_name;
+  IF portable_worker_heartbeat.worker_process_rss_bytes > 0 THEN
+    INSERT INTO otlet.portable_worker_process_samples (
+      runtime_name,
+      worker_id,
+      worker_process_rss_bytes,
+      sampled_at
+    )
+    VALUES (
+      worker_row.runtime_name,
+      worker_row.worker_id,
+      portable_worker_heartbeat.worker_process_rss_bytes,
+      now()
+    )
+    ON CONFLICT (runtime_name, worker_id) DO UPDATE
+    SET worker_process_rss_bytes = EXCLUDED.worker_process_rss_bytes,
+        sampled_at = EXCLUDED.sampled_at;
+  END IF;
   RETURN NEXT;
 END;
 $$;
@@ -919,6 +944,8 @@ SELECT
   w.last_heartbeat_at,
   w.last_claimed_at,
   w.process_started_at,
+  sample.worker_process_rss_bytes,
+  sample.sampled_at AS worker_memory_sampled_at,
   CASE
     WHEN NOT w.enabled THEN 'disabled'
     WHEN w.desired_state = 'draining' AND w.reported_state = 'drained' THEN 'drained'
@@ -954,6 +981,9 @@ SELECT
 FROM otlet.portable_workers w
 LEFT JOIN otlet.portable_claims c ON c.worker_id = w.worker_id
 LEFT JOIN otlet.jobs j ON j.id = c.job_id
+LEFT JOIN otlet.portable_worker_process_samples sample
+  ON sample.runtime_name = w.runtime_name
+ AND sample.worker_id = w.worker_id
 GROUP BY
   w.worker_id,
   w.database_role_oid,
@@ -970,7 +1000,9 @@ GROUP BY
   w.last_seen_at,
   w.last_heartbeat_at,
   w.last_claimed_at,
-  w.process_started_at;
+  w.process_started_at,
+  sample.worker_process_rss_bytes,
+  sample.sampled_at;
 
 CREATE VIEW otlet.portable_claim_status AS
 SELECT

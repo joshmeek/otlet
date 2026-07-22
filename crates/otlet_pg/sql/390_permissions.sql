@@ -124,6 +124,7 @@ BEGIN
     'otlet.semantic_dependency_audit, '
     'otlet.operational_event_log, '
     'otlet.worker_batch_timing_status, '
+    'otlet.database_health_status, '
     'otlet.portable_protocol_status, '
     'otlet.portable_worker_status, '
     'otlet.portable_claim_status, '

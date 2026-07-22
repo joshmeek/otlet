@@ -50,6 +50,7 @@ register_models
 
 source "$demo_dir/model_artifact_trust.sh"
 source "$demo_dir/production_policy.sh"
+source "$demo_dir/database_health.sh"
 source "$demo_dir/job_fencing.sh"
 source "$demo_dir/portable_result_validation.sh"
 source "$demo_dir/portable_worker_protocol.sh"

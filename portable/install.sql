@@ -8,6 +8,7 @@ BEGIN;
 \ir 050_runtime_models.sql
 \ir ../crates/otlet_pg/sql/060_tasks_scan.sql
 \ir ../crates/otlet_pg/sql/070_runtime_health.sql
+\ir ../crates/otlet_pg/sql/075_database_health.sql
 \ir ../crates/otlet_pg/sql/080_job_claims.sql
 \ir ../crates/otlet_pg/sql/085_portable_schema.sql
 \ir ../crates/otlet_pg/sql/090_job_attempts.sql

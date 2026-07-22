@@ -459,12 +459,13 @@ SELECT concat_ws('|',
   (SELECT status || ':' || attempts || ':' || outputs || ':' || receipts
    FROM job_state WHERE subject_id = 'recovery-worker-loss'),
   (SELECT status FROM job_state WHERE subject_id = 'recovery-database-restart'),
-  (SELECT desired_state || ':' || reported_state || ':' || worker_health || ':' || expired_claims
+  (SELECT desired_state || ':' || reported_state || ':' || worker_health || ':' || expired_claims || ':' ||
+          (worker_process_rss_bytes > 0)::text
    FROM otlet.portable_worker_status WHERE worker_id = :'worker_id')
 );
 SQL
 )"
-expected_recovery_contract="complete|canceled|complete:2:1:1|complete:2:1:1|complete|draining:drained:drained:0"
+expected_recovery_contract="complete|canceled|complete:2:1:1|complete:2:1:1|complete|draining:drained:drained:0:true"
 if [ "$recovery_contract" != "$expected_recovery_contract" ]; then
   echo "Expected portable recovery contract $expected_recovery_contract, got $recovery_contract" >&2
   exit 1

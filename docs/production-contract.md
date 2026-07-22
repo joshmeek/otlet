@@ -122,6 +122,27 @@ The [reference external worker](../portable/README.md) uses ordinary `psql` conn
 
 Before any portable claim, deployment preflight resolves and reaches the database endpoint, requires `sslmode=verify-full` with a readable CA by default, verifies the negotiated TLS session, authenticates the registered role, checks the seven RPC grants and active protocol version, verifies the runtime and model allowlists, hashes the local GGUF, probes the runtime directory, and requires the `deny_model_providers` egress declaration. `otlet_worker --preflight` runs the same checks and exits without loading the model or claiming work. Operators must enforce the declared egress policy in the deployment network
 
+`otlet.database_health_status` tracks queued jobs and bytes, current native or recent portable worker RSS, connections to the current database, current database size, WAL bytes since the statistics reset, Otlet relation storage, autovacuum configuration and activity, and the latest application-latency sample. The status view is read-only and available to auditors
+
+Health limits are nullable typed columns on the existing `otlet.production_policy` row: `health_max_queued_jobs`, `health_max_worker_rss_bytes`, `health_max_connections`, `health_max_database_bytes`, `health_max_wal_bytes_since_reset`, `health_max_otlet_storage_bytes`, and `health_max_application_latency_ms`. `health_require_autovacuum` rejects a globally disabled autovacuum or any Otlet relation with `autovacuum_enabled=false`. A configured application-latency limit also requires a sample no older than `health_application_latency_max_age`
+
+```sql
+UPDATE otlet.production_policy
+SET health_max_connections = 80,
+    health_max_database_bytes = 536870912000,
+    health_require_autovacuum = true,
+    health_max_application_latency_ms = 100
+WHERE name = 'default';
+
+SELECT otlet.record_application_latency(42.5);
+SELECT claims_allowed, failed_checks, checked_at
+FROM otlet.database_health_status;
+```
+
+Unset limits observe without gating. When a configured limit fails, the shared `claim_jobs(...)` boundary returns no new work to either runtime; live claims keep their existing lease behavior. Recovery needs no worker restart because the next claim reevaluates current state. Application tables and queries do not call the health gate
+
+`database_size_bytes` measures allocated bytes for the current database, not free filesystem capacity. `wal_bytes_since_reset` is the PostgreSQL cumulative WAL statistic. Infrastructure monitoring still owns free disk, volume growth, replicas, backups, and WAL retention outside the current database
+
 Otlet debounces suppressed queue-admission events per task and reason for one minute, so a full queue stays visible without flooding `worker_events`. `production_status` exposes `semantic_materialization_failed_events` and `semantic_materialization_last_failed_at`. Nonzero `max_worker_rss_bytes` budgets require Linux RSS, total-memory, and available-memory samples. A cache miss also requires artifact metadata and a no-allocation llama.cpp projection; missing evidence or insufficient headroom rejects the load before tensor allocation. Cleanup can prune old failed or canceled jobs after outputs, actions, eval labels, and receipts no longer reference them
 
 The resident worker attaches to `OTLET_DATABASE`, which defaults to `postgres`. One PostgreSQL cluster runs Otlet against one database because cross-database worker registration requires separate shared-memory and latch routing. Setup refuses an Otlet installation in a second database and checks the target database, extension files, model files, schema access, runtime role, and memory budget before enabling the worker
@@ -340,6 +361,7 @@ The auditor capability grants these redacted policy and audit views:
 - `otlet.semantic_dependency_audit`
 - `otlet.operational_event_log`
 - `otlet.worker_batch_timing_status`
+- `otlet.database_health_status`
 
 The grant also includes three pure JSON hashing helpers required by `audit_review_export`; those helpers read no database rows. The operator capability includes auditor access plus these functions:
 

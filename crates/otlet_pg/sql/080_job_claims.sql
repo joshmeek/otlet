@@ -18,6 +18,7 @@ AS $$
       job_lease_interval
     FROM otlet.production_policy
     WHERE name = 'default'
+      AND otlet.database_health_claims_allowed()
     FOR UPDATE
   ),
   invalid_claim_input AS MATERIALIZED (
