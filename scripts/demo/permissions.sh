@@ -531,7 +531,8 @@ WITH table_grants AS (
           'portable_record_attempt',
           'portable_complete_job',
           'portable_fail_job',
-          'portable_cancel_job'
+          'portable_cancel_job',
+          'portable_worker_heartbeat'
         )
     )::bigint AS unexpected_definer_functions
   FROM pg_catalog.pg_proc p
@@ -571,16 +572,16 @@ CROSS JOIN definer_status;
 SQL
 )"
 echo "permission_catalog_contract=$permission_catalog_contract"
-[ "$permission_catalog_contract" = "false|0|0|0|19|3|19|11|0|0|0|0|17|17|0|6|6|6|true" ] || {
+[ "$permission_catalog_contract" = "false|0|0|0|19|3|19|11|0|0|0|0|18|18|0|7|7|7|true" ] || {
   echo "Expected exact public, auditor, operator, and owner ACLs, got $permission_catalog_contract" >&2
   exit 1
 }
 
 source "$demo_dir/review_provenance.sh"
 
-permission_contract="public=0/0/0|auditor=19/3|operator=19/11|definer=17/17|portable=6/6/6|positive=7|denied=$permission_denied_count"
+permission_contract="public=0/0/0|auditor=19/3|operator=19/11|definer=18/18|portable=7/7/7|positive=7|denied=$permission_denied_count"
 echo "permission_contract=$permission_contract"
-[ "$permission_contract" = "public=0/0/0|auditor=19/3|operator=19/11|definer=17/17|portable=6/6/6|positive=7|denied=77" ] || {
+[ "$permission_contract" = "public=0/0/0|auditor=19/3|operator=19/11|definer=18/18|portable=7/7/7|positive=7|denied=77" ] || {
   echo "Expected complete permission contract, got $permission_contract" >&2
   exit 1
 }

@@ -32,7 +32,8 @@ BEGIN
         'portable_record_attempt',
         'portable_complete_job',
         'portable_fail_job',
-        'portable_cancel_job'
+        'portable_cancel_job',
+        'portable_worker_heartbeat'
       )
     ORDER BY p.proname
   LOOP

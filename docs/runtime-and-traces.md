@@ -80,7 +80,7 @@ ORDER BY receipt_id DESC
 LIMIT 1;
 ```
 
-Portable execution uses the same receipt state and records `portable:<runtime_name>` with endpoint `postgres_rpc`. Inspect protocol compatibility, registered runtime identities, claim ownership, and linked receipts without reading the underlying tables:
+Portable execution uses the same receipt state and records `portable:<runtime_name>` with endpoint `postgres_rpc`. Inspect protocol compatibility, worker and model health, queue depth, lease health, claim ownership, and linked receipts without reading the underlying tables:
 
 ```sql
 SELECT * FROM otlet.portable_protocol_status;
@@ -89,7 +89,7 @@ SELECT * FROM otlet.portable_claim_status ORDER BY claim_id DESC;
 SELECT * FROM otlet.portable_receipt_status ORDER BY receipt_id DESC;
 ```
 
-The [reference external worker](../portable/README.md) runs the same database-built prompt with one local GGUF when the PostgreSQL host cannot load the native extension worker. The worker returns model text and trace measurements, but PostgreSQL still parses the envelope and owns every validation and trusted-state write
+The [reference external worker](../portable/README.md) runs the same database-built prompt with one local GGUF when the PostgreSQL host cannot load the native extension worker. It renews the lease during decode and interrupts work after cancellation, claim loss, or database disconnect. PostgreSQL still parses the returned envelope and owns every validation and trusted-state write
 
 Receipt timing splits runtime preparation, model load, context creation, tokenization, prompt decode, generation, validation and post-processing, finish SQL, and semantic materialization. `otlet.runtime_stage_timing_status` aggregates every attempt for a job and leaves unmeasured worker work in `worker_overhead_ms`:
 

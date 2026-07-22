@@ -6,11 +6,19 @@ use std::fs::File;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, AtomicU8, Ordering},
+};
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const CONTEXT_TOKENS: u32 = 4096;
 const BATCH_TOKENS: usize = 512;
 const MAX_TOKEN_PIECE_BYTES: usize = 16 * 1024;
+const CLAIM_ACTIVE: u8 = 0;
+const CLAIM_CANCELED: u8 = 1;
+const CLAIM_LOST: u8 = 2;
 
 #[derive(Deserialize)]
 struct Claim {
@@ -25,6 +33,7 @@ struct Claim {
     evidence_limits: Value,
 }
 
+#[derive(Clone)]
 struct Config {
     database_url: String,
     psql: String,
@@ -35,6 +44,7 @@ struct Config {
     model_path: PathBuf,
     model_sha256: String,
     poll_interval: Duration,
+    renew_interval: Duration,
     once: bool,
 }
 
@@ -57,6 +67,13 @@ impl Config {
             .clamp(100, 60_000);
         let once = std::env::args().any(|arg| arg == "--once")
             || env_bool("OTLET_PORTABLE_ONCE").unwrap_or(false);
+        let renew_ms = std::env::var("OTLET_PORTABLE_RENEW_MS")
+            .ok()
+            .map(|value| value.parse::<u64>())
+            .transpose()
+            .map_err(|_| "OTLET_PORTABLE_RENEW_MS must be an integer".to_owned())?
+            .unwrap_or(1000)
+            .clamp(100, 60_000);
 
         Ok(Self {
             database_url: env_required("OTLET_DATABASE_URL")?,
@@ -68,11 +85,13 @@ impl Config {
             model_path: PathBuf::from(env_required("OTLET_MODEL_PATH")?),
             model_sha256,
             poll_interval: Duration::from_millis(poll_ms),
+            renew_interval: Duration::from_millis(renew_ms),
             once,
         })
     }
 }
 
+#[derive(Clone)]
 struct Database {
     url: String,
     psql: String,
@@ -120,6 +139,46 @@ impl Database {
             .collect())
     }
 
+    fn terminal_query(&self, sql: &str) -> Result<Vec<String>, String> {
+        for attempt in 0..3 {
+            match self.query(sql) {
+                Ok(rows) => return Ok(rows),
+                Err(error) if attempt < 2 && is_connection_error(&error) => {
+                    std::thread::sleep(Duration::from_millis(200));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        unreachable!()
+    }
+
+    fn heartbeat(
+        &self,
+        config: &Config,
+        state: &str,
+        model_status: Option<&str>,
+        error_code: Option<&str>,
+    ) -> Result<String, String> {
+        let model_status = model_status.map_or_else(|| "NULL".to_owned(), sql_text);
+        let error_code = error_code.map_or_else(|| "NULL".to_owned(), sql_text);
+        let sql = format!(
+            "SELECT desired_state FROM otlet.portable_worker_heartbeat({}, {}, {}, {}, {}, {});\n",
+            sql_text(&config.worker_id),
+            config.protocol_version,
+            sql_text(&config.runtime_identity_hash),
+            sql_text(state),
+            model_status,
+            error_code
+        );
+        let rows = self.query(&sql)?;
+        match rows.as_slice() {
+            [state] => Ok(state.clone()),
+            _ => Err(format!(
+                "portable heartbeat returned unexpected state: {rows:?}"
+            )),
+        }
+    }
+
     fn claim(&self, config: &Config) -> Result<Vec<Claim>, String> {
         let sql = format!(
             "SELECT jsonb_build_object(\
@@ -147,6 +206,24 @@ impl Database {
             .collect()
     }
 
+    fn renew(&self, config: &Config, job_id: i64, claim_token: &str) -> Result<String, String> {
+        let sql = format!(
+            "SELECT job_status FROM otlet.portable_renew_job({}, {}, {}, {}, {});\n",
+            sql_text(&config.worker_id),
+            config.protocol_version,
+            sql_text(&config.runtime_identity_hash),
+            job_id,
+            sql_text(claim_token)
+        );
+        let rows = self.query(&sql)?;
+        match rows.as_slice() {
+            [state] if state == "running" || state == "cancel_requested" => Ok(state.clone()),
+            _ => Err(format!(
+                "portable renewal returned unexpected state: {rows:?}"
+            )),
+        }
+    }
+
     fn complete(
         &self,
         config: &Config,
@@ -155,7 +232,7 @@ impl Database {
         output: &Value,
         actions: &Value,
         trace_summary: &Value,
-    ) -> Result<(), String> {
+    ) -> Result<String, String> {
         let sql = format!(
             "SELECT job_status \
              FROM otlet.portable_complete_job(\
@@ -174,13 +251,13 @@ impl Database {
             sql_text(&trace_summary.to_string()),
             sql_text(&config.model_name)
         );
-        let rows = self.query(&sql)?;
-        if rows.as_slice() != ["complete"] {
-            return Err(format!(
+        let rows = self.terminal_query(&sql)?;
+        match rows.as_slice() {
+            [state] if state == "complete" || state == "canceled" => Ok(state.clone()),
+            _ => Err(format!(
                 "portable completion returned unexpected state: {rows:?}"
-            ));
+            )),
         }
-        Ok(())
     }
 
     fn fail(
@@ -209,7 +286,7 @@ impl Database {
             sql_text(&claim.prompt_hash),
             sql_text(&config.model_name)
         );
-        let rows = self.query(&sql)?;
+        let rows = self.terminal_query(&sql)?;
         if !matches!(rows.as_slice(), [state] if state == "failed" || state == "canceled") {
             return Err(format!(
                 "portable failure returned unexpected state: {rows:?}"
@@ -227,7 +304,7 @@ impl Database {
             claim.job_id,
             sql_text(&claim.claim_token)
         );
-        let rows = self.query(&sql)?;
+        let rows = self.terminal_query(&sql)?;
         if rows.as_slice() != ["canceled"] {
             return Err(format!(
                 "portable cancellation returned unexpected state: {rows:?}"
@@ -248,7 +325,10 @@ impl LocalModel {
     fn load(path: &Path, threads: i32) -> Result<Self, String> {
         let path = CString::new(path.as_os_str().as_encoded_bytes())
             .map_err(|_| "model path contains a null byte".to_owned())?;
-        unsafe { llama_cpp_sys_4::llama_backend_init() };
+        unsafe {
+            llama_cpp_sys_4::llama_log_set(Some(discard_llama_log), std::ptr::null_mut());
+            llama_cpp_sys_4::llama_backend_init();
+        }
         let mut model_params = unsafe { llama_cpp_sys_4::llama_model_default_params() };
         model_params.n_gpu_layers = 0;
         let model =
@@ -290,7 +370,9 @@ impl LocalModel {
         prompt: &str,
         max_tokens: usize,
         max_output_bytes: usize,
+        signal: &ClaimSignal,
     ) -> Result<Inference, String> {
+        let _abort = AbortGuard::new(self.context, signal);
         unsafe {
             llama_cpp_sys_4::llama_set_n_threads(self.context, self.threads, self.threads);
             let memory = llama_cpp_sys_4::llama_get_memory(self.context);
@@ -299,6 +381,7 @@ impl LocalModel {
             }
         }
         let tokens = tokenize(self.vocab, prompt)?;
+        signal.ensure_active()?;
         if tokens.is_empty() {
             return Err("prompt produced no tokens".to_owned());
         }
@@ -309,6 +392,7 @@ impl LocalModel {
         let mut batch = Batch::new(BATCH_TOKENS)?;
         let start = Instant::now();
         for (chunk_index, chunk) in tokens.chunks(BATCH_TOKENS).enumerate() {
+            signal.ensure_active()?;
             batch.reset();
             let start_position = chunk_index * BATCH_TOKENS;
             for (index, token) in chunk.iter().copied().enumerate() {
@@ -321,6 +405,7 @@ impl LocalModel {
             }
             let status = unsafe { llama_cpp_sys_4::llama_decode(self.context, batch.value) };
             if status != 0 {
+                signal.ensure_active()?;
                 return Err(format!("prompt decode failed with status {status}"));
             }
         }
@@ -337,6 +422,7 @@ impl LocalModel {
         let mut generated_tokens = 0_i64;
 
         for position in tokens.len()..tokens.len() + max_tokens {
+            signal.ensure_active()?;
             let token =
                 unsafe { llama_cpp_sys_4::llama_sampler_sample(sampler.value, self.context, -1) };
             if unsafe { llama_cpp_sys_4::llama_vocab_is_eog(self.vocab, token) } {
@@ -362,6 +448,7 @@ impl LocalModel {
             )?;
             let status = unsafe { llama_cpp_sys_4::llama_decode(self.context, batch.value) };
             if status != 0 {
+                signal.ensure_active()?;
                 return Err(format!("generation decode failed with status {status}"));
             }
         }
@@ -376,6 +463,47 @@ impl LocalModel {
             generated_tokens,
             generate_ms: i64::try_from(start.elapsed().as_millis()).unwrap_or(i64::MAX),
         })
+    }
+}
+
+unsafe extern "C" fn discard_llama_log(
+    _level: llama_cpp_sys_4::ggml_log_level,
+    _text: *const std::ffi::c_char,
+    _user_data: *mut std::ffi::c_void,
+) {
+}
+
+unsafe extern "C" fn abort_on_claim_change(data: *mut std::ffi::c_void) -> bool {
+    let state = unsafe { &*data.cast::<AtomicU8>() };
+    state.load(Ordering::Acquire) != CLAIM_ACTIVE
+}
+
+struct AbortGuard<'a> {
+    context: *mut llama_cpp_sys_4::llama_context,
+    _signal: &'a ClaimSignal,
+}
+
+impl<'a> AbortGuard<'a> {
+    fn new(context: *mut llama_cpp_sys_4::llama_context, signal: &'a ClaimSignal) -> Self {
+        unsafe {
+            llama_cpp_sys_4::llama_set_abort_callback(
+                context,
+                Some(abort_on_claim_change),
+                Arc::as_ptr(&signal.state).cast_mut().cast(),
+            );
+        }
+        Self {
+            context,
+            _signal: signal,
+        }
+    }
+}
+
+impl Drop for AbortGuard<'_> {
+    fn drop(&mut self) {
+        unsafe {
+            llama_cpp_sys_4::llama_set_abort_callback(self.context, None, std::ptr::null_mut());
+        }
     }
 }
 
@@ -472,6 +600,104 @@ struct Inference {
     prompt_tokens: i64,
     generated_tokens: i64,
     generate_ms: i64,
+}
+
+#[derive(Clone)]
+struct ClaimSignal {
+    state: Arc<AtomicU8>,
+}
+
+impl ClaimSignal {
+    fn new() -> Self {
+        Self {
+            state: Arc::new(AtomicU8::new(CLAIM_ACTIVE)),
+        }
+    }
+
+    fn set(&self, state: u8) {
+        let _ =
+            self.state
+                .compare_exchange(CLAIM_ACTIVE, state, Ordering::AcqRel, Ordering::Acquire);
+    }
+
+    fn state(&self) -> u8 {
+        self.state.load(Ordering::Acquire)
+    }
+
+    fn ensure_active(&self) -> Result<(), String> {
+        match self.state() {
+            CLAIM_ACTIVE => Ok(()),
+            CLAIM_CANCELED => Err("portable claim was canceled".to_owned()),
+            _ => Err("portable claim was lost".to_owned()),
+        }
+    }
+}
+
+struct LeaseGuard {
+    signal: ClaimSignal,
+    stop: Arc<AtomicBool>,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl LeaseGuard {
+    fn start(database: Database, config: Config, claim: &Claim) -> Self {
+        let signal = ClaimSignal::new();
+        let thread_signal = signal.clone();
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_stop = Arc::clone(&stop);
+        let job_id = claim.job_id;
+        let claim_token = claim.claim_token.clone();
+        let task_name = claim.task_name.clone();
+        let handle = thread::spawn(move || {
+            while !thread_stop.load(Ordering::Acquire) {
+                thread::park_timeout(config.renew_interval);
+                if thread_stop.load(Ordering::Acquire) {
+                    break;
+                }
+                match database.renew(&config, job_id, &claim_token) {
+                    Ok(state) if state == "cancel_requested" => {
+                        thread_signal.set(CLAIM_CANCELED);
+                        log_job("job_cancel_observed", job_id, &task_name, None);
+                        break;
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        thread_signal.set(CLAIM_LOST);
+                        log_job(
+                            "job_claim_lost",
+                            job_id,
+                            &task_name,
+                            Some(if is_connection_error(&error) {
+                                "database_unavailable"
+                            } else {
+                                "lease_renewal_rejected"
+                            }),
+                        );
+                        break;
+                    }
+                }
+            }
+        });
+        Self {
+            signal,
+            stop,
+            handle: Some(handle),
+        }
+    }
+
+    fn signal(&self) -> ClaimSignal {
+        self.signal.clone()
+    }
+}
+
+impl Drop for LeaseGuard {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(handle) = self.handle.take() {
+            handle.thread().unpark();
+            let _ = handle.join();
+        }
+    }
 }
 
 struct JsonCompletion {
@@ -650,7 +876,23 @@ fn process_claim(
         .unwrap_or(1024 * 1024)
         .clamp(1, 16 * 1024 * 1024);
     let max_output_bytes = usize::try_from(max_output_bytes).unwrap_or(16 * 1024 * 1024);
-    let inference = match model.infer(&claim.prompt, max_tokens, max_output_bytes) {
+    let lease = LeaseGuard::start(database.clone(), config.clone(), claim);
+    let signal = lease.signal();
+    let inference = model.infer(&claim.prompt, max_tokens, max_output_bytes, &signal);
+    drop(lease);
+    match signal.state() {
+        CLAIM_CANCELED => {
+            database.cancel(config, claim)?;
+            log_event("job_canceled", claim, Some("cancel_requested"));
+            return Ok(());
+        }
+        CLAIM_LOST => {
+            log_event("job_abandoned", claim, Some("claim_lost"));
+            return Ok(());
+        }
+        _ => {}
+    }
+    let inference = match inference {
         Ok(inference) => inference,
         Err(error) => {
             database.fail(config, claim, &truncate(&error, 1024), None)?;
@@ -690,7 +932,7 @@ fn process_claim(
         "schema_validation_status": "not_run",
         "runtime": "local_llama_cpp"
     });
-    if let Err(error) = database.complete(
+    match database.complete(
         config,
         claim,
         &inference.raw_output,
@@ -698,23 +940,28 @@ fn process_claim(
         actions,
         &trace,
     ) {
-        database.fail(
-            config,
-            claim,
-            "portable_result_rejected_by_database",
-            Some(&inference.raw_output),
-        )?;
-        log_event(
-            "job_failed",
-            claim,
-            Some(&format!(
-                "database_validation_failed:{}",
-                truncate(&error, 160)
-            )),
-        );
-        return Ok(());
+        Ok(state) if state == "complete" => log_event("job_completed", claim, None),
+        Ok(_) => log_event("job_canceled", claim, Some("cancel_requested")),
+        Err(error) if is_connection_error(&error) => {
+            log_event(
+                "job_terminal_uncertain",
+                claim,
+                Some("database_unavailable"),
+            );
+        }
+        Err(error) if is_claim_loss(&error) => {
+            log_event("job_abandoned", claim, Some("claim_lost"));
+        }
+        Err(_) => {
+            database.fail(
+                config,
+                claim,
+                "portable_result_rejected_by_database",
+                Some(&inference.raw_output),
+            )?;
+            log_event("job_failed", claim, Some("database_validation_failed"));
+        }
     }
-    log_event("job_completed", claim, None);
     Ok(())
 }
 
@@ -736,7 +983,11 @@ fn main() {
     if let Err(error) = run() {
         eprintln!(
             "{}",
-            json!({"event":"worker_error","error":truncate(&error, 1024)})
+            json!({
+                "event": "worker_error",
+                "reason": error_code(&error),
+                "timestamp_ms": timestamp_ms()
+            })
         );
         std::process::exit(1);
     }
@@ -744,10 +995,46 @@ fn main() {
 
 fn run() -> Result<(), String> {
     let config = Config::from_env()?;
-    let actual_hash = sha256_file(&config.model_path)?;
+    let database = Database {
+        url: config.database_url.clone(),
+        psql: config.psql.clone(),
+    };
+    let mut database_unavailable = false;
+    let desired = heartbeat_until_available(
+        &database,
+        &config,
+        "starting",
+        Some("verifying"),
+        &mut database_unavailable,
+    )?;
+    if desired == "draining" {
+        database.heartbeat(&config, "drained", Some("unverified"), None)?;
+        log_worker("worker_drained", &config, None);
+        return Ok(());
+    }
+    let actual_hash = match sha256_file(&config.model_path) {
+        Ok(hash) => hash,
+        Err(error) => {
+            let _ = database.heartbeat(
+                &config,
+                "error",
+                Some("error"),
+                Some("model_artifact_unreadable"),
+            );
+            return Err(error);
+        }
+    };
     if actual_hash != config.model_sha256 {
+        let _ = database.heartbeat(&config, "error", Some("error"), Some("model_hash_mismatch"));
         return Err("local GGUF SHA-256 does not match OTLET_MODEL_SHA256".to_owned());
     }
+    heartbeat_until_available(
+        &database,
+        &config,
+        "starting",
+        Some("loading"),
+        &mut database_unavailable,
+    )?;
     let threads = std::env::var("OTLET_LLAMA_THREADS")
         .ok()
         .and_then(|value| value.parse::<i32>().ok())
@@ -761,37 +1048,105 @@ fn run() -> Result<(), String> {
             )
             .unwrap_or(4)
         });
-    let mut model = LocalModel::load(&config.model_path, threads)?;
-    let database = Database {
-        url: config.database_url.clone(),
-        psql: config.psql.clone(),
+    let mut model = match LocalModel::load(&config.model_path, threads) {
+        Ok(model) => model,
+        Err(error) => {
+            let _ = database.heartbeat(&config, "error", Some("error"), Some("model_load_failed"));
+            return Err(error);
+        }
     };
     log_worker("worker_started", &config, None);
 
     loop {
-        let claims = database.claim(&config)?;
+        let desired = heartbeat_until_available(
+            &database,
+            &config,
+            "idle",
+            Some("ready"),
+            &mut database_unavailable,
+        )?;
+        if desired == "paused" {
+            database.heartbeat(&config, "paused", Some("ready"), None)?;
+            log_worker("worker_paused", &config, None);
+            if config.once {
+                break;
+            }
+            thread::sleep(config.poll_interval);
+            continue;
+        }
+        if desired == "draining" {
+            database.heartbeat(&config, "drained", Some("ready"), None)?;
+            log_worker("worker_drained", &config, None);
+            return Ok(());
+        }
+        let claims = match database.claim(&config) {
+            Ok(claims) => claims,
+            Err(error) if is_connection_error(&error) && !config.once => {
+                if !database_unavailable {
+                    log_worker("database_unavailable", &config, Some("claim_failed"));
+                    database_unavailable = true;
+                }
+                thread::sleep(config.poll_interval);
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
         for claim in &claims {
             if let Err(error) = process_claim(&database, &config, &mut model, claim) {
-                log_event("job_error", claim, Some(&truncate(&error, 512)));
+                log_event("job_error", claim, Some(error_code(&error)));
             }
         }
         if config.once {
             break;
         }
-        std::thread::sleep(config.poll_interval);
+        thread::sleep(config.poll_interval);
     }
+    let _ = database.heartbeat(&config, "stopped", Some("ready"), None);
     log_worker("worker_stopped", &config, None);
     Ok(())
 }
 
+fn heartbeat_until_available(
+    database: &Database,
+    config: &Config,
+    state: &str,
+    model_status: Option<&str>,
+    unavailable: &mut bool,
+) -> Result<String, String> {
+    loop {
+        match database.heartbeat(config, state, model_status, None) {
+            Ok(desired) => {
+                if *unavailable {
+                    log_worker("database_recovered", config, None);
+                    *unavailable = false;
+                }
+                return Ok(desired);
+            }
+            Err(error) if is_connection_error(&error) && !config.once => {
+                if !*unavailable {
+                    log_worker("database_unavailable", config, Some("heartbeat_failed"));
+                    *unavailable = true;
+                }
+                thread::sleep(config.poll_interval);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
 fn log_event(event: &str, claim: &Claim, reason: Option<&str>) {
+    log_job(event, claim.job_id, &claim.task_name, reason);
+}
+
+fn log_job(event: &str, job_id: i64, task_name: &str, reason: Option<&str>) {
     eprintln!(
         "{}",
         json!({
             "event": event,
-            "job_id": claim.job_id,
-            "task_name": claim.task_name,
-            "reason": reason
+            "job_id": job_id,
+            "task_name": task_name,
+            "reason": reason,
+            "timestamp_ms": timestamp_ms()
         })
     );
 }
@@ -804,9 +1159,17 @@ fn log_worker(event: &str, config: &Config, reason: Option<&str>) {
             "worker_id": config.worker_id,
             "model_name": config.model_name,
             "protocol_version": config.protocol_version,
-            "reason": reason
+            "reason": reason,
+            "timestamp_ms": timestamp_ms()
         })
     );
+}
+
+fn timestamp_ms() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
 }
 
 fn sha256_file(path: &Path) -> Result<String, String> {
@@ -853,6 +1216,47 @@ fn is_sha256(value: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
+fn is_connection_error(error: &str) -> bool {
+    let error = error.to_ascii_lowercase();
+    [
+        "connection refused",
+        "connection timed out",
+        "could not connect to server",
+        "could not translate host name",
+        "server closed the connection unexpectedly",
+        "terminating connection due to administrator command",
+        "the database system is starting up",
+        "the database system is shutting down",
+        "no route to host",
+    ]
+    .iter()
+    .any(|needle| error.contains(needle))
+}
+
+fn is_claim_loss(error: &str) -> bool {
+    let error = error.to_ascii_lowercase();
+    error.contains("claim is stale")
+        || error.contains("claim token")
+        || error.contains("belongs to another worker")
+        || error.contains("identity is not authorized")
+}
+
+fn error_code(error: &str) -> &'static str {
+    if is_connection_error(error) {
+        "database_unavailable"
+    } else if is_claim_loss(error) {
+        "claim_lost"
+    } else if error.contains("GGUF") || error.contains("model") {
+        "model_error"
+    } else if error.contains("required") || error.contains("must be") {
+        "configuration_error"
+    } else if error.contains("psql") || error.contains("database") || error.contains("portable") {
+        "database_rejected"
+    } else {
+        "worker_failed"
+    }
+}
+
 fn truncate(value: &str, limit: usize) -> String {
     value.chars().take(limit).collect()
 }
@@ -874,5 +1278,20 @@ mod tests {
             sql_text("a'\n🙂"),
             "convert_from(decode('61270af09f9982', 'hex'), 'UTF8')"
         );
+    }
+
+    #[test]
+    fn connection_errors_are_classified_without_logging_details() {
+        let error = "psql failed: connection to server failed: Connection refused";
+        assert!(is_connection_error(error));
+        assert_eq!(error_code(error), "database_unavailable");
+    }
+
+    #[test]
+    fn claim_signal_keeps_the_first_terminal_change() {
+        let signal = ClaimSignal::new();
+        signal.set(CLAIM_CANCELED);
+        signal.set(CLAIM_LOST);
+        assert_eq!(signal.state(), CLAIM_CANCELED);
     }
 }

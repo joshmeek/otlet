@@ -35,8 +35,25 @@ CREATE TABLE otlet.portable_workers (
     AND runtime_identity_hash = otlet.portable_json_hash(runtime_identity)
   ),
   enabled boolean NOT NULL DEFAULT true,
+  desired_state text NOT NULL DEFAULT 'running' CHECK (
+    desired_state IN ('running', 'paused', 'draining')
+  ),
+  reported_state text NOT NULL DEFAULT 'registered' CHECK (
+    reported_state IN (
+      'registered', 'starting', 'idle', 'running', 'paused', 'draining',
+      'drained', 'stopped', 'error'
+    )
+  ),
+  model_status text NOT NULL DEFAULT 'unverified' CHECK (
+    model_status IN ('unverified', 'verifying', 'loading', 'ready', 'error')
+  ),
+  last_error_code text CHECK (
+    last_error_code IS NULL OR last_error_code ~ '^[a-z0-9][a-z0-9_.-]{0,127}$'
+  ),
   last_seen_at timestamptz,
+  last_heartbeat_at timestamptz,
   last_claimed_at timestamptz,
+  process_started_at timestamptz,
   created_at timestamptz NOT NULL DEFAULT now(),
   updated_at timestamptz NOT NULL DEFAULT now()
 );
@@ -157,6 +174,12 @@ BEGIN
       runtime_identity = EXCLUDED.runtime_identity,
       runtime_identity_hash = EXCLUDED.runtime_identity_hash,
       enabled = true,
+      desired_state = 'running',
+      reported_state = 'registered',
+      model_status = 'unverified',
+      last_error_code = NULL,
+      last_heartbeat_at = NULL,
+      process_started_at = NULL,
       updated_at = now()
   RETURNING * INTO saved_worker;
 
@@ -169,10 +192,37 @@ LANGUAGE sql
 AS $$
   UPDATE otlet.portable_workers w
   SET enabled = false,
+      desired_state = 'draining',
       updated_at = now()
   WHERE w.worker_id = disable_portable_worker.worker_id
     AND w.enabled
   RETURNING true
+$$;
+
+CREATE FUNCTION otlet.set_portable_worker_control(
+  worker_id text,
+  desired_state text
+) RETURNS otlet.portable_workers
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  saved_worker otlet.portable_workers%ROWTYPE;
+BEGIN
+  IF set_portable_worker_control.desired_state NOT IN ('running', 'paused', 'draining') THEN
+    RAISE EXCEPTION 'otlet portable worker state must be running, paused, or draining';
+  END IF;
+
+  UPDATE otlet.portable_workers w
+  SET desired_state = set_portable_worker_control.desired_state,
+      updated_at = now()
+  WHERE w.worker_id = set_portable_worker_control.worker_id
+  RETURNING * INTO saved_worker;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'otlet portable worker % does not exist', set_portable_worker_control.worker_id;
+  END IF;
+
+  RETURN saved_worker;
+END;
 $$;
 
 CREATE FUNCTION otlet.authorized_portable_worker(
@@ -285,6 +335,59 @@ BEGIN
 END;
 $$;
 
+CREATE FUNCTION otlet.portable_worker_heartbeat(
+  requested_worker_id text,
+  requested_protocol_version integer,
+  requested_runtime_identity_hash text,
+  reported_state text,
+  model_status text DEFAULT NULL,
+  error_code text DEFAULT NULL
+) RETURNS TABLE (desired_state text)
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, otlet, pg_temp
+AS $$
+DECLARE
+  worker_row otlet.portable_workers%ROWTYPE;
+BEGIN
+  IF portable_worker_heartbeat.reported_state NOT IN (
+    'starting', 'idle', 'running', 'paused', 'draining', 'drained', 'stopped', 'error'
+  ) THEN
+    RAISE EXCEPTION 'otlet portable worker reported state is invalid';
+  END IF;
+  IF portable_worker_heartbeat.model_status IS NOT NULL
+     AND portable_worker_heartbeat.model_status NOT IN (
+       'unverified', 'verifying', 'loading', 'ready', 'error'
+     ) THEN
+    RAISE EXCEPTION 'otlet portable worker model status is invalid';
+  END IF;
+  IF portable_worker_heartbeat.error_code IS NOT NULL
+     AND portable_worker_heartbeat.error_code !~ '^[a-z0-9][a-z0-9_.-]{0,127}$' THEN
+    RAISE EXCEPTION 'otlet portable worker error code is invalid';
+  END IF;
+
+  worker_row := otlet.authorized_portable_worker(
+    portable_worker_heartbeat.requested_worker_id,
+    portable_worker_heartbeat.requested_protocol_version,
+    portable_worker_heartbeat.requested_runtime_identity_hash
+  );
+  UPDATE otlet.portable_workers w
+  SET reported_state = portable_worker_heartbeat.reported_state,
+      model_status = COALESCE(portable_worker_heartbeat.model_status, w.model_status),
+      last_error_code = portable_worker_heartbeat.error_code,
+      last_heartbeat_at = now(),
+      process_started_at = CASE
+        WHEN portable_worker_heartbeat.reported_state = 'starting'
+         AND w.reported_state <> 'starting' THEN now()
+        ELSE w.process_started_at
+      END,
+      updated_at = now()
+  WHERE w.worker_id = worker_row.worker_id
+  RETURNING w.desired_state INTO desired_state;
+  RETURN NEXT;
+END;
+$$;
+
 CREATE FUNCTION otlet.portable_claim_jobs(
   requested_worker_id text,
   requested_protocol_version integer,
@@ -331,6 +434,9 @@ BEGIN
     portable_claim_jobs.requested_protocol_version,
     portable_claim_jobs.requested_runtime_identity_hash
   );
+  IF worker_row.desired_state <> 'running' THEN
+    RETURN;
+  END IF;
   SELECT p.* INTO policy_row FROM otlet.production_policy p WHERE p.name = 'default';
 
   FOR claimed_job IN
@@ -362,7 +468,9 @@ BEGIN
     RETURNING * INTO saved_claim;
 
     UPDATE otlet.portable_workers w
-    SET last_claimed_at = now()
+    SET last_claimed_at = now(),
+        last_heartbeat_at = now(),
+        reported_state = 'running'
     WHERE w.worker_id = worker_row.worker_id;
 
     SELECT t.*
@@ -477,6 +585,10 @@ BEGIN
   SET status = 'renewed',
       last_renewed_at = now()
   WHERE c.id = claim_row.id;
+  UPDATE otlet.portable_workers w
+  SET last_heartbeat_at = now(),
+      reported_state = 'running'
+  WHERE w.worker_id = worker_row.worker_id;
   RETURN NEXT;
 END;
 $$;
@@ -799,13 +911,49 @@ SELECT
   w.runtime_version,
   w.runtime_identity_hash,
   w.enabled,
+  w.desired_state,
+  w.reported_state,
+  w.model_status,
+  w.last_error_code,
   w.last_seen_at,
+  w.last_heartbeat_at,
   w.last_claimed_at,
+  w.process_started_at,
+  CASE
+    WHEN NOT w.enabled THEN 'disabled'
+    WHEN w.desired_state = 'draining' AND w.reported_state = 'drained' THEN 'drained'
+    WHEN w.last_heartbeat_at IS NULL THEN 'never_seen'
+    WHEN w.last_heartbeat_at < now() - interval '2 minutes' THEN 'stale'
+    WHEN w.desired_state = 'paused' THEN 'paused'
+    WHEN w.desired_state = 'draining' THEN 'draining'
+    ELSE 'healthy'
+  END AS worker_health,
+  (
+    SELECT count(*)
+    FROM otlet.jobs queued_job
+    JOIN otlet.tasks queued_task ON queued_task.name = queued_job.task_name
+    WHERE queued_task.model_name = w.model_name
+      AND queued_job.status = 'queued'
+  ) AS queued_jobs,
   count(c.id) AS claims,
-  count(c.id) FILTER (WHERE c.status IN ('claimed', 'renewed')) AS live_claims,
+  count(c.id) FILTER (
+    WHERE c.status IN ('claimed', 'renewed')
+      AND j.status IN ('running', 'cancel_requested')
+      AND j.leased_until >= now()
+  ) AS live_claims,
+  count(c.id) FILTER (
+    WHERE c.status IN ('claimed', 'renewed')
+      AND j.status IN ('running', 'cancel_requested')
+      AND (j.leased_until IS NULL OR j.leased_until < now())
+  ) AS expired_claims,
+  min(j.leased_until) FILTER (
+    WHERE c.status IN ('claimed', 'renewed')
+      AND j.status IN ('running', 'cancel_requested')
+  ) AS earliest_lease_expires_at,
   max(c.claimed_at) AS latest_claimed_at
 FROM otlet.portable_workers w
 LEFT JOIN otlet.portable_claims c ON c.worker_id = w.worker_id
+LEFT JOIN otlet.jobs j ON j.id = c.job_id
 GROUP BY
   w.worker_id,
   w.database_role_oid,
@@ -815,8 +963,14 @@ GROUP BY
   w.runtime_version,
   w.runtime_identity_hash,
   w.enabled,
+  w.desired_state,
+  w.reported_state,
+  w.model_status,
+  w.last_error_code,
   w.last_seen_at,
-  w.last_claimed_at;
+  w.last_heartbeat_at,
+  w.last_claimed_at,
+  w.process_started_at;
 
 CREATE VIEW otlet.portable_claim_status AS
 SELECT
@@ -830,6 +984,12 @@ SELECT
   j.status AS job_status,
   j.task_name,
   j.subject_id,
+  j.leased_until,
+  CASE
+    WHEN c.status NOT IN ('claimed', 'renewed') THEN 'terminal'
+    WHEN j.leased_until IS NULL OR j.leased_until < now() THEN 'expired'
+    ELSE 'live'
+  END AS lease_health,
   c.claimed_at,
   c.last_renewed_at,
   c.finished_at

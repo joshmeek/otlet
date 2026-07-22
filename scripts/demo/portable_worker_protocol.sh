@@ -99,12 +99,41 @@ VALUES
   (:'task_name', 'complete', '{"allowed":"complete","secret":"hidden"}'::jsonb),
   (:'task_name', 'fail', '{"allowed":"fail","secret":"hidden"}'::jsonb),
   (:'task_name', 'cancel', '{"allowed":"cancel","secret":"hidden"}'::jsonb);
+SELECT otlet.set_portable_worker_control(:'worker_id', 'paused') \g /dev/null
 SELECT
   pg_catalog.set_config('otlet.demo_portable_identity_hash', :'identity_hash', true) AS configured_identity,
   pg_catalog.set_config('otlet.demo_portable_worker_id', :'worker_id', true) AS configured_worker
 \gset
 
 SET LOCAL ROLE :worker_role;
+SELECT 'portable_pause_contract=' || desired_state || '|' ||
+       (
+         SELECT count(*)
+         FROM otlet.portable_claim_jobs(
+           pg_catalog.current_setting('otlet.demo_portable_worker_id'),
+           1,
+           pg_catalog.current_setting('otlet.demo_portable_identity_hash')
+         )
+       )::text
+FROM otlet.portable_worker_heartbeat(
+  pg_catalog.current_setting('otlet.demo_portable_worker_id'),
+  1,
+  pg_catalog.current_setting('otlet.demo_portable_identity_hash'),
+  'paused',
+  'ready'
+);
+RESET ROLE;
+SELECT otlet.set_portable_worker_control(:'worker_id', 'running') \g /dev/null
+
+SET LOCAL ROLE :worker_role;
+SELECT 'portable_resume_contract=' || desired_state
+FROM otlet.portable_worker_heartbeat(
+  pg_catalog.current_setting('otlet.demo_portable_worker_id'),
+  1,
+  pg_catalog.current_setting('otlet.demo_portable_identity_hash'),
+  'idle',
+  'ready'
+);
 DO $body$
 BEGIN
   BEGIN
@@ -200,6 +229,21 @@ FROM otlet.portable_complete_job(
   model_name => :'model_name'
 );
 
+SELECT 'portable_duplicate_delivery_contract=' || job_status || '|' ||
+       (receipt_id IS NOT NULL)::text || '|' || (output_id IS NOT NULL)::text
+FROM otlet.portable_complete_job(
+  :'worker_id',
+  1,
+  pg_catalog.current_setting('otlet.demo_portable_identity_hash'),
+  (SELECT job_id FROM portable_demo_claims WHERE subject_id = 'complete'),
+  (SELECT claim_token FROM portable_demo_claims WHERE subject_id = 'complete'),
+  '{"status":"ok"}'::jsonb,
+  '{"output":{"status":"ok"},"actions":[]}',
+  '[]'::jsonb,
+  trace_summary => '{"schema_validation_status":"failed"}'::jsonb,
+  model_name => :'model_name'
+);
+
 SELECT 'portable_fail_contract=' || job_status || '|' || (receipt_id IS NOT NULL)::text
 FROM otlet.portable_fail_job(
   :'worker_id',
@@ -253,7 +297,8 @@ WITH rpc_catalog AS (
   WHERE n.nspname = 'otlet'
     AND p.proname IN (
       'portable_claim_jobs', 'portable_renew_job', 'portable_record_attempt',
-      'portable_complete_job', 'portable_fail_job', 'portable_cancel_job'
+      'portable_complete_job', 'portable_fail_job', 'portable_cancel_job',
+      'portable_worker_heartbeat'
     )
 ), worker_grants AS (
   SELECT
@@ -306,7 +351,7 @@ WHERE protocol.protocol_version = 1;
 SQL
 )"
 echo "portable_protocol_contract=$portable_protocol_contract"
-expected_portable_protocol_contract="1|active|true|true|3|0|cancel:canceled:canceled,complete:complete:complete,fail:failed:failed|4|true|true|1|1|1|1|6|6|6|1|6|false|false"
+expected_portable_protocol_contract="1|active|true|true|3|0|cancel:canceled:canceled,complete:complete:complete,fail:failed:failed|4|true|true|1|1|1|1|7|7|7|1|7|false|false"
 [ "$portable_protocol_contract" = "$expected_portable_protocol_contract" ] || {
   echo "Unexpected portable protocol contract: $portable_protocol_contract" >&2
   exit 1

@@ -33,6 +33,8 @@ docker run --rm \
   otlet-portable-worker:0.1.0
 ```
 
-The libpq connection string uses `sslmode=verify-full` and the mounted CA. The worker has no HTTP client or model-provider credential. Database networking, credentials, CA distribution, model distribution, process restart, and log collection remain customer-VPC responsibilities
+The libpq connection string uses `sslmode=verify-full` and the mounted CA. The worker has no HTTP client or model-provider credential. It reconnects after a database restart and exits after an owner-requested drain. Database networking, credentials, CA distribution, model distribution, process supervision, and log collection remain customer-VPC responsibilities
+
+Use `otlet.set_portable_worker_control(...)` to pause, resume, or drain the process. Monitor `otlet.portable_worker_status` for heartbeat, model, queue, and lease health. The process emits one-line JSON logs without prompt or source evidence
 
 This first deployment supports one process, one database, and one model. Use a separate registered identity and role for each additional worker
