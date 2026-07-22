@@ -153,6 +153,8 @@ Otlet records both attempts and creates `merge_candidate` from the accepted outp
 
 The full demo checks row and pair watches, candidate drift, CustomScan freshness, portable watch definitions, and bounded `update_row`. It covers receipt redaction, role grants, cancellation, model-load admission, memory pressure, cache bounds, prompt and runtime fingerprints, invariants, and Docker crash logs
 
+Build the reproducible pgrx package, machine-readable SBOM, RustSec report, supported-matrix result, and exact release identity with [the release evidence command](docs/release-evidence.md)
+
 ## Docs
 
 Start with [the worked example](docs/otlet-worked-example.md)

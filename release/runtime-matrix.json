@@ -1,0 +1,29 @@
+{
+  "format": "otlet.runtime-matrix.v1",
+  "supported": [
+    {
+      "postgres": {
+        "major": 18,
+        "tested": "18.4"
+      },
+      "os": {
+        "id": "debian",
+        "version": "13",
+        "codename": "trixie"
+      },
+      "cpu": {
+        "architecture": "aarch64"
+      },
+      "runtime": {
+        "mode": "linked_inproc",
+        "llama_cpp_sys_version": "0.3.1",
+        "llama_cpp_revision": "94a220cd6",
+        "features": [
+          "native",
+          "openmp",
+          "pg18"
+        ]
+      }
+    }
+  ]
+}

@@ -8,7 +8,7 @@ Otlet runs local model judgment through Postgres contracts. New work must preser
 
 | Priority | Track | Next proof |
 | --- | --- | --- |
-| 1 | Release | Reproducible artifacts and lifecycle checks |
+| 1 | Release | Lifecycle checks |
 | 2 | Portable runtime | One SQL-only install and reference worker for Postgres hosts that block native workers |
 | 3 | Trust and evidence | Fenced writes, database-side validation, bounded evidence, retention, and redacted export |
 | 4 | Packs and decisions | Versioned workload packs, evaluation gates, review state, and replay-safe actions |
@@ -18,10 +18,6 @@ Each change needs SQL-visible state, a closed failure mode, and demo, conformanc
 
 ## Release
 
-- build reproducible extension and linked-runtime artifacts
-- test one PostgreSQL, operating-system, CPU, and llama.cpp matrix
-- record exact binary, prompt, schema, pack, and runtime identity
-- generate a software bill of materials and vulnerability report
 - prove install, restart, upgrade preflight, rollback, and crash-log checks
 
 ## Portable Runtime
