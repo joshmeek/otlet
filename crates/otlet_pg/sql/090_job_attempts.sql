@@ -96,7 +96,8 @@ CREATE FUNCTION otlet.record_model_attempt(
   selection_status text DEFAULT 'accepted',
   selection_reason text DEFAULT NULL,
   error text DEFAULT NULL,
-  receipt_status text DEFAULT NULL
+  receipt_status text DEFAULT NULL,
+  expected_claim_attempt integer DEFAULT NULL
 ) RETURNS otlet.inference_receipts
 LANGUAGE plpgsql
 AS $$
@@ -117,9 +118,10 @@ DECLARE
   ];
   stored_output jsonb;
   stored_trace_summary jsonb;
+  expected_model_name text;
 BEGIN
-  SELECT j.id, j.task_name, j.subject_id, j.started_at, j.created_at
-  INTO job_row.id, job_row.task_name, job_row.subject_id, job_row.started_at, job_row.created_at
+  SELECT j.*
+  INTO job_row
   FROM otlet.jobs j
   WHERE j.id = record_model_attempt.job_id
   FOR UPDATE;
@@ -128,10 +130,20 @@ BEGIN
     RAISE EXCEPTION 'otlet job % does not exist', record_model_attempt.job_id;
   END IF;
 
-  SELECT runtime_options, decision_contract
-  INTO task_row.runtime_options, task_row.decision_contract
-  FROM otlet.tasks
-  WHERE name = job_row.task_name;
+  IF record_model_attempt.expected_claim_attempt IS NOT NULL
+     AND (
+       job_row.attempts IS DISTINCT FROM record_model_attempt.expected_claim_attempt
+       OR job_row.status NOT IN ('running', 'cancel_requested')
+       OR job_row.leased_until IS NULL
+       OR job_row.leased_until < now()
+     ) THEN
+    RAISE EXCEPTION 'otlet job claim is stale';
+  END IF;
+
+  SELECT t.model_name, t.runtime_options, t.decision_contract
+  INTO task_row.model_name, task_row.runtime_options, task_row.decision_contract
+  FROM otlet.tasks t
+  WHERE t.name = job_row.task_name;
   IF NOT FOUND THEN
     RAISE EXCEPTION 'otlet task % does not exist', job_row.task_name;
   END IF;
@@ -156,6 +168,24 @@ BEGIN
   END IF;
   IF COALESCE(record_model_attempt.selection_role, 'direct') NOT IN ('direct', 'cheap', 'strong') THEN
     RAISE EXCEPTION 'otlet record_model_attempt selection_role must be direct, cheap, or strong';
+  END IF;
+  IF COALESCE(record_model_attempt.selection_role, 'direct') = 'direct' THEN
+    expected_model_name := task_row.model_name;
+  ELSE
+    SELECT CASE record_model_attempt.selection_role
+      WHEN 'cheap' THEN selection_policy.cheap_model_name
+      ELSE selection_policy.strong_model_name
+    END
+    INTO expected_model_name
+    FROM otlet.model_selection_policies selection_policy
+    WHERE selection_policy.task_name = job_row.task_name;
+
+    IF NOT FOUND THEN
+      RAISE EXCEPTION 'otlet task % has no model selection policy', job_row.task_name;
+    END IF;
+  END IF;
+  IF model_row.name IS DISTINCT FROM expected_model_name THEN
+    RAISE EXCEPTION 'otlet model identity does not match task selection role';
   END IF;
   IF COALESCE(record_model_attempt.selection_status, 'accepted') NOT IN ('accepted', 'rejected', 'failed') THEN
     RAISE EXCEPTION 'otlet record_model_attempt selection_status must be accepted, rejected, or failed';

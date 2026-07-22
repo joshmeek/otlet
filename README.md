@@ -151,7 +151,7 @@ ORDER BY attempt_index;
 
 Otlet records both attempts and creates `merge_candidate` from the accepted output. The action requires operator approval. The source vendor rows remain unchanged
 
-The full demo checks row and pair watches, candidate drift, CustomScan freshness, portable watch definitions, and workflow-bound `update_row`. It proves target binding, recommendation-only defaults, evidence holds and cleanup receipts, active-state canary deletion, receipt redaction, role grants, cancellation, model-load admission, memory pressure, cache bounds, prompt and runtime fingerprints, invariants, and Docker crash logs
+The full demo checks row and pair watches, candidate drift, CustomScan freshness, portable watch definitions, workflow-bound `update_row`, and adversarial trust cases. It proves target binding, recommendation-only defaults, evidence holds and cleanup receipts, active-state canary deletion, receipt redaction, role grants, cancellation, model-load admission, memory pressure, cache bounds, prompt and runtime fingerprints, invariants, and Docker crash logs
 
 Build the reproducible pgrx package, machine-readable SBOM, RustSec report, supported-matrix result, and exact release identity with [the release evidence command](docs/release-evidence.md)
 
@@ -167,6 +167,7 @@ Start with [the worked example](docs/otlet-worked-example.md)
 - [Runtime and traces](docs/runtime-and-traces.md)
 - [Semantic watches](docs/semantic-watches.md)
 - [Production contract](docs/production-contract.md)
+- [Trust conformance](docs/trust-conformance.md)
 - [Model benchmarks](benchmarks/README.md)
 - [Roadmap](docs/roadmap.md)
 

@@ -7,7 +7,8 @@ CREATE FUNCTION otlet.finish_canceled_job(
   raw_output_hash text DEFAULT NULL,
   started_at timestamptz DEFAULT NULL,
   release_runtime boolean DEFAULT true,
-  model_name text DEFAULT NULL
+  model_name text DEFAULT NULL,
+  expected_claim_attempt integer DEFAULT NULL
 ) RETURNS SETOF otlet.jobs
 LANGUAGE plpgsql
 AS $$
@@ -20,6 +21,16 @@ BEGIN
   SELECT * INTO job_row
   FROM otlet.jobs
   WHERE id = finish_canceled_job.job_id
+    AND status IN ('queued', 'running', 'cancel_requested')
+    AND (
+      finish_canceled_job.expected_claim_attempt IS NULL
+      OR (
+        attempts = finish_canceled_job.expected_claim_attempt
+        AND status IN ('running', 'cancel_requested')
+        AND leased_until IS NOT NULL
+        AND leased_until >= now()
+      )
+    )
   FOR UPDATE;
 
   IF NOT FOUND THEN
@@ -198,4 +209,3 @@ BEGIN
   RETURN NEXT job_row;
 END;
 $$;
-

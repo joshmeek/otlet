@@ -541,7 +541,8 @@ CREATE FUNCTION otlet.complete_and_materialize_job(
   trace_summary jsonb,
   model_name text,
   selection_role text,
-  selection_reason text
+  selection_reason text,
+  expected_claim_attempt integer
 ) RETURNS TABLE (
   output_id bigint,
   semantic_materialized boolean,
@@ -566,7 +567,8 @@ BEGIN
       trace_summary => complete_and_materialize_job.trace_summary,
       model_name => complete_and_materialize_job.model_name,
       selection_role => complete_and_materialize_job.selection_role,
-      selection_reason => complete_and_materialize_job.selection_reason
+      selection_reason => complete_and_materialize_job.selection_reason,
+      expected_claim_attempt => complete_and_materialize_job.expected_claim_attempt
     )
     AS completed
     LIMIT 1;

@@ -90,7 +90,8 @@ CREATE FUNCTION otlet.fail_job(
   selection_role text DEFAULT 'direct',
   selection_status text DEFAULT 'failed',
   selection_reason text DEFAULT NULL,
-  candidate_output jsonb DEFAULT NULL
+  candidate_output jsonb DEFAULT NULL,
+  expected_claim_attempt integer DEFAULT NULL
 ) RETURNS SETOF otlet.jobs
 LANGUAGE plpgsql
 AS $$
@@ -105,6 +106,14 @@ BEGIN
   FROM otlet.jobs
   WHERE id = fail_job.job_id
     AND status IN ('running', 'cancel_requested')
+    AND (
+      fail_job.expected_claim_attempt IS NULL
+      OR (
+        attempts = fail_job.expected_claim_attempt
+        AND leased_until IS NOT NULL
+        AND leased_until >= now()
+      )
+    )
   FOR UPDATE;
 
   IF NOT FOUND THEN
@@ -149,7 +158,8 @@ BEGIN
         fail_job.raw_output_hash,
         fail_job.started_at,
         true,
-        model_row.name
+        model_row.name,
+        fail_job.expected_claim_attempt
       );
     RETURN;
   END IF;

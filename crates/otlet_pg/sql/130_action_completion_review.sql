@@ -12,7 +12,8 @@ CREATE FUNCTION otlet.complete_job(
   model_name text DEFAULT NULL,
   selection_role text DEFAULT 'direct',
   selection_status text DEFAULT 'accepted',
-  selection_reason text DEFAULT NULL
+  selection_reason text DEFAULT NULL,
+  expected_claim_attempt integer DEFAULT NULL
 ) RETURNS SETOF otlet.outputs
 LANGUAGE plpgsql
 AS $$
@@ -58,6 +59,14 @@ BEGIN
   FROM otlet.jobs
   WHERE id = complete_job.job_id
     AND status IN ('running', 'cancel_requested')
+    AND (
+      complete_job.expected_claim_attempt IS NULL
+      OR (
+        attempts = complete_job.expected_claim_attempt
+        AND leased_until IS NOT NULL
+        AND leased_until >= now()
+      )
+    )
   FOR UPDATE;
 
   IF NOT FOUND THEN
@@ -149,7 +158,8 @@ BEGIN
       COALESCE(complete_job.raw_output_hash, md5(complete_job.raw_output)),
       complete_job.started_at,
       true,
-      model_row.name
+      model_row.name,
+      complete_job.expected_claim_attempt
     );
     RETURN;
   END IF;
