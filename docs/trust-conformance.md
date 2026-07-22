@@ -12,7 +12,7 @@ Otlet treats source text, imported configuration, identifiers, model files, mode
 | Operations | Review, dry run, apply, cancellation, and policy status | `otlet_operator` session | Allowlisted functions and redacted views |
 | Audit | Receipts, labels, policy state, and redacted operational evidence | `otlet_auditor` session | Read-only allowlisted views |
 | Portable authoring | `otlet.watch.v1`, SQL text, JSON Schema, model policy, runtime options, and ordinary files | Pack author and importer | Untrusted bytes until database validation and import |
-| Future portable runtime | Claim, attempt, completion, failure, and cancellation messages | External worker identity | Unshipped; must use authenticated fenced RPCs before it enters this boundary |
+| Portable protocol | Shaped snapshots and claim, attempt, completion, failure, and cancellation messages | Allowlisted external worker identity | Exact-version, role-bound, fenced RPC authority with no direct table access |
 
 The native worker and PostgreSQL extension are trusted code. The local model is not a principal and receives no database authority. Its text stays untrusted until schema, decision, action, authority, identity, freshness, and evidence checks pass
 
@@ -26,7 +26,7 @@ The native worker and PostgreSQL extension are trusted code. The local model is 
 | Job snapshot to model | Prompt and row text | Input shaping, prompt and context bounds, local execution, and no model database credential | Fail the attempt without output or action state |
 | Model response to evidence | Raw text, JSON, trace detail, and claimed model identity | Output envelope, JSON Schema, decision contract, evidence bounds, redaction, registered model role, and receipt hashes | Store a rejected or failed receipt, or one validated output |
 | Model action to workflow state | Action type, subject, target, identity, and changes | Task action allowlist, registered workflow authority, target binding, source identity, and recommendation-only default | Reject the action or keep it non-applyable |
-| Worker claim to terminal state | Job ID, attempt number, and lease | Attempt fence and live-lease check on attempt receipts, completion, failure, and terminal recovery | Ignore reclaimed or expired workers without partial trusted state |
+| Worker claim to terminal state | Worker identity, protocol version, job ID, attempt number, and lease | Role-bound runtime allowlist, fixed-search-path RPC, attempt fence, and live-lease check | Reject unauthorized, incompatible, reclaimed, or expired workers without partial trusted state |
 | Evidence to reader | Receipts, events, traces, policies, and action state | Role grants and redacted status or export views | Deny raw tables and internal mutation functions |
 
 The redacted storage mode keeps source input in the job snapshot until retention cleanup but removes a canary from raw model output, structured redacted fields, action redacted fields, trace detail, and operational events. Diagnostic mode can retain raw model text for its configured interval, so do not use it when that retention conflicts with a secret-handling requirement
@@ -44,15 +44,13 @@ The suite expects rejection, bounded evidence, no apply receipt, worker availabi
 
 ## Portable Runtime Threats
 
-The repository ships portable watch authoring and round-trip import/export. It has no external inference worker. A future portable runtime must close these threats before release:
+The database protocol accepts shaped snapshots and fenced writes only from an enabled runtime identity bound to the invoking worker role. The reference external worker and deployment preflight are not shipped yet. They must close these remaining threats before release:
 
 - stolen or replayed worker credentials
 - claim replay after lease expiry or failover
-- completion against a different task, model, prompt, schema, source identity, or action policy
-- direct worker writes to Otlet or application tables
 - intercepted database traffic or permissive egress
 
-Required controls are verified TLS, allowlisted runtime identities, fixed-search-path `SECURITY DEFINER` RPCs, an attempt fence on every write, database-recomputed identity, receiver-enforced idempotency, no direct table grants, and deployment preflight
+The database already enforces the runtime allowlist, exact protocol compatibility, fixed-search-path `SECURITY DEFINER` RPCs, a claim fence on every write, database-recomputed identity, idempotent terminal state, and no direct table grants. Deployment still requires verified TLS, credential rotation, egress policy, and preflight
 
 ## Stable Decisions
 

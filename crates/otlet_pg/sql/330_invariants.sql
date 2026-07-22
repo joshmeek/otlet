@@ -386,6 +386,75 @@ BEGIN
 
   RETURN QUERY
   SELECT
+    'portable_live_claims_match_jobs'::text,
+    'portable_claim'::text,
+    c.id::text,
+    jsonb_build_object(
+      'job_id', c.job_id,
+      'worker_id', c.worker_id,
+      'claim_status', c.status,
+      'job_status', j.status
+    )
+  FROM otlet.portable_claims c
+  JOIN otlet.jobs j ON j.id = c.job_id
+  WHERE c.status IN ('claimed', 'renewed')
+    AND (
+      j.status NOT IN ('running', 'cancel_requested')
+      OR j.claim_token IS NULL
+      OR c.claim_token_hash IS DISTINCT FROM otlet.portable_text_hash(j.claim_token)
+    );
+
+  RETURN QUERY
+  SELECT
+    'portable_terminal_claims_match_jobs'::text,
+    'portable_claim'::text,
+    c.id::text,
+    jsonb_build_object(
+      'job_id', c.job_id,
+      'worker_id', c.worker_id,
+      'claim_status', c.status,
+      'job_status', j.status
+    )
+  FROM otlet.portable_claims c
+  JOIN otlet.jobs j ON j.id = c.job_id
+  WHERE c.status IN ('complete', 'failed', 'canceled')
+    AND c.status IS DISTINCT FROM j.status;
+
+  RETURN QUERY
+  SELECT
+    'portable_receipts_match_claims'::text,
+    'receipt'::text,
+    r.id::text,
+    jsonb_build_object(
+      'claim_id', c.id,
+      'claim_job_id', c.job_id,
+      'receipt_job_id', r.job_id,
+      'runtime_name', r.runtime_name,
+      'runtime_endpoint', r.runtime_endpoint
+    )
+  FROM otlet.portable_receipt_links l
+  JOIN otlet.portable_claims c ON c.id = l.claim_id
+  JOIN otlet.inference_receipts r ON r.id = l.receipt_id
+  WHERE r.job_id IS DISTINCT FROM c.job_id
+     OR r.runtime_name NOT LIKE 'portable:%'
+     OR r.runtime_endpoint IS DISTINCT FROM 'postgres_rpc';
+
+  RETURN QUERY
+  SELECT
+    'enabled_portable_workers_have_database_roles'::text,
+    'portable_worker'::text,
+    w.worker_id,
+    jsonb_build_object('database_role_oid', w.database_role_oid)
+  FROM otlet.portable_workers w
+  WHERE w.enabled
+    AND NOT EXISTS (
+      SELECT 1
+      FROM pg_catalog.pg_roles r
+      WHERE r.oid = w.database_role_oid
+    );
+
+  RETURN QUERY
+  SELECT
     'sensitive_storage_matches_policy'::text,
     'redaction_policy'::text,
     s.policy_name,

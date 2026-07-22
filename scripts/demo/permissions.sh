@@ -95,12 +95,16 @@ SELECT (SELECT count(*) = 1 FROM otlet.redaction_policy_status)::text || '|' ||
        (SELECT count(*) = 1 FROM otlet.retention_copy_status)::text || '|' ||
        (SELECT count(*) > 0 FROM otlet.semantic_dependency_audit)::text || '|' ||
        (SELECT count(*) > 0 FROM otlet.operational_event_log)::text || '|' ||
-       (SELECT count(*) > 0 FROM otlet.worker_batch_timing_status)::text;
+       (SELECT count(*) > 0 FROM otlet.worker_batch_timing_status)::text || '|' ||
+       (SELECT count(*) = 1 FROM otlet.portable_protocol_status)::text || '|' ||
+       (SELECT count(*) >= 0 FROM otlet.portable_worker_status)::text || '|' ||
+       (SELECT count(*) >= 0 FROM otlet.portable_claim_status)::text || '|' ||
+       (SELECT count(*) >= 0 FROM otlet.portable_receipt_status)::text;
 ROLLBACK;
 SQL
 )"
 echo "auditor_read_contract=$auditor_read_contract"
-[ "$auditor_read_contract" = "true|true|true|true|true|true|true|true|true|true|true|true|true|true|true" ] || {
+[ "$auditor_read_contract" = "true|true|true|true|true|true|true|true|true|true|true|true|true|true|true|true|true|true|true" ] || {
   echo "Expected auditor access to all redacted exports, got $auditor_read_contract" >&2
   exit 1
 }
@@ -144,6 +148,7 @@ expect_permission_denied "$permission_auditor_role" "SELECT otlet.export_watch('
 expect_permission_denied "$permission_auditor_role" "SELECT otlet.import_watch('{}'::jsonb)" "auditor watch import"
 expect_permission_denied "$permission_auditor_role" "SELECT otlet.grant_auditor_access('$permission_auditor_role'::regrole)" "auditor grant helper"
 expect_permission_denied "$permission_auditor_role" "SELECT otlet.grant_operator_access('$permission_auditor_role'::regrole)" "auditor operator grant helper"
+expect_permission_denied "$permission_auditor_role" "SELECT otlet.grant_portable_worker_access('$permission_auditor_role'::regrole)" "auditor portable worker grant helper"
 
 operator_audit_contract="$(psql_value <<SQL
 BEGIN;
@@ -432,6 +437,7 @@ expect_permission_denied "$permission_operator_role" "SELECT otlet.export_watch(
 expect_permission_denied "$permission_operator_role" "SELECT otlet.import_watch('{}'::jsonb)" "operator watch import"
 expect_permission_denied "$permission_operator_role" "SELECT otlet.grant_auditor_access('$permission_operator_role'::regrole)" "operator auditor grant helper"
 expect_permission_denied "$permission_operator_role" "SELECT otlet.grant_operator_access('$permission_operator_role'::regrole)" "operator grant helper"
+expect_permission_denied "$permission_operator_role" "SELECT otlet.grant_portable_worker_access('$permission_operator_role'::regrole)" "operator portable worker grant helper"
 
 permission_catalog_contract="$(psql_value -v auditor_role="$permission_auditor_role" -v operator_role="$permission_operator_role" <<'SQL'
 WITH table_grants AS (
@@ -457,7 +463,11 @@ WITH table_grants AS (
             'retention_copy_status',
             'semantic_dependency_audit',
             'operational_event_log',
-            'worker_batch_timing_status'
+            'worker_batch_timing_status',
+            'portable_protocol_status',
+            'portable_worker_status',
+            'portable_claim_status',
+            'portable_receipt_status'
           )
         )
     )::bigint AS unexpected_grants
@@ -512,7 +522,16 @@ WITH table_grants AS (
           'otlet.dry_run_action(bigint)'::regprocedure,
           'otlet.apply_action(bigint)'::regprocedure,
           'otlet.grant_auditor_access(regrole)'::regprocedure,
-          'otlet.grant_operator_access(regrole)'::regprocedure
+          'otlet.grant_operator_access(regrole)'::regprocedure,
+          'otlet.grant_portable_worker_access(regrole)'::regprocedure
+        )
+        AND p.proname NOT IN (
+          'portable_claim_jobs',
+          'portable_renew_job',
+          'portable_record_attempt',
+          'portable_complete_job',
+          'portable_fail_job',
+          'portable_cancel_job'
         )
     )::bigint AS unexpected_definer_functions
   FROM pg_catalog.pg_proc p
@@ -540,6 +559,9 @@ SELECT access.public_schema_usage::text || '|' ||
        definer_status.definer_functions::text || '|' ||
        definer_status.fixed_search_path_functions::text || '|' ||
        definer_status.unexpected_definer_functions::text || '|' ||
+       access.portable_rpc_functions::text || '|' ||
+       access.portable_rpc_security_definer_functions::text || '|' ||
+       access.portable_rpc_fixed_search_path_functions::text || '|' ||
        pg_catalog.has_function_privilege(current_user, 'otlet.grant_auditor_access(regrole)', 'EXECUTE')::text
 FROM otlet.access_policy_status access
 CROSS JOIN table_grants
@@ -549,16 +571,16 @@ CROSS JOIN definer_status;
 SQL
 )"
 echo "permission_catalog_contract=$permission_catalog_contract"
-[ "$permission_catalog_contract" = "false|0|0|0|15|3|15|11|0|0|0|0|10|10|0|true" ] || {
+[ "$permission_catalog_contract" = "false|0|0|0|19|3|19|11|0|0|0|0|17|17|0|6|6|6|true" ] || {
   echo "Expected exact public, auditor, operator, and owner ACLs, got $permission_catalog_contract" >&2
   exit 1
 }
 
 source "$demo_dir/review_provenance.sh"
 
-permission_contract="public=0/0/0|auditor=15/3|operator=15/11|definer=10/10|positive=7|denied=$permission_denied_count"
+permission_contract="public=0/0/0|auditor=19/3|operator=19/11|definer=17/17|portable=6/6/6|positive=7|denied=$permission_denied_count"
 echo "permission_contract=$permission_contract"
-[ "$permission_contract" = "public=0/0/0|auditor=15/3|operator=15/11|definer=10/10|positive=7|denied=75" ] || {
+[ "$permission_contract" = "public=0/0/0|auditor=19/3|operator=19/11|definer=17/17|portable=6/6/6|positive=7|denied=77" ] || {
   echo "Expected complete permission contract, got $permission_contract" >&2
   exit 1
 }

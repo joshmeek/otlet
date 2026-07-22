@@ -91,7 +91,9 @@ CREATE FUNCTION otlet.fail_job(
   selection_status text DEFAULT 'failed',
   selection_reason text DEFAULT NULL,
   candidate_output jsonb DEFAULT NULL,
-  expected_claim_token text DEFAULT NULL
+  expected_claim_token text DEFAULT NULL,
+  runtime_name text DEFAULT 'linked_inproc',
+  runtime_endpoint text DEFAULT 'linked'
 ) RETURNS SETOF otlet.jobs
 LANGUAGE plpgsql
 AS $$
@@ -119,7 +121,9 @@ BEGIN
       fail_job.selection_role,
       fail_job.selection_status,
       fail_job.selection_reason,
-      fail_job.candidate_output
+      fail_job.candidate_output,
+      fail_job.runtime_name,
+      fail_job.runtime_endpoint
     )
   );
 
@@ -192,7 +196,9 @@ BEGIN
         true,
         model_row.name,
         fail_job.expected_claim_token,
-        request_hash
+        request_hash,
+        fail_job.runtime_name,
+        fail_job.runtime_endpoint
       );
     RETURN;
   END IF;
@@ -218,7 +224,9 @@ BEGIN
     selection_status => COALESCE(fail_job.selection_status, 'failed'),
     selection_reason => fail_job.selection_reason,
     error => fail_job.error,
-    expected_claim_token => fail_job.expected_claim_token
+    expected_claim_token => fail_job.expected_claim_token,
+    runtime_name => fail_job.runtime_name,
+    runtime_endpoint => fail_job.runtime_endpoint
   );
 
   UPDATE otlet.jobs
@@ -244,16 +252,18 @@ BEGIN
     WHERE r.id = saved_receipt_id;
   END IF;
 
-  IF fail_job.schema_validation_status = 'failed'
-     OR COALESCE(fail_job.selection_status, 'failed') = 'rejected' THEN
-    PERFORM otlet.touch_runtime_slot(model_row.name, 'ready', 0, NULL);
-  ELSE
-    PERFORM otlet.touch_runtime_slot(model_row.name, 'error', 0, fail_job.error);
+  IF COALESCE(fail_job.runtime_name, 'linked_inproc') = 'linked_inproc' THEN
+    IF fail_job.schema_validation_status = 'failed'
+       OR COALESCE(fail_job.selection_status, 'failed') = 'rejected' THEN
+      PERFORM otlet.touch_runtime_slot(model_row.name, 'ready', 0, NULL);
+    ELSE
+      PERFORM otlet.touch_runtime_slot(model_row.name, 'error', 0, fail_job.error);
+    END IF;
   END IF;
   PERFORM otlet.record_worker_event(
     'job_failed',
     saved_job.id,
-    'linked_inproc',
+    COALESCE(fail_job.runtime_name, 'linked_inproc'),
     'otlet worker failed job',
     jsonb_build_object(
       'task_name', saved_job.task_name,

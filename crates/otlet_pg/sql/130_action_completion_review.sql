@@ -13,7 +13,9 @@ CREATE FUNCTION otlet.complete_job(
   selection_role text DEFAULT 'direct',
   selection_status text DEFAULT 'accepted',
   selection_reason text DEFAULT NULL,
-  expected_claim_token text DEFAULT NULL
+  expected_claim_token text DEFAULT NULL,
+  runtime_name text DEFAULT 'linked_inproc',
+  runtime_endpoint text DEFAULT 'linked'
 ) RETURNS SETOF otlet.outputs
 LANGUAGE plpgsql
 AS $$
@@ -71,7 +73,9 @@ BEGIN
       complete_job.model_name,
       complete_job.selection_role,
       complete_job.selection_status,
-      complete_job.selection_reason
+      complete_job.selection_reason,
+      complete_job.runtime_name,
+      complete_job.runtime_endpoint
     )
   );
 
@@ -190,7 +194,9 @@ BEGIN
       true,
       model_row.name,
       complete_job.expected_claim_token,
-      request_hash
+      request_hash,
+      complete_job.runtime_name,
+      complete_job.runtime_endpoint
     );
     RETURN;
   END IF;
@@ -216,7 +222,9 @@ BEGIN
     selection_reason => complete_job.selection_reason,
     error => NULL,
     expected_claim_token => complete_job.expected_claim_token,
-    actions => complete_job.actions
+    actions => complete_job.actions,
+    runtime_name => complete_job.runtime_name,
+    runtime_endpoint => complete_job.runtime_endpoint
   );
 
   UPDATE otlet.jobs
@@ -240,11 +248,13 @@ BEGIN
     RETURN;
   END IF;
 
-  PERFORM otlet.touch_runtime_slot(model_row.name, 'ready', 0, NULL);
+  IF COALESCE(complete_job.runtime_name, 'linked_inproc') = 'linked_inproc' THEN
+    PERFORM otlet.touch_runtime_slot(model_row.name, 'ready', 0, NULL);
+  END IF;
   PERFORM otlet.record_worker_event(
     'job_completed',
     job_row.id,
-    'linked_inproc',
+    COALESCE(complete_job.runtime_name, 'linked_inproc'),
     'otlet worker completed job',
     jsonb_build_object(
       'task_name', job_row.task_name,

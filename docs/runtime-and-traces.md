@@ -80,6 +80,15 @@ ORDER BY receipt_id DESC
 LIMIT 1;
 ```
 
+Portable execution uses the same receipt state and records `portable:<runtime_name>` with endpoint `postgres_rpc`. Inspect protocol compatibility, registered runtime identities, claim ownership, and linked receipts without reading the underlying tables:
+
+```sql
+SELECT * FROM otlet.portable_protocol_status;
+SELECT * FROM otlet.portable_worker_status;
+SELECT * FROM otlet.portable_claim_status ORDER BY claim_id DESC;
+SELECT * FROM otlet.portable_receipt_status ORDER BY receipt_id DESC;
+```
+
 Receipt timing splits runtime preparation, model load, context creation, tokenization, prompt decode, generation, validation and post-processing, finish SQL, and semantic materialization. `otlet.runtime_stage_timing_status` aggregates every attempt for a job and leaves unmeasured worker work in `worker_overhead_ms`:
 
 ```sql

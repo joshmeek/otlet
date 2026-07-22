@@ -98,7 +98,9 @@ CREATE FUNCTION otlet.record_model_attempt(
   error text DEFAULT NULL,
   receipt_status text DEFAULT NULL,
   expected_claim_token text DEFAULT NULL,
-  actions jsonb DEFAULT NULL
+  actions jsonb DEFAULT NULL,
+  runtime_name text DEFAULT 'linked_inproc',
+  runtime_endpoint text DEFAULT 'linked'
 ) RETURNS otlet.inference_receipts
 LANGUAGE plpgsql
 AS $$
@@ -353,8 +355,8 @@ BEGIN
     model_row.artifact_path,
     model_row.artifact_hash,
     model_row.artifact_identity,
-    'linked_inproc',
-    'linked',
+    COALESCE(record_model_attempt.runtime_name, 'linked_inproc'),
+    COALESCE(record_model_attempt.runtime_endpoint, 'linked'),
     policy.default_runtime_options || task_row.runtime_options,
     portable_identity ->> 'task_identity_hash',
     portable_identity ->> 'source_identity_hash',

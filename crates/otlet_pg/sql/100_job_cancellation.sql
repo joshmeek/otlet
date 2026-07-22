@@ -9,7 +9,9 @@ CREATE FUNCTION otlet.finish_canceled_job(
   release_runtime boolean DEFAULT true,
   model_name text DEFAULT NULL,
   expected_claim_token text DEFAULT NULL,
-  terminal_request_hash text DEFAULT NULL
+  terminal_request_hash text DEFAULT NULL,
+  runtime_name text DEFAULT 'linked_inproc',
+  runtime_endpoint text DEFAULT 'linked'
 ) RETURNS SETOF otlet.jobs
 LANGUAGE plpgsql
 AS $$
@@ -32,7 +34,9 @@ BEGIN
         finish_canceled_job.raw_output_hash,
         finish_canceled_job.started_at,
         finish_canceled_job.release_runtime,
-        finish_canceled_job.model_name
+        finish_canceled_job.model_name,
+        finish_canceled_job.runtime_name,
+        finish_canceled_job.runtime_endpoint
       )
     )
   );
@@ -98,7 +102,9 @@ BEGIN
     selection_reason => 'canceled',
     error => COALESCE(job_row.error, 'canceled'),
     receipt_status => 'canceled',
-    expected_claim_token => finish_canceled_job.expected_claim_token
+    expected_claim_token => finish_canceled_job.expected_claim_token,
+    runtime_name => finish_canceled_job.runtime_name,
+    runtime_endpoint => finish_canceled_job.runtime_endpoint
   );
 
   UPDATE otlet.jobs
@@ -113,14 +119,15 @@ BEGIN
   WHERE id = job_row.id
   RETURNING * INTO saved_job;
 
-  IF finish_canceled_job.release_runtime THEN
+  IF finish_canceled_job.release_runtime
+     AND COALESCE(finish_canceled_job.runtime_name, 'linked_inproc') = 'linked_inproc' THEN
     PERFORM otlet.touch_runtime_slot(model_row.name, 'ready', 0, NULL);
   END IF;
 
   PERFORM otlet.record_worker_event(
     'job_canceled',
     saved_job.id,
-    'linked_inproc',
+    COALESCE(finish_canceled_job.runtime_name, 'linked_inproc'),
     'otlet job canceled',
     jsonb_build_object(
       'task_name', saved_job.task_name,
@@ -221,7 +228,9 @@ $$;
 CREATE FUNCTION otlet.cancel_job(
   job_id bigint,
   expected_claim_token text,
-  reason text DEFAULT 'canceled'
+  reason text DEFAULT 'canceled',
+  runtime_name text DEFAULT 'linked_inproc',
+  runtime_endpoint text DEFAULT 'linked'
 ) RETURNS SETOF otlet.jobs
 LANGUAGE plpgsql
 AS $$
@@ -229,7 +238,7 @@ DECLARE
   job_row otlet.jobs%ROWTYPE;
   request_hash text := otlet.job_terminal_request_hash(
     'cancel',
-    jsonb_build_array(cancel_job.reason)
+    jsonb_build_array(cancel_job.reason, cancel_job.runtime_name, cancel_job.runtime_endpoint)
   );
 BEGIN
   SELECT * INTO job_row
@@ -273,7 +282,9 @@ BEGIN
       job_row.id,
       release_runtime => true,
       expected_claim_token => cancel_job.expected_claim_token,
-      terminal_request_hash => request_hash
+      terminal_request_hash => request_hash,
+      runtime_name => cancel_job.runtime_name,
+      runtime_endpoint => cancel_job.runtime_endpoint
     );
 END;
 $$;

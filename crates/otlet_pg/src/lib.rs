@@ -82,9 +82,14 @@ pgrx::extension_sql_file!(
     requires = ["portable_result_validation"]
 );
 pgrx::extension_sql_file!(
+    "../sql/135_portable_worker_protocol.sql",
+    name = "portable_worker_protocol",
+    requires = ["action_completion_review"]
+);
+pgrx::extension_sql_file!(
     "../sql/140_action_execution.sql",
     name = "action_execution",
-    requires = ["action_completion_review"]
+    requires = ["portable_worker_protocol"]
 );
 pgrx::extension_sql_file!(
     "../sql/150_eval_labels.sql",
