@@ -122,6 +122,7 @@ WITH definitions AS (
   UNION ALL SELECT pg_temp.expect_watch_import_error(row_definition || '{"extra":true}', false, 'unsupported key extra') FROM definitions
   UNION ALL SELECT pg_temp.expect_watch_import_error(row_definition - 'model_name', false, 'missing key model_name') FROM definitions
   UNION ALL SELECT pg_temp.expect_watch_import_error(row_definition || '{"model_name":"missing_model"}', false, 'model missing_model does not exist') FROM definitions
+  UNION ALL SELECT pg_temp.expect_watch_import_error(jsonb_set(row_definition, '{model_artifact_identity,sha256}', to_jsonb(repeat('0', 64))), true, 'model artifact identity does not match') FROM definitions
   UNION ALL SELECT pg_temp.expect_watch_import_error(row_definition || '{"table_name":"public.missing_table"}', true, 'table public.missing_table does not exist') FROM definitions
   UNION ALL SELECT pg_temp.expect_watch_import_error(row_definition || '{"subject_column":"missing_column"}', true, 'subject column missing_column does not exist') FROM definitions
   UNION ALL SELECT pg_temp.expect_watch_import_error(pair_definition || jsonb_build_object('candidate_query', 'SELECT broken'), true, 'column "broken" does not exist') FROM definitions
@@ -132,8 +133,8 @@ ROLLBACK;
 SQL
 )"
 echo "watch_import_failure_contract=$watch_import_failure_contract"
-[ "$watch_import_failure_contract" = "9|true" ] || {
-  echo "Expected nine watch import failures to roll back cleanly, got $watch_import_failure_contract" >&2
+[ "$watch_import_failure_contract" = "10|true" ] || {
+  echo "Expected ten watch import failures to roll back cleanly, got $watch_import_failure_contract" >&2
   exit 1
 }
 
@@ -184,4 +185,3 @@ echo "semantic_join_current_row_contract=$join_subject_rows|$join_sql_plan"
   exit 1
 }
 require_regex "$join_sql_plan" '^semantic_join_lookup\|4\|4\|0\|0\|' "Expected semantic join SQL plan lookup with four fresh subjects"
-

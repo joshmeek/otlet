@@ -1,5 +1,5 @@
 log "Checking pair strip-key freshness"
-psql_exec \
+psql_candidate_exec \
   -v watch_name="$pair_strip_watch" \
   -v model_name="$strong_model_name" >/dev/null <<'SQL'
 DROP VIEW IF EXISTS public.otlet_demo_pair_strip_input;
@@ -39,7 +39,7 @@ SELECT otlet.create_watch(
   record_type => 'pair_strip_result',
   runtime_options => '{"max_tokens":64,"reasoning":"off","inference_cache":false}'::jsonb,
   trigger_policy => '{"on_change":"mark_stale"}'::jsonb,
-  input_shaping => '{"strip_keys":["volatile_note"]}'::jsonb,
+  input_shaping => '{"source_fields":["_otlet_mvcc","left_name","right_name","volatile_note"],"strip_keys":["volatile_note"]}'::jsonb,
   decision_contract => '{"answer_field":"status","abstain_values":[],"confidence_field":"confidence","accepted_confidence":["high"]}'::jsonb,
   max_candidate_rows => 5
 );
@@ -263,4 +263,3 @@ echo "row_correction_contract=$row_correction_contract"
   echo "Expected correction to reject action, write gold label, and remove review queue row, got $row_correction_contract" >&2
   exit 1
 }
-

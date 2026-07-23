@@ -33,9 +33,25 @@ observed AS (
         OR jsonb_path_exists(r.trace_summary, '$.detailed_trace.steps[*].token_text')
         OR jsonb_path_exists(r.trace_summary, '$.detailed_trace.steps[*].top_alternatives[*].token_text')
       )
-    )::bigint AS overdue_sensitive_rows
+    )::bigint AS overdue_sensitive_rows,
+    count(*) FILTER (
+      WHERE r.trace_summary #> '{evidence_redaction,structured_output}' = 'true'::jsonb
+    )::bigint AS structured_output_redacted_receipts,
+    count(*) FILTER (
+      WHERE r.trace_summary #> '{evidence_redaction,actions}' = 'true'::jsonb
+    )::bigint AS action_redacted_receipts
   FROM otlet.inference_receipts r
   CROSS JOIN policy p
+),
+configured AS (
+  SELECT
+    count(*) FILTER (
+      WHERE jsonb_array_length(COALESCE(t.decision_contract -> 'redact_output_fields', '[]'::jsonb)) > 0
+    )::bigint AS structured_output_redaction_tasks,
+    count(*) FILTER (
+      WHERE jsonb_array_length(COALESCE(t.decision_contract -> 'redact_action_fields', '[]'::jsonb)) > 0
+    )::bigint AS action_redaction_tasks
+  FROM otlet.tasks t
 )
 SELECT
   'stored_sensitive_evidence'::text AS policy_name,
@@ -50,6 +66,10 @@ SELECT
   o.token_text_values,
   o.alternative_token_text_values,
   o.overdue_sensitive_rows,
+  c.structured_output_redaction_tasks,
+  c.action_redaction_tasks,
+  o.structured_output_redacted_receipts,
+  o.action_redacted_receipts,
   (o.overdue_sensitive_rows = 0) AS storage_compliant,
   false AS prompts_visible,
   false AS raw_output_visible,
@@ -66,15 +86,46 @@ SELECT
   ARRAY[
     'otlet.audit_receipt_export',
     'otlet.audit_review_export',
+    'otlet.audit_review_event_export',
     'otlet.audit_action_execution_export',
     'otlet.audit_eval_label_export',
+    'otlet.audit_workload_evaluation_export',
+    'otlet.decision_trace_export',
+    'otlet.destination_reconciliation_status',
+    'otlet.action_workflow_policy_status',
+    'otlet.cleanup_receipt_status',
+    'otlet.retention_hold_status',
+    'otlet.retention_copy_status',
     'otlet.semantic_dependency_audit',
+    'otlet.operational_event_log',
     'otlet.worker_batch_timing_status',
     'otlet.access_policy_status'
   ]::text[] AS export_views,
   'Assembled prompts are hash-only. Audit exports omit job input, raw output, candidate output, token detail, and full trace summaries. Task configuration and active job input remain owner-only.'::text AS notes
 FROM policy p
-CROSS JOIN observed o;
+CROSS JOIN observed o
+CROSS JOIN configured c;
+
+CREATE VIEW otlet.operational_event_log AS
+SELECT
+  e.id AS event_id,
+  e.created_at,
+  e.event_type,
+  e.job_id,
+  e.runtime_name,
+  e.detail ->> 'task_name' AS task_name,
+  e.detail -> 'task_names' AS task_names,
+  e.detail ->> 'model_name' AS model_name,
+  e.detail ->> 'reason' AS reason,
+  e.detail ->> 'status' AS status,
+  CASE WHEN jsonb_typeof(e.detail -> 'job_count') = 'number' THEN (e.detail ->> 'job_count')::bigint END AS job_count,
+  CASE WHEN jsonb_typeof(e.detail -> 'completed_jobs') = 'number' THEN (e.detail ->> 'completed_jobs')::bigint END AS completed_jobs,
+  CASE WHEN jsonb_typeof(e.detail -> 'failed_jobs') = 'number' THEN (e.detail ->> 'failed_jobs')::bigint END AS failed_jobs,
+  CASE WHEN jsonb_typeof(e.detail -> 'batch_ms') = 'number' THEN (e.detail ->> 'batch_ms')::bigint END AS batch_ms,
+  CASE WHEN jsonb_typeof(e.detail -> 'input_bytes') = 'number' THEN (e.detail ->> 'input_bytes')::bigint END AS input_bytes,
+  CASE WHEN jsonb_typeof(e.detail -> 'limit_bytes') = 'number' THEN (e.detail ->> 'limit_bytes')::bigint END AS limit_bytes,
+  (e.detail::text LIKE '%[REDACTED]%') AS evidence_redacted
+FROM otlet.worker_events e;
 
 CREATE VIEW otlet.audit_receipt_export AS
 SELECT
@@ -89,8 +140,19 @@ SELECT
   s.accepted,
   s.status,
   s.model_name,
+  s.model_artifact_hash AS model_artifact_sha256,
+  s.model_artifact_identity,
   s.runtime_name,
+  s.task_identity_hash,
+  s.source_identity_hash,
+  s.model_identity_hash,
+  s.runtime_options_hash,
   s.prompt_hash,
+  s.input_hash,
+  s.output_schema_hash,
+  s.output_hash,
+  s.actions_hash,
+  s.portable_validation_version,
   s.prompt_tokens,
   s.generated_tokens,
   s.generate_ms,
@@ -132,8 +194,21 @@ SELECT
   s.shaped_input_bytes,
   s.input_truncated,
   s.input_shaping_applied,
+  (r.trace_summary #> '{evidence_redaction,structured_output}' = 'true'::jsonb) AS structured_output_redacted,
+  CASE
+    WHEN jsonb_typeof(r.trace_summary #> '{evidence_redaction,structured_output_field_count}') = 'number'
+    THEN (r.trace_summary #>> '{evidence_redaction,structured_output_field_count}')::integer
+    ELSE 0
+  END AS structured_output_redacted_field_count,
+  (r.trace_summary #> '{evidence_redaction,actions}' = 'true'::jsonb) AS actions_redacted,
+  CASE
+    WHEN jsonb_typeof(r.trace_summary #> '{evidence_redaction,action_field_count}') = 'number'
+    THEN (r.trace_summary #>> '{evidence_redaction,action_field_count}')::integer
+    ELSE 0
+  END AS action_redacted_field_count,
   s.receipt_finished_at
-FROM otlet.inference_receipt_trace_status s;
+FROM otlet.inference_receipt_trace_status s
+JOIN otlet.inference_receipts r ON r.id = s.receipt_id;
 
 CREATE VIEW otlet.audit_review_export AS
 SELECT
@@ -147,6 +222,12 @@ SELECT
   q.output_id,
   q.receipt_id,
   q.action_type,
+  a.authority_origin,
+  a.authority_mode,
+  a.evaluation_status,
+  a.authority_policy_hash,
+  a.subject_namespace,
+  a.target_name,
   q.action_status,
   q.approval_status,
   q.dry_run_status,
@@ -166,7 +247,35 @@ SELECT
   q.current_content_hash,
   q.source_stale,
   q.created_at
-FROM otlet.review_queue q;
+FROM otlet.review_queue q
+LEFT JOIN otlet.actions a ON a.id = q.action_id;
+
+CREATE VIEW otlet.audit_review_event_export AS
+SELECT
+  id AS review_event_id,
+  outcome,
+  reviewer_identity,
+  reviewer_role,
+  reason,
+  job_id,
+  task_name,
+  subject_id,
+  action_id,
+  output_id,
+  receipt_id,
+  source_table,
+  source_hash,
+  content_hash,
+  current_content_hash,
+  source_freshness,
+  model_name,
+  model_artifact_hash,
+  prompt_hash,
+  output_schema_hash,
+  output_hash,
+  runtime_fingerprint_hash,
+  reviewed_at
+FROM otlet.review_events;
 
 CREATE VIEW otlet.audit_action_execution_export AS
 SELECT
@@ -177,6 +286,11 @@ SELECT
   j.task_name,
   a.subject_id,
   a.action_type,
+  a.authority_origin,
+  a.authority_mode,
+  a.evaluation_status,
+  a.authority_policy_hash,
+  a.subject_namespace,
   a.status AS action_status,
   a.approval_status,
   a.dry_run_status,
@@ -204,6 +318,10 @@ SELECT
   l.action_id,
   l.output_id,
   l.receipt_id,
+  l.workload_name,
+  l.case_key,
+  l.case_weight,
+  l.task_name,
   l.source_table,
   l.subject_id,
   l.source_hash,
@@ -222,6 +340,10 @@ SELECT
   l.selection_status,
   l.created_at
 FROM otlet.eval_label_status l;
+
+CREATE VIEW otlet.audit_workload_evaluation_export AS
+SELECT *
+FROM otlet.workload_evaluation_status;
 
 CREATE VIEW otlet.semantic_dependency_audit AS
 SELECT DISTINCT ON (sm.task_name, sm.record_type, sm.subject_id)

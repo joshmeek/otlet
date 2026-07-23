@@ -5,6 +5,8 @@ WITH operator_functions(oid) AS (
     'otlet.reject_action(bigint,text,text)'::regprocedure::oid,
     'otlet.label_action(bigint,text,text,text,text,text)'::regprocedure::oid,
     'otlet.correct_action(bigint,jsonb,text)'::regprocedure::oid,
+    'otlet.defer_action(bigint,text)'::regprocedure::oid,
+    'otlet.abstain_review(bigint,text)'::regprocedure::oid,
     'otlet.dry_run_action(bigint)'::regprocedure::oid,
     'otlet.apply_action(bigint)'::regprocedure::oid
   ])
@@ -18,6 +20,26 @@ operator_status AS (
     )::bigint AS fixed_search_path_count
   FROM operator_functions expected
   JOIN pg_catalog.pg_proc p ON p.oid = expected.oid
+),
+portable_status AS (
+  SELECT
+    count(*)::bigint AS function_count,
+    count(*) FILTER (WHERE p.prosecdef)::bigint AS security_definer_count,
+    count(*) FILTER (
+      WHERE p.proconfig @> ARRAY['search_path=pg_catalog, otlet, pg_temp']
+    )::bigint AS fixed_search_path_count
+  FROM pg_catalog.pg_proc p
+  JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
+  WHERE n.nspname = 'otlet'
+    AND p.proname IN (
+      'portable_claim_jobs',
+      'portable_renew_job',
+      'portable_record_attempt',
+      'portable_complete_job',
+      'portable_fail_job',
+      'portable_cancel_job',
+      'portable_worker_heartbeat'
+    )
 )
 SELECT
   'owner_granted_roles'::text AS policy_name,
@@ -60,8 +82,12 @@ SELECT
   ) AS public_sequence_privileges,
   operator_status.function_count AS operator_functions,
   operator_status.security_definer_count AS operator_security_definer_functions,
-  operator_status.fixed_search_path_count AS operator_fixed_search_path_functions
-FROM operator_status;
+  operator_status.fixed_search_path_count AS operator_fixed_search_path_functions,
+  portable_status.function_count AS portable_rpc_functions,
+  portable_status.security_definer_count AS portable_rpc_security_definer_functions,
+  portable_status.fixed_search_path_count AS portable_rpc_fixed_search_path_functions
+FROM operator_status
+CROSS JOIN portable_status;
 
 CREATE FUNCTION otlet.grant_auditor_access(target_role regrole) RETURNS void
 LANGUAGE plpgsql
@@ -87,10 +113,24 @@ BEGIN
     'otlet.access_policy_status, '
     'otlet.audit_receipt_export, '
     'otlet.audit_review_export, '
+    'otlet.audit_review_event_export, '
     'otlet.audit_action_execution_export, '
     'otlet.audit_eval_label_export, '
+    'otlet.audit_workload_evaluation_export, '
+    'otlet.decision_trace_export, '
+    'otlet.destination_reconciliation_status, '
+    'otlet.action_workflow_policy_status, '
+    'otlet.cleanup_receipt_status, '
+    'otlet.retention_hold_status, '
+    'otlet.retention_copy_status, '
     'otlet.semantic_dependency_audit, '
-    'otlet.worker_batch_timing_status TO %I',
+    'otlet.operational_event_log, '
+    'otlet.worker_batch_timing_status, '
+    'otlet.database_health_status, '
+    'otlet.portable_protocol_status, '
+    'otlet.portable_worker_status, '
+    'otlet.portable_claim_status, '
+    'otlet.portable_receipt_status TO %I',
     role_name
   );
   EXECUTE pg_catalog.format(
@@ -122,7 +162,7 @@ BEGIN
 
   PERFORM otlet.grant_auditor_access(grant_operator_access.target_role);
   EXECUTE pg_catalog.format(
-    'GRANT USAGE ON TYPE otlet.actions, otlet.eval_labels TO %I',
+    'GRANT USAGE ON TYPE otlet.actions, otlet.eval_labels, otlet.review_events TO %I',
     role_name
   );
   EXECUTE pg_catalog.format(
@@ -131,6 +171,8 @@ BEGIN
     'otlet.reject_action(bigint, text, text), '
     'otlet.label_action(bigint, text, text, text, text, text), '
     'otlet.correct_action(bigint, jsonb, text), '
+    'otlet.defer_action(bigint, text), '
+    'otlet.abstain_review(bigint, text), '
     'otlet.dry_run_action(bigint), '
     'otlet.apply_action(bigint) TO %I',
     role_name

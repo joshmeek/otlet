@@ -1,3 +1,331 @@
+CREATE FUNCTION otlet.watch_pack_with_digest(definition jsonb) RETURNS jsonb
+LANGUAGE sql
+IMMUTABLE
+STRICT
+AS $$
+  WITH canonical AS (
+    SELECT otlet.semantic_canonical_jsonb($1 - 'content_digest') AS value
+  )
+  SELECT value || jsonb_build_object('content_digest', md5(value::text))
+  FROM canonical;
+$$;
+
+CREATE FUNCTION otlet.validate_watch_pack(definition jsonb) RETURNS jsonb
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  allowed_keys constant text[] := ARRAY[
+    'format', 'name', 'kind', 'instruction', 'output_schema', 'model_name',
+    'model_artifact_identity', 'table_name', 'subject_column', 'candidate_query',
+    'record_type', 'runtime_options', 'selection_policy', 'trigger_policy',
+    'action_types', 'stale_policy', 'input_shaping', 'decision_contract',
+    'max_candidate_rows', 'input_columns', 'pair_sources', 'content_digest',
+    'version_metadata', 'fixtures', 'labels', 'expected_receipts', 'review_outcomes',
+    'evaluation_gates'
+  ];
+  required_keys constant text[] := ARRAY[
+    'format', 'name', 'kind', 'instruction', 'output_schema', 'model_name',
+    'model_artifact_identity', 'table_name', 'subject_column', 'candidate_query',
+    'record_type', 'runtime_options', 'selection_policy', 'trigger_policy',
+    'action_types', 'stale_policy', 'input_shaping', 'decision_contract',
+    'max_candidate_rows', 'input_columns', 'pair_sources'
+  ];
+  pack jsonb := validate_watch_pack.definition;
+  object_key text;
+  object_field text;
+  array_field text;
+  provided_digest text;
+  canonical_table text;
+  source_table regclass;
+  source_column text;
+  source jsonb;
+  normalized jsonb;
+  cheap_model_name text;
+  strong_model_name text;
+BEGIN
+  IF jsonb_typeof(pack) IS DISTINCT FROM 'object' THEN
+    RAISE EXCEPTION 'otlet watch definition must be a JSON object';
+  END IF;
+  IF octet_length(pack::text) > 16777216 THEN
+    RAISE EXCEPTION 'otlet watch definition exceeds 16777216 bytes';
+  END IF;
+
+  SELECT key INTO object_key
+  FROM jsonb_object_keys(pack) key
+  WHERE NOT key = ANY(allowed_keys)
+  ORDER BY key
+  LIMIT 1;
+  IF object_key IS NOT NULL THEN
+    RAISE EXCEPTION 'otlet watch definition has unsupported key %', object_key;
+  END IF;
+
+  SELECT key INTO object_key
+  FROM unnest(required_keys) key
+  WHERE NOT pack ? key
+  ORDER BY key
+  LIMIT 1;
+  IF object_key IS NOT NULL THEN
+    RAISE EXCEPTION 'otlet watch definition is missing key %', object_key;
+  END IF;
+
+  provided_digest := pack ->> 'content_digest';
+  IF pack ? 'content_digest'
+     AND (
+       jsonb_typeof(pack -> 'content_digest') IS DISTINCT FROM 'string'
+       OR provided_digest !~ '^[0-9a-f]{32}$'
+     ) THEN
+    RAISE EXCEPTION 'otlet watch definition content_digest must be a lowercase MD5 digest';
+  END IF;
+
+  pack := pack || jsonb_build_object(
+    'version_metadata', COALESCE(pack -> 'version_metadata', '{}'::jsonb),
+    'fixtures', COALESCE(pack -> 'fixtures', '[]'::jsonb),
+    'labels', COALESCE(pack -> 'labels', '[]'::jsonb),
+    'expected_receipts', COALESCE(pack -> 'expected_receipts', '[]'::jsonb),
+    'review_outcomes', COALESCE(pack -> 'review_outcomes', '[]'::jsonb),
+    'evaluation_gates', COALESCE(pack -> 'evaluation_gates', '{}'::jsonb)
+  );
+
+  IF pack ->> 'format' IS DISTINCT FROM 'otlet.watch.v1' THEN
+    RAISE EXCEPTION 'otlet watch definition format must be otlet.watch.v1';
+  END IF;
+  FOREACH object_key IN ARRAY ARRAY['name', 'kind', 'instruction', 'model_name', 'record_type', 'stale_policy'] LOOP
+    IF jsonb_typeof(pack -> object_key) IS DISTINCT FROM 'string'
+       OR NULLIF(pack ->> object_key, '') IS NULL THEN
+      RAISE EXCEPTION 'otlet watch definition % must be a non-empty string', object_key;
+    END IF;
+  END LOOP;
+  IF pack ->> 'name' !~ '^[a-z0-9][a-z0-9_-]*$' THEN
+    RAISE EXCEPTION 'otlet watch definition name must be a simple identifier';
+  END IF;
+  IF pack ->> 'kind' NOT IN ('row', 'pair') THEN
+    RAISE EXCEPTION 'otlet watch definition kind must be row or pair';
+  END IF;
+  IF jsonb_typeof(pack -> 'output_schema') IS DISTINCT FROM 'object' THEN
+    RAISE EXCEPTION 'otlet watch definition output_schema must be an object';
+  END IF;
+
+  FOREACH object_field IN ARRAY ARRAY[
+    'runtime_options', 'selection_policy', 'trigger_policy', 'input_shaping',
+    'decision_contract', 'model_artifact_identity', 'version_metadata', 'evaluation_gates'
+  ] LOOP
+    IF jsonb_typeof(pack -> object_field) IS DISTINCT FROM 'object' THEN
+      RAISE EXCEPTION 'otlet watch definition % must be an object', object_field;
+    END IF;
+  END LOOP;
+
+  FOREACH array_field IN ARRAY ARRAY[
+    'action_types', 'pair_sources', 'fixtures', 'labels', 'expected_receipts',
+    'review_outcomes'
+  ] LOOP
+    IF jsonb_typeof(pack -> array_field) IS DISTINCT FROM 'array' THEN
+      RAISE EXCEPTION 'otlet watch definition % must be an array', array_field;
+    END IF;
+  END LOOP;
+  IF jsonb_array_length(pack -> 'fixtures') > 10000
+     OR jsonb_array_length(pack -> 'labels') > 10000
+     OR jsonb_array_length(pack -> 'expected_receipts') > 10000
+     OR jsonb_array_length(pack -> 'review_outcomes') > 10000 THEN
+    RAISE EXCEPTION 'otlet watch pack evidence arrays must contain at most 10000 entries';
+  END IF;
+  FOREACH array_field IN ARRAY ARRAY['fixtures', 'labels', 'expected_receipts', 'review_outcomes'] LOOP
+    IF EXISTS (
+      SELECT 1
+      FROM jsonb_array_elements(pack -> array_field) item(value)
+      WHERE jsonb_typeof(item.value) IS DISTINCT FROM 'object'
+    ) THEN
+      RAISE EXCEPTION 'otlet watch definition % entries must be objects', array_field;
+    END IF;
+    SELECT COALESCE(
+      jsonb_agg(item.value ORDER BY otlet.semantic_canonical_jsonb(item.value)::text),
+      '[]'::jsonb
+    )
+    INTO normalized
+    FROM jsonb_array_elements(pack -> array_field) item(value);
+    pack := jsonb_set(pack, ARRAY[array_field], normalized, true);
+  END LOOP;
+
+  IF jsonb_typeof(pack -> 'input_columns') NOT IN ('array', 'null') THEN
+    RAISE EXCEPTION 'otlet watch definition input_columns must be an array or null';
+  END IF;
+  IF EXISTS (
+    SELECT 1
+    FROM jsonb_array_elements(pack -> 'action_types') item(value)
+    WHERE jsonb_typeof(item.value) IS DISTINCT FROM 'string'
+       OR NULLIF(item.value #>> '{}', '') IS NULL
+       OR NOT EXISTS (
+         SELECT 1
+         FROM otlet.action_type_schemas schema
+         WHERE schema.action_type = item.value #>> '{}'
+       )
+  ) THEN
+    RAISE EXCEPTION 'otlet watch definition action_types contains an unsupported action type';
+  END IF;
+  SELECT COALESCE(jsonb_agg(to_jsonb(value) ORDER BY value), '[]'::jsonb)
+  INTO normalized
+  FROM (
+    SELECT DISTINCT value
+    FROM jsonb_array_elements_text(pack -> 'action_types') item(value)
+  ) action_type;
+  pack := jsonb_set(pack, '{action_types}', normalized, true);
+  pack := jsonb_set(pack, '{decision_contract,action_types}', normalized, true);
+
+  IF jsonb_typeof(pack -> 'input_columns') = 'array' THEN
+    IF EXISTS (
+      SELECT 1
+      FROM jsonb_array_elements(pack -> 'input_columns') item(value)
+      WHERE jsonb_typeof(item.value) IS DISTINCT FROM 'string'
+         OR NULLIF(item.value #>> '{}', '') IS NULL
+    ) THEN
+      RAISE EXCEPTION 'otlet watch definition input_columns entries must be non-empty strings';
+    END IF;
+    SELECT COALESCE(jsonb_agg(to_jsonb(value) ORDER BY value), '[]'::jsonb)
+    INTO normalized
+    FROM (
+      SELECT DISTINCT value
+      FROM jsonb_array_elements_text(pack -> 'input_columns') item(value)
+    ) input_column;
+    pack := jsonb_set(pack, '{input_columns}', normalized, true);
+  END IF;
+
+  IF jsonb_typeof(pack -> 'max_candidate_rows') IS DISTINCT FROM 'number'
+     OR (pack ->> 'max_candidate_rows') !~ '^[1-9][0-9]*$'
+     OR (pack ->> 'max_candidate_rows')::numeric > 100000 THEN
+    RAISE EXCEPTION 'otlet watch definition max_candidate_rows must be an integer between 1 and 100000';
+  END IF;
+
+  PERFORM 1 FROM otlet.models model WHERE model.name = pack ->> 'model_name';
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'otlet watch definition model % does not exist', pack ->> 'model_name';
+  END IF;
+  PERFORM 1
+  FROM otlet.models model
+  WHERE model.name = pack ->> 'model_name'
+    AND model.artifact_identity = pack -> 'model_artifact_identity';
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'otlet watch definition model artifact identity does not match registered model %', pack ->> 'model_name';
+  END IF;
+
+  cheap_model_name := COALESCE(
+    pack #>> '{selection_policy,cheap_model_name}',
+    pack #>> '{selection_policy,cheap_model}'
+  );
+  strong_model_name := COALESCE(
+    pack #>> '{selection_policy,strong_model_name}',
+    pack #>> '{selection_policy,strong_model}'
+  );
+  IF cheap_model_name IS NOT NULL OR strong_model_name IS NOT NULL THEN
+    IF cheap_model_name IS NULL OR strong_model_name IS NULL THEN
+      RAISE EXCEPTION 'otlet watch selection_policy requires both cheap_model_name and strong_model_name';
+    END IF;
+    PERFORM 1 FROM otlet.models model WHERE model.name = cheap_model_name;
+    IF NOT FOUND THEN
+      RAISE EXCEPTION 'otlet watch selection policy model % does not exist', cheap_model_name;
+    END IF;
+    PERFORM 1 FROM otlet.models model WHERE model.name = strong_model_name;
+    IF NOT FOUND THEN
+      RAISE EXCEPTION 'otlet watch selection policy model % does not exist', strong_model_name;
+    END IF;
+  END IF;
+
+  IF pack ->> 'kind' = 'row' THEN
+    IF jsonb_typeof(pack -> 'table_name') IS DISTINCT FROM 'string'
+       OR NULLIF(pack ->> 'table_name', '') IS NULL THEN
+      RAISE EXCEPTION 'otlet row watch definition requires table_name';
+    END IF;
+    source_table := to_regclass(pack ->> 'table_name');
+    IF source_table IS NULL THEN
+      RAISE EXCEPTION 'otlet row watch definition table % does not exist', pack ->> 'table_name';
+    END IF;
+    source_column := pack ->> 'subject_column';
+    IF jsonb_typeof(pack -> 'subject_column') IS DISTINCT FROM 'string'
+       OR NULLIF(source_column, '') IS NULL
+       OR NOT EXISTS (
+         SELECT 1 FROM pg_attribute
+         WHERE attrelid = source_table
+           AND attname = source_column
+           AND attnum > 0
+           AND NOT attisdropped
+       ) THEN
+      RAISE EXCEPTION 'otlet row watch definition subject column % does not exist', source_column;
+    END IF;
+    IF pack -> 'candidate_query' <> 'null'::jsonb OR pack -> 'pair_sources' <> '[]'::jsonb THEN
+      RAISE EXCEPTION 'otlet row watch definition cannot declare pair fields';
+    END IF;
+    SELECT format('%I.%I', namespace.nspname, relation.relname)
+    INTO canonical_table
+    FROM pg_class relation
+    JOIN pg_namespace namespace ON namespace.oid = relation.relnamespace
+    WHERE relation.oid = source_table;
+    pack := jsonb_set(pack, '{table_name}', to_jsonb(canonical_table), true);
+    pack := jsonb_set(
+      pack,
+      '{input_shaping,source_fields}',
+      '["_otlet_mvcc","row","table"]'::jsonb,
+      true
+    );
+  ELSE
+    IF jsonb_typeof(pack -> 'candidate_query') IS DISTINCT FROM 'string'
+       OR NULLIF(pack ->> 'candidate_query', '') IS NULL THEN
+      RAISE EXCEPTION 'otlet pair watch definition requires candidate_query';
+    END IF;
+    IF pack -> 'table_name' <> 'null'::jsonb
+       OR pack -> 'subject_column' <> 'null'::jsonb
+       OR pack -> 'input_columns' <> 'null'::jsonb THEN
+      RAISE EXCEPTION 'otlet pair watch definition cannot declare row fields';
+    END IF;
+    PERFORM 1 FROM otlet.preflight_candidate_query(pack ->> 'candidate_query');
+
+    normalized := '[]'::jsonb;
+    FOR source IN SELECT value FROM jsonb_array_elements(pack -> 'pair_sources') item(value) LOOP
+      IF jsonb_typeof(source) IS DISTINCT FROM 'object'
+         OR EXISTS (
+           SELECT 1 FROM jsonb_object_keys(source) key
+           WHERE key NOT IN ('table', 'source_table', 'subject_column')
+         ) THEN
+        RAISE EXCEPTION 'otlet watch definition pair_sources entries must be source objects';
+      END IF;
+      source_table := to_regclass(COALESCE(source ->> 'table', source ->> 'source_table'));
+      source_column := COALESCE(NULLIF(source ->> 'subject_column', ''), 'id');
+      IF source_table IS NULL THEN
+        RAISE EXCEPTION 'otlet pair source table % does not exist', COALESCE(source ->> 'table', source ->> 'source_table');
+      END IF;
+      IF NOT EXISTS (
+        SELECT 1 FROM pg_attribute
+        WHERE attrelid = source_table
+          AND attname = source_column
+          AND attnum > 0
+          AND NOT attisdropped
+      ) THEN
+        RAISE EXCEPTION 'otlet pair source subject column % does not exist on %', source_column, source_table;
+      END IF;
+      SELECT format('%I.%I', namespace.nspname, relation.relname)
+      INTO canonical_table
+      FROM pg_class relation
+      JOIN pg_namespace namespace ON namespace.oid = relation.relnamespace
+      WHERE relation.oid = source_table;
+      normalized := normalized || jsonb_build_array(jsonb_build_object(
+        'table', canonical_table,
+        'subject_column', source_column
+      ));
+    END LOOP;
+    SELECT COALESCE(
+      jsonb_agg(item.value ORDER BY item.value ->> 'table', item.value ->> 'subject_column'),
+      '[]'::jsonb
+    )
+    INTO normalized
+    FROM jsonb_array_elements(normalized) item(value);
+    pack := jsonb_set(pack, '{pair_sources}', normalized, true);
+  END IF;
+
+  pack := otlet.watch_pack_with_digest(pack);
+  IF provided_digest IS NOT NULL AND provided_digest IS DISTINCT FROM pack ->> 'content_digest' THEN
+    RAISE EXCEPTION 'otlet watch definition content digest does not match canonical content';
+  END IF;
+  RETURN pack;
+END;
+$$;
+
 CREATE FUNCTION otlet.export_watch(watch_name text) RETURNS jsonb
 LANGUAGE plpgsql
 STABLE
@@ -12,6 +340,7 @@ BEGIN
     'instruction', t.instruction,
     'output_schema', w.output_schema,
     'model_name', w.model_name,
+    'model_artifact_identity', m.artifact_identity,
     'table_name', w.source_table,
     'subject_column', w.subject_column,
     'candidate_query', w.candidate_query,
@@ -40,18 +369,72 @@ BEGIN
         FROM jsonb_array_elements(w.pair_sources) source(value)
       ),
       '[]'::jsonb
-    )
+    ),
+    'version_metadata', COALESCE(version.definition -> 'version_metadata', '{}'::jsonb),
+    'fixtures', COALESCE(version.definition -> 'fixtures', '[]'::jsonb),
+    'labels', COALESCE(version.definition -> 'labels', '[]'::jsonb),
+    'expected_receipts', COALESCE(version.definition -> 'expected_receipts', '[]'::jsonb),
+    'review_outcomes', COALESCE(version.definition -> 'review_outcomes', '[]'::jsonb),
+    'evaluation_gates', COALESCE(version.definition -> 'evaluation_gates', '{}'::jsonb)
   )
   INTO definition
   FROM otlet.watches w
   JOIN otlet.tasks t ON t.name = w.task_name
+  JOIN otlet.models m ON m.name = w.model_name
+  LEFT JOIN otlet.watch_pack_heads head ON head.watch_name = w.name
+  LEFT JOIN otlet.watch_pack_versions version ON version.id = head.version_id
   WHERE w.name = export_watch.watch_name;
 
   IF NOT FOUND THEN
     RAISE EXCEPTION 'otlet watch % does not exist', watch_name;
   END IF;
 
-  RETURN definition;
+  RETURN otlet.watch_pack_with_digest(definition);
+END;
+$$;
+
+CREATE FUNCTION otlet.record_watch_pack_version(definition jsonb)
+RETURNS otlet.watch_pack_versions
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  canonical jsonb := otlet.watch_pack_with_digest(record_watch_pack_version.definition);
+  saved otlet.watch_pack_versions%ROWTYPE;
+  next_version integer;
+  pack_watch_name text := canonical ->> 'name';
+BEGIN
+  IF jsonb_typeof(record_watch_pack_version.definition) IS DISTINCT FROM 'object'
+     OR canonical IS DISTINCT FROM record_watch_pack_version.definition THEN
+    RAISE EXCEPTION 'otlet watch pack version requires a canonical definition';
+  END IF;
+
+  PERFORM pg_advisory_xact_lock(hashtextextended('otlet.watch_pack:' || pack_watch_name, 0));
+  SELECT COALESCE(max(version.version_number), 0) + 1
+  INTO next_version
+  FROM otlet.watch_pack_versions version
+  WHERE version.watch_name = pack_watch_name;
+
+  INSERT INTO otlet.watch_pack_versions (
+    watch_name,
+    version_number,
+    content_digest,
+    definition
+  )
+  VALUES (
+    pack_watch_name,
+    next_version,
+    canonical ->> 'content_digest',
+    canonical
+  )
+  RETURNING * INTO saved;
+
+  INSERT INTO otlet.watch_pack_heads (watch_name, version_id, updated_at)
+  VALUES (pack_watch_name, saved.id, now())
+  ON CONFLICT (watch_name) DO UPDATE
+    SET version_id = EXCLUDED.version_id,
+        updated_at = now();
+
+  RETURN saved;
 END;
 $$;
 
@@ -62,31 +445,6 @@ CREATE FUNCTION otlet.import_watch(
 LANGUAGE plpgsql
 AS $$
 DECLARE
-  allowed_keys constant text[] := ARRAY[
-    'format',
-    'name',
-    'kind',
-    'instruction',
-    'output_schema',
-    'model_name',
-    'table_name',
-    'subject_column',
-    'candidate_query',
-    'record_type',
-    'runtime_options',
-    'selection_policy',
-    'trigger_policy',
-    'action_types',
-    'stale_policy',
-    'input_shaping',
-    'decision_contract',
-    'max_candidate_rows',
-    'input_columns',
-    'pair_sources'
-  ];
-  object_key text;
-  object_field text;
-  array_field text;
   watch_name text;
   watch_kind text;
   table_name regclass;
@@ -94,103 +452,10 @@ DECLARE
   input_columns text[];
   saved otlet.watches%ROWTYPE;
 BEGIN
-  IF jsonb_typeof(import_watch.definition) IS DISTINCT FROM 'object' THEN
-    RAISE EXCEPTION 'otlet watch definition must be a JSON object';
-  END IF;
-
-  SELECT key INTO object_key
-  FROM jsonb_object_keys(import_watch.definition) key
-  WHERE NOT key = ANY(allowed_keys)
-  ORDER BY key
-  LIMIT 1;
-  IF object_key IS NOT NULL THEN
-    RAISE EXCEPTION 'otlet watch definition has unsupported key %', object_key;
-  END IF;
-
-  SELECT key INTO object_key
-  FROM unnest(allowed_keys) key
-  WHERE NOT import_watch.definition ? key
-  ORDER BY key
-  LIMIT 1;
-  IF object_key IS NOT NULL THEN
-    RAISE EXCEPTION 'otlet watch definition is missing key %', object_key;
-  END IF;
-
-  IF import_watch.definition ->> 'format' IS DISTINCT FROM 'otlet.watch.v1' THEN
-    RAISE EXCEPTION 'otlet watch definition format must be otlet.watch.v1';
-  END IF;
-
-  FOREACH object_key IN ARRAY ARRAY['name', 'kind', 'instruction', 'model_name', 'record_type', 'stale_policy'] LOOP
-    IF jsonb_typeof(import_watch.definition -> object_key) IS DISTINCT FROM 'string'
-       OR NULLIF(import_watch.definition ->> object_key, '') IS NULL THEN
-      RAISE EXCEPTION 'otlet watch definition % must be a non-empty string', object_key;
-    END IF;
-  END LOOP;
-
-  IF jsonb_typeof(import_watch.definition -> 'output_schema') IS DISTINCT FROM 'object' THEN
-    RAISE EXCEPTION 'otlet watch definition output_schema must be an object';
-  END IF;
-
-  FOREACH object_field IN ARRAY ARRAY[
-    'runtime_options',
-    'selection_policy',
-    'trigger_policy',
-    'input_shaping',
-    'decision_contract'
-  ] LOOP
-    IF jsonb_typeof(import_watch.definition -> object_field) IS DISTINCT FROM 'object' THEN
-      RAISE EXCEPTION 'otlet watch definition % must be an object', object_field;
-    END IF;
-  END LOOP;
-
-  FOREACH array_field IN ARRAY ARRAY['action_types', 'pair_sources'] LOOP
-    IF jsonb_typeof(import_watch.definition -> array_field) IS DISTINCT FROM 'array' THEN
-      RAISE EXCEPTION 'otlet watch definition % must be an array', array_field;
-    END IF;
-  END LOOP;
-  IF NOT import_watch.definition ? 'input_columns'
-     OR jsonb_typeof(import_watch.definition -> 'input_columns') NOT IN ('array', 'null') THEN
-    RAISE EXCEPTION 'otlet watch definition input_columns must be an array or null';
-  END IF;
-  IF EXISTS (
-    SELECT 1
-    FROM jsonb_array_elements(import_watch.definition -> 'action_types') item(value)
-    WHERE jsonb_typeof(item.value) IS DISTINCT FROM 'string'
-  ) THEN
-    RAISE EXCEPTION 'otlet watch definition action_types entries must be strings';
-  END IF;
-  IF jsonb_typeof(import_watch.definition -> 'input_columns') = 'array'
-     AND EXISTS (
-       SELECT 1
-       FROM jsonb_array_elements(import_watch.definition -> 'input_columns') item(value)
-       WHERE jsonb_typeof(item.value) IS DISTINCT FROM 'string'
-     ) THEN
-    RAISE EXCEPTION 'otlet watch definition input_columns entries must be strings';
-  END IF;
-  IF EXISTS (
-    SELECT 1
-    FROM jsonb_array_elements(import_watch.definition -> 'pair_sources') item(value)
-    WHERE jsonb_typeof(item.value) IS DISTINCT FROM 'object'
-  ) THEN
-    RAISE EXCEPTION 'otlet watch definition pair_sources entries must be objects';
-  END IF;
-
-  IF jsonb_typeof(import_watch.definition -> 'max_candidate_rows') IS DISTINCT FROM 'number'
-     OR (import_watch.definition ->> 'max_candidate_rows') !~ '^[1-9][0-9]*$'
-     OR (import_watch.definition ->> 'max_candidate_rows')::numeric > 100000 THEN
-    RAISE EXCEPTION 'otlet watch definition max_candidate_rows must be an integer between 1 and 100000';
-  END IF;
+  definition := otlet.validate_watch_pack(import_watch.definition);
 
   watch_name := import_watch.definition ->> 'name';
   watch_kind := import_watch.definition ->> 'kind';
-  IF watch_kind NOT IN ('row', 'pair') THEN
-    RAISE EXCEPTION 'otlet watch definition kind must be row or pair';
-  END IF;
-
-  PERFORM 1 FROM otlet.models m WHERE m.name = import_watch.definition ->> 'model_name';
-  IF NOT FOUND THEN
-    RAISE EXCEPTION 'otlet watch definition model % does not exist', import_watch.definition ->> 'model_name';
-  END IF;
 
   IF EXISTS (SELECT 1 FROM otlet.watches w WHERE w.name = watch_name)
      AND NOT COALESCE(import_watch.replace_existing, false) THEN
@@ -198,32 +463,7 @@ BEGIN
   END IF;
 
   IF watch_kind = 'row' THEN
-    IF jsonb_typeof(import_watch.definition -> 'table_name') IS DISTINCT FROM 'string'
-       OR NULLIF(import_watch.definition ->> 'table_name', '') IS NULL THEN
-      RAISE EXCEPTION 'otlet row watch definition requires table_name';
-    END IF;
-    IF jsonb_typeof(import_watch.definition -> 'subject_column') IS DISTINCT FROM 'string'
-       OR NULLIF(import_watch.definition ->> 'subject_column', '') IS NULL THEN
-      RAISE EXCEPTION 'otlet row watch definition requires subject_column';
-    END IF;
-    IF import_watch.definition -> 'candidate_query' <> 'null'::jsonb
-       OR import_watch.definition -> 'pair_sources' <> '[]'::jsonb THEN
-      RAISE EXCEPTION 'otlet row watch definition cannot declare pair fields';
-    END IF;
     table_name := to_regclass(import_watch.definition ->> 'table_name');
-    IF table_name IS NULL THEN
-      RAISE EXCEPTION 'otlet row watch definition table % does not exist', import_watch.definition ->> 'table_name';
-    END IF;
-  ELSE
-    IF jsonb_typeof(import_watch.definition -> 'candidate_query') IS DISTINCT FROM 'string'
-       OR NULLIF(import_watch.definition ->> 'candidate_query', '') IS NULL THEN
-      RAISE EXCEPTION 'otlet pair watch definition requires candidate_query';
-    END IF;
-    IF import_watch.definition -> 'table_name' <> 'null'::jsonb
-       OR import_watch.definition -> 'subject_column' <> 'null'::jsonb
-       OR import_watch.definition -> 'input_columns' <> 'null'::jsonb THEN
-      RAISE EXCEPTION 'otlet pair watch definition cannot declare row fields';
-    END IF;
   END IF;
 
   SELECT COALESCE(array_agg(value ORDER BY value), ARRAY[]::text[])
@@ -259,9 +499,109 @@ BEGIN
     pair_sources => import_watch.definition -> 'pair_sources'
   );
 
+  PERFORM otlet.record_watch_pack_version(import_watch.definition);
+
   RETURN saved;
 END;
 $$;
+
+CREATE FUNCTION otlet.lint_watch_pack(definition jsonb)
+RETURNS TABLE(valid boolean, content_digest text)
+LANGUAGE sql
+AS $$
+  SELECT true, otlet.validate_watch_pack($1) ->> 'content_digest';
+$$;
+
+CREATE FUNCTION otlet.dry_run_watch_pack(definition jsonb) RETURNS jsonb
+LANGUAGE sql
+AS $$
+  SELECT otlet.validate_watch_pack($1);
+$$;
+
+CREATE FUNCTION otlet.diff_watch_packs(before_definition jsonb, after_definition jsonb)
+RETURNS TABLE (
+  field_name text,
+  change_type text,
+  before_value jsonb,
+  after_value jsonb
+)
+LANGUAGE sql
+AS $$
+  WITH packs AS (
+    SELECT
+      otlet.validate_watch_pack($1) - 'content_digest' AS before_pack,
+      otlet.validate_watch_pack($2) - 'content_digest' AS after_pack
+  ), fields AS (
+    SELECT key
+    FROM packs
+    CROSS JOIN LATERAL (
+      SELECT jsonb_object_keys(before_pack) AS key
+      UNION
+      SELECT jsonb_object_keys(after_pack) AS key
+    ) keys
+  )
+  SELECT
+    fields.key,
+    CASE
+      WHEN NOT packs.before_pack ? fields.key THEN 'added'
+      WHEN NOT packs.after_pack ? fields.key THEN 'removed'
+      ELSE 'changed'
+    END,
+    packs.before_pack -> fields.key,
+    packs.after_pack -> fields.key
+  FROM packs
+  CROSS JOIN fields
+  WHERE packs.before_pack -> fields.key IS DISTINCT FROM packs.after_pack -> fields.key
+  ORDER BY fields.key;
+$$;
+
+CREATE FUNCTION otlet.rollback_watch_pack(
+  watch_name text,
+  version_number integer
+) RETURNS otlet.watches
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  definition jsonb;
+  saved otlet.watches%ROWTYPE;
+BEGIN
+  SELECT version.definition
+  INTO definition
+  FROM otlet.watch_pack_versions version
+  WHERE version.watch_name = rollback_watch_pack.watch_name
+    AND version.version_number = rollback_watch_pack.version_number;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'otlet watch pack version %.% does not exist', watch_name, version_number;
+  END IF;
+
+  SELECT *
+  INTO saved
+  FROM otlet.import_watch(definition, true);
+  RETURN saved;
+END;
+$$;
+
+CREATE VIEW otlet.watch_pack_history AS
+SELECT
+  version.id,
+  version.watch_name,
+  version.version_number,
+  version.content_digest,
+  head.version_id = version.id AS current_version,
+  version.definition -> 'version_metadata' AS version_metadata,
+  version.definition ->> 'candidate_query' AS candidate_query,
+  version.definition ->> 'instruction' AS instruction,
+  version.definition -> 'output_schema' AS output_schema,
+  version.definition -> 'selection_policy' AS model_policy,
+  version.definition -> 'fixtures' AS fixtures,
+  version.definition -> 'labels' AS labels,
+  version.definition -> 'expected_receipts' AS expected_receipts,
+  version.definition -> 'review_outcomes' AS review_outcomes,
+  version.definition -> 'evaluation_gates' AS evaluation_gates,
+  version.created_by,
+  version.created_at
+FROM otlet.watch_pack_versions version
+LEFT JOIN otlet.watch_pack_heads head ON head.watch_name = version.watch_name;
 
 CREATE VIEW otlet.watch_status AS
 WITH watch_sources AS (
@@ -277,6 +617,9 @@ WITH watch_sources AS (
     '[]'::jsonb AS pair_sources,
     si.record_type,
     si.model_name,
+    NULL::jsonb AS candidate_plan,
+    NULL::numeric AS candidate_plan_cost,
+    NULL::timestamptz AS candidate_preflight_at,
     COALESCE(w.stale_policy, 'refresh_then_fail_closed') AS stale_policy,
     COALESCE(w.trigger_policy, '{"on_change":"mark_stale"}'::jsonb) AS trigger_policy,
     COALESCE(w.selection_policy, '{}'::jsonb) AS selection_policy
@@ -295,6 +638,9 @@ WITH watch_sources AS (
     COALESCE(w.pair_sources, '[]'::jsonb) AS pair_sources,
     ji.record_type,
     ji.model_name,
+    ji.candidate_plan,
+    ji.candidate_plan_cost,
+    ji.candidate_preflight_at,
     COALESCE(w.stale_policy, 'refresh_then_fail_closed') AS stale_policy,
     COALESCE(w.trigger_policy, '{"on_change":"mark_stale"}'::jsonb) AS trigger_policy,
     COALESCE(w.selection_policy, '{}'::jsonb) AS selection_policy
@@ -374,6 +720,9 @@ SELECT
   w.pair_sources,
   w.record_type,
   w.model_name,
+  w.candidate_plan,
+  w.candidate_plan_cost,
+  w.candidate_preflight_at,
   w.stale_policy,
   w.trigger_policy,
   w.selection_policy,

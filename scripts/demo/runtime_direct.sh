@@ -49,6 +49,11 @@ SELECT 'direct_ask_runtime_fingerprint_contract=' ||
        s.runtime_fingerprint_version || '|' ||
        (s.runtime_fingerprint_hash = rs.runtime_fingerprint_hash)::text || '|' ||
        (s.runtime_output_contract_hash = rs.runtime_output_contract_hash)::text || '|' ||
+       (s.model_artifact_hash = rs.artifact_sha256)::text || '|' ||
+       (s.model_artifact_identity = rs.artifact_identity)::text || '|' ||
+       (s.runtime_fingerprint -> 'artifact' ->> 'sha256' = s.model_artifact_hash)::text || '|' ||
+       (s.runtime_fingerprint -> 'artifact' -> 'identity' = s.model_artifact_identity)::text || '|' ||
+       (s.runtime_fingerprint -> 'artifact' ->> 'verification') || '|' ||
        (s.runtime_fingerprint -> 'artifact' ->> 'quantization') || '|' ||
        jsonb_extract_path_text(s.runtime_fingerprint, 'output_contract', 'prompt_template', 'name') || '|' ||
        jsonb_extract_path_text(s.runtime_fingerprint, 'output_contract', 'llama_cpp', 'revision') || '|' ||
@@ -65,12 +70,12 @@ direct_ask_receipt_contract="$(sed -n 's/^direct_ask_receipt_contract=//p' <<<"$
 direct_ask_cache_contract="$(sed -n 's/^direct_ask_cache_contract=//p' <<<"$direct_ask_output")"
 direct_ask_runtime_fingerprint_contract="$(sed -n 's/^direct_ask_runtime_fingerprint_contract=//p' <<<"$direct_ask_output")"
 require_regex "$direct_ask_contract" '^review_payment\|[1-9][0-9]*\|[1-9][0-9]*$' "Expected direct ask to return review_payment with job and receipt ids"
-require_regex "$direct_ask_receipt_contract" "^$strong_model_name\\|complete\\|passed\\|[1-9][0-9]*\\|post_generation_json_schema_validation\\|greedy_with_balanced_json_object_stop_post_generation_schema_check\\|balanced_json_stop_prevents_trailing_prose_schema_failures_stay_receipts_only\\|chosen_token_softmax_from_llama_logits$" "Expected direct ask decode and validation evidence"
+require_regex "$direct_ask_receipt_contract" "^$strong_model_name\\|complete\\|passed\\|[1-9][0-9]*\\|postgres_portable_json_schema_validation\\|greedy_with_balanced_json_object_stop_post_generation_schema_check\\|balanced_json_stop_prevents_trailing_prose_schema_failures_stay_receipts_only\\|chosen_token_softmax_from_llama_logits$" "Expected direct ask decode and validation evidence"
 [ "$direct_ask_cache_contract" = "false|disabled_for_generation_trace|content_hash_contract_hash_runtime_output_contract_hash_model_fingerprint|true|none" ] || {
   echo "Expected direct ask trace to make cache-disabled-under-generation-trace explicit, got $direct_ask_cache_contract" >&2
   exit 1
 }
-require_regex "$direct_ask_runtime_fingerprint_contract" '^otlet_runtime_fingerprint_v1\|true\|true\|Q4_K_M\|otlet_raw_json_worker_v1\|94a220cd6\|512\|[1-9][0-9]*$' "Expected receipt and runtime status to share one complete runtime fingerprint"
+require_regex "$direct_ask_runtime_fingerprint_contract" '^otlet_runtime_fingerprint_v1\|true\|true\|true\|true\|true\|true\|sha256_verified_before_model_load\|Q4_K_M\|otlet_raw_json_worker_v1\|94a220cd6\|512\|[1-9][0-9]*$' "Expected receipt and runtime status to share one verified model identity and complete runtime fingerprint"
 
 log "Checking opt-in direct decision contract gate"
 direct_gate_jobs_completed_before="$(psql_value -v model_name="$strong_model_name" <<'SQL'
@@ -110,7 +115,7 @@ SELECT otlet.create_task(
   }'::jsonb,
   :'model_name',
   '{"max_tokens":96,"reasoning":"off","inference_cache":false}'::jsonb,
-  '{}'::jsonb,
+  '{"source_fields":["row"]}'::jsonb,
   '{"answer_field":"decision","abstain_values":["unclear"],"confidence_field":"confidence","accepted_confidence":["high"],"enforce_on_direct":true}'::jsonb
 );
 
@@ -170,7 +175,7 @@ WITH params AS (
       }
     }'::jsonb AS output_schema,
     '{"max_tokens":256,"reasoning":"off","inference_cache":false}'::jsonb AS runtime_options,
-    '{"evidence_fields":["candidate_evidence"],"action_id_fields":{"left_id":"left_id","right_id":"right_id"}}'::jsonb AS input_shaping
+    '{"source_fields":["candidate_evidence","left_id","right_id"],"evidence_fields":["candidate_evidence"],"action_id_fields":{"left_id":"left_id","right_id":"right_id"}}'::jsonb AS input_shaping
 )
 SELECT otlet.create_task(
   :'preset_task',
@@ -210,7 +215,7 @@ WITH params AS (
       }
     }'::jsonb AS output_schema,
     '{"max_tokens":256,"reasoning":"off","inference_cache":false}'::jsonb AS runtime_options,
-    '{"evidence_fields":["candidate_evidence"],"action_id_fields":{"left_id":"left_id","right_id":"right_id"}}'::jsonb AS input_shaping
+    '{"source_fields":["candidate_evidence","left_id","right_id"],"evidence_fields":["candidate_evidence"],"action_id_fields":{"left_id":"left_id","right_id":"right_id"}}'::jsonb AS input_shaping
 )
 SELECT otlet.create_task(
   :'direct_task',
@@ -284,7 +289,7 @@ SELECT otlet.create_task(
   output_schema,
   :'model_name',
   runtime_options,
-  '{}'::jsonb,
+  '{"source_fields":["_otlet_mvcc","row"]}'::jsonb,
   '{"answer_field":"status","abstain_values":[],"confidence_field":"confidence","accepted_confidence":["high"]}'::jsonb
 )
 FROM params;
@@ -305,7 +310,7 @@ SELECT otlet.create_task(
   output_schema,
   :'model_name',
   runtime_options,
-  '{}'::jsonb,
+  '{"source_fields":["row"]}'::jsonb,
   '{"answer_field":"status","abstain_values":[],"confidence_field":"confidence","accepted_confidence":["high"]}'::jsonb
 )
 FROM params;
@@ -320,7 +325,7 @@ SELECT otlet.create_task(
   '{"type":"object","required":["status","confidence"],"additionalProperties":false,"properties":{"status":{"enum":["truncated"]},"confidence":{"enum":["high"]}}}'::jsonb,
   :'model_name',
   '{"max_tokens":64,"reasoning":"off","inference_cache":false}'::jsonb,
-  '{"max_shaped_input_bytes":256}'::jsonb,
+  '{"source_fields":["row"],"max_shaped_input_bytes":256}'::jsonb,
   '{"answer_field":"status","abstain_values":["truncated"],"confidence_field":"confidence","accepted_confidence":["high"]}'::jsonb
 );
 

@@ -1,5 +1,5 @@
 log "Checking pair candidate drift audit"
-candidate_removed_contract="$(psql_exec -qAt -v index_name="$join_index_name" -v task_name="$join_task" <<'SQL'
+candidate_removed_contract="$(psql_candidate_exec -qAt -v index_name="$join_index_name" -v task_name="$join_task" <<'SQL'
 BEGIN;
 DELETE FROM public.otlet_demo_vendor_pair
 WHERE pair_id = 'vendor-1001:vendor-314';
@@ -32,7 +32,7 @@ echo "candidate_removed_contract=$candidate_removed_refresh|$candidate_removed_a
   exit 1
 }
 
-candidate_changed_contract="$(psql_exec -qAt -v index_name="$join_index_name" -v task_name="$join_task" <<'SQL'
+candidate_changed_contract="$(psql_candidate_exec -qAt -v index_name="$join_index_name" -v task_name="$join_task" <<'SQL'
 BEGIN;
 UPDATE public.otlet_demo_vendor_pair
 SET right_id = 'vendor-77'

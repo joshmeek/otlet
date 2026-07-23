@@ -1,10 +1,16 @@
 -- Atomic queue claim for the resident worker; returns zero rows when no work exists
-CREATE FUNCTION otlet.claim_jobs() RETURNS SETOF otlet.jobs
+CREATE FUNCTION otlet.claim_jobs(
+  requested_model_name text DEFAULT NULL,
+  requested_limit integer DEFAULT NULL
+) RETURNS SETOF otlet.jobs
 LANGUAGE sql
 AS $$
   WITH policy AS (
     SELECT
-      worker_claim_batch_size AS batch_size,
+      CASE
+        WHEN claim_jobs.requested_limit IS NULL THEN worker_claim_batch_size
+        ELSE LEAST(worker_claim_batch_size, GREATEST(claim_jobs.requested_limit, 1))
+      END AS batch_size,
       worker_claim_task_cursor AS task_cursor,
       max_attempts,
       max_attempt_ms,
@@ -12,7 +18,33 @@ AS $$
       job_lease_interval
     FROM otlet.production_policy
     WHERE name = 'default'
+      AND otlet.database_health_claims_allowed()
     FOR UPDATE
+  ),
+  invalid_claim_input AS MATERIALIZED (
+    SELECT j.id
+    FROM otlet.jobs j
+    JOIN otlet.tasks t ON t.name = j.task_name
+    WHERE j.status IN ('queued', 'running', 'cancel_requested')
+      AND (
+        claim_jobs.requested_model_name IS NULL
+        OR t.model_name = claim_jobs.requested_model_name
+      )
+      AND NOT otlet.source_fields_are_allowed(j.input, t.input_shaping)
+    ORDER BY j.created_at, j.id
+    FOR UPDATE OF j SKIP LOCKED
+    LIMIT (SELECT batch_size FROM policy)
+  ),
+  rejected_claim_input AS (
+    UPDATE otlet.jobs j
+    SET status = 'failed',
+        leased_until = NULL,
+        claim_token = NULL,
+        error = 'source field allowlist violation',
+        finished_at = now()
+    FROM invalid_claim_input invalid
+    WHERE j.id = invalid.id
+    RETURNING j.id
   ),
   active_model AS (
     SELECT
@@ -70,6 +102,11 @@ AS $$
         COALESCE(active_model.running_jobs, 0)
         + COALESCE(active_model.cancel_requested_jobs, 0)
       ) < m.max_active_jobs
+      AND (
+        claim_jobs.requested_model_name IS NULL
+        OR t.model_name = claim_jobs.requested_model_name
+      )
+      AND otlet.source_fields_are_allowed(j.input, t.input_shaping)
     GROUP BY
       j.task_name,
       m.name,
@@ -155,6 +192,7 @@ AS $$
           AND (j.leased_until IS NULL OR j.leased_until < now())
         )
       )
+      AND otlet.source_fields_are_allowed(j.input, t.input_shaping)
   ),
   claimable AS (
     SELECT
@@ -177,6 +215,12 @@ AS $$
           j.status = 'cancel_requested'
           AND (j.leased_until IS NULL OR j.leased_until < now())
         )
+      )
+      AND EXISTS (
+        SELECT 1
+        FROM otlet.tasks t
+        WHERE t.name = j.task_name
+          AND otlet.source_fields_are_allowed(j.input, t.input_shaping)
       )
     ORDER BY
       candidate.task_job_rank,
@@ -201,6 +245,9 @@ AS $$
     SET status = CASE WHEN j.status = 'cancel_requested' THEN 'cancel_requested' ELSE 'running' END,
         attempts = attempts + 1,
         leased_until = now() + claimable.lease_interval,
+        claim_token = gen_random_uuid()::text,
+        terminal_claim_token = NULL,
+        terminal_request_hash = NULL,
         error = CASE WHEN j.status = 'cancel_requested' THEN j.error ELSE NULL END,
         started_at = now(),
         finished_at = NULL
@@ -212,12 +259,13 @@ AS $$
   SELECT updated.*
   FROM updated
   JOIN claimable ON claimable.id = updated.id
+  CROSS JOIN (SELECT count(*) FROM rejected_claim_input) rejected
   ORDER BY claimable.task_rank, claimable.task_job_rank;
 $$;
 
 CREATE FUNCTION otlet.renew_job_lease(
   job_id bigint,
-  expected_attempt integer
+  expected_claim_token text
 ) RETURNS TABLE (
   status text,
   leased_until timestamptz
@@ -233,11 +281,27 @@ AS $$
   FROM otlet.tasks t
   CROSS JOIN otlet.production_policy p
   WHERE j.id = renew_job_lease.job_id
-    AND j.attempts = renew_job_lease.expected_attempt
+    AND j.claim_token = renew_job_lease.expected_claim_token
     AND j.status IN ('running', 'cancel_requested')
+    AND j.leased_until IS NOT NULL
+    AND j.leased_until >= now()
     AND t.name = j.task_name
     AND p.name = 'default'
   RETURNING j.status, j.leased_until;
+$$;
+
+CREATE FUNCTION otlet.job_terminal_request_hash(
+  operation text,
+  request jsonb
+) RETURNS text
+LANGUAGE sql
+IMMUTABLE
+PARALLEL SAFE
+AS $$
+  SELECT encode(
+    sha256(convert_to(job_terminal_request_hash.operation || ':' || job_terminal_request_hash.request::text, 'UTF8')),
+    'hex'
+  )
 $$;
 
 CREATE FUNCTION otlet.mark_job_started(job_id bigint) RETURNS void
@@ -278,4 +342,3 @@ BEGIN
   );
 END;
 $$;
-

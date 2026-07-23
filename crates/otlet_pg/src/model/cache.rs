@@ -72,94 +72,23 @@ fn inference_cache_model_key(model: JobModelRef<'_>, context: &RunContext) -> u6
 }
 
 fn model_fingerprint_hash(model: JobModelRef<'_>) -> Arc<str> {
-    if let Some(hash) = model
-        .artifact_hash
-        .map(str::trim)
-        .filter(|hash| !hash.is_empty())
-    {
-        thread_local! {
-            static CATALOG_FINGERPRINT_CACHE: RefCell<HashMap<String, Arc<str>>> =
-                RefCell::new(HashMap::with_capacity(4));
-        }
-        return CATALOG_FINGERPRINT_CACHE.with(|cell| {
-            let mut cache = cell.borrow_mut();
-            if let Some(cached) = cache.get(hash) {
-                return Arc::clone(cached);
-            }
-            let fingerprint = Arc::<str>::from(hash_text_parts(&["catalog_hash:", hash]));
-            if cache.len() >= 32 {
-                cache.drain().next();
-            }
-            cache.insert(hash.to_owned(), Arc::clone(&fingerprint));
-            fingerprint
-        });
+    let hash = model.artifact_hash;
+    thread_local! {
+        static CATALOG_FINGERPRINT_CACHE: RefCell<HashMap<String, Arc<str>>> =
+            RefCell::new(HashMap::with_capacity(4));
     }
-
-    struct FingerprintMeta {
-        modified_ms: u128,
-        bytes: u64,
-        hash: Arc<str>,
-    }
-
-    static FINGERPRINT_CACHE: OnceLock<Mutex<HashMap<String, FingerprintMeta>>> = OnceLock::new();
-
-    let metadata = match fs::metadata(model.artifact_path) {
-        Ok(metadata) => metadata,
-        Err(_) => {
-            return Arc::<str>::from(hash_text_parts(&["path_only:", model.artifact_path]));
+    CATALOG_FINGERPRINT_CACHE.with(|cell| {
+        let mut cache = cell.borrow_mut();
+        if let Some(cached) = cache.get(hash) {
+            return Arc::clone(cached);
         }
-    };
-    let modified_ms = metadata
-        .modified()
-        .ok()
-        .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
-        .map_or(0, |duration| duration.as_millis());
-    let bytes = metadata.len();
-
-    let cache = FINGERPRINT_CACHE.get_or_init(|| Mutex::new(HashMap::with_capacity(32)));
-    if let Ok(mut cache) = cache.lock() {
-        if let Some(cached) = cache.get(model.artifact_path)
-            && cached.modified_ms == modified_ms
-            && cached.bytes == bytes
-        {
-            return Arc::clone(&cached.hash);
-        }
-
-        let hash = local_file_fingerprint(model.artifact_path, modified_ms, bytes);
-        let shared = Arc::<str>::from(hash);
+        let fingerprint = Arc::<str>::from(hash_text_parts(&["catalog_hash:", hash]));
         if cache.len() >= 32 {
-            // Drop an arbitrary entry; process-local and rebuilt from metadata
             cache.drain().next();
         }
-        cache.insert(
-            model.artifact_path.to_owned(),
-            FingerprintMeta {
-                modified_ms,
-                bytes,
-                hash: Arc::clone(&shared),
-            },
-        );
-        return shared;
-    }
-
-    Arc::<str>::from(local_file_fingerprint(
-        model.artifact_path,
-        modified_ms,
-        bytes,
-    ))
-}
-
-fn local_file_fingerprint(path: &str, modified_ms: u128, bytes: u64) -> String {
-    let bytes_text = bytes.to_string();
-    let modified_text = modified_ms.to_string();
-    hash_text_parts(&[
-        "local_file:path=",
-        path,
-        ":bytes=",
-        &bytes_text,
-        ":mtime_ms=",
-        &modified_text,
-    ])
+        cache.insert(hash.to_owned(), Arc::clone(&fingerprint));
+        fingerprint
+    })
 }
 
 fn input_mvcc_row_identity(input: &Value, subject_id: &str) -> String {

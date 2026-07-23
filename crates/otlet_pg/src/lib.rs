@@ -42,14 +42,24 @@ pgrx::extension_sql_file!(
     requires = ["tasks_scan"]
 );
 pgrx::extension_sql_file!(
+    "../sql/075_database_health.sql",
+    name = "database_health",
+    requires = ["runtime_health"]
+);
+pgrx::extension_sql_file!(
     "../sql/080_job_claims.sql",
     name = "job_claims",
-    requires = ["runtime_health"]
+    requires = ["database_health"]
+);
+pgrx::extension_sql_file!(
+    "../sql/085_portable_schema.sql",
+    name = "portable_schema",
+    requires = ["job_claims"]
 );
 pgrx::extension_sql_file!(
     "../sql/090_job_attempts.sql",
     name = "job_attempts",
-    requires = ["job_claims"]
+    requires = ["portable_schema"]
 );
 pgrx::extension_sql_file!(
     "../sql/100_job_cancellation.sql",
@@ -67,14 +77,24 @@ pgrx::extension_sql_file!(
     requires = ["job_terminal_recovery"]
 );
 pgrx::extension_sql_file!(
+    "../sql/125_portable_result_validation.sql",
+    name = "portable_result_validation",
+    requires = ["action_contract"]
+);
+pgrx::extension_sql_file!(
     "../sql/130_action_completion_review.sql",
     name = "action_completion_review",
-    requires = ["action_contract"]
+    requires = ["portable_result_validation"]
+);
+pgrx::extension_sql_file!(
+    "../sql/135_portable_worker_protocol.sql",
+    name = "portable_worker_protocol",
+    requires = ["action_completion_review"]
 );
 pgrx::extension_sql_file!(
     "../sql/140_action_execution.sql",
     name = "action_execution",
-    requires = ["action_completion_review"]
+    requires = ["portable_worker_protocol"]
 );
 pgrx::extension_sql_file!(
     "../sql/150_eval_labels.sql",
@@ -82,9 +102,14 @@ pgrx::extension_sql_file!(
     requires = ["action_execution"]
 );
 pgrx::extension_sql_file!(
+    "../sql/155_workload_evaluation.sql",
+    name = "workload_evaluation",
+    requires = ["eval_labels"]
+);
+pgrx::extension_sql_file!(
     "../sql/160_action_review_status.sql",
     name = "action_review_status",
-    requires = ["eval_labels"]
+    requires = ["workload_evaluation"]
 );
 pgrx::extension_sql_file!(
     "../sql/170_inference_receipt_status.sql",
@@ -92,9 +117,19 @@ pgrx::extension_sql_file!(
     requires = ["action_review_status"]
 );
 pgrx::extension_sql_file!(
+    "../sql/175_decision_exports.sql",
+    name = "decision_exports",
+    requires = ["inference_receipt_status"]
+);
+pgrx::extension_sql_file!(
+    "../sql/177_destination_reconciliation.sql",
+    name = "destination_reconciliation",
+    requires = ["decision_exports"]
+);
+pgrx::extension_sql_file!(
     "../sql/180_runtime_cache_status.sql",
     name = "runtime_cache_status",
-    requires = ["inference_receipt_status"]
+    requires = ["destination_reconciliation"]
 );
 pgrx::extension_sql_file!(
     "../sql/190_trace_tokens.sql",
@@ -197,9 +232,14 @@ pgrx::extension_sql_file!(
     requires = ["watch_portability_status"]
 );
 pgrx::extension_sql_file!(
+    "../sql/385_portable_permissions.sql",
+    name = "portable_permissions",
+    requires = ["audit_export"]
+);
+pgrx::extension_sql_file!(
     "../sql/390_permissions.sql",
     name = "permissions",
-    requires = ["audit_export"]
+    requires = ["portable_permissions"]
 );
 
 #[allow(non_snake_case)]

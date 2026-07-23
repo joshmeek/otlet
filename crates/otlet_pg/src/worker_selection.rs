@@ -242,7 +242,7 @@ fn guard_job_lease(job: &Job, model_name: &str, selection_role: &str) -> Option<
 fn renew_job_lease(job: &Job) -> Result<bool, String> {
     let result: pgrx::spi::Result<Option<bool>> = BackgroundWorker::transaction(|| {
         pgrx::Spi::connect_mut(|client| {
-            let args = [job.id.into(), job.claim_attempt.into()];
+            let args = [job.id.into(), job.claim_token.as_str().into()];
             let rows = client.update(
                 "SELECT status FROM otlet.renew_job_lease($1, $2) LIMIT 1",
                 Some(1),
@@ -260,7 +260,7 @@ fn renew_job_lease(job: &Job) -> Result<bool, String> {
 
     match result {
         Ok(Some(canceled)) => Ok(canceled),
-        Ok(None) => Err("job lease fence lost: claim attempt is no longer active".to_owned()),
+        Ok(None) => Err("job lease fence lost: claim token is no longer active".to_owned()),
         Err(err) => Err(format!("job lease renewal failed: {err}")),
     }
 }
@@ -312,4 +312,3 @@ fn accepted_by_policy(output: &Value, accept_field_checks: &Value) -> (bool, &'s
 
     (true, "accepted_by_policy")
 }
-

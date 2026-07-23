@@ -6,15 +6,21 @@ Use this SQL walkthrough to build the entity-resolution path from `docs/otlet-wo
 docker exec -it otlet-postgres sh -lc '
   cheap_model_artifact="$(find /var/lib/postgresql -name Qwen3-1.7B-Q8_0.gguf -print -quit)"
   strong_model_artifact="$(find /var/lib/postgresql -name Qwen3.5-4B-Q4_K_M.gguf -print -quit)"
+  cheap_model_sha256="$(sha256sum "$cheap_model_artifact" | cut -d " " -f 1)"
+  strong_model_sha256="$(sha256sum "$strong_model_artifact" | cut -d " " -f 1)"
   psql -U postgres -d postgres \
     -v cheap_model_artifact="$cheap_model_artifact" \
-    -v strong_model_artifact="$strong_model_artifact"
+    -v cheap_model_sha256="$cheap_model_sha256" \
+    -v cheap_model_bytes="$(stat -c %s "$cheap_model_artifact")" \
+    -v strong_model_artifact="$strong_model_artifact" \
+    -v strong_model_sha256="$strong_model_sha256" \
+    -v strong_model_bytes="$(stat -c %s "$strong_model_artifact")"
 '
 ```
 
 Run the sections in order before adapting them. Each section names the state it creates and the output to inspect. Follow-up checks live in [runtime-and-traces.md](runtime-and-traces.md), [semantic-watches.md](semantic-watches.md), and [production-contract.md](production-contract.md)
 
-The setup and inspection sections run as the extension owner. A delegated reviewer reads `otlet.audit_review_export` and receives `otlet.grant_operator_access(...)` before using the action review functions. Raw `otlet.review_queue`, task configuration, receipts, and trace state remain owner-only
+The setup and inspection sections run as the extension owner. A delegated reviewer reads `otlet.audit_review_export` and `otlet.audit_review_event_export`, then receives `otlet.grant_operator_access(...)` before using the action review functions. Raw `otlet.review_queue`, task configuration, receipts, and trace state remain owner-only
 
 Receipts keep prompt and raw-output hashes under the default storage policy. Accepted output and rejected structured candidates remain available without persisting the assembled prompt or raw model text
 
@@ -25,16 +31,34 @@ CREATE EXTENSION IF NOT EXISTS otlet;
 
 SELECT otlet.register_model(
   'qwen3_1_7b',
-  :'cheap_model_artifact'
+  :'cheap_model_artifact',
+  :'cheap_model_sha256',
+  jsonb_build_object(
+    'sha256', :'cheap_model_sha256',
+    'bytes', :'cheap_model_bytes'::bigint,
+    'source', 'https://huggingface.co/Qwen/Qwen3-1.7B-GGUF/resolve/main/Qwen3-1.7B-Q8_0.gguf',
+    'revision', 'main',
+    'quantization', 'Q8_0',
+    'license', 'unknown'
+  )
 );
 
 SELECT otlet.register_model(
   'qwen35_4b',
-  :'strong_model_artifact'
+  :'strong_model_artifact',
+  :'strong_model_sha256',
+  jsonb_build_object(
+    'sha256', :'strong_model_sha256',
+    'bytes', :'strong_model_bytes'::bigint,
+    'source', 'https://huggingface.co/unsloth/Qwen3.5-4B-GGUF/resolve/main/Qwen3.5-4B-Q4_K_M.gguf',
+    'revision', 'main',
+    'quantization', 'Q4_K_M',
+    'license', 'unknown'
+  )
 );
 ```
 
-The Otlet background worker runs `linked_inproc` inference. It loads a local GGUF through in-process llama.cpp and keeps the model resident across jobs. Postgres exposes the queue, source row identity, output validation, receipts, traces, and runtime state through SQL
+The Otlet background worker verifies each registered digest before `linked_inproc` inference. It loads the local GGUF through in-process llama.cpp and keeps the model resident across jobs. Postgres exposes the model identity, queue, source row identity, output validation, receipts, traces, and runtime state through SQL
 
 ## Step 2 - Create The Source Tables
 
@@ -241,6 +265,7 @@ FROM otlet.create_task(
     "generation_trace_top_k": 3
   }'::jsonb,
   '{
+    "source_fields": ["_otlet_mvcc", "action_ids", "candidate_evidence", "evidence_counts"],
     "evidence_fields": ["candidate_evidence"],
     "action_id_fields": {"left_id": "left_id", "right_id": "right_id"}
   }'::jsonb,
@@ -279,7 +304,7 @@ The task contract includes:
 - `output_schema` is the JSON schema Otlet enforces before storing output
 - `model_name` chooses the cheap registered local model
 - `runtime_options` bound generation, tracing, and cache behavior
-- `input_shaping` names the evidence and action-ID fields
+- `input_shaping` allowlists source fields and names the evidence and action-ID fields
 - `decision_contract` loads the immutable entity-resolution evidence rules
 - `model_selection_policies` chooses the stronger registered local model for escalation
 
@@ -598,10 +623,10 @@ Representative output:
 ```text
    action_type   | requires_approval | creates_record | applyable
 -----------------+-------------------+----------------+-----------
- create_record   | f                 | t              | t
+ create_record   | f                 | t              | f
  merge_candidate | t                 | f              | f
  new_entity      | f                 | f              | f
- note            | f                 | t              | t
+ note            | f                 | t              | f
  review_flag     | f                 | f              | f
  update_row      | t                 | f              | t
 (6 rows)
@@ -612,7 +637,7 @@ Representative output:
 (1 row)
 ```
 
-Otlet enforces write authority through the action catalog. The model can request an action; Otlet decides which action types can become database state. Otlet stores unsupported actions as rejected evidence when they arrive with an accepted output. `otlet.action_status` shows approval, dry-run, and apply state
+Otlet enforces write authority through the task contract and action catalog. Each task has an `action_types` allowlist. Presets and watches set it when actions are expected; an omitted allowlist rejects every model action. `create_record`, `note`, and the decision actions remain recommendation state inside Otlet. Only `update_row` exposes an application-table write path. `otlet.action_status` shows its authority, approval, dry-run, and apply state
 
 Otlet exposes one source-table write action: `update_row`. The extension owner registers one ordinary table, its sole primary key, and the columns Otlet may update:
 
@@ -623,7 +648,17 @@ SELECT otlet.register_action_target(
   'id',
   ARRAY['review_state', 'review_reason']::name[]
 );
+
+SELECT otlet.register_action_workflow_policy(
+  'review_items_watch_task',
+  'update_row',
+  'review_items',
+  'bounded_mutation',
+  'evaluated'
+);
 ```
+
+The policy derives the destination and subject namespace from the registered row watch and target. Recommendation-only is the default. Mutation requires an evaluated bounded policy, a current task and target contract, a fresh source row, a passing dry run, approval, replay checks, and an execution receipt. An adversarial or unevaluated workflow cannot mutate rows
 
 The model-authored action contains data, not SQL:
 
@@ -641,7 +676,7 @@ The model-authored action contains data, not SQL:
 }
 ```
 
-The identity must equal the job subject, the target must equal the modeled source table, and the target registration must list each changed key. Version one supports one ordinary table, one single-column primary key, one row, and at most 16 changed columns. It rejects raw SQL, predicates, expressions, joins, generated columns, identity columns, partitions, foreign tables, views, temporary tables, Otlet tables, and RLS targets
+The identity must equal the job subject and the target registration must list each changed key. The stored target comes from workflow policy, not model text; a different model-proposed target rejects the action. Version one supports one ordinary table, one single-column primary key, one row, and at most 16 changed columns. It rejects raw SQL, predicates, expressions, joins, generated columns, identity columns, partitions, foreign tables, views, temporary tables, Otlet tables, and RLS targets
 
 Review the typed result before approval, then apply it:
 
@@ -650,6 +685,11 @@ SELECT dry_run_status FROM otlet.dry_run_action(:action_id);
 SELECT approval_status FROM otlet.approve_action(:action_id, 'reviewed source evidence');
 SELECT apply_status FROM otlet.apply_action(:action_id);
 SELECT apply_status FROM otlet.apply_action(:action_id);
+
+SELECT outcome, reviewer_identity, reviewer_role, source_freshness, receipt_id
+FROM otlet.audit_review_event_export
+WHERE action_id = :action_id
+ORDER BY review_event_id;
 ```
 
-The first apply updates one row and stores before/after hashes. The second returns `replayed`, writes no row, and links to the original receipt. If the source row, target registration, schema, or privileges changed after dry run, apply fails closed. `correct_action` still means reject plus eval label; a corrected executable write is a new proposal with a new dry run and approval
+The first apply updates one row and stores before/after hashes. The second returns `replayed`, writes no row, and links to the original receipt. Approval records the database login and active reviewer role without caller-supplied identity. If the source row, target registration, schema, or privileges changed after dry run, apply fails closed. `correct_action` still means reject plus eval label; a corrected executable write is a new proposal with a new dry run and approval

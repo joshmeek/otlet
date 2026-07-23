@@ -249,7 +249,7 @@ pub(crate) fn persist_timeout_cancel(job_id: i64) -> Result<bool, String> {
             pgrx::Spi::connect_mut(|client| {
                 let args = [job_id.into(), TIMEOUT_CANCEL_REASON.into()];
                 let rows = client.select(
-                    "SELECT status FROM otlet.cancel_job($1, $2) LIMIT 1",
+                    "SELECT status FROM otlet.request_job_cancellation($1, $2) LIMIT 1",
                     Some(1),
                     &args,
                 )?;

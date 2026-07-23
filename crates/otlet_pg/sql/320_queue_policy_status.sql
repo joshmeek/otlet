@@ -3,6 +3,21 @@ SELECT
   p.name,
   p.stale_policy,
   p.max_queued_jobs_per_model,
+  p.max_admission_rows,
+  p.max_input_bytes_per_job,
+  p.max_queued_input_bytes_per_model,
+  p.max_queued_input_bytes_total,
+  p.max_candidate_query_cost,
+  p.candidate_query_statement_timeout_ms,
+  p.max_raw_output_bytes,
+  p.max_structured_output_bytes,
+  p.max_actions_per_job,
+  p.max_action_bytes,
+  p.max_trace_bytes,
+  p.max_error_bytes,
+  p.max_event_message_bytes,
+  p.max_event_detail_bytes,
+  p.max_receipt_bytes,
   p.max_attempts,
   p.max_attempt_ms,
   p.default_runtime_options,
@@ -13,12 +28,22 @@ SELECT
   p.worker_claim_batch_size,
   p.worker_claim_task_cursor,
   p.job_lease_interval,
+  p.health_max_queued_jobs,
+  p.health_max_worker_rss_bytes,
+  p.health_max_connections,
+  p.health_max_database_bytes,
+  p.health_max_wal_bytes_since_reset,
+  p.health_max_otlet_storage_bytes,
+  p.health_require_autovacuum,
+  p.health_max_application_latency_ms,
+  p.health_application_latency_max_age,
   p.worker_event_retention,
   p.trace_detail_retention,
   p.eval_label_retention,
   p.delete_stale_materialization_retention,
   p.sensitive_evidence_mode,
   p.sensitive_evidence_retention,
+  p.terminal_evidence_retention,
   p.failed_job_retention
 FROM otlet.production_policy p
 WHERE p.name = 'default';
@@ -29,7 +54,11 @@ SELECT
   m.name AS model_name,
   m.max_active_jobs,
   p.max_queued_jobs_per_model,
+  p.max_queued_input_bytes_per_model,
+  p.max_queued_input_bytes_total,
   count(j.id) FILTER (WHERE j.status = 'queued')::bigint AS queued_jobs,
+  COALESCE(sum(octet_length(j.input::text)) FILTER (WHERE j.status = 'queued'), 0)::bigint AS queued_input_bytes,
+  total_queue.queued_input_bytes AS total_queued_input_bytes,
   count(j.id) FILTER (WHERE j.status = 'running')::bigint AS running_jobs,
   count(j.id) FILTER (WHERE j.status = 'cancel_requested')::bigint AS cancel_requested_jobs,
   count(j.id) FILTER (
@@ -41,8 +70,19 @@ SELECT
       - count(j.id) FILTER (WHERE j.status = 'queued'),
     0
   ) AS available_queue_slots,
+  GREATEST(
+    p.max_queued_input_bytes_per_model
+      - COALESCE(sum(octet_length(j.input::text)) FILTER (WHERE j.status = 'queued'), 0),
+    0
+  )::bigint AS available_model_queue_input_bytes,
+  GREATEST(
+    p.max_queued_input_bytes_total - total_queue.queued_input_bytes,
+    0
+  )::bigint AS available_total_queue_input_bytes,
   CASE
     WHEN count(j.id) FILTER (WHERE j.status = 'queued') >= p.max_queued_jobs_per_model
+      OR COALESCE(sum(octet_length(j.input::text)) FILTER (WHERE j.status = 'queued'), 0) >= p.max_queued_input_bytes_per_model
+      OR total_queue.queued_input_bytes >= p.max_queued_input_bytes_total
     THEN 'queue_full'
     ELSE 'queue_accepting'
   END AS queue_state,
@@ -54,6 +94,11 @@ LEFT JOIN otlet.tasks t ON t.model_name = m.name
 LEFT JOIN otlet.jobs j
   ON j.task_name = t.name
  AND j.status IN ('queued', 'running', 'cancel_requested')
+LEFT JOIN LATERAL (
+  SELECT COALESCE(sum(octet_length(queued.input::text)), 0)::bigint AS queued_input_bytes
+  FROM otlet.jobs queued
+  WHERE queued.status = 'queued'
+) total_queue ON true
 LEFT JOIN LATERAL (
   SELECT
     count(*)::bigint AS suppressed_events,
@@ -68,6 +113,9 @@ GROUP BY
   m.name,
   m.max_active_jobs,
   p.max_queued_jobs_per_model,
+  p.max_queued_input_bytes_per_model,
+  p.max_queued_input_bytes_total,
+  total_queue.queued_input_bytes,
   suppressed.suppressed_events,
   suppressed.last_suppressed_at;
 
@@ -234,4 +282,3 @@ SELECT
 FROM otlet.model_selection_policies p
 LEFT JOIN job_counts j ON j.task_name = p.task_name
 LEFT JOIN attempt_counts a ON a.task_name = p.task_name;
-

@@ -330,7 +330,7 @@ Custom Scan (Otlet Semantic Source CustomScan) on public.otlet_demo_semantic_ven
 
 The child scan reads the source table. Otlet strips the semantic predicate from the child plan and evaluates it against preloaded semantic state
 
-CustomScan uses statement preload semantics. Row-marked queries such as `FOR UPDATE` stay on the standard Postgres plan because Otlet blocks the CustomScan planner path when queries include rowmarks; Postgres still owns locking and row recheck behavior. For non-rowmark CustomScan, stale triggers and the next statement pick up concurrent source changes instead of a per-tuple recheck inside that scan
+CustomScan uses statement preload semantics. Row-marked queries such as `FOR UPDATE` and correlated `LATERAL` relations stay on the standard Postgres plan. Otlet blocks CustomScan for both shapes so Postgres owns locking, parameter propagation, rescans, and row rechecks. For supported CustomScan plans, stale triggers and the next statement pick up concurrent source changes instead of a per-tuple recheck inside that scan
 
 ## Step 8 - Fail Closed On Stale Rows
 
@@ -498,13 +498,17 @@ FROM otlet.create_watch(
   $$,
   record_type => 'learning_entity_pair',
   runtime_options => '{"max_tokens":160,"reasoning":"off"}'::jsonb,
+  input_shaping => '{"source_fields":["_otlet_mvcc","left","right"]}'::jsonb,
   trigger_policy => '{"on_change":"mark_stale"}'::jsonb,
   max_candidate_rows => 10,
   pair_sources => '[{"table":"public.learning_entity","subject_column":"id"}]'::jsonb
 );
 
+BEGIN;
+SET LOCAL statement_timeout = '2000ms';
 SELECT 'semantic_join_refresh_queued=' ||
        otlet.refresh_semantic_join_index('learning_entity_pair_idx')::text;
+COMMIT;
 ```
 
 Use the semantic-index wait loop, or run `./scripts/otlet-demo.sh` for the compact proof. Then inspect the automatic materialization:
@@ -580,24 +584,27 @@ semantic_join_match_contract=true
 
 Use explicit JSON predicates for row and join semantic filters
 
-## Step 12 - Move A Watch Definition
+## Step 12 - Version A Watch Pack
 
-The extension owner can export a row or pair watch as configuration-only JSONB:
+The extension owner can export a row or pair watch as an `otlet.watch.v1` JSONB document:
 
 ```sql
 SELECT jsonb_pretty(otlet.export_watch('learning_entity_pair_idx'));
 ```
 
-`otlet.watch.v1` uses the same fields as `otlet.create_watch(...)`. The shortened values below show the key and type contract; export keeps the full instruction, schema, and candidate query
+The pack keeps SQL and JSON Schema as ordinary document fields. The shortened values below show the field contract; export keeps the full instruction, schema, candidate query, and verified model identity
 
 ```json
 {
   "format": "otlet.watch.v1",
   "name": "learning_entity_pair_idx",
   "kind": "pair",
+  "content_digest": "e2a4fd1f9d6943d73cb3c201e22f1817",
+  "version_metadata": {"version": "1.0.0"},
   "instruction": "Compare one candidate pair",
   "output_schema": {},
   "model_name": "qwen3_1_7b",
+  "model_artifact_identity": {},
   "table_name": null,
   "subject_column": null,
   "candidate_query": "SELECT subject_id, input FROM public.learning_entity_pair_input",
@@ -607,17 +614,43 @@ SELECT jsonb_pretty(otlet.export_watch('learning_entity_pair_idx'));
   "trigger_policy": {"on_change": "mark_stale"},
   "action_types": [],
   "stale_policy": "refresh_then_fail_closed",
-  "input_shaping": {},
+  "input_shaping": {"source_fields": ["_otlet_mvcc", "left", "right"]},
   "decision_contract": {},
   "max_candidate_rows": 10,
   "input_columns": null,
   "pair_sources": [
     {"table": "public.learning_entity", "subject_column": "id"}
-  ]
+  ],
+  "fixtures": [],
+  "labels": [],
+  "expected_receipts": [],
+  "review_outcomes": [],
+  "evaluation_gates": {}
 }
 ```
 
-The document contains watch configuration and owner-authored candidate SQL. It excludes model paths, source rows, jobs, outputs, actions, receipts, labels, traces, materializations, trigger names, timestamps, and counters
+The document contains watch configuration, owner-authored candidate SQL, fixtures, labels, expected receipt shapes, review outcomes, evaluation gates, and a digest of canonical content. It excludes model paths, source rows, jobs, runtime outputs, runtime actions, runtime receipts, traces, materializations, trigger names, and counters. Store the JSON in an ordinary file; Otlet adds no workflow language or pack registry
+
+Lint and dry run use the same validator as import and do not change the watch or its version history:
+
+```sql
+SELECT valid, content_digest
+FROM otlet.lint_watch_pack(:'watch_definition'::jsonb);
+
+SELECT jsonb_pretty(
+  otlet.dry_run_watch_pack(:'watch_definition'::jsonb)
+);
+```
+
+Canonical validation sorts unordered pack fields before calculating the digest. Object key order and fixture or label order do not create a false change. Compare two packs by semantic top-level field:
+
+```sql
+SELECT field_name, change_type, before_value, after_value
+FROM otlet.diff_watch_packs(
+  :'before_definition'::jsonb,
+  :'after_definition'::jsonb
+);
+```
 
 Import requires the referenced model, tables, and columns to exist. The function rejects an existing watch unless the owner requests replacement:
 
@@ -636,12 +669,65 @@ FROM otlet.import_watch(
 );
 ```
 
-Import validates `otlet.watch.v1`, resolves database dependencies, and calls `otlet.create_watch(...)`. A failed import rolls back its statement and leaves an existing watch unchanged
+Import validates `otlet.watch.v1`, preflights bounded candidate SQL, resolves database dependencies, and calls `otlet.create_watch(...)`. Each successful import appends an immutable version and moves the current head. A failed import rolls back its statement and leaves the watch and history unchanged
 
-The Docker demo proves replacement, drop/import round trip, lookup preservation, trigger preservation, and nine rejected documents:
+Inspect history and restore an exact prior pack through the same import contract:
+
+```sql
+SELECT version_number, content_digest, current_version, version_metadata
+FROM otlet.watch_pack_history
+WHERE watch_name = 'learning_entity_pair_idx'
+ORDER BY version_number;
+
+SELECT name, kind
+FROM otlet.rollback_watch_pack(
+  'learning_entity_pair_idx',
+  version_number => 1
+);
+```
+
+Rollback appends a new version with the restored canonical content. Prior rows remain immutable, so the history records both the superseded pack and the rollback
+
+### Evaluate a pack version
+
+Portable labels use workload and case keys, task and subject identity, expected answer and action, and a positive case weight. They do not contain a source row. Export rows can be aggregated to JSON and imported directly:
+
+```sql
+SELECT jsonb_agg(to_jsonb(c)) AS cases
+FROM otlet.export_eval_cases(10000) c
+WHERE workload_name = 'entity_resolution_release' \gset
+
+SELECT otlet.import_eval_cases(:'cases'::jsonb);
+```
+
+Evaluate a candidate against a named baseline with exact receipt and pack identities:
+
+```sql
+SELECT gate_status
+FROM otlet.evaluate_workload(
+  'entity_resolution_v2',
+  'entity_resolution_release',
+  'entity_resolution_v1',
+  '{
+    "model_name":"qwen35_4b",
+    "prompt_version":"prompt-sha256-v2",
+    "schema_version":"schema-sha256-v2",
+    "runtime_version":"runtime-fingerprint-v2",
+    "pack_name":"learning_entity_pair_idx",
+    "pack_version":2
+  }'::jsonb,
+  '{"max_quality_regression":0.01,"max_latency_regression_ms":250}'::jsonb
+);
+```
+
+`otlet.workload_evaluation_status` exposes the weighted metrics, normalized thresholds, per-metric results, baseline deltas, and model, prompt, schema, runtime, and pack change flags. Evaluation rows are immutable
+
+The Docker demo proves nonmutating lint, canonical dry run, stable semantic diff, immutable history, exact rollback, replacement, drop/import round trip, lookup preservation, trigger preservation, and ten rejected documents:
 
 ```text
+watch_pack_contract=true|true|true|true|true|true|true|true|true|true|true|true|true
 watch_replace_contract=true|true|true|true|true|true|true|true|true|true
+watch_import_failure_contract=10|true
 watch_round_trip_contract=true|true|true|true|true
-watch_import_failure_contract=9|true
+workload_evaluation_contract=true|true|true|true|true|true|true|true|true
 ```

@@ -5,56 +5,45 @@
 
 malformed_schema_task="malformed_schema_worker_demo"
 cleanup_task "$malformed_schema_task"
-psql_exec -v task_name="$malformed_schema_task" -v model_name="$strong_model_name" >/dev/null <<'SQL'
-SELECT otlet.create_task(
-  :'task_name',
-  $source$
-    SELECT 'malformed-schema-1'::text AS subject_id, '{}'::jsonb AS input
-  $source$::text,
-  'Return JSON only.',
-  '{"type":"not_a_valid_json_schema_type"}'::jsonb,
-  :'model_name',
-  '{"max_tokens":16,"reasoning":"off","inference_cache":false}'::jsonb
-);
-SELECT otlet.run_task(:'task_name');
-SQL
-wait_task_failed "$malformed_schema_task" 1 120 1
 malformed_schema_contract="$(psql_exec -qAt \
   -v task_name="$malformed_schema_task" \
   -v model_name="$strong_model_name" <<'SQL'
-WITH job_row AS (
-  SELECT id, status, error
-  FROM otlet.jobs
-  WHERE task_name = :'task_name'
-  ORDER BY id DESC
-  LIMIT 1
-),
-receipt_row AS (
-  SELECT status, selection_status, selection_reason, schema_validation_status, trace_summary
-  FROM otlet.inference_receipts
-  WHERE job_id = (SELECT id FROM job_row)
-  ORDER BY id DESC
-  LIMIT 1
-)
-SELECT j.status || '|' ||
-       (j.error LIKE 'invalid output schema:%')::text || '|' ||
-       r.status || '|' ||
-       r.selection_status || '|' ||
-       r.selection_reason || '|' ||
-       r.schema_validation_status || '|' ||
-       COALESCE(r.trace_summary ->> 'stop_reason', '') || '|' ||
-       (SELECT count(*) FROM otlet.outputs WHERE job_id = j.id)::text || '|' ||
+CREATE TEMP TABLE malformed_schema_result (rejected boolean NOT NULL);
+CREATE TEMP TABLE malformed_schema_params AS
+SELECT :'task_name'::text AS task_name, :'model_name'::text AS model_name;
+DO $body$
+BEGIN
+  BEGIN
+    PERFORM otlet.create_task(
+      (SELECT task_name FROM malformed_schema_params),
+      NULL,
+      'Return JSON only',
+      '{"type":"not_a_valid_json_schema_type"}'::jsonb,
+      (SELECT model_name FROM malformed_schema_params)
+    );
+    RAISE EXCEPTION 'malformed schema was accepted';
+  EXCEPTION WHEN OTHERS THEN
+    IF SQLERRM NOT LIKE '%type not_a_valid_json_schema_type is unsupported%' THEN
+      RAISE;
+    END IF;
+    INSERT INTO malformed_schema_result VALUES (true);
+  END;
+END
+$body$;
+SELECT result.rejected::text || '|' ||
+       (SELECT count(*) FROM otlet.json_schema_support_report(
+         '{"type":"not_a_valid_json_schema_type"}'::jsonb
+       ))::text || '|' ||
+       (SELECT count(*) FROM otlet.tasks WHERE name = :'task_name')::text || '|' ||
        COALESCE(rs.runtime_status, '') || '|' ||
        COALESCE(rs.slot_state, '')
-FROM job_row j
-CROSS JOIN receipt_row r
-JOIN otlet.runtime_status rs
-  ON rs.model_name = :'model_name';
+FROM malformed_schema_result result
+JOIN otlet.runtime_status rs ON rs.model_name = :'model_name';
 SQL
 )"
 echo "malformed_schema_worker_contract=$malformed_schema_contract"
-[ "$malformed_schema_contract" = "failed|true|failed|failed|direct_attempt_failed|failed|invalid_output_schema|0|ready|ready" ] || {
-  echo "Expected malformed schema to produce a clean failed receipt and healthy worker, got $malformed_schema_contract" >&2
+[ "$malformed_schema_contract" = "true|1|0|ready|ready" ] || {
+  echo "Expected malformed schema registration to fail before worker admission, got $malformed_schema_contract" >&2
   exit 1
 }
 
@@ -217,7 +206,8 @@ SELECT otlet.create_task(
   'Return JSON only: {"output":{"status":"ok"},"actions":[]}',
   '{"type":"object","required":["status"],"additionalProperties":false,"properties":{"status":{"enum":["ok"]}}}'::jsonb,
   :'model_name',
-  '{"max_tokens":4096,"reasoning":"off","inference_cache":false}'::jsonb
+  '{"max_tokens":4096,"reasoning":"off","inference_cache":false}'::jsonb,
+  '{"source_fields":["payload"]}'::jsonb
 );
 SELECT otlet.run_task(:'task_name');
 SQL

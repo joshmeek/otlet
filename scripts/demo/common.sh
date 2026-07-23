@@ -10,11 +10,20 @@ require_container() {
 }
 
 psql_exec() {
-  docker exec -i "$container" psql -U postgres -d postgres -v ON_ERROR_STOP=1 "$@"
+  docker exec -i "$container" psql -U postgres -d "$database" -v ON_ERROR_STOP=1 "$@"
 }
 
 psql_value() {
   psql_exec -qAt "$@"
+}
+
+psql_candidate_exec() {
+  docker exec -e PGOPTIONS='-c statement_timeout=2000ms' -i "$container" \
+    psql -U postgres -d "$database" -v ON_ERROR_STOP=1 "$@"
+}
+
+psql_candidate_value() {
+  psql_candidate_exec -qAt "$@"
 }
 
 require_contains() {

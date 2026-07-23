@@ -141,7 +141,7 @@ SELECT otlet.create_watch(
 
 CREATE TEMP TABLE colon_subject_claim AS
 WITH inserted AS (
-  INSERT INTO otlet.jobs (task_name, subject_id, input, status, attempts, started_at, leased_until)
+  INSERT INTO otlet.jobs (task_name, subject_id, input, status, attempts, started_at, leased_until, claim_token)
   SELECT
     :'task_name',
     src.id,
@@ -158,12 +158,13 @@ WITH inserted AS (
     'running',
     1,
     now(),
-    now() + interval '5 minutes'
+    now() + interval '5 minutes',
+    gen_random_uuid()::text
   FROM public.otlet_demo_colon_subject src
   WHERE src.id = 'tenant:colon-fragment-only:1'
-  RETURNING id
+  RETURNING id, claim_token
 )
-SELECT id FROM inserted;
+SELECT id, claim_token FROM inserted;
 SELECT otlet.complete_job(
   id,
   '{"decision":"pass","confidence":"high","reason":"colon subject"}'::jsonb,
@@ -172,10 +173,11 @@ SELECT otlet.complete_job(
   NULL,
   NULL,
   NULL,
-  md5('{"output":{"decision":"pass","confidence":"high","reason":"colon subject"},"actions":[]}'),
+  otlet.portable_text_hash('{"output":{"decision":"pass","confidence":"high","reason":"colon subject"},"actions":[]}'),
   now(),
   '{"schema_validation_status":"passed"}'::jsonb,
-  :'model_name'
+  :'model_name',
+  expected_claim_token => claim_token
 )
 FROM colon_subject_claim;
 WITH output_row AS (
@@ -197,6 +199,11 @@ action_row AS (
     receipt_id,
     action_type,
     payload,
+    authority_origin,
+    authority_mode,
+    evaluation_status,
+    authority_policy_hash,
+    subject_namespace,
     status,
     subject_id,
     source_table,
@@ -213,6 +220,11 @@ action_row AS (
       'subject_id', subject_id,
       'body', output
     ),
+    'system',
+    'recommendation_only',
+    'unevaluated',
+    otlet.default_action_authority_hash('colon_subject_demo_task', 'create_record'),
+    'public.otlet_demo_colon_subject',
     'complete',
     subject_id,
     'public.otlet_demo_colon_subject',
@@ -327,8 +339,13 @@ SELECT (SELECT count(*) FROM otlet.redaction_policy_status)::text || '|' ||
        (SELECT raw_output_rows = 0 AND token_text_values = 0 AND alternative_token_text_values = 0 FROM otlet.redaction_policy_status)::text || '|' ||
        (SELECT count(*) > 0 FROM otlet.audit_receipt_export)::text || '|' ||
        (SELECT count(*) > 0 FROM otlet.audit_review_export)::text || '|' ||
+       (SELECT count(*) > 0 FROM otlet.audit_review_event_export)::text || '|' ||
        (SELECT count(*) > 0 FROM otlet.audit_eval_label_export)::text || '|' ||
+       (SELECT count(*) >= 0 FROM otlet.audit_workload_evaluation_export)::text || '|' ||
+       (SELECT count(*) > 0 FROM otlet.decision_trace_export)::text || '|' ||
+       (SELECT count(*) >= 0 FROM otlet.destination_reconciliation_status)::text || '|' ||
        (SELECT count(*) > 0 FROM otlet.semantic_dependency_audit)::text || '|' ||
+       (SELECT count(*) > 0 FROM otlet.operational_event_log)::text || '|' ||
        (SELECT count(*) > 0 FROM otlet.worker_batch_timing_status)::text || '|' ||
        (SELECT NOT EXISTS (
           SELECT 1
@@ -340,7 +357,7 @@ SELECT (SELECT count(*) FROM otlet.redaction_policy_status)::text || '|' ||
 SQL
 )"
 echo "audit_export_contract=$audit_export_contract"
-[ "$audit_export_contract" = "1|true|true|true|true|true|true|true|true" ] || {
+[ "$audit_export_contract" = "1|true|true|true|true|true|true|true|true|true|true|true|true|true" ] || {
   echo "Expected audit export surfaces and redaction withholdings, got $audit_export_contract" >&2
   exit 1
 }

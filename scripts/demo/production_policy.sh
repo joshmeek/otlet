@@ -1,7 +1,7 @@
 production_policy_contract="$(psql_exec -qAt <<'SQL'
 SELECT name || '|' || stale_policy || '|' || max_attempts::text || '|' ||
        max_attempt_ms::text || '|' || worker_claim_batch_size::text || '|' ||
-       sensitive_evidence_mode
+       sensitive_evidence_mode || '|' || terminal_evidence_retention::text
 FROM otlet.production_policy_status;
 SQL
 )"
@@ -50,16 +50,16 @@ INSERT INTO otlet.jobs (task_name, subject_id, input)
 SELECT :'task_name', 'lease-fence-1', '{}'::jsonb
 FROM created;
 CREATE TEMP TABLE lease_claim AS
-SELECT id, attempts, leased_until
+SELECT id, leased_until, claim_token
 FROM otlet.claim_jobs();
 CREATE TEMP TABLE wrong_renew AS
 SELECT renewed.*
 FROM lease_claim claim
-CROSS JOIN LATERAL otlet.renew_job_lease(claim.id, claim.attempts + 1) renewed;
+CROSS JOIN LATERAL otlet.renew_job_lease(claim.id, gen_random_uuid()::text) renewed;
 CREATE TEMP TABLE current_renew AS
 SELECT renewed.*
 FROM lease_claim claim
-CROSS JOIN LATERAL otlet.renew_job_lease(claim.id, claim.attempts) renewed;
+CROSS JOIN LATERAL otlet.renew_job_lease(claim.id, claim.claim_token) renewed;
 SELECT (SELECT count(*) FROM lease_claim)::text || '|' ||
        (SELECT count(*) FROM wrong_renew)::text || '|' ||
        COALESCE((SELECT status FROM current_renew), '') || '|' ||
@@ -76,7 +76,7 @@ echo "lease_fence_contract=$lease_fence_contract"
   echo "Expected claim-attempt fencing and timeout-aware lease renewal, got $lease_fence_contract" >&2
   exit 1
 }
-[ "$production_policy_contract" = "default|refresh_then_fail_closed|3|300000|8|redacted" ] || {
+[ "$production_policy_contract" = "default|refresh_then_fail_closed|3|300000|8|redacted|30 days" ] || {
   echo "Expected default production policy, got $production_policy_contract" >&2
   exit 1
 }
@@ -235,8 +235,13 @@ echo "model_queue_status_contract=$model_queue_status_contract"
 
 queue_underfill_contract="$(psql_value <<'SQL'
 BEGIN;
-INSERT INTO otlet.models (name, artifact_path)
-VALUES ('queue_underfill_contract_model', '/tmp/not-used.gguf');
+INSERT INTO otlet.models (name, artifact_path, artifact_hash, artifact_identity)
+VALUES (
+  'queue_underfill_contract_model',
+  '/tmp/not-used.gguf',
+  repeat('0', 64),
+  jsonb_build_object('sha256', repeat('0', 64), 'bytes', 24, 'source', 'smoke', 'revision', 'v1', 'quantization', 'test', 'license', 'test')
+);
 INSERT INTO otlet.tasks (name, input_query, instruction, output_schema, model_name)
 VALUES (
   'queue_underfill_contract_task',
@@ -263,8 +268,8 @@ ROLLBACK;
 SQL
 )"
 echo "queue_underfill_contract=$queue_underfill_contract"
-[ "$queue_underfill_contract" = "2|5|1" ] || {
-  echo "Expected queue underfill contract 2|5|1, got $queue_underfill_contract" >&2
+[ "$queue_underfill_contract" = "0|3|1" ] || {
+  echo "Expected all-or-nothing queue contract 0|3|1, got $queue_underfill_contract" >&2
   exit 1
 }
 
@@ -349,7 +354,8 @@ BEGIN
         '{"status":"ok"}'::jsonb,
         '{"output":{"status":"ok"},"actions":[]}',
         '[]'::jsonb,
-        trace_summary => '{"schema_validation_status":"passed","trace_version":"queue_fairness_smoke"}'::jsonb
+        trace_summary => '{"schema_validation_status":"passed","trace_version":"queue_fairness_smoke"}'::jsonb,
+        expected_claim_token => job_row.claim_token
       );
     END LOOP;
 
@@ -464,7 +470,7 @@ SELECT otlet.create_task(
   :'task_name',
   $source$
     SELECT 'race-' || i::text AS subject_id, '{}'::jsonb AS input
-    FROM generate_series(1, 50) AS g(i)
+    FROM generate_series(1, 5) AS g(i)
   $source$::text,
   'Queue admission race smoke placeholder',
   '{"type":"object","required":["status"],"additionalProperties":false,"properties":{"status":{"enum":["ok"]}}}'::jsonb,

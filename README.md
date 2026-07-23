@@ -36,7 +36,7 @@ Otlet ran the model beside the selected rows, validated the JSON, and recorded a
 
 ## Longer Example
 
-Entity resolution uses a cheap local model for the first pass and a stronger local model when the first answer does not meet the decision contract. Start the local runtime, then register both GGUF files:
+Entity resolution uses a cheap local model for the first pass and a stronger local model when the first answer does not meet the decision contract. Start the local runtime:
 
 ```sh
 ./scripts/otlet-setup.sh
@@ -44,21 +44,9 @@ Entity resolution uses a cheap local model for the first pass and a stronger loc
 
 Rerunning setup reuses the PostgreSQL volume and model artifacts while rebuilding Otlet extension state; user tables stay in place. When the container or image changes, setup clears persisted preload state before reinstalling the extension
 
-```sql
-SELECT name
-FROM otlet.register_model('qwen3_1_7b', '/var/lib/postgresql/otlet-models/Qwen3-1.7B-Q8_0.gguf')
-UNION ALL
-SELECT name
-FROM otlet.register_model('qwen35_4b', '/var/lib/postgresql/otlet-models/Qwen3.5-4B-Q4_K_M.gguf');
-```
+The native worker connects to `postgres` and uses an 8 GiB RSS budget by default. Set `OTLET_DATABASE` to install into another database and `OTLET_MAX_WORKER_RSS_BYTES` to change the budget. An explicit value of `0` disables RSS enforcement. Use a separate PostgreSQL volume for each Otlet database
 
-```text
-    name
-------------
- qwen3_1_7b
- qwen35_4b
-(2 rows)
-```
+The full demo registers both models with a streamed SHA-256 digest, byte size, source, revision, quantization, and license value. Otlet verifies the digest before llama.cpp loads the file and binds the same identity to runtime fingerprints, receipts, status, and watch exports. Set the `OTLET_CHEAP_MODEL_*` and `OTLET_STRONG_MODEL_*` provenance variables when using artifacts other than the demo defaults. The [entity-resolution starter pack](docs/entity-resolution-starter-pack.md) packages vendor, account, and catalog-item fixtures through the same public watch contract
 
 An Otlet task reads any SQL query that returns `subject_id` and row-shaped `input`. The [entity-resolution walkthrough](docs/entity-resolution-walkthrough.md) builds `public.otlet_demo_vendor_pair_input` from two application tables. The shortened task call includes the SQL API, output contract, trace settings, input shaping, and decision preset:
 
@@ -84,7 +72,7 @@ FROM otlet.create_task(
   }',
   model_name => 'qwen3_1_7b',
   runtime_options => '{"max_tokens":256,"reasoning":"off","inference_cache":true,"generation_trace":true,"generation_trace_max_tokens":16,"generation_trace_top_k":3}',
-  input_shaping => '{"evidence_fields":["candidate_evidence"],"action_id_fields":{"left_id":"left_id","right_id":"right_id"}}',
+  input_shaping => '{"source_fields":["_otlet_mvcc","action_ids","candidate_evidence","evidence_counts"],"evidence_fields":["candidate_evidence"],"action_id_fields":{"left_id":"left_id","right_id":"right_id"}}',
   decision_contract => '{"preset":"entity_resolution_evidence_v1"}'
 );
 
@@ -163,7 +151,17 @@ ORDER BY attempt_index;
 
 Otlet records both attempts and creates `merge_candidate` from the accepted output. The action requires operator approval. The source vendor rows remain unchanged
 
-The full demo checks row and pair watches, candidate drift, CustomScan freshness, portable watch definitions, and bounded `update_row`. It covers receipt redaction, role grants, cancellation, model-load admission, memory pressure, cache bounds, prompt and runtime fingerprints, invariants, and Docker crash logs
+The full demo checks row and pair watches, candidate drift, CustomScan freshness, versioned watch packs, workload-weighted evaluation gates, review provenance, workflow-bound `update_row`, and adversarial trust cases. It proves portable label round trips, named baseline regressions, canonical pack diff and rollback, fenced claim ownership, idempotent terminal retries, PostgreSQL-owned result validation and identities, the versioned least-privilege portable worker RPC, session-bound review identity, target binding, recommendation-only defaults, evidence holds and cleanup receipts, active-state canary deletion, receipt redaction, role grants, cancellation, model-load admission, memory pressure, cache bounds, prompt and runtime fingerprints, invariants, and Docker crash logs
+
+Build the reproducible pgrx package, machine-readable SBOM, RustSec report, supported-matrix result, and exact release identity with [the release evidence command](docs/release-evidence.md)
+
+Prove a fresh disposable install, worker lifecycle, database restart, upgrade failure rollback, startup recovery, and crash-log safety with [the release lifecycle command](docs/release-lifecycle.md)
+
+Run native and portable equivalence, the complete failure matrix, lifecycle recovery, invariants, and final crash-log checks with [the runtime conformance command](docs/runtime-conformance.md)
+
+Configure all-or-nothing row, input-byte, queue-byte, candidate-plan, and candidate-timeout limits with [the workload admission contract](docs/workload-admission.md)
+
+Run Otlet against a standard PostgreSQL service that cannot load the native worker with [the portable worker](portable/README.md). Its real-model smoke test creates a disposable SQL-only database and completes one job through the same trusted receipt state
 
 ## Docs
 
@@ -173,6 +171,9 @@ Start with [the worked example](docs/otlet-worked-example.md)
 - [Runtime and traces](docs/runtime-and-traces.md)
 - [Semantic watches](docs/semantic-watches.md)
 - [Production contract](docs/production-contract.md)
+- [Trust conformance](docs/trust-conformance.md)
+- [Runtime conformance](docs/runtime-conformance.md)
+- [Portable worker](portable/README.md)
 - [Model benchmarks](benchmarks/README.md)
 - [Roadmap](docs/roadmap.md)
 

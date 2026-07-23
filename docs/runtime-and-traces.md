@@ -58,9 +58,19 @@ receipt_attempt_contract=8|4|4|4
 
 A receipt records evidence for one model run. A candidate pair can have multiple receipts when model selection escalates
 
-Each receipt links the model, artifact, runtime options, prompt hash, input hash, output schema hash, raw-output hash, runtime fingerprint, validation status, timing, token counts, memory summary, and trace summary. Otlet does not persist the assembled prompt
+Each accepted receipt links PostgreSQL-recomputed SHA-256 identities for the task, source snapshot, model, effective runtime options, prompt, input, output schema, raw output, structured output, and actions. It also records verified artifact provenance, the detailed runtime fingerprint, validation status, timing, token counts, memory summary, and trace summary. Otlet does not persist the assembled prompt
 
-Linked llama.cpp uses greedy decoding and stops after one balanced JSON object. Otlet then requires the common `output` plus `actions` envelope and runs the task JSON Schema, action schema, decision contract, and selection policy. Inspect the decode and validation contract through the receipt:
+```sql
+SELECT receipt_id,
+       model_artifact_hash AS artifact_sha256,
+       model_artifact_identity,
+       runtime_fingerprint -> 'artifact' ->> 'verification' AS verification
+FROM otlet.inference_receipt_trace_status
+ORDER BY receipt_id DESC
+LIMIT 1;
+```
+
+Linked llama.cpp uses greedy decoding and stops after one balanced JSON object. PostgreSQL parses that envelope again, requires the submitted output and actions to match it, validates the supported task JSON Schema subset, recomputes the portable identities, and applies the action, freshness, decision, and selection contracts. The worker's validation flag cannot authorize output. Inspect the decode and validation contract through the receipt:
 
 ```sql
 SELECT schema_force, decode_constraint, decode_constraint_reason
@@ -69,6 +79,17 @@ WHERE task_name = 'entity_resolution_demo'
 ORDER BY receipt_id DESC
 LIMIT 1;
 ```
+
+Portable execution uses the same receipt state and records `portable:<runtime_name>` with endpoint `postgres_rpc`. Inspect protocol compatibility, worker and model health, queue depth, lease health, claim ownership, and linked receipts without reading the underlying tables:
+
+```sql
+SELECT * FROM otlet.portable_protocol_status;
+SELECT * FROM otlet.portable_worker_status;
+SELECT * FROM otlet.portable_claim_status ORDER BY claim_id DESC;
+SELECT * FROM otlet.portable_receipt_status ORDER BY receipt_id DESC;
+```
+
+The [reference external worker](../portable/README.md) runs the same database-built prompt with one local GGUF when the PostgreSQL host cannot load the native extension worker. It renews the lease during decode and interrupts work after cancellation, claim loss, or database disconnect. PostgreSQL still parses the returned envelope and owns every validation and trusted-state write
 
 Receipt timing splits runtime preparation, model load, context creation, tokenization, prompt decode, generation, validation and post-processing, finish SQL, and semantic materialization. `otlet.runtime_stage_timing_status` aggregates every attempt for a job and leaves unmeasured worker work in `worker_overhead_ms`:
 
@@ -277,7 +298,8 @@ FROM otlet.create_task(
   'Return exactly this JSON object: {"output":{"status":"ok"},"actions":[]}',
   '{"type":"object","required":["status"],"additionalProperties":false,"properties":{"status":{"enum":["ok"]}}}'::jsonb,
   'qwen3_1_7b',
-  '{"max_tokens":64,"reasoning":"off"}'::jsonb
+  '{"max_tokens":64,"reasoning":"off"}'::jsonb,
+  '{"source_fields":["id","note"]}'::jsonb
 );
 ```
 
@@ -304,7 +326,8 @@ FROM otlet.create_task(
   'Lifecycle task used to show queued cancellation',
   '{"type":"object","required":["status"],"additionalProperties":false,"properties":{"status":{"enum":["ok"]}}}'::jsonb,
   'qwen3_1_7b',
-  '{}'::jsonb
+  '{}'::jsonb,
+  '{"source_fields":["kind"]}'::jsonb
 );
 
 INSERT INTO otlet.jobs (task_name, subject_id, input)
@@ -312,7 +335,7 @@ VALUES ('learning_cancel_task', 'cancel-1', '{"kind":"manual queued job"}'::json
 RETURNING id, task_name, subject_id, status, attempts;
 
 SELECT id, task_name, subject_id, status, error
-FROM otlet.cancel_job(
+FROM otlet.request_job_cancellation(
   (SELECT id FROM otlet.jobs WHERE task_name = 'learning_cancel_task' AND subject_id = 'cancel-1'),
   'learning example cancellation'
 );
@@ -350,7 +373,7 @@ Representative output:
 
 Otlet records a receipt for canceled work and preserves model-run evidence
 
-A synchronous infer-now caller can time out while the worker decodes. The requester records a shared abort marker, and the worker calls `otlet.cancel_job` before it can accept output. The caller's failed transaction cannot roll back that worker-owned cancellation
+A synchronous infer-now caller can time out while the worker decodes. The requester records a shared abort marker and calls `otlet.request_job_cancellation`; the worker then closes the job with its live claim token before it can accept output. The caller's failed transaction cannot roll back that worker-owned cancellation
 
 The demo requires the canceled job and receipt, zero outputs and actions, a recorded timeout and abort, the canceled job ID, and one healthy worker:
 
@@ -416,6 +439,30 @@ Failure records a raw-output hash, a non-sensitive error, and an attempt receipt
 ## Step 10 - Check Worker Events And Receipt Statuses
 
 Events show worker behavior. Receipts show model behavior
+
+The portable worker emits one `preflight_passed` event before model load or claims. A failed explicit `--preflight` emits `preflight_failed` with one stable dependency code and no connection string, credential, prompt, or source value
+
+`otlet.decision_trace_export` is the content-addressed export surface for accepted receipts. `decision_trace_sha256` covers the canonical identity trace and identifies its compact recommendation. Actions include payload hashes and ordered execution-receipt identities; reviews include reviewer, freshness, and evidence hashes without reason text
+
+`otlet.destination_reconciliation_status` links that recommendation identity to each receiver-enforced idempotency key, authenticated acknowledgement, destination execution receipt, and replay decision. `acknowledgement_pending` keeps both never-acknowledged exports and explicitly unknown deliveries visible
+
+Database health is a separate live surface:
+
+```sql
+SELECT queued_jobs,
+       worker_process_rss_bytes,
+       database_connections,
+       database_size_bytes,
+       wal_bytes_since_reset,
+       otlet_storage_bytes,
+       dead_tuples,
+       application_latency_ms,
+       claims_allowed,
+       failed_checks
+FROM otlet.database_health_status;
+```
+
+Native memory comes from the resident runtime slot while its worker is present. Portable memory comes from heartbeats sampled within the last two minutes. Configure an application-latency limit only when an owner-side monitor records representative query latency through `record_application_latency(...)`
 
 ```sql
 SELECT event_type, count(*)

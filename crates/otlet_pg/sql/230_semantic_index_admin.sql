@@ -18,7 +18,8 @@ DECLARE
   saved otlet.semantic_indexes%ROWTYPE;
   semantic_record_type text := COALESCE(record_type, index_name);
   semantic_task_name text := index_name || '_task';
-  current_contract_hash text := otlet.task_contract_hash(instruction, output_schema, model_name, runtime_options, input_shaping, decision_contract);
+  actual_input_shaping jsonb := COALESCE(input_shaping, '{}'::jsonb);
+  current_contract_hash text;
   actual_input_columns text[];
   query text;
 BEGIN
@@ -43,7 +44,14 @@ BEGIN
   JOIN pg_namespace n ON n.oid = c.relnamespace
   WHERE c.oid = table_name;
 
-  IF input_columns IS NOT NULL THEN
+  IF input_columns IS NULL THEN
+    SELECT array_agg(a.attname::text ORDER BY a.attnum)
+    INTO actual_input_columns
+    FROM pg_attribute a
+    WHERE a.attrelid = table_name
+      AND a.attnum > 0
+      AND NOT a.attisdropped;
+  ELSE
     SELECT array_agg(DISTINCT column_name ORDER BY column_name)
     INTO actual_input_columns
     FROM unnest(input_columns) AS requested(column_name)
@@ -68,6 +76,21 @@ BEGIN
       RAISE EXCEPTION 'otlet input_columns must all exist on %', table_name;
     END IF;
   END IF;
+
+  actual_input_shaping := jsonb_set(
+    actual_input_shaping,
+    '{source_fields}',
+    '["_otlet_mvcc","row","table"]'::jsonb,
+    true
+  );
+  current_contract_hash := otlet.task_contract_hash(
+    instruction,
+    output_schema,
+    model_name,
+    runtime_options,
+    actual_input_shaping,
+    decision_contract
+  );
 
   query := format(
     $query$
@@ -109,7 +132,7 @@ BEGIN
     semantic_task_name,
     actual_input_columns,
     current_contract_hash,
-    input_shaping
+    actual_input_shaping
   );
 
   PERFORM otlet.create_task(
@@ -119,7 +142,7 @@ BEGIN
     output_schema,
     model_name,
     runtime_options,
-    input_shaping,
+    actual_input_shaping,
     decision_contract
   );
 
@@ -299,4 +322,3 @@ BEGIN
   RETURN updated_count;
 END;
 $$;
-

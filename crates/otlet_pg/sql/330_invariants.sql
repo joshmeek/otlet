@@ -110,6 +110,59 @@ BEGIN
 
   RETURN QUERY
   SELECT
+    'queued_input_bytes_within_model_cap'::text,
+    'model'::text,
+    q.model_name,
+    jsonb_build_object(
+      'queued_input_bytes', q.queued_input_bytes,
+      'max_queued_input_bytes_per_model', q.max_queued_input_bytes_per_model
+    )
+  FROM (
+    SELECT
+      m.name AS model_name,
+      COALESCE(sum(octet_length(j.input::text)), 0)::bigint AS queued_input_bytes,
+      p.max_queued_input_bytes_per_model
+    FROM otlet.production_policy p
+    CROSS JOIN otlet.models m
+    LEFT JOIN otlet.tasks t ON t.model_name = m.name
+    LEFT JOIN otlet.jobs j ON j.task_name = t.name AND j.status = 'queued'
+    GROUP BY m.name, p.max_queued_input_bytes_per_model
+  ) q
+  WHERE q.queued_input_bytes > q.max_queued_input_bytes_per_model;
+
+  RETURN QUERY
+  SELECT
+    'total_queued_input_bytes_within_cap'::text,
+    'queue'::text,
+    p.name,
+    jsonb_build_object(
+      'queued_input_bytes', q.queued_input_bytes,
+      'max_queued_input_bytes_total', p.max_queued_input_bytes_total
+    )
+  FROM otlet.production_policy p
+  CROSS JOIN LATERAL (
+    SELECT COALESCE(sum(octet_length(j.input::text)), 0)::bigint AS queued_input_bytes
+    FROM otlet.jobs j
+    WHERE j.status = 'queued'
+  ) q
+  WHERE q.queued_input_bytes > p.max_queued_input_bytes_total;
+
+  RETURN QUERY
+  SELECT
+    'queued_input_within_per_job_cap'::text,
+    'job'::text,
+    j.id::text,
+    jsonb_build_object(
+      'input_bytes', octet_length(j.input::text),
+      'max_input_bytes_per_job', p.max_input_bytes_per_job
+    )
+  FROM otlet.jobs j
+  CROSS JOIN otlet.production_policy p
+  WHERE j.status = 'queued'
+    AND octet_length(j.input::text) > p.max_input_bytes_per_job;
+
+  RETURN QUERY
+  SELECT
     'no_applied_action_without_approval'::text,
     'action'::text,
     a.id::text,
@@ -122,6 +175,84 @@ BEGIN
   FROM otlet.actions a
   WHERE a.apply_status IN ('applied', 'replayed')
     AND a.approval_status IS DISTINCT FROM 'approved';
+
+  RETURN QUERY
+  SELECT
+    'workflow_actions_match_task_allowlist'::text,
+    'action'::text,
+    a.id::text,
+    jsonb_build_object(
+      'task_name', j.task_name,
+      'action_type', a.action_type,
+      'status', a.status
+    )
+  FROM otlet.actions a
+  JOIN otlet.jobs j ON j.id = a.job_id
+  JOIN otlet.tasks t ON t.name = j.task_name
+  WHERE a.authority_origin = 'workflow'
+    AND a.status <> 'rejected'
+    AND NOT COALESCE(t.decision_contract -> 'action_types', '[]'::jsonb) ? a.action_type;
+
+  RETURN QUERY
+  SELECT
+    'accepted_updates_match_workflow_authority'::text,
+    'action'::text,
+    a.id::text,
+    jsonb_build_object(
+      'task_name', j.task_name,
+      'target_name', a.target_name,
+      'subject_namespace', a.subject_namespace,
+      'authority_error', otlet.action_workflow_policy_error(
+        j.task_name,
+        a.action_type,
+        a.authority_policy_hash,
+        a.target_name,
+        a.subject_namespace,
+        false
+      )
+    )
+  FROM otlet.actions a
+  JOIN otlet.jobs j ON j.id = a.job_id
+  WHERE a.action_type = 'update_row'
+    AND a.status <> 'rejected'
+    AND (
+      a.authority_origin <> 'workflow'
+      OR otlet.action_workflow_policy_error(
+        j.task_name,
+        a.action_type,
+        a.authority_policy_hash,
+        a.target_name,
+        a.subject_namespace,
+        false
+      ) IS NOT NULL
+    );
+
+  RETURN QUERY
+  SELECT
+    'applied_updates_have_mutation_authority'::text,
+    'action'::text,
+    a.id::text,
+    jsonb_build_object(
+      'authority_origin', a.authority_origin,
+      'authority_mode', a.authority_mode,
+      'evaluation_status', a.evaluation_status,
+      'target_name', a.target_name,
+      'payload_target', a.payload #>> '{body,target}'
+    )
+  FROM otlet.actions a
+  WHERE a.action_type = 'update_row'
+    AND a.apply_status IN ('applied', 'replayed')
+    AND (
+      a.authority_origin <> 'workflow'
+      OR a.authority_mode <> 'bounded_mutation'
+      OR a.evaluation_status <> 'evaluated'
+      OR a.authority_policy_hash !~ '^[0-9a-f]{32}$'
+      OR a.target_name IS NULL
+      OR a.subject_namespace IS NULL
+      OR a.payload #>> '{body,target}' IS DISTINCT FROM a.target_name
+      OR a.dry_run_status <> 'passed'
+      OR a.approval_status <> 'approved'
+    );
 
   RETURN QUERY
   SELECT
@@ -197,6 +328,16 @@ BEGIN
 
   RETURN QUERY
   SELECT
+    'active_jobs_have_claim_tokens'::text,
+    'job'::text,
+    j.id::text,
+    jsonb_build_object('status', j.status, 'attempts', j.attempts)
+  FROM otlet.jobs j
+  WHERE j.status IN ('running', 'cancel_requested')
+    AND j.claim_token IS NULL;
+
+  RETURN QUERY
+  SELECT
     'complete_receipts_are_schema_validated'::text,
     'receipt'::text,
     r.id::text,
@@ -208,6 +349,109 @@ BEGIN
   FROM otlet.inference_receipts r
   WHERE r.status = 'complete'
     AND r.schema_validation_status IS DISTINCT FROM 'passed';
+
+  RETURN QUERY
+  SELECT
+    'complete_receipts_have_portable_identities'::text,
+    'receipt'::text,
+    r.id::text,
+    jsonb_build_object(
+      'job_id', r.job_id,
+      'task_identity_hash', r.task_identity_hash,
+      'source_identity_hash', r.source_identity_hash,
+      'model_identity_hash', r.model_identity_hash,
+      'runtime_options_hash', r.runtime_options_hash,
+      'prompt_hash', r.prompt_hash,
+      'input_hash', r.input_hash,
+      'output_schema_hash', r.output_schema_hash,
+      'output_hash', r.output_hash,
+      'actions_hash', r.actions_hash,
+      'validation_version', r.trace_summary #>> '{portable_validation,version}'
+    )
+  FROM otlet.inference_receipts r
+  WHERE r.status = 'complete'
+    AND (
+      r.task_identity_hash IS NULL
+      OR r.source_identity_hash IS NULL
+      OR r.model_identity_hash IS NULL
+      OR r.runtime_options_hash IS NULL
+      OR r.prompt_hash IS NULL
+      OR r.input_hash IS NULL
+      OR r.output_schema_hash IS NULL
+      OR r.output_hash IS NULL
+      OR r.actions_hash IS NULL
+      OR r.trace_summary #>> '{portable_validation,version}'
+        IS DISTINCT FROM 'otlet_portable_validation_v1'
+    );
+
+  RETURN QUERY
+  SELECT
+    'portable_live_claims_match_jobs'::text,
+    'portable_claim'::text,
+    c.id::text,
+    jsonb_build_object(
+      'job_id', c.job_id,
+      'worker_id', c.worker_id,
+      'claim_status', c.status,
+      'job_status', j.status
+    )
+  FROM otlet.portable_claims c
+  JOIN otlet.jobs j ON j.id = c.job_id
+  WHERE c.status IN ('claimed', 'renewed')
+    AND (
+      j.status NOT IN ('running', 'cancel_requested')
+      OR j.claim_token IS NULL
+      OR c.claim_token_hash IS DISTINCT FROM otlet.portable_text_hash(j.claim_token)
+    );
+
+  RETURN QUERY
+  SELECT
+    'portable_terminal_claims_match_jobs'::text,
+    'portable_claim'::text,
+    c.id::text,
+    jsonb_build_object(
+      'job_id', c.job_id,
+      'worker_id', c.worker_id,
+      'claim_status', c.status,
+      'job_status', j.status
+    )
+  FROM otlet.portable_claims c
+  JOIN otlet.jobs j ON j.id = c.job_id
+  WHERE c.status IN ('complete', 'failed', 'canceled')
+    AND c.status IS DISTINCT FROM j.status;
+
+  RETURN QUERY
+  SELECT
+    'portable_receipts_match_claims'::text,
+    'receipt'::text,
+    r.id::text,
+    jsonb_build_object(
+      'claim_id', c.id,
+      'claim_job_id', c.job_id,
+      'receipt_job_id', r.job_id,
+      'runtime_name', r.runtime_name,
+      'runtime_endpoint', r.runtime_endpoint
+    )
+  FROM otlet.portable_receipt_links l
+  JOIN otlet.portable_claims c ON c.id = l.claim_id
+  JOIN otlet.inference_receipts r ON r.id = l.receipt_id
+  WHERE r.job_id IS DISTINCT FROM c.job_id
+     OR r.runtime_name NOT LIKE 'portable:%'
+     OR r.runtime_endpoint IS DISTINCT FROM 'postgres_rpc';
+
+  RETURN QUERY
+  SELECT
+    'enabled_portable_workers_have_database_roles'::text,
+    'portable_worker'::text,
+    w.worker_id,
+    jsonb_build_object('database_role_oid', w.database_role_oid)
+  FROM otlet.portable_workers w
+  WHERE w.enabled
+    AND NOT EXISTS (
+      SELECT 1
+      FROM pg_catalog.pg_roles r
+      WHERE r.oid = w.database_role_oid
+    );
 
   RETURN QUERY
   SELECT
@@ -224,6 +468,49 @@ BEGIN
     )
   FROM otlet.redaction_policy_status s
   WHERE NOT s.storage_compliant;
+
+  RETURN QUERY
+  SELECT
+    'destination_state_matches_latest_acknowledgement'::text,
+    'destination_export'::text,
+    export.id::text,
+    jsonb_build_object(
+      'destination', export.destination,
+      'export_state', export.state,
+      'acknowledgement_state', latest.acknowledgement_state
+    )
+  FROM otlet.destination_exports export
+  JOIN LATERAL (
+    SELECT acknowledgement.acknowledgement_state
+    FROM otlet.destination_acknowledgements acknowledgement
+    WHERE acknowledgement.destination_export_id = export.id
+    ORDER BY acknowledgement.id DESC
+    LIMIT 1
+  ) latest ON true
+  WHERE export.state IS DISTINCT FROM latest.acknowledgement_state;
+
+  RETURN QUERY
+  SELECT
+    'destination_replays_link_to_applied_acknowledgements'::text,
+    'destination_acknowledgement'::text,
+    replay.id::text,
+    jsonb_build_object(
+      'destination_export_id', replay.destination_export_id,
+      'acknowledgement_id', replay.acknowledgement_id,
+      'replay_of_acknowledgement_id', replay.replay_of_acknowledgement_id,
+      'destination_execution_receipt_id', replay.destination_execution_receipt_id
+    )
+  FROM otlet.destination_acknowledgements replay
+  LEFT JOIN otlet.destination_acknowledgements source
+    ON source.destination_export_id = replay.destination_export_id
+   AND source.acknowledgement_id = replay.replay_of_acknowledgement_id
+  WHERE replay.replay_decision = 'duplicate_replay'
+    AND (
+      source.id IS NULL
+      OR source.acknowledgement_state <> 'applied'
+      OR source.destination_execution_receipt_id
+        IS DISTINCT FROM replay.destination_execution_receipt_id
+    );
 
   RETURN QUERY
   SELECT
@@ -461,4 +748,3 @@ BEGIN
   END LOOP;
 END;
 $$;
-

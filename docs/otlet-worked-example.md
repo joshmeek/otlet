@@ -33,16 +33,22 @@ Run the setup script:
 ./scripts/otlet-demo.sh
 ```
 
-Observed setup output:
+Setup prints:
 
 ```text
 postgres_url=postgres://postgres:postgres@127.0.0.1:55432/postgres
+database=postgres
 worker_count=1
+max_worker_rss_bytes=8589934592
 cheap_model_artifact=/var/lib/postgresql/otlet-models/Qwen3-1.7B-Q8_0.gguf
 strong_model_artifact=/var/lib/postgresql/otlet-models/Qwen3.5-4B-Q4_K_M.gguf
+cheap_model_sha256=<64 lowercase hex characters>
+strong_model_sha256=<64 lowercase hex characters>
+cheap_model_bytes=<positive byte count>
+strong_model_bytes=<positive byte count>
 ```
 
-The setup installs the extension and starts one resident worker. The demo registers both models, creates its fixtures and tasks, waits for the model work, and checks each contract
+The setup installs the extension and starts one resident worker. Set `OTLET_DATABASE` to use another database and `OTLET_MAX_WORKER_RSS_BYTES` to override the default 8 GiB worker RSS budget. The demo registers both models, creates its fixtures and tasks, waits for the model work, and checks each contract
 
 Open `psql` to inspect the completed run:
 
@@ -200,10 +206,13 @@ bounded_proposal_contract=5|3|1|1|1|2|1
 bounded_dry_run_contract=4|1|4|1
 bounded_queue_contract=4|1
 bounded_execution_contract=approved|bounded apply|1|DO_NOT_TOUCH_SENTINEL|pending||0|DO_NOT_TOUCH_SENTINEL|1|2|2|0
-permission_contract=public=0/0/0|auditor=8/3|operator=8/9|definer=8/8|positive=7|denied=48
+action_authority_contract=true|true|true|true|true|true|true|true|true|true
+retention_contract=true|true|true|true|true|true|true|true|true
+review_provenance_contract=true|true|true|true|true|true|true|true|true|true|true
+permission_contract=public=0/0/0|auditor=14/3|operator=14/11|definer=10/10|positive=7|denied=69
 ```
 
-Otlet changes `row-1` once and preserves its protected sentinel. `row-3` stays unchanged. The two replay receipts affect zero rows, and the two rejected apply attempts affect zero rows
+Otlet changes `row-1` once and preserves its protected sentinel. `row-3` stays unchanged. The authority proof rejects a forged destination, recommendation-only policy, unevaluated and adversarial policies, missing approval, and stale source state before proving one bounded mutation
 
 ## Step 7 - Check Semantic And Production Paths
 
@@ -216,13 +225,14 @@ semantic_join_lookup_contract=4|1|3
 semantic_join_match_contract=true|true
 watch_replace_contract=true|true|true|true|true|true|true|true|true|true
 watch_round_trip_contract=true|true|true|true|true
-watch_import_failure_contract=9|true
+watch_import_failure_contract=10|true
+watch_pack_contract=true|true|true|true|true|true|true|true|true|true|true|true|true
 candidate_removed_contract=0|true|candidate_removed|0|0|false|
 candidate_changed_contract=1|true|candidate_changed|0
 semantic_join_stale_contract=4|0|fresh_after_lookup=0|receipts=8|8
 receipt_trace_contract=8|8|8|8
 inference_visibility_status=true|true|true|true|true
-direct_ask_runtime_fingerprint_contract=otlet_runtime_fingerprint_v1|true|true|Q4_K_M|otlet_raw_json_worker_v1|94a220cd6|512|8217751552
+direct_ask_runtime_fingerprint_contract=otlet_runtime_fingerprint_v1|true|true|true|true|true|true|sha256_verified_before_model_load|Q4_K_M|otlet_raw_json_worker_v1|94a220cd6|512|8217751552
 preload_admission_contract=failed|model_load_admission_rejected|rejected|true|true|true|true|0|true|true|true|true
 requester_timeout_contract=canceled|true|canceled|canceled|0|0|true|true|true|1|ready|ready
 redaction_status_contract=redacted|0|0|0|0|0|true

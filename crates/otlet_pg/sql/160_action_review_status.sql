@@ -95,11 +95,16 @@ SELECT
   j.subject_id AS job_subject_id,
   a.subject_id,
   a.action_type,
+  a.authority_origin,
+  a.authority_mode,
+  a.evaluation_status,
+  a.authority_policy_hash,
+  a.subject_namespace,
   a.status,
   a.approval_status,
   a.dry_run_status,
   a.apply_status,
-  a.payload #>> '{body,target}' AS target_name,
+  a.target_name,
   a.idempotency_key,
   a.source_table,
   a.source_hash,
@@ -133,12 +138,44 @@ LEFT JOIN LATERAL (
   LIMIT 1
 ) execution ON true;
 
+CREATE VIEW otlet.action_workflow_policy_status AS
+SELECT
+  p.task_name,
+  p.action_type,
+  p.target_name,
+  p.subject_namespace,
+  p.authority_mode,
+  p.evaluation_status,
+  p.policy_hash,
+  p.task_contract_hash,
+  p.target_contract_hash,
+  p.enabled,
+  p.task_contract_hash IS NOT DISTINCT FROM otlet.current_task_contract_hash(p.task_name)
+    AS task_contract_current,
+  p.target_contract_hash IS NOT DISTINCT FROM otlet.action_target_contract_hash(p.target_name)
+    AS target_contract_current,
+  otlet.action_target_validation_error(p.target_name) AS target_error,
+  p.enabled
+    AND p.authority_mode = 'bounded_mutation'
+    AND p.evaluation_status = 'evaluated'
+    AND p.task_contract_hash IS NOT DISTINCT FROM otlet.current_task_contract_hash(p.task_name)
+    AND p.target_contract_hash IS NOT DISTINCT FROM otlet.action_target_contract_hash(p.target_name)
+    AND otlet.action_target_validation_error(p.target_name) IS NULL
+    AS mutation_authorized,
+  p.created_at,
+  p.updated_at
+FROM otlet.action_workflow_policies p;
+
 CREATE VIEW otlet.eval_label_status AS
 SELECT
   l.id AS label_id,
   l.action_id,
   l.output_id,
   l.receipt_id,
+  COALESCE(l.workload_name, l.task_name, j.task_name, r.task_name) AS workload_name,
+  COALESCE(l.case_key, 'label:' || l.id::text) AS case_key,
+  l.case_weight,
+  COALESCE(l.task_name, j.task_name, r.task_name) AS task_name,
   l.source_table,
   l.subject_id,
   l.source_hash,
@@ -158,10 +195,10 @@ SELECT
   l.created_at
 FROM otlet.eval_labels l
 LEFT JOIN otlet.actions a ON a.id = l.action_id
-LEFT JOIN otlet.jobs j ON j.id = a.job_id
-LEFT JOIN otlet.tasks t ON t.name = j.task_name
-LEFT JOIN otlet.outputs o ON o.id = l.output_id
-LEFT JOIN otlet.inference_receipts r ON r.id = l.receipt_id;
+LEFT JOIN otlet.inference_receipts r ON r.id = l.receipt_id
+LEFT JOIN otlet.jobs j ON j.id = COALESCE(a.job_id, r.job_id)
+LEFT JOIN otlet.tasks t ON t.name = COALESCE(l.task_name, j.task_name, r.task_name)
+LEFT JOIN otlet.outputs o ON o.id = l.output_id;
 
 CREATE VIEW otlet.review_queue AS
 WITH action_items AS (
@@ -320,6 +357,12 @@ abstention_items AS (
       WHERE l.output_id = o.id
         AND l.label_source = 'manual_correction'
     )
+    AND NOT EXISTS (
+      SELECT 1
+      FROM otlet.review_events event
+      WHERE event.output_id = o.id
+        AND event.outcome = 'abstain'
+    )
 ),
 direct_rejected_items AS (
   SELECT
@@ -385,6 +428,12 @@ direct_rejected_items AS (
       FROM otlet.eval_labels l
       WHERE l.receipt_id = r.id
         AND l.label_source = 'manual_correction'
+    )
+    AND NOT EXISTS (
+      SELECT 1
+      FROM otlet.review_events event
+      WHERE event.receipt_id = r.id
+        AND event.outcome = 'abstain'
     )
 )
 SELECT
@@ -487,3 +536,48 @@ SELECT
 FROM direct_rejected_items
 ORDER BY created_at, task_name, job_subject_id, queue_kind;
 
+CREATE FUNCTION otlet.defer_action(
+  action_id bigint,
+  reason text DEFAULT NULL
+) RETURNS SETOF otlet.review_events
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, otlet, pg_temp
+AS $$
+BEGIN
+  PERFORM 1
+  FROM otlet.review_queue queue
+  WHERE queue.action_id = defer_action.action_id;
+  IF NOT FOUND THEN
+    RETURN;
+  END IF;
+
+  RETURN QUERY
+  SELECT *
+  FROM otlet.record_review_event('defer', defer_action.action_id, NULL, defer_action.reason);
+END;
+$$;
+
+CREATE FUNCTION otlet.abstain_review(
+  receipt_id bigint,
+  reason text DEFAULT NULL
+) RETURNS SETOF otlet.review_events
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, otlet, pg_temp
+AS $$
+BEGIN
+  PERFORM 1
+  FROM otlet.review_queue queue
+  WHERE queue.receipt_id = abstain_review.receipt_id
+    AND queue.action_id IS NULL
+    AND queue.queue_kind IN ('abstention_output', 'direct_rejected_output');
+  IF NOT FOUND THEN
+    RETURN;
+  END IF;
+
+  RETURN QUERY
+  SELECT *
+  FROM otlet.record_review_event('abstain', NULL, abstain_review.receipt_id, abstain_review.reason);
+END;
+$$;

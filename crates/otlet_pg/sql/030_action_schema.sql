@@ -13,11 +13,11 @@ INSERT INTO otlet.action_type_schemas (
   applyable
 )
 VALUES
-  ('create_record', false, true, true),
+  ('create_record', false, true, false),
   ('merge_candidate', true, false, false),
   ('new_entity', false, false, false),
   ('review_flag', false, false, false),
-  ('note', false, true, true),
+  ('note', false, true, false),
   ('update_row', true, false, true);
 
 CREATE TABLE otlet.action_targets (
@@ -32,12 +32,41 @@ CREATE TABLE otlet.action_targets (
   CHECK (NOT identity_column = ANY(allowed_columns))
 );
 
+CREATE TABLE otlet.action_workflow_policies (
+  task_name text NOT NULL REFERENCES otlet.tasks(name) ON DELETE CASCADE,
+  action_type text NOT NULL REFERENCES otlet.action_type_schemas(action_type),
+  target_name text NOT NULL REFERENCES otlet.action_targets(name),
+  subject_namespace text NOT NULL,
+  authority_mode text NOT NULL DEFAULT 'recommendation_only',
+  evaluation_status text NOT NULL DEFAULT 'unevaluated',
+  task_contract_hash text NOT NULL,
+  target_contract_hash text NOT NULL,
+  policy_hash text NOT NULL,
+  enabled boolean NOT NULL DEFAULT true,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (task_name, action_type),
+  CHECK (action_type = 'update_row'),
+  CHECK (NULLIF(subject_namespace, '') IS NOT NULL),
+  CHECK (authority_mode IN ('recommendation_only', 'bounded_mutation')),
+  CHECK (evaluation_status IN ('unevaluated', 'evaluated', 'adversarial')),
+  CHECK (task_contract_hash ~ '^[0-9a-f]{32}$'),
+  CHECK (target_contract_hash ~ '^[0-9a-f]{32}$'),
+  CHECK (policy_hash ~ '^[0-9a-f]{32}$')
+);
+
 CREATE TABLE otlet.actions (
   id bigserial PRIMARY KEY,
   job_id bigint NOT NULL REFERENCES otlet.jobs(id),
   output_id bigint REFERENCES otlet.outputs(id),
   receipt_id bigint REFERENCES otlet.inference_receipts(id),
   action_type text NOT NULL,
+  authority_origin text NOT NULL,
+  authority_mode text NOT NULL,
+  evaluation_status text NOT NULL,
+  authority_policy_hash text NOT NULL,
+  subject_namespace text NOT NULL,
+  target_name text REFERENCES otlet.action_targets(name),
   payload jsonb NOT NULL CHECK (jsonb_typeof(payload) = 'object'),
   status text NOT NULL DEFAULT 'proposed',
   approval_status text NOT NULL DEFAULT 'not_required',
@@ -54,6 +83,11 @@ CREATE TABLE otlet.actions (
   approved_at timestamptz,
   applied_at timestamptz,
   CHECK (status IN ('proposed', 'complete', 'rejected', 'approved', 'applied')),
+  CHECK (authority_origin IN ('workflow', 'system')),
+  CHECK (authority_mode IN ('recommendation_only', 'bounded_mutation')),
+  CHECK (evaluation_status IN ('unevaluated', 'evaluated', 'adversarial')),
+  CHECK (authority_policy_hash ~ '^[0-9a-f]{32}$'),
+  CHECK (NULLIF(subject_namespace, '') IS NOT NULL),
   CHECK (approval_status IN ('not_required', 'required', 'approved', 'rejected')),
   CHECK (dry_run_status IN ('not_run', 'passed', 'failed')),
   CHECK (apply_status IN ('not_applicable', 'applied', 'replayed', 'failed')),
@@ -120,6 +154,10 @@ CREATE TABLE otlet.eval_labels (
   action_id bigint REFERENCES otlet.actions(id),
   output_id bigint REFERENCES otlet.outputs(id),
   receipt_id bigint REFERENCES otlet.inference_receipts(id),
+  workload_name text,
+  case_key text,
+  case_weight numeric NOT NULL DEFAULT 1 CHECK (case_weight > 0),
+  task_name text,
   source_table text,
   subject_id text NOT NULL,
   source_hash text,
@@ -154,3 +192,89 @@ WHERE label_source = 'manual_correction' AND receipt_id IS NOT NULL;
 CREATE INDEX eval_labels_created_at_idx
 ON otlet.eval_labels (created_at, id);
 
+CREATE UNIQUE INDEX eval_labels_workload_case_idx
+ON otlet.eval_labels (workload_name, case_key)
+WHERE workload_name IS NOT NULL
+  AND case_key IS NOT NULL
+  AND action_id IS NULL
+  AND output_id IS NULL
+  AND receipt_id IS NULL;
+
+CREATE TABLE otlet.workload_evaluation_runs (
+  name text PRIMARY KEY CHECK (name ~ '^[a-z0-9][a-z0-9_-]*$'),
+  workload_name text NOT NULL CHECK (NULLIF(workload_name, '') IS NOT NULL),
+  baseline_name text REFERENCES otlet.workload_evaluation_runs(name),
+  identity jsonb NOT NULL CHECK (jsonb_typeof(identity) = 'object'),
+  metrics jsonb NOT NULL CHECK (jsonb_typeof(metrics) = 'object'),
+  thresholds jsonb NOT NULL CHECK (jsonb_typeof(thresholds) = 'object'),
+  gate_results jsonb NOT NULL CHECK (jsonb_typeof(gate_results) = 'object'),
+  gate_status text NOT NULL CHECK (gate_status IN ('passed', 'failed')),
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE INDEX workload_evaluation_runs_workload_created_idx
+ON otlet.workload_evaluation_runs (workload_name, created_at DESC, name);
+
+CREATE FUNCTION otlet.reject_workload_evaluation_run_change() RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+BEGIN
+  RAISE EXCEPTION 'otlet workload evaluation history is immutable';
+END;
+$$;
+
+CREATE TRIGGER workload_evaluation_runs_immutable
+BEFORE UPDATE OR DELETE ON otlet.workload_evaluation_runs
+FOR EACH ROW EXECUTE FUNCTION otlet.reject_workload_evaluation_run_change();
+
+CREATE TRIGGER workload_evaluation_runs_no_truncate
+BEFORE TRUNCATE ON otlet.workload_evaluation_runs
+FOR EACH STATEMENT EXECUTE FUNCTION otlet.reject_workload_evaluation_run_change();
+
+CREATE TABLE otlet.review_events (
+  id bigserial PRIMARY KEY,
+  outcome text NOT NULL CHECK (outcome IN ('approve', 'reject', 'correct', 'defer', 'abstain')),
+  reviewer_identity text NOT NULL CHECK (NULLIF(reviewer_identity, '') IS NOT NULL),
+  reviewer_role text NOT NULL CHECK (NULLIF(reviewer_role, '') IS NOT NULL),
+  reason text NOT NULL CHECK (NULLIF(reason, '') IS NOT NULL AND octet_length(reason) <= 8192),
+  job_id bigint NOT NULL CHECK (job_id > 0),
+  task_name text NOT NULL CHECK (NULLIF(task_name, '') IS NOT NULL),
+  subject_id text NOT NULL,
+  action_id bigint CHECK (action_id > 0),
+  output_id bigint CHECK (output_id > 0),
+  receipt_id bigint NOT NULL CHECK (receipt_id > 0),
+  source_table text,
+  source_hash text,
+  content_hash text,
+  current_content_hash text,
+  source_freshness text NOT NULL CHECK (source_freshness IN ('fresh', 'stale', 'unavailable')),
+  model_name text NOT NULL CHECK (NULLIF(model_name, '') IS NOT NULL),
+  model_artifact_hash text NOT NULL CHECK (NULLIF(model_artifact_hash, '') IS NOT NULL),
+  prompt_hash text,
+  output_schema_hash text NOT NULL CHECK (NULLIF(output_schema_hash, '') IS NOT NULL),
+  output_hash text NOT NULL CHECK (NULLIF(output_hash, '') IS NOT NULL),
+  runtime_fingerprint_hash text,
+  reviewed_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE INDEX review_events_target_reviewed_idx
+ON otlet.review_events (action_id, output_id, receipt_id, reviewed_at DESC, id DESC);
+
+CREATE INDEX review_events_reviewer_reviewed_idx
+ON otlet.review_events (reviewer_identity, reviewer_role, reviewed_at DESC, id DESC);
+
+CREATE FUNCTION otlet.reject_review_event_change() RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+BEGIN
+  RAISE EXCEPTION 'otlet review event history is immutable';
+END;
+$$;
+
+CREATE TRIGGER review_events_immutable
+BEFORE UPDATE OR DELETE ON otlet.review_events
+FOR EACH ROW EXECUTE FUNCTION otlet.reject_review_event_change();
+
+CREATE TRIGGER review_events_no_truncate
+BEFORE TRUNCATE ON otlet.review_events
+FOR EACH STATEMENT EXECUTE FUNCTION otlet.reject_review_event_change();

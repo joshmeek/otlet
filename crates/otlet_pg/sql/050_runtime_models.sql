@@ -1,7 +1,8 @@
 CREATE FUNCTION otlet.register_model(
   model_name text,
   artifact_path text,
-  artifact_hash text DEFAULT NULL,
+  artifact_hash text,
+  artifact_identity jsonb,
   max_active_jobs int DEFAULT 1
 ) RETURNS otlet.models
 LANGUAGE plpgsql
@@ -9,16 +10,18 @@ AS $$
 DECLARE
   saved otlet.models%ROWTYPE;
 BEGIN
-  INSERT INTO otlet.models (name, artifact_path, artifact_hash, max_active_jobs)
+  INSERT INTO otlet.models (name, artifact_path, artifact_hash, artifact_identity, max_active_jobs)
   VALUES (
     register_model.model_name,
     register_model.artifact_path,
-    register_model.artifact_hash,
+    lower(register_model.artifact_hash),
+    register_model.artifact_identity,
     GREATEST(1, LEAST(COALESCE(register_model.max_active_jobs, 1), 1024))
   )
   ON CONFLICT (name) DO UPDATE
     SET artifact_path = EXCLUDED.artifact_path,
         artifact_hash = EXCLUDED.artifact_hash,
+        artifact_identity = EXCLUDED.artifact_identity,
         max_active_jobs = EXCLUDED.max_active_jobs
   RETURNING * INTO saved;
 
