@@ -154,7 +154,7 @@ runtime_identity="$(docker exec "$container" /target/release/otlet_worker --prin
 
 docker exec "$container" createdb -U postgres "$portable_database"
 docker exec -w /work "$container" psql -U postgres -d "$portable_database" \
-  -X -q -v ON_ERROR_STOP=1 -f portable/install.sql
+  -X -q -v ON_ERROR_STOP=1 -f crates/otlet_worker/sql/install.sql
 
 docker exec -i "$container" psql -U postgres -d "$portable_database" \
   -X -qAt -v ON_ERROR_STOP=1 \

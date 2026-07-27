@@ -10,7 +10,7 @@ This example runs one Otlet worker beside an RDS-like PostgreSQL service. The se
 - Mount one GGUF from VPC-local storage and the database CA bundle as read-only files
 - Keep model-provider egress closed because inference is local
 
-Install [the portable SQL contract](../../../portable/README.md), create the dedicated login, register the exact worker identity, and register the model artifact before starting the container
+Install [the portable SQL contract](../../../crates/otlet_worker/README.md), create the dedicated login, register the exact worker identity, and register the model artifact before starting the container
 
 ## Build And Run
 

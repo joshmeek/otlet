@@ -122,7 +122,7 @@ fi
 
 docker exec "$database_container" createdb -h 127.0.0.1 -U postgres "$database"
 docker exec -w /work "$database_container" psql -h 127.0.0.1 -U postgres -d "$database" \
-  -X -q -v ON_ERROR_STOP=1 -f portable/install.sql
+  -X -q -v ON_ERROR_STOP=1 -f crates/otlet_worker/sql/install.sql
 runtime_identity="$(docker run --rm "$worker_image" --print-runtime-identity)"
 
 docker exec -i "$database_container" psql -h 127.0.0.1 -U postgres -d "$database" \

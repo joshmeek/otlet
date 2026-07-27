@@ -9,7 +9,7 @@ The first scope is one worker process, one database, and one registered model. I
 Run the installer as the database owner from the repository checkout:
 
 ```sh
-psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f portable/install.sql
+psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f crates/otlet_worker/sql/install.sql
 ```
 
 The install transaction creates the task, job, receipt, review, action, evaluation, freshness, and portable protocol state with SQL and PL/pgSQL only. The database keeps zero `otlet` extension objects and zero C-language Otlet functions
@@ -96,7 +96,7 @@ SELECT * FROM otlet.portable_claim_status ORDER BY claim_id DESC;
 
 Worker logs contain one-line JSON events with IDs and bounded reason codes. They omit llama.cpp diagnostics, raw prompts, and source evidence
 
-See [the customer-VPC example](../docs/examples/customer-vpc-portable-worker/README.md) for a small container deployment and [the production contract](../docs/production-contract.md) for the trust boundary
+See [the customer-VPC example](../../docs/examples/customer-vpc-portable-worker/README.md) for a small container deployment and [the production contract](../../docs/production-contract.md) for the trust boundary
 
 ## Run The Real Smoke Test
 
