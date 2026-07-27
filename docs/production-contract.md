@@ -102,7 +102,7 @@ Admission caps cover bulk rows, raw bytes per job, queue depth, queued bytes per
 
 Pair-watch creation stores a non-executing candidate `EXPLAIN` plan and rejects invalid or over-cost plans. Pair refresh requires a caller `statement_timeout` from 1 ms through the policy limit because Postgres cannot arm a timeout from inside the statement already running. See [the workload admission contract](workload-admission.md) for the transaction form and SQL-visible limits
 
-Claimed jobs use `otlet.effective_job_lease_interval(...)`, which covers the task attempt timeout plus 30 seconds of completion grace. The claim function creates a random opaque token each time. Renew, attempt, complete, fail, and worker-owned cancel calls must present the token while its lease is live. Reclaim replaces the token, so an expired or displaced worker cannot add trusted state. Exact terminal retries return the existing result; a retry that changes the terminal request is rejected. `model_selection_policy_status.effective_job_lease_interval` exposes the derived interval
+Claimed jobs use `otlet.effective_job_lease_interval(...)`, which covers the task attempt timeout plus 30 seconds of completion grace. The claim function creates a random opaque token each time. Renew, attempt, complete, fail, and worker-owned cancel calls must present the token while its lease is live. Reclaim replaces the token, so an expired or displaced worker cannot add trusted state. Exact terminal retries return the existing result; PostgreSQL rejects a retry that changes the terminal request. `model_selection_policy_status.effective_job_lease_interval` exposes the derived interval
 
 Requester cancellation is a separate operation. `request_job_cancellation` marks live work for the owner to stop and can cancel queued work before it starts. `cancel_job` is the fenced terminal write and requires the live claim token
 
@@ -114,34 +114,13 @@ Portable protocol `otlet.portable.worker.v1` uses exact-version compatibility an
 
 `portable_claim_jobs(...)` returns the shaped input snapshot, database-built prompt and prompt hash, task contract, registered model policy, effective runtime options, evidence limits, a live claim token, and no source-table authority. A registered worker is bound to one model, so it cannot claim work for another artifact. Every later RPC requires the same role, worker ID, protocol version, runtime identity hash, job ID, and claim token
 
-The owner sets a worker to `running`, `paused`, or `draining`. The heartbeat returns that desired state, records process and model health, and does not grant owner controls to the worker role. Pause and drain block new claims. The reference worker renews during decode, stops after cancellation or claim loss, retries an exact terminal request after a transient disconnect, and reconnects after a database restart. It never submits a stale terminal write after renewal fails
+The owner sets a worker to `running`, `paused`, or `draining`. The heartbeat returns that desired state, records process and model health, and does not grant owner controls to the worker role. Pause and drain block new claims. The reference worker renews during decode, stops after cancellation or claim loss, retries an exact terminal request after a transient disconnect, and reconnects after a database restart. It suppresses stale terminal writes after renewal fails
 
-`portable_worker_status`, `portable_claim_status`, and `portable_receipt_status` expose identity, desired and reported state, model health, queue depth, live and expired claims, lease expiry, terminal state, and receipt attribution without exposing claim tokens. Exact duplicate terminal delivery returns the stored terminal result, while a changed retry is rejected
+`portable_worker_status`, `portable_claim_status`, and `portable_receipt_status` expose identity, desired and reported state, model health, queue depth, live and expired claims, lease expiry, terminal state, and receipt attribution without exposing claim tokens. Exact duplicate terminal delivery returns the prior result; PostgreSQL rejects a changed retry
 
 The [reference external worker](../portable/README.md) uses ordinary `psql` connections and a local llama.cpp runtime. It verifies the configured GGUF SHA-256 before loading, compares each claim with the registered model identity, submits accepted output through `portable_complete_job(...)`, and submits claimed failures through `portable_fail_job(...)`. Its one-line JSON logs carry identifiers and reason codes without llama.cpp diagnostics, prompts, or source evidence. It has no HTTP model client. The SQL-only installer creates no extension object or C-language function
 
 Before any portable claim, deployment preflight resolves and reaches the database endpoint, requires `sslmode=verify-full` with a readable CA by default, verifies the negotiated TLS session, authenticates the registered role, checks the seven RPC grants and active protocol version, verifies the runtime and model allowlists, hashes the local GGUF, probes the runtime directory, and requires the `deny_model_providers` egress declaration. `otlet_worker --preflight` runs the same checks and exits without loading the model or claiming work. Operators must enforce the declared egress policy in the deployment network
-
-`otlet.database_health_status` tracks queued jobs and bytes, current native or recent portable worker RSS, connections to the current database, current database size, WAL bytes since the statistics reset, Otlet relation storage, autovacuum configuration and activity, and the latest application-latency sample. The status view is read-only and available to auditors
-
-Health limits are nullable typed columns on the existing `otlet.production_policy` row: `health_max_queued_jobs`, `health_max_worker_rss_bytes`, `health_max_connections`, `health_max_database_bytes`, `health_max_wal_bytes_since_reset`, `health_max_otlet_storage_bytes`, and `health_max_application_latency_ms`. `health_require_autovacuum` rejects a globally disabled autovacuum or any Otlet relation with `autovacuum_enabled=false`. A configured application-latency limit also requires a sample no older than `health_application_latency_max_age`
-
-```sql
-UPDATE otlet.production_policy
-SET health_max_connections = 80,
-    health_max_database_bytes = 536870912000,
-    health_require_autovacuum = true,
-    health_max_application_latency_ms = 100
-WHERE name = 'default';
-
-SELECT otlet.record_application_latency(42.5);
-SELECT claims_allowed, failed_checks, checked_at
-FROM otlet.database_health_status;
-```
-
-Unset limits observe without gating. When a configured limit fails, the shared `claim_jobs(...)` boundary returns no new work to either runtime; live claims keep their existing lease behavior. Recovery needs no worker restart because the next claim reevaluates current state. Application tables and queries do not call the health gate
-
-`database_size_bytes` measures allocated bytes for the current database, not free filesystem capacity. `wal_bytes_since_reset` is the PostgreSQL cumulative WAL statistic. Infrastructure monitoring still owns free disk, volume growth, replicas, backups, and WAL retention outside the current database
 
 Otlet debounces suppressed queue-admission events per task and reason for one minute, so a full queue stays visible without flooding `worker_events`. `production_status` exposes `semantic_materialization_failed_events` and `semantic_materialization_last_failed_at`. Nonzero `max_worker_rss_bytes` budgets require Linux RSS, total-memory, and available-memory samples. A cache miss also requires artifact metadata and a no-allocation llama.cpp projection; missing evidence or insufficient headroom rejects the load before tensor allocation. Cleanup can prune old failed or canceled jobs after outputs, actions, eval labels, and receipts no longer reference them
 
@@ -240,7 +219,7 @@ SELECT * FROM otlet.cleanup_policy_state(false);
 COMMIT;
 ```
 
-Every task also has an explicit top-level source-field allowlist in `input_shaping.source_fields`. A missing allowlist becomes an empty array, so `{}` is the only admitted input until the owner names fields. `create_task`, `run_task`, `admit_task_input`, watch refresh, direct job insertion, and claim all enforce the same contract. Row watches store their selected column list when the watch is created; a later table column does not enter model input by accident
+Every task also has an explicit top-level source-field allowlist in `input_shaping.source_fields`. A missing allowlist becomes an empty array, so Otlet admits only `{}` until the owner names fields. `create_task`, `run_task`, `admit_task_input`, watch refresh, direct job insertion, and claim all enforce the same contract. Row watches store their selected column list at creation; a later table column does not enter model input by accident
 
 ```sql
 SELECT name, input_shaping -> 'source_fields' AS source_fields
@@ -354,8 +333,6 @@ The auditor capability grants these redacted policy and audit views:
 - `otlet.audit_action_execution_export`
 - `otlet.audit_eval_label_export`
 - `otlet.audit_workload_evaluation_export`
-- `otlet.decision_trace_export`
-- `otlet.destination_reconciliation_status`
 - `otlet.action_workflow_policy_status`
 - `otlet.cleanup_receipt_status`
 - `otlet.retention_hold_status`
@@ -363,7 +340,6 @@ The auditor capability grants these redacted policy and audit views:
 - `otlet.semantic_dependency_audit`
 - `otlet.operational_event_log`
 - `otlet.worker_batch_timing_status`
-- `otlet.database_health_status`
 
 The grant also includes three pure JSON hashing helpers required by `audit_review_export`; those helpers read no database rows. The operator capability includes auditor access plus these functions:
 
@@ -378,51 +354,9 @@ The grant also includes three pure JSON hashing helpers required by `audit_revie
 
 The eight operator functions run as the extension owner with `search_path` fixed to `pg_catalog, otlet, pg_temp`. Operators receive no direct table writes. The owner alone registers targets and workflow policies, disables them, and imports or exports watches. Watch exports contain instructions, policies, schemas, source identifiers, and owner-authored candidate SQL, so auditor and operator roles cannot read or import them
 
-## Signed decision exports
-
-`otlet.decision_trace_export` joins each accepted receipt to its source, task, model, prompt, schema, runtime, output, review, action, freshness, and execution identities. It exports hashes and bounded audit fields, not source rows, prompts, model output, action payloads, review reasons, credentials, or signing material
-
-Generate a deterministic SQL and CSV bundle for one receipt with an Ed25519 key stored outside PostgreSQL:
-
-```sh
-openssl genpkey -algorithm ED25519 -out /secure/otlet-signing-key.pem
-./scripts/otlet-export-decision.sh 42 /secure/exports/receipt-42 /secure/otlet-signing-key.pem
-./scripts/otlet-verify-decision-export.sh /secure/exports/receipt-42
-```
-
-The bundle contains `decision.sql`, `decision.csv`, `audit-manifest.json`, `recommendation-envelope.json`, its detached signature, and the public verification key. The manifest uses SHA-256 file identities and the signed envelope binds the manifest, recommendation, and public-key identity. Re-exporting unchanged database evidence with the same key produces identical bytes
-
-The exporter writes one local directory and performs no destination delivery. Keep the private key in an external secret store or signing service, distribute the public key through a trusted channel, and let a separate delivery process move verified bundles
-
-## Destination reconciliation
-
-Register one destination against the frozen recommendation identity before delivery:
-
-```sql
-SELECT *
-FROM otlet.register_destination_export(42, 'erp-production');
-```
-
-The returned `sha256:` idempotency key is stable for that recommendation and destination. It also appears in the signed recommendation envelope. The envelope includes only destinations registered against its exact recommendation identity. Retain that bundle for delivery retries; if later review or action evidence changes the recommendation identity, export the new recommendation before registering another destination. The receiver must enforce the key so a retry returns its first execution result instead of applying the recommendation again
-
-Receivers return canonical `otlet.destination-acknowledgement.v1` JSON signed with Ed25519. `scripts/otlet-record-destination-ack.sh` verifies the signature against a trusted public key before calling the bounded database function. PostgreSQL records the authenticated session identity, active role, public-key fingerprint, payload hash, signature hash, destination execution receipt, and replay decision. The private key and public-key material stay outside evidence tables
-
-Grant only the acknowledgement function to a dedicated authenticated database role when the recorder should not connect as the extension owner:
-
-```sql
-GRANT USAGE ON SCHEMA otlet TO otlet_destination_receiver;
-GRANT EXECUTE ON FUNCTION otlet.record_destination_acknowledgement(
-  text, text, text, text, text, text, text, text, text, text, text
-) TO otlet_destination_receiver;
-```
-
-`otlet.destination_reconciliation_status` tracks `exported`, `received`, `applied`, `rejected`, and `unknown`. Use `mark_destination_unknown(...)` after an ambiguous or timed-out delivery. Exact acknowledgement retries are harmless, conflicts fail, and an applied replay must point to the original acknowledgement and destination execution receipt. Missing acknowledgements remain visible through `acknowledgement_pending`
-
-This contract has no destination catalog, connector abstraction, network client, or delivery scheduler. Application infrastructure owns transport and receiver-specific behavior
-
 Approval, rejection, correction, deferral, and abstention append immutable rows to `otlet.review_events`. Otlet derives `reviewer_identity` from `session_user` and `reviewer_role` from the active `SET ROLE` state; none of the review functions accepts either value from the caller. Each event snapshots its reason, timestamp, source freshness, and links to the job, action or output, receipt, model artifact, prompt, schema, runtime, and output identities
 
-`otlet.defer_action(...)` leaves the action in the review queue. `otlet.abstain_review(...)` records the final review of an abstention or directly rejected output and removes that item from the queue. Inspect the append-only audit projection without raw source rows:
+`otlet.defer_action(...)` leaves the action in the review queue. `otlet.abstain_review(...)` records the final review of an abstention or an output rejected without an action and removes that item from the queue. Inspect the append-only audit projection without raw source rows:
 
 ```sql
 SELECT outcome, reviewer_identity, reviewer_role, reason,
@@ -447,7 +381,7 @@ WHERE name = 'candidate_v2';
 
 Each threshold and per-metric pass result is a typed column in `otlet.workload_evaluation_status`. Raw snapshots remain append-only in `otlet.workload_evaluation_runs`; auditors use `otlet.audit_workload_evaluation_export`
 
-An action target must be an ordinary non-partitioned table without RLS, use one primary-key column, and list each writable non-key column. A row-watch task must also allow `update_row` and bind that action to the target with `otlet.register_action_workflow_policy(...)`. The policy starts recommendation-only and unevaluated unless the owner explicitly marks it `bounded_mutation` and `evaluated`. Otlet snapshots the task, target, source namespace, and authority hashes, then revalidates them during dry run and apply
+An action target must be an ordinary non-partitioned table without RLS, use one primary-key column, and list each writable non-key column. A row-watch task must also allow `update_row` and bind that action to the target with `otlet.register_action_workflow_policy(...)`. The policy starts recommendation-only and unevaluated unless the owner marks it `bounded_mutation` and `evaluated`. Otlet snapshots the task, target, source namespace, and authority hashes, then revalidates them during dry run and apply
 
 Raw targets, execution receipts, outputs, source evidence, trace summaries, token traces, worker functions, model registration, watch administration, cleanup, and the grant helpers stay owner-only. Auditors see execution mode, status, hashes, changed-column names, affected-row count, and replay linkage through `otlet.audit_action_execution_export`. They do not see target row values
 
@@ -457,11 +391,11 @@ Check the installed policy:
 SELECT * FROM otlet.access_policy_status;
 ```
 
-The demo proves the catalog ACLs, 22 auditor views, 11 operator function grants, seven existing operator paths, 19 exact security-definer functions, seven portable RPCs, and 77 denied paths. It separately proves all five review outcomes through the delegated operator role:
+The demo proves the catalog ACLs, 19 auditor views, 11 operator function grants, seven existing operator paths, 18 exact security-definer functions, seven portable RPCs, and 77 denied paths. The delegated operator role proves all five review outcomes:
 
 ```text
 review_provenance_contract=true|true|true|true|true|true|true|true|true|true|true
-permission_contract=public=0/0/0|auditor=22/3|operator=22/11|definer=19/19|portable=7/7/7|positive=7|denied=77
+permission_contract=public=0/0/0|auditor=19/3|operator=19/11|definer=18/18|portable=7/7/7|positive=7|denied=77
 ```
 
 Your application still owns these deployment boundaries:

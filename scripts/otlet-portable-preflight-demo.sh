@@ -261,13 +261,12 @@ preflight_state="$(
 SELECT concat_ws('|',
   (SELECT count(*) FROM otlet.portable_claims),
   (SELECT status FROM otlet.jobs WHERE subject_id = 'preflight-queued'),
-  (SELECT reported_state || ':' || model_status || ':' ||
-          (worker_process_rss_bytes > 0)::text
+  (SELECT reported_state || ':' || model_status
    FROM otlet.portable_worker_status WHERE worker_id = :'worker_id')
 );
 SQL
 )"
-if [ "$preflight_state" != "0|queued|error:error:true" ]; then
+if [ "$preflight_state" != "0|queued|error:error" ]; then
   echo "Expected preflight to leave claims untouched, got $preflight_state" >&2
   exit 1
 fi

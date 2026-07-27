@@ -14,7 +14,7 @@ Otlet treats source text, imported configuration, identifiers, model files, mode
 | Portable authoring | `otlet.watch.v1`, SQL text, JSON Schema, model policy, runtime options, and ordinary files | Pack author and importer | Untrusted bytes until database validation and import |
 | Portable protocol | Shaped snapshots and claim, attempt, completion, failure, and cancellation messages | Allowlisted external worker identity | Exact-version, role-bound, fenced RPC authority with no direct table access |
 
-The native worker and PostgreSQL extension are trusted code. The local model is not a principal and receives no database authority. Its text stays untrusted until schema, decision, action, authority, identity, freshness, and evidence checks pass
+Deployers trust the native worker and PostgreSQL extension code. The local model is not a principal and receives no database authority. Its text stays untrusted until schema, decision, action, authority, identity, freshness, and evidence checks pass
 
 ## Trust Transitions
 

@@ -93,14 +93,9 @@ Inspect the process, model, queue, and lease state without exposing prompt text 
 ```sql
 SELECT * FROM otlet.portable_worker_status;
 SELECT * FROM otlet.portable_claim_status ORDER BY claim_id DESC;
-SELECT * FROM otlet.database_health_status;
 ```
 
-Worker heartbeats report process RSS, and the shared database-health gate pauses new claims when an owner-configured limit fails. Existing claims retain their lease and cancellation behavior. Worker logs are one-line JSON events with IDs and bounded reason codes. llama.cpp diagnostics and raw prompt or source evidence are not written to the worker log
-
-Accepted portable receipts also appear in `otlet.decision_trace_export`. Run `scripts/otlet-export-decision.sh` from the repository host to create a local signed SQL and CSV bundle; signing keys remain outside the database and network delivery remains a separate deployment concern
-
-Register each outbound receiver with `otlet.register_destination_export(...)`, then inspect `otlet.destination_reconciliation_status`. The signed envelope carries the stable receiver idempotency key. `scripts/otlet-record-destination-ack.sh` verifies signed receiver acknowledgements before recording their state, execution receipt, and replay decision
+Worker logs contain one-line JSON events with IDs and bounded reason codes. They omit llama.cpp diagnostics, raw prompts, and source evidence
 
 See [the customer-VPC example](../examples/customer-vpc-portable-worker/README.md) for a small container deployment and [the production contract](../docs/production-contract.md) for the trust boundary
 
@@ -114,7 +109,7 @@ After `./scripts/otlet-setup.sh` has placed the demo GGUF in Docker, run:
 
 The script creates a disposable SQL-only database, builds the worker, runs real local inference, and checks trusted receipt lineage. It also proves pause, resume, cancellation, claim loss, process restart, database restart, reclaim, duplicate delivery, drain, source denial, and redacted structured logs before dropping the database and role
 
-Run the isolated deployment-preflight proof separately:
+Run the isolated deployment-preflight proof:
 
 ```sh
 ./scripts/otlet-portable-preflight-demo.sh

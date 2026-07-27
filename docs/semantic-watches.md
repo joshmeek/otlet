@@ -624,12 +624,11 @@ The pack keeps SQL and JSON Schema as ordinary document fields. The shortened va
   "fixtures": [],
   "labels": [],
   "expected_receipts": [],
-  "review_outcomes": [],
   "evaluation_gates": {}
 }
 ```
 
-The document contains watch configuration, owner-authored candidate SQL, fixtures, labels, expected receipt shapes, review outcomes, evaluation gates, and a digest of canonical content. It excludes model paths, source rows, jobs, runtime outputs, runtime actions, runtime receipts, traces, materializations, trigger names, and counters. Store the JSON in an ordinary file; Otlet adds no workflow language or pack registry
+The document contains watch configuration, owner-authored candidate SQL, fixtures, labels, expected receipt shapes, evaluation gates, and a digest of canonical content. It excludes model paths, source rows, jobs, runtime outputs, runtime actions, runtime receipts, traces, materializations, trigger names, and counters. Store the JSON in an ordinary file; Otlet adds no workflow language or pack registry
 
 Lint and dry run use the same validator as import and do not change the watch or its version history:
 
@@ -690,7 +689,7 @@ Rollback appends a new version with the restored canonical content. Prior rows r
 
 ### Evaluate a pack version
 
-Portable labels use workload and case keys, task and subject identity, expected answer and action, and a positive case weight. They do not contain a source row. Export rows can be aggregated to JSON and imported directly:
+Portable labels use workload and case keys, task and subject identity, expected answer and action, and a positive case weight. They do not contain a source row. Pack authors can aggregate export rows to JSON and import them:
 
 ```sql
 SELECT jsonb_agg(to_jsonb(c)) AS cases

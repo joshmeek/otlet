@@ -11,7 +11,7 @@ The command creates a fresh disposable Postgres volume and container, installs O
 
 The injected update file exists only inside the disposable container. It does not add a compatibility layer or migration to the extension
 
-The lifecycle container and volume are removed when the command exits
+The cleanup trap removes the lifecycle container and volume when the command exits
 
 Run a preflight against an existing installation before an upgrade:
 

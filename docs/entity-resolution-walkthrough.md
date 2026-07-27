@@ -637,7 +637,7 @@ Representative output:
 (1 row)
 ```
 
-Otlet enforces write authority through the task contract and action catalog. Each task has an `action_types` allowlist. Presets and watches set it when actions are expected; an omitted allowlist rejects every model action. `create_record`, `note`, and the decision actions remain recommendation state inside Otlet. Only `update_row` exposes an application-table write path. `otlet.action_status` shows its authority, approval, dry-run, and apply state
+Otlet enforces write authority through the task contract and action catalog. Each task has an `action_types` allowlist. Presets and watches set it for tasks that expect actions; an omitted allowlist rejects every model action. `create_record`, `note`, and the decision actions remain recommendation state inside Otlet. Only `update_row` exposes an application-table write path. `otlet.action_status` shows its authority, approval, dry-run, and apply state
 
 Otlet exposes one source-table write action: `update_row`. The extension owner registers one ordinary table, its sole primary key, and the columns Otlet may update:
 

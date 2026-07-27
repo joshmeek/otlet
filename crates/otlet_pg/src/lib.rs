@@ -42,14 +42,9 @@ pgrx::extension_sql_file!(
     requires = ["tasks_scan"]
 );
 pgrx::extension_sql_file!(
-    "../sql/075_database_health.sql",
-    name = "database_health",
-    requires = ["runtime_health"]
-);
-pgrx::extension_sql_file!(
     "../sql/080_job_claims.sql",
     name = "job_claims",
-    requires = ["database_health"]
+    requires = ["runtime_health"]
 );
 pgrx::extension_sql_file!(
     "../sql/085_portable_schema.sql",
@@ -117,19 +112,9 @@ pgrx::extension_sql_file!(
     requires = ["action_review_status"]
 );
 pgrx::extension_sql_file!(
-    "../sql/175_decision_exports.sql",
-    name = "decision_exports",
-    requires = ["inference_receipt_status"]
-);
-pgrx::extension_sql_file!(
-    "../sql/177_destination_reconciliation.sql",
-    name = "destination_reconciliation",
-    requires = ["decision_exports"]
-);
-pgrx::extension_sql_file!(
     "../sql/180_runtime_cache_status.sql",
     name = "runtime_cache_status",
-    requires = ["destination_reconciliation"]
+    requires = ["inference_receipt_status"]
 );
 pgrx::extension_sql_file!(
     "../sql/190_trace_tokens.sql",

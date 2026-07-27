@@ -8,7 +8,6 @@ BEGIN;
 \ir 050_runtime_models.sql
 \ir ../crates/otlet_pg/sql/060_tasks_scan.sql
 \ir ../crates/otlet_pg/sql/070_runtime_health.sql
-\ir ../crates/otlet_pg/sql/075_database_health.sql
 \ir ../crates/otlet_pg/sql/080_job_claims.sql
 \ir ../crates/otlet_pg/sql/085_portable_schema.sql
 \ir ../crates/otlet_pg/sql/090_job_attempts.sql
@@ -23,8 +22,6 @@ BEGIN;
 \ir ../crates/otlet_pg/sql/155_workload_evaluation.sql
 \ir ../crates/otlet_pg/sql/160_action_review_status.sql
 \ir ../crates/otlet_pg/sql/170_inference_receipt_status.sql
-\ir ../crates/otlet_pg/sql/175_decision_exports.sql
-\ir ../crates/otlet_pg/sql/177_destination_reconciliation.sql
 \ir ../crates/otlet_pg/sql/385_portable_permissions.sql
 \ir permissions.sql
 COMMIT;

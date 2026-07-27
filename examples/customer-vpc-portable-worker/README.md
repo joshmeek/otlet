@@ -1,6 +1,6 @@
 # Customer-VPC Portable Worker
 
-This example runs one Otlet worker beside an RDS-like PostgreSQL service where SQL and PL/pgSQL are available and native extension worker loading is blocked. The example contains one Dockerfile and one run command
+This example runs one Otlet worker beside an RDS-like PostgreSQL service. The service allows SQL and PL/pgSQL and blocks native extension workers. The example contains one Dockerfile and one run command
 
 ## Network Shape
 

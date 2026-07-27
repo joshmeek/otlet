@@ -46,7 +46,7 @@ Rerunning setup reuses the PostgreSQL volume and model artifacts while rebuildin
 
 The native worker connects to `postgres` and uses an 8 GiB RSS budget by default. Set `OTLET_DATABASE` to install into another database and `OTLET_MAX_WORKER_RSS_BYTES` to change the budget. An explicit value of `0` disables RSS enforcement. Use a separate PostgreSQL volume for each Otlet database
 
-The full demo registers both models with a streamed SHA-256 digest, byte size, source, revision, quantization, and license value. Otlet verifies the digest before llama.cpp loads the file and binds the same identity to runtime fingerprints, receipts, status, and watch exports. Set the `OTLET_CHEAP_MODEL_*` and `OTLET_STRONG_MODEL_*` provenance variables when using artifacts other than the demo defaults. The [entity-resolution starter pack](docs/entity-resolution-starter-pack.md) packages vendor, account, and catalog-item fixtures through the same public watch contract
+The full demo registers both models with a streamed SHA-256 digest, byte size, source, revision, quantization, and license value. Otlet verifies the digest before llama.cpp loads the file and binds the same identity to runtime fingerprints, receipts, status, and watch exports. Set the `OTLET_CHEAP_MODEL_*` and `OTLET_STRONG_MODEL_*` provenance variables when using artifacts other than the demo defaults
 
 An Otlet task reads any SQL query that returns `subject_id` and row-shaped `input`. The [entity-resolution walkthrough](docs/entity-resolution-walkthrough.md) builds `public.otlet_demo_vendor_pair_input` from two application tables. The shortened task call includes the SQL API, output contract, trace settings, input shaping, and decision preset:
 
@@ -153,11 +153,7 @@ Otlet records both attempts and creates `merge_candidate` from the accepted outp
 
 The full demo checks row and pair watches, candidate drift, CustomScan freshness, versioned watch packs, workload-weighted evaluation gates, review provenance, workflow-bound `update_row`, and adversarial trust cases. It proves portable label round trips, named baseline regressions, canonical pack diff and rollback, fenced claim ownership, idempotent terminal retries, PostgreSQL-owned result validation and identities, the versioned least-privilege portable worker RPC, session-bound review identity, target binding, recommendation-only defaults, evidence holds and cleanup receipts, active-state canary deletion, receipt redaction, role grants, cancellation, model-load admission, memory pressure, cache bounds, prompt and runtime fingerprints, invariants, and Docker crash logs
 
-Build the reproducible pgrx package, machine-readable SBOM, RustSec report, supported-matrix result, and exact release identity with [the release evidence command](docs/release-evidence.md)
-
 Prove a fresh disposable install, worker lifecycle, database restart, upgrade failure rollback, startup recovery, and crash-log safety with [the release lifecycle command](docs/release-lifecycle.md)
-
-Run native and portable equivalence, the complete failure matrix, lifecycle recovery, invariants, and final crash-log checks with [the runtime conformance command](docs/runtime-conformance.md)
 
 Configure all-or-nothing row, input-byte, queue-byte, candidate-plan, and candidate-timeout limits with [the workload admission contract](docs/workload-admission.md)
 
@@ -172,7 +168,6 @@ Start with [the worked example](docs/otlet-worked-example.md)
 - [Semantic watches](docs/semantic-watches.md)
 - [Production contract](docs/production-contract.md)
 - [Trust conformance](docs/trust-conformance.md)
-- [Runtime conformance](docs/runtime-conformance.md)
 - [Portable worker](portable/README.md)
 - [Model benchmarks](benchmarks/README.md)
 - [Roadmap](docs/roadmap.md)
