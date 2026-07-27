@@ -93,7 +93,7 @@ model_sha256="$(shasum -a 256 "$cert_dir/preflight.gguf" | awk '{print $1}')"
 model_bytes="$(stat -f %z "$cert_dir/preflight.gguf" 2>/dev/null || stat -c %s "$cert_dir/preflight.gguf")"
 
 docker build --provenance=false \
-  -f examples/customer-vpc-portable-worker/Dockerfile \
+  -f docs/examples/customer-vpc-portable-worker/Dockerfile \
   -t "$worker_image" . >/dev/null
 docker network create --internal "$network" >/dev/null
 docker run -d \

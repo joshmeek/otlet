@@ -10,7 +10,7 @@ This example runs one Otlet worker beside an RDS-like PostgreSQL service. The se
 - Mount one GGUF from VPC-local storage and the database CA bundle as read-only files
 - Keep model-provider egress closed because inference is local
 
-Install [the portable SQL contract](../../portable/README.md), create the dedicated login, register the exact worker identity, and register the model artifact before starting the container
+Install [the portable SQL contract](../../../portable/README.md), create the dedicated login, register the exact worker identity, and register the model artifact before starting the container
 
 ## Build And Run
 
@@ -18,7 +18,7 @@ Build from the repository root so the Dockerfile can copy the workspace:
 
 ```sh
 docker build \
-  -f examples/customer-vpc-portable-worker/Dockerfile \
+  -f docs/examples/customer-vpc-portable-worker/Dockerfile \
   -t otlet-portable-worker:0.1.0 \
   .
 ```

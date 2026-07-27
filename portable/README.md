@@ -96,7 +96,7 @@ SELECT * FROM otlet.portable_claim_status ORDER BY claim_id DESC;
 
 Worker logs contain one-line JSON events with IDs and bounded reason codes. They omit llama.cpp diagnostics, raw prompts, and source evidence
 
-See [the customer-VPC example](../examples/customer-vpc-portable-worker/README.md) for a small container deployment and [the production contract](../docs/production-contract.md) for the trust boundary
+See [the customer-VPC example](../docs/examples/customer-vpc-portable-worker/README.md) for a small container deployment and [the production contract](../docs/production-contract.md) for the trust boundary
 
 ## Run The Real Smoke Test
 
