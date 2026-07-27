@@ -120,7 +120,7 @@ The owner sets a worker to `running`, `paused`, or `draining`. The heartbeat ret
 
 The [reference external worker](../portable/README.md) uses ordinary `psql` connections and a local llama.cpp runtime. It verifies the configured GGUF SHA-256 before loading, compares each claim with the registered model identity, submits accepted output through `portable_complete_job(...)`, and submits claimed failures through `portable_fail_job(...)`. Its one-line JSON logs carry identifiers and reason codes without llama.cpp diagnostics, prompts, or source evidence. It has no HTTP model client. The SQL-only installer creates no extension object or C-language function
 
-Before any portable claim, deployment preflight resolves and reaches the database endpoint, requires `sslmode=verify-full` with a readable CA by default, verifies the negotiated TLS session, authenticates the registered role, checks the seven RPC grants and active protocol version, verifies the runtime and model allowlists, hashes the local GGUF, probes the runtime directory, and requires the `deny_model_providers` egress declaration. `otlet_worker --preflight` runs the same checks and exits without loading the model or claiming work. Operators must enforce the declared egress policy in the deployment network
+Before any portable claim, deployment preflight connects through libpq, authenticates the registered role, checks the seven RPC grants and active protocol version, verifies the runtime and model allowlists, confirms TLS is active when required, hashes the local GGUF, and probes the runtime directory. `otlet_worker --preflight` runs the same checks and exits without loading the model or claiming work. Use `sslmode=verify-full` with a trusted CA and enforce model-provider egress denial in the deployment network
 
 Otlet debounces suppressed queue-admission events per task and reason for one minute, so a full queue stays visible without flooding `worker_events`. `production_status` exposes `semantic_materialization_failed_events` and `semantic_materialization_last_failed_at`. Nonzero `max_worker_rss_bytes` budgets require Linux RSS, total-memory, and available-memory samples. A cache miss also requires artifact metadata and a no-allocation llama.cpp projection; missing evidence or insufficient headroom rejects the load before tensor allocation. Cleanup can prune old failed or canceled jobs after outputs, actions, eval labels, and receipts no longer reference them
 
@@ -150,37 +150,14 @@ ffi_sweep_safety_contract=1|failed|job lease expired after max attempts|failed|f
 Representative output from the demo contract:
 
 ```text
-production_policy_contract=default|refresh_then_fail_closed|3|300000|8|redacted|30 days
+production_policy_contract=default|refresh_then_fail_closed|3|300000|8|redacted
 production_status_contract=true|true|true|true
 model_queue_status_contract=queue_accepting|0|0
 throughput_status_contract=queue_accepting|0|0|4|4|0
 cleanup_policy_dry_run=0|0|0|0|0|0|0|0|0|0|true
 ```
 
-### Step 3a - Apply Evidence Retention
-
-`terminal_evidence_retention` covers complete, failed, and canceled jobs after their actions reach a terminal state. Cleanup removes job input, structured output, action and correction payloads, receipt payloads, linked events, record bodies, and materializations. It keeps structural rows needed by linked audit state and writes a per-job hash receipt first. Cleanup may then prune unreferenced failed or canceled skeletons
-
-Place a job hold before cleanup when legal, incident, or evaluation work must retain its payload:
-
-```sql
-SELECT * FROM otlet.place_retention_hold(:job_id, 'legal hold 2026-07');
-SELECT * FROM otlet.cleanup_policy_state(true);
-SELECT * FROM otlet.release_retention_hold(:hold_id, 'matter closed');
-SELECT * FROM otlet.cleanup_policy_state(false);
-```
-
-Dry run writes no cleanup receipt. Applied cleanup writes one `cleanup_runs` row and one `evidence_cleanup_receipts` row per job before removing payloads. `cleanup_receipt_status` exposes policy, counts, candidate digest, requester, and timing. `retention_hold_status` keeps hold and release identity, timestamps, and reason hashes without exposing reason text
-
-Cleanup applies to active Otlet tables. PostgreSQL can reclaim deleted table payloads after vacuum, and the cleanup writes WAL. Your existing WAL segments, replicas, physical backups, snapshots, restored databases, and point-in-time recovery windows can retain earlier copies until their infrastructure retention expires. Use `retention_copy_status` to inspect those boundaries. Coordinate backup expiry and replica policy when a deletion request requires every recoverable copy to age out
-
-The canary proof covers input, output, action, correction, trace, event, label, record, and materialization payloads:
-
-```text
-retention_contract=true|true|true|true|true|true|true|true|true
-```
-
-### Step 3b - Inspect Stored Evidence Redaction
+### Step 3a - Inspect Stored Evidence Redaction
 
 Otlet keeps assembled prompts in worker memory and stores `prompt_hash` on receipts. The `redacted` production default stores raw-output hashes, structured accepted output, structured rejected candidates, token IDs, probabilities, and timing. It removes raw model text, reconstructed chosen text, and token text before receipt insertion
 
@@ -307,7 +284,7 @@ SELECT count(*) FROM otlet.verify_invariants();
 
 Contract: `0` (demo prints `invariant_contract=0`). The suite fails closed on expired or NULL leases for `running` and `cancel_requested` jobs, complete receipts without schema pass, sensitive evidence that violates the active storage policy, materializations missing `source_hash`, and error runtime slots. `production_status` and `verify_invariants` name the receipt invariant `complete_receipts_are_schema_validated`; throughput views use `completed_jobs` and `last_batch_completed_jobs`. Step 6 of `docs/semantic-watches.md` anchors the planner vocabulary for `selected_path` / `Planner Selected Path` and `freshness_basis`
 
-Operators query redacted, read-only projections through `otlet.audit_receipt_export`, `otlet.audit_review_export`, `otlet.audit_review_event_export`, `otlet.audit_action_execution_export`, `otlet.audit_eval_label_export`, `otlet.audit_workload_evaluation_export`, `otlet.semantic_dependency_audit`, `otlet.operational_event_log`, and `otlet.worker_batch_timing_status`. `otlet.redaction_policy_status` lists withheld fields
+Operators query redacted, read-only projections through `otlet.audit_receipt_export`, `otlet.audit_review_export`, `otlet.audit_review_event_export`, `otlet.audit_action_execution_export`, `otlet.audit_eval_label_export`, `otlet.semantic_dependency_audit`, `otlet.operational_event_log`, and `otlet.worker_batch_timing_status`. `otlet.redaction_policy_status` lists withheld fields
 
 ## Step 4 - Grant Role-Scoped Access
 
@@ -332,11 +309,7 @@ The auditor capability grants these redacted policy and audit views:
 - `otlet.audit_review_event_export`
 - `otlet.audit_action_execution_export`
 - `otlet.audit_eval_label_export`
-- `otlet.audit_workload_evaluation_export`
 - `otlet.action_workflow_policy_status`
-- `otlet.cleanup_receipt_status`
-- `otlet.retention_hold_status`
-- `otlet.retention_copy_status`
 - `otlet.semantic_dependency_audit`
 - `otlet.operational_event_log`
 - `otlet.worker_batch_timing_status`
@@ -366,21 +339,6 @@ FROM otlet.audit_review_event_export
 ORDER BY review_event_id;
 ```
 
-Evaluation labels carry a workload name, stable case key, task name, and positive case weight. `otlet.export_eval_cases(...)` returns those fields with source identity hashes but no source row. The owner can import the returned JSON rows into another database with `otlet.import_eval_cases(...)`; existing workload and case keys are left unchanged
-
-`otlet.evaluate_workload(...)` selects accepted receipts by model, prompt template, schema, and runtime identity, then binds the result to an immutable pack version. It calculates weighted coverage, answer quality, abstention, action quality, generation latency, and review delay. Pack gates supply defaults and call-time thresholds override them. A named baseline adds regression deltas and identity-change flags
-
-```sql
-SELECT gate_status, quality, abstention, action_quality,
-       latency_ms, reviewer_time_ms,
-       quality_regression, model_changed, prompt_changed,
-       schema_changed, runtime_changed, pack_changed
-FROM otlet.workload_evaluation_status
-WHERE name = 'candidate_v2';
-```
-
-Each threshold and per-metric pass result is a typed column in `otlet.workload_evaluation_status`. Raw snapshots remain append-only in `otlet.workload_evaluation_runs`; auditors use `otlet.audit_workload_evaluation_export`
-
 An action target must be an ordinary non-partitioned table without RLS, use one primary-key column, and list each writable non-key column. A row-watch task must also allow `update_row` and bind that action to the target with `otlet.register_action_workflow_policy(...)`. The policy starts recommendation-only and unevaluated unless the owner marks it `bounded_mutation` and `evaluated`. Otlet snapshots the task, target, source namespace, and authority hashes, then revalidates them during dry run and apply
 
 Raw targets, execution receipts, outputs, source evidence, trace summaries, token traces, worker functions, model registration, watch administration, cleanup, and the grant helpers stay owner-only. Auditors see execution mode, status, hashes, changed-column names, affected-row count, and replay linkage through `otlet.audit_action_execution_export`. They do not see target row values
@@ -391,17 +349,16 @@ Check the installed policy:
 SELECT * FROM otlet.access_policy_status;
 ```
 
-The demo proves the catalog ACLs, 19 auditor views, 11 operator function grants, seven existing operator paths, 18 exact security-definer functions, seven portable RPCs, and 77 denied paths. The delegated operator role proves all five review outcomes:
+The demo proves the catalog ACLs, 15 auditor views, 11 operator function grants, seven existing operator paths, 18 exact security-definer functions, seven portable RPCs, and 61 denied paths. The delegated operator role proves all five review outcomes:
 
 ```text
 review_provenance_contract=true|true|true|true|true|true|true|true|true|true|true
-permission_contract=public=0/0/0|auditor=19/3|operator=19/11|definer=18/18|portable=7/7/7|positive=7|denied=77
+permission_contract=public=0/0/0|auditor=15/3|operator=15/11|definer=18/18|portable=7/7/7|positive=7|denied=61
 ```
 
 Your application still owns these deployment boundaries:
 
 - add RLS or schema isolation if multiple tenants share the database
-- schedule `otlet.cleanup_policy_state(false)` for terminal evidence, worker events, trace detail, diagnostic evidence, stale materializations, and unreferenced failed or canceled jobs
-- align backup, snapshot, replica, restore, and point-in-time recovery retention with deletion obligations
+- schedule `otlet.cleanup_policy_state(false)` for worker-event, trace-detail, diagnostic evidence, stale materialization, and unreferenced failed/canceled job pruning
 - allow action types your application has code to interpret
 - decide which users inherit the auditor and operator roles

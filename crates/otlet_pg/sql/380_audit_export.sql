@@ -89,11 +89,7 @@ SELECT
     'otlet.audit_review_event_export',
     'otlet.audit_action_execution_export',
     'otlet.audit_eval_label_export',
-    'otlet.audit_workload_evaluation_export',
     'otlet.action_workflow_policy_status',
-    'otlet.cleanup_receipt_status',
-    'otlet.retention_hold_status',
-    'otlet.retention_copy_status',
     'otlet.semantic_dependency_audit',
     'otlet.operational_event_log',
     'otlet.worker_batch_timing_status',
@@ -316,10 +312,6 @@ SELECT
   l.action_id,
   l.output_id,
   l.receipt_id,
-  l.workload_name,
-  l.case_key,
-  l.case_weight,
-  l.task_name,
   l.source_table,
   l.subject_id,
   l.source_hash,
@@ -338,10 +330,6 @@ SELECT
   l.selection_status,
   l.created_at
 FROM otlet.eval_label_status l;
-
-CREATE VIEW otlet.audit_workload_evaluation_export AS
-SELECT *
-FROM otlet.workload_evaluation_status;
 
 CREATE VIEW otlet.semantic_dependency_audit AS
 SELECT DISTINCT ON (sm.task_name, sm.record_type, sm.subject_id)

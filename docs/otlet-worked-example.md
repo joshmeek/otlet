@@ -207,9 +207,8 @@ bounded_dry_run_contract=4|1|4|1
 bounded_queue_contract=4|1
 bounded_execution_contract=approved|bounded apply|1|DO_NOT_TOUCH_SENTINEL|pending||0|DO_NOT_TOUCH_SENTINEL|1|2|2|0
 action_authority_contract=true|true|true|true|true|true|true|true|true|true
-retention_contract=true|true|true|true|true|true|true|true|true
 review_provenance_contract=true|true|true|true|true|true|true|true|true|true|true
-permission_contract=public=0/0/0|auditor=14/3|operator=14/11|definer=10/10|positive=7|denied=69
+permission_contract=public=0/0/0|auditor=15/3|operator=15/11|definer=18/18|portable=7/7/7|positive=7|denied=61
 ```
 
 Otlet changes `row-1` once and preserves its protected sentinel. `row-3` stays unchanged. The authority proof rejects a forged destination, recommendation-only policy, unevaluated and adversarial policies, missing approval, and stale source state before proving one bounded mutation
@@ -226,7 +225,6 @@ semantic_join_match_contract=true|true
 watch_replace_contract=true|true|true|true|true|true|true|true|true|true
 watch_round_trip_contract=true|true|true|true|true
 watch_import_failure_contract=10|true
-watch_pack_contract=true|true|true|true|true|true|true|true|true|true|true|true|true
 candidate_removed_contract=0|true|candidate_removed|0|0|false|
 candidate_changed_contract=1|true|candidate_changed|0
 semantic_join_stale_contract=4|0|fresh_after_lookup=0|receipts=8|8

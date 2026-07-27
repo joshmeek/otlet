@@ -52,7 +52,6 @@ export OTLET_MODEL_PATH='/models/Qwen3.5-4B-Q4_K_M.gguf'
 export OTLET_MODEL_SHA256='registered-model-sha256'
 export OTLET_PORTABLE_RUNTIME_DIR='/tmp'
 export OTLET_PORTABLE_REQUIRE_TLS='1'
-export OTLET_PORTABLE_EGRESS_MODE='deny_model_providers'
 export OTLET_PORTABLE_RENEW_MS='1000'
 
 otlet_worker
@@ -68,9 +67,9 @@ Run the same image, mounts, network, and environment with `--preflight` before s
 otlet_worker --preflight
 ```
 
-A passing preflight resolves and reaches the database, negotiates hostname-verified TLS with the configured CA, authenticates the dedicated role, checks all seven worker RPCs and the exact protocol version, verifies the runtime and model registrations, hashes the local GGUF, probes the runtime directory, and requires the declared `deny_model_providers` egress policy. It exits before loading llama.cpp or claiming a job
+A passing preflight connects through libpq, authenticates the dedicated role, checks all seven worker RPCs and the exact protocol version, verifies the runtime and model registrations, confirms TLS is active when required, hashes the local GGUF, and probes the runtime directory. It exits before loading llama.cpp or claiming a job
 
-Failures are one-line JSON with a stable reason such as `dns_resolution_failed`, `database_unreachable`, `tls_verification_failed`, `credentials_rejected`, `database_contract_missing`, `protocol_incompatible`, `runtime_not_allowlisted`, `model_not_allowlisted`, `model_hash_mismatch`, or `runtime_path_unwritable`. The deployment must enforce the declared egress policy; the worker has no remote model client to test
+Failures are one-line JSON with a stable reason such as `database_unavailable`, `tls_verification_failed`, `credentials_rejected`, `database_contract_missing`, `protocol_incompatible`, `runtime_not_allowlisted`, `model_not_allowlisted`, `model_hash_mismatch`, or `runtime_path_unwritable`. Use `sslmode=verify-full` and a trusted CA in the libpq connection string. The deployment must block model-provider egress; the worker has no remote model client
 
 ## Pause, Drain, And Recover
 
@@ -115,4 +114,4 @@ Run the isolated deployment-preflight proof:
 ./scripts/otlet-portable-preflight-demo.sh
 ```
 
-It starts a TLS-enabled disposable PostgreSQL on an internal-only Docker network, proves a valid configuration leaves a queued job unclaimed, then breaks DNS, reachability, TLS, credentials, grants, protocol, runtime identity, model registration, artifact access, runtime storage, egress declaration, and client availability one dependency at a time
+It starts a TLS-enabled disposable PostgreSQL on an internal-only Docker network, proves a valid configuration leaves a queued job unclaimed, then breaks connectivity, TLS, credentials, grants, protocol, runtime identity, model registration, artifact access, runtime storage, and client availability one dependency at a time

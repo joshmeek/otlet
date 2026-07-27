@@ -319,12 +319,13 @@ SELECT
   )::text || '|' ||
   (
     SELECT count(*) = 2
-      AND bool_and(expected_answer = 'flag')
-      AND bool_and(observed_answer = 'flag')
-      AND bool_and(expected_action_type = 'review_flag')
-      AND bool_and(observed_action_type = 'review_flag')
-    FROM otlet.eval_label_status
-    WHERE task_name = 'runtime_conformance_task'
+      AND bool_and(label.expected_answer = 'flag')
+      AND bool_and(label.observed_answer = 'flag')
+      AND bool_and(label.expected_action_type = 'review_flag')
+      AND bool_and(label.observed_action_type = 'review_flag')
+    FROM otlet.eval_label_status label
+    JOIN otlet.action_status action ON action.action_id = label.action_id
+    WHERE action.task_name = 'runtime_conformance_task'
   )::text || '|' ||
   (
     SELECT count(*) = 2
@@ -368,55 +369,5 @@ SQL
 echo "runtime_equivalence_contract=$runtime_equivalence_contract"
 [ "$runtime_equivalence_contract" = "true|true|true|true|true|true|true|true|true|true" ] || {
   echo "Expected equivalent native and portable trusted state, got $runtime_equivalence_contract" >&2
-  exit 1
-}
-
-credential_role="otlet_runtime_rotation_probe"
-old_password="$(openssl rand -hex 24)"
-new_password="$(openssl rand -hex 24)"
-credential_host="$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$container")"
-[ -n "$credential_host" ] || {
-  echo "Could not resolve the database container address for credential rotation" >&2
-  exit 1
-}
-psql_exec -qAt -v role_name="$credential_role" <<'SQL' >/dev/null
-SELECT format('DROP ROLE IF EXISTS %I', :'role_name') \gexec
-SQL
-psql_exec -qAt -v role_name="$credential_role" -v role_password="$old_password" <<'SQL' >/dev/null
-SELECT format(
-  'CREATE ROLE %I LOGIN PASSWORD %L NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS',
-  :'role_name',
-  :'role_password'
-) \gexec
-SQL
-old_password_before=false
-old_password_after=false
-new_password_after=false
-if docker exec -e "PGPASSWORD=$old_password" "$container" \
-  psql -h "$credential_host" -U "$credential_role" -d "$database" -qAt \
-  -c 'SELECT current_user' | grep -qx "$credential_role"; then
-  old_password_before=true
-fi
-psql_exec -qAt -v role_name="$credential_role" -v role_password="$new_password" <<'SQL' >/dev/null
-SELECT format('ALTER ROLE %I PASSWORD %L', :'role_name', :'role_password') \gexec
-SQL
-if docker exec -e "PGPASSWORD=$old_password" "$container" \
-  psql -h "$credential_host" -U "$credential_role" -d "$database" -qAt \
-  -c 'SELECT current_user' >/dev/null 2>&1; then
-  old_password_after=true
-fi
-if docker exec -e "PGPASSWORD=$new_password" "$container" \
-  psql -h "$credential_host" -U "$credential_role" -d "$database" -qAt \
-  -c 'SELECT current_user' | grep -qx "$credential_role"; then
-  new_password_after=true
-fi
-psql_exec -qAt -v role_name="$credential_role" <<'SQL' >/dev/null
-SELECT format('DROP ROLE %I', :'role_name') \gexec
-SQL
-
-runtime_credential_rotation_contract="$old_password_before|$old_password_after|$new_password_after"
-echo "runtime_credential_rotation_contract=$runtime_credential_rotation_contract"
-[ "$runtime_credential_rotation_contract" = "true|false|true" ] || {
-  echo "Expected old credentials to fail after rotation and new credentials to succeed" >&2
   exit 1
 }

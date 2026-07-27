@@ -52,7 +52,7 @@ The portable boundary covers these threats:
 - claim replay after lease expiry or failover
 - intercepted database traffic or permissive egress
 
-The database enforces the runtime allowlist, exact protocol compatibility, fixed-search-path `SECURITY DEFINER` RPCs, a claim fence on every write, database-recomputed identity, idempotent terminal state, and no direct table grants. Before claims begin, the worker verifies hostname-checked TLS, credentials, grants, protocol, runtime identity, model registration, local artifact digest, writable runtime storage, and the deployment's egress declaration. Infrastructure still owns credential rotation and enforcement of the declared model-provider egress denial
+The database enforces the runtime allowlist, exact protocol compatibility, fixed-search-path `SECURITY DEFINER` RPCs, a claim fence on every write, database-recomputed identity, idempotent terminal state, and no direct table grants. Before claims begin, the worker verifies the database session, grants, protocol, runtime identity, model registration, TLS state, local artifact digest, and writable runtime storage. Libpq enforces the configured CA and hostname checks. Infrastructure still owns credential rotation and model-provider egress denial
 
 ## Stable Decisions
 

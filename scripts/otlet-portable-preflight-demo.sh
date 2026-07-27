@@ -45,7 +45,6 @@ probe() {
       -e "OTLET_MODEL_SHA256=$model_sha256" \
       -e OTLET_PORTABLE_RUNTIME_DIR=/tmp \
       -e OTLET_PORTABLE_REQUIRE_TLS=1 \
-      -e OTLET_PORTABLE_EGRESS_MODE=deny_model_providers \
       "$@" \
       "$worker_image" --preflight 2>&1
   )"
@@ -54,7 +53,7 @@ probe() {
 
   if [ "$expected" = "passed" ]; then
     if [ "$status" != "0" ] || ! printf '%s\n' "$output" | jq -e \
-      'select(.event == "preflight_passed" and .tls_required == true and .egress_mode == "deny_model_providers")' >/dev/null; then
+      'select(.event == "preflight_passed" and .tls_required == true)' >/dev/null; then
       echo "Expected valid portable preflight, got $output" >&2
       exit 1
     fi
@@ -210,16 +209,10 @@ SQL
 database_url="postgresql://${worker_role}:${worker_password}@database:5432/${database}?connect_timeout=3&sslmode=verify-full&sslrootcert=/run/certs/ca.crt"
 
 probe valid passed
-probe dns dns_resolution_failed \
+probe dns database_unavailable \
   -e "OTLET_DATABASE_URL=postgresql://${worker_role}:${worker_password}@missing-otlet-host:5432/${database}?connect_timeout=3&sslmode=verify-full&sslrootcert=/run/certs/ca.crt"
-probe network database_unreachable \
+probe network database_unavailable \
   -e "OTLET_DATABASE_URL=postgresql://${worker_role}:${worker_password}@database:6543/${database}?connect_timeout=3&sslmode=verify-full&sslrootcert=/run/certs/ca.crt"
-probe tls_mode tls_mode_invalid \
-  -e "OTLET_DATABASE_URL=postgresql://${worker_role}:${worker_password}@database:5432/${database}?connect_timeout=3&sslmode=require&sslrootcert=/run/certs/ca.crt"
-probe tls_ca_config tls_ca_missing \
-  -e "OTLET_DATABASE_URL=postgresql://${worker_role}:${worker_password}@database:5432/${database}?connect_timeout=3&sslmode=verify-full"
-probe tls_ca tls_ca_unreadable \
-  -e "OTLET_DATABASE_URL=postgresql://${worker_role}:${worker_password}@database:5432/${database}?connect_timeout=3&sslmode=verify-full&sslrootcert=/run/certs/missing-ca.crt"
 probe tls_hostname tls_verification_failed \
   -e "OTLET_DATABASE_URL=postgresql://${worker_role}:${worker_password}@${database_container}:5432/${database}?connect_timeout=3&sslmode=verify-full&sslrootcert=/run/certs/ca.crt"
 probe credentials credentials_rejected \
@@ -234,7 +227,6 @@ probe model_allowlist model_not_allowlisted -e OTLET_MODEL_NAME=unregistered_mod
 probe model_path model_artifact_unreadable -e OTLET_MODEL_PATH=/models/missing.gguf
 probe model_hash model_hash_mismatch -e "OTLET_MODEL_SHA256=$(printf '0%.0s' {1..64})"
 probe runtime_path runtime_path_unwritable -e OTLET_PORTABLE_RUNTIME_DIR=/proc
-probe egress egress_policy_invalid -e OTLET_PORTABLE_EGRESS_MODE=allow
 probe psql psql_unavailable -e OTLET_PSQL=/missing/psql
 
 docker exec -i "$database_container" psql -h 127.0.0.1 -U postgres -d "$database" \
@@ -275,4 +267,4 @@ if [ "$(docker network inspect -f '{{.Internal}}' "$network")" != "true" ]; then
   exit 1
 fi
 
-echo "portable_preflight_contract=$preflight_state|egress=denied|$diagnostics"
+echo "portable_preflight_contract=$preflight_state|$diagnostics"

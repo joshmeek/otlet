@@ -39,7 +39,7 @@ docker run --rm \
   otlet-portable-worker:0.1.0
 ```
 
-The first command must emit `preflight_passed` and exit without claiming work. The libpq connection string uses `sslmode=verify-full` and the mounted CA. The worker requires the `deny_model_providers` egress declaration, has no HTTP client or model-provider credential, and must run in a subnet or network policy that blocks model-provider egress. It reconnects after a database restart and exits after an owner-requested drain. Database networking, credentials, CA distribution, model distribution, process supervision, and log collection remain customer-VPC responsibilities
+The first command must emit `preflight_passed` and exit without claiming work. The libpq connection string uses `sslmode=verify-full` and the mounted CA. The worker has no HTTP client or model-provider credential and must run in a subnet or network policy that blocks model-provider egress. It reconnects after a database restart and exits after an owner-requested drain. Database networking, credentials, CA distribution, model distribution, process supervision, and log collection remain customer-VPC responsibilities
 
 Use `otlet.set_portable_worker_control(...)` to pause, resume, or drain the process. Monitor `otlet.portable_worker_status` for heartbeat, model, queue, and lease health. The process emits one-line JSON logs without prompt or source evidence
 

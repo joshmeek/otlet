@@ -4,7 +4,6 @@ use sha2::{Digest, Sha256};
 use std::ffi::CString;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
-use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{
@@ -50,7 +49,6 @@ struct Config {
     preflight_only: bool,
     require_tls: bool,
     runtime_dir: PathBuf,
-    egress_mode: String,
 }
 
 impl Config {
@@ -98,12 +96,6 @@ impl Config {
             runtime_dir: PathBuf::from(
                 std::env::var("OTLET_PORTABLE_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".to_owned()),
             ),
-            egress_mode: std::env::var("OTLET_PORTABLE_EGRESS_MODE").map_err(|_| {
-                coded(
-                    "egress_policy_missing",
-                    "OTLET_PORTABLE_EGRESS_MODE is required",
-                )
-            })?,
         })
     }
 }
@@ -1051,17 +1043,7 @@ fn runtime_identity() -> Value {
 }
 
 fn deployment_preflight(database: &Database, config: &Config) -> Result<String, String> {
-    if config.egress_mode != "deny_model_providers" {
-        return Err(coded(
-            "egress_policy_invalid",
-            "OTLET_PORTABLE_EGRESS_MODE must be deny_model_providers",
-        ));
-    }
     check_runtime_dir(&config.runtime_dir)?;
-    check_database_endpoint(&config.database_url)?;
-    if config.require_tls {
-        check_tls_parameters(&config.database_url)?;
-    }
 
     let desired = database.heartbeat(config, "starting", Some("verifying"), None)?;
     database.preflight_contract(config)?;
@@ -1081,108 +1063,6 @@ fn deployment_preflight(database: &Database, config: &Config) -> Result<String, 
         ));
     }
     Ok(desired)
-}
-
-fn check_database_endpoint(database_url: &str) -> Result<(), String> {
-    let (host, port) = database_endpoint(database_url)?;
-    let addresses: Vec<_> = (host.as_str(), port)
-        .to_socket_addrs()
-        .map_err(|_| coded("dns_resolution_failed", "database hostname did not resolve"))?
-        .collect();
-    if addresses.is_empty() {
-        return Err(coded(
-            "dns_resolution_failed",
-            "database hostname did not resolve",
-        ));
-    }
-    if addresses
-        .iter()
-        .any(|address| TcpStream::connect_timeout(address, Duration::from_secs(2)).is_ok())
-    {
-        Ok(())
-    } else {
-        Err(coded(
-            "database_unreachable",
-            "database TCP endpoint is unreachable",
-        ))
-    }
-}
-
-fn database_endpoint(database_url: &str) -> Result<(String, u16), String> {
-    let rest = database_url
-        .strip_prefix("postgresql://")
-        .or_else(|| database_url.strip_prefix("postgres://"))
-        .ok_or_else(|| {
-            coded(
-                "database_url_invalid",
-                "OTLET_DATABASE_URL must use postgres:// or postgresql://",
-            )
-        })?;
-    let authority = rest.split(['/', '?']).next().unwrap_or_default();
-    let endpoint = authority
-        .rsplit_once('@')
-        .map_or(authority, |(_, value)| value);
-    if endpoint.is_empty() {
-        return Err(coded(
-            "database_url_invalid",
-            "OTLET_DATABASE_URL has no database host",
-        ));
-    }
-    if let Some(bracketed) = endpoint.strip_prefix('[') {
-        let Some((host, suffix)) = bracketed.split_once(']') else {
-            return Err(coded(
-                "database_url_invalid",
-                "OTLET_DATABASE_URL has an invalid IPv6 host",
-            ));
-        };
-        let port = suffix
-            .strip_prefix(':')
-            .map(str::parse::<u16>)
-            .transpose()
-            .map_err(|_| coded("database_url_invalid", "database port is invalid"))?
-            .unwrap_or(5432);
-        return Ok((host.to_owned(), port));
-    }
-    let (host, port) = match endpoint.rsplit_once(':') {
-        Some((host, port)) if !host.contains(':') => (
-            host,
-            port.parse::<u16>()
-                .map_err(|_| coded("database_url_invalid", "database port is invalid"))?,
-        ),
-        _ => (endpoint, 5432),
-    };
-    if host.is_empty() {
-        return Err(coded(
-            "database_url_invalid",
-            "OTLET_DATABASE_URL has no database host",
-        ));
-    }
-    Ok((host.to_owned(), port))
-}
-
-fn check_tls_parameters(database_url: &str) -> Result<(), String> {
-    if connection_parameter(database_url, "sslmode") != Some("verify-full") {
-        return Err(coded(
-            "tls_mode_invalid",
-            "OTLET_DATABASE_URL must set sslmode=verify-full",
-        ));
-    }
-    let Some(root_cert) = connection_parameter(database_url, "sslrootcert") else {
-        return Err(coded(
-            "tls_ca_missing",
-            "OTLET_DATABASE_URL must set sslrootcert",
-        ));
-    };
-    File::open(root_cert)
-        .map(|_| ())
-        .map_err(|_| coded("tls_ca_unreadable", "database CA file is not readable"))
-}
-
-fn connection_parameter<'a>(database_url: &'a str, name: &str) -> Option<&'a str> {
-    database_url.split_once('?')?.1.split('&').find_map(|part| {
-        let (key, value) = part.split_once('=')?;
-        (key == name && !value.is_empty()).then_some(value)
-    })
 }
 
 fn check_runtime_dir(runtime_dir: &Path) -> Result<(), String> {
@@ -1342,11 +1222,7 @@ fn deployment_preflight_until_available(
                 }
                 return Ok(desired);
             }
-            Err(error)
-                if !config.once
-                    && !config.preflight_only
-                    && is_preflight_connection_error(&error) =>
-            {
+            Err(error) if !config.once && !config.preflight_only && is_connection_error(&error) => {
                 if !*unavailable {
                     log_worker("database_unavailable", config, Some(error_code(&error)));
                     *unavailable = true;
@@ -1430,7 +1306,6 @@ fn log_preflight(config: &Config) {
             "model_name": config.model_name,
             "protocol_version": config.protocol_version,
             "tls_required": config.require_tls,
-            "egress_mode": config.egress_mode,
             "timestamp_ms": timestamp_ms()
         })
     );
@@ -1528,14 +1403,6 @@ fn is_claim_loss(error: &str) -> bool {
         || error.contains("identity is not authorized")
 }
 
-fn is_preflight_connection_error(error: &str) -> bool {
-    is_connection_error(error)
-        || matches!(
-            error_code(error),
-            "database_unreachable" | "dns_resolution_failed" | "database_unavailable"
-        )
-}
-
 fn coded(code: &str, message: &str) -> String {
     format!("otlet_error:{code}:{message}")
 }
@@ -1602,36 +1469,6 @@ mod tests {
         let error = "psql failed: connection to server failed: Connection refused";
         assert!(is_connection_error(error));
         assert_eq!(error_code(error), "database_unavailable");
-    }
-
-    #[test]
-    fn database_urls_yield_dns_endpoint_and_tls_settings() {
-        let url = "postgresql://worker:secret@database.example:6432/app?sslmode=verify-full&sslrootcert=/run/ca.crt";
-        assert_eq!(
-            database_endpoint(url),
-            Ok(("database.example".to_owned(), 6432))
-        );
-        assert_eq!(connection_parameter(url, "sslmode"), Some("verify-full"));
-        assert_eq!(
-            connection_parameter(url, "sslrootcert"),
-            Some("/run/ca.crt")
-        );
-    }
-
-    #[test]
-    fn database_urls_support_defaults_and_bracketed_ipv6() {
-        assert_eq!(
-            database_endpoint("postgres://database.example/app"),
-            Ok(("database.example".to_owned(), 5432))
-        );
-        assert_eq!(
-            database_endpoint("postgresql://worker@[2001:db8::1]:6432/app"),
-            Ok(("2001:db8::1".to_owned(), 6432))
-        );
-        assert_eq!(
-            error_code(&database_endpoint("https://database/app").unwrap_err()),
-            "database_url_invalid"
-        );
     }
 
     #[test]

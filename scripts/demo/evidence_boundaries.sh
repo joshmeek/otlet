@@ -367,13 +367,9 @@ SELECT
      UNION ALL SELECT to_jsonb(metric_row) FROM otlet.worker_batch_timing_status metric_row
      UNION ALL SELECT to_jsonb(permission_row) FROM otlet.access_policy_status permission_row
      UNION ALL SELECT to_jsonb(redaction_row) FROM otlet.redaction_policy_status redaction_row
-     UNION ALL SELECT to_jsonb(cleanup_row) FROM otlet.cleanup_receipt_status cleanup_row
-     UNION ALL SELECT to_jsonb(hold_row) FROM otlet.retention_hold_status hold_row
-     UNION ALL SELECT to_jsonb(copy_row) FROM otlet.retention_copy_status copy_row
      UNION ALL SELECT to_jsonb(receipt_row) FROM otlet.audit_receipt_export receipt_row
      UNION ALL SELECT to_jsonb(review_row) FROM otlet.audit_review_export review_row
      UNION ALL SELECT to_jsonb(review_event_row) FROM otlet.audit_review_event_export review_event_row
-     UNION ALL SELECT to_jsonb(evaluation_row) FROM otlet.audit_workload_evaluation_export evaluation_row
    ) surfaces)::text;
 ROLLBACK;
 SQL

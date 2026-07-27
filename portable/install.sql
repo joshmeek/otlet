@@ -19,7 +19,6 @@ BEGIN;
 \ir ../crates/otlet_pg/sql/135_portable_worker_protocol.sql
 \ir ../crates/otlet_pg/sql/140_action_execution.sql
 \ir ../crates/otlet_pg/sql/150_eval_labels.sql
-\ir ../crates/otlet_pg/sql/155_workload_evaluation.sql
 \ir ../crates/otlet_pg/sql/160_action_review_status.sql
 \ir ../crates/otlet_pg/sql/170_inference_receipt_status.sql
 \ir ../crates/otlet_pg/sql/385_portable_permissions.sql

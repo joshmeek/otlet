@@ -14,7 +14,6 @@ New work needs a measured trigger, SQL-visible state, a closed failure mode, and
 - native execution requires a host that can load the extension and resident background worker
 - the reference portable deployment uses one supervised worker, one database, and one local GGUF model
 - lifecycle tests cover database restart and recovery, not multi-node failover
-- credential rotation proof covers PostgreSQL authentication; infrastructure still owns secret rollout and connection draining
 - CPU execution is the supported runtime; no GPU scheduling or CPU fallback matrix ships in core
 - backup, snapshot, replica, restore, and point-in-time-recovery deletion remain deployment responsibilities
 - bounded performance smoke detects obvious regression but does not replace hardware-specific throughput, latency, memory, energy, and database-responsiveness measurement
@@ -35,6 +34,7 @@ These tracks stay closed until their recorded trigger changes:
 | Provider matrices and remote model APIs | A concrete deployment cannot use the local native or portable runtime |
 | Plugin systems, registry processes, custom workflow languages, and connector catalogs | Repeated shipped workloads cannot use SQL, JSON Schema, watch packs, and application-owned delivery |
 | Signed decision bundles | A shipped consumer needs tamper-evident bundles beyond the audit views |
+| Built-in evaluation gates, watch history, and retention workflows | A shipped deployment cannot keep those controls in CI, Git, or infrastructure policy |
 | Built-in network delivery | A shipped application needs shared delivery and reconciliation inside Otlet |
 
 ## Boundaries

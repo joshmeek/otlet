@@ -151,7 +151,7 @@ ORDER BY attempt_index;
 
 Otlet records both attempts and creates `merge_candidate` from the accepted output. The action requires operator approval. The source vendor rows remain unchanged
 
-The full demo checks row and pair watches, candidate drift, CustomScan freshness, versioned watch packs, workload-weighted evaluation gates, review provenance, workflow-bound `update_row`, and adversarial trust cases. It proves portable label round trips, named baseline regressions, canonical pack diff and rollback, fenced claim ownership, idempotent terminal retries, PostgreSQL-owned result validation and identities, the versioned least-privilege portable worker RPC, session-bound review identity, target binding, recommendation-only defaults, evidence holds and cleanup receipts, active-state canary deletion, receipt redaction, role grants, cancellation, model-load admission, memory pressure, cache bounds, prompt and runtime fingerprints, invariants, and Docker crash logs
+The full demo checks row and pair watches, candidate drift, CustomScan freshness, review provenance, workflow-bound `update_row`, and adversarial trust cases. It proves fenced claim ownership, idempotent terminal retries, PostgreSQL-owned result validation and identities, the versioned least-privilege portable worker RPC, session-bound review identity, target binding, recommendation-only defaults, receipt redaction, role grants, cancellation, model-load admission, memory pressure, cache bounds, prompt and runtime fingerprints, invariants, and Docker crash logs
 
 Prove a fresh disposable install, worker lifecycle, database restart, upgrade failure rollback, startup recovery, and crash-log safety with [the release lifecycle command](docs/release-lifecycle.md)
 
