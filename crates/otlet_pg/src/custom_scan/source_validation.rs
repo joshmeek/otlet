@@ -99,6 +99,24 @@ unsafe fn rel_has_lateral_ref(rel: *mut pg_sys::RelOptInfo) -> bool {
     }
 }
 
+unsafe fn rel_has_parameterized_restrictinfo(rel: *mut pg_sys::RelOptInfo) -> bool {
+    unsafe {
+        if rel.is_null() {
+            return false;
+        }
+        for idx in 0..pg_sys::list_length((*rel).baserestrictinfo) {
+            let restrict =
+                pg_sys::list_nth((*rel).baserestrictinfo, idx).cast::<pg_sys::RestrictInfo>();
+            if !restrict.is_null()
+                && !pg_sys::bms_is_subset((*restrict).required_relids, (*rel).relids)
+            {
+                return true;
+            }
+        }
+        false
+    }
+}
+
 fn nonnegative_count(value: i64) -> u64 {
     value.max(0).cast_unsigned()
 }

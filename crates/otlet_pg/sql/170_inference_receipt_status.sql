@@ -67,8 +67,20 @@ SELECT
   (o.id IS NOT NULL) AS accepted,
   r.status,
   r.model_name,
+  r.model_artifact_path,
+  r.model_artifact_hash,
+  r.model_artifact_identity,
   r.runtime_name,
+  r.task_identity_hash,
+  r.source_identity_hash,
+  r.model_identity_hash,
+  r.runtime_options_hash,
   r.prompt_hash,
+  r.input_hash,
+  r.output_schema_hash,
+  r.output_hash,
+  r.actions_hash,
+  trace.summary #>> '{portable_validation,version}' AS portable_validation_version,
   r.prompt_tokens,
   CASE
     WHEN jsonb_typeof(trace.summary -> 'prompt_cached_tokens_before') = 'number'
@@ -410,4 +422,3 @@ CROSS JOIN LATERAL (
 ) trace
 LEFT JOIN otlet.outputs o ON o.receipt_id = r.id
 LEFT JOIN latest_materialization materialization ON materialization.receipt_id = r.id;
-

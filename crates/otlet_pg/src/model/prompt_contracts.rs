@@ -347,7 +347,7 @@ struct TaskContractCacheEntry {
     decision_contract: Value,
     model_name: String,
     artifact_path: String,
-    artifact_hash: Option<String>,
+    artifact_hash: String,
     digests: Arc<TaskContractDigests>,
 }
 

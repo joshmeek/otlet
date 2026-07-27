@@ -241,6 +241,18 @@ BEGIN
   IF actual_stale_policy NOT IN ('lookup_only_fail_closed', 'refresh_then_fail_closed') THEN
     RAISE EXCEPTION 'otlet watch stale_policy % is not supported', actual_stale_policy;
   END IF;
+  SELECT COALESCE(array_agg(action_type ORDER BY action_type), ARRAY[]::text[])
+  INTO actual_action_types
+  FROM (
+    SELECT DISTINCT action_type
+    FROM unnest(actual_action_types) action_type
+  ) normalized;
+  actual_decision_contract := jsonb_set(
+    actual_decision_contract,
+    '{action_types}',
+    to_jsonb(actual_action_types),
+    true
+  );
 
   IF actual_kind = 'row' THEN
     IF create_watch.table_name IS NULL THEN
@@ -255,6 +267,13 @@ BEGIN
     FROM pg_class c
     JOIN pg_namespace n ON n.oid = c.relnamespace
     WHERE c.oid = create_watch.table_name;
+
+    actual_input_shaping := jsonb_set(
+      actual_input_shaping,
+      '{source_fields}',
+      '["_otlet_mvcc","row","table"]'::jsonb,
+      true
+    );
   ELSE
     actual_pair_sources := '[]'::jsonb;
 
@@ -479,4 +498,3 @@ BEGIN
   RETURN saved;
 END;
 $$;
-

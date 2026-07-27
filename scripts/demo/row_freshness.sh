@@ -227,7 +227,7 @@ echo "row_delete_contract=$row_delete_fresh|$row_delete_reason"
 psql_exec -v task_name="$row_triage_task" -v model_name="$strong_model_name" >/dev/null <<'SQL'
 CREATE TEMP TABLE row_triage_invalid_claim AS
 WITH inserted AS (
-  INSERT INTO otlet.jobs (task_name, subject_id, input, status, attempts, started_at, leased_until)
+  INSERT INTO otlet.jobs (task_name, subject_id, input, status, attempts, started_at, leased_until, claim_token)
   VALUES (
     :'task_name',
     'triage-invalid-json',
@@ -235,11 +235,12 @@ WITH inserted AS (
     'running',
     1,
     now(),
-    now() + interval '5 minutes'
+    now() + interval '5 minutes',
+    gen_random_uuid()::text
   )
-  RETURNING id
+  RETURNING id, claim_token
 )
-SELECT id FROM inserted;
+SELECT id, claim_token FROM inserted;
 
 SELECT otlet.fail_job(
   id,
@@ -248,14 +249,16 @@ SELECT otlet.fail_job(
   NULL,
   NULL,
   md5('{"type":"object","required":["decision","confidence","reason"]}'),
-  md5('not json'),
+  otlet.portable_text_hash('not json'),
   now(),
   'failed',
   '{"schema_validation_status":"failed"}'::jsonb,
   :'model_name',
   'direct',
   'failed',
-  'invalid_model_json'
+  'invalid_model_json',
+  NULL,
+  claim_token
 )
 FROM row_triage_invalid_claim;
 SQL
@@ -265,7 +268,7 @@ SELECT j.status || '|' ||
        r.status || '|' ||
        r.selection_status || '|' ||
        r.schema_validation_status || '|' ||
-       (r.raw_output_hash = md5('not json'))::text || '|' ||
+       (r.raw_output_hash = otlet.portable_text_hash('not json'))::text || '|' ||
        (SELECT count(*) FROM otlet.outputs WHERE job_id = j.id)::text || '|' ||
        (SELECT count(*) FROM otlet.actions WHERE job_id = j.id)::text || '|' ||
        (
@@ -291,4 +294,3 @@ echo "row_triage_invalid_answer_contract=$row_triage_invalid_contract"
 
 
 source "$demo_dir/customscan.sh"
-

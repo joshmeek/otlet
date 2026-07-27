@@ -218,6 +218,51 @@ SET signal = 'pass';
 SELECT otlet.run_task(:'row_customscan_watch' || '_task');
 SQL
 wait_task_complete "$row_customscan_task" 4 900 1
+
+correlated_customscan_plan="$(psql_exec -P border=2 -P null='' -v watch_name="$row_customscan_watch" <<'SQL'
+EXPLAIN (ANALYZE, VERBOSE, COSTS, SUMMARY OFF, TIMING OFF)
+SELECT repeated.pass, refreshed.id
+FROM generate_series(1, 2) repeated(pass)
+CROSS JOIN LATERAL (
+  SELECT id
+  FROM public.otlet_demo_customscan_signal
+  WHERE otlet.semantic_matches_auto(:'watch_name', id, '{}'::jsonb)
+    AND repeated.pass > 0
+  OFFSET 0
+) refreshed;
+SQL
+)"
+printf '%s\n' "$correlated_customscan_plan"
+require_contains "$correlated_customscan_plan" "Seq Scan on public.otlet_demo_customscan_signal" "Expected correlated semantic predicate to use the standard Postgres scan"
+if [[ "$correlated_customscan_plan" == *"Otlet Semantic Source CustomScan"* ]]; then
+  echo "Correlated semantic predicate must not use an Otlet CustomScan" >&2
+  exit 1
+fi
+
+correlated_customscan_soak="$(psql_exec -qAt -v watch_name="$row_customscan_watch" <<'SQL'
+SELECT count(*)::text || '|' ||
+       count(*) FILTER (WHERE pass = 1 AND id = 'customscan-1')::text || '|' ||
+       count(*) FILTER (WHERE pass = 1 AND id = 'customscan-2')::text || '|' ||
+       count(*) FILTER (WHERE pass = 2 AND id = 'customscan-1')::text || '|' ||
+       count(*) FILTER (WHERE pass = 2 AND id = 'customscan-2')::text
+FROM generate_series(1, 25) soak(iteration)
+CROSS JOIN generate_series(1, 2) repeated(pass)
+CROSS JOIN LATERAL (
+  SELECT id
+  FROM public.otlet_demo_customscan_signal
+  WHERE otlet.semantic_matches_auto(:'watch_name', id, '{}'::jsonb)
+    AND soak.iteration > 0
+    AND repeated.pass > 0
+  OFFSET 0
+) refreshed;
+SQL
+)"
+echo "correlated_customscan_soak_contract=$correlated_customscan_soak"
+[ "$correlated_customscan_soak" = "100|25|25|25|25" ] || {
+  echo "Expected 25 stable correlated fallback scans, got $correlated_customscan_soak" >&2
+  exit 1
+}
+
 psql_exec >/dev/null <<'SQL'
 UPDATE public.otlet_demo_customscan_signal
 SET signal = 'manual-review';

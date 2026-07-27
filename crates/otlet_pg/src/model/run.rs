@@ -34,7 +34,8 @@ pub(crate) fn run_job(job: &Job) -> Result<ModelRun, ModelError> {
         JobModelRef {
             name: job.model_name.as_str(),
             artifact_path: job.artifact_path.as_str(),
-            artifact_hash: job.artifact_hash.as_deref(),
+            artifact_hash: job.artifact_hash.as_str(),
+            artifact_identity: &job.artifact_identity,
         },
     )
 }
@@ -46,13 +47,15 @@ pub(crate) fn run_job_with_model(job: &Job, model: &JobModel) -> Result<ModelRun
         JobModelRef {
             name: model.name.as_str(),
             artifact_path: model.artifact_path.as_str(),
-            artifact_hash: model.artifact_hash.as_deref(),
+            artifact_hash: model.artifact_hash.as_str(),
+            artifact_identity: &model.artifact_identity,
         },
     )
 }
 
 fn run_job_with_model_ref(job: &Job, model: JobModelRef<'_>) -> Result<ModelRun, ModelError> {
     let prepare_started = Instant::now();
+    verify_model_artifact(model)?;
     let digests = task_contract_digests(job);
     let options = digests
         .runtime_options
@@ -383,4 +386,3 @@ fn run_job_with_model_ref(job: &Job, model: JobModelRef<'_>) -> Result<ModelRun,
         trace_summary,
     })
 }
-

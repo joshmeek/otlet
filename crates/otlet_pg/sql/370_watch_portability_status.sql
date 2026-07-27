@@ -12,6 +12,7 @@ BEGIN
     'instruction', t.instruction,
     'output_schema', w.output_schema,
     'model_name', w.model_name,
+    'model_artifact_identity', m.artifact_identity,
     'table_name', w.source_table,
     'subject_column', w.subject_column,
     'candidate_query', w.candidate_query,
@@ -45,6 +46,7 @@ BEGIN
   INTO definition
   FROM otlet.watches w
   JOIN otlet.tasks t ON t.name = w.task_name
+  JOIN otlet.models m ON m.name = w.model_name
   WHERE w.name = export_watch.watch_name;
 
   IF NOT FOUND THEN
@@ -69,6 +71,7 @@ DECLARE
     'instruction',
     'output_schema',
     'model_name',
+    'model_artifact_identity',
     'table_name',
     'subject_column',
     'candidate_query',
@@ -136,7 +139,8 @@ BEGIN
     'selection_policy',
     'trigger_policy',
     'input_shaping',
-    'decision_contract'
+    'decision_contract',
+    'model_artifact_identity'
   ] LOOP
     IF jsonb_typeof(import_watch.definition -> object_field) IS DISTINCT FROM 'object' THEN
       RAISE EXCEPTION 'otlet watch definition % must be an object', object_field;
@@ -190,6 +194,13 @@ BEGIN
   PERFORM 1 FROM otlet.models m WHERE m.name = import_watch.definition ->> 'model_name';
   IF NOT FOUND THEN
     RAISE EXCEPTION 'otlet watch definition model % does not exist', import_watch.definition ->> 'model_name';
+  END IF;
+  PERFORM 1
+  FROM otlet.models m
+  WHERE m.name = import_watch.definition ->> 'model_name'
+    AND m.artifact_identity = import_watch.definition -> 'model_artifact_identity';
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'otlet watch definition model artifact identity does not match registered model %', import_watch.definition ->> 'model_name';
   END IF;
 
   IF EXISTS (SELECT 1 FROM otlet.watches w WHERE w.name = watch_name)
@@ -277,6 +288,9 @@ WITH watch_sources AS (
     '[]'::jsonb AS pair_sources,
     si.record_type,
     si.model_name,
+    NULL::jsonb AS candidate_plan,
+    NULL::numeric AS candidate_plan_cost,
+    NULL::timestamptz AS candidate_preflight_at,
     COALESCE(w.stale_policy, 'refresh_then_fail_closed') AS stale_policy,
     COALESCE(w.trigger_policy, '{"on_change":"mark_stale"}'::jsonb) AS trigger_policy,
     COALESCE(w.selection_policy, '{}'::jsonb) AS selection_policy
@@ -295,6 +309,9 @@ WITH watch_sources AS (
     COALESCE(w.pair_sources, '[]'::jsonb) AS pair_sources,
     ji.record_type,
     ji.model_name,
+    ji.candidate_plan,
+    ji.candidate_plan_cost,
+    ji.candidate_preflight_at,
     COALESCE(w.stale_policy, 'refresh_then_fail_closed') AS stale_policy,
     COALESCE(w.trigger_policy, '{"on_change":"mark_stale"}'::jsonb) AS trigger_policy,
     COALESCE(w.selection_policy, '{}'::jsonb) AS selection_policy
@@ -374,6 +391,9 @@ SELECT
   w.pair_sources,
   w.record_type,
   w.model_name,
+  w.candidate_plan,
+  w.candidate_plan_cost,
+  w.candidate_preflight_at,
   w.stale_policy,
   w.trigger_policy,
   w.selection_policy,

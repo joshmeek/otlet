@@ -964,7 +964,9 @@ $instruction$,
     }
   }'::jsonb,
   :'model_name',
-  '{"max_tokens":256,"reasoning":"off","inference_cache":false,"generation_trace":true,"generation_trace_max_tokens":16,"generation_trace_top_k":3}'::jsonb
+  '{"max_tokens":256,"reasoning":"off","inference_cache":false,"generation_trace":true,"generation_trace_max_tokens":16,"generation_trace_top_k":3}'::jsonb,
+  '{"source_fields":["_otlet_mvcc","action_ids","candidate_evidence","evidence_counts"]}'::jsonb,
+  '{"action_types":["merge_candidate","new_entity","review_flag"]}'::jsonb
 );
 
 SELECT otlet.create_task(
@@ -989,8 +991,8 @@ $instruction$,
   }'::jsonb,
   :'model_name',
   '{"max_tokens":160,"reasoning":"off","inference_cache":false,"generation_trace":true,"generation_trace_max_tokens":12,"generation_trace_top_k":3}'::jsonb,
-  '{}'::jsonb,
-  '{"answer_field":"decision","abstain_values":["unclear"],"confidence_field":"confidence","accepted_confidence":["high"]}'::jsonb
+  '{"source_fields":["action_ids","phase","row_quality_warnings","row_text","signal_counts"]}'::jsonb,
+  '{"answer_field":"decision","abstain_values":["unclear"],"confidence_field":"confidence","accepted_confidence":["high"],"action_types":["review_flag"]}'::jsonb
 );
 
 SELECT otlet.create_task(
@@ -1015,8 +1017,8 @@ $instruction$,
   }'::jsonb,
   :'model_name',
   '{"max_tokens":160,"reasoning":"off","inference_cache":false,"generation_trace":true,"generation_trace_max_tokens":12,"generation_trace_top_k":3}'::jsonb,
-  '{}'::jsonb,
-  '{"answer_field":"decision","abstain_values":["unclear"],"confidence_field":"confidence","accepted_confidence":["high"]}'::jsonb
+  '{"source_fields":["action_ids","metric_name","observed_value","phase","row_quality_warnings","row_text","thresholds"]}'::jsonb,
+  '{"answer_field":"decision","abstain_values":["unclear"],"confidence_field":"confidence","accepted_confidence":["high"],"action_types":["review_flag"]}'::jsonb
 );
 
 SELECT otlet.create_task(
@@ -1044,7 +1046,7 @@ $instruction$,
   }'::jsonb,
   :'model_name',
   '{"max_tokens":160,"reasoning":"off","inference_cache":false,"generation_trace":true,"generation_trace_max_tokens":12,"generation_trace_top_k":3}'::jsonb,
-  '{}'::jsonb,
+  '{"source_fields":["document_text","phase","required_fields"]}'::jsonb,
   '{"answer_field":"invoice_id","abstain_values":[],"confidence_field":"confidence","accepted_confidence":["high"]}'::jsonb
 );
 
@@ -1070,8 +1072,8 @@ $instruction$,
   }'::jsonb,
   :'model_name',
   '{"max_tokens":160,"reasoning":"off","inference_cache":false,"generation_trace":true,"generation_trace_max_tokens":12,"generation_trace_top_k":3}'::jsonb,
-  '{}'::jsonb,
-  '{"answer_field":"decision","abstain_values":["unclear"],"confidence_field":"confidence","accepted_confidence":["high"]}'::jsonb
+  '{"source_fields":["action_ids","phase","policy_text","signals"]}'::jsonb,
+  '{"answer_field":"decision","abstain_values":["unclear"],"confidence_field":"confidence","accepted_confidence":["high"],"action_types":["review_flag"]}'::jsonb
 );
 
 SELECT otlet.create_watch(
@@ -1098,6 +1100,7 @@ $instruction$,
   $$,
   record_type => 'entity_hypothesis',
   runtime_options => '{"max_tokens":256,"reasoning":"off","inference_cache":false,"generation_trace":true,"generation_trace_max_tokens":16,"generation_trace_top_k":3}'::jsonb,
+  input_shaping => '{"source_fields":["_otlet_mvcc","action_ids","candidate_evidence","evidence_counts"],"evidence_fields":["candidate_evidence"],"action_id_fields":{"left_id":"left_id","right_id":"right_id"}}'::jsonb,
   trigger_policy => '{"on_change":"mark_stale"}'::jsonb,
   action_types => ARRAY['merge_candidate', 'new_entity', 'review_flag'],
   max_candidate_rows => 1000

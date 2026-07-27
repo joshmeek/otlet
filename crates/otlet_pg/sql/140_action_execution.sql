@@ -27,7 +27,7 @@ BEGIN
   END IF;
 
   action_row := context_row.action_row;
-  validation_error := context_row.validation_error;
+  validation_error := COALESCE(context_row.validation_error, context_row.authority_error);
   IF action_row.content_hash IS NOT NULL
      AND context_row.current_content_hash IS DISTINCT FROM action_row.content_hash THEN
     validation_error := 'source identity stale';
@@ -168,6 +168,17 @@ BEGIN
 
   IF action_row.action_type = 'update_row' THEN
     action_body := action_row.payload -> 'body';
+    validation_error := COALESCE(
+      validation_error,
+      otlet.action_workflow_policy_error(
+        context_row.task_name,
+        action_row.action_type,
+        action_row.authority_policy_hash,
+        action_row.target_name,
+        action_row.subject_namespace,
+        true
+      )
+    );
     IF action_row.idempotency_key IS NULL THEN
       validation_error := COALESCE(validation_error, 'update_row idempotency key is missing');
     ELSE
@@ -176,7 +187,8 @@ BEGIN
       );
     END IF;
 
-    IF action_row.idempotency_key IS NOT NULL
+    IF validation_error IS NULL
+       AND action_row.idempotency_key IS NOT NULL
        AND action_row.approval_status = 'approved'
        AND action_row.dry_run_status = 'passed'
        AND action_row.status IN ('approved', 'applied') THEN

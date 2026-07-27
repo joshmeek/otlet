@@ -330,7 +330,7 @@ Custom Scan (Otlet Semantic Source CustomScan) on public.otlet_demo_semantic_ven
 
 The child scan reads the source table. Otlet strips the semantic predicate from the child plan and evaluates it against preloaded semantic state
 
-CustomScan uses statement preload semantics. Row-marked queries such as `FOR UPDATE` stay on the standard Postgres plan because Otlet blocks the CustomScan planner path when queries include rowmarks; Postgres still owns locking and row recheck behavior. For non-rowmark CustomScan, stale triggers and the next statement pick up concurrent source changes instead of a per-tuple recheck inside that scan
+CustomScan uses statement preload semantics. Row-marked queries such as `FOR UPDATE` and correlated `LATERAL` relations stay on the standard Postgres plan. Otlet blocks CustomScan for both shapes so Postgres owns locking, parameter propagation, rescans, and row rechecks. For supported CustomScan plans, stale triggers and the next statement pick up concurrent source changes instead of a per-tuple recheck inside that scan
 
 ## Step 8 - Fail Closed On Stale Rows
 
@@ -498,13 +498,17 @@ FROM otlet.create_watch(
   $$,
   record_type => 'learning_entity_pair',
   runtime_options => '{"max_tokens":160,"reasoning":"off"}'::jsonb,
+  input_shaping => '{"source_fields":["_otlet_mvcc","left","right"]}'::jsonb,
   trigger_policy => '{"on_change":"mark_stale"}'::jsonb,
   max_candidate_rows => 10,
   pair_sources => '[{"table":"public.learning_entity","subject_column":"id"}]'::jsonb
 );
 
+BEGIN;
+SET LOCAL statement_timeout = '2000ms';
 SELECT 'semantic_join_refresh_queued=' ||
        otlet.refresh_semantic_join_index('learning_entity_pair_idx')::text;
+COMMIT;
 ```
 
 Use the semantic-index wait loop, or run `./scripts/otlet-demo.sh` for the compact proof. Then inspect the automatic materialization:
@@ -607,7 +611,7 @@ SELECT jsonb_pretty(otlet.export_watch('learning_entity_pair_idx'));
   "trigger_policy": {"on_change": "mark_stale"},
   "action_types": [],
   "stale_policy": "refresh_then_fail_closed",
-  "input_shaping": {},
+  "input_shaping": {"source_fields": ["_otlet_mvcc", "left", "right"]},
   "decision_contract": {},
   "max_candidate_rows": 10,
   "input_columns": null,
@@ -638,10 +642,10 @@ FROM otlet.import_watch(
 
 Import validates `otlet.watch.v1`, resolves database dependencies, and calls `otlet.create_watch(...)`. A failed import rolls back its statement and leaves an existing watch unchanged
 
-The Docker demo proves replacement, drop/import round trip, lookup preservation, trigger preservation, and nine rejected documents:
+The Docker demo proves replacement, drop/import round trip, lookup preservation, trigger preservation, and ten rejected documents:
 
 ```text
 watch_replace_contract=true|true|true|true|true|true|true|true|true|true
+watch_import_failure_contract=10|true
 watch_round_trip_contract=true|true|true|true|true
-watch_import_failure_contract=9|true
 ```

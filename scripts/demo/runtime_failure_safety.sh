@@ -12,7 +12,8 @@ SELECT otlet.create_task(
   'Return JSON only: {"output":{"status":"ok"},"actions":[]}',
   '{"type":"object","required":["status"],"additionalProperties":false,"properties":{"status":{"enum":["ok"]}}}'::jsonb,
   :'model_name',
-  '{"max_tokens":512,"reasoning":"off","inference_cache":false}'::jsonb
+  '{"max_tokens":512,"reasoning":"off","inference_cache":false}'::jsonb,
+  '{"source_fields":["payload"]}'::jsonb
 );
 SELECT otlet.run_task(:'task_name');
 SQL
@@ -26,7 +27,7 @@ SQL
 )"
   if [ -n "$cancel_decode_job_id" ]; then
     psql_exec -qAt -v job_id="$cancel_decode_job_id" >/dev/null <<'SQL'
-SELECT count(*) FROM otlet.cancel_job(:'job_id'::bigint, 'demo cancel mid-decode');
+SELECT count(*) FROM otlet.request_job_cancellation(:'job_id'::bigint, 'demo cancel mid-decode');
 SQL
     break
   fi
@@ -80,7 +81,7 @@ JOIN otlet.runtime_status rs
 SQL
 )"
 echo "cancel_decode_worker_contract=$cancel_decode_contract"
-[ "$cancel_decode_contract" = "canceled|true|canceled|failed|canceled||0|ready|ready" ] || {
+[ "$cancel_decode_contract" = "canceled|true|canceled|failed|canceled|not_run|0|ready|ready" ] || {
   echo "Expected mid-decode cancel to produce a clean canceled receipt and healthy worker, got $cancel_decode_contract" >&2
   exit 1
 }
@@ -100,11 +101,11 @@ SELECT otlet.create_task(
 );
 CREATE TEMP TABLE invalid_json_claim AS
 WITH inserted AS (
-  INSERT INTO otlet.jobs (task_name, subject_id, input, status, attempts, started_at, leased_until)
-  VALUES (:'task_name', 'invalid-json-1', '{}'::jsonb, 'running', 1, now(), now() + interval '5 minutes')
-  RETURNING id
+  INSERT INTO otlet.jobs (task_name, subject_id, input, status, attempts, started_at, leased_until, claim_token)
+  VALUES (:'task_name', 'invalid-json-1', '{}'::jsonb, 'running', 1, now(), now() + interval '5 minutes', gen_random_uuid()::text)
+  RETURNING id, claim_token
 )
-SELECT id FROM inserted;
+SELECT id, claim_token FROM inserted;
 SELECT otlet.fail_job(
   id,
   'invalid model JSON: expected object',
@@ -112,14 +113,16 @@ SELECT otlet.fail_job(
   NULL,
   NULL,
   NULL,
-  md5('not json'),
+  otlet.portable_text_hash('not json'),
   now(),
   'failed',
   '{"schema_validation_status":"failed"}'::jsonb,
   :'model_name',
   'direct',
   'failed',
-  'invalid_model_json'
+  'invalid_model_json',
+  NULL,
+  claim_token
 )
 FROM invalid_json_claim;
 SQL
@@ -203,10 +206,10 @@ VALUES
   );
 
 WITH inserted AS (
-  INSERT INTO otlet.jobs (task_name, subject_id, input, status, attempts, started_at, leased_until)
-  SELECT :'task_name', subject_id, '{}'::jsonb, 'running', 1, now(), now() + interval '5 minutes'
+  INSERT INTO otlet.jobs (task_name, subject_id, input, status, attempts, started_at, leased_until, claim_token)
+  SELECT :'task_name', subject_id, '{}'::jsonb, 'running', 1, now(), now() + interval '5 minutes', gen_random_uuid()::text
   FROM output_envelope_cases
-  RETURNING id, subject_id
+  RETURNING id, subject_id, claim_token
 )
 SELECT otlet.fail_job(
   inserted.id,
@@ -215,14 +218,16 @@ SELECT otlet.fail_job(
   NULL,
   NULL,
   NULL,
-  md5(cases.raw_output),
+  otlet.portable_text_hash(cases.raw_output),
   now(),
   'failed',
   '{}'::jsonb,
   :'model_name',
   'direct',
   'failed',
-  'output_envelope_contract'
+  'output_envelope_contract',
+  NULL,
+  inserted.claim_token
 )
 FROM inserted
 JOIN output_envelope_cases cases USING (subject_id);
@@ -270,7 +275,7 @@ SELECT count(*) FILTER (WHERE subject_id = 'markdown-fence' AND job_error = expe
        count(*) FILTER (WHERE subject_id = 'extra-top-level' AND job_error = expected_error AND receipt_error = expected_error)::text || '|' ||
        count(*) FILTER (WHERE subject_id = 'non-object-action' AND job_error = expected_error AND receipt_error = expected_error)::text || '|' ||
        bool_and(job_status = 'failed' AND receipt_status = 'failed' AND selection_status = 'failed' AND schema_validation_status = 'failed')::text || '|' ||
-       bool_and(raw_output IS NULL AND raw_output_hash = md5(expected_raw_output))::text || '|' ||
+       bool_and(raw_output IS NULL AND raw_output_hash = otlet.portable_text_hash(expected_raw_output))::text || '|' ||
        (SELECT count(*) FROM otlet.outputs WHERE job_id IN (SELECT job_id FROM rows))::text || '|' ||
        (SELECT count(*) FROM otlet.actions WHERE job_id IN (SELECT job_id FROM rows))::text
 FROM rows;
@@ -297,11 +302,11 @@ SELECT otlet.create_task(
 );
 CREATE TEMP TABLE hallucinated_action_claim AS
 WITH inserted AS (
-  INSERT INTO otlet.jobs (task_name, subject_id, input, status, attempts, started_at, leased_until)
-  VALUES (:'task_name', 'hallucinated-action-1', '{}'::jsonb, 'running', 1, now(), now() + interval '5 minutes')
-  RETURNING id
+  INSERT INTO otlet.jobs (task_name, subject_id, input, status, attempts, started_at, leased_until, claim_token)
+  VALUES (:'task_name', 'hallucinated-action-1', '{}'::jsonb, 'running', 1, now(), now() + interval '5 minutes', gen_random_uuid()::text)
+  RETURNING id, claim_token
 )
-SELECT id FROM inserted;
+SELECT id, claim_token FROM inserted;
 SELECT otlet.complete_job(
   id,
   '{"status":"ok"}'::jsonb,
@@ -310,10 +315,11 @@ SELECT otlet.complete_job(
   NULL,
   NULL,
   NULL,
-  md5('{"output":{"status":"ok"},"actions":[{"type":"invented_action","body":{"subject_id":"hallucinated-action-1","text":"no record"}}]}'),
+  otlet.portable_text_hash('{"output":{"status":"ok"},"actions":[{"type":"invented_action","body":{"subject_id":"hallucinated-action-1","text":"no record"}}]}'),
   now(),
   '{"schema_validation_status":"passed"}'::jsonb,
-  :'model_name'
+  :'model_name',
+  expected_claim_token => claim_token
 )
 FROM hallucinated_action_claim;
 SQL
@@ -330,7 +336,7 @@ SELECT (SELECT count(*) FROM otlet.outputs WHERE job_id = j.id)::text || '|' ||
        (SELECT count(*) FROM otlet.records r JOIN otlet.actions a ON a.id = r.action_id WHERE a.job_id = j.id)::text || '|' ||
        COALESCE((
          SELECT (r.raw_output IS NULL AND
-                 r.raw_output_hash = md5('{"output":{"status":"ok"},"actions":[{"type":"invented_action","body":{"subject_id":"hallucinated-action-1","text":"no record"}}]}'))::text
+                 r.raw_output_hash = otlet.portable_text_hash('{"output":{"status":"ok"},"actions":[{"type":"invented_action","body":{"subject_id":"hallucinated-action-1","text":"no record"}}]}'))::text
          FROM otlet.inference_receipts r
          WHERE r.job_id = j.id
          ORDER BY r.id DESC
@@ -340,7 +346,7 @@ FROM job_row j;
 SQL
 )"
 echo "hallucinated_action_safety_contract=$hallucinated_action_contract"
-[ "$hallucinated_action_contract" = "1|rejected|unsupported action type|0|true" ] || {
+[ "$hallucinated_action_contract" = "1|rejected|action type invented_action is not allowed by workflow|0|true" ] || {
   echo "Expected hallucinated action type to be rejected without a record, got $hallucinated_action_contract" >&2
   exit 1
 }

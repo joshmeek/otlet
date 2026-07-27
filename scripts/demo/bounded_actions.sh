@@ -49,10 +49,19 @@ SELECT otlet.create_watch(
   '{}'
 );
 
+SELECT otlet.register_action_workflow_policy(
+  :'watch_name' || '_task',
+  'update_row',
+  :'target_name',
+  'bounded_mutation',
+  'evaluated'
+);
+
 DO $body$
 DECLARE
   proposal record;
   job_id bigint;
+  claim_token text;
   job_input jsonb;
 BEGIN
   FOR proposal IN
@@ -173,7 +182,8 @@ BEGIN
       status,
       attempts,
       started_at,
-      leased_until
+      leased_until,
+      claim_token
     )
     VALUES (
       'bounded_action_demo_task',
@@ -182,9 +192,10 @@ BEGIN
       'running',
       1,
       now(),
-      now() + interval '5 minutes'
+      now() + interval '5 minutes',
+      gen_random_uuid()::text
     )
-    RETURNING id INTO job_id;
+    RETURNING id, otlet.jobs.claim_token INTO job_id, claim_token;
 
     PERFORM otlet.complete_job(
       job_id => job_id,
@@ -203,7 +214,8 @@ BEGIN
         SELECT model_name
         FROM otlet.tasks
         WHERE name = 'bounded_action_demo_task'
-      )
+      ),
+      expected_claim_token => claim_token
     );
   END LOOP;
 END
@@ -215,7 +227,7 @@ SELECT
   count(*) FILTER (WHERE a.status = 'proposed')::text || '|' ||
   count(*) FILTER (WHERE a.status = 'rejected')::text || '|' ||
   count(*) FILTER (WHERE a.error = 'update_row column is not allowed')::text || '|' ||
-  count(*) FILTER (WHERE a.error = 'unknown action target')::text || '|' ||
+  count(*) FILTER (WHERE a.error = 'update_row target does not match workflow authority')::text || '|' ||
   count(*) FILTER (WHERE a.error = 'update_row identity must match job subject_id')::text || '|' ||
   count(*) FILTER (
     WHERE payload #>> '{body,changes,review_reason}' = 'bounded apply'

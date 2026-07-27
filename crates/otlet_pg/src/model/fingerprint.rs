@@ -66,10 +66,15 @@ fn runtime_fingerprint(
         "artifact": {
             "name": artifact_name,
             "bytes": fs::metadata(model.artifact_path).map(|meta| meta.len()).unwrap_or(0),
-            "catalog_hash": model.artifact_hash,
+            "sha256": model.artifact_hash,
+            "identity": model.artifact_identity,
+            "verification": "sha256_verified_before_model_load",
             "fingerprint_hash": model_fingerprint_hash,
-            "quantization": artifact_quantization(artifact_name),
-            "quantization_source": "artifact_filename_bound_by_fingerprint"
+            "quantization": model.artifact_identity
+                .get("quantization")
+                .and_then(Value::as_str)
+                .unwrap_or_else(|| artifact_quantization(artifact_name)),
+            "quantization_source": "registered_identity_bound_by_verified_sha256"
         },
         "runtime": {
             "device_policy": LINKED_MODEL_DEVICE_POLICY,
@@ -197,10 +202,19 @@ mod runtime_fingerprint_tests {
 
     #[test]
     fn output_contract_hash_is_stable_and_scoped() {
+        let identity = json!({
+            "sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+            "bytes": 24,
+            "source": "test",
+            "revision": "v1",
+            "quantization": "test",
+            "license": "test"
+        });
         let model = JobModelRef {
             name: "test",
             artifact_path: "/not/read",
-            artifact_hash: Some("catalog-hash"),
+            artifact_hash: identity.get("sha256").and_then(Value::as_str).unwrap(),
+            artifact_identity: &identity,
         };
         let options = crate::runtime::RuntimeOptions::default();
         let first = runtime_fingerprint(model, "model-hash", &options);
@@ -213,6 +227,23 @@ mod runtime_fingerprint_tests {
         let reasoning_on = runtime_fingerprint(model, "model-hash", &reasoning_on);
         let mut changed_host = first.document.clone();
         changed_host["host"]["memory_bytes"] = json!(1);
+        let changed_identity = json!({
+            "sha256": "2222222222222222222222222222222222222222222222222222222222222222",
+            "bytes": 24,
+            "source": "test",
+            "revision": "v2",
+            "quantization": "test",
+            "license": "test"
+        });
+        let changed_artifact = runtime_fingerprint(
+            JobModelRef {
+                artifact_hash: changed_identity.get("sha256").and_then(Value::as_str).unwrap(),
+                artifact_identity: &changed_identity,
+                ..model
+            },
+            "changed-model-hash",
+            &options,
+        );
 
         assert_eq!(first.hash, second.hash);
         assert_eq!(first.output_contract_hash, second.output_contract_hash);
@@ -222,6 +253,7 @@ mod runtime_fingerprint_tests {
             reasoning_on.document["output_contract"]["prompt_template"]["hash"]
         );
         assert_ne!(first.hash, hash_json(&changed_host));
+        assert_ne!(first.hash, changed_artifact.hash);
         assert_eq!(
             first.output_contract_hash,
             changed_host["output_contract_hash"].as_str().unwrap()

@@ -6,7 +6,8 @@ pub(crate) fn preload_model(
     let model = JobModelRef {
         name: model.name.as_str(),
         artifact_path: model.artifact_path.as_str(),
-        artifact_hash: model.artifact_hash.as_deref(),
+        artifact_hash: model.artifact_hash.as_str(),
+        artifact_identity: &model.artifact_identity,
     };
     let model_fingerprint_hash = model_fingerprint_hash(model);
     let cache = LINKED_CACHE.get_or_init(|| Mutex::new(None));
@@ -51,6 +52,7 @@ fn ensure_linked_model(
     if job_model.artifact_path.starts_with("hf:") {
         return Err(ModelError::new("linked llama.cpp runtime requires a local GGUF artifact path"));
     }
+    verify_model_artifact(job_model)?;
     LINKED_BACKEND.get_or_init(|| unsafe {
         llama_cpp_sys_4::llama_backend_init();
     });
@@ -302,4 +304,3 @@ fn linked_model_load_projection(
             .saturating_add(batch_compute_bytes),
     })
 }
-

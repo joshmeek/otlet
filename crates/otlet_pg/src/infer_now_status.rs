@@ -66,7 +66,7 @@ pub(crate) fn status_json() -> JsonB {
         "admission_policy": INFER_NOW_ADMISSION_POLICY,
         "cap_policy": "task_subject_inline_task_input_byte_caps_reject_before_queue_insert",
         "timeout_policy": "requester_fail_closed_job_cancel_requested_no_late_materialization",
-        "cancellation_policy": "timeout_calls_cancel_job_then_linked_runtime_checks_cancel_requested",
+        "cancellation_policy": "timeout_requests_cancellation_then_linked_runtime_checks_cancel_requested",
         "mutation_policy": "otlet_tables_only_no_user_table_mutation",
         "error": read_buf(&last_slot.error, last_slot.error_len as usize),
     }))
@@ -130,4 +130,3 @@ pub extern "C-unwind" fn otlet_worker_infer_now_state(
 ) -> pg_sys::Datum {
     status_json().into_datum().unwrap()
 }
-

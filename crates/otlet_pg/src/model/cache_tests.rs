@@ -101,10 +101,12 @@ mod cache_tests {
 
     #[test]
     fn catalog_model_fingerprint_reuses_cached_allocation() {
+        let identity = json!({"sha256": "catalog-hash", "bytes": 1});
         let model = JobModelRef {
             name: "test",
             artifact_path: "/not/read",
-            artifact_hash: Some("catalog-hash"),
+            artifact_hash: "catalog-hash",
+            artifact_identity: &identity,
         };
         let first = model_fingerprint_hash(model);
         let second = model_fingerprint_hash(model);

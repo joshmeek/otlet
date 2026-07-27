@@ -22,12 +22,16 @@ const SCHEMA_READY_PROBE_INTERVAL: Duration = Duration::from_secs(30);
 #[pgrx::pg_guard]
 #[unsafe(no_mangle)]
 pub extern "C-unwind" fn otlet_worker_main(_arg: pgrx::pg_sys::Datum) {
-    // SIGTERM handling lets Postgres stop the worker cleanly
     BackgroundWorker::attach_signal_handlers(SignalWakeFlags::SIGTERM);
-    BackgroundWorker::connect_worker_to_spi(Some("postgres"), None);
+    let database = match configured_worker_database() {
+        Ok(database) => database,
+        Err(error) => pgrx::error!("{error}"),
+    };
+    pgrx::log!("otlet worker connecting database={database}");
+    BackgroundWorker::connect_worker_to_spi(Some(&database), None);
 
     crate::wake::register_worker_latch();
-    pgrx::log!("otlet worker started");
+    pgrx::log!("otlet worker started database={database}");
 
     let recovery_interval = Duration::from_millis(crate::wake::MISSED_WAKE_RECOVERY_MS);
     let mut last_expired_sweep = Instant::now()
@@ -37,6 +41,11 @@ pub extern "C-unwind" fn otlet_worker_main(_arg: pgrx::pg_sys::Datum) {
         .checked_sub(SCHEMA_READY_PROBE_INTERVAL)
         .unwrap_or_else(Instant::now);
     let mut schema_probe_due = true;
+    let mut startup_recorded = false;
+    let mut startup_probe_due = true;
+    let mut last_startup_probe = Instant::now()
+        .checked_sub(SCHEMA_READY_PROBE_INTERVAL)
+        .unwrap_or_else(Instant::now);
     let mut preload_checked = false;
 
     while BackgroundWorker::wait_latch(Some(recovery_interval)) {
@@ -55,6 +64,36 @@ pub extern "C-unwind" fn otlet_worker_main(_arg: pgrx::pg_sys::Datum) {
                 continue;
             }
             schema_probe_due = false;
+        }
+
+        if !startup_recorded
+            && (startup_probe_due || last_startup_probe.elapsed() >= SCHEMA_READY_PROBE_INTERVAL)
+        {
+            startup_probe_due = false;
+            last_startup_probe = Instant::now();
+            let startup_result = BackgroundWorker::transaction(startup_runtime_options)
+                .map_err(|error| error.to_string())
+                .and_then(|options| {
+                    crate::runtime::parse_runtime_options(&options)
+                        .map(|parsed| parsed.max_worker_rss_bytes)
+                });
+            match startup_result {
+                Ok(max_worker_rss_bytes) => {
+                    match BackgroundWorker::transaction(|| {
+                        record_worker_started(max_worker_rss_bytes)
+                    }) {
+                        Ok(()) => startup_recorded = true,
+                        Err(err) => pgrx::warning!("otlet worker startup status failed: {err}"),
+                    }
+                }
+                Err(error) => {
+                    record_worker_startup_failure(&error);
+                    pgrx::warning!("otlet worker startup preflight failed: {error}");
+                }
+            }
+        }
+        if !startup_recorded {
+            continue;
         }
 
         if !preload_checked {
@@ -143,7 +182,79 @@ pub extern "C-unwind" fn otlet_worker_main(_arg: pgrx::pg_sys::Datum) {
     }
 
     crate::wake::unregister_worker_latch();
-    pgrx::log!("otlet worker stopped");
+    pgrx::log!("otlet worker stopped database={database}");
+}
+
+fn configured_worker_database() -> Result<String, String> {
+    match std::env::var("OTLET_DATABASE") {
+        Ok(database) => validate_worker_database(database),
+        Err(std::env::VarError::NotPresent) => Ok("postgres".to_owned()),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            Err("OTLET_DATABASE must be valid UTF-8".to_owned())
+        }
+    }
+}
+
+fn validate_worker_database(database: String) -> Result<String, String> {
+    if database.is_empty() {
+        return Err("OTLET_DATABASE must name a database".to_owned());
+    }
+    if database.len() > 63 {
+        return Err("OTLET_DATABASE must be at most 63 bytes".to_owned());
+    }
+    if !database
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'-'))
+    {
+        return Err(
+            "OTLET_DATABASE may contain only ASCII letters, digits, underscore, dot, and hyphen"
+                .to_owned(),
+        );
+    }
+    Ok(database)
+}
+
+fn startup_runtime_options() -> pgrx::spi::Result<Value> {
+    pgrx::Spi::get_one::<JsonB>(
+        "SELECT default_runtime_options FROM otlet.production_policy WHERE name = 'default'",
+    )?
+    .map(|options| options.0)
+    .ok_or(pgrx::spi::SpiError::InvalidPosition)
+}
+
+fn record_worker_started(max_worker_rss_bytes: u64) -> pgrx::spi::Result<()> {
+    pgrx::Spi::connect_mut(|client| {
+        let max_worker_rss_bytes = i64::try_from(max_worker_rss_bytes).unwrap_or(i64::MAX);
+        client.update(
+            "SELECT otlet.record_worker_event(\
+               'worker_started', NULL, 'linked_inproc', 'otlet worker connected', \
+               jsonb_build_object(\
+                 'database', current_database(), \
+                 'role', current_user, \
+                 'default_max_worker_rss_bytes', $1))",
+            Some(1),
+            &[max_worker_rss_bytes.into()],
+        )?;
+        Ok(())
+    })
+}
+
+fn record_worker_startup_failure(error: &str) {
+    let result: pgrx::spi::Result<()> = BackgroundWorker::transaction(|| {
+        pgrx::Spi::connect_mut(|client| {
+            client.update(
+                "SELECT otlet.record_worker_event(\
+                   'worker_startup_failed', NULL, 'linked_inproc', 'otlet worker startup preflight failed', \
+                   jsonb_build_object('database', current_database(), 'role', current_user, 'error', $1))",
+                Some(1),
+                &[error.into()],
+            )?;
+            Ok(())
+        })
+    });
+    if let Err(status_error) = result {
+        pgrx::warning!("otlet worker startup failure status failed: {status_error}");
+    }
 }
 
 struct StartupPreload {
@@ -155,7 +266,7 @@ struct StartupPreload {
 fn startup_preload_config() -> pgrx::spi::Result<Option<StartupPreload>> {
     pgrx::Spi::connect(|client| {
         let rows = client.select(
-            "SELECT p.preload_model_name, m.artifact_path, m.artifact_hash, p.default_runtime_options FROM otlet.production_policy p LEFT JOIN otlet.models m ON m.name = p.preload_model_name WHERE p.name = 'default' AND p.preload_model_name IS NOT NULL LIMIT 1",
+            "SELECT p.preload_model_name, m.artifact_path, m.artifact_hash, m.artifact_identity, p.default_runtime_options FROM otlet.production_policy p LEFT JOIN otlet.models m ON m.name = p.preload_model_name WHERE p.name = 'default' AND p.preload_model_name IS NOT NULL LIMIT 1",
             Some(1),
             &[],
         )?;
@@ -168,15 +279,19 @@ fn startup_preload_config() -> pgrx::spi::Result<Option<StartupPreload>> {
             .ok_or(pgrx::spi::SpiError::InvalidPosition)?;
         let artifact_path = row.get::<String>(2)?;
         let artifact_hash = row.get::<String>(3)?;
+        let artifact_identity = row.get::<JsonB>(4)?.map(|value| value.0);
         Ok(Some(StartupPreload {
-            model: artifact_path.map(|artifact_path| crate::job::JobModel {
-                name: model_name.clone(),
-                artifact_path,
-                artifact_hash,
-            }),
+            model: artifact_path.zip(artifact_hash).zip(artifact_identity).map(
+                |((artifact_path, artifact_hash), artifact_identity)| crate::job::JobModel {
+                    name: model_name.clone(),
+                    artifact_path,
+                    artifact_hash,
+                    artifact_identity,
+                },
+            ),
             model_name,
             runtime_options: row
-                .get::<JsonB>(4)?
+                .get::<JsonB>(5)?
                 .ok_or(pgrx::spi::SpiError::InvalidPosition)?
                 .0,
         }))
@@ -367,7 +482,8 @@ fn ensure_inline_task(request: &crate::infer_now::InferNowRequest) -> Result<(),
                          COALESCE((SELECT t->>'instruction' FROM src), ''), \
                          COALESCE((SELECT t->'output_schema' FROM src), '{\"type\":\"object\"}'::jsonb), \
                          COALESCE((SELECT t->>'model_name' FROM src), ''), \
-                         COALESCE((SELECT t->'runtime_options' FROM src), '{}'::jsonb) \
+                         COALESCE((SELECT t->'runtime_options' FROM src), '{}'::jsonb), \
+                         COALESCE((SELECT t->'input_shaping' FROM src), '{\"source_fields\":[]}'::jsonb) \
                        )::text \
                      ) \
                      ELSE NULL \
@@ -442,7 +558,7 @@ fn materialize_infer_now_subject(task_name: &str, subject_id: &str) -> pgrx::spi
 fn otlet_schema_ready() -> pgrx::spi::Result<bool> {
     pgrx::Spi::connect(|client| {
         let rows = client.select(
-            "SELECT to_regprocedure('otlet.claim_jobs()') IS NOT NULL AND to_regprocedure('otlet.materialize_completed_semantic_job(bigint)') IS NOT NULL AND to_regprocedure('otlet.complete_and_materialize_job(bigint,jsonb,text,jsonb,text,text,text,text,jsonb,text,text,text)') IS NOT NULL",
+            "SELECT to_regprocedure('otlet.claim_jobs(text,integer)') IS NOT NULL AND to_regprocedure('otlet.materialize_completed_semantic_job(bigint)') IS NOT NULL AND to_regprocedure('otlet.complete_and_materialize_job(bigint,jsonb,text,jsonb,text,text,text,text,jsonb,text,text,text,text)') IS NOT NULL",
             Some(1),
             &[],
         )?;
@@ -453,3 +569,20 @@ fn otlet_schema_ready() -> pgrx::spi::Result<bool> {
 include!("worker_batch.rs");
 include!("worker_selection.rs");
 include!("worker_completion.rs");
+
+#[cfg(test)]
+mod startup_tests {
+    use super::validate_worker_database;
+
+    #[test]
+    fn worker_database_rejects_invalid_names() {
+        assert_eq!(
+            validate_worker_database("otlet_data".to_owned()).unwrap(),
+            "otlet_data"
+        );
+        assert!(validate_worker_database(String::new()).is_err());
+        assert!(validate_worker_database("x".repeat(64)).is_err());
+        assert!(validate_worker_database("otlet\ndata".to_owned()).is_err());
+        assert!(validate_worker_database("otlet/data".to_owned()).is_err());
+    }
+}

@@ -4,9 +4,24 @@ CREATE TABLE otlet.production_policy (
   name text PRIMARY KEY DEFAULT 'default',
   stale_policy text NOT NULL DEFAULT 'refresh_then_fail_closed',
   max_queued_jobs_per_model integer NOT NULL DEFAULT 1000,
+  max_admission_rows integer NOT NULL DEFAULT 1000,
+  max_input_bytes_per_job bigint NOT NULL DEFAULT 1048576,
+  max_queued_input_bytes_per_model bigint NOT NULL DEFAULT 67108864,
+  max_queued_input_bytes_total bigint NOT NULL DEFAULT 268435456,
+  max_candidate_query_cost numeric NOT NULL DEFAULT 1000000,
+  candidate_query_statement_timeout_ms integer NOT NULL DEFAULT 2000,
+  max_raw_output_bytes bigint NOT NULL DEFAULT 1048576,
+  max_structured_output_bytes bigint NOT NULL DEFAULT 1048576,
+  max_actions_per_job integer NOT NULL DEFAULT 64,
+  max_action_bytes bigint NOT NULL DEFAULT 65536,
+  max_trace_bytes bigint NOT NULL DEFAULT 1048576,
+  max_error_bytes bigint NOT NULL DEFAULT 4096,
+  max_event_message_bytes bigint NOT NULL DEFAULT 4096,
+  max_event_detail_bytes bigint NOT NULL DEFAULT 262144,
+  max_receipt_bytes bigint NOT NULL DEFAULT 4194304,
   max_attempts integer NOT NULL DEFAULT 3,
   max_attempt_ms integer NOT NULL DEFAULT 300000,
-  default_runtime_options jsonb NOT NULL DEFAULT '{}'::jsonb,
+  default_runtime_options jsonb NOT NULL DEFAULT '{"max_worker_rss_bytes":8589934592}'::jsonb,
   preload_model_name text,
   semantic_auto_wait_ms integer NOT NULL DEFAULT 10000,
   semantic_auto_infer_ms integer NOT NULL DEFAULT 15000,
@@ -27,6 +42,21 @@ CREATE TABLE otlet.production_policy (
     'refresh_then_fail_closed'
   )),
   CHECK (max_queued_jobs_per_model BETWEEN 1 AND 1000000),
+  CHECK (max_admission_rows BETWEEN 1 AND 100000),
+  CHECK (max_input_bytes_per_job BETWEEN 1 AND 16777216),
+  CHECK (max_queued_input_bytes_per_model BETWEEN 1 AND 1073741824),
+  CHECK (max_queued_input_bytes_total BETWEEN max_queued_input_bytes_per_model AND 4294967296),
+  CHECK (max_candidate_query_cost BETWEEN 1 AND 1000000000000),
+  CHECK (candidate_query_statement_timeout_ms BETWEEN 1 AND 30000),
+  CHECK (max_raw_output_bytes BETWEEN 1 AND 16777216),
+  CHECK (max_structured_output_bytes BETWEEN 1 AND 16777216),
+  CHECK (max_actions_per_job BETWEEN 0 AND 1024),
+  CHECK (max_action_bytes BETWEEN 1 AND 1048576),
+  CHECK (max_trace_bytes BETWEEN 1 AND 16777216),
+  CHECK (max_error_bytes BETWEEN 1 AND 65536),
+  CHECK (max_event_message_bytes BETWEEN 1 AND 65536),
+  CHECK (max_event_detail_bytes BETWEEN 1 AND 4194304),
+  CHECK (max_receipt_bytes BETWEEN 1 AND 67108864),
   CHECK (max_attempts BETWEEN 1 AND 20),
   CHECK (max_attempt_ms BETWEEN 1 AND 3600000),
   CHECK (jsonb_typeof(default_runtime_options) = 'object'),
@@ -50,7 +80,18 @@ VALUES ('default');
 CREATE TABLE otlet.models (
   name text PRIMARY KEY,
   artifact_path text NOT NULL,
-  artifact_hash text,
+  artifact_hash text NOT NULL CHECK (artifact_hash ~ '^[0-9a-f]{64}$'),
+  artifact_identity jsonb NOT NULL CHECK (
+    jsonb_typeof(artifact_identity) = 'object'
+    AND artifact_identity ->> 'sha256' = artifact_hash
+    AND jsonb_typeof(artifact_identity -> 'bytes') = 'number'
+    AND artifact_identity ->> 'bytes' ~ '^[1-9][0-9]*$'
+    AND (artifact_identity ->> 'bytes')::numeric <= 9223372036854775807
+    AND NULLIF(artifact_identity ->> 'source', '') IS NOT NULL
+    AND NULLIF(artifact_identity ->> 'revision', '') IS NOT NULL
+    AND NULLIF(artifact_identity ->> 'quantization', '') IS NOT NULL
+    AND NULLIF(artifact_identity ->> 'license', '') IS NOT NULL
+  ),
   max_active_jobs int NOT NULL DEFAULT 1 CHECK (max_active_jobs BETWEEN 1 AND 1024),
   last_used_at timestamptz,
   created_at timestamptz NOT NULL DEFAULT now()
@@ -149,12 +190,18 @@ CREATE TABLE otlet.jobs (
   status text NOT NULL DEFAULT 'queued',
   attempts int NOT NULL DEFAULT 0,
   leased_until timestamptz,
+  claim_token text,
+  terminal_claim_token text,
+  terminal_request_hash text,
   error text,
   created_at timestamptz NOT NULL DEFAULT now(),
   started_at timestamptz,
   finished_at timestamptz,
   cancel_requested_at timestamptz,
-  CHECK (status IN ('queued', 'running', 'complete', 'failed', 'canceled', 'cancel_requested'))
+  CHECK (status IN ('queued', 'running', 'complete', 'failed', 'canceled', 'cancel_requested')),
+  CHECK ((status IN ('running', 'cancel_requested')) = (claim_token IS NOT NULL)),
+  CHECK ((terminal_claim_token IS NULL) = (terminal_request_hash IS NULL)),
+  CHECK (terminal_claim_token IS NULL OR status IN ('complete', 'failed', 'canceled'))
 );
 
 CREATE UNIQUE INDEX jobs_active_subject_idx
@@ -187,13 +234,20 @@ CREATE TABLE otlet.inference_receipts (
   subject_id text NOT NULL,
   model_name text NOT NULL,
   model_artifact_path text NOT NULL,
-  model_artifact_hash text,
+  model_artifact_hash text NOT NULL,
+  model_artifact_identity jsonb NOT NULL CHECK (jsonb_typeof(model_artifact_identity) = 'object'),
   runtime_name text NOT NULL,
   runtime_endpoint text NOT NULL,
   runtime_options jsonb NOT NULL,
+  task_identity_hash text,
+  source_identity_hash text,
+  model_identity_hash text,
+  runtime_options_hash text,
   prompt_hash text,
   input_hash text,
   output_schema_hash text,
+  output_hash text,
+  actions_hash text,
   raw_output_hash text,
   raw_output text,
   candidate_output jsonb,
@@ -278,4 +332,3 @@ CREATE TABLE otlet.outputs (
 
 CREATE UNIQUE INDEX outputs_one_per_job_idx
 ON otlet.outputs (job_id);
-

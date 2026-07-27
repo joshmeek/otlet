@@ -9,13 +9,6 @@ impl FnvWriter {
         }
     }
 
-    fn finish(self) -> String {
-        let mut out = String::with_capacity(16);
-        use std::fmt::Write as _;
-        let _ = write!(out, "{:016x}", self.hash);
-        out
-    }
-
     fn write_bytes(&mut self, bytes: &[u8]) {
         for byte in bytes {
             self.hash ^= u64::from(*byte);
@@ -24,24 +17,9 @@ impl FnvWriter {
     }
 }
 
-impl std::io::Write for FnvWriter {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.write_bytes(buf);
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
 fn hash_json(value: &Value) -> String {
-    let mut writer = FnvWriter::new();
-    // Stream JSON bytes into the hasher; same fingerprint as hashing Display output
-    if serde_json::to_writer(&mut writer, value).is_err() {
-        return hash_text(&value.to_string());
-    }
-    writer.finish()
+    serde_json::to_vec(value)
+        .map_or_else(|_| hash_text(&value.to_string()), |bytes| hash_bytes(&bytes))
 }
 
 fn hash_text(text: &str) -> String {
@@ -49,11 +27,15 @@ fn hash_text(text: &str) -> String {
 }
 
 fn hash_text_parts(parts: &[&str]) -> String {
-    let mut writer = FnvWriter::new();
+    let mut hasher = Sha256::new();
     for part in parts {
-        writer.write_bytes(part.as_bytes());
+        hasher.update(part.as_bytes());
     }
-    writer.finish()
+    format!("{:x}", hasher.finalize())
+}
+
+fn hash_bytes(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
 }
 
 fn hash_bytes_parts_u64(parts: &[&[u8]]) -> u64 {
@@ -143,13 +125,14 @@ mod output_tests {
             input: json!({"value": "test"}),
             input_content_hash: "content".to_owned(),
             artifact_path: "/tmp/model.gguf".to_owned(),
-            artifact_hash: Some("artifact".to_owned()),
+            artifact_hash: "artifact".to_owned(),
+            artifact_identity: json!({"sha256": "artifact", "bytes": 1}),
             model_name: "test_model".to_owned(),
             runtime_options: json!({"reasoning": "off"}),
             input_shaping: json!({"include": ["value"]}),
             decision_contract: json!({"answer_field": "decision"}),
             max_attempt_ms: 30_000,
-            claim_attempt: 1,
+            claim_token: "test-claim-token".to_owned(),
         }
     }
 
@@ -183,7 +166,7 @@ mod output_tests {
         changed.artifact_path = "/tmp/other.gguf".to_owned();
         assert!(cache.get(&changed).is_none());
         changed = contract_test_job();
-        changed.artifact_hash = Some("other_artifact".to_owned());
+        changed.artifact_hash = "other_artifact".to_owned();
         assert!(cache.get(&changed).is_none());
     }
 
@@ -335,4 +318,3 @@ mod output_tests {
         assert_eq!(counter_delta(25, 10), 0);
     }
 }
-

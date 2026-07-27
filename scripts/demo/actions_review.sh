@@ -38,7 +38,7 @@ SELECT otlet.create_watch(
 );
 
 WITH inserted AS (
-  INSERT INTO otlet.jobs (task_name, subject_id, input, status, attempts, started_at, leased_until)
+  INSERT INTO otlet.jobs (task_name, subject_id, input, status, attempts, started_at, leased_until, claim_token)
   SELECT
     :'watch_name' || '_task',
     src.id,
@@ -55,19 +55,21 @@ WITH inserted AS (
     'running',
     1,
     now(),
-    now() + interval '5 minutes'
+    now() + interval '5 minutes',
+    gen_random_uuid()::text
   FROM public.otlet_demo_action_allowlist src
-  RETURNING id
+  RETURNING id, claim_token
 )
 SELECT otlet.complete_job(
   job_id => id,
   output => '{"decision":"flag","confidence":"high","reason":"allowlist smoke"}'::jsonb,
   raw_output => '{"output":{"decision":"flag","confidence":"high","reason":"allowlist smoke"},"actions":[{"type":"note","body":{"subject_id":"allow-1","text":"not allowed"}}]}',
   actions => '[{"type":"note","body":{"subject_id":"allow-1","text":"not allowed"}}]'::jsonb,
-  raw_output_hash => md5('{"output":{"decision":"flag","confidence":"high","reason":"allowlist smoke"},"actions":[{"type":"note","body":{"subject_id":"allow-1","text":"not allowed"}}]}'),
+  raw_output_hash => otlet.portable_text_hash('{"output":{"decision":"flag","confidence":"high","reason":"allowlist smoke"},"actions":[{"type":"note","body":{"subject_id":"allow-1","text":"not allowed"}}]}'),
   started_at => now(),
   trace_summary => '{"schema_validation_status":"passed"}'::jsonb,
-  model_name => :'model_name'
+  model_name => :'model_name',
+  expected_claim_token => claim_token
 )
 FROM inserted;
 SQL
@@ -75,7 +77,7 @@ action_allowlist_contract="$(psql_exec -qAt -v task_name="$action_allowlist_task
 SELECT count(*) FILTER (
          WHERE action_type = 'note'
            AND status = 'rejected'
-           AND error = 'action type note is not allowed by watch'
+           AND error = 'action type note is not allowed by workflow'
        )::text || '|' ||
        count(*) FILTER (WHERE action_type = 'note' AND output_id IS NOT NULL AND receipt_id IS NOT NULL)::text || '|' ||
        (

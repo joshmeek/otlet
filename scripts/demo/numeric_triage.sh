@@ -130,6 +130,8 @@ DECLARE
   model_name_value text;
   positive_job_id bigint;
   alias_job_id bigint;
+  positive_claim_token text;
+  alias_claim_token text;
   positive_action_id bigint;
   alias_action_id bigint;
 BEGIN
@@ -149,10 +151,12 @@ BEGIN
     'Return JSON only.',
     '{"type":"object","required":["match","confidence"],"additionalProperties":false,"properties":{"match":{"enum":["same_entity","different_entity"]},"confidence":{"enum":["high"]}}}'::jsonb,
     model_name_value,
-    '{"max_tokens":32,"reasoning":"off","inference_cache":false}'::jsonb
+    '{"max_tokens":32,"reasoning":"off","inference_cache":false}'::jsonb,
+    '{"source_fields":["action_ids"]}'::jsonb,
+    '{"action_types":["merge_candidate"]}'::jsonb
   );
 
-  INSERT INTO otlet.jobs (task_name, subject_id, input, status, attempts, started_at, leased_until)
+  INSERT INTO otlet.jobs (task_name, subject_id, input, status, attempts, started_at, leased_until, claim_token)
   VALUES (
     task_name_value,
     'no-abstain-positive',
@@ -160,9 +164,10 @@ BEGIN
     'running',
     1,
     now(),
-    now() + interval '5 minutes'
+    now() + interval '5 minutes',
+    gen_random_uuid()::text
   )
-  RETURNING id INTO positive_job_id;
+  RETURNING id, claim_token INTO positive_job_id, positive_claim_token;
 
   PERFORM otlet.complete_job(
     positive_job_id,
@@ -172,13 +177,14 @@ BEGIN
     NULL,
     NULL,
     NULL,
-    md5('{"output":{"match":"same_entity","confidence":"high"},"actions":[{"type":"merge_candidate","body":{"left_id":"noab-left","right_id":"noab-right","confidence":"high","reason":"same"}}]}'),
+    otlet.portable_text_hash('{"output":{"match":"same_entity","confidence":"high"},"actions":[{"type":"merge_candidate","body":{"left_id":"noab-left","right_id":"noab-right","confidence":"high","reason":"same"}}]}'),
     now(),
     '{"schema_validation_status":"passed"}'::jsonb,
-    model_name_value
+    model_name_value,
+    expected_claim_token => positive_claim_token
   );
 
-  INSERT INTO otlet.jobs (task_name, subject_id, input, status, attempts, started_at, leased_until)
+  INSERT INTO otlet.jobs (task_name, subject_id, input, status, attempts, started_at, leased_until, claim_token)
   VALUES (
     task_name_value,
     'alias-match',
@@ -186,9 +192,10 @@ BEGIN
     'running',
     1,
     now(),
-    now() + interval '5 minutes'
+    now() + interval '5 minutes',
+    gen_random_uuid()::text
   )
-  RETURNING id INTO alias_job_id;
+  RETURNING id, claim_token INTO alias_job_id, alias_claim_token;
 
   PERFORM otlet.complete_job(
     alias_job_id,
@@ -198,10 +205,11 @@ BEGIN
     NULL,
     NULL,
     NULL,
-    md5('{"output":{"match":"same_entity","confidence":"high"},"actions":[{"type":"merge_candidate","body":{"left_id":"alias-left","right_id":"alias-right","confidence":"high","reason":"same"}}]}'),
+    otlet.portable_text_hash('{"output":{"match":"same_entity","confidence":"high"},"actions":[{"type":"merge_candidate","body":{"left_id":"alias-left","right_id":"alias-right","confidence":"high","reason":"same"}}]}'),
     now(),
     '{"schema_validation_status":"passed"}'::jsonb,
-    model_name_value
+    model_name_value,
+    expected_claim_token => alias_claim_token
   );
 
   SELECT a.id INTO positive_action_id
@@ -324,4 +332,3 @@ require_contains "$row_fresh_customscan_plan" "Actual Fresh Subjects: 1" "Expect
 require_contains "$row_fresh_customscan_plan" "Actual Stale Subjects: 0" "Expected fresh CustomScan stale count"
 require_contains "$row_fresh_customscan_plan" "Infer Now Batches: 0" "Expected fresh CustomScan zero infer-now"
 require_contains "$row_fresh_customscan_plan" "Infer Now Receipts: 0" "Expected fresh CustomScan zero infer-now receipts"
-

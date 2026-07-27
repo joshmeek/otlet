@@ -24,7 +24,12 @@ unsafe extern "C-unwind" fn otlet_set_rel_pathlist(
         else {
             return;
         };
-        if relation_has_rowmark(root, rti) {
+        if relation_has_rowmark(root, rti)
+            || !(*root).parent_root.is_null()
+            || (*root).hasLateralRTEs
+            || rel_has_parameterized_restrictinfo(rel)
+            || rel_has_lateral_ref(rel)
+        {
             return;
         }
         let (target_has_subject, target_has_rel_var) =
@@ -35,9 +40,7 @@ unsafe extern "C-unwind" fn otlet_set_rel_pathlist(
             || predicate.infer_ms > 0;
         if !target_has_subject
             && (predicate.index_kind == SemanticIndexKind::Join
-                || (!executor_owned_policy
-                    && !target_has_rel_var
-                    && !rel_has_lateral_ref(rel)))
+                || (!executor_owned_policy && !target_has_rel_var))
         {
             return;
         }

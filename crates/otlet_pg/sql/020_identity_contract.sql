@@ -228,7 +228,8 @@ VALUES (
     'answer_field', 'match',
     'abstain_values', jsonb_build_array('unclear'),
     'confidence_field', 'confidence',
-    'accepted_confidence', jsonb_build_array('high')
+    'accepted_confidence', jsonb_build_array('high'),
+    'action_types', jsonb_build_array('merge_candidate', 'new_entity', 'review_flag')
   )
 ),
 (
@@ -239,7 +240,7 @@ VALUES (
     'answer_field', 'decision',
     'abstain_values', jsonb_build_array('unclear'),
     'confidence_field', 'confidence',
-    'accepted_confidence', jsonb_build_array('high', 'medium')
+    'accepted_confidence', jsonb_build_array('high', 'medium'),
+    'action_types', jsonb_build_array('review_flag')
   )
 );
-

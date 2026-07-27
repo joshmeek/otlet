@@ -66,11 +66,19 @@ fn submit_infer_now_with_inline_task(
     runtime_options: &Value,
     input: &Value,
 ) -> Result<Option<SubmittedInferNow>, String> {
+    let mut source_fields = input
+        .as_object()
+        .ok_or_else(|| "infer-now input must be a JSON object".to_owned())?
+        .keys()
+        .cloned()
+        .collect::<Vec<_>>();
+    source_fields.sort();
     let inline_task_text = serde_json::to_string(&json!({
         "model_name": model_name,
         "instruction": instruction,
         "output_schema": output_schema,
-        "runtime_options": runtime_options
+        "runtime_options": runtime_options,
+        "input_shaping": {"source_fields": source_fields}
     }))
     .map_err(|err| err.to_string())?;
     let input_text = serde_json::to_string(input).map_err(|err| err.to_string())?;
@@ -227,7 +235,7 @@ fn wait_for_request(request_id: u64, timeout_ms: u32) -> Result<Option<Completed
                 }
             }
             if cancel_job_id > 0
-                && let Err(err) = cancel_job(cancel_job_id)
+                && let Err(err) = request_job_cancellation(cancel_job_id)
             {
                 pgrx::warning!("otlet infer-now timeout cancel failed: {err}");
                 force_cancel_requested(cancel_job_id, TIMEOUT_CANCEL_REASON);
@@ -250,12 +258,12 @@ fn wait_for_request(request_id: u64, timeout_ms: u32) -> Result<Option<Completed
     }
 }
 
-fn cancel_job(job_id: i64) -> Result<(), String> {
+fn request_job_cancellation(job_id: i64) -> Result<(), String> {
     pgrx::Spi::connect_mut(|client| {
         let args = [job_id.into(), TIMEOUT_CANCEL_REASON.into()];
         let table = client
             .select(
-                "SELECT id FROM otlet.cancel_job($1, $2) LIMIT 1",
+                "SELECT id FROM otlet.request_job_cancellation($1, $2) LIMIT 1",
                 Some(1),
                 &args,
             )
@@ -266,15 +274,17 @@ fn cancel_job(job_id: i64) -> Result<(), String> {
             .map_err(|err| err.to_string())?
             .is_some();
         if !canceled {
-            return Err(format!("cancel_job affected no rows for job_id={job_id}"));
+            return Err(format!(
+                "request_job_cancellation affected no rows for job_id={job_id}"
+            ));
         }
         Ok(())
     })
 }
 
 fn force_cancel_requested(job_id: i64, reason: &str) {
-    // Error-path only: when cancel_job SPI fails on infer-now timeout, still
-    // mark cancel_requested so linked_cancel_requested can stop decode.
+    // Emergency fallback marks the cancellation when the requester call fails
+    // The linked worker observes cancel_requested and stops decoding
     let recovery: pgrx::spi::Result<()> = pgrx::Spi::connect_mut(|client| {
         let args = [job_id.into(), reason.into()];
         client.update(
