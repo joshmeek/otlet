@@ -20,7 +20,7 @@ WHERE task_name = 'entity_resolution_demo'
 ORDER BY subject_id, attempt_index;
 ```
 
-Representative output from the demo run:
+Representative output:
 
 ```text
       subject_id       | attempt_index | selection_role | selection_status |    model_name    |      match       | confidence
@@ -36,7 +36,7 @@ Representative output from the demo run:
 (8 rows)
 ```
 
-The stricter output/action envelope leaves every cheap attempt untrusted in this captured demo. A cheap attempt can finish as `rejected` when its structured output fails the decision contract or `failed` when its output is malformed. Both states remain visible as receipts and escalate to `qwen35_4b`. In this run all four were `rejected`, and Otlet materialized the accepted strong-model output for each job
+The stricter output/action envelope leaves every cheap attempt untrusted in this example. A cheap attempt can finish as `rejected` when its structured output fails the decision contract or `failed` when its output is malformed. Both states remain visible as receipts and escalate to `qwen35_4b`. All four representative cheap attempts were `rejected`, and Otlet materialized the accepted strong-model output for each job
 
 ## Step 2 - Read The Receipt
 
@@ -173,7 +173,7 @@ LIMIT 1;
 
 The inference-output cache stores schema-valid raw model output before Otlet applies selection trust. Accepted abstentions and rejected-but-valid attempts may reuse cached bytes; invalid JSON/schema failures stay out of the cache. The receipt still records accepted/rejected/failed status, and the cache key basis is content hash + contract hash + runtime output-contract hash + model fingerprint
 
-The process-local cache holds at most 512 entries or 8 MiB. Otlet does not persist it. The fresh demo and a stable restart probe showed no eviction pressure or repeated restart misses. Persisting exact raw envelopes would cross the default hash-only stored-evidence boundary, while parsed trusted output survives through outputs and semantic materializations
+The process-local cache holds at most 512 entries or 8 MiB. Otlet does not persist it. The demo and a stable restart probe showed no eviction pressure or repeated restart misses. Persisting exact raw envelopes would cross the default hash-only stored-evidence boundary, while parsed trusted output survives through outputs and semantic materializations
 
 ```sql
 SELECT task_name,

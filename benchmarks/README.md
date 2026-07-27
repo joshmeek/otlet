@@ -19,7 +19,7 @@ Set `OTLET_PROBE_DOWNLOAD=1` when you want the probe to fetch a missing GGUF. Do
 
 ## Current Model Decision
 
-The raw `/no_think` prompt and Q4_K_M artifact remain the defaults. A fresh three-sample control after one warmup passed `5/5` correctness and schema cases with median `27.74` mean tok/s, `27.28` steady tok/s, `3158 ms` p95 generation, `1012 ms` p95 TTFT, and `997 ms` p95 prompt decode
+The raw `/no_think` prompt and Q4_K_M artifact remain the defaults. A three-sample control after one warmup passed `5/5` correctness and schema cases with median `27.74` mean tok/s, `27.28` steady tok/s, `3158 ms` p95 generation, `1012 ms` p95 TTFT, and `997 ms` p95 prompt decode
 
 Disposable binaries built from the same commit tested the current prompt, the same prompt without `/no_think`, and the GGUF's embedded one-user chat template. The embedded template renders the same byte boundary as the smallest explicit Qwen ChatML wrapper, so those two labels shared one runtime probe
 
@@ -158,7 +158,7 @@ One-client `SELECT 1` load during the alternating probe completed `1,072,092` tr
 
 ### Persisted inference cache
 
-Otlet keeps the process-local inference-output cache. The fresh demo produced 13 cache-enabled attempts, one hit, 12 misses, a three-entry and 880-byte high-water mark, and zero evictions. A later research sequence reached 13 entries and 2,941 bytes without eviction. The 512-entry cap would use about 116 KiB at that observed average, far below the 8 MiB byte cap
+Otlet keeps the process-local inference-output cache. The demo produced 13 cache-enabled attempts, one hit, 12 misses, a three-entry and 880-byte high-water mark, and zero evictions. A research sequence reached 13 entries and 2,941 bytes without eviction. The 512-entry cap would use about 116 KiB at that observed average, far below the 8 MiB byte cap
 
 One stable qwen35 row measured a `9.452s` enabled miss, a `0.503s` exact hit, a `3.189s` cache-disabled warm run, and a `15.310s` miss after restart. These four runs produced the same schema-valid raw-output and runtime-contract hashes. A second cold miss under one-client `SELECT 1` load completed while 444,899 database transactions ran with zero failures at `47us` p50 and `100us` p95
 
@@ -166,7 +166,7 @@ No installed workload records eviction followed by a repeated-identity miss, and
 
 ### Cache-hit completion path
 
-The earlier `0.503s` exact-hit result included a 500 ms shell polling interval. Runtime-stage timing on commit `f57dea7d` found no corresponding completion cost. Ten direct qwen35 exact hits measured `3ms` requester p50 and `10.05ms` p95. Ten supported queued `run_task` hits measured `11.5ms` end-to-end p50 and `25.7ms` p95, including `5ms` median queue wait and `7.5ms` median worker time. Exact hits for row-watch and pair-watch tasks completed in `16ms` and `6ms`, including semantic materialization
+The `0.503s` exact-hit result included a 500 ms shell polling interval. Runtime-stage timing on commit `f57dea7d` found no corresponding completion cost. Ten direct qwen35 exact hits measured `3ms` requester p50 and `10.05ms` p95. Ten supported queued `run_task` hits measured `11.5ms` end-to-end p50 and `25.7ms` p95, including `5ms` median queue wait and `7.5ms` median worker time. Exact hits for row-watch and pair-watch tasks completed in `16ms` and `6ms`, including semantic materialization
 
 A real worker restart cleared the cache. The next identical request missed in `13.857s`, including `6.311s` model load, `262ms` context creation, `5.679s` prompt decode, and `1.474s` generation; the following exact hit took `8ms`. Disabling the cache kept the generation path and reported `disabled` instead of a hit
 
@@ -246,11 +246,11 @@ Use the smallest ring that covers the changed contract:
 | Prompt, template, quantization, model, decoding, schema acceptance, output selection, or published scores | Comparable quick probe followed by the full suite | Yes |
 | Final integrated runtime state | Complete validation ring | Yes |
 
-A full qwen35 run executes 447 sequential model jobs: 112 direct pair jobs, 110 general reliability jobs, 112 semantic-join jobs, and 113 row-watch jobs. The July 13, 2026 `b1783967979` run took 48 minutes 20 seconds at `0.1542 jobs/s`. Its 340 scored cases reached `0.9882` schema validity, `0.9664` trusted quality, `1.0000` entity accuracy, zero false merges, zero stale leaks, and zero worker crashes. It did not pass the production gate: extraction scored `0.7667`, the hallucinated trusted-action rate was `0.3324`, and the run had one repeat. Join replay covers watch-owned worker and materialization behavior; row watch uses a distinct prompt and schema
+A full qwen35 run executes 447 sequential model jobs: 112 direct pair jobs, 110 general reliability jobs, 112 semantic-join jobs, and 113 row-watch jobs. Run `b1783967979` took 48 minutes 20 seconds at `0.1542 jobs/s`. Its 340 scored cases reached `0.9882` schema validity, `0.9664` trusted quality, `1.0000` entity accuracy, zero false merges, zero stale leaks, and zero worker crashes. It did not pass the production gate: extraction scored `0.7667`, the hallucinated trusted-action rate was `0.3324`, and the run had one repeat. Join replay covers watch-owned worker and materialization behavior; row watch uses a distinct prompt and schema
 
 Limit routine model search to 4B active parameters and about 4 GB of local artifact size. Qwen3.5 4B stays the stable default until a smaller model passes the fast probe and the full benchmark. MiniStral, Gemma, GLM Edge, Phi mini, and SmolLM stay in comparison lanes
 
-Recent quick-probe findings:
+Quick-probe findings:
 
 | model | viable | mean tok/s | result |
 | --- | --- | ---: | --- |
@@ -276,7 +276,7 @@ Thread sweep on the current Docker CPU showed the best stable qwen35 setting at 
 | `qwen3_1_7b` | `6` | no | `71.91` |
 | `qwen3_1_7b` | `12` | no | `10.63` |
 
-Recent CPU tuning sweep on `qwen35_4b` kept the old default at `41.89 tok/s` as the before sample. The control build stayed neutral at `41.44 tok/s`; each tested default change failed correctness or lost throughput:
+The CPU tuning sweep on `qwen35_4b` kept the old default at `41.89 tok/s` as the before sample. The control build stayed neutral at `41.44 tok/s`; each tested default change failed correctness or lost throughput:
 
 | control | tested setting | viable | mean tok/s | result |
 | --- | --- | --- | ---: | --- |

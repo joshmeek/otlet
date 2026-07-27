@@ -47,7 +47,7 @@ Representative output:
 ```text
  otlet_base_tables
 -------------------
-                20
+                26
 (1 row)
 ```
 
@@ -55,75 +55,38 @@ Group the base tables by role:
 
 - `models` and `runtime_slots` describe the local resident model runtime
 - `tasks`, `model_selection_policies`, and `jobs` describe durable work and cheap-first escalation policy
-- `outputs`, `action_type_schemas`, `actions`, `records`, `inference_receipts`, and `worker_events` store results and execution evidence
+- `outputs`, `actions`, `records`, `inference_receipts`, `eval_labels`, `review_events`, and `worker_events` store results and execution evidence
+- `action_type_schemas`, `action_targets`, `action_workflow_policies`, and `action_execution_receipts` constrain application writes
 - `production_policy` defines queue admission, leases, invalid output handling, stale-result behavior, and cleanup windows
 - `watches`, `semantic_indexes`, and `semantic_materializations` make row-derived model state queryable
 - `watches` and `semantic_join_indexes` store pairwise candidate definitions
+- `portable_workers`, `portable_claims`, `portable_protocol_versions`, and `portable_receipt_links` fence external workers
 
 Use `otlet.runs` for application reads. Use trace and status views for debugging, proof, and learning
 
-## Step 3 - Materialize Records Into Semantic State
+## Step 3 - Create The Row Source
 
-Otlet stores actions and records first, then exposes records to queries through semantic materializations
-
-This sequence materializes an entity-pair record, watches source changes, and marks the record stale through an update trigger:
+Create three ordinary source rows for the watch:
 
 ```sql
-SELECT record_type, subject_id, body, stale, source_table
-FROM otlet.semantic_materializations
-WHERE record_type = 'entity_hypothesis'
-ORDER BY id;
+SELECT otlet.drop_watch('demo_semantic_vendor_idx');
+DROP TABLE IF EXISTS public.otlet_demo_semantic_vendor;
 
-SELECT otlet.materialize_semantic_index('demo_semantic_vendor_idx') AS refreshed_materializations;
+CREATE TABLE public.otlet_demo_semantic_vendor (
+  id bigint PRIMARY KEY,
+  name text NOT NULL,
+  email text NOT NULL,
+  updated_at timestamptz NOT NULL DEFAULT clock_timestamp()
+);
 
-SELECT otlet.watch_semantic_stale('public.otlet_entity_vendor'::regclass, 'id') AS stale_trigger_name;
-
-UPDATE public.otlet_entity_vendor
-SET city = 'Austin Learning'
-WHERE id = 1;
-
-SELECT count(*) AS stale_materializations
-FROM otlet.semantic_materializations
-WHERE record_type = 'entity_hypothesis'
-  AND stale;
+INSERT INTO public.otlet_demo_semantic_vendor (id, name, email)
+VALUES
+  (1, 'Northstar Logistics', 'ops@northstar.example'),
+  (2, 'N-Star Freight', 'ap@nstar.example'),
+  (3, 'Clearwater Medical', 'orders@clearwater.example');
 ```
 
-Representative output:
-
-```text
-    record_type    | subject_id |                                          body                                           | stale |        source_table
--------------------+------------+-----------------------------------------------------------------------------------------+-------+----------------------------
- entity_hypothesis | 1:2        | {"match": "yes", "reason": "same normalized name, phone, and city", "confidence": 0.95} | t     | public.otlet_entity_vendor
-(1 row)
-
- refreshed_materializations
-----------------------------
-                          1
-(1 row)
-
-      stale_trigger_name
-------------------------------
- otlet_stale_f2ddcf358c8f1d1f
-(1 row)
-
-UPDATE 1
-
- stale_materializations
-------------------------
-                      1
-(1 row)
-```
-
-The trigger marks the previous derived fact stale and leaves model reruns to refresh policy. A source delete records `source_delete` in `otlet.semantic_dependency_audit`
-
-Plain `mark_stale` row watches treat INSERT as missing semantic state rather than stale semantic state. Exact planning shows the new row as unresolved until refresh or infer-now:
-
-```sql
-SELECT missing_subjects, queue_subjects, count_basis
-FROM otlet.semantic_index_plan('demo_semantic_vendor_idx', true);
-```
-
-Use `{"on_change":"mark_stale_and_enqueue"}` when inserts need immediate enqueue
+The source table remains application-owned. The watch stores model-derived state and marks it stale when these rows change
 
 ## Step 4 - Build A Row Watch
 
@@ -135,7 +98,7 @@ The creation shape is:
 SELECT otlet.create_watch(
   'demo_semantic_vendor_idx',
   'row',
-  'Otlet demo row watch. Return exactly this JSON object for every input row: {"output":{"status":"needs_review","needs_review":true,"issues":["demo semantic index"]},"actions":[{"type":"create_record","record_type":"demo_semantic_fact","subject_id":"db-owned","body":{"status":"needs_review","needs_review":true,"semantic":"indexed row"}}]}',
+  'Otlet demo row watch. Return exactly this JSON object for every input row: {"output":{"status":"needs_review","needs_review":true,"issues":["demo semantic index"]},"actions":[]}',
   '{
     "type": "object",
     "required": ["status", "needs_review", "issues"],
@@ -154,10 +117,11 @@ SELECT otlet.create_watch(
   '{"max_tokens":256,"reasoning":"off","inference_cache":true,"generation_trace":true,"generation_trace_max_tokens":12,"generation_trace_top_k":3}'::jsonb,
   '{}'::jsonb,
   '{"on_change":"mark_stale"}'::jsonb,
-  ARRAY['create_record']
+  ARRAY[]::text[]
 );
 
-SELECT otlet.refresh_semantic_index('demo_semantic_vendor_idx') AS queued;
+SELECT 'semantic_index_refresh_queued=' ||
+       otlet.refresh_semantic_index('demo_semantic_vendor_idx')::text;
 
 DO $$
 DECLARE
@@ -171,8 +135,12 @@ BEGIN
       count(*) FILTER (WHERE status = 'complete'),
       count(*) FILTER (WHERE status IN ('failed','canceled'))
     INTO active_jobs, complete_jobs, failed_jobs
-    FROM otlet.jobs
-    WHERE task_name = 'demo_semantic_vendor_idx_task';
+    FROM (
+      SELECT DISTINCT ON (subject_id) subject_id, status
+      FROM otlet.jobs
+      WHERE task_name = 'demo_semantic_vendor_idx_task'
+      ORDER BY subject_id, id DESC
+    ) latest_jobs;
 
     IF failed_jobs > 0 THEN
       RAISE EXCEPTION 'semantic index refresh failed';
@@ -187,15 +155,12 @@ BEGIN
 
   RAISE EXCEPTION 'timed out waiting for semantic index refresh';
 END $$;
-
-SELECT otlet.materialize_semantic_index('demo_semantic_vendor_idx') AS materialized;
 ```
 
-Compact output from the demo run:
+Contract output:
 
 ```text
 semantic_index_refresh_queued=3
-semantic_index_materialized=3
 ```
 
 Once materialized, the index has planner-visible status:
@@ -275,7 +240,7 @@ The SQL plan row and CustomScan EXPLAIN share planner terms
 | Warm-job SQL finish | `inference_receipt_trace_status.finish_sql_ms` | `Infer Now Trace Finish Sql Ms` | Optional; stamped inside `complete_job` / `fail_job` |
 | Warm-job materialize | `inference_receipt_trace_status.materialize_ms` | `Infer Now Trace Materialize Ms` | Optional; stamped inside `materialize_completed_semantic_job` |
 
-Captured row-plan excerpt:
+Row-plan excerpt:
 
 ```text
 selected_path | semantic_lookup
@@ -284,7 +249,7 @@ model_cost_source | task_receipt
 count_basis | exact
 ```
 
-Captured CustomScan EXPLAIN excerpt:
+CustomScan EXPLAIN excerpt:
 
 ```text
 Child Plan Attached: 1
@@ -345,8 +310,7 @@ SELECT 'semantic_stale_status_contract=' ||
        fresh_subjects::text || '|' ||
        stale_subjects::text || '|' ||
        inflight_subjects::text AS semantic_stale_status_contract
-FROM otlet.semantic_index_status
-WHERE name = 'demo_semantic_vendor_idx';
+FROM otlet.semantic_index_plan('demo_semantic_vendor_idx', true);
 
 SELECT count(*) AS fail_closed_rows
 FROM public.otlet_demo_semantic_vendor v
@@ -440,9 +404,9 @@ LIMIT 1;
 Representative output:
 
 ```text
-                    receipt_contract
----------------------------------------------------------
- customscan_infer_now|demo_semantic_vendor_idx|complete|t|t
+                         receipt_contract
+------------------------------------------------------------------
+ customscan_infer_now|demo_semantic_vendor_idx|complete|true|true
 (1 row)
 ```
 

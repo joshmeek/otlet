@@ -4,7 +4,7 @@ This worked example follows the learning structure from [this study](https://www
 
 Follow one Docker-backed Otlet entity-resolution loop: leave vendor rows in Postgres tables, select hard candidate pairs in SQL, enqueue durable model work, let the resident worker try a cheap local model and escalate hard rows to a stronger local model, validate `same_entity` / `different_entity` / `unclear`, record typed actions, and preserve receipts
 
-The output blocks come from a Docker-backed run on July 13, 2026 with `./scripts/otlet-setup.sh` and `./scripts/otlet-demo.sh`. Job IDs, receipt IDs, hashes, timestamps, token counts, timings, and token rates are representative and vary by machine and cache state
+The output blocks are validated with `./scripts/otlet-setup.sh` and `./scripts/otlet-demo.sh`. Job IDs, receipt IDs, hashes, timestamps, token counts, timings, and token rates are representative and vary by machine and cache state
 
 This walkthrough runs as the extension owner because it registers models and tasks, reads raw attempt state, and administers watches. Production auditors use the redacted `otlet.audit_*` views. Reviewers receive `otlet.grant_operator_access(...)` before calling approval, correction, dry-run, or apply functions. See [production-contract.md](production-contract.md) for the exact grants
 
@@ -72,7 +72,7 @@ JOIN public.otlet_demo_vendor_pair_input v ON v.subject_id = p.pair_id
 ORDER BY p.pair_id;
 ```
 
-Observed output:
+Representative output:
 
 ```text
 +------------------------+-------------------------------+------------------------------------+--------------------------------------------+
@@ -103,7 +103,7 @@ FROM otlet.runs
 WHERE task_name = 'entity_resolution_demo';
 ```
 
-Observed contract output:
+Contract output:
 
 ```text
 entity_resolution_contract=4|same_entity|different_entity|4|4
@@ -130,7 +130,7 @@ WHERE task_name = 'entity_resolution_demo'
 ORDER BY subject_id;
 ```
 
-Observed output:
+Representative output:
 
 ```text
 +------------------------+------------------+------------+-------------------------------------------------------------+
@@ -156,7 +156,7 @@ WHERE task_name = 'entity_resolution_demo'
 ORDER BY subject_id, attempt_index;
 ```
 
-Observed output:
+Representative output:
 
 ```text
 +------------------------+---------------+----------------+------------------+------------+------------------+------------+

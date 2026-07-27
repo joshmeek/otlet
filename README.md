@@ -23,7 +23,7 @@ FROM otlet.ask(
 );
 ```
 
-One run returned:
+Representative output:
 
 ```text
                                                                  output
@@ -119,7 +119,7 @@ Run the complete checked version, including the source rows and full instruction
 ./scripts/otlet-demo.sh
 ```
 
-One run produced these accepted outputs and typed actions. The query clips reasons to 48 characters:
+Representative accepted outputs and typed actions. The query clips reasons to 48 characters:
 
 ```sql
 SELECT r.subject_id, r.output->>'match' AS match,
@@ -132,12 +132,12 @@ ORDER BY r.subject_id;
 ```
 
 ```text
-       subject_id       |      match       |                      reason                      |   action_type
-------------------------+------------------+--------------------------------------------------+-----------------
- vendor-1001:vendor-313 | different_entity | Conflicting stable identifiers found.            | new_entity
- vendor-1001:vendor-314 | different_entity | Conflicting stable identifiers: different countr | new_entity
- vendor-1001:vendor-42  | same_entity      | Same remittance account and tax ID match         | merge_candidate
- vendor-1001:vendor-77  | different_entity | Different industry and city; no shared identifie | new_entity
+       subject_id       |      match       |                  reason                  |   action_type
+------------------------+------------------+------------------------------------------+-----------------
+ vendor-1001:vendor-313 | different_entity | Conflicting stable identifiers found.    | new_entity
+ vendor-1001:vendor-314 | different_entity | 4 conflicting stable identifiers found   | new_entity
+ vendor-1001:vendor-42  | same_entity      | Same remittance account and tax ID match | merge_candidate
+ vendor-1001:vendor-77  | different_entity | Conflicting stable identifiers found.    | new_entity
 (4 rows)
 ```
 
@@ -156,8 +156,8 @@ ORDER BY attempt_index;
 ```text
  selection_role | selection_status | model_name | schema_validation_status | prompt_tokens | generated_tokens | fingerprinted
 ----------------+------------------+------------+--------------------------+---------------+------------------+---------------
- cheap          | rejected         | qwen3_1_7b | passed                   |           845 |               26 | t
- strong         | accepted         | qwen35_4b  | passed                   |           863 |              126 | t
+ cheap          | rejected         | qwen3_1_7b | passed                   |           720 |               27 | t
+ strong         | accepted         | qwen35_4b  | passed                   |           738 |              126 | t
 (2 rows)
 ```
 

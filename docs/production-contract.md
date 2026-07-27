@@ -43,7 +43,7 @@ WHERE model_name = 'qwen3_1_7b'
 LIMIT 1;
 ```
 
-Representative output from the demo run:
+Representative output:
 
 ```text
 runtime_status_contract=ready|ready|37.78|true|true|true|none|linux_proc_self_and_optional_cgroup_v2_memory_pressure_v1
@@ -147,7 +147,7 @@ Representative targeted smoke output:
 ffi_sweep_safety_contract=1|failed|job lease expired after max attempts|failed|failed|job_lease_expired_after_max_attempts
 ```
 
-Representative output from the demo contract:
+Contract output:
 
 ```text
 production_policy_contract=default|refresh_then_fail_closed|3|300000|8|redacted
@@ -255,7 +255,7 @@ FROM otlet.production_status;
 Representative demo output:
 
 ```text
-performance_ratio_contract=40|50|1.250|16548|413.700
+performance_ratio_contract=40|49|1.225|16548|413.700
 ```
 
 ### Step 3c - Materialization Failure Visibility

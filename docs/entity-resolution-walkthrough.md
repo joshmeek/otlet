@@ -24,6 +24,8 @@ The setup and inspection sections run as the extension owner. A delegated review
 
 Receipts keep prompt and raw-output hashes under the default storage policy. Accepted output and rejected structured candidates remain available without persisting the assembled prompt or raw model text
 
+The output blocks are representative. IDs, hashes, timestamps, token counts, timings, and model wording can vary between runs
+
 ## Step 1 - Register The Models
 
 ```sql
@@ -410,9 +412,9 @@ Representative output:
 |       subject_id       |      match       | confidence |                                              reason                                               |
 +------------------------+------------------+------------+---------------------------------------------------------------------------------------------------+
 | vendor-1001:vendor-313 | different_entity | high       | Conflicting stable identifiers found.                                                             |
-| vendor-1001:vendor-314 | different_entity | high       | Conflicting stable identifiers: different country, tax ID, bank account, and no acquisition note. |
+| vendor-1001:vendor-314 | different_entity | high       | 4 conflicting stable identifiers found                                                            |
 | vendor-1001:vendor-42  | same_entity      | high       | Same remittance account and tax ID match                                                          |
-| vendor-1001:vendor-77  | different_entity | high       | Different industry and city; no shared identifiers.                                               |
+| vendor-1001:vendor-77  | different_entity | high       | Conflicting stable identifiers found.                                                             |
 +------------------------+------------------+------------+---------------------------------------------------------------------------------------------------+
 (4 rows)
 ```
