@@ -21,6 +21,20 @@ No feature track is active. New work needs a measured trigger, SQL-visible state
 | PostgreSQL core changes | A required planner or executor contract has no extension hook |
 | Remote providers, plugins, or built-in delivery | A shipped workload cannot use local inference and application-owned delivery |
 | Evaluation gates, watch history, retention workflows, or signed bundles | A shipped deployment cannot keep those controls in CI, Git, or infrastructure policy |
+| Portable worker platform parity | A managed-PostgreSQL deployment needs more than queued task execution |
+
+## Portable worker
+
+The SQL-only install supports queued tasks through `otlet.run_task(...)` and `otlet.run_task_subject(...)`, fenced polling claims, local GGUF inference, trusted completion, receipts, actions, and worker lifecycle control
+
+| Surface | Portable status |
+| --- | --- |
+| `otlet.ask(...)` | The portable path cannot run it because an external worker cannot see a job created inside the caller's open transaction. Add an asynchronous enqueue API with status and result reads |
+| Watches and semantic reads | The installer omits these surfaces. Add the SQL-only watch lifecycle, change enqueue, completion materialization, reads, and status |
+| Model selection | The current worker supports one registered model per process. It does not run cheap-to-strong escalation or multi-model routing |
+| Planner integration | The native extension owns CustomScan, infer-now, shared memory, and resident-worker status. Keep them outside portable parity |
+
+Require isolated portable smoke proof against a SQL-only database before moving a surface out of this section
 
 ## Non-negotiables
 
