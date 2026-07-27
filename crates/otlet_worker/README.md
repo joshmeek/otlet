@@ -1,6 +1,6 @@
 # Portable Worker
 
-> Portable support is incomplete. The current worker supports queued tasks, fenced completion, receipts, actions, and lifecycle control. The portable path does not support synchronous `otlet.ask(...)`, watches and semantic materialization or reads, model-selection escalation, or native CustomScan and infer-now. See the [roadmap](../../docs/roadmap.md#portable-worker)
+> Portable support is incomplete. The current worker supports queued tasks, fenced completion, receipts, actions, and lifecycle control. The portable path does not support synchronous `otlet.ask(...)`, watches and semantic materialization or reads, model-selection escalation, or native CustomScan and infer-now. See the [roadmap](../../docs/roadmap.md)
 
 Use this path when PostgreSQL allows ordinary SQL but cannot load the native Otlet extension worker. The reference worker connects through `psql`, claims one model's bounded snapshots, runs one local GGUF with llama.cpp, and submits results through the fenced portable RPCs
 

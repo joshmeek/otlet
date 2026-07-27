@@ -1,45 +1,17 @@
 # Otlet roadmap
 
-No feature track is active. New work needs a measured trigger, SQL-visible state, a closed failure mode, and executable proof
-
-## Limits
-
-- Docker validation targets PostgreSQL 18 on Linux
-- native execution requires a host that can load the extension and resident background worker
-- the reference portable deployment uses one supervised worker, one database, and one local GGUF model
-- lifecycle tests cover database restart and recovery, not multi-node failover
-- CPU execution is the supported runtime; no GPU scheduling or CPU fallback matrix ships in core
-- backup, snapshot, replica, restore, and point-in-time-recovery deletion remain deployment responsibilities
-- performance smoke does not replace hardware-specific measurement
-
-## Deferred
-
-| Track | Reopen when |
+| Feature | Explanation |
 | --- | --- |
-| Accelerators and alternate CPU paths | A supported deployment needs them and can preserve current runtime contracts |
-| Batching, multi-model residency, speculative decoding, or persisted cache | Measurements justify their memory and complexity cost |
-| PostgreSQL core changes | A required planner or executor contract has no extension hook |
-| Remote providers, plugins, or built-in delivery | A shipped workload cannot use local inference and application-owned delivery |
-| Evaluation gates, watch history, retention workflows, or signed bundles | A shipped deployment cannot keep those controls in CI, Git, or infrastructure policy |
-| Portable worker platform parity | A managed-PostgreSQL deployment needs more than queued task execution |
-
-## Portable worker
-
-The SQL-only install supports queued tasks through `otlet.run_task(...)` and `otlet.run_task_subject(...)`, fenced polling claims, local GGUF inference, trusted completion, receipts, actions, and worker lifecycle control
-
-| Surface | Portable status |
-| --- | --- |
-| `otlet.ask(...)` | The portable path cannot run it because an external worker cannot see a job created inside the caller's open transaction. Add an asynchronous enqueue API with status and result reads |
-| Watches and semantic reads | The installer omits these surfaces. Add the SQL-only watch lifecycle, change enqueue, completion materialization, reads, and status |
-| Model selection | The current worker supports one registered model per process. It does not run cheap-to-strong escalation or multi-model routing |
-| Planner integration | The native extension owns CustomScan, infer-now, shared memory, and resident-worker status. Keep them outside portable parity |
-
-Require isolated portable smoke proof against a SQL-only database before moving a surface out of this section
-
-## Non-negotiables
-
-- source rows stay in user tables and derived state stays under `otlet`
-- PostgreSQL validates trusted output, action contracts, portable results, and claim fencing
-- mutation requires workflow authority, fresh source state, dry-run evidence, approval, replay checks, and execution receipts
-- normal application queries remain independent of a live worker
-- no second database or required remote model API enters the core path
+| Asynchronous portable inference | Give SQL callers an enqueue API that returns a job ID, plus status and result reads. This replaces synchronous `otlet.ask(...)` where an external worker cannot see uncommitted work |
+| Portable watches and semantic reads | Install row and pair watch lifecycle in SQL-only PostgreSQL, enqueue source changes after commit, materialize portable completions, and expose semantic reads and status |
+| Portable model routing | Route jobs across registered portable workers and support cheap-to-strong escalation without granting worker roles direct table access |
+| Portable conformance | Extend the isolated portable smoke test across inference, watches, materialization, model routing, cancellation, restart, and failure paths |
+| GPU and alternate CPU execution | Run models on GPUs and distinct CPU paths while preserving receipts, quality checks, memory bounds, cancellation, and fallback |
+| Batching and speculative decoding | Improve throughput while keeping worker memory and PostgreSQL responsiveness bounded |
+| Multi-model residency | Keep more than one useful model resident and schedule jobs by model without starving tasks |
+| Persisted inference cache | Reuse inference state across restarts with bounded storage, eviction, and identity checks |
+| PostgreSQL planner and executor integration | Add core PostgreSQL work for capabilities that extension hooks cannot provide |
+| Remote model providers | Support deployments that cannot run the native or portable local runtime while keeping PostgreSQL validation and evidence in the path |
+| Plugins and delivery | Package reusable workflows and shared delivery or reconciliation without replacing SQL and JSON Schema as the core contracts |
+| Evaluation and history | Add evaluation gates, watch history, retention workflows, and signed decision bundles |
+| Multi-node recovery | Add failover and recovery coverage beyond the current single-node restart path |
