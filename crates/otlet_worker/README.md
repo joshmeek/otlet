@@ -16,7 +16,9 @@ Run the installer as the database owner from the repository checkout:
 psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f crates/otlet_worker/sql/install.sql
 ```
 
-The install transaction creates the task, job, receipt, review, action, evaluation, freshness, and portable protocol state with SQL and PL/pgSQL only. The database keeps zero `otlet` extension objects and zero C-language Otlet functions
+The install transaction runs the current SQL contract as migrations `0001` through `0043`. Re-running it skips recorded migrations and preserves existing data. This greenfield path rejects older unversioned `otlet` schemas instead of converting them
+
+The database keeps zero `otlet` extension objects and zero C-language Otlet functions
 
 ## Register The Worker
 
@@ -191,3 +193,11 @@ Run the isolated deployment-preflight proof:
 ```
 
 It starts a TLS-enabled disposable PostgreSQL on an internal-only Docker network, proves a valid configuration leaves a queued job unclaimed, then breaks connectivity, TLS, credentials, grants, protocol, runtime identity, model registration, artifact access, runtime storage, and client availability one dependency at a time
+
+Run the repeat-install proof:
+
+```sh
+./scripts/otlet-portable-upgrade-demo.sh
+```
+
+It installs the full SQL contract twice and checks that the migration ledger, existing data, and invariants stay intact
