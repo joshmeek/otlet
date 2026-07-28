@@ -27,7 +27,7 @@ AS $$
     WHERE j.status IN ('queued', 'running', 'cancel_requested')
       AND (
         claim_jobs.requested_model_name IS NULL
-        OR t.model_name = claim_jobs.requested_model_name
+        OR COALESCE(j.routed_model_name, t.model_name) = claim_jobs.requested_model_name
       )
       AND NOT otlet.source_fields_are_allowed(j.input, t.input_shaping)
     ORDER BY j.created_at, j.id
@@ -47,7 +47,7 @@ AS $$
   ),
   active_model AS (
     SELECT
-      t.model_name,
+      COALESCE(j.routed_model_name, t.model_name) AS model_name,
       -- Occupied only while a live lease holds; NULL / expired leases are reclaimable.
       count(*) FILTER (
         WHERE j.status = 'running'
@@ -60,7 +60,7 @@ AS $$
     FROM otlet.jobs j
     JOIN otlet.tasks t ON t.name = j.task_name
     WHERE j.status IN ('running', 'cancel_requested')
-    GROUP BY t.model_name
+    GROUP BY COALESCE(j.routed_model_name, t.model_name)
   ),
   eligible_tasks AS (
     SELECT
@@ -81,7 +81,7 @@ AS $$
       min(j.id) AS first_job_id
     FROM otlet.jobs j
     JOIN otlet.tasks t ON t.name = j.task_name
-    JOIN otlet.models m ON m.name = t.model_name
+    JOIN otlet.models m ON m.name = COALESCE(j.routed_model_name, t.model_name)
     LEFT JOIN otlet.model_selection_policies selection ON selection.task_name = t.name
     CROSS JOIN policy p
     LEFT JOIN active_model ON active_model.model_name = m.name
@@ -103,7 +103,7 @@ AS $$
       ) < m.max_active_jobs
       AND (
         claim_jobs.requested_model_name IS NULL
-        OR t.model_name = claim_jobs.requested_model_name
+        OR m.name = claim_jobs.requested_model_name
       )
       AND otlet.source_fields_are_allowed(j.input, t.input_shaping)
     GROUP BY
@@ -173,7 +173,7 @@ AS $$
       ) AS task_job_rank
     FROM otlet.jobs j
     JOIN otlet.tasks t ON t.name = j.task_name
-    JOIN otlet.models m ON m.name = t.model_name
+    JOIN otlet.models m ON m.name = COALESCE(j.routed_model_name, t.model_name)
     JOIN same_model_tasks f
       ON f.task_name = j.task_name
      AND f.model_name = m.name

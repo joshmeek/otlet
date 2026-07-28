@@ -25,11 +25,12 @@ struct Claim {
     job_id: i64,
     claim_token: String,
     claim_status: String,
+    selection_role: String,
     task_name: String,
     prompt: String,
     prompt_hash: String,
     runtime_options: Value,
-    model_policy: Value,
+    model: Value,
     evidence_limits: Value,
 }
 
@@ -252,11 +253,12 @@ impl Database {
                'job_id', c.job_id, \
                'claim_token', c.claim_token, \
                'claim_status', c.claim_status, \
+               'selection_role', c.selection_role, \
                'task_name', c.task_name, \
                'prompt', c.prompt, \
                'prompt_hash', c.prompt_hash, \
                'runtime_options', c.runtime_options, \
-               'model_policy', c.model_policy, \
+               'model', c.model, \
                'evidence_limits', c.evidence_limits\
              )::text \
              FROM otlet.portable_claim_jobs({}, {}, {}, 1) c;\n",
@@ -304,7 +306,7 @@ impl Database {
             "SELECT job_status \
              FROM otlet.portable_complete_job(\
                {}, {}, {}, {}, {}, {}::jsonb, {}, {}::jsonb, \
-               prompt_hash => {}, trace_summary => {}::jsonb, model_name => {}\
+               prompt_hash => {}, trace_summary => {}::jsonb\
              );\n",
             sql_text(&config.worker_id),
             config.protocol_version,
@@ -315,12 +317,13 @@ impl Database {
             sql_text(raw_output),
             sql_text(&actions.to_string()),
             sql_text(&claim.prompt_hash),
-            sql_text(&trace_summary.to_string()),
-            sql_text(&config.model_name)
+            sql_text(&trace_summary.to_string())
         );
         let rows = self.terminal_query(&sql)?;
         match rows.as_slice() {
-            [state] if state == "complete" || state == "canceled" => Ok(state.clone()),
+            [state] if state == "complete" || state == "canceled" || state == "queued" => {
+                Ok(state.clone())
+            }
             _ => Err(format!(
                 "portable completion returned unexpected state: {rows:?}"
             )),
@@ -333,15 +336,19 @@ impl Database {
         claim: &Claim,
         error: &str,
         raw_output: Option<&str>,
-    ) -> Result<(), String> {
+        candidate_output: Option<&Value>,
+    ) -> Result<String, String> {
         let raw = raw_output.map_or_else(|| "NULL".to_owned(), sql_text);
+        let candidate = candidate_output
+            .map(|output| format!("{}::jsonb", sql_text(&output.to_string())))
+            .unwrap_or_else(|| "NULL".to_owned());
         let sql = format!(
             "SELECT job_status \
              FROM otlet.portable_fail_job(\
                {}, {}, {}, {}, {}, {}, raw_output => {}, \
                prompt_hash => {}, schema_validation_status => 'failed', \
                trace_summary => '{{\"trace_version\":\"otlet_portable_worker_trace_v1\",\"schema_validation_status\":\"failed\"}}'::jsonb, \
-               model_name => {}\
+               candidate_output => {}\
              );\n",
             sql_text(&config.worker_id),
             config.protocol_version,
@@ -351,15 +358,17 @@ impl Database {
             sql_text(error),
             raw,
             sql_text(&claim.prompt_hash),
-            sql_text(&config.model_name)
+            candidate
         );
         let rows = self.terminal_query(&sql)?;
-        if !matches!(rows.as_slice(), [state] if state == "failed" || state == "canceled") {
-            return Err(format!(
+        match rows.as_slice() {
+            [state] if state == "failed" || state == "canceled" || state == "queued" => {
+                Ok(state.clone())
+            }
+            _ => Err(format!(
                 "portable failure returned unexpected state: {rows:?}"
-            ));
+            )),
         }
-        Ok(())
     }
 
     fn cancel(&self, config: &Config, claim: &Claim) -> Result<(), String> {
@@ -918,16 +927,26 @@ fn process_claim(
         log_event("job_canceled", claim, None);
         return Ok(());
     }
-    let Some(direct) = claim.model_policy.get("direct").and_then(Value::as_object) else {
-        database.fail(config, claim, "portable_model_policy_missing", None)?;
-        log_event("job_failed", claim, Some("model_policy_missing"));
+    if !matches!(claim.selection_role.as_str(), "direct" | "cheap" | "strong") {
+        return Err("portable claim selection role is invalid".to_owned());
+    }
+    let Some(selected_model) = claim.model.as_object() else {
+        let state = database.fail(config, claim, "portable_model_identity_missing", None, None)?;
+        log_failure_state(&state, claim, "model_identity_missing");
         return Ok(());
     };
-    if direct.get("name").and_then(Value::as_str) != Some(config.model_name.as_str())
-        || direct.get("artifact_hash").and_then(Value::as_str) != Some(config.model_sha256.as_str())
+    if selected_model.get("name").and_then(Value::as_str) != Some(config.model_name.as_str())
+        || selected_model.get("artifact_hash").and_then(Value::as_str)
+            != Some(config.model_sha256.as_str())
     {
-        database.fail(config, claim, "portable_model_identity_mismatch", None)?;
-        log_event("job_failed", claim, Some("model_identity_mismatch"));
+        let state = database.fail(
+            config,
+            claim,
+            "portable_model_identity_mismatch",
+            None,
+            None,
+        )?;
+        log_failure_state(&state, claim, "model_identity_mismatch");
         return Ok(());
     }
     let max_tokens = claim
@@ -962,32 +981,34 @@ fn process_claim(
     let inference = match inference {
         Ok(inference) => inference,
         Err(error) => {
-            database.fail(config, claim, &truncate(&error, 1024), None)?;
-            log_event("job_failed", claim, Some("local_inference_failed"));
+            let state = database.fail(config, claim, &truncate(&error, 1024), None, None)?;
+            log_failure_state(&state, claim, "local_inference_failed");
             return Ok(());
         }
     };
     let envelope: Value = match serde_json::from_str(&inference.raw_output) {
         Ok(value) => value,
         Err(_) => {
-            database.fail(
+            let state = database.fail(
                 config,
                 claim,
                 "portable_model_output_invalid_json",
                 Some(&inference.raw_output),
+                None,
             )?;
-            log_event("job_failed", claim, Some("invalid_model_json"));
+            log_failure_state(&state, claim, "invalid_model_json");
             return Ok(());
         }
     };
     let (Some(output), Some(actions)) = (envelope.get("output"), envelope.get("actions")) else {
-        database.fail(
+        let state = database.fail(
             config,
             claim,
             "portable_model_output_invalid_envelope",
             Some(&inference.raw_output),
+            None,
         )?;
-        log_event("job_failed", claim, Some("invalid_model_envelope"));
+        log_failure_state(&state, claim, "invalid_model_envelope");
         return Ok(());
     };
     let trace = json!({
@@ -1008,6 +1029,9 @@ fn process_claim(
         &trace,
     ) {
         Ok(state) if state == "complete" => log_event("job_completed", claim, None),
+        Ok(state) if state == "queued" => {
+            log_event("job_escalated", claim, Some("cheap_attempt_rejected"))
+        }
         Ok(_) => log_event("job_canceled", claim, Some("cancel_requested")),
         Err(error) if is_connection_error(&error) => {
             log_event(
@@ -1020,16 +1044,27 @@ fn process_claim(
             log_event("job_abandoned", claim, Some("claim_lost"));
         }
         Err(_) => {
-            database.fail(
+            let state = database.fail(
                 config,
                 claim,
                 "portable_result_rejected_by_database",
                 Some(&inference.raw_output),
+                Some(output),
             )?;
-            log_event("job_failed", claim, Some("database_validation_failed"));
+            log_failure_state(&state, claim, "database_validation_failed");
         }
     }
     Ok(())
+}
+
+fn log_failure_state(state: &str, claim: &Claim, reason: &str) {
+    if state == "queued" {
+        log_event("job_escalated", claim, Some(reason));
+    } else if state == "canceled" {
+        log_event("job_canceled", claim, Some("cancel_requested"));
+    } else {
+        log_event("job_failed", claim, Some(reason));
+    }
 }
 
 fn runtime_identity() -> Value {

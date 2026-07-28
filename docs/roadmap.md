@@ -2,10 +2,6 @@
 
 | Feature | Explanation |
 | --- | --- |
-| Asynchronous portable inference | Give SQL callers an enqueue API that returns a job ID, plus status and result reads. This replaces synchronous `otlet.ask(...)` where an external worker cannot see uncommitted work |
-| Portable watches and semantic reads | Install row and pair watch lifecycle in SQL-only PostgreSQL, enqueue source changes after commit, materialize portable completions, and expose semantic reads and status |
-| Portable model routing | Route jobs across registered portable workers and support cheap-to-strong escalation without granting worker roles direct table access |
-| Portable conformance | Extend the isolated portable smoke test across inference, watches, materialization, model routing, cancellation, restart, and failure paths |
 | GPU and alternate CPU execution | Run models on GPUs and distinct CPU paths while preserving receipts, quality checks, memory bounds, cancellation, and fallback |
 | Batching and speculative decoding | Improve throughput while keeping worker memory and PostgreSQL responsiveness bounded |
 | Multi-model residency | Keep more than one useful model resident and schedule jobs by model without starving tasks |

@@ -186,8 +186,7 @@ FROM otlet.portable_complete_job(
   (SELECT claim_token FROM conformance_claims WHERE subject_id = 'portable-action'),
   '{"decision":"flag","confidence":"high"}'::jsonb,
   '{"output":{"decision":"flag","confidence":"high"},"actions":[{"type":"review_flag","body":{"severity":"high","reason":"conformance review"}}]}',
-  '[{"type":"review_flag","body":{"severity":"high","reason":"conformance review"}}]'::jsonb,
-  model_name => :'model_name'
+  '[{"type":"review_flag","body":{"severity":"high","reason":"conformance review"}}]'::jsonb
 ) \g /dev/null
 SELECT count(*)
 FROM otlet.portable_complete_job(
@@ -198,8 +197,7 @@ FROM otlet.portable_complete_job(
   (SELECT claim_token FROM conformance_claims WHERE subject_id = 'portable-abstain'),
   '{"decision":"abstain","confidence":"medium"}'::jsonb,
   '{"output":{"decision":"abstain","confidence":"medium"},"actions":[]}',
-  '[]'::jsonb,
-  model_name => :'model_name'
+  '[]'::jsonb
 ) \g /dev/null
 
 DO $body$
@@ -216,8 +214,7 @@ BEGIN
       selected.claim_token,
       '{"decision":"flag","confidence":"high"}'::jsonb,
       '{"output":',
-      '[]'::jsonb,
-      model_name => pg_catalog.current_setting('otlet.runtime_conformance_model')
+      '[]'::jsonb
     );
     RAISE EXCEPTION 'portable malformed output was accepted';
   EXCEPTION WHEN OTHERS THEN
@@ -232,8 +229,7 @@ BEGIN
     selected.job_id,
     selected.claim_token,
     'malformed output rejected',
-    schema_validation_status => 'failed',
-    model_name => pg_catalog.current_setting('otlet.runtime_conformance_model')
+    schema_validation_status => 'failed'
   );
 END
 $body$;

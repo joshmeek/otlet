@@ -80,7 +80,14 @@ DECLARE
   v_auto_max_rows integer := 1;
   v_selected_path text;
   v_reason text;
-  v_runtime_name text := 'linked_inproc';
+  v_portable boolean := COALESCE(
+    otlet.worker_wake_state() ->> 'state' = 'portable_external_worker',
+    false
+  );
+  v_runtime_name text := CASE
+    WHEN v_portable THEN 'portable_external_worker'
+    ELSE 'linked_inproc'
+  END;
   v_stale_reasons jsonb := COALESCE(p_stale_reasons, '{}'::jsonb);
 BEGIN
   v_refresh_subjects := v_stale_subjects + v_missing_subjects;
@@ -150,7 +157,9 @@ BEGIN
   FROM otlet.production_policy policy
   WHERE policy.name = 'default';
 
-  IF COALESCE(v_auto_infer_ms, 0) > 0 AND COALESCE(v_auto_max_rows, 0) > 0 THEN
+  IF NOT v_portable
+     AND COALESCE(v_auto_infer_ms, 0) > 0
+     AND COALESCE(v_auto_max_rows, 0) > 0 THEN
     v_infer_now_subjects := LEAST(v_refresh_subjects, v_auto_max_rows::bigint);
   END IF;
 
@@ -248,4 +257,3 @@ BEGIN
     clock_timestamp();
 END;
 $$;
-

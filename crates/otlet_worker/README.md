@@ -1,10 +1,12 @@
 # Portable Worker
 
-> Portable support is incomplete. The current worker supports queued tasks, fenced completion, receipts, actions, and lifecycle control. The portable path does not support synchronous `otlet.ask(...)`, watches and semantic materialization or reads, model-selection escalation, or native CustomScan and infer-now. See the [roadmap](../../docs/roadmap.md)
+The portable worker runs one-off inference, model routing, and row or pair watches through Otlet's asynchronous SQL surface. Portable jobs reuse the existing materialization, read, action, status, audit, cleanup, cancellation, and recovery functions
 
 Use this path when PostgreSQL allows ordinary SQL but cannot load the native Otlet extension worker. The reference worker connects through `psql`, claims one model's bounded snapshots, runs one local GGUF with llama.cpp, and submits results through the fenced portable RPCs
 
-The first scope is one worker process, one database, and one registered model. It has no remote model API and no direct access to source or Otlet tables
+Synchronous `otlet.ask(...)`, CustomScan, and infer-now remain native-only because they require an in-process PostgreSQL worker or extension hooks. Portable callers use committed queues and the same SQL read functions
+
+Each process loads one registered model. Register a separate role and worker identity for each additional model. The worker has no remote model API and no direct access to source or Otlet tables
 
 ## Install The SQL Contract
 
@@ -14,7 +16,9 @@ Run the installer as the database owner from the repository checkout:
 psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f crates/otlet_worker/sql/install.sql
 ```
 
-The install transaction creates the task, job, receipt, review, action, evaluation, freshness, and portable protocol state with SQL and PL/pgSQL only. The database keeps zero `otlet` extension objects and zero C-language Otlet functions
+The install transaction runs the current SQL contract as migrations `0001` through `0043`. Re-running it skips recorded migrations and preserves existing data. This greenfield path rejects older unversioned `otlet` schemas instead of converting them
+
+The database keeps zero `otlet` extension objects and zero C-language Otlet functions
 
 ## Register The Worker
 
@@ -60,6 +64,78 @@ otlet_worker
 ```
 
 The process runs deployment preflight before it can claim work, then verifies the GGUF digest before loading it. PostgreSQL assembles the exact prompt from the shaped snapshot and task contract, then recomputes and validates the terminal identities, schema result, output, actions, and receipt lineage
+
+## Enqueue One-Off Inference
+
+Portable workers cannot see work created inside the open transaction used by synchronous `otlet.ask(...)`. Queue the request, commit it, then read status and trusted output from `otlet.runs`:
+
+```sql
+BEGIN;
+SELECT otlet.enqueue_ask(
+  'qwen35_4b',
+  'Summarize the note',
+  '{"note":"Customer requested a procurement summary"}',
+  '{"type":"object","required":["summary"],"additionalProperties":false,"properties":{"summary":{"type":"string"}}}'
+) AS job_id \gset
+COMMIT;
+
+SELECT status, output, receipt_id, error
+FROM otlet.runs
+WHERE job_id = :'job_id';
+```
+
+`enqueue_ask(...)` returns `0` when queue admission rejects the request. It uses the same task, input shaping, queue limits, PostgreSQL validation, receipt, and cancellation state as other jobs
+
+## Route Across Models
+
+Register cheap and strong model workers, then use the normal selection policy:
+
+```sql
+SELECT otlet.set_model_selection_policy(
+  'vendor_summary_task',
+  'qwen3_1_7b',
+  'qwen35_4b',
+  '{"confidence_field":"confidence","accepted_confidence":["high"]}'::jsonb
+);
+```
+
+PostgreSQL assigns the cheap claim, validates the result, and completes accepted output. It records rejected output in a receipt and requeues the same job for the strong worker. PostgreSQL preserves the job ID, lease fence, retry budget, receipt history, queue accounting, and status reads
+
+## Watch Source Rows
+
+Create a row watch with automatic enqueue, then commit source changes before polling results:
+
+```sql
+CREATE TABLE vendor_notes (
+  vendor_id text PRIMARY KEY,
+  note text NOT NULL
+);
+
+SELECT otlet.create_watch(
+  watch_name => 'vendor_note_summary',
+  kind => 'row',
+  instruction => 'Summarize the note',
+  output_schema => '{"type":"object","required":["summary"],"additionalProperties":false,"properties":{"summary":{"type":"string"}}}'::jsonb,
+  model_name => 'qwen35_4b',
+  table_name => 'vendor_notes'::regclass,
+  subject_column => 'vendor_id',
+  trigger_policy => '{"on_change":"mark_stale_and_enqueue"}'::jsonb,
+  input_columns => ARRAY['note']::text[]
+);
+
+INSERT INTO vendor_notes VALUES ('vendor-1', 'Customer requested a procurement summary');
+
+SELECT *
+FROM otlet.semantic_index_current_rows('vendor_note_summary');
+
+SELECT *
+FROM otlet.semantic_index_status
+WHERE name = 'vendor_note_summary';
+```
+
+PostgreSQL queues inserts and updates in the source transaction, so the external worker sees them after commit. Portable completion stores the output and semantic materialization in one transaction. Deletes mark prior materializations stale and remove them from current-row reads. Canceled jobs do not materialize
+
+Pair watches use the same `create_watch(..., kind => 'pair')`, `refresh_semantic_join_index(...)`, `semantic_join_index_current_rows(...)`, and `semantic_join_index_plan(...)` functions as the native installation. Candidate preflight, bounded refresh, pair-source stale triggers, completion materialization, deletion reconciliation, watch export, and status are PostgreSQL-owned and work without the extension
 
 ## Run Deployment Preflight
 
@@ -108,7 +184,7 @@ After `./scripts/otlet-setup.sh` has placed the demo GGUF in Docker, run:
 ./scripts/otlet-portable-worker-demo.sh
 ```
 
-The script creates a disposable SQL-only database, builds the worker, runs real local inference, and checks trusted receipt lineage. It also proves pause, resume, cancellation, claim loss, process restart, database restart, reclaim, duplicate delivery, drain, source denial, and redacted structured logs before dropping the database and role
+The script creates a disposable SQL-only database, builds the worker, and runs real local inference through direct, cheap-to-strong, row-watch, and pair-watch paths. It also proves receipt lineage, semantic reads, update and delete reconciliation, pause, resume, cancellation, claim loss, process restart, database restart, reclaim, duplicate delivery, drain, source denial, and redacted structured logs before dropping the database and roles
 
 Run the isolated deployment-preflight proof:
 
@@ -117,3 +193,11 @@ Run the isolated deployment-preflight proof:
 ```
 
 It starts a TLS-enabled disposable PostgreSQL on an internal-only Docker network, proves a valid configuration leaves a queued job unclaimed, then breaks connectivity, TLS, credentials, grants, protocol, runtime identity, model registration, artifact access, runtime storage, and client availability one dependency at a time
+
+Run the repeat-install proof:
+
+```sh
+./scripts/otlet-portable-upgrade-demo.sh
+```
+
+It installs the full SQL contract twice and checks that the migration ledger, existing data, and invariants stay intact

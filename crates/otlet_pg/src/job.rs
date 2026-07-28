@@ -13,6 +13,7 @@ pub(crate) struct Job {
     pub(crate) artifact_hash: String,
     pub(crate) artifact_identity: Value,
     pub(crate) model_name: String,
+    pub(crate) selection_role: String,
     pub(crate) runtime_options: Value,
     pub(crate) input_shaping: Value,
     pub(crate) decision_contract: Value,
@@ -63,11 +64,12 @@ macro_rules! job_from_row {
             artifact_hash: required_col!($row, String, 9),
             artifact_identity: required_col!($row, JsonB, 10).0,
             model_name: required_col!($row, String, 11),
-            runtime_options: required_col!($row, JsonB, 12).0,
-            input_shaping: required_col!($row, JsonB, 13).0,
-            decision_contract: required_col!($row, JsonB, 14).0,
-            max_attempt_ms: i64::from(required_col!($row, i32, 15)),
-            claim_token: required_col!($row, String, 16),
+            selection_role: required_col!($row, String, 12),
+            runtime_options: required_col!($row, JsonB, 13).0,
+            input_shaping: required_col!($row, JsonB, 14).0,
+            decision_contract: required_col!($row, JsonB, 15).0,
+            max_attempt_ms: i64::from(required_col!($row, i32, 16)),
+            claim_token: required_col!($row, String, 17),
         }
     };
 }
@@ -91,13 +93,14 @@ WITH claimed AS (
     m.artifact_hash,
     m.artifact_identity,
     m.name AS model_name,
+    CASE WHEN j.routed_model_name IS NOT NULL THEN 'strong' ELSE 'direct' END AS selection_role,
     p.default_runtime_options,
     p.max_attempt_ms,
     j.claim_token,
     otlet.semantic_shaped_input(j.input, t.input_shaping) AS shaped_input
   FROM otlet.claim_jobs() j
   JOIN otlet.tasks t ON t.name = j.task_name
-  JOIN otlet.models m ON m.name = t.model_name
+  JOIN otlet.models m ON m.name = COALESCE(j.routed_model_name, t.model_name)
   CROSS JOIN otlet.production_policy p
   WHERE p.name = 'default'
 )
@@ -113,6 +116,7 @@ SELECT
   artifact_hash,
   artifact_identity,
   model_name,
+  selection_role,
   default_runtime_options || runtime_options,
   input_shaping,
   decision_contract,
@@ -191,6 +195,7 @@ SELECT
   artifact_hash,
   artifact_identity,
   model_name,
+  selection_role,
   default_runtime_options || runtime_options,
   input_shaping,
   decision_contract,
@@ -210,6 +215,7 @@ FROM (
     m.artifact_hash,
     m.artifact_identity,
     m.name AS model_name,
+    'direct'::text AS selection_role,
     p.default_runtime_options,
     p.max_attempt_ms,
     j.claim_token,

@@ -80,9 +80,10 @@ SELECT
   suppressed.last_suppressed_at AS queue_admission_last_suppressed_at
 FROM otlet.models m
 CROSS JOIN otlet.production_policy p
-LEFT JOIN otlet.tasks t ON t.model_name = m.name
+LEFT JOIN otlet.tasks t ON true
 LEFT JOIN otlet.jobs j
   ON j.task_name = t.name
+ AND COALESCE(j.routed_model_name, t.model_name) = m.name
  AND j.status IN ('queued', 'running', 'cancel_requested')
 LEFT JOIN LATERAL (
   SELECT COALESCE(sum(octet_length(queued.input::text)), 0)::bigint AS queued_input_bytes
