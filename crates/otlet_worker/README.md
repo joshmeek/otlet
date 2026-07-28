@@ -1,6 +1,6 @@
 # Portable Worker
 
-> Portable support is incomplete. The current worker supports asynchronous one-off inference, queued tasks, fenced completion, receipts, actions, and lifecycle control. The portable path does not support synchronous `otlet.ask(...)`, watches and semantic materialization or reads, model-selection escalation, or native CustomScan and infer-now. See the [roadmap](../../docs/roadmap.md)
+> Portable support is incomplete. The current worker supports asynchronous one-off inference, row watches, semantic materialization and reads, queued tasks, fenced completion, receipts, actions, and lifecycle control. The portable path does not support synchronous `otlet.ask(...)`, pair watches and semantic joins, model-selection escalation, or native CustomScan and infer-now. See the [roadmap](../../docs/roadmap.md)
 
 Use this path when PostgreSQL allows ordinary SQL but cannot load the native Otlet extension worker. The reference worker connects through `psql`, claims one model's bounded snapshots, runs one local GGUF with llama.cpp, and submits results through the fenced portable RPCs
 
@@ -81,6 +81,42 @@ WHERE job_id = :'job_id';
 ```
 
 `enqueue_ask(...)` returns `0` when queue admission rejects the request. It uses the same task, input shaping, queue limits, PostgreSQL validation, receipt, and cancellation state as other jobs
+
+## Watch Source Rows
+
+Create a row watch with automatic enqueue, then commit source changes before polling results:
+
+```sql
+CREATE TABLE vendor_notes (
+  vendor_id text PRIMARY KEY,
+  note text NOT NULL
+);
+
+SELECT otlet.create_watch(
+  watch_name => 'vendor_note_summary',
+  kind => 'row',
+  instruction => 'Summarize the note',
+  output_schema => '{"type":"object","required":["summary"],"additionalProperties":false,"properties":{"summary":{"type":"string"}}}'::jsonb,
+  model_name => 'qwen35_4b',
+  table_name => 'vendor_notes'::regclass,
+  subject_column => 'vendor_id',
+  trigger_policy => '{"on_change":"mark_stale_and_enqueue"}'::jsonb,
+  input_columns => ARRAY['note']::text[]
+);
+
+INSERT INTO vendor_notes VALUES ('vendor-1', 'Customer requested a procurement summary');
+
+SELECT *
+FROM otlet.semantic_index_current_rows('vendor_note_summary');
+
+SELECT *
+FROM otlet.semantic_index_status
+WHERE name = 'vendor_note_summary';
+```
+
+PostgreSQL queues inserts and updates in the source transaction, so the external worker sees them after commit. Portable completion stores the output and semantic materialization in one transaction. Deletes mark prior materializations stale and remove them from current-row reads. Canceled jobs do not materialize
+
+The portable installer rejects pair watches until portable candidate generation and semantic joins ship
 
 ## Run Deployment Preflight
 

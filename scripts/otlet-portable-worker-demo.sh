@@ -130,6 +130,31 @@ SQL
   exit 1
 }
 
+run_worker_once() {
+  : >"$worker_log"
+  if ! docker exec \
+    -e "OTLET_DATABASE_URL=$worker_database_url" \
+    -e "OTLET_PORTABLE_WORKER_ID=$worker_id" \
+    -e OTLET_PORTABLE_PROTOCOL_VERSION=1 \
+    -e "OTLET_PORTABLE_RUNTIME_IDENTITY_HASH=$runtime_identity_hash" \
+    -e "OTLET_MODEL_NAME=$model_name" \
+    -e "OTLET_MODEL_PATH=$model_artifact" \
+    -e "OTLET_MODEL_SHA256=$model_sha256" \
+    -e OTLET_PORTABLE_REQUIRE_TLS=0 \
+    -e OTLET_PORTABLE_ONCE=1 \
+    -e "OTLET_LLAMA_THREADS=${OTLET_LLAMA_THREADS:-4}" \
+    "$container" /target/release/otlet_worker --once >"$worker_log" 2>&1; then
+    tail -n 120 "$worker_log" >&2
+    exit 1
+  fi
+
+  if ! grep -q '"event":"job_completed"' "$worker_log"; then
+    tail -n 120 "$worker_log" >&2
+    echo "Portable worker did not report a completed job" >&2
+    exit 1
+  fi
+}
+
 if ! docker ps --format '{{.Names}}' | grep -qx "$container"; then
   echo "Container $container is not running. Run ./scripts/otlet-setup.sh first" >&2
   exit 1
@@ -214,7 +239,41 @@ SELECT otlet.create_task(
   '{"reasoning":"off","max_tokens":48,"inference_cache":false}'::jsonb,
   '{"source_fields":["signal"]}'::jsonb
 );
+CREATE TABLE public.otlet_portable_watch_source (
+  subject_id text PRIMARY KEY,
+  signal text NOT NULL
+);
+SELECT otlet.create_watch(
+  watch_name => 'portable_row_watch',
+  kind => 'row',
+  instruction => 'Return decision keep',
+  output_schema => '{"type":"object","required":["decision"],"additionalProperties":false,"properties":{"decision":{"const":"keep"}}}'::jsonb,
+  model_name => :'model_name',
+  table_name => 'public.otlet_portable_watch_source'::regclass,
+  subject_column => 'subject_id',
+  record_type => 'portable_row_decision',
+  runtime_options => '{"reasoning":"off","max_tokens":48,"inference_cache":false}'::jsonb,
+  trigger_policy => '{"on_change":"mark_stale_and_enqueue"}'::jsonb,
+  input_columns => ARRAY['signal']::text[]
+);
 SQL
+
+pair_watch_error="$(
+  docker exec -i "$container" psql -U postgres -d "$portable_database" \
+    -X -qAt -v ON_ERROR_STOP=1 -v model_name="$model_name" <<'SQL' 2>&1 || true
+SELECT otlet.create_watch(
+  watch_name => 'portable_pair_watch',
+  kind => 'pair',
+  instruction => 'Return decision keep',
+  output_schema => '{"type":"object"}'::jsonb,
+  model_name => :'model_name'
+);
+SQL
+)"
+if [[ "$pair_watch_error" != *"otlet portable SQL installation supports row watches only"* ]]; then
+  echo "Expected portable pair watches to remain unavailable, got $pair_watch_error" >&2
+  exit 1
+fi
 
 invalid_input="$(
   docker exec -i "$container" psql -U postgres -d "$portable_database" \
@@ -301,27 +360,7 @@ SQL
 )"
 
 worker_database_url="postgresql://${worker_role}:${worker_password}@127.0.0.1:5432/${portable_database}"
-if ! docker exec \
-  -e "OTLET_DATABASE_URL=$worker_database_url" \
-  -e "OTLET_PORTABLE_WORKER_ID=$worker_id" \
-  -e OTLET_PORTABLE_PROTOCOL_VERSION=1 \
-  -e "OTLET_PORTABLE_RUNTIME_IDENTITY_HASH=$runtime_identity_hash" \
-  -e "OTLET_MODEL_NAME=$model_name" \
-  -e "OTLET_MODEL_PATH=$model_artifact" \
-  -e "OTLET_MODEL_SHA256=$model_sha256" \
-  -e OTLET_PORTABLE_REQUIRE_TLS=0 \
-  -e OTLET_PORTABLE_ONCE=1 \
-  -e "OTLET_LLAMA_THREADS=${OTLET_LLAMA_THREADS:-4}" \
-  "$container" /target/release/otlet_worker --once >"$worker_log" 2>&1; then
-  tail -n 120 "$worker_log" >&2
-  exit 1
-fi
-
-if ! grep -q '"event":"job_completed"' "$worker_log"; then
-  tail -n 120 "$worker_log" >&2
-  echo "Portable worker did not report a completed job" >&2
-  exit 1
-fi
+run_worker_once
 
 contract="$(
   docker exec -i "$container" psql -U postgres -d "$portable_database" \
@@ -391,10 +430,223 @@ if [ "$async_result_contract" != "complete|keep|true|true" ]; then
   exit 1
 fi
 
+non_watch_scalar_contract="$(
+  docker exec -i "$container" psql -U postgres -d "$portable_database" \
+    -X -qAt -v ON_ERROR_STOP=1 -v async_job_id="$async_job_id" <<'SQL'
+BEGIN;
+UPDATE otlet.outputs
+SET output = '"scalar"'::jsonb
+WHERE job_id = :'async_job_id'::bigint;
+SELECT (otlet.materialize_completed_semantic_job(:'async_job_id'::bigint) = 0)::text;
+ROLLBACK;
+SQL
+)"
+if [ "$non_watch_scalar_contract" != "true" ]; then
+  echo "Expected scalar non-watch output to skip semantic materialization, got $non_watch_scalar_contract" >&2
+  exit 1
+fi
+
+watch_insert_job_id="$(
+  docker exec -i "$container" psql -U postgres -d "$portable_database" \
+    -X -qAt -v ON_ERROR_STOP=1 <<'SQL'
+BEGIN;
+INSERT INTO public.otlet_portable_watch_source
+VALUES ('watch-live', 'retain');
+SELECT j.id AS watch_insert_job_id
+FROM otlet.jobs j
+JOIN otlet.watches w ON w.task_name = j.task_name
+WHERE w.name = 'portable_row_watch'
+  AND j.subject_id = 'watch-live'
+  AND j.status = 'queued'
+ORDER BY j.id DESC
+LIMIT 1
+\gset
+COMMIT;
+SELECT :'watch_insert_job_id';
+SQL
+)"
+if [[ ! "$watch_insert_job_id" =~ ^[1-9][0-9]*$ ]]; then
+  echo "Expected the row-watch insert to queue a job, got $watch_insert_job_id" >&2
+  exit 1
+fi
+
+watch_queued_contract="$(
+  docker exec -i "$container" psql -U postgres -d "$portable_database" \
+    -X -qAt -v ON_ERROR_STOP=1 -v watch_job_id="$watch_insert_job_id" <<'SQL'
+SELECT concat_ws('|',
+  (SELECT status FROM otlet.jobs WHERE id = :'watch_job_id'::bigint),
+  (SELECT count(*) FROM otlet.semantic_index_current_rows('portable_row_watch')),
+  plan.runtime_name,
+  plan.infer_now_subjects
+)
+FROM otlet.semantic_index_plan('portable_row_watch', true) plan;
+SQL
+)"
+if [ "$watch_queued_contract" != "queued|0|portable_external_worker|0" ]; then
+  echo "Expected a committed portable row-watch job with queue-only status, got $watch_queued_contract" >&2
+  exit 1
+fi
+
+run_worker_once
+
+watch_insert_contract="$(
+  docker exec -i "$container" psql -U postgres -d "$portable_database" \
+    -X -qAt -v ON_ERROR_STOP=1 -v watch_job_id="$watch_insert_job_id" <<'SQL'
+SELECT concat_ws('|',
+  (SELECT status FROM otlet.jobs WHERE id = :'watch_job_id'::bigint),
+  (SELECT body ->> 'decision'
+   FROM otlet.semantic_index_current_rows('portable_row_watch')
+   WHERE subject_id = 'watch-live'),
+  (SELECT stale::text
+   FROM otlet.semantic_index_current_rows('portable_row_watch')
+   WHERE subject_id = 'watch-live'),
+  (SELECT count(*)
+   FROM otlet.semantic_materializations
+   WHERE subject_id = 'watch-live'),
+  (SELECT (trace_summary ? 'materialize_ms')::text
+   FROM otlet.inference_receipts
+   WHERE job_id = :'watch_job_id'::bigint
+   ORDER BY id DESC
+   LIMIT 1),
+  plan.total_subjects,
+  plan.fresh_subjects,
+  plan.stale_subjects,
+  plan.missing_subjects,
+  plan.runtime_name,
+  plan.infer_now_subjects
+)
+FROM otlet.semantic_index_plan('portable_row_watch', true) plan;
+SQL
+)"
+expected_watch_insert="complete|keep|false|1|true|1|1|0|0|portable_external_worker|0"
+if [ "$watch_insert_contract" != "$expected_watch_insert" ]; then
+  echo "Expected portable row-watch insert contract $expected_watch_insert, got $watch_insert_contract" >&2
+  exit 1
+fi
+
+watch_update_job_id="$(
+  docker exec -i "$container" psql -U postgres -d "$portable_database" \
+    -X -qAt -v ON_ERROR_STOP=1 <<'SQL'
+BEGIN;
+UPDATE public.otlet_portable_watch_source
+SET signal = 'retain updated'
+WHERE subject_id = 'watch-live';
+SELECT j.id AS watch_update_job_id
+FROM otlet.jobs j
+JOIN otlet.watches w ON w.task_name = j.task_name
+WHERE w.name = 'portable_row_watch'
+  AND j.subject_id = 'watch-live'
+  AND j.status = 'queued'
+ORDER BY j.id DESC
+LIMIT 1
+\gset
+COMMIT;
+SELECT :'watch_update_job_id';
+SQL
+)"
+if [[ ! "$watch_update_job_id" =~ ^[1-9][0-9]*$ ]]; then
+  echo "Expected the row-watch update to queue a job, got $watch_update_job_id" >&2
+  exit 1
+fi
+
+run_worker_once
+
+watch_update_contract="$(
+  docker exec -i "$container" psql -U postgres -d "$portable_database" \
+    -X -qAt -v ON_ERROR_STOP=1 -v watch_job_id="$watch_update_job_id" <<'SQL'
+SELECT concat_ws('|',
+  (SELECT status FROM otlet.jobs WHERE id = :'watch_job_id'::bigint),
+  (SELECT body ->> 'decision'
+   FROM otlet.semantic_index_current_rows('portable_row_watch')
+   WHERE subject_id = 'watch-live'),
+  (SELECT stale::text
+   FROM otlet.semantic_index_current_rows('portable_row_watch')
+   WHERE subject_id = 'watch-live'),
+  count(*),
+  count(*) FILTER (WHERE stale),
+  count(*) FILTER (WHERE NOT stale)
+)
+FROM otlet.semantic_materializations
+WHERE subject_id = 'watch-live';
+SQL
+)"
+expected_watch_update="complete|keep|false|2|1|1"
+if [ "$watch_update_contract" != "$expected_watch_update" ]; then
+  echo "Expected portable row-watch update contract $expected_watch_update, got $watch_update_contract" >&2
+  exit 1
+fi
+
+docker exec -i "$container" psql -U postgres -d "$portable_database" \
+  -X -qAt -v ON_ERROR_STOP=1 <<'SQL' >/dev/null
+DELETE FROM public.otlet_portable_watch_source
+WHERE subject_id = 'watch-live';
+SQL
+
+watch_delete_contract="$(
+  docker exec -i "$container" psql -U postgres -d "$portable_database" \
+    -X -qAt -v ON_ERROR_STOP=1 <<'SQL'
+SELECT concat_ws('|',
+  (SELECT count(*)
+   FROM otlet.semantic_index_current_rows('portable_row_watch')
+   WHERE subject_id = 'watch-live'),
+  count(*),
+  count(*) FILTER (WHERE stale),
+  count(*) FILTER (WHERE stale_reason = 'source_delete'),
+  (SELECT count(*)
+   FROM otlet.jobs j
+   JOIN otlet.watches w ON w.task_name = j.task_name
+   WHERE w.name = 'portable_row_watch'
+     AND j.subject_id = 'watch-live')
+)
+FROM otlet.semantic_materializations
+WHERE subject_id = 'watch-live';
+SQL
+)"
+expected_watch_delete="0|2|2|2|2"
+if [ "$watch_delete_contract" != "$expected_watch_delete" ]; then
+  echo "Expected portable row-watch delete contract $expected_watch_delete, got $watch_delete_contract" >&2
+  exit 1
+fi
+
+watch_cancel_contract="$(
+  docker exec -i "$container" psql -U postgres -d "$portable_database" \
+    -X -qAt -v ON_ERROR_STOP=1 <<'SQL'
+INSERT INTO public.otlet_portable_watch_source
+VALUES ('watch-cancel', 'retain');
+WITH target AS (
+  SELECT j.id
+  FROM otlet.jobs j
+  JOIN otlet.watches w ON w.task_name = j.task_name
+  WHERE w.name = 'portable_row_watch'
+    AND j.subject_id = 'watch-cancel'
+  ORDER BY j.id DESC
+  LIMIT 1
+),
+canceled AS (
+  SELECT c.*
+  FROM target
+  CROSS JOIN LATERAL otlet.request_job_cancellation(target.id, 'portable row-watch probe') c
+)
+SELECT concat_ws('|',
+  (SELECT status FROM canceled),
+  (SELECT count(*)
+   FROM otlet.semantic_materializations
+   WHERE subject_id = 'watch-cancel'),
+  (SELECT count(*)
+   FROM otlet.semantic_index_current_rows('portable_row_watch')
+   WHERE subject_id = 'watch-cancel')
+);
+SQL
+)"
+if [ "$watch_cancel_contract" != "canceled|0|0" ]; then
+  echo "Expected canceled row-watch work to remain unmaterialized, got $watch_cancel_contract" >&2
+  exit 1
+fi
+
 source_read="$(
   docker exec -e "PGPASSWORD=$worker_password" "$container" \
     psql -h 127.0.0.1 -U "$worker_role" -d "$portable_database" -X -qAt \
-      -c 'SELECT count(*) FROM public.otlet_portable_worker_source' 2>&1 || true
+      -c 'SELECT count(*) FROM public.otlet_portable_watch_source' 2>&1 || true
 )"
 if [[ "$source_read" != *"permission denied"* ]]; then
   echo "Expected the portable worker role to be denied source-table access, got $source_read" >&2
@@ -494,8 +746,38 @@ if ! docker exec "$container" pg_isready -U postgres -d "$portable_database" >/d
   echo "Portable recovery database did not restart" >&2
   exit 1
 fi
-queue_recovery_job recovery-database-restart 0
-wait_for_job_status recovery-database-restart complete
+docker exec -i "$container" psql -U postgres -d "$portable_database" \
+  -X -qAt -v ON_ERROR_STOP=1 <<'SQL' >/dev/null
+INSERT INTO public.otlet_portable_watch_source
+VALUES ('watch-restart', 'retain');
+SQL
+wait_for_job_status watch-restart complete
+
+watch_restart_contract="$(
+  docker exec -i "$container" psql -U postgres -d "$portable_database" \
+    -X -qAt -v ON_ERROR_STOP=1 <<'SQL'
+SELECT concat_ws('|',
+  (SELECT status
+   FROM otlet.jobs
+   WHERE subject_id = 'watch-restart'
+   ORDER BY id DESC
+   LIMIT 1),
+  (SELECT body ->> 'decision'
+   FROM otlet.semantic_index_current_rows('portable_row_watch')
+   WHERE subject_id = 'watch-restart'),
+  (SELECT stale::text
+   FROM otlet.semantic_index_current_rows('portable_row_watch')
+   WHERE subject_id = 'watch-restart'),
+  (SELECT count(*)
+   FROM otlet.semantic_materializations
+   WHERE subject_id = 'watch-restart')
+);
+SQL
+)"
+if [ "$watch_restart_contract" != "complete|keep|false|1" ]; then
+  echo "Expected row-watch materialization after database restart, got $watch_restart_contract" >&2
+  exit 1
+fi
 
 docker exec -i "$container" psql -U postgres -d "$portable_database" -X -qAt \
   -v ON_ERROR_STOP=1 -v worker_id="$worker_id" <<'SQL' >/dev/null
@@ -550,7 +832,11 @@ SELECT concat_ws('|',
    FROM job_state WHERE subject_id = 'recovery-claim-loss'),
   (SELECT status || ':' || attempts || ':' || outputs || ':' || receipts
    FROM job_state WHERE subject_id = 'recovery-worker-loss'),
-  (SELECT status FROM job_state WHERE subject_id = 'recovery-database-restart'),
+  (SELECT status
+   FROM otlet.jobs
+   WHERE subject_id = 'watch-restart'
+   ORDER BY id DESC
+   LIMIT 1),
   (SELECT desired_state || ':' || reported_state || ':' || worker_health || ':' || expired_claims
    FROM otlet.portable_worker_status WHERE worker_id = :'worker_id')
 );
@@ -562,6 +848,7 @@ if [ "$recovery_contract" != "$expected_recovery_contract" ]; then
   exit 1
 fi
 
-echo "portable_async_inference_contract=$async_queued_contract|$async_result_contract|admission=closed|input=validated"
+echo "portable_async_inference_contract=$async_queued_contract|$async_result_contract|admission=closed|input=validated|scalar_non_watch=accepted"
+echo "portable_row_watch_contract=$watch_queued_contract|$watch_insert_contract|$watch_update_contract|$watch_delete_contract|$watch_cancel_contract|$watch_restart_contract|pair=deferred"
 echo "portable_external_worker_contract=$contract|source_access=denied|protocol=1"
 echo "portable_recovery_contract=$recovery_contract|logs=structured_redacted|duplicate=covered_by_protocol"

@@ -749,6 +749,9 @@ BEGIN
     LIMIT 1;
   END IF;
   PERFORM otlet.link_portable_receipt(claim_row.id, receipt_id);
+  PERFORM otlet.materialize_completed_semantic_job(
+    portable_complete_job.requested_job_id
+  );
 
   UPDATE otlet.portable_claims c
   SET status = CASE job_status WHEN 'canceled' THEN 'canceled' ELSE 'complete' END,

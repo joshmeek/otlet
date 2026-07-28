@@ -2,7 +2,7 @@
 
 | Feature | Explanation |
 | --- | --- |
-| Portable watches and semantic reads | Install row and pair watch lifecycle in SQL-only PostgreSQL, enqueue source changes after commit, materialize portable completions, and expose semantic reads and status |
+| Portable pair watches and semantic joins | Add bounded candidate generation, pair-source change tracking, completion materialization, semantic join reads, and status to SQL-only PostgreSQL |
 | Portable model routing | Route jobs across registered portable workers and support cheap-to-strong escalation without granting worker roles direct table access |
 | Portable conformance | Extend the isolated portable smoke test across inference, watches, materialization, model routing, cancellation, restart, and failure paths |
 | GPU and alternate CPU execution | Run models on GPUs and distinct CPU paths while preserving receipts, quality checks, memory bounds, cancellation, and fallback |

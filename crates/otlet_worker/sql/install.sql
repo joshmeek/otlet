@@ -21,6 +21,13 @@ BEGIN;
 \ir ../../otlet_pg/sql/150_eval_labels.sql
 \ir ../../otlet_pg/sql/160_action_review_status.sql
 \ir ../../otlet_pg/sql/170_inference_receipt_status.sql
+\ir ../../otlet_pg/sql/220_semantic_stale.sql
+\ir ../../otlet_pg/sql/230_semantic_index_admin.sql
+\ir ../../otlet_pg/sql/240_semantic_materialization.sql
+\ir ../../otlet_pg/sql/250_semantic_reads.sql
+\ir ../../otlet_pg/sql/280_semantic_cost.sql
+\ir ../../otlet_pg/sql/310_semantic_status_plan.sql
+\ir ../../otlet_pg/sql/360_watch_lifecycle.sql
 \ir ../../otlet_pg/sql/385_portable_permissions.sql
 \ir permissions.sql
 COMMIT;
