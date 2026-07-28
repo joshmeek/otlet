@@ -214,8 +214,82 @@ SELECT otlet.create_task(
   '{"reasoning":"off","max_tokens":48,"inference_cache":false}'::jsonb,
   '{"source_fields":["signal"]}'::jsonb
 );
-SELECT otlet.run_task('portable_worker_demo');
 SQL
+
+invalid_input="$(
+  docker exec -i "$container" psql -U postgres -d "$portable_database" \
+    -X -qAt -v ON_ERROR_STOP=1 -v model_name="$model_name" <<'SQL' 2>&1 || true
+SELECT otlet.enqueue_ask(
+  :'model_name',
+  'Return decision keep',
+  '[]'::jsonb,
+  '{"type":"object"}'::jsonb
+);
+SQL
+)"
+if [[ "$invalid_input" != *"otlet ask input must be a JSON object"* ]]; then
+  echo "Expected enqueue_ask to reject a non-object input, got $invalid_input" >&2
+  exit 1
+fi
+
+admission_contract="$(
+  docker exec -i "$container" psql -U postgres -d "$portable_database" \
+    -X -qAt -v ON_ERROR_STOP=1 -v model_name="$model_name" <<'SQL'
+BEGIN;
+UPDATE otlet.production_policy
+SET max_input_bytes_per_job = 1
+WHERE name = 'default';
+SELECT (otlet.enqueue_ask(
+  :'model_name',
+  'Return decision keep',
+  '{"signal":"retain"}'::jsonb,
+  '{"type":"object"}'::jsonb
+) = 0)::text;
+ROLLBACK;
+SQL
+)"
+if [ "$admission_contract" != "true" ]; then
+  echo "Expected enqueue_ask admission rejection to return zero, got $admission_contract" >&2
+  exit 1
+fi
+
+async_job_id="$(
+  docker exec -i "$container" psql -U postgres -d "$portable_database" \
+    -X -qAt -v ON_ERROR_STOP=1 -v model_name="$model_name" <<'SQL'
+BEGIN;
+SELECT otlet.enqueue_ask(
+  :'model_name',
+  'Return decision keep',
+  '{"signal":"retain"}'::jsonb,
+  '{"type":"object","required":["decision"],"additionalProperties":false,"properties":{"decision":{"const":"keep"}}}'::jsonb,
+  '{"reasoning":"off","max_tokens":48,"inference_cache":false}'::jsonb
+) AS async_job_id \gset
+COMMIT;
+SELECT :'async_job_id';
+SQL
+)"
+if [[ ! "$async_job_id" =~ ^[1-9][0-9]*$ ]]; then
+  echo "Expected enqueue_ask to return a positive job ID, got $async_job_id" >&2
+  exit 1
+fi
+
+async_queued_contract="$(
+  docker exec -i "$container" psql -U postgres -d "$portable_database" \
+    -X -qAt -v ON_ERROR_STOP=1 -v async_job_id="$async_job_id" <<'SQL'
+SELECT concat_ws('|',
+  status,
+  (output IS NULL)::text,
+  (receipt_id IS NULL)::text,
+  (task_name LIKE 'ask_%')::text
+)
+FROM otlet.runs
+WHERE job_id = :'async_job_id'::bigint;
+SQL
+)"
+if [ "$async_queued_contract" != "queued|true|true|true" ]; then
+  echo "Expected queued asynchronous ask state, got $async_queued_contract" >&2
+  exit 1
+fi
 
 runtime_identity_hash="$(
   docker exec -i "$container" psql -U postgres -d "$portable_database" -X -qAt \
@@ -251,7 +325,9 @@ fi
 
 contract="$(
   docker exec -i "$container" psql -U postgres -d "$portable_database" \
-    -X -qAt -v ON_ERROR_STOP=1 -v model_sha256="$model_sha256" <<'SQL'
+    -X -qAt -v ON_ERROR_STOP=1 \
+    -v model_sha256="$model_sha256" \
+    -v async_job_id="$async_job_id" <<'SQL'
 SELECT concat_ws('|',
   (SELECT count(*) FROM pg_extension WHERE extname = 'otlet'),
   (SELECT count(*)
@@ -288,12 +364,30 @@ JOIN otlet.outputs o ON o.job_id = j.id
 JOIN otlet.inference_receipts r ON r.id = o.receipt_id
 JOIN otlet.portable_receipt_links l ON l.receipt_id = r.id
 JOIN otlet.portable_claims c ON c.id = l.claim_id
-WHERE j.task_name = 'portable_worker_demo';
+WHERE j.id = :'async_job_id'::bigint;
 SQL
 )"
 expected="0|0|complete|keep|complete|accepted|passed|portable:otlet-portable-worker|postgres_rpc|true|true|complete|true|1|1|0"
 if [ "$contract" != "$expected" ]; then
   echo "Expected portable external worker contract $expected, got $contract" >&2
+  exit 1
+fi
+
+async_result_contract="$(
+  docker exec -i "$container" psql -U postgres -d "$portable_database" \
+    -X -qAt -v ON_ERROR_STOP=1 -v async_job_id="$async_job_id" <<'SQL'
+SELECT concat_ws('|',
+  status,
+  output ->> 'decision',
+  (receipt_id IS NOT NULL)::text,
+  (raw_output_hash IS NOT NULL)::text
+)
+FROM otlet.runs
+WHERE job_id = :'async_job_id'::bigint;
+SQL
+)"
+if [ "$async_result_contract" != "complete|keep|true|true" ]; then
+  echo "Expected completed asynchronous ask result, got $async_result_contract" >&2
   exit 1
 fi
 
@@ -468,5 +562,6 @@ if [ "$recovery_contract" != "$expected_recovery_contract" ]; then
   exit 1
 fi
 
+echo "portable_async_inference_contract=$async_queued_contract|$async_result_contract|admission=closed|input=validated"
 echo "portable_external_worker_contract=$contract|source_access=denied|protocol=1"
 echo "portable_recovery_contract=$recovery_contract|logs=structured_redacted|duplicate=covered_by_protocol"

@@ -112,6 +112,8 @@ Completion parses the raw envelope and requires it to match the submitted output
 
 Portable protocol `otlet.portable.worker.v1` uses exact-version compatibility and an owner-registered runtime identity bound to one database role. `grant_portable_worker_access(...)` grants that dedicated role one compatibility view and seven fixed-search-path `SECURITY DEFINER` RPCs for heartbeat, claim, renewal, attempt, completion, failure, and cancellation. It grants no source or Otlet table access
 
+Portable callers use `enqueue_ask(...)` for one-off inference. Commit the transaction, then read status or trusted output from `otlet.runs` with the returned job ID. Queue rejection returns `0`; synchronous `otlet.ask(...)` remains native-only because an external worker cannot see uncommitted work
+
 `portable_claim_jobs(...)` returns the shaped input snapshot, database-built prompt and prompt hash, task contract, registered model policy, effective runtime options, evidence limits, a live claim token, and no source-table authority. A registered worker is bound to one model, so it cannot claim work for another artifact. Every later RPC requires the same role, worker ID, protocol version, runtime identity hash, job ID, and claim token
 
 The owner sets a worker to `running`, `paused`, or `draining`. The heartbeat returns that desired state, records process and model health, and does not grant owner controls to the worker role. Pause and drain block new claims. The reference worker renews during decode, stops after cancellation or claim loss, retries an exact terminal request after a transient disconnect, and reconnects after a database restart. It suppresses stale terminal writes after renewal fails

@@ -662,6 +662,78 @@ BEGIN
 END;
 $$;
 
+CREATE FUNCTION otlet.enqueue_ask(
+  model_name text,
+  instruction text,
+  input jsonb DEFAULT '{}'::jsonb,
+  output_schema jsonb DEFAULT '{"type":"object"}'::jsonb,
+  runtime_options jsonb DEFAULT '{"max_tokens":256}'::jsonb
+) RETURNS bigint
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  actual_input jsonb := COALESCE(enqueue_ask.input, '{}'::jsonb);
+  actual_schema jsonb := COALESCE(enqueue_ask.output_schema, '{"type":"object"}'::jsonb);
+  actual_options jsonb := COALESCE(enqueue_ask.runtime_options, '{"max_tokens":256}'::jsonb);
+  input_fields jsonb;
+  direct_task_name text;
+  direct_subject_id text;
+  queued_job_id bigint;
+BEGIN
+  IF jsonb_typeof(actual_input) IS DISTINCT FROM 'object' THEN
+    RAISE EXCEPTION 'otlet ask input must be a JSON object';
+  END IF;
+
+  SELECT COALESCE(jsonb_agg(input_field ORDER BY input_field), '[]'::jsonb)
+  INTO input_fields
+  FROM jsonb_object_keys(actual_input) input_field;
+
+  direct_task_name := 'ask_' || substr(md5(
+    enqueue_ask.model_name || chr(10) ||
+    enqueue_ask.instruction || chr(10) ||
+    actual_schema::text || chr(10) ||
+    actual_options::text || chr(10) ||
+    input_fields::text
+  ), 1, 24);
+  direct_subject_id := 'ask_' || substr(md5(
+    clock_timestamp()::text || chr(10) ||
+    random()::text || chr(10) ||
+    actual_input::text
+  ), 1, 24);
+
+  PERFORM otlet.create_task(
+    direct_task_name,
+    NULL,
+    enqueue_ask.instruction,
+    actual_schema,
+    enqueue_ask.model_name,
+    actual_options,
+    jsonb_build_object('source_fields', input_fields)
+  );
+
+  IF NOT otlet.admit_task_input(direct_task_name, direct_subject_id, actual_input) THEN
+    RETURN 0;
+  END IF;
+
+  SELECT id
+  INTO queued_job_id
+  FROM otlet.jobs
+  WHERE task_name = direct_task_name
+    AND subject_id = direct_subject_id
+    AND status = 'queued';
+
+  IF queued_job_id IS NULL THEN
+    RAISE EXCEPTION 'otlet queued ask is missing after admission';
+  END IF;
+
+  PERFORM otlet.wake_worker();
+  RETURN queued_job_id;
+END;
+$$;
+
+COMMENT ON FUNCTION otlet.enqueue_ask(text, text, jsonb, jsonb, jsonb) IS
+  'Queues one-off inference and returns its job ID, or zero when queue admission rejects it';
+
 CREATE FUNCTION otlet.run_task(task_name text) RETURNS bigint
 LANGUAGE plpgsql
 AS $$

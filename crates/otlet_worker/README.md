@@ -1,6 +1,6 @@
 # Portable Worker
 
-> Portable support is incomplete. The current worker supports queued tasks, fenced completion, receipts, actions, and lifecycle control. The portable path does not support synchronous `otlet.ask(...)`, watches and semantic materialization or reads, model-selection escalation, or native CustomScan and infer-now. See the [roadmap](../../docs/roadmap.md)
+> Portable support is incomplete. The current worker supports asynchronous one-off inference, queued tasks, fenced completion, receipts, actions, and lifecycle control. The portable path does not support synchronous `otlet.ask(...)`, watches and semantic materialization or reads, model-selection escalation, or native CustomScan and infer-now. See the [roadmap](../../docs/roadmap.md)
 
 Use this path when PostgreSQL allows ordinary SQL but cannot load the native Otlet extension worker. The reference worker connects through `psql`, claims one model's bounded snapshots, runs one local GGUF with llama.cpp, and submits results through the fenced portable RPCs
 
@@ -60,6 +60,27 @@ otlet_worker
 ```
 
 The process runs deployment preflight before it can claim work, then verifies the GGUF digest before loading it. PostgreSQL assembles the exact prompt from the shaped snapshot and task contract, then recomputes and validates the terminal identities, schema result, output, actions, and receipt lineage
+
+## Enqueue One-Off Inference
+
+Portable workers cannot see work created inside the open transaction used by synchronous `otlet.ask(...)`. Queue the request, commit it, then read status and trusted output from `otlet.runs`:
+
+```sql
+BEGIN;
+SELECT otlet.enqueue_ask(
+  'qwen35_4b',
+  'Summarize the note',
+  '{"note":"Customer requested a procurement summary"}',
+  '{"type":"object","required":["summary"],"additionalProperties":false,"properties":{"summary":{"type":"string"}}}'
+) AS job_id \gset
+COMMIT;
+
+SELECT status, output, receipt_id, error
+FROM otlet.runs
+WHERE job_id = :'job_id';
+```
+
+`enqueue_ask(...)` returns `0` when queue admission rejects the request. It uses the same task, input shaping, queue limits, PostgreSQL validation, receipt, and cancellation state as other jobs
 
 ## Run Deployment Preflight
 

@@ -2,7 +2,6 @@
 
 | Feature | Explanation |
 | --- | --- |
-| Asynchronous portable inference | Give SQL callers an enqueue API that returns a job ID, plus status and result reads. This replaces synchronous `otlet.ask(...)` where an external worker cannot see uncommitted work |
 | Portable watches and semantic reads | Install row and pair watch lifecycle in SQL-only PostgreSQL, enqueue source changes after commit, materialize portable completions, and expose semantic reads and status |
 | Portable model routing | Route jobs across registered portable workers and support cheap-to-strong escalation without granting worker roles direct table access |
 | Portable conformance | Extend the isolated portable smoke test across inference, watches, materialization, model routing, cancellation, restart, and failure paths |
