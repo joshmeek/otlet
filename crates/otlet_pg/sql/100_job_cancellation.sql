@@ -21,6 +21,7 @@ DECLARE
   task_row otlet.tasks%ROWTYPE;
   model_row otlet.models%ROWTYPE;
   actual_request_hash text;
+  actual_selection_role text;
 BEGIN
   actual_request_hash := COALESCE(
     finish_canceled_job.terminal_request_hash,
@@ -80,11 +81,28 @@ BEGIN
   SELECT m.name
   INTO model_row.name
   FROM otlet.models m
-  WHERE m.name = COALESCE(finish_canceled_job.model_name, task_row.model_name);
+  WHERE m.name = COALESCE(
+    finish_canceled_job.model_name,
+    job_row.routed_model_name,
+    task_row.model_name
+  );
   IF NOT FOUND THEN
     RAISE EXCEPTION 'otlet model % does not exist',
-      COALESCE(finish_canceled_job.model_name, task_row.model_name);
+      COALESCE(
+        finish_canceled_job.model_name,
+        job_row.routed_model_name,
+        task_row.model_name
+      );
   END IF;
+  actual_selection_role := CASE
+    WHEN job_row.routed_model_name IS NOT NULL THEN 'strong'
+    WHEN EXISTS (
+      SELECT 1
+      FROM otlet.model_selection_policies selection
+      WHERE selection.task_name = job_row.task_name
+    ) THEN 'cheap'
+    ELSE 'direct'
+  END;
 
   PERFORM otlet.record_model_attempt(
     job_row.id,
@@ -98,6 +116,7 @@ BEGIN
       otlet.portable_text_hash(COALESCE(finish_canceled_job.raw_output, ''))
     ),
     started_at => finish_canceled_job.started_at,
+    selection_role => actual_selection_role,
     selection_status => 'failed',
     selection_reason => 'canceled',
     error => COALESCE(job_row.error, 'canceled'),

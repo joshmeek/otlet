@@ -187,6 +187,7 @@ CREATE TABLE otlet.jobs (
   task_name text NOT NULL REFERENCES otlet.tasks(name),
   subject_id text NOT NULL,
   input jsonb NOT NULL,
+  routed_model_name text REFERENCES otlet.models(name),
   status text NOT NULL DEFAULT 'queued',
   attempts int NOT NULL DEFAULT 0,
   leased_until timestamptz,

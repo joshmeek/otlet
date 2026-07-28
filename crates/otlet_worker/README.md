@@ -1,10 +1,12 @@
 # Portable Worker
 
-> Portable support is incomplete. The current worker supports asynchronous one-off inference, row watches, semantic materialization and reads, queued tasks, fenced completion, receipts, actions, and lifecycle control. The portable path does not support synchronous `otlet.ask(...)`, pair watches and semantic joins, model-selection escalation, or native CustomScan and infer-now. See the [roadmap](../../docs/roadmap.md)
+The portable worker covers Otlet's asynchronous SQL surface: one-off inference, row and pair watches, model-selection escalation, materialization, semantic reads and predicates, receipts, actions, evaluation, status, cleanup, export, cancellation, and restart recovery
 
 Use this path when PostgreSQL allows ordinary SQL but cannot load the native Otlet extension worker. The reference worker connects through `psql`, claims one model's bounded snapshots, runs one local GGUF with llama.cpp, and submits results through the fenced portable RPCs
 
-The first scope is one worker process, one database, and one registered model. It has no remote model API and no direct access to source or Otlet tables
+Synchronous `otlet.ask(...)`, CustomScan, and infer-now remain native-only because they require an in-process PostgreSQL worker or extension hooks. Portable callers use committed queues and the same SQL read functions
+
+Each process loads one registered model. Register a separate role and worker identity for each additional model. The worker has no remote model API and no direct access to source or Otlet tables
 
 ## Install The SQL Contract
 
@@ -82,6 +84,21 @@ WHERE job_id = :'job_id';
 
 `enqueue_ask(...)` returns `0` when queue admission rejects the request. It uses the same task, input shaping, queue limits, PostgreSQL validation, receipt, and cancellation state as other jobs
 
+## Route Across Models
+
+Register cheap and strong model workers, then use the normal selection policy:
+
+```sql
+SELECT otlet.set_model_selection_policy(
+  'vendor_summary_task',
+  'qwen3_1_7b',
+  'qwen35_4b',
+  '{"confidence_field":"confidence","accepted_confidence":["high"]}'::jsonb
+);
+```
+
+PostgreSQL assigns the cheap claim, validates its result, and either accepts it or records a rejected receipt before requeuing the same job for the strong worker. The handoff preserves the job ID, lease fencing, retry budget, receipt history, queue accounting, and status reads
+
 ## Watch Source Rows
 
 Create a row watch with automatic enqueue, then commit source changes before polling results:
@@ -116,7 +133,7 @@ WHERE name = 'vendor_note_summary';
 
 PostgreSQL queues inserts and updates in the source transaction, so the external worker sees them after commit. Portable completion stores the output and semantic materialization in one transaction. Deletes mark prior materializations stale and remove them from current-row reads. Canceled jobs do not materialize
 
-The portable installer rejects pair watches until portable candidate generation and semantic joins ship
+Pair watches use the same `create_watch(..., kind => 'pair')`, `refresh_semantic_join_index(...)`, `semantic_join_index_current_rows(...)`, and `semantic_join_index_plan(...)` functions as the native installation. Candidate preflight, bounded refresh, pair-source stale triggers, completion materialization, deletion reconciliation, watch export, and status are PostgreSQL-owned and work without the extension
 
 ## Run Deployment Preflight
 
@@ -165,7 +182,7 @@ After `./scripts/otlet-setup.sh` has placed the demo GGUF in Docker, run:
 ./scripts/otlet-portable-worker-demo.sh
 ```
 
-The script creates a disposable SQL-only database, builds the worker, runs real local inference, and checks trusted receipt lineage. It also proves pause, resume, cancellation, claim loss, process restart, database restart, reclaim, duplicate delivery, drain, source denial, and redacted structured logs before dropping the database and role
+The script creates a disposable SQL-only database, builds the worker, and runs real local inference through direct, cheap-to-strong, row-watch, and pair-watch paths. It also proves receipt lineage, semantic reads, update and delete reconciliation, pause, resume, cancellation, claim loss, process restart, database restart, reclaim, duplicate delivery, drain, source denial, and redacted structured logs before dropping the database and roles
 
 Run the isolated deployment-preflight proof:
 

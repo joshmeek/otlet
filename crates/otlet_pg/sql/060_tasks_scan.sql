@@ -526,7 +526,7 @@ AS $$
         FROM otlet.jobs j
         JOIN otlet.tasks t ON t.name = j.task_name
         WHERE j.status = 'queued'
-          AND t.model_name = $1
+          AND COALESCE(j.routed_model_name, t.model_name) = $1
       ),
     0
   )::integer
@@ -617,8 +617,10 @@ BEGIN
   WHERE name = 'default';
 
   SELECT
-    count(*) FILTER (WHERE t.model_name = task_model_name),
-    COALESCE(sum(octet_length(j.input::text)) FILTER (WHERE t.model_name = task_model_name), 0),
+    count(*) FILTER (WHERE COALESCE(j.routed_model_name, t.model_name) = task_model_name),
+    COALESCE(sum(octet_length(j.input::text)) FILTER (
+      WHERE COALESCE(j.routed_model_name, t.model_name) = task_model_name
+    ), 0),
     COALESCE(sum(octet_length(j.input::text)), 0)
   INTO queued_jobs, model_queued_bytes, total_queued_bytes
   FROM otlet.jobs j
@@ -772,8 +774,12 @@ BEGIN
      ),
      queue_state AS (
        SELECT
-         count(*) FILTER (WHERE queued_tasks.model_name = %1$L)::bigint AS model_queued_jobs,
-         COALESCE(sum(octet_length(j.input::text)) FILTER (WHERE queued_tasks.model_name = %1$L), 0)::bigint AS model_queued_bytes,
+         count(*) FILTER (
+           WHERE COALESCE(j.routed_model_name, queued_tasks.model_name) = %1$L
+         )::bigint AS model_queued_jobs,
+         COALESCE(sum(octet_length(j.input::text)) FILTER (
+           WHERE COALESCE(j.routed_model_name, queued_tasks.model_name) = %1$L
+         ), 0)::bigint AS model_queued_bytes,
          COALESCE(sum(octet_length(j.input::text)), 0)::bigint AS total_queued_bytes
        FROM otlet.jobs j
        JOIN otlet.tasks queued_tasks ON queued_tasks.name = j.task_name

@@ -166,10 +166,18 @@ BEGIN
   SELECT m.name
   INTO model_row.name
   FROM otlet.models m
-  WHERE m.name = COALESCE(fail_job.model_name, task_row.model_name);
+  WHERE m.name = COALESCE(
+    fail_job.model_name,
+    saved_job.routed_model_name,
+    task_row.model_name
+  );
   IF NOT FOUND THEN
     RAISE EXCEPTION 'otlet model % does not exist',
-      COALESCE(fail_job.model_name, task_row.model_name);
+      COALESCE(
+        fail_job.model_name,
+        saved_job.routed_model_name,
+        task_row.model_name
+      );
   END IF;
 
   IF jsonb_typeof(COALESCE(fail_job.trace_summary, '{}'::jsonb)) IS DISTINCT FROM 'object' THEN
@@ -289,7 +297,7 @@ DECLARE
   canceled_swept bigint := 0;
 BEGIN
   FOR job_row IN
-    SELECT j.id, j.task_name, j.started_at, j.created_at, j.error
+    SELECT j.*
     FROM otlet.jobs j
     CROSS JOIN otlet.production_policy p
     WHERE p.name = 'default'
@@ -299,7 +307,7 @@ BEGIN
     ORDER BY j.id
     FOR UPDATE OF j
   LOOP
-    SELECT t.model_name
+    SELECT COALESCE(job_row.routed_model_name, t.model_name)
     INTO task_row.model_name
     FROM otlet.tasks t
     WHERE t.name = job_row.task_name;
@@ -345,6 +353,15 @@ BEGIN
       schema_validation_status => 'not_run',
       started_at => COALESCE(job_row.started_at, job_row.created_at, now()),
       model_name => model_row.name,
+      selection_role => CASE
+        WHEN job_row.routed_model_name IS NOT NULL THEN 'strong'
+        WHEN EXISTS (
+          SELECT 1
+          FROM otlet.model_selection_policies selection
+          WHERE selection.task_name = job_row.task_name
+        ) THEN 'cheap'
+        ELSE 'direct'
+      END,
       selection_status => 'failed',
       selection_reason => 'job_lease_expired_after_max_attempts',
       expected_claim_token => job_row.claim_token
@@ -356,7 +373,7 @@ BEGIN
   -- Symmetric terminalization for cancel_requested rows that exhausted attempts
   -- and lost their lease (prevents infinite reclaim under nested SPI failure).
   FOR job_row IN
-    SELECT j.id, j.task_name, j.error
+    SELECT j.*
     FROM otlet.jobs j
     CROSS JOIN otlet.production_policy p
     WHERE p.name = 'default'
@@ -368,7 +385,7 @@ BEGIN
   LOOP
     -- finish_canceled_job fail-closes on missing task/model; terminalize orphans
     -- without a receipt so one corrupt row cannot abort the whole sweep.
-    SELECT t.model_name
+    SELECT COALESCE(job_row.routed_model_name, t.model_name)
     INTO task_row.model_name
     FROM otlet.tasks t
     WHERE t.name = job_row.task_name;

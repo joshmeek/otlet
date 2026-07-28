@@ -43,4 +43,4 @@ The first command must emit `preflight_passed` and exit without claiming work. T
 
 Use `otlet.set_portable_worker_control(...)` to pause, resume, or drain the process. Monitor `otlet.portable_worker_status` for heartbeat, model, queue, and lease health. The process emits one-line JSON logs without prompt or source evidence
 
-This first deployment supports one process, one database, and one model. Use a separate registered identity and role for each additional worker
+Each process loads one model. Run a separate registered identity and role for each additional model, including cheap and strong workers used by a selection policy. PostgreSQL owns routing and the atomic handoff between them

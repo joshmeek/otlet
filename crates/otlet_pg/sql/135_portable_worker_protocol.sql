@@ -68,6 +68,7 @@ CREATE TABLE otlet.portable_claims (
   protocol_version integer NOT NULL,
   runtime_identity_hash text NOT NULL,
   attempt_index integer NOT NULL CHECK (attempt_index > 0),
+  selection_role text NOT NULL CHECK (selection_role IN ('direct', 'cheap', 'strong')),
   claim_token_hash text NOT NULL UNIQUE CHECK (claim_token_hash ~ '^[0-9a-f]{64}$'),
   status text NOT NULL DEFAULT 'claimed' CHECK (
     status IN ('claimed', 'renewed', 'complete', 'failed', 'canceled', 'replaced')
@@ -398,6 +399,7 @@ CREATE FUNCTION otlet.portable_claim_jobs(
   job_id bigint,
   claim_token text,
   claim_status text,
+  selection_role text,
   attempt_index integer,
   leased_until timestamptz,
   task_name text,
@@ -423,6 +425,7 @@ DECLARE
   policy_row otlet.production_policy%ROWTYPE;
   saved_claim otlet.portable_claims%ROWTYPE;
   selected_model_policy jsonb;
+  claim_selection_role text;
 BEGIN
   IF portable_claim_jobs.requested_claim_limit IS NOT NULL
      AND portable_claim_jobs.requested_claim_limit NOT BETWEEN 1 AND 128 THEN
@@ -442,6 +445,21 @@ BEGIN
     SELECT *
     FROM otlet.claim_jobs(worker_row.model_name, portable_claim_jobs.requested_claim_limit)
   LOOP
+    SELECT t.*
+    INTO task_row
+    FROM otlet.tasks t
+    WHERE t.name = claimed_job.task_name;
+
+    claim_selection_role := CASE
+      WHEN claimed_job.routed_model_name IS NOT NULL THEN 'strong'
+      WHEN EXISTS (
+        SELECT 1
+        FROM otlet.model_selection_policies selection
+        WHERE selection.task_name = claimed_job.task_name
+      ) THEN 'cheap'
+      ELSE 'direct'
+    END;
+
     UPDATE otlet.portable_claims c
     SET status = 'replaced',
         finished_at = now()
@@ -454,6 +472,7 @@ BEGIN
       protocol_version,
       runtime_identity_hash,
       attempt_index,
+      selection_role,
       claim_token_hash
     )
     VALUES (
@@ -462,6 +481,7 @@ BEGIN
       worker_row.protocol_version,
       worker_row.runtime_identity_hash,
       claimed_job.attempts,
+      claim_selection_role,
       otlet.portable_text_hash(claimed_job.claim_token)
     )
     RETURNING * INTO saved_claim;
@@ -471,11 +491,6 @@ BEGIN
         last_heartbeat_at = now(),
         reported_state = 'running'
     WHERE w.worker_id = worker_row.worker_id;
-
-    SELECT t.*
-    INTO task_row
-    FROM otlet.tasks t
-    WHERE t.name = claimed_job.task_name;
 
     SELECT jsonb_build_object(
       'direct', jsonb_build_object(
@@ -511,6 +526,7 @@ BEGIN
     job_id := claimed_job.id;
     claim_token := claimed_job.claim_token;
     claim_status := claimed_job.status;
+    selection_role := saved_claim.selection_role;
     attempt_index := claimed_job.attempts;
     leased_until := claimed_job.leased_until;
     task_name := claimed_job.task_name;
@@ -637,6 +653,10 @@ BEGIN
     portable_record_attempt.requested_job_id,
     portable_record_attempt.requested_claim_token
   );
+  IF portable_record_attempt.selection_role IS DISTINCT FROM claim_row.selection_role
+     OR portable_record_attempt.model_name IS DISTINCT FROM worker_row.model_name THEN
+    RAISE EXCEPTION 'otlet portable attempt model or selection role is forged';
+  END IF;
   IF COALESCE(portable_record_attempt.selection_status, '') NOT IN ('rejected', 'failed') THEN
     RAISE EXCEPTION 'otlet portable attempt must be rejected or failed';
   END IF;
@@ -671,6 +691,137 @@ BEGIN
 END;
 $$;
 
+CREATE FUNCTION otlet.portable_selection_acceptance(
+  output jsonb,
+  accept_field_checks jsonb
+) RETURNS TABLE (accepted boolean, reason text)
+LANGUAGE plpgsql
+IMMUTABLE
+PARALLEL SAFE
+AS $$
+DECLARE
+  confidence_field text := NULLIF(portable_selection_acceptance.accept_field_checks ->> 'confidence_field', '');
+  answer_field text := NULLIF(portable_selection_acceptance.accept_field_checks ->> 'answer_field', '');
+  field_value text;
+BEGIN
+  IF confidence_field IS NOT NULL THEN
+    IF jsonb_typeof(portable_selection_acceptance.output -> confidence_field) IS DISTINCT FROM 'string' THEN
+      RETURN QUERY SELECT false, 'missing_confidence_field'::text;
+      RETURN;
+    END IF;
+    field_value := portable_selection_acceptance.output ->> confidence_field;
+    IF jsonb_typeof(portable_selection_acceptance.accept_field_checks -> 'accepted_confidence') = 'array'
+       AND EXISTS (
+         SELECT 1
+         FROM jsonb_array_elements(
+           portable_selection_acceptance.accept_field_checks -> 'accepted_confidence'
+         ) item(value)
+         WHERE jsonb_typeof(item.value) = 'string'
+       )
+       AND NOT EXISTS (
+         SELECT 1
+         FROM jsonb_array_elements(
+           portable_selection_acceptance.accept_field_checks -> 'accepted_confidence'
+         ) item(value)
+         WHERE jsonb_typeof(item.value) = 'string'
+           AND item.value #>> '{}' = field_value
+       ) THEN
+      RETURN QUERY SELECT false, 'confidence_below_policy'::text;
+      RETURN;
+    END IF;
+  END IF;
+
+  IF answer_field IS NULL THEN
+    RETURN QUERY SELECT true, 'accepted_by_policy'::text;
+    RETURN;
+  END IF;
+  IF jsonb_typeof(portable_selection_acceptance.output -> answer_field) IS DISTINCT FROM 'string' THEN
+    RETURN QUERY SELECT false, 'missing_decision_field'::text;
+    RETURN;
+  END IF;
+  field_value := portable_selection_acceptance.output ->> answer_field;
+  IF jsonb_typeof(portable_selection_acceptance.accept_field_checks -> 'abstain_values') = 'array'
+     AND EXISTS (
+       SELECT 1
+       FROM jsonb_array_elements(
+         portable_selection_acceptance.accept_field_checks -> 'abstain_values'
+       ) item(value)
+       WHERE jsonb_typeof(item.value) = 'string'
+         AND item.value #>> '{}' = field_value
+     ) THEN
+    RETURN QUERY SELECT false, 'abstained_output'::text;
+    RETURN;
+  END IF;
+
+  RETURN QUERY SELECT true, 'accepted_by_policy'::text;
+END;
+$$;
+
+CREATE FUNCTION otlet.requeue_portable_job_to_strong(
+  job_id bigint,
+  claim_id bigint,
+  expected_claim_token text
+) RETURNS void
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  strong_model_name text;
+  changed bigint;
+BEGIN
+  SELECT selection.strong_model_name
+  INTO strong_model_name
+  FROM otlet.jobs j
+  JOIN otlet.model_selection_policies selection ON selection.task_name = j.task_name
+  WHERE j.id = requeue_portable_job_to_strong.job_id;
+
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'otlet portable job has no strong model route';
+  END IF;
+
+  UPDATE otlet.jobs j
+  SET status = 'queued',
+      attempts = GREATEST(j.attempts - 1, 0),
+      routed_model_name = strong_model_name,
+      leased_until = NULL,
+      claim_token = NULL,
+      terminal_claim_token = NULL,
+      terminal_request_hash = NULL,
+      error = NULL,
+      finished_at = NULL,
+      cancel_requested_at = NULL
+  WHERE j.id = requeue_portable_job_to_strong.job_id
+    AND j.claim_token = requeue_portable_job_to_strong.expected_claim_token
+    AND j.status = 'running';
+  GET DIAGNOSTICS changed = ROW_COUNT;
+  IF changed <> 1 THEN
+    RAISE EXCEPTION 'otlet portable job claim is stale';
+  END IF;
+
+  UPDATE otlet.portable_claims c
+  SET status = 'replaced',
+      finished_at = COALESCE(c.finished_at, now())
+  WHERE c.id = requeue_portable_job_to_strong.claim_id;
+  PERFORM otlet.wake_worker();
+END;
+$$;
+
+CREATE FUNCTION otlet.portable_strong_selection_reason(job_id bigint)
+RETURNS text
+LANGUAGE sql
+STABLE
+PARALLEL SAFE
+AS $$
+  SELECT CASE r.selection_status
+    WHEN 'rejected' THEN 'escalated_after_cheap_rejection'
+    WHEN 'failed' THEN 'escalated_after_cheap_schema_failure'
+  END
+  FROM otlet.inference_receipts r
+  WHERE r.job_id = portable_strong_selection_reason.job_id
+    AND r.selection_role = 'cheap'
+  ORDER BY r.attempt_index DESC, r.id DESC
+  LIMIT 1
+$$;
+
 CREATE FUNCTION otlet.portable_complete_job(
   requested_worker_id text,
   requested_protocol_version integer,
@@ -702,6 +853,10 @@ AS $$
 DECLARE
   worker_row otlet.portable_workers%ROWTYPE;
   claim_row otlet.portable_claims%ROWTYPE;
+  receipt_row otlet.inference_receipts%ROWTYPE;
+  acceptance_accepted boolean;
+  acceptance_reason text;
+  current_job_status text;
 BEGIN
   worker_row := otlet.authorized_portable_worker(
     portable_complete_job.requested_worker_id,
@@ -713,6 +868,77 @@ BEGIN
     portable_complete_job.requested_job_id,
     portable_complete_job.requested_claim_token
   );
+  IF portable_complete_job.selection_role IS DISTINCT FROM claim_row.selection_role
+     OR portable_complete_job.model_name IS DISTINCT FROM worker_row.model_name THEN
+    RAISE EXCEPTION 'otlet portable completion model or selection role is forged';
+  END IF;
+
+  SELECT j.status
+  INTO current_job_status
+  FROM otlet.jobs j
+  WHERE j.id = portable_complete_job.requested_job_id;
+
+  IF portable_complete_job.selection_role = 'cheap'
+     AND current_job_status = 'running' THEN
+    PERFORM otlet.validate_portable_result(
+      portable_complete_job.requested_job_id,
+      portable_complete_job.output,
+      portable_complete_job.raw_output,
+      portable_complete_job.actions,
+      portable_complete_job.model_name,
+      portable_complete_job.selection_role,
+      portable_complete_job.prompt_hash,
+      portable_complete_job.input_hash,
+      portable_complete_job.output_schema_hash,
+      portable_complete_job.raw_output_hash,
+      portable_complete_job.trace_summary
+    );
+    SELECT accepted, reason
+    INTO acceptance_accepted, acceptance_reason
+    FROM otlet.portable_selection_acceptance(
+      portable_complete_job.output,
+      (
+        SELECT selection.accept_field_checks
+        FROM otlet.jobs j
+        JOIN otlet.model_selection_policies selection ON selection.task_name = j.task_name
+        WHERE j.id = portable_complete_job.requested_job_id
+      )
+    );
+    IF NOT acceptance_accepted THEN
+      receipt_row := otlet.record_model_attempt(
+        portable_complete_job.requested_job_id,
+        portable_complete_job.model_name,
+        output => portable_complete_job.output,
+        raw_output => portable_complete_job.raw_output,
+        prompt_hash => portable_complete_job.prompt_hash,
+        input_hash => portable_complete_job.input_hash,
+        output_schema_hash => portable_complete_job.output_schema_hash,
+        raw_output_hash => portable_complete_job.raw_output_hash,
+        started_at => portable_complete_job.started_at,
+        trace_summary => portable_complete_job.trace_summary,
+        schema_validation_status => 'passed',
+        selection_role => 'cheap',
+        selection_status => 'rejected',
+        selection_reason => acceptance_reason,
+        expected_claim_token => portable_complete_job.requested_claim_token,
+        actions => portable_complete_job.actions,
+        runtime_name => 'portable:' || worker_row.runtime_name,
+        runtime_endpoint => 'postgres_rpc'
+      );
+      PERFORM otlet.link_portable_receipt(claim_row.id, receipt_row.id);
+      PERFORM otlet.requeue_portable_job_to_strong(
+        portable_complete_job.requested_job_id,
+        claim_row.id,
+        portable_complete_job.requested_claim_token
+      );
+      job_id := portable_complete_job.requested_job_id;
+      job_status := 'queued';
+      receipt_id := receipt_row.id;
+      output_id := NULL;
+      RETURN NEXT;
+      RETURN;
+    END IF;
+  END IF;
 
   SELECT completed.id, completed.receipt_id
   INTO output_id, receipt_id
@@ -730,7 +956,15 @@ BEGIN
     model_name => portable_complete_job.model_name,
     selection_role => portable_complete_job.selection_role,
     selection_status => 'accepted',
-    selection_reason => portable_complete_job.selection_reason,
+    selection_reason => COALESCE(
+      portable_complete_job.selection_reason,
+      CASE portable_complete_job.selection_role
+        WHEN 'strong' THEN otlet.portable_strong_selection_reason(
+          portable_complete_job.requested_job_id
+        )
+      END,
+      acceptance_reason
+    ),
     expected_claim_token => portable_complete_job.requested_claim_token,
     runtime_name => 'portable:' || worker_row.runtime_name,
     runtime_endpoint => 'postgres_rpc'
@@ -789,6 +1023,8 @@ AS $$
 DECLARE
   worker_row otlet.portable_workers%ROWTYPE;
   claim_row otlet.portable_claims%ROWTYPE;
+  receipt_row otlet.inference_receipts%ROWTYPE;
+  current_job_status text;
 BEGIN
   worker_row := otlet.authorized_portable_worker(
     portable_fail_job.requested_worker_id,
@@ -800,6 +1036,54 @@ BEGIN
     portable_fail_job.requested_job_id,
     portable_fail_job.requested_claim_token
   );
+  IF portable_fail_job.selection_role IS DISTINCT FROM claim_row.selection_role
+     OR portable_fail_job.model_name IS DISTINCT FROM worker_row.model_name THEN
+    RAISE EXCEPTION 'otlet portable failure model or selection role is forged';
+  END IF;
+
+  SELECT j.status
+  INTO current_job_status
+  FROM otlet.jobs j
+  WHERE j.id = portable_fail_job.requested_job_id;
+
+  IF portable_fail_job.selection_role = 'cheap'
+     AND current_job_status = 'running'
+     AND portable_fail_job.raw_output IS NOT NULL THEN
+    receipt_row := otlet.record_model_attempt(
+      portable_fail_job.requested_job_id,
+      portable_fail_job.model_name,
+      output => portable_fail_job.candidate_output,
+      raw_output => portable_fail_job.raw_output,
+      prompt_hash => portable_fail_job.prompt_hash,
+      input_hash => portable_fail_job.input_hash,
+      output_schema_hash => portable_fail_job.output_schema_hash,
+      raw_output_hash => portable_fail_job.raw_output_hash,
+      started_at => portable_fail_job.started_at,
+      trace_summary => portable_fail_job.trace_summary,
+      schema_validation_status => portable_fail_job.schema_validation_status,
+      selection_role => 'cheap',
+      selection_status => 'failed',
+      selection_reason => COALESCE(
+        portable_fail_job.selection_reason,
+        'cheap_attempt_failed'
+      ),
+      error => portable_fail_job.error,
+      expected_claim_token => portable_fail_job.requested_claim_token,
+      runtime_name => 'portable:' || worker_row.runtime_name,
+      runtime_endpoint => 'postgres_rpc'
+    );
+    PERFORM otlet.link_portable_receipt(claim_row.id, receipt_row.id);
+    PERFORM otlet.requeue_portable_job_to_strong(
+      portable_fail_job.requested_job_id,
+      claim_row.id,
+      portable_fail_job.requested_claim_token
+    );
+    job_id := portable_fail_job.requested_job_id;
+    job_status := 'queued';
+    receipt_id := receipt_row.id;
+    RETURN NEXT;
+    RETURN;
+  END IF;
 
   SELECT failed.id, failed.status
   INTO job_id, job_status
@@ -817,7 +1101,14 @@ BEGIN
     model_name => portable_fail_job.model_name,
     selection_role => portable_fail_job.selection_role,
     selection_status => portable_fail_job.selection_status,
-    selection_reason => portable_fail_job.selection_reason,
+    selection_reason => COALESCE(
+      portable_fail_job.selection_reason,
+      CASE portable_fail_job.selection_role
+        WHEN 'strong' THEN otlet.portable_strong_selection_reason(
+          portable_fail_job.requested_job_id
+        )
+      END
+    ),
     candidate_output => portable_fail_job.candidate_output,
     expected_claim_token => portable_fail_job.requested_claim_token,
     runtime_name => 'portable:' || worker_row.runtime_name,
@@ -934,7 +1225,7 @@ SELECT
     SELECT count(*)
     FROM otlet.jobs queued_job
     JOIN otlet.tasks queued_task ON queued_task.name = queued_job.task_name
-    WHERE queued_task.model_name = w.model_name
+    WHERE COALESCE(queued_job.routed_model_name, queued_task.model_name) = w.model_name
       AND queued_job.status = 'queued'
   ) AS queued_jobs,
   count(c.id) AS claims,
@@ -982,13 +1273,19 @@ SELECT
   c.protocol_version,
   c.runtime_identity_hash,
   c.attempt_index,
-  c.status AS claim_status,
+  c.selection_role,
+  CASE
+    WHEN c.status IN ('claimed', 'renewed')
+      AND j.status IN ('complete', 'failed', 'canceled') THEN j.status
+    ELSE c.status
+  END AS claim_status,
   j.status AS job_status,
   j.task_name,
   j.subject_id,
   j.leased_until,
   CASE
-    WHEN c.status NOT IN ('claimed', 'renewed') THEN 'terminal'
+    WHEN c.status NOT IN ('claimed', 'renewed')
+      OR j.status IN ('complete', 'failed', 'canceled') THEN 'terminal'
     WHEN j.leased_until IS NULL OR j.leased_until < now() THEN 'expired'
     ELSE 'live'
   END AS lease_health,

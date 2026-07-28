@@ -128,10 +128,18 @@ BEGIN
   SELECT m.name
   INTO model_row.name
   FROM otlet.models m
-  WHERE m.name = COALESCE(complete_job.model_name, task_row.model_name);
+  WHERE m.name = COALESCE(
+    complete_job.model_name,
+    job_row.routed_model_name,
+    task_row.model_name
+  );
   IF NOT FOUND THEN
     RAISE EXCEPTION 'otlet model % does not exist',
-      COALESCE(complete_job.model_name, task_row.model_name);
+      COALESCE(
+        complete_job.model_name,
+        job_row.routed_model_name,
+        task_row.model_name
+      );
   END IF;
 
   -- Fail before mutating job/receipt state on a bad envelope.

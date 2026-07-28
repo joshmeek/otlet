@@ -191,6 +191,28 @@ fn process_job_deferred(
         mark_jobs_started(std::slice::from_ref(job));
     }
 
+    if job.selection_role == "strong" {
+        return match policy_cache.get(&job.task_name) {
+            Ok(Some(policy)) => {
+                run_strong_attempt_with_model(job, &policy.strong, "cheap_attempt_rejected")
+            }
+            Ok(None) => fail_attempt_result_with_model(
+                job,
+                job.model_name.as_str(),
+                &ModelError::new("strong_fallback_missing_policy"),
+                "strong",
+                "strong_fallback_missing_policy",
+            ),
+            Err(err) => fail_attempt_result_with_model(
+                job,
+                job.model_name.as_str(),
+                &ModelError::new(format!("strong fallback policy lookup failed: {err}")),
+                "strong",
+                "strong_fallback_policy_lookup_failed",
+            ),
+        };
+    }
+
     match policy_cache.get(&job.task_name) {
         Ok(Some(policy)) => process_selected_job(job, policy),
         Ok(None) => process_direct_job(job),

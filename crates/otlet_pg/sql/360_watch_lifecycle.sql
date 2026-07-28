@@ -214,10 +214,6 @@ BEGIN
   IF actual_kind NOT IN ('row', 'pair') THEN
     RAISE EXCEPTION 'otlet watch kind % must be row or pair', create_watch.kind;
   END IF;
-  IF actual_kind = 'pair'
-     AND otlet.worker_wake_state() ->> 'state' = 'portable_external_worker' THEN
-    RAISE EXCEPTION 'otlet portable SQL installation supports row watches only';
-  END IF;
   IF jsonb_typeof(create_watch.output_schema) IS DISTINCT FROM 'object' THEN
     RAISE EXCEPTION 'otlet watch output_schema must be a JSON object';
   END IF;

@@ -2,9 +2,6 @@
 
 | Feature | Explanation |
 | --- | --- |
-| Portable pair watches and semantic joins | Add bounded candidate generation, pair-source change tracking, completion materialization, semantic join reads, and status to SQL-only PostgreSQL |
-| Portable model routing | Route jobs across registered portable workers and support cheap-to-strong escalation without granting worker roles direct table access |
-| Portable conformance | Extend the isolated portable smoke test across inference, watches, materialization, model routing, cancellation, restart, and failure paths |
 | GPU and alternate CPU execution | Run models on GPUs and distinct CPU paths while preserving receipts, quality checks, memory bounds, cancellation, and fallback |
 | Batching and speculative decoding | Improve throughput while keeping worker memory and PostgreSQL responsiveness bounded |
 | Multi-model residency | Keep more than one useful model resident and schedule jobs by model without starving tasks |

@@ -102,8 +102,11 @@ BEGIN
       p.max_queued_jobs_per_model
     FROM otlet.production_policy p
     JOIN otlet.models m ON true
-    LEFT JOIN otlet.tasks t ON t.model_name = m.name
-    LEFT JOIN otlet.jobs j ON j.task_name = t.name AND j.status = 'queued'
+    LEFT JOIN otlet.tasks t ON true
+    LEFT JOIN otlet.jobs j
+      ON j.task_name = t.name
+     AND COALESCE(j.routed_model_name, t.model_name) = m.name
+     AND j.status = 'queued'
     GROUP BY m.name, p.max_queued_jobs_per_model
   ) q
   WHERE q.queued_jobs > q.max_queued_jobs_per_model;
@@ -124,8 +127,11 @@ BEGIN
       p.max_queued_input_bytes_per_model
     FROM otlet.production_policy p
     CROSS JOIN otlet.models m
-    LEFT JOIN otlet.tasks t ON t.model_name = m.name
-    LEFT JOIN otlet.jobs j ON j.task_name = t.name AND j.status = 'queued'
+    LEFT JOIN otlet.tasks t ON true
+    LEFT JOIN otlet.jobs j
+      ON j.task_name = t.name
+     AND COALESCE(j.routed_model_name, t.model_name) = m.name
+     AND j.status = 'queued'
     GROUP BY m.name, p.max_queued_input_bytes_per_model
   ) q
   WHERE q.queued_input_bytes > q.max_queued_input_bytes_per_model;

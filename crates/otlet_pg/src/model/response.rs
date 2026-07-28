@@ -128,6 +128,7 @@ mod output_tests {
             artifact_hash: "artifact".to_owned(),
             artifact_identity: json!({"sha256": "artifact", "bytes": 1}),
             model_name: "test_model".to_owned(),
+            selection_role: "direct".to_owned(),
             runtime_options: json!({"reasoning": "off"}),
             input_shaping: json!({"include": ["value"]}),
             decision_contract: json!({"answer_field": "decision"}),
