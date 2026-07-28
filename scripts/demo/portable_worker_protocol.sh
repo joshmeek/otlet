@@ -185,7 +185,7 @@ SELECT 'portable_snapshot_contract=' || count(*)::text || '|' ||
        bool_and(input_snapshot ? 'allowed')::text || '|' ||
        bool_and(NOT (input_snapshot ? 'secret'))::text || '|' ||
        bool_and(octet_length(input_snapshot::text) <= (evidence_limits ->> 'max_input_bytes')::bigint)::text || '|' ||
-       bool_and(model_policy #>> '{direct,name}' = :'model_name')::text
+       bool_and(model ->> 'name' = :'model_name')::text
 FROM portable_demo_claims;
 
 SELECT 'portable_renew_contract=' || job_status || '|' || (leased_until > now())::text
@@ -204,8 +204,6 @@ FROM otlet.portable_record_attempt(
   pg_catalog.current_setting('otlet.demo_portable_identity_hash'),
   (SELECT job_id FROM portable_demo_claims WHERE subject_id = 'complete'),
   (SELECT claim_token FROM portable_demo_claims WHERE subject_id = 'complete'),
-  :'model_name',
-  'direct',
   'rejected',
   'portable protocol rejected attempt',
   '{"status":"ok"}'::jsonb,
@@ -225,8 +223,7 @@ FROM otlet.portable_complete_job(
   '{"status":"ok"}'::jsonb,
   '{"output":{"status":"ok"},"actions":[]}',
   '[]'::jsonb,
-  trace_summary => '{"schema_validation_status":"failed"}'::jsonb,
-  model_name => :'model_name'
+  trace_summary => '{"schema_validation_status":"failed"}'::jsonb
 );
 
 SELECT 'portable_duplicate_delivery_contract=' || job_status || '|' ||
@@ -240,8 +237,7 @@ FROM otlet.portable_complete_job(
   '{"status":"ok"}'::jsonb,
   '{"output":{"status":"ok"},"actions":[]}',
   '[]'::jsonb,
-  trace_summary => '{"schema_validation_status":"failed"}'::jsonb,
-  model_name => :'model_name'
+  trace_summary => '{"schema_validation_status":"failed"}'::jsonb
 );
 
 SELECT 'portable_fail_contract=' || job_status || '|' || (receipt_id IS NOT NULL)::text
@@ -252,8 +248,7 @@ FROM otlet.portable_fail_job(
   (SELECT job_id FROM portable_demo_claims WHERE subject_id = 'fail'),
   (SELECT claim_token FROM portable_demo_claims WHERE subject_id = 'fail'),
   'portable worker failure',
-  schema_validation_status => 'not_run',
-  model_name => :'model_name'
+  schema_validation_status => 'not_run'
 );
 
 SELECT 'portable_cancel_contract=' || job_status || '|' || (receipt_id IS NOT NULL)::text

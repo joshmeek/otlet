@@ -30,7 +30,7 @@ struct Claim {
     prompt: String,
     prompt_hash: String,
     runtime_options: Value,
-    model_policy: Value,
+    model: Value,
     evidence_limits: Value,
 }
 
@@ -258,7 +258,7 @@ impl Database {
                'prompt', c.prompt, \
                'prompt_hash', c.prompt_hash, \
                'runtime_options', c.runtime_options, \
-               'model_policy', c.model_policy, \
+               'model', c.model, \
                'evidence_limits', c.evidence_limits\
              )::text \
              FROM otlet.portable_claim_jobs({}, {}, {}, 1) c;\n",
@@ -306,8 +306,7 @@ impl Database {
             "SELECT job_status \
              FROM otlet.portable_complete_job(\
                {}, {}, {}, {}, {}, {}::jsonb, {}, {}::jsonb, \
-               prompt_hash => {}, trace_summary => {}::jsonb, model_name => {}, \
-               selection_role => {}\
+               prompt_hash => {}, trace_summary => {}::jsonb\
              );\n",
             sql_text(&config.worker_id),
             config.protocol_version,
@@ -318,9 +317,7 @@ impl Database {
             sql_text(raw_output),
             sql_text(&actions.to_string()),
             sql_text(&claim.prompt_hash),
-            sql_text(&trace_summary.to_string()),
-            sql_text(&config.model_name),
-            sql_text(&claim.selection_role)
+            sql_text(&trace_summary.to_string())
         );
         let rows = self.terminal_query(&sql)?;
         match rows.as_slice() {
@@ -351,7 +348,7 @@ impl Database {
                {}, {}, {}, {}, {}, {}, raw_output => {}, \
                prompt_hash => {}, schema_validation_status => 'failed', \
                trace_summary => '{{\"trace_version\":\"otlet_portable_worker_trace_v1\",\"schema_validation_status\":\"failed\"}}'::jsonb, \
-               model_name => {}, selection_role => {}, candidate_output => {}\
+               candidate_output => {}\
              );\n",
             sql_text(&config.worker_id),
             config.protocol_version,
@@ -361,8 +358,6 @@ impl Database {
             sql_text(error),
             raw,
             sql_text(&claim.prompt_hash),
-            sql_text(&config.model_name),
-            sql_text(&claim.selection_role),
             candidate
         );
         let rows = self.terminal_query(&sql)?;
@@ -935,13 +930,9 @@ fn process_claim(
     if !matches!(claim.selection_role.as_str(), "direct" | "cheap" | "strong") {
         return Err("portable claim selection role is invalid".to_owned());
     }
-    let Some(selected_model) = claim
-        .model_policy
-        .get(&claim.selection_role)
-        .and_then(Value::as_object)
-    else {
-        let state = database.fail(config, claim, "portable_model_policy_missing", None, None)?;
-        log_failure_state(&state, claim, "model_policy_missing");
+    let Some(selected_model) = claim.model.as_object() else {
+        let state = database.fail(config, claim, "portable_model_identity_missing", None, None)?;
+        log_failure_state(&state, claim, "model_identity_missing");
         return Ok(());
     };
     if selected_model.get("name").and_then(Value::as_str) != Some(config.model_name.as_str())

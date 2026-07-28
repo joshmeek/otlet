@@ -730,10 +730,10 @@ docker exec -i "$container" psql -U postgres -d "$portable_database" \
 SELECT otlet.run_task('portable_claim_fence_demo');
 SQL
 
-claim_fence_contract="$(
+claim_metadata_contract="$(
   docker exec -i \
     -e "PGPASSWORD=$cheap_worker_password" \
-    -e "PGOPTIONS=-c otlet.probe_worker_id=$cheap_worker_id -c otlet.probe_runtime_hash=$runtime_identity_hash -c otlet.probe_cheap_model=$cheap_model_name -c otlet.probe_strong_model=$model_name" \
+    -e "PGOPTIONS=-c otlet.probe_worker_id=$cheap_worker_id -c otlet.probe_runtime_hash=$runtime_identity_hash -c otlet.probe_cheap_model=$cheap_model_name" \
     "$container" \
     psql -h 127.0.0.1 -U "$cheap_worker_role" -d "$portable_database" \
     -X -qAt -v ON_ERROR_STOP=1 <<'SQL'
@@ -741,10 +741,6 @@ DO $$
 DECLARE
   claim_row record;
   cleanup_status text;
-  role_blocked boolean := false;
-  model_blocked boolean := false;
-  attempt_blocked boolean := false;
-  failure_blocked boolean := false;
 BEGIN
   SELECT *
   INTO claim_row
@@ -754,94 +750,9 @@ BEGIN
     current_setting('otlet.probe_runtime_hash'),
     1
   );
-  IF claim_row.selection_role IS DISTINCT FROM 'cheap' THEN
-    RAISE EXCEPTION 'expected a cheap portable claim';
-  END IF;
-
-  BEGIN
-    PERFORM *
-    FROM otlet.portable_complete_job(
-      current_setting('otlet.probe_worker_id'),
-      1,
-      current_setting('otlet.probe_runtime_hash'),
-      claim_row.job_id,
-      claim_row.claim_token,
-      '{"decision":"keep"}'::jsonb,
-      '{"decision":"keep"}',
-      model_name => current_setting('otlet.probe_cheap_model'),
-      selection_role => 'direct'
-    );
-  EXCEPTION WHEN OTHERS THEN
-    IF SQLERRM = 'otlet portable completion model or selection role is forged' THEN
-      role_blocked := true;
-    ELSE
-      RAISE;
-    END IF;
-  END;
-
-  BEGIN
-    PERFORM *
-    FROM otlet.portable_complete_job(
-      current_setting('otlet.probe_worker_id'),
-      1,
-      current_setting('otlet.probe_runtime_hash'),
-      claim_row.job_id,
-      claim_row.claim_token,
-      '{"decision":"keep"}'::jsonb,
-      '{"decision":"keep"}',
-      model_name => current_setting('otlet.probe_strong_model'),
-      selection_role => 'cheap'
-    );
-  EXCEPTION WHEN OTHERS THEN
-    IF SQLERRM = 'otlet portable completion model or selection role is forged' THEN
-      model_blocked := true;
-    ELSE
-      RAISE;
-    END IF;
-  END;
-
-  BEGIN
-    PERFORM *
-    FROM otlet.portable_record_attempt(
-      current_setting('otlet.probe_worker_id'),
-      1,
-      current_setting('otlet.probe_runtime_hash'),
-      claim_row.job_id,
-      claim_row.claim_token,
-      current_setting('otlet.probe_strong_model'),
-      'cheap',
-      'failed'
-    );
-  EXCEPTION WHEN OTHERS THEN
-    IF SQLERRM = 'otlet portable attempt model or selection role is forged' THEN
-      attempt_blocked := true;
-    ELSE
-      RAISE;
-    END IF;
-  END;
-
-  BEGIN
-    PERFORM *
-    FROM otlet.portable_fail_job(
-      current_setting('otlet.probe_worker_id'),
-      1,
-      current_setting('otlet.probe_runtime_hash'),
-      claim_row.job_id,
-      claim_row.claim_token,
-      'forged failure',
-      model_name => current_setting('otlet.probe_cheap_model'),
-      selection_role => 'direct'
-    );
-  EXCEPTION WHEN OTHERS THEN
-    IF SQLERRM = 'otlet portable failure model or selection role is forged' THEN
-      failure_blocked := true;
-    ELSE
-      RAISE;
-    END IF;
-  END;
-
-  IF NOT role_blocked OR NOT model_blocked OR NOT attempt_blocked OR NOT failure_blocked THEN
-    RAISE EXCEPTION 'portable claim fence accepted forged terminal metadata';
+  IF claim_row.selection_role IS DISTINCT FROM 'cheap'
+     OR claim_row.model ->> 'name' IS DISTINCT FROM current_setting('otlet.probe_cheap_model') THEN
+    RAISE EXCEPTION 'portable claim returned incorrect model metadata';
   END IF;
 
   SELECT job_status
@@ -852,23 +763,21 @@ BEGIN
     current_setting('otlet.probe_runtime_hash'),
     claim_row.job_id,
     claim_row.claim_token,
-    'claim fence probe cleanup',
-    raw_output => '{"output":{"decision":"keep"},"actions":[]}',
-    model_name => current_setting('otlet.probe_cheap_model'),
-    selection_role => 'cheap'
+    'claim metadata probe cleanup',
+    raw_output => '{"output":{"decision":"keep"},"actions":[]}'
   );
   IF cleanup_status IS DISTINCT FROM 'queued' THEN
-    RAISE EXCEPTION 'portable claim fence cleanup did not requeue';
+    RAISE EXCEPTION 'portable claim metadata cleanup did not requeue';
   END IF;
 END;
 $$;
-SELECT 'role=blocked|model=blocked|attempt=blocked|failure=blocked|queued';
+SELECT 'cheap|' || current_setting('otlet.probe_cheap_model') || '|queued';
 SQL
 )"
-claim_fence_contract+="|$(
+claim_metadata_contract+="|$(
   docker exec -i "$container" psql -U postgres -d "$portable_database" \
-    -X -qAt -v ON_ERROR_STOP=1 <<'SQL'
-SELECT id AS forgery_job_id
+    -X -qAt -v ON_ERROR_STOP=1 -v cheap_model_name="$cheap_model_name" <<'SQL'
+SELECT id AS metadata_job_id
 FROM otlet.jobs
 WHERE task_name = 'portable_claim_fence_demo'
   AND subject_id = 'routing-live'
@@ -876,7 +785,7 @@ ORDER BY id DESC
 LIMIT 1
 \gset
 SELECT status AS cancellation_status
-FROM otlet.request_job_cancellation(:'forgery_job_id'::bigint, 'claim fence probe cleanup')
+FROM otlet.request_job_cancellation(:'metadata_job_id'::bigint, 'claim metadata probe cleanup')
 \gset
 SELECT concat_ws('|',
   :'cancellation_status',
@@ -884,7 +793,15 @@ SELECT concat_ws('|',
   claim.claim_status,
   receipt.model_name,
   receipt.selection_role,
-  receipt.status
+  receipt.status,
+  (
+    SELECT count(*)
+    FROM otlet.inference_receipts attempted
+    WHERE attempted.job_id = claim.job_id
+      AND attempted.model_name = :'cheap_model_name'
+      AND attempted.selection_role = 'cheap'
+      AND attempted.status = 'failed'
+  )
 )
 FROM otlet.portable_claim_status claim
 CROSS JOIN LATERAL (
@@ -894,11 +811,11 @@ CROSS JOIN LATERAL (
   ORDER BY r.id DESC
   LIMIT 1
 ) receipt
-WHERE claim.job_id = :'forgery_job_id'::bigint;
+WHERE claim.job_id = :'metadata_job_id'::bigint;
 SQL
 )"
-if [ "$claim_fence_contract" != "role=blocked|model=blocked|attempt=blocked|failure=blocked|queued|canceled|cheap|replaced|$model_name|strong|canceled" ]; then
-  echo "Expected the portable claim fence to preserve its assigned role and cleanly cancel, got $claim_fence_contract" >&2
+if [ "$claim_metadata_contract" != "cheap|$cheap_model_name|queued|canceled|cheap|replaced|$model_name|strong|canceled|1" ]; then
+  echo "Expected portable RPCs to preserve server-owned model metadata, got $claim_metadata_contract" >&2
   exit 1
 fi
 
@@ -935,9 +852,7 @@ BEGIN
     current_setting('otlet.probe_runtime_hash'),
     claim_row.job_id,
     claim_row.claim_token,
-    'cheap runtime failure',
-    model_name => current_setting('otlet.probe_cheap_model'),
-    selection_role => 'cheap'
+    'cheap runtime failure'
   );
   IF claim_row.selection_role IS DISTINCT FROM 'cheap'
      OR failure_status IS DISTINCT FROM 'failed' THEN
@@ -1569,7 +1484,7 @@ fi
 
 echo "portable_async_inference_contract=$async_queued_contract|$async_result_contract|admission=closed|input=validated|scalar_non_watch=accepted"
 echo "portable_model_routing_contract=$routing_handoff_contract|$routing_complete_contract|$routing_accept_contract"
-echo "portable_claim_fence_contract=$claim_fence_contract"
+echo "portable_claim_metadata_contract=$claim_metadata_contract"
 echo "portable_selection_failure_contract=$routing_failure_contract"
 echo "portable_routed_recovery_contract=$routed_recovery_contract"
 echo "portable_row_watch_contract=$watch_queued_contract|$watch_insert_contract|$watch_update_contract|$watch_delete_contract|$watch_cancel_contract|$watch_restart_contract"

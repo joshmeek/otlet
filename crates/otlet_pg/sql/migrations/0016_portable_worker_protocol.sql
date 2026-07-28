@@ -411,7 +411,7 @@ CREATE FUNCTION otlet.portable_claim_jobs(
   input_snapshot jsonb,
   prompt text,
   prompt_hash text,
-  model_policy jsonb,
+  model jsonb,
   evidence_limits jsonb
 )
 LANGUAGE plpgsql
@@ -424,7 +424,7 @@ DECLARE
   task_row otlet.tasks%ROWTYPE;
   policy_row otlet.production_policy%ROWTYPE;
   saved_claim otlet.portable_claims%ROWTYPE;
-  selected_model_policy jsonb;
+  selected_model jsonb;
   claim_selection_role text;
 BEGIN
   IF portable_claim_jobs.requested_claim_limit IS NOT NULL
@@ -493,33 +493,13 @@ BEGIN
     WHERE w.worker_id = worker_row.worker_id;
 
     SELECT jsonb_build_object(
-      'direct', jsonb_build_object(
-        'name', direct_model.name,
-        'artifact_hash', direct_model.artifact_hash,
-        'artifact_identity', direct_model.artifact_identity
-      )
-    ) || CASE
-      WHEN selection.task_name IS NULL THEN '{}'::jsonb
-      ELSE jsonb_build_object(
-        'cheap', jsonb_build_object(
-          'name', cheap_model.name,
-          'artifact_hash', cheap_model.artifact_hash,
-          'artifact_identity', cheap_model.artifact_identity
-        ),
-        'strong', jsonb_build_object(
-          'name', strong_model.name,
-          'artifact_hash', strong_model.artifact_hash,
-          'artifact_identity', strong_model.artifact_identity
-        ),
-        'accept_field_checks', selection.accept_field_checks
-      )
-    END
-    INTO selected_model_policy
-    FROM otlet.models direct_model
-    LEFT JOIN otlet.model_selection_policies selection ON selection.task_name = task_row.name
-    LEFT JOIN otlet.models cheap_model ON cheap_model.name = selection.cheap_model_name
-    LEFT JOIN otlet.models strong_model ON strong_model.name = selection.strong_model_name
-    WHERE direct_model.name = task_row.model_name;
+      'name', m.name,
+      'artifact_hash', m.artifact_hash,
+      'artifact_identity', m.artifact_identity
+    )
+    INTO selected_model
+    FROM otlet.models m
+    WHERE m.name = worker_row.model_name;
 
     protocol_version := worker_row.protocol_version;
     worker_id := worker_row.worker_id;
@@ -544,7 +524,7 @@ BEGIN
       task_row.decision_contract
     );
     prompt_hash := otlet.portable_text_hash(prompt);
-    model_policy := selected_model_policy;
+    model := selected_model;
     evidence_limits := jsonb_build_object(
       'max_input_bytes', policy_row.max_input_bytes_per_job,
       'max_raw_output_bytes', policy_row.max_raw_output_bytes,
@@ -614,8 +594,6 @@ CREATE FUNCTION otlet.portable_record_attempt(
   requested_runtime_identity_hash text,
   requested_job_id bigint,
   requested_claim_token text,
-  model_name text,
-  selection_role text,
   selection_status text,
   selection_reason text DEFAULT NULL,
   output jsonb DEFAULT NULL,
@@ -653,17 +631,13 @@ BEGIN
     portable_record_attempt.requested_job_id,
     portable_record_attempt.requested_claim_token
   );
-  IF portable_record_attempt.selection_role IS DISTINCT FROM claim_row.selection_role
-     OR portable_record_attempt.model_name IS DISTINCT FROM worker_row.model_name THEN
-    RAISE EXCEPTION 'otlet portable attempt model or selection role is forged';
-  END IF;
   IF COALESCE(portable_record_attempt.selection_status, '') NOT IN ('rejected', 'failed') THEN
     RAISE EXCEPTION 'otlet portable attempt must be rejected or failed';
   END IF;
 
   receipt_row := otlet.record_model_attempt(
     portable_record_attempt.requested_job_id,
-    portable_record_attempt.model_name,
+    worker_row.model_name,
     output => portable_record_attempt.output,
     raw_output => portable_record_attempt.raw_output,
     prompt_hash => portable_record_attempt.prompt_hash,
@@ -673,7 +647,7 @@ BEGIN
     started_at => portable_record_attempt.started_at,
     trace_summary => portable_record_attempt.trace_summary,
     schema_validation_status => portable_record_attempt.schema_validation_status,
-    selection_role => portable_record_attempt.selection_role,
+    selection_role => claim_row.selection_role,
     selection_status => portable_record_attempt.selection_status,
     selection_reason => portable_record_attempt.selection_reason,
     error => portable_record_attempt.error,
@@ -836,8 +810,6 @@ CREATE FUNCTION otlet.portable_complete_job(
   output_schema_hash text DEFAULT NULL,
   raw_output_hash text DEFAULT NULL,
   trace_summary jsonb DEFAULT '{}'::jsonb,
-  model_name text DEFAULT NULL,
-  selection_role text DEFAULT 'direct',
   selection_reason text DEFAULT NULL,
   started_at timestamptz DEFAULT NULL
 ) RETURNS TABLE (
@@ -868,25 +840,20 @@ BEGIN
     portable_complete_job.requested_job_id,
     portable_complete_job.requested_claim_token
   );
-  IF portable_complete_job.selection_role IS DISTINCT FROM claim_row.selection_role
-     OR portable_complete_job.model_name IS DISTINCT FROM worker_row.model_name THEN
-    RAISE EXCEPTION 'otlet portable completion model or selection role is forged';
-  END IF;
-
   SELECT j.status
   INTO current_job_status
   FROM otlet.jobs j
   WHERE j.id = portable_complete_job.requested_job_id;
 
-  IF portable_complete_job.selection_role = 'cheap'
+  IF claim_row.selection_role = 'cheap'
      AND current_job_status = 'running' THEN
     PERFORM otlet.validate_portable_result(
       portable_complete_job.requested_job_id,
       portable_complete_job.output,
       portable_complete_job.raw_output,
       portable_complete_job.actions,
-      portable_complete_job.model_name,
-      portable_complete_job.selection_role,
+      worker_row.model_name,
+      claim_row.selection_role,
       portable_complete_job.prompt_hash,
       portable_complete_job.input_hash,
       portable_complete_job.output_schema_hash,
@@ -907,7 +874,7 @@ BEGIN
     IF NOT acceptance_accepted THEN
       receipt_row := otlet.record_model_attempt(
         portable_complete_job.requested_job_id,
-        portable_complete_job.model_name,
+        worker_row.model_name,
         output => portable_complete_job.output,
         raw_output => portable_complete_job.raw_output,
         prompt_hash => portable_complete_job.prompt_hash,
@@ -953,12 +920,12 @@ BEGIN
     raw_output_hash => portable_complete_job.raw_output_hash,
     started_at => portable_complete_job.started_at,
     trace_summary => portable_complete_job.trace_summary,
-    model_name => portable_complete_job.model_name,
-    selection_role => portable_complete_job.selection_role,
+    model_name => worker_row.model_name,
+    selection_role => claim_row.selection_role,
     selection_status => 'accepted',
     selection_reason => COALESCE(
       portable_complete_job.selection_reason,
-      CASE portable_complete_job.selection_role
+      CASE claim_row.selection_role
         WHEN 'strong' THEN otlet.portable_strong_selection_reason(
           portable_complete_job.requested_job_id
         )
@@ -1009,8 +976,6 @@ CREATE FUNCTION otlet.portable_fail_job(
   raw_output_hash text DEFAULT NULL,
   schema_validation_status text DEFAULT NULL,
   trace_summary jsonb DEFAULT '{}'::jsonb,
-  model_name text DEFAULT NULL,
-  selection_role text DEFAULT 'direct',
   selection_status text DEFAULT 'failed',
   selection_reason text DEFAULT NULL,
   candidate_output jsonb DEFAULT NULL,
@@ -1036,22 +1001,17 @@ BEGIN
     portable_fail_job.requested_job_id,
     portable_fail_job.requested_claim_token
   );
-  IF portable_fail_job.selection_role IS DISTINCT FROM claim_row.selection_role
-     OR portable_fail_job.model_name IS DISTINCT FROM worker_row.model_name THEN
-    RAISE EXCEPTION 'otlet portable failure model or selection role is forged';
-  END IF;
-
   SELECT j.status
   INTO current_job_status
   FROM otlet.jobs j
   WHERE j.id = portable_fail_job.requested_job_id;
 
-  IF portable_fail_job.selection_role = 'cheap'
+  IF claim_row.selection_role = 'cheap'
      AND current_job_status = 'running'
      AND portable_fail_job.raw_output IS NOT NULL THEN
     receipt_row := otlet.record_model_attempt(
       portable_fail_job.requested_job_id,
-      portable_fail_job.model_name,
+      worker_row.model_name,
       output => portable_fail_job.candidate_output,
       raw_output => portable_fail_job.raw_output,
       prompt_hash => portable_fail_job.prompt_hash,
@@ -1098,12 +1058,12 @@ BEGIN
     started_at => portable_fail_job.started_at,
     schema_validation_status => portable_fail_job.schema_validation_status,
     trace_summary => portable_fail_job.trace_summary,
-    model_name => portable_fail_job.model_name,
-    selection_role => portable_fail_job.selection_role,
+    model_name => worker_row.model_name,
+    selection_role => claim_row.selection_role,
     selection_status => portable_fail_job.selection_status,
     selection_reason => COALESCE(
       portable_fail_job.selection_reason,
-      CASE portable_fail_job.selection_role
+      CASE claim_row.selection_role
         WHEN 'strong' THEN otlet.portable_strong_selection_reason(
           portable_fail_job.requested_job_id
         )

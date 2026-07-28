@@ -697,11 +697,7 @@ BEGIN
     actual_options::text || chr(10) ||
     input_fields::text
   ), 1, 24);
-  direct_subject_id := 'ask_' || substr(md5(
-    clock_timestamp()::text || chr(10) ||
-    random()::text || chr(10) ||
-    actual_input::text
-  ), 1, 24);
+  direct_subject_id := 'ask_' || gen_random_uuid()::text;
 
   PERFORM otlet.create_task(
     direct_task_name,

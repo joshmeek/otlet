@@ -1,3 +1,7 @@
+SELECT substring(:'portable_migration_file' FROM '([0-9]{4})_[^/]+$')::integer
+  AS portable_migration_version
+\gset
+
 SELECT NOT EXISTS (
   SELECT 1
   FROM otlet.portable_schema_migrations
