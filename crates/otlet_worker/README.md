@@ -1,6 +1,6 @@
 # Portable Worker
 
-The portable worker covers Otlet's asynchronous SQL surface: one-off inference, row and pair watches, model-selection escalation, materialization, semantic reads and predicates, receipts, actions, evaluation, status, cleanup, export, cancellation, and restart recovery
+The portable worker runs one-off inference, model routing, and row or pair watches through Otlet's asynchronous SQL surface. Portable jobs reuse the existing materialization, read, action, status, audit, cleanup, cancellation, and recovery functions
 
 Use this path when PostgreSQL allows ordinary SQL but cannot load the native Otlet extension worker. The reference worker connects through `psql`, claims one model's bounded snapshots, runs one local GGUF with llama.cpp, and submits results through the fenced portable RPCs
 
@@ -97,7 +97,7 @@ SELECT otlet.set_model_selection_policy(
 );
 ```
 
-PostgreSQL assigns the cheap claim, validates its result, and either accepts it or records a rejected receipt before requeuing the same job for the strong worker. The handoff preserves the job ID, lease fencing, retry budget, receipt history, queue accounting, and status reads
+PostgreSQL assigns the cheap claim, validates the result, and completes accepted output. It records rejected output in a receipt and requeues the same job for the strong worker. PostgreSQL preserves the job ID, lease fence, retry budget, receipt history, queue accounting, and status reads
 
 ## Watch Source Rows
 
