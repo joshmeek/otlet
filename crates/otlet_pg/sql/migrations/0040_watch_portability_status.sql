@@ -391,12 +391,26 @@ WITH watch_sources AS (
     COALESCE(revision.definition #> '{source,pair_sources}', '[]'::jsonb) AS pair_sources,
     revision.definition #>> '{source,record_type}' AS record_type,
     revision.definition #>> '{models,direct,name}' AS model_name,
-    join_index.candidate_plan,
-    join_index.candidate_plan_cost,
-    join_index.candidate_preflight_at,
-    otlet.source_query_contract_error(
-      revision.definition #> '{source,query_contract}'
-    ) AS source_dependency_error,
+    revision.candidate_plan,
+    revision.candidate_plan_cost,
+    revision.candidate_preflight_at,
+    current_preflight.candidate_plan AS current_candidate_plan,
+    current_preflight.candidate_plan_cost AS current_candidate_plan_cost,
+    current_preflight.candidate_preflight_at AS current_candidate_preflight_at,
+    CASE
+      WHEN revision.candidate_plan IS NULL OR current_preflight.candidate_plan IS NULL THEN false
+      ELSE revision.candidate_plan IS DISTINCT FROM current_preflight.candidate_plan
+    END AS candidate_plan_drift,
+    CASE
+      WHEN revision.definition #>> '{source,kind}' <> 'pair' THEN NULL
+      WHEN dependency.error IS NOT NULL THEN 'suspended'
+      ELSE current_preflight.candidate_preflight_status
+    END AS candidate_preflight_status,
+    COALESCE(
+      dependency.error,
+      current_preflight.candidate_preflight_error
+    ) AS candidate_preflight_error,
+    dependency.error AS source_dependency_error,
     COALESCE(w.stale_policy, 'refresh_then_fail_closed') AS stale_policy,
     COALESCE(w.trigger_policy, '{"on_change":"mark_stale"}'::jsonb) AS trigger_policy,
     COALESCE(w.selection_policy, '{}'::jsonb) AS selection_policy
@@ -407,8 +421,16 @@ WITH watch_sources AS (
   LEFT JOIN otlet.watches w
     ON w.task_name = head.task_name
    AND w.name = revision.definition #>> '{source,watch_name}'
-  LEFT JOIN otlet.semantic_join_indexes join_index
-    ON join_index.name = revision.definition #>> '{source,semantic_join_index_name}'
+  LEFT JOIN LATERAL (
+    SELECT otlet.source_query_contract_error(
+      revision.definition #> '{source,query_contract}'
+    ) AS error
+  ) dependency ON true
+  LEFT JOIN LATERAL otlet.preflight_candidate_query(
+    revision.definition #>> '{source,candidate_query}',
+    false
+  ) current_preflight
+    ON revision.definition #>> '{source,kind}' = 'pair'
   WHERE revision.definition #>> '{source,kind}' IN ('row', 'pair')
 ), watch_plans AS (
   SELECT w.watch_name, p.*
@@ -426,6 +448,7 @@ WITH watch_sources AS (
     FROM watch_sources
     WHERE kind = 'pair'
       AND source_dependency_error IS NULL
+      AND candidate_preflight_status = 'ready'
   ) w
   JOIN LATERAL otlet.semantic_join_index_plan(w.semantic_join_index_name) p ON true
 ), watch_revisions AS (
@@ -501,6 +524,12 @@ SELECT
   w.candidate_plan,
   w.candidate_plan_cost,
   w.candidate_preflight_at,
+  w.current_candidate_plan,
+  w.current_candidate_plan_cost,
+  w.current_candidate_preflight_at,
+  w.candidate_plan_drift,
+  w.candidate_preflight_status,
+  w.candidate_preflight_error,
   w.stale_policy,
   w.trigger_policy,
   w.selection_policy,
@@ -513,8 +542,13 @@ SELECT
   COALESCE(plan.inflight_subjects, 0)::bigint AS inflight_subjects,
   COALESCE(plan.queue_subjects, 0)::bigint AS queue_subjects,
   COALESCE(plan.fail_closed_subjects, 0)::bigint AS fail_closed_subjects,
-  CASE WHEN w.source_dependency_error IS NULL THEN plan.selected_path ELSE 'suspended' END AS selected_path,
-  COALESCE(w.source_dependency_error, plan.reason) AS reason,
+  CASE
+    WHEN w.source_dependency_error IS NULL
+     AND COALESCE(w.candidate_preflight_status, 'ready') = 'ready'
+      THEN plan.selected_path
+    ELSE 'suspended'
+  END AS selected_path,
+  COALESCE(w.source_dependency_error, w.candidate_preflight_error, plan.reason) AS reason,
   COALESCE(plan.stale_reasons, '{}'::jsonb) AS stale_reasons,
   COALESCE(plan.freshness, 0)::numeric AS freshness,
   COALESCE(plan.worker_queue_depth, 0)::bigint AS worker_queue_depth,

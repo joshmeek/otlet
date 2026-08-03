@@ -1116,6 +1116,7 @@ BEGIN
           )
           ELSE NULL
         END,
+        'candidate_overflow_policy', CASE WHEN w.kind = 'pair' THEN 'reject' END,
         'pair_sources', w.pair_sources,
         'max_candidate_rows', w.max_candidate_rows,
         'record_type', w.record_type
@@ -1141,6 +1142,7 @@ BEGIN
           t.source_query_contract #>> '{query,resolved}',
           sji.candidate_query
         ),
+        'candidate_overflow_policy', 'reject',
         'max_candidate_rows', sji.max_candidate_rows,
         'record_type', sji.record_type
       )
@@ -1276,6 +1278,10 @@ BEGIN
      OR NEW.definition #>> '{task,input_relation,order}' IS DISTINCT FROM 'subject_id_collate_c_asc' THEN
     RAISE EXCEPTION 'otlet workload revision input relation contract is invalid';
   END IF;
+  IF NEW.definition #>> '{source,kind}' = 'pair'
+     AND NEW.definition #>> '{source,candidate_overflow_policy}' IS DISTINCT FROM 'reject' THEN
+    RAISE EXCEPTION 'otlet workload revision candidate overflow policy is invalid';
+  END IF;
   IF NEW.workload_revision_hash IS DISTINCT FROM otlet.identity_hash(
     'workload_revision',
     NEW.definition
@@ -1341,6 +1347,9 @@ DECLARE
   revision_definition jsonb;
   revision_hash text;
   stored_definition jsonb;
+  candidate_plan jsonb;
+  candidate_plan_cost numeric;
+  candidate_preflight_at timestamptz;
 BEGIN
   revision_definition := otlet.current_workload_revision_definition(
     capture_workload_revision.task_name
@@ -1349,16 +1358,35 @@ BEGIN
     RAISE EXCEPTION 'otlet task % does not exist', capture_workload_revision.task_name;
   END IF;
 
+  IF revision_definition #>> '{source,kind}' = 'pair' THEN
+    SELECT
+      preflight.candidate_plan,
+      preflight.candidate_plan_cost,
+      preflight.candidate_preflight_at
+    INTO candidate_plan, candidate_plan_cost, candidate_preflight_at
+    FROM otlet.preflight_candidate_query(
+      revision_definition #>> '{source,candidate_query}',
+      true,
+      false
+    ) preflight;
+  END IF;
+
   revision_hash := otlet.identity_hash('workload_revision', revision_definition);
   INSERT INTO otlet.workload_revisions (
     workload_revision_hash,
     task_name,
-    definition
+    definition,
+    candidate_plan,
+    candidate_plan_cost,
+    candidate_preflight_at
   )
   VALUES (
     revision_hash,
     capture_workload_revision.task_name,
-    revision_definition
+    revision_definition,
+    candidate_plan,
+    candidate_plan_cost,
+    candidate_preflight_at
   )
   ON CONFLICT (workload_revision_hash) DO NOTHING;
 
@@ -1439,7 +1467,6 @@ LANGUAGE plpgsql
 AS $$
 DECLARE
   active_hash text;
-  target_definition jsonb;
 BEGIN
   PERFORM 1
   FROM otlet.production_policy policy
@@ -1449,17 +1476,9 @@ BEGIN
     hashtextextended('otlet_workload_revision:' || promote_workload_revision.task_name, 0)
   );
 
-  SELECT revision.definition
-  INTO target_definition
-    FROM otlet.workload_revisions revision
-    WHERE revision.task_name = promote_workload_revision.task_name
-      AND revision.workload_revision_hash = promote_workload_revision.target_workload_revision_hash;
-  IF NOT FOUND THEN
-    RAISE EXCEPTION 'otlet workload revision does not belong to task %', promote_workload_revision.task_name;
-  END IF;
-  PERFORM otlet.source_query_contract_guard(
-    target_definition #> '{source,query_contract}',
-    true
+  PERFORM otlet.require_workload_source_contract(
+    promote_workload_revision.task_name,
+    promote_workload_revision.target_workload_revision_hash
   );
 
   SELECT head.active_workload_revision_hash
@@ -1551,6 +1570,9 @@ DECLARE
   repaired_definition jsonb;
   raw_search_path text := current_setting('search_path');
   repaired_hash text;
+  candidate_plan jsonb;
+  candidate_plan_cost numeric;
+  candidate_preflight_at timestamptz;
   repaired_relation regclass;
   pair_source jsonb;
   watch_row otlet.watches%ROWTYPE;
@@ -1636,15 +1658,34 @@ BEGIN
   END IF;
   PERFORM set_config('search_path', raw_search_path, true);
 
+  IF repaired_definition #>> '{source,kind}' = 'pair' THEN
+    SELECT
+      preflight.candidate_plan,
+      preflight.candidate_plan_cost,
+      preflight.candidate_preflight_at
+    INTO candidate_plan, candidate_plan_cost, candidate_preflight_at
+    FROM otlet.preflight_candidate_query(
+      repaired_definition #>> '{source,candidate_query}',
+      true,
+      false
+    ) preflight;
+  END IF;
+
   repaired_hash := otlet.identity_hash('workload_revision', repaired_definition);
   INSERT INTO otlet.workload_revisions (
     workload_revision_hash,
     task_name,
-    definition
+    definition,
+    candidate_plan,
+    candidate_plan_cost,
+    candidate_preflight_at
   ) VALUES (
     repaired_hash,
     repair_source_query_contract.task_name,
-    repaired_definition
+    repaired_definition,
+    candidate_plan,
+    candidate_plan_cost,
+    candidate_preflight_at
   )
   ON CONFLICT (workload_revision_hash) DO NOTHING;
 
@@ -1836,6 +1877,12 @@ BEGIN
   IF revision_definition #>> '{source,kind}' NOT IN ('row', 'pair')
      OR NULLIF(revision_definition #>> '{task,input_query}', '') IS NULL THEN
     RETURN 0;
+  END IF;
+
+  IF revision_definition #>> '{source,kind}' = 'pair' THEN
+    RETURN otlet.materialize_semantic_join_index(
+      revision_definition #>> '{source,semantic_join_index_name}'
+    );
   END IF;
 
   RETURN otlet.materialize_semantic_records(

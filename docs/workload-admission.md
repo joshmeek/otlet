@@ -16,7 +16,11 @@ The default production policy sets these limits:
 
 `otlet.model_queue_status`, `otlet.production_policy_status`, and `otlet.production_status` expose current limits and queue bytes. `otlet.verify_invariants()` checks queue depth, per-job bytes, per-model bytes, and total bytes
 
-Pair-watch creation runs `EXPLAIN (FORMAT JSON)` without executing candidate rows. Otlet stores the plan, total cost, and preflight timestamp on the semantic join index and rejects invalid or over-cost plans before watch mutation
+Pair-watch creation runs `EXPLAIN (FORMAT JSON)` without executing candidate rows. Otlet stores the accepted plan, total cost, and preflight timestamp on the immutable workload revision and rejects invalid or over-cost plans before watch mutation
+
+Every pair execution revalidates source dependencies and reruns plan-cost preflight. `otlet.watch_status` keeps the accepted revision evidence separate from the current read-only plan, reports drift and current preflight status, and suspends the watch when the live plan exceeds policy. Source-query repair must capture fresh accepted evidence before it can promote a revision
+
+Candidate execution reads one row past `max_candidate_rows`. Otlet rejects overflow before it returns rows, creates jobs, or reconciles removed candidates. This makes `candidate_removed` evidence depend on a complete candidate set rather than a truncated top-N result
 
 Postgres cannot arm `statement_timeout` from inside the statement already executing. Set it in the session or in a transaction before every pair refresh:
 

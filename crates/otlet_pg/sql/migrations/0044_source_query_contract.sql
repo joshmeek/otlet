@@ -1228,10 +1228,10 @@ LANGUAGE plpgsql
 VOLATILE
 AS $$
 DECLARE
-  query_contract jsonb;
+  revision_definition jsonb;
 BEGIN
-  SELECT revision.definition #> '{source,query_contract}'
-  INTO query_contract
+  SELECT revision.definition
+  INTO revision_definition
   FROM otlet.workload_revisions revision
   WHERE revision.task_name = require_workload_source_contract.task_name
     AND revision.workload_revision_hash = require_workload_source_contract.workload_revision_hash;
@@ -1239,6 +1239,17 @@ BEGIN
     RAISE EXCEPTION 'otlet workload revision is missing for task %',
       require_workload_source_contract.task_name;
   END IF;
-  PERFORM otlet.source_query_contract_guard(query_contract, true);
+  PERFORM otlet.source_query_contract_guard(
+    revision_definition #> '{source,query_contract}',
+    true
+  );
+  IF revision_definition #>> '{source,kind}' = 'pair' THEN
+    PERFORM preflight.candidate_plan
+    FROM otlet.preflight_candidate_query(
+      revision_definition #>> '{source,candidate_query}',
+      true,
+      false
+    ) preflight;
+  END IF;
 END;
 $$;

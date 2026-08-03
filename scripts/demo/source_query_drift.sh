@@ -835,6 +835,7 @@ DO $body$
 DECLARE
   proof source_query_drift_proof%ROWTYPE;
   running_claim_token text;
+  isolated_claim otlet.jobs%ROWTYPE;
 BEGIN
   SELECT * INTO proof FROM source_query_drift_proof;
   IF EXISTS (
@@ -842,6 +843,16 @@ BEGIN
   ) THEN
     RAISE EXCEPTION 'drifted queued job was claimable';
   END IF;
+
+  INSERT INTO otlet.jobs (task_name, subject_id, input)
+  VALUES ('source_query_constant', 'claim-isolation', '{}'::jsonb);
+  SELECT * INTO isolated_claim
+  FROM otlet.claim_jobs('source_query_drift_model', 1);
+  IF isolated_claim.task_name IS DISTINCT FROM 'source_query_constant'
+     OR isolated_claim.subject_id IS DISTINCT FROM 'claim-isolation' THEN
+    RAISE EXCEPTION 'drifted revision blocked an unrelated healthy claim';
+  END IF;
+  DELETE FROM otlet.jobs WHERE id = isolated_claim.id;
 
   SELECT claim_token
   INTO running_claim_token
@@ -1084,10 +1095,14 @@ DO $body$
 DECLARE
   old_revision text;
   repaired_revision text;
+  candidate_preflight_before timestamptz;
 BEGIN
-  SELECT head.active_workload_revision_hash
-  INTO old_revision
+  SELECT head.active_workload_revision_hash, revision.candidate_preflight_at
+  INTO old_revision, candidate_preflight_before
   FROM otlet.workload_revision_heads head
+  JOIN otlet.workload_revisions revision
+    ON revision.task_name = head.task_name
+   AND revision.workload_revision_hash = head.active_workload_revision_hash
   WHERE head.task_name = 'source_query_pair_repair_task';
   repaired_revision := otlet.repair_source_query_contract(
     'source_query_pair_repair_task',
@@ -1095,6 +1110,17 @@ BEGIN
   );
   IF repaired_revision IS NULL OR repaired_revision = old_revision THEN
     RAISE EXCEPTION 'pair relation recreation repair did not create a revision';
+  END IF;
+  IF NOT EXISTS (
+    SELECT 1
+    FROM otlet.workload_revisions revision
+    WHERE revision.task_name = 'source_query_pair_repair_task'
+      AND revision.workload_revision_hash = repaired_revision
+      AND revision.candidate_plan IS NOT NULL
+      AND revision.candidate_plan_cost IS NOT NULL
+      AND revision.candidate_preflight_at > candidate_preflight_before
+  ) THEN
+    RAISE EXCEPTION 'pair source repair did not capture fresh candidate preflight evidence';
   END IF;
   IF NOT EXISTS (
     SELECT 1
@@ -1114,7 +1140,7 @@ BEGIN
 END
 $body$;
 
-SELECT 'pair=exact|writer=rejected|binding=qualified|relation=suspended|schema=suspended|privilege=suspended|rls=suspended|function=suspended|customscan=cached_fail_closed|lifecycle=fail_closed|repair=promoted|repair_config=isolated|triggers=restored';
+SELECT 'pair=exact|writer=rejected|binding=qualified|relation=suspended|schema=suspended|privilege=suspended|rls=suspended|function=suspended|customscan=cached_fail_closed|lifecycle=fail_closed|repair=promoted|repair_config=isolated|triggers=restored|pair_preflight=rerun';
 
 ROLLBACK;
 SQL

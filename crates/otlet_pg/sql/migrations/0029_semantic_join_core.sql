@@ -41,16 +41,9 @@ BEGIN
       semantic_join_refresh_inputs.index_name;
   END IF;
 
-  PERFORM otlet.require_workload_source_contract(
-    revision_definition #>> '{task,name}',
-    requested_revision_hash
-  );
-
   index_row.name := revision_definition #>> '{source,semantic_join_index_name}';
   index_row.task_name := revision_definition #>> '{task,name}';
-  index_row.candidate_query := revision_definition #>> '{source,candidate_query}';
   index_row.record_type := revision_definition #>> '{source,record_type}';
-  index_row.max_candidate_rows := (revision_definition #>> '{source,max_candidate_rows}')::integer;
   current_input_shaping := revision_definition #> '{task,input_shaping}';
   current_contract_hash := requested_revision_hash;
 
@@ -61,7 +54,7 @@ BEGIN
           candidate.subject_id,
           candidate.input,
           otlet.semantic_content_hash(candidate.input, %6$L::jsonb) AS content_hash
-        FROM otlet.validated_task_input_rows(%1$L, %2$s) candidate
+        FROM otlet.semantic_join_candidate_rows(%1$L, %2$L) candidate
       ),
       candidate_materializations AS (
         SELECT
@@ -150,8 +143,8 @@ BEGIN
       )
       ORDER BY ci.subject_id COLLATE "C"
     $sql$,
-    index_row.candidate_query,
-    index_row.max_candidate_rows,
+    index_row.name,
+    current_contract_hash,
     index_row.task_name,
     index_row.record_type,
     current_contract_hash,
@@ -182,6 +175,7 @@ DECLARE
   bounded_rows integer := GREATEST(1, LEAST(COALESCE(max_candidate_rows, 1000), 100000));
   candidate_plan jsonb;
   candidate_plan_cost numeric;
+  candidate_preflight_at timestamptz;
 BEGIN
   IF index_name !~ '^[a-z0-9][a-z0-9_-]*$' THEN
     RAISE EXCEPTION 'otlet semantic join index name % must be a simple identifier', index_name;
@@ -191,8 +185,11 @@ BEGIN
     RAISE EXCEPTION 'otlet semantic join index name % creates invalid task name %', index_name, semantic_task_name;
   END IF;
 
-  SELECT preflight.candidate_plan, preflight.candidate_plan_cost
-  INTO candidate_plan, candidate_plan_cost
+  SELECT
+    preflight.candidate_plan,
+    preflight.candidate_plan_cost,
+    preflight.candidate_preflight_at
+  INTO candidate_plan, candidate_plan_cost, candidate_preflight_at
   FROM otlet.preflight_candidate_query(candidate_query) preflight;
 
   PERFORM otlet.create_task(
@@ -228,7 +225,7 @@ BEGIN
     bounded_rows,
     candidate_plan,
     candidate_plan_cost,
-    now(),
+    candidate_preflight_at,
     now()
   )
   ON CONFLICT (name) DO UPDATE
@@ -316,11 +313,13 @@ DECLARE
   input_query text;
   refreshed bigint;
   revision_definition jsonb;
+  active_revision_hash text;
 BEGIN
   SELECT
     revision.definition #>> '{source,semantic_join_index_name}',
-    revision.definition #>> '{task,name}'
-  INTO index_row.name, index_row.task_name
+    revision.definition #>> '{task,name}',
+    head.active_workload_revision_hash
+  INTO index_row.name, index_row.task_name, active_revision_hash
   FROM otlet.workload_revision_heads head
   JOIN otlet.workload_revisions revision
     ON revision.task_name = head.task_name
@@ -337,17 +336,15 @@ BEGIN
   INTO revision_definition
   FROM otlet.active_workload_revision(index_row.task_name) active;
   index_row.record_type := revision_definition #>> '{source,record_type}';
-  index_row.candidate_query := revision_definition #>> '{source,candidate_query}';
-  index_row.max_candidate_rows := (revision_definition #>> '{source,max_candidate_rows}')::integer;
   index_row.name := revision_definition #>> '{source,semantic_join_index_name}';
 
   input_query := format(
     $sql$
       SELECT subject_id, input
-      FROM otlet.validated_task_input_rows(%1$L, %2$s)
+      FROM otlet.semantic_join_candidate_rows(%1$L, %2$L)
     $sql$,
-    index_row.candidate_query,
-    index_row.max_candidate_rows
+    index_row.name,
+    active_revision_hash
   );
 
   refreshed := otlet.materialize_semantic_records(
@@ -401,18 +398,16 @@ BEGIN
   INTO revision_definition
   FROM otlet.active_workload_revision(index_row.task_name) active;
   index_row.record_type := revision_definition #>> '{source,record_type}';
-  index_row.candidate_query := revision_definition #>> '{source,candidate_query}';
-  index_row.max_candidate_rows := (revision_definition #>> '{source,max_candidate_rows}')::integer;
   index_row.name := revision_definition #>> '{source,semantic_join_index_name}';
 
   input_query := format(
     $sql$
       SELECT subject_id, input
-      FROM otlet.validated_task_input_rows(%1$L, %2$s)
+      FROM otlet.semantic_join_candidate_rows(%1$L, %2$L)
       WHERE subject_id = %3$L
     $sql$,
-    index_row.candidate_query,
-    index_row.max_candidate_rows,
+    index_row.name,
+    active_revision_hash,
     materialize_semantic_join_index_subject.subject_id
   );
 

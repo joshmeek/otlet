@@ -219,22 +219,22 @@ AS $$
     CROSS JOIN policy p
   ),
   locked_tasks AS MATERIALIZED (
-    SELECT task.*
+    SELECT task.*, revision.definition
     FROM same_model_tasks task
     JOIN otlet.workload_revision_heads head
       ON head.task_name = task.task_name
      AND head.active_workload_revision_hash = task.workload_revision_hash
+    JOIN otlet.workload_revisions revision
+      ON revision.task_name = task.task_name
+     AND revision.workload_revision_hash = task.workload_revision_hash
     ORDER BY task.task_rank
     FOR UPDATE OF head
   ),
   guarded_tasks AS MATERIALIZED (
     SELECT task.*
     FROM locked_tasks task
-    JOIN otlet.workload_revisions revision
-      ON revision.task_name = task.task_name
-     AND revision.workload_revision_hash = task.workload_revision_hash
     WHERE otlet.source_query_contract_guard(
-      revision.definition #> '{source,query_contract}',
+      task.definition #> '{source,query_contract}',
       true
     )::text = ''
   ),

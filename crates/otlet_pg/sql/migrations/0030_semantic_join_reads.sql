@@ -22,17 +22,13 @@ BEGIN
   SELECT
     revision.definition #>> '{source,semantic_join_index_name}',
     revision.definition #>> '{task,name}',
-    revision.definition #>> '{source,candidate_query}',
     revision.definition #>> '{source,record_type}',
-    (revision.definition #>> '{source,max_candidate_rows}')::integer,
     head.active_workload_revision_hash,
     revision.definition #> '{task,input_shaping}'
   INTO
     index_row.name,
     index_row.task_name,
-    index_row.candidate_query,
     index_row.record_type,
-    index_row.max_candidate_rows,
     current_contract_hash,
     current_input_shaping
   FROM otlet.workload_revision_heads head
@@ -46,8 +42,6 @@ BEGIN
     RAISE EXCEPTION 'otlet semantic join index % does not exist', semantic_join_index_current_rows.index_name;
   END IF;
 
-  PERFORM otlet.require_workload_source_contract(index_row.task_name, current_contract_hash);
-
   IF semantic_join_index_current_rows.expected_workload_revision_hash IS NOT NULL
      AND semantic_join_index_current_rows.expected_workload_revision_hash IS DISTINCT FROM current_contract_hash THEN
     RAISE EXCEPTION 'otlet workload revision changed during semantic read for index %', index_row.name;
@@ -57,14 +51,14 @@ BEGIN
     $sql$
       WITH raw_inputs AS (
         SELECT subject_id, input
-        FROM otlet.validated_task_input_rows(%1$L, %2$s)
+        FROM otlet.semantic_join_candidate_rows(%1$L, %4$L)
       ),
       current_inputs AS (
         SELECT
           subject_id,
           input,
           otlet.semantic_source_hash(input) AS source_hash,
-          otlet.semantic_content_hash(input, %7$L::jsonb) AS content_hash
+          otlet.semantic_content_hash(input, %6$L::jsonb) AS content_hash
         FROM raw_inputs
       ),
       latest AS (
@@ -82,14 +76,14 @@ BEGIN
         FROM current_inputs ci
         JOIN otlet.semantic_materializations sm
           ON sm.subject_id = ci.subject_id
-        WHERE sm.task_name = %3$L
-          AND sm.record_type = %4$L
-          AND sm.contract_hash = %5$L
+        WHERE sm.task_name = %2$L
+          AND sm.record_type = %3$L
+          AND sm.contract_hash = %4$L
         ORDER BY
           sm.subject_id,
           (
             sm.content_hash IS NOT DISTINCT FROM ci.content_hash
-            AND sm.contract_hash IS NOT DISTINCT FROM %5$L
+            AND sm.contract_hash IS NOT DISTINCT FROM %4$L
           ) DESC,
           sm.updated_at DESC,
           sm.id DESC
@@ -113,17 +107,16 @@ BEGIN
         latest.stale_reason,
         latest.source_hash,
         ci.content_hash,
-        %5$L,
+        %4$L,
         ci.source_hash
       ) status
       WHERE (
-        NOT %6$s
+        NOT %5$s
         OR status.is_fresh
       )
       ORDER BY latest.subject_id
     $sql$,
-    index_row.candidate_query,
-    index_row.max_candidate_rows,
+    index_row.name,
     index_row.task_name,
     index_row.record_type,
     current_contract_hash,
@@ -154,17 +147,13 @@ BEGIN
   SELECT
     revision.definition #>> '{source,semantic_join_index_name}',
     revision.definition #>> '{task,name}',
-    revision.definition #>> '{source,candidate_query}',
     revision.definition #>> '{source,record_type}',
-    (revision.definition #>> '{source,max_candidate_rows}')::integer,
     head.active_workload_revision_hash,
     revision.definition #> '{task,input_shaping}'
   INTO
     index_row.name,
     index_row.task_name,
-    index_row.candidate_query,
     index_row.record_type,
-    index_row.max_candidate_rows,
     current_contract_hash,
     current_input_shaping
   FROM otlet.workload_revision_heads head
@@ -178,13 +167,11 @@ BEGIN
     RAISE EXCEPTION 'otlet semantic join index % does not exist', semantic_join_matches.index_name;
   END IF;
 
-  PERFORM otlet.require_workload_source_contract(index_row.task_name, current_contract_hash);
-
   current_input := otlet.task_subject_input(
     format(
-      'SELECT subject_id, input FROM otlet.validated_task_input_rows(%L, %s)',
-      index_row.candidate_query,
-      index_row.max_candidate_rows
+      'SELECT subject_id, input FROM otlet.semantic_join_candidate_rows(%L, %L)',
+      index_row.name,
+      current_contract_hash
     ),
     semantic_join_matches.subject_id
   );

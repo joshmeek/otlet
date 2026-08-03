@@ -45,6 +45,117 @@ echo "candidate_preflight_contract=$candidate_preflight_contract"
   exit 1
 }
 
+candidate_plan_drift_contract="$(psql_candidate_value -v model_name="$cheap_model_name" <<'SQL'
+BEGIN;
+
+CREATE TABLE public.otlet_candidate_plan_drift_demo (
+  subject_id text PRIMARY KEY,
+  input jsonb NOT NULL,
+  eligible boolean NOT NULL
+);
+INSERT INTO public.otlet_candidate_plan_drift_demo (subject_id, input, eligible)
+SELECT
+  'candidate-' || i,
+  jsonb_build_object('value', i),
+  true
+FROM generate_series(1, 8) candidate(i);
+
+SELECT otlet.create_watch(
+  watch_name => 'candidate_plan_drift_demo',
+  kind => 'pair',
+  instruction => 'Return an empty object',
+  output_schema => '{"type":"object"}'::jsonb,
+  model_name => :'model_name',
+  candidate_query => $query$
+    SELECT subject_id, input
+    FROM public.otlet_candidate_plan_drift_demo
+    WHERE eligible
+  $query$,
+  max_candidate_rows => 16,
+  input_shaping => '{"source_fields":["value"]}'::jsonb,
+  pair_sources => '[{
+    "table":"public.otlet_candidate_plan_drift_demo",
+    "subject_column":"subject_id"
+  }]'::jsonb
+) \g /dev/null
+
+SET LOCAL seq_page_cost = 1000;
+
+CREATE TEMP TABLE candidate_plan_ready AS
+SELECT
+  revision.candidate_plan IS NOT NULL
+    AND revision.candidate_plan_cost IS NOT NULL
+    AND revision.candidate_preflight_at IS NOT NULL AS stored,
+  status.source_dependency_status,
+  status.candidate_plan_drift,
+  status.candidate_preflight_status,
+  status.candidate_plan IS DISTINCT FROM status.current_candidate_plan AS distinct_plans,
+  revision.candidate_plan_cost AS accepted_candidate_plan_cost,
+  status.current_candidate_plan_cost
+FROM otlet.watch_status status
+JOIN otlet.workload_revision_heads head ON head.task_name = status.task_name
+JOIN otlet.workload_revisions revision
+  ON revision.task_name = head.task_name
+ AND revision.workload_revision_hash = head.active_workload_revision_hash
+WHERE status.watch_name = 'candidate_plan_drift_demo';
+
+UPDATE otlet.production_policy
+SET max_candidate_query_cost = (
+  SELECT accepted_candidate_plan_cost
+  FROM candidate_plan_ready
+)
+WHERE name = 'default';
+
+CREATE TEMP TABLE candidate_plan_rejected AS
+SELECT
+  candidate_preflight_status,
+  selected_path,
+  candidate_preflight_error
+FROM otlet.watch_status
+WHERE watch_name = 'candidate_plan_drift_demo';
+
+DO $body$
+BEGIN
+  BEGIN
+    PERFORM otlet.refresh_semantic_join_index('candidate_plan_drift_demo');
+    RAISE EXCEPTION 'over-cost candidate refresh succeeded';
+  EXCEPTION WHEN OTHERS THEN
+    IF position('candidate query plan cost' IN SQLERRM) = 0 THEN
+      RAISE;
+    END IF;
+  END;
+END
+$body$;
+
+SELECT concat_ws('|',
+  ready.stored,
+  ready.source_dependency_status,
+  ready.candidate_plan_drift,
+  ready.candidate_preflight_status,
+  ready.distinct_plans,
+  ready.current_candidate_plan_cost > ready.accepted_candidate_plan_cost,
+  rejected.candidate_preflight_status,
+  rejected.selected_path,
+  position('candidate query plan cost' IN rejected.candidate_preflight_error) > 0,
+  NOT EXISTS (
+    SELECT 1 FROM otlet.jobs WHERE task_name = 'candidate_plan_drift_demo_task'
+  ),
+  NOT EXISTS (
+    SELECT 1 FROM otlet.semantic_materializations
+    WHERE task_name = 'candidate_plan_drift_demo_task'
+  )
+)
+FROM candidate_plan_ready ready
+CROSS JOIN candidate_plan_rejected rejected;
+ROLLBACK;
+SQL
+)"
+echo "candidate_plan_drift_contract=$candidate_plan_drift_contract"
+[ "$candidate_plan_drift_contract" = "t|ready|t|ready|t|t|rejected|suspended|t|t|t" ] || {
+  echo "Expected immutable prior and live candidate plan drift evidence, got $candidate_plan_drift_contract" >&2
+  exit 1
+}
+
 set +e
 invalid_candidate_output="$(psql_exec -qAt 2>&1 <<'SQL'
 SELECT *

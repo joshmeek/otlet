@@ -344,27 +344,6 @@ VALUES
   ('a', '{"value":1}'),
   ('b', '{"value":2}'),
   ('c', '{"value":3}');
-CREATE TEMP TABLE input_relation_pair_first AS
-SELECT string_agg(subject_id, ',' ORDER BY ordinality) AS subject_ids
-FROM otlet.semantic_join_refresh_inputs('input_relation_pair_demo') WITH ORDINALITY
-  AS candidate(subject_id, input, ordinality);
-
-DELETE FROM public.otlet_input_relation_pair_demo;
-INSERT INTO public.otlet_input_relation_pair_demo (subject_id, input)
-VALUES
-  ('c', '{"value":3}'),
-  ('a', '{"value":1}'),
-  ('b', '{"value":2}');
-CREATE TEMP TABLE input_relation_pair_second AS
-SELECT string_agg(subject_id, ',' ORDER BY ordinality) AS subject_ids
-FROM otlet.semantic_join_refresh_inputs('input_relation_pair_demo') WITH ORDINALITY
-  AS candidate(subject_id, input, ordinality);
-
-SELECT pg_temp.assert_true(
-  (SELECT subject_ids FROM input_relation_pair_first) = 'a'
-  AND (SELECT subject_ids FROM input_relation_pair_second) = 'a',
-  'pair cap was applied before deterministic validation and ordering'
-) \g /dev/null
 
 WITH revision AS (
   SELECT revision.workload_revision_hash, revision.definition
@@ -406,22 +385,67 @@ SELECT
 FROM revision
 CROSS JOIN seeded_record;
 
-SELECT pg_temp.assert_true(
-  NOT otlet.semantic_join_matches(
+SELECT pg_temp.expect_error(
+  $$SELECT * FROM otlet.semantic_join_refresh_inputs('input_relation_pair_demo')$$,
+  'candidate query for semantic join index input_relation_pair_demo exceeds max_candidate_rows 1'
+) \g /dev/null
+SELECT pg_temp.expect_error(
+  $$SELECT otlet.semantic_join_matches(
     'input_relation_pair_demo',
     'b',
     '{"match":"seeded"}'::jsonb
+  )$$,
+  'candidate query for semantic join index input_relation_pair_demo exceeds max_candidate_rows 1'
+) \g /dev/null
+SELECT pg_temp.assert_true(
+  (
+    SELECT NOT stale AND stale_reason IS NULL
+    FROM otlet.semantic_materializations
+    WHERE task_name = 'input_relation_pair_demo_task'
+      AND subject_id = 'b'
+  )
+  AND NOT EXISTS (
+    SELECT 1
+    FROM otlet.jobs
+    WHERE task_name = 'input_relation_pair_demo_task'
   ),
-  'pair lookup admitted a subject outside the deterministic cap'
+  'candidate overflow changed jobs or unseen materialization state'
 ) \g /dev/null
 
-SELECT 'canonical_order|null_and_duplicates|active_conflict|row_unique_key|pair_cap_order';
+DELETE FROM public.otlet_input_relation_pair_demo
+WHERE subject_id <> 'b';
+UPDATE otlet.tasks
+SET instruction = 'Return an empty object after promotion'
+WHERE name = 'input_relation_pair_demo_task';
+SELECT otlet.promote_configured_workload_revision(
+  'input_relation_pair_demo_task'
+) \g /dev/null
+SELECT pg_temp.assert_true(
+  (SELECT active_workload_revision_hash
+   FROM otlet.workload_revision_heads
+   WHERE task_name = 'input_relation_pair_demo_task') <>
+    (SELECT revision_hash FROM pg_temp.input_relation_pair_revision)
+  AND otlet.current_task_subject_content_hash(
+      'input_relation_pair_demo_task',
+      'b',
+      (SELECT revision_hash FROM pg_temp.input_relation_pair_revision)
+    ) = otlet.semantic_content_hash(
+      '{"value":2}'::jsonb,
+      (SELECT revision.definition #> '{task,input_shaping}'
+       FROM otlet.workload_revisions revision
+       JOIN pg_temp.input_relation_pair_revision saved
+         ON saved.revision_hash = revision.workload_revision_hash)
+    ),
+  'superseded pair revision could not read its candidate set'
+) \g /dev/null
+
+SELECT 'canonical_order|null_and_duplicates|active_conflict|row_unique_key|pair_overflow|pair_history';
 ROLLBACK;
 SQL
 )"
 
 echo "input_relation_contract=$input_relation_contract"
-[ "$input_relation_contract" = "canonical_order|null_and_duplicates|active_conflict|row_unique_key|pair_cap_order" ] || {
+[ "$input_relation_contract" = "canonical_order|null_and_duplicates|active_conflict|row_unique_key|pair_overflow|pair_history" ] || {
   echo "Expected deterministic input relation contract, got $input_relation_contract" >&2
   exit 1
 }

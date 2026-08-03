@@ -156,7 +156,29 @@ CREATE TABLE otlet.workload_revisions (
   ),
   task_name text NOT NULL REFERENCES otlet.tasks(name),
   definition jsonb NOT NULL CHECK (jsonb_typeof(definition) = 'object'),
+  candidate_plan jsonb CHECK (
+    candidate_plan IS NULL OR jsonb_typeof(candidate_plan) = 'array'
+  ),
+  candidate_plan_cost numeric CHECK (
+    candidate_plan_cost IS NULL OR candidate_plan_cost >= 0
+  ),
+  candidate_preflight_at timestamptz,
   created_at timestamptz NOT NULL DEFAULT now(),
+  CHECK (
+    (
+      definition #>> '{source,kind}' = 'pair'
+      AND candidate_plan IS NOT NULL
+      AND candidate_plan_cost IS NOT NULL
+      AND candidate_preflight_at IS NOT NULL
+    )
+    OR
+    (
+      definition #>> '{source,kind}' IS DISTINCT FROM 'pair'
+      AND candidate_plan IS NULL
+      AND candidate_plan_cost IS NULL
+      AND candidate_preflight_at IS NULL
+    )
+  ),
   UNIQUE (task_name, workload_revision_hash)
 );
 

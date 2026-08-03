@@ -783,7 +783,7 @@ BEGIN
         $sql$
           WITH source_inputs AS (
             SELECT subject_id, input
-            FROM otlet.validated_task_input_rows(%1$L, %2$s)
+            FROM otlet.semantic_join_candidate_rows(%6$L, %5$L)
           ),
           current_inputs AS (
             SELECT *

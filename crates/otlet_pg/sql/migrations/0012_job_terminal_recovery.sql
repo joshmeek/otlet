@@ -13,6 +13,7 @@ DECLARE
   source_kind text;
   current_input_query text;
   current_input jsonb;
+  active_revision_hash text;
 BEGIN
   IF current_task_subject_content_hash.workload_revision_hash IS NULL THEN
     SELECT t.name, t.input_shaping, t.input_query, t.source_query_contract
@@ -26,15 +27,16 @@ BEGIN
     WHERE revision.task_name = current_task_subject_content_hash.task_name
       AND revision.workload_revision_hash = current_task_subject_content_hash.workload_revision_hash;
 
-    PERFORM otlet.source_query_contract_guard(
-      revision_definition #> '{source,query_contract}',
-      true
-    );
-
     task_row.name := revision_definition #>> '{task,name}';
     task_row.input_shaping := revision_definition #> '{task,input_shaping}';
     task_row.input_query := revision_definition #>> '{task,input_query}';
     source_kind := revision_definition #>> '{source,kind}';
+    IF source_kind IS DISTINCT FROM 'pair' THEN
+      PERFORM otlet.source_query_contract_guard(
+        revision_definition #> '{source,query_contract}',
+        true
+      );
+    END IF;
     IF source_kind = 'row' THEN
       index_row.subject_column := (revision_definition #>> '{source,subject_column}')::name;
       index_row.source_table := revision_definition #>> '{source,source_table}';
@@ -45,9 +47,9 @@ BEGIN
       ) field(field_name);
     ELSIF source_kind = 'pair' THEN
       task_row.input_query := format(
-        'SELECT subject_id, input FROM otlet.validated_task_input_rows(%L, %s)',
-        revision_definition #>> '{source,candidate_query}',
-        (revision_definition #>> '{source,max_candidate_rows}')::integer
+        'SELECT subject_id, input FROM otlet.semantic_join_candidate_rows(%L, %L)',
+        revision_definition #>> '{source,semantic_join_index_name}',
+        current_task_subject_content_hash.workload_revision_hash
       );
     END IF;
   END IF;
@@ -57,7 +59,21 @@ BEGIN
   END IF;
 
   IF current_task_subject_content_hash.workload_revision_hash IS NULL THEN
-    PERFORM otlet.source_query_contract_guard(task_row.source_query_contract, true);
+    SELECT join_index.name, head.active_workload_revision_hash
+    INTO index_row.name, active_revision_hash
+    FROM otlet.semantic_join_indexes join_index
+    JOIN otlet.workload_revision_heads head ON head.task_name = join_index.task_name
+    WHERE join_index.task_name = task_row.name;
+    IF FOUND THEN
+      source_kind := 'pair';
+      task_row.input_query := format(
+        'SELECT subject_id, input FROM otlet.semantic_join_candidate_rows(%L, %L)',
+        index_row.name,
+        active_revision_hash
+      );
+    ELSE
+      PERFORM otlet.source_query_contract_guard(task_row.source_query_contract, true);
+    END IF;
   END IF;
 
   IF current_task_subject_content_hash.workload_revision_hash IS NULL

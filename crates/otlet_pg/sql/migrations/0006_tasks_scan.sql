@@ -433,20 +433,35 @@ BEGIN
 END;
 $$;
 
-CREATE FUNCTION otlet.preflight_candidate_query(candidate_query text)
+CREATE FUNCTION otlet.preflight_candidate_query(
+  candidate_query text,
+  enforce_policy boolean DEFAULT true,
+  validate_contract boolean DEFAULT true
+)
 RETURNS TABLE (
   candidate_plan jsonb,
   candidate_plan_cost numeric,
-  statement_timeout_ms integer
+  statement_timeout_ms integer,
+  candidate_preflight_at timestamptz,
+  candidate_preflight_status text,
+  candidate_preflight_error text
 )
 LANGUAGE plpgsql
 AS $$
 DECLARE
   policy otlet.production_policy%ROWTYPE;
   query_contract jsonb;
+  explained_query text;
 BEGIN
+  candidate_preflight_at := clock_timestamp();
   IF NULLIF(btrim(preflight_candidate_query.candidate_query), '') IS NULL THEN
-    RAISE EXCEPTION 'otlet candidate query is required';
+    candidate_preflight_status := 'failed';
+    candidate_preflight_error := 'otlet candidate query is required';
+    IF COALESCE(preflight_candidate_query.enforce_policy, true) THEN
+      RAISE EXCEPTION '%', candidate_preflight_error;
+    END IF;
+    RETURN NEXT;
+    RETURN;
   END IF;
 
   SELECT *
@@ -455,23 +470,43 @@ BEGIN
   WHERE name = 'default';
 
   BEGIN
-    query_contract := otlet.build_source_query_contract(
-      preflight_candidate_query.candidate_query
-    );
+    IF COALESCE(preflight_candidate_query.enforce_policy, true)
+       AND COALESCE(preflight_candidate_query.validate_contract, true) THEN
+      query_contract := otlet.build_source_query_contract(
+        preflight_candidate_query.candidate_query
+      );
+      explained_query := query_contract #>> '{query,resolved}';
+    ELSE
+      explained_query := preflight_candidate_query.candidate_query;
+    END IF;
     EXECUTE format(
       'EXPLAIN (FORMAT JSON) SELECT subject_id::text, input::jsonb FROM (%s) otlet_candidate',
-      query_contract #>> '{query,resolved}'
+      explained_query
     ) INTO candidate_plan;
   EXCEPTION WHEN OTHERS THEN
-    RAISE EXCEPTION 'otlet candidate query EXPLAIN failed: %', SQLERRM;
+    candidate_preflight_status := 'failed';
+    candidate_preflight_error := 'otlet candidate query EXPLAIN failed: ' || SQLERRM;
+    IF COALESCE(preflight_candidate_query.enforce_policy, true) THEN
+      RAISE EXCEPTION '%', candidate_preflight_error;
+    END IF;
+    RETURN NEXT;
+    RETURN;
   END;
 
   candidate_plan_cost := (candidate_plan #>> '{0,Plan,Total Cost}')::numeric;
   statement_timeout_ms := policy.candidate_query_statement_timeout_ms;
   IF candidate_plan_cost > policy.max_candidate_query_cost THEN
-    RAISE EXCEPTION 'otlet candidate query plan cost % exceeds limit %',
+    candidate_preflight_status := 'rejected';
+    candidate_preflight_error := format(
+      'otlet candidate query plan cost %s exceeds limit %s',
       candidate_plan_cost,
-      policy.max_candidate_query_cost;
+      policy.max_candidate_query_cost
+    );
+    IF COALESCE(preflight_candidate_query.enforce_policy, true) THEN
+      RAISE EXCEPTION '%', candidate_preflight_error;
+    END IF;
+  ELSE
+    candidate_preflight_status := 'ready';
   END IF;
 
   RETURN NEXT;
@@ -605,6 +640,58 @@ BEGIN
       RETURN NEXT;
       returned_rows := returned_rows + 1;
     END IF;
+  END LOOP;
+END;
+$$;
+
+CREATE FUNCTION otlet.semantic_join_candidate_rows(
+  index_name text,
+  workload_revision_hash text
+) RETURNS TABLE(subject_id text, input jsonb)
+LANGUAGE plpgsql
+VOLATILE
+AS $$
+DECLARE
+  revision_definition jsonb;
+  candidate record;
+  candidate_limit integer;
+  returned_rows integer := 0;
+BEGIN
+  SELECT revision.definition
+  INTO revision_definition
+  FROM otlet.workload_revisions revision
+  WHERE revision.workload_revision_hash = semantic_join_candidate_rows.workload_revision_hash
+    AND revision.definition #>> '{source,kind}' = 'pair'
+    AND revision.definition #>> '{source,semantic_join_index_name}' =
+      semantic_join_candidate_rows.index_name;
+
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'otlet workload revision does not define semantic join index %',
+      semantic_join_candidate_rows.index_name;
+  END IF;
+
+  PERFORM otlet.require_workload_source_contract(
+    revision_definition #>> '{task,name}',
+    semantic_join_candidate_rows.workload_revision_hash
+  );
+  candidate_limit := (revision_definition #>> '{source,max_candidate_rows}')::integer;
+
+  FOR candidate IN
+    SELECT validated.subject_id, validated.input
+    FROM otlet.validated_task_input_rows(
+      revision_definition #>> '{source,candidate_query}',
+      candidate_limit + 1
+    ) validated
+  LOOP
+    IF returned_rows >= candidate_limit THEN
+      RAISE EXCEPTION 'otlet candidate query for semantic join index % exceeds max_candidate_rows %',
+        semantic_join_candidate_rows.index_name,
+        candidate_limit;
+    END IF;
+    subject_id := candidate.subject_id;
+    input := candidate.input;
+    RETURN NEXT;
+    returned_rows := returned_rows + 1;
   END LOOP;
 END;
 $$;
