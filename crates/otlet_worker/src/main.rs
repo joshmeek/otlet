@@ -15,7 +15,21 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const CONTEXT_TOKENS: u32 = 4096;
 const BATCH_TOKENS: usize = 512;
+const UBATCH_TOKENS: u32 = 128;
 const MAX_TOKEN_PIECE_BYTES: usize = 16 * 1024;
+const LOAD_POLICY: &str = "eager_single_resident_model";
+const DEVICE_POLICY: &str = "cpu_only_n_gpu_layers_0";
+const RSS_POLICY: &str = "linux_proc_status_vmrss_fail_closed";
+const SUPPORTED_RUNTIME_OPTIONS: &[&str] = &[
+    "reasoning",
+    "max_tokens",
+    "max_attempt_ms",
+    "inference_cache",
+    "max_worker_rss_bytes",
+    "generation_trace",
+    "llama_threads",
+    "llama_batch_threads",
+];
 const CLAIM_ACTIVE: u8 = 0;
 const CLAIM_CANCELED: u8 = 1;
 const CLAIM_LOST: u8 = 2;
@@ -36,6 +50,8 @@ struct Claim {
     evidence_limits: Value,
     #[serde(skip, default = "Instant::now")]
     attempt_deadline: Instant,
+    #[serde(skip)]
+    claim_rss_bytes: u64,
 }
 
 #[derive(Clone)]
@@ -103,6 +119,104 @@ impl Config {
             ),
         })
     }
+}
+
+struct RuntimeOptions {
+    max_tokens: usize,
+    max_worker_rss_bytes: u64,
+    llama_threads: i32,
+    llama_batch_threads: i32,
+}
+
+impl RuntimeOptions {
+    fn parse(value: &Value) -> Result<Self, String> {
+        let object = value
+            .as_object()
+            .ok_or("runtime_options must be an object")?;
+        for key in object.keys() {
+            if !SUPPORTED_RUNTIME_OPTIONS.contains(&key.as_str()) {
+                return Err(format!("unsupported runtime option: {key}"));
+            }
+        }
+
+        if let Some(value) = object.get("reasoning") {
+            match value.as_str() {
+                Some("on" | "off") => {}
+                Some(_) => return Err("runtime_options.reasoning must be on or off".to_owned()),
+                None => return Err("runtime_options.reasoning must be a string".to_owned()),
+            }
+        }
+        let max_tokens = bounded_runtime_integer(object, "max_tokens", 512, 1, 4096)?;
+        if let Some(value) = object.get("max_attempt_ms") {
+            let valid_string = value.as_str().is_some_and(|raw| {
+                !raw.is_empty() && raw.bytes().all(|byte| byte.is_ascii_digit())
+            });
+            if value.as_u64().is_none() && !valid_string {
+                return Err(
+                    "runtime_options.max_attempt_ms must be a non-negative integer".to_owned(),
+                );
+            }
+        }
+        match object.get("inference_cache") {
+            Some(Value::Bool(false)) => {}
+            Some(Value::Bool(true)) | None => {
+                return Err("runtime_options.inference_cache must be false".to_owned());
+            }
+            Some(_) => return Err("runtime_options.inference_cache must be a boolean".to_owned()),
+        }
+        let max_worker_rss_bytes =
+            required_runtime_integer(object, "max_worker_rss_bytes", 1, 70_368_744_177_664)?;
+        match object.get("generation_trace") {
+            Some(Value::Bool(false)) | None => {}
+            Some(Value::Bool(true)) => {
+                return Err("runtime_options.generation_trace must be false".to_owned());
+            }
+            Some(_) => return Err("runtime_options.generation_trace must be a boolean".to_owned()),
+        }
+        let llama_threads = required_runtime_integer(object, "llama_threads", 1, 1024)? as i32;
+        let llama_batch_threads =
+            required_runtime_integer(object, "llama_batch_threads", 1, 1024)? as i32;
+
+        Ok(Self {
+            max_tokens: max_tokens as usize,
+            max_worker_rss_bytes,
+            llama_threads,
+            llama_batch_threads,
+        })
+    }
+}
+
+fn required_runtime_integer(
+    object: &serde_json::Map<String, Value>,
+    name: &str,
+    min: u64,
+    max: u64,
+) -> Result<u64, String> {
+    if !object.contains_key(name) {
+        return Err(format!("runtime_options.{name} is required"));
+    }
+    bounded_runtime_integer(object, name, min, min, max)
+}
+
+fn bounded_runtime_integer(
+    object: &serde_json::Map<String, Value>,
+    name: &str,
+    default: u64,
+    min: u64,
+    max: u64,
+) -> Result<u64, String> {
+    let Some(value) = object.get(name) else {
+        return Ok(default);
+    };
+    let value = value
+        .as_u64()
+        .ok_or_else(|| format!("runtime_options.{name} must be an integer"))?;
+    if !(min..=max).contains(&value) {
+        return Err(format!(
+            "runtime_options.{name} must be between {min} and {max}"
+        ));
+    }
+    Ok(value)
 }
 
 #[derive(Clone)]
@@ -176,7 +290,7 @@ impl Database {
         let model_status = model_status.map_or_else(|| "NULL".to_owned(), sql_text);
         let error_code = error_code.map_or_else(|| "NULL".to_owned(), sql_text);
         let sql = format!(
-            "SELECT desired_state, registered_model_name FROM otlet.portable_worker_heartbeat({}, {}, {}, {}, {}, {});\n",
+            "SELECT desired_state, registered_model_name, registered_model_artifact_hash, registered_model_artifact_bytes FROM otlet.portable_worker_heartbeat({}, {}, {}, {}, {}, {});\n",
             sql_text(&config.worker_id),
             config.protocol_version,
             sql_text(&config.runtime_identity_hash),
@@ -187,7 +301,21 @@ impl Database {
         let rows = self.query(&sql)?;
         match rows.as_slice() {
             [row] => {
-                let Some((state, model_name)) = row.split_once('|') else {
+                let mut fields = row.split('|');
+                let (
+                    Some(state),
+                    Some(model_name),
+                    Some(artifact_hash),
+                    Some(artifact_bytes),
+                    None,
+                ) = (
+                    fields.next(),
+                    fields.next(),
+                    fields.next(),
+                    fields.next(),
+                    fields.next(),
+                )
+                else {
                     return Err(coded(
                         "database_contract_invalid",
                         "portable heartbeat returned an invalid row",
@@ -197,6 +325,32 @@ impl Database {
                     return Err(coded(
                         "model_not_allowlisted",
                         "portable worker is registered for another model",
+                    ));
+                }
+                if artifact_hash != config.model_sha256 {
+                    return Err(coded(
+                        "model_hash_mismatch",
+                        "portable worker model hash does not match its registration",
+                    ));
+                }
+                let artifact_bytes = artifact_bytes.parse::<u64>().map_err(|_| {
+                    coded(
+                        "database_contract_invalid",
+                        "portable heartbeat returned invalid model bytes",
+                    )
+                })?;
+                let local_bytes = std::fs::metadata(&config.model_path)
+                    .map_err(|_| {
+                        coded(
+                            "model_artifact_unreadable",
+                            "local GGUF metadata is unavailable",
+                        )
+                    })?
+                    .len();
+                if artifact_bytes != local_bytes {
+                    return Err(coded(
+                        "model_artifact_size_mismatch",
+                        "portable worker model bytes do not match its registration",
                     ));
                 }
                 Ok(state.to_owned())
@@ -251,8 +405,9 @@ impl Database {
         Ok(rows.as_slice() == ["true"])
     }
 
-    fn claim(&self, config: &Config) -> Result<Vec<Claim>, String> {
+    fn claim(&self, config: &Config, default_llama_threads: i32) -> Result<Vec<Claim>, String> {
         let attempt_start = Instant::now();
+        let claim_rss_bytes = process_rss_bytes()?;
         let sql = format!(
             "SELECT jsonb_build_object(\
                'job_id', c.job_id, \
@@ -267,14 +422,16 @@ impl Database {
                'model', c.model, \
                'evidence_limits', c.evidence_limits\
              )::text \
-             FROM otlet.portable_claim_jobs({}, {}, {}, 1) c;\n",
+             FROM otlet.portable_claim_jobs({}, {}, {}, {}, {}, 1) c;\n",
             sql_text(&config.worker_id),
             config.protocol_version,
-            sql_text(&config.runtime_identity_hash)
+            sql_text(&config.runtime_identity_hash),
+            claim_rss_bytes,
+            default_llama_threads
         );
         self.query(&sql)?
             .into_iter()
-            .map(|line| parse_claim(&line, attempt_start))
+            .map(|line| parse_claim(&line, attempt_start, claim_rss_bytes))
             .collect()
     }
 
@@ -340,28 +497,36 @@ impl Database {
         error: &str,
         raw_output: Option<&str>,
         candidate_output: Option<&Value>,
+        trace_summary: &Value,
     ) -> Result<String, String> {
         let raw = raw_output.map_or_else(|| "NULL".to_owned(), sql_text);
         let candidate = candidate_output
             .map(|output| format!("{}::jsonb", sql_text(&output.to_string())))
             .unwrap_or_else(|| "NULL".to_owned());
         let timeout = error == "attempt_timeout";
-        let selection_reason = timeout
-            .then(|| sql_text("attempt_timeout"))
-            .unwrap_or_else(|| "NULL".to_owned());
-        let trace_summary = if timeout {
-            json!({
-                "trace_version": "otlet_portable_worker_trace_v1",
-                "schema_validation_status": "failed",
-                "schema_force": "attempt_timeout_before_schema_validation",
-                "stop_reason": "attempt_timeout"
-            })
+        let selection_reason = if timeout {
+            sql_text("attempt_timeout")
         } else {
-            json!({
-                "trace_version": "otlet_portable_worker_trace_v1",
-                "schema_validation_status": "failed"
-            })
+            "NULL".to_owned()
         };
+        let mut trace_summary = trace_summary.clone();
+        let trace = trace_summary
+            .as_object_mut()
+            .ok_or("portable trace summary must be an object")?;
+        trace.insert(
+            "schema_validation_status".to_owned(),
+            Value::String("failed".to_owned()),
+        );
+        if timeout {
+            trace.insert(
+                "schema_force".to_owned(),
+                Value::String("attempt_timeout_before_schema_validation".to_owned()),
+            );
+            trace.insert(
+                "stop_reason".to_owned(),
+                Value::String("attempt_timeout".to_owned()),
+            );
+        }
         let sql = format!(
             "SELECT job_status \
              FROM otlet.portable_fail_job(\
@@ -416,11 +581,20 @@ struct LocalModel {
     model: *mut llama_cpp_sys_4::llama_model,
     context: *mut llama_cpp_sys_4::llama_context,
     vocab: *const llama_cpp_sys_4::llama_vocab,
-    threads: i32,
+    default_threads: i32,
+    artifact_bytes: u64,
+    model_memory_bytes: u64,
+    model_parameters: u64,
+    context_window_tokens: u32,
+    load_ms: u64,
+    context_ms: u64,
 }
 
 impl LocalModel {
     fn load(path: &Path, threads: i32) -> Result<Self, String> {
+        let artifact_bytes = std::fs::metadata(path)
+            .map_err(|err| format!("could not read local GGUF metadata: {err}"))?
+            .len();
         let path = CString::new(path.as_os_str().as_encoded_bytes())
             .map_err(|_| "model path contains a null byte".to_owned())?;
         unsafe {
@@ -429,8 +603,10 @@ impl LocalModel {
         }
         let mut model_params = unsafe { llama_cpp_sys_4::llama_model_default_params() };
         model_params.n_gpu_layers = 0;
+        let load_start = Instant::now();
         let model =
             unsafe { llama_cpp_sys_4::llama_model_load_from_file(path.as_ptr(), model_params) };
+        let load_ms = u64::try_from(load_start.elapsed().as_millis()).unwrap_or(u64::MAX);
         if model.is_null() {
             return Err("local GGUF model load failed".to_owned());
         }
@@ -438,14 +614,26 @@ impl LocalModel {
         let mut context_params = unsafe { llama_cpp_sys_4::llama_context_default_params() };
         context_params.n_ctx = CONTEXT_TOKENS;
         context_params.n_batch = BATCH_TOKENS as u32;
-        context_params.n_ubatch = 128;
+        context_params.n_ubatch = UBATCH_TOKENS;
         context_params.n_threads = threads;
         context_params.n_threads_batch = threads;
         context_params.no_perf = true;
+        let context_start = Instant::now();
         let context = unsafe { llama_cpp_sys_4::llama_init_from_model(model, context_params) };
+        let context_ms = u64::try_from(context_start.elapsed().as_millis()).unwrap_or(u64::MAX);
         if context.is_null() {
             unsafe { llama_cpp_sys_4::llama_model_free(model) };
             return Err("local GGUF context start failed".to_owned());
+        }
+        let context_window_tokens = unsafe { llama_cpp_sys_4::llama_n_ctx(context) };
+        if context_window_tokens != CONTEXT_TOKENS {
+            unsafe {
+                llama_cpp_sys_4::llama_free(context);
+                llama_cpp_sys_4::llama_model_free(model);
+            }
+            return Err(format!(
+                "local GGUF context is {context_window_tokens} tokens, expected {CONTEXT_TOKENS}"
+            ));
         }
         let vocab = unsafe { llama_cpp_sys_4::llama_model_get_vocab(model) };
         if vocab.is_null() {
@@ -459,7 +647,13 @@ impl LocalModel {
             model,
             context,
             vocab,
-            threads,
+            default_threads: threads,
+            artifact_bytes,
+            model_memory_bytes: unsafe { llama_cpp_sys_4::llama_model_size(model) },
+            model_parameters: unsafe { llama_cpp_sys_4::llama_model_n_params(model) },
+            context_window_tokens,
+            load_ms,
+            context_ms,
         })
     }
 
@@ -468,11 +662,13 @@ impl LocalModel {
         prompt: &str,
         max_tokens: usize,
         max_output_bytes: usize,
+        threads: i32,
+        batch_threads: i32,
         signal: &ClaimSignal,
     ) -> Result<Inference, String> {
         let _abort = AbortGuard::new(self.context, signal);
         unsafe {
-            llama_cpp_sys_4::llama_set_n_threads(self.context, self.threads, self.threads);
+            llama_cpp_sys_4::llama_set_n_threads(self.context, threads, batch_threads);
             let memory = llama_cpp_sys_4::llama_get_memory(self.context);
             if !memory.is_null() {
                 llama_cpp_sys_4::llama_memory_clear(memory, true);
@@ -483,8 +679,11 @@ impl LocalModel {
         if tokens.is_empty() {
             return Err("prompt produced no tokens".to_owned());
         }
-        if tokens.len().saturating_add(max_tokens) > CONTEXT_TOKENS as usize {
-            return Err("prompt and generation exceed the 4096-token context".to_owned());
+        if tokens.len().saturating_add(max_tokens) > self.context_window_tokens as usize {
+            return Err(format!(
+                "prompt and generation exceed the {}-token context",
+                self.context_window_tokens
+            ));
         }
 
         let mut batch = Batch::new(BATCH_TOKENS)?;
@@ -994,6 +1193,100 @@ fn token_to_piece(
     Ok(())
 }
 
+fn runtime_trace(
+    config: &Config,
+    claim: &Claim,
+    model: &LocalModel,
+    options: Option<&RuntimeOptions>,
+    rss_before: Option<u64>,
+    rss_after: Option<u64>,
+    inference: Option<&Inference>,
+) -> Value {
+    let budget = options.map(|options| options.max_worker_rss_bytes);
+    let final_rss = rss_after.or(rss_before).unwrap_or(claim.claim_rss_bytes);
+    let admission_rss = claim.claim_rss_bytes.max(rss_before.unwrap_or(0));
+    let (admission, admission_reason) = match (budget, rss_before) {
+        (Some(budget), Some(_)) if admission_rss <= budget => {
+            ("allowed", "loaded_worker_rss_within_job_budget")
+        }
+        (Some(_), Some(_)) => ("rejected", "observed_worker_rss_exceeds_job_budget"),
+        (Some(_), None) => ("not_evaluated", "pre_inference_rss_not_recorded"),
+        (None, _) => ("not_evaluated", "worker_memory_budget_unavailable"),
+    };
+    let (post_enforcement, post_enforcement_reason) = match (budget, rss_after) {
+        (Some(budget), Some(rss)) if rss <= budget => {
+            ("allowed", "post_inference_rss_within_job_budget")
+        }
+        (Some(_), Some(_)) => ("rejected", "post_inference_rss_exceeds_job_budget"),
+        (Some(_), None) => ("not_evaluated", "post_inference_rss_not_recorded"),
+        (None, _) => ("not_evaluated", "worker_memory_budget_unavailable"),
+    };
+    json!({
+        "trace_version": "otlet_portable_worker_trace_v1",
+        "workload_revision_hash": claim.workload_revision_hash,
+        "prompt_hash": claim.prompt_hash,
+        "prompt_tokens": inference.map(|inference| inference.prompt_tokens),
+        "generated_tokens": inference.map(|inference| inference.generated_tokens),
+        "generate_ms": inference.map(|inference| inference.generate_ms),
+        "schema_validation_status": "not_run",
+        "runtime": "local_llama_cpp",
+        "runtime_fingerprint_version": "otlet_portable_runtime_contract_v1",
+        "runtime_fingerprint": {
+            "artifact": {
+                "sha256": config.model_sha256,
+                "bytes": model.artifact_bytes,
+                "verification": "sha256_verified_before_eager_load"
+            },
+            "context": {
+                "tokens": model.context_window_tokens,
+                "batch_tokens": BATCH_TOKENS,
+                "ubatch_tokens": UBATCH_TOKENS,
+                "decode_threads": options.map(|options| options.llama_threads),
+                "batch_threads": options.map(|options| options.llama_batch_threads)
+            },
+            "runtime": {
+                "load_policy": LOAD_POLICY,
+                "device_policy": DEVICE_POLICY,
+                "rss_policy": RSS_POLICY
+            }
+        },
+        "model_load_ms": 0,
+        "model_context_ms": 0,
+        "resident_model_load_ms": model.load_ms,
+        "resident_model_context_ms": model.context_ms,
+        "model_memory_bytes": model.model_memory_bytes,
+        "model_parameters": model.model_parameters,
+        "context_window_tokens": model.context_window_tokens,
+        "model_device_policy": DEVICE_POLICY,
+        "memory_accounting_policy": "linux_proc_status_vmrss_resident_model",
+        "model_cache_hit": true,
+        "inference_cache_hit": false,
+        "effective_llama_threads": options.map(|options| options.llama_threads),
+        "effective_llama_batch_threads": options.map(|options| options.llama_batch_threads),
+        "worker_process_rss_bytes": final_rss,
+        "worker_memory_sample_policy": RSS_POLICY,
+        "worker_memory_budget_bytes": budget,
+        "memory": {
+            "worker_memory_sample_policy": RSS_POLICY,
+            "worker_memory_budget_bytes": budget,
+            "worker_memory_budget_policy": "max_worker_rss_bytes_fail_closed",
+            "claim": { "process_rss_bytes": claim.claim_rss_bytes },
+            "before": rss_before.map(|rss| json!({ "process_rss_bytes": rss })).unwrap_or_else(|| json!({})),
+            "after": rss_after.map(|rss| json!({ "process_rss_bytes": rss })).unwrap_or_else(|| json!({})),
+            "admission": {
+                "decision": admission,
+                "reason": admission_reason,
+                "policy": "portable_claim_and_pre_inference_rss_v1"
+            },
+            "post_inference_enforcement": {
+                "decision": post_enforcement,
+                "reason": post_enforcement_reason,
+                "policy": "max_worker_rss_bytes_fail_closed"
+            }
+        }
+    })
+}
+
 fn process_claim(
     database: &Database,
     config: &Config,
@@ -1009,30 +1302,61 @@ fn process_claim(
         return Err("portable claim selection role is invalid".to_owned());
     }
     let Some(selected_model) = claim.model.as_object() else {
-        let state = database.fail(config, claim, "portable_model_identity_missing", None, None)?;
+        let trace = runtime_trace(config, claim, model, None, None, None, None);
+        let state = database.fail(
+            config,
+            claim,
+            "portable_model_identity_missing",
+            None,
+            None,
+            &trace,
+        )?;
         log_failure_state(&state, claim, "model_identity_missing");
         return Ok(());
     };
+    let artifact_identity = selected_model
+        .get("artifact_identity")
+        .and_then(Value::as_object);
     if selected_model.get("name").and_then(Value::as_str) != Some(config.model_name.as_str())
         || selected_model.get("artifact_hash").and_then(Value::as_str)
             != Some(config.model_sha256.as_str())
+        || artifact_identity
+            .and_then(|identity| identity.get("sha256"))
+            .and_then(Value::as_str)
+            != Some(config.model_sha256.as_str())
+        || artifact_identity
+            .and_then(|identity| identity.get("bytes"))
+            .and_then(Value::as_u64)
+            != Some(model.artifact_bytes)
     {
+        let trace = runtime_trace(config, claim, model, None, None, None, None);
         let state = database.fail(
             config,
             claim,
             "portable_model_identity_mismatch",
             None,
             None,
+            &trace,
         )?;
         log_failure_state(&state, claim, "model_identity_mismatch");
         return Ok(());
     }
-    let max_tokens = claim
-        .runtime_options
-        .get("max_tokens")
-        .and_then(Value::as_u64)
-        .unwrap_or(512);
-    let max_tokens = usize::try_from(max_tokens.clamp(1, 4096)).unwrap_or(4096);
+    let options = match RuntimeOptions::parse(&claim.runtime_options) {
+        Ok(options) => options,
+        Err(_) => {
+            let trace = runtime_trace(config, claim, model, None, None, None, None);
+            let state = database.fail(
+                config,
+                claim,
+                "portable_runtime_options_rejected",
+                None,
+                None,
+                &trace,
+            )?;
+            log_failure_state(&state, claim, "runtime_options_rejected");
+            return Ok(());
+        }
+    };
     let max_output_bytes = claim
         .evidence_limits
         .get("max_raw_output_bytes")
@@ -1040,9 +1364,53 @@ fn process_claim(
         .unwrap_or(1024 * 1024)
         .clamp(1, 16 * 1024 * 1024);
     let max_output_bytes = usize::try_from(max_output_bytes).unwrap_or(16 * 1024 * 1024);
+    let rss_before = match process_rss_bytes() {
+        Ok(rss) => rss,
+        Err(_) => {
+            let trace = runtime_trace(config, claim, model, Some(&options), None, None, None);
+            let state = database.fail(
+                config,
+                claim,
+                "portable_worker_rss_unavailable",
+                None,
+                None,
+                &trace,
+            )?;
+            log_failure_state(&state, claim, "worker_rss_unavailable");
+            return Ok(());
+        }
+    };
+    if enforce_worker_rss_budget(rss_before, options.max_worker_rss_bytes).is_err() {
+        let trace = runtime_trace(
+            config,
+            claim,
+            model,
+            Some(&options),
+            Some(rss_before),
+            None,
+            None,
+        );
+        let state = database.fail(
+            config,
+            claim,
+            "portable_worker_rss_budget_exceeded",
+            None,
+            None,
+            &trace,
+        )?;
+        log_failure_state(&state, claim, "worker_rss_budget_exceeded");
+        return Ok(());
+    }
     let lease = LeaseGuard::start(database.clone(), config.clone(), claim);
     let signal = lease.signal();
-    let inference = model.infer(&claim.prompt, max_tokens, max_output_bytes, &signal);
+    let inference = model.infer(
+        &claim.prompt,
+        options.max_tokens,
+        max_output_bytes,
+        options.llama_threads,
+        options.llama_batch_threads,
+        &signal,
+    );
     let inference_state = signal.state();
     drop(lease);
     match signal.state() {
@@ -1056,16 +1424,71 @@ fn process_claim(
             return Ok(());
         }
         CLAIM_TIMED_OUT if inference_state == CLAIM_TIMED_OUT => {
-            let state = database.fail(config, claim, "attempt_timeout", None, None)?;
+            let trace = runtime_trace(
+                config,
+                claim,
+                model,
+                Some(&options),
+                Some(rss_before),
+                None,
+                None,
+            );
+            let state = database.fail(config, claim, "attempt_timeout", None, None, &trace)?;
             log_failure_state(&state, claim, "attempt_timeout");
             return Ok(());
         }
         _ => {}
     }
+    let rss_after = match process_rss_bytes() {
+        Ok(rss) => rss,
+        Err(_) => {
+            let trace = runtime_trace(
+                config,
+                claim,
+                model,
+                Some(&options),
+                Some(rss_before),
+                None,
+                inference.as_ref().ok(),
+            );
+            let state = database.fail(
+                config,
+                claim,
+                "portable_worker_rss_unavailable",
+                None,
+                None,
+                &trace,
+            )?;
+            log_failure_state(&state, claim, "worker_rss_unavailable");
+            return Ok(());
+        }
+    };
+    let trace = runtime_trace(
+        config,
+        claim,
+        model,
+        Some(&options),
+        Some(rss_before),
+        Some(rss_after),
+        inference.as_ref().ok(),
+    );
+    if enforce_worker_rss_budget(rss_after, options.max_worker_rss_bytes).is_err() {
+        let state = database.fail(
+            config,
+            claim,
+            "portable_worker_rss_budget_exceeded",
+            None,
+            None,
+            &trace,
+        )?;
+        log_failure_state(&state, claim, "worker_rss_budget_exceeded");
+        return Ok(());
+    }
     let inference = match inference {
         Ok(inference) => inference,
         Err(error) => {
-            let state = database.fail(config, claim, &truncate(&error, 1024), None, None)?;
+            let state =
+                database.fail(config, claim, &truncate(&error, 1024), None, None, &trace)?;
             log_failure_state(&state, claim, "local_inference_failed");
             return Ok(());
         }
@@ -1079,6 +1502,7 @@ fn process_claim(
                 "portable_model_output_invalid_json",
                 Some(&inference.raw_output),
                 None,
+                &trace,
             )?;
             log_failure_state(&state, claim, "invalid_model_json");
             return Ok(());
@@ -1091,20 +1515,11 @@ fn process_claim(
             "portable_model_output_invalid_envelope",
             Some(&inference.raw_output),
             None,
+            &trace,
         )?;
         log_failure_state(&state, claim, "invalid_model_envelope");
         return Ok(());
     };
-    let trace = json!({
-        "trace_version": "otlet_portable_worker_trace_v1",
-        "workload_revision_hash": claim.workload_revision_hash,
-        "prompt_hash": claim.prompt_hash,
-        "prompt_tokens": inference.prompt_tokens,
-        "generated_tokens": inference.generated_tokens,
-        "generate_ms": inference.generate_ms,
-        "schema_validation_status": "not_run",
-        "runtime": "local_llama_cpp"
-    });
     match database.complete(
         config,
         claim,
@@ -1135,6 +1550,7 @@ fn process_claim(
                 "portable_result_rejected_by_database",
                 Some(&inference.raw_output),
                 Some(output),
+                &trace,
             )?;
             log_failure_state(&state, claim, "database_validation_failed");
         }
@@ -1156,6 +1572,15 @@ fn runtime_identity() -> Value {
     json!({
         "engine": "llama.cpp",
         "protocol_version": 1,
+        "runtime_contract": {
+            "context_window_tokens": CONTEXT_TOKENS,
+            "batch_tokens": BATCH_TOKENS,
+            "ubatch_tokens": UBATCH_TOKENS,
+            "load_policy": LOAD_POLICY,
+            "device_policy": DEVICE_POLICY,
+            "rss_policy": RSS_POLICY,
+            "supported_runtime_options": SUPPORTED_RUNTIME_OPTIONS
+        },
         "transport": "postgres_psql",
         "worker": "otlet-portable-worker",
         "worker_version": env!("CARGO_PKG_VERSION")
@@ -1301,7 +1726,7 @@ fn run() -> Result<(), String> {
             log_worker("worker_drained", &config, None);
             return Ok(());
         }
-        let claims = match database.claim(&config) {
+        let claims = match database.claim(&config, model.default_threads) {
             Ok(claims) => claims,
             Err(error) if is_connection_error(&error) && !config.once => {
                 if !database_unavailable {
@@ -1467,6 +1892,37 @@ fn sha256_file(path: &Path) -> Result<String, String> {
     Ok(format!("{:x}", digest.finalize()))
 }
 
+fn process_rss_bytes() -> Result<u64, String> {
+    let status = std::fs::read_to_string("/proc/self/status").map_err(|_| {
+        coded(
+            "worker_rss_unavailable",
+            "portable worker requires Linux /proc VmRSS",
+        )
+    })?;
+    process_rss_bytes_from(&status).ok_or_else(|| {
+        coded(
+            "worker_rss_unavailable",
+            "portable worker could not parse Linux /proc VmRSS",
+        )
+    })
+}
+
+fn process_rss_bytes_from(status: &str) -> Option<u64> {
+    let mut fields = status
+        .lines()
+        .find_map(|line| line.strip_prefix("VmRSS:"))?
+        .split_ascii_whitespace();
+    let kib = fields.next()?.parse::<u64>().ok()?;
+    (fields.next() == Some("kB") && fields.next().is_none()).then(|| kib.checked_mul(1024))?
+}
+
+fn enforce_worker_rss_budget(rss_bytes: u64, max_worker_rss_bytes: u64) -> Result<(), String> {
+    if rss_bytes > max_worker_rss_bytes {
+        return Err("portable_worker_rss_budget_exceeded".to_owned());
+    }
+    Ok(())
+}
+
 fn sql_text(value: &str) -> String {
     let mut hex = String::with_capacity(value.len() * 2);
     for byte in value.as_bytes() {
@@ -1517,7 +1973,7 @@ fn is_identity_hash(value: &str) -> bool {
         .is_some_and(is_sha256)
 }
 
-fn parse_claim(line: &str, attempt_start: Instant) -> Result<Claim, String> {
+fn parse_claim(line: &str, attempt_start: Instant, claim_rss_bytes: u64) -> Result<Claim, String> {
     let mut claim: Claim = serde_json::from_str(line)
         .map_err(|err| format!("portable claim response is invalid: {err}"))?;
     if !is_identity_hash(&claim.workload_revision_hash) {
@@ -1545,6 +2001,7 @@ fn parse_claim(line: &str, attempt_start: Instant) -> Result<Claim, String> {
                 "portable claim attempt deadline overflowed",
             )
         })?;
+    claim.claim_rss_bytes = claim_rss_bytes;
     Ok(claim)
 }
 
@@ -1687,19 +2144,115 @@ mod tests {
             "model": {},
             "evidence_limits": {"max_attempt_ms": 30000}
         });
-        assert!(parse_claim(&claim.to_string(), Instant::now()).is_ok());
+        assert!(parse_claim(&claim.to_string(), Instant::now(), 4096).is_ok());
 
         claim["evidence_limits"] = json!({});
-        let error = parse_claim(&claim.to_string(), Instant::now())
+        let error = parse_claim(&claim.to_string(), Instant::now(), 4096)
             .err()
             .expect("missing attempt budget should be rejected");
         assert_eq!(error_code(&error), "database_contract_invalid");
 
         claim["evidence_limits"] = json!({"max_attempt_ms": 30000});
         claim["workload_revision_hash"] = json!("a".repeat(64));
-        let error = parse_claim(&claim.to_string(), Instant::now())
+        let error = parse_claim(&claim.to_string(), Instant::now(), 4096)
             .err()
             .expect("unversioned revision hash should be rejected");
         assert_eq!(error_code(&error), "database_contract_invalid");
+    }
+
+    #[test]
+    fn portable_runtime_options_are_strict_and_keep_separate_threads() {
+        let valid_options = || {
+            json!({
+                "reasoning": "off",
+                "max_tokens": 16,
+                "max_attempt_ms": "0",
+                "inference_cache": false,
+                "max_worker_rss_bytes": 1024,
+                "generation_trace": false,
+                "llama_threads": 3,
+                "llama_batch_threads": 2
+            })
+        };
+        let mut options = valid_options();
+        let parsed = RuntimeOptions::parse(&options).expect("valid options must parse");
+        assert_eq!(parsed.max_tokens, 16);
+        assert_eq!(parsed.max_worker_rss_bytes, 1024);
+        assert_eq!(parsed.llama_threads, 3);
+        assert_eq!(parsed.llama_batch_threads, 2);
+
+        let required = options.as_object_mut().expect("options are an object");
+        required.remove("inference_cache");
+        assert!(RuntimeOptions::parse(&options).is_err());
+        options = valid_options();
+        options
+            .as_object_mut()
+            .expect("options are an object")
+            .remove("max_worker_rss_bytes");
+        assert!(RuntimeOptions::parse(&options).is_err());
+        options = valid_options();
+        options
+            .as_object_mut()
+            .expect("options are an object")
+            .remove("generation_trace");
+        assert!(RuntimeOptions::parse(&options).is_ok());
+
+        for (key, value) in [
+            ("inference_cache", json!(true)),
+            ("max_worker_rss_bytes", json!(0)),
+            ("generation_trace", json!(true)),
+            ("llama_threads", json!(0)),
+            ("llama_batch_threads", json!(1025)),
+        ] {
+            options = valid_options();
+            options[key] = value;
+            assert!(RuntimeOptions::parse(&options).is_err());
+        }
+        options = valid_options();
+        options["generation_trace_top_k"] = json!(5);
+        assert!(RuntimeOptions::parse(&options).is_err());
+
+        for key in ["llama_threads", "llama_batch_threads"] {
+            options = valid_options();
+            options
+                .as_object_mut()
+                .expect("options are an object")
+                .remove(key);
+            assert!(RuntimeOptions::parse(&options).is_err());
+        }
+    }
+
+    #[test]
+    fn portable_runtime_identity_has_the_fixed_contract() {
+        assert_eq!(
+            runtime_identity()["runtime_contract"],
+            json!({
+                "context_window_tokens": 4096,
+                "batch_tokens": 512,
+                "ubatch_tokens": 128,
+                "load_policy": "eager_single_resident_model",
+                "device_policy": "cpu_only_n_gpu_layers_0",
+                "rss_policy": "linux_proc_status_vmrss_fail_closed",
+                "supported_runtime_options": [
+                    "reasoning",
+                    "max_tokens",
+                    "max_attempt_ms",
+                    "inference_cache",
+                    "max_worker_rss_bytes",
+                    "generation_trace",
+                    "llama_threads",
+                    "llama_batch_threads"
+                ]
+            })
+        );
+    }
+
+    #[test]
+    fn proc_status_vmrss_is_strictly_parsed() {
+        assert_eq!(
+            process_rss_bytes_from("Name:\totlet_worker\nVmRSS:\t1234 kB\n"),
+            Some(1_263_616)
+        );
+        assert_eq!(process_rss_bytes_from("VmRSS:\t1234 bytes\n"), None);
     }
 }

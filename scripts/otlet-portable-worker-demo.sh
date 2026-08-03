@@ -319,6 +319,16 @@ SELECT otlet.create_task(
   '{"reasoning":"off","max_tokens":48,"inference_cache":false}'::jsonb,
   '{"source_fields":["signal"]}'::jsonb
 );
+SELECT otlet.create_task(
+  'aaa_portable_runtime_incompatible',
+  NULL,
+  'Return decision keep',
+  '{"type":"object","required":["decision"],"additionalProperties":false,"properties":{"decision":{"const":"keep"}}}'::jsonb,
+  :'model_name',
+  '{"reasoning":"off","max_tokens":48,"inference_cache":false,"max_worker_rss_bytes":1,"n_gpu_layers":1}'::jsonb
+);
+INSERT INTO otlet.jobs (task_name, subject_id, input)
+VALUES ('aaa_portable_runtime_incompatible', 'runtime-incompatible', '{}'::jsonb);
 CREATE TABLE public.otlet_portable_routing_source (
   subject_id text PRIMARY KEY,
   input jsonb NOT NULL
@@ -472,7 +482,7 @@ SELECT otlet.enqueue_ask(
   'Return decision keep',
   '{"signal":"retain"}'::jsonb,
   '{"type":"object","required":["decision"],"additionalProperties":false,"properties":{"decision":{"const":"keep"}}}'::jsonb,
-  '{"reasoning":"off","max_tokens":48,"inference_cache":false}'::jsonb
+  '{"reasoning":"off","max_tokens":48,"inference_cache":false,"llama_threads":2,"llama_batch_threads":3}'::jsonb
 ) AS async_job_id \gset
 COMMIT;
 SELECT :'async_job_id';
@@ -563,6 +573,122 @@ if [ "$contract" != "$expected" ]; then
   echo "Expected portable external worker contract $expected, got $contract" >&2
   exit 1
 fi
+
+portable_runtime_contract_query() {
+  docker exec -i "$container" psql -U postgres -d "$portable_database" \
+    -X -qAt -v ON_ERROR_STOP=1 \
+    -v model_sha256="$model_sha256" \
+    -v model_bytes="$model_bytes" \
+    -v async_job_id="$async_job_id" <<'SQL'
+WITH receipt_contract AS (
+  SELECT
+    receipt.trace_summary,
+    receipt.trace_summary -> 'runtime_options_status' AS option_status,
+    claim.runtime_options_status AS claim_option_status
+  FROM otlet.inference_receipts receipt
+  JOIN otlet.portable_receipt_links link ON link.receipt_id = receipt.id
+  JOIN otlet.portable_claims claim ON claim.id = link.claim_id
+  WHERE receipt.job_id = :'async_job_id'::bigint
+), incompatible_state AS (
+  SELECT
+    job.status,
+    job.attempts,
+    (SELECT count(*) FROM otlet.portable_claims claim WHERE claim.job_id = job.id) AS claims,
+    (SELECT count(*) FROM otlet.inference_receipts receipt WHERE receipt.job_id = job.id) AS receipts
+  FROM otlet.jobs job
+  WHERE job.task_name = 'aaa_portable_runtime_incompatible'
+    AND job.subject_id = 'runtime-incompatible'
+)
+SELECT concat_ws('|',
+  contract.option_status ->> 'version',
+  (
+    contract.option_status ->> 'compatible' = 'true'
+    AND contract.option_status = contract.claim_option_status
+  )::text,
+  (
+    contract.option_status -> 'requested' =
+      '{"reasoning":"off","max_tokens":48,"inference_cache":false,"llama_threads":2,"llama_batch_threads":3}'::jsonb
+    AND contract.option_status -> 'honored' =
+      '{"reasoning":"off","max_tokens":48,"inference_cache":false,"llama_threads":2,"llama_batch_threads":3}'::jsonb
+  )::text,
+  (
+    contract.option_status -> 'defaulted' ?&
+      ARRAY['max_attempt_ms','max_worker_rss_bytes','generation_trace']
+    AND (SELECT count(*) FROM jsonb_object_keys(contract.option_status -> 'defaulted')) = 3
+    AND (contract.option_status #>> '{defaulted,max_attempt_ms}')::bigint > 0
+    AND (contract.option_status #>> '{defaulted,max_worker_rss_bytes}')::bigint > 0
+    AND contract.option_status #> '{defaulted,generation_trace}' = 'false'::jsonb
+    AND contract.option_status -> 'rejected' = '{}'::jsonb
+    AND contract.option_status -> 'effective' =
+      (contract.option_status -> 'honored') || (contract.option_status -> 'defaulted')
+  )::text,
+  (
+    contract.option_status #>> '{envelope,model_artifact_hash}' = :'model_sha256'
+    AND (contract.option_status #>> '{envelope,model_artifact_bytes}')::bigint = :'model_bytes'::bigint
+    AND (contract.option_status #>> '{envelope,context_window_tokens}')::integer = 4096
+    AND (contract.option_status #>> '{envelope,batch_tokens}')::integer = 512
+    AND (contract.option_status #>> '{envelope,ubatch_tokens}')::integer = 128
+    AND contract.option_status #>> '{envelope,load_policy}' = 'eager_single_resident_model'
+    AND contract.option_status #>> '{envelope,device_policy}' = 'cpu_only_n_gpu_layers_0'
+    AND contract.option_status #>> '{envelope,rss_policy}' = 'linux_proc_status_vmrss_fail_closed'
+  )::text,
+  (
+    (contract.option_status #>> '{envelope,max_worker_rss_bytes}')::bigint > 0
+    AND (contract.option_status #>> '{envelope,current_rss_bytes}')::bigint > 0
+    AND (contract.option_status #>> '{envelope,current_rss_bytes}')::bigint <=
+      (contract.option_status #>> '{envelope,max_worker_rss_bytes}')::bigint
+    AND contract.trace_summary #>> '{memory,claim,process_rss_bytes}' =
+      contract.option_status #>> '{envelope,current_rss_bytes}'
+    AND (contract.trace_summary #>> '{memory,after,process_rss_bytes}')::bigint > 0
+    AND (contract.trace_summary #>> '{memory,after,process_rss_bytes}')::bigint <=
+      (contract.option_status #>> '{envelope,max_worker_rss_bytes}')::bigint
+    AND contract.trace_summary #>> '{memory,worker_memory_budget_bytes}' =
+      contract.option_status #>> '{envelope,max_worker_rss_bytes}'
+    AND contract.trace_summary #>> '{memory,admission,decision}' = 'allowed'
+    AND contract.trace_summary #>> '{memory,post_inference_enforcement,decision}' = 'allowed'
+  )::text,
+  (
+    contract.trace_summary #>> '{runtime_fingerprint,artifact,sha256}' = :'model_sha256'
+    AND (contract.trace_summary #>> '{runtime_fingerprint,artifact,bytes}')::bigint = :'model_bytes'::bigint
+    AND (contract.trace_summary #>> '{runtime_fingerprint,context,tokens}')::integer = 4096
+    AND (contract.trace_summary #>> '{runtime_fingerprint,context,batch_tokens}')::integer = 512
+    AND (contract.trace_summary #>> '{runtime_fingerprint,context,ubatch_tokens}')::integer = 128
+    AND contract.trace_summary #>> '{runtime_fingerprint,runtime,load_policy}' = 'eager_single_resident_model'
+    AND contract.trace_summary #>> '{runtime_fingerprint,runtime,device_policy}' = 'cpu_only_n_gpu_layers_0'
+    AND contract.trace_summary #>> '{runtime_fingerprint,runtime,rss_policy}' = 'linux_proc_status_vmrss_fail_closed'
+    AND contract.trace_summary ->> 'model_cache_hit' = 'true'
+    AND contract.trace_summary ->> 'inference_cache_hit' = 'false'
+  )::text,
+  (
+    (contract.option_status #>> '{effective,llama_threads}')::integer = 2
+    AND (contract.option_status #>> '{effective,llama_batch_threads}')::integer = 3
+    AND (contract.trace_summary ->> 'effective_llama_threads')::integer = 2
+    AND (contract.trace_summary ->> 'effective_llama_batch_threads')::integer = 3
+    AND (contract.trace_summary #>> '{runtime_fingerprint,context,decode_threads}')::integer = 2
+    AND (contract.trace_summary #>> '{runtime_fingerprint,context,batch_threads}')::integer = 3
+  )::text,
+  incompatible.status,
+  incompatible.attempts,
+  incompatible.claims,
+  incompatible.receipts
+)
+FROM receipt_contract contract
+CROSS JOIN incompatible_state incompatible;
+SQL
+}
+portable_runtime_contract="$(portable_runtime_contract_query)"
+expected_portable_runtime_contract="otlet_portable_runtime_options_status_v1|true|true|true|true|true|true|true|queued|0|0|0"
+if [ "$portable_runtime_contract" != "$expected_portable_runtime_contract" ]; then
+  echo "Expected portable runtime contract $expected_portable_runtime_contract, got $portable_runtime_contract" >&2
+  exit 1
+fi
+echo "portable_runtime_contract=$portable_runtime_contract"
+docker exec -i "$container" psql -U postgres -d "$portable_database" \
+  -X -qAt -v ON_ERROR_STOP=1 <<'SQL' >/dev/null
+DELETE FROM otlet.jobs
+WHERE task_name = 'aaa_portable_runtime_incompatible'
+  AND subject_id = 'runtime-incompatible';
+SQL
 
 async_result_contract="$(
   docker exec -i "$container" psql -U postgres -d "$portable_database" \
@@ -820,6 +946,8 @@ BEGIN
     current_setting('otlet.probe_worker_id'),
     1,
     current_setting('otlet.probe_runtime_hash'),
+    1048576,
+    6,
     1
   );
   IF claim_row.selection_role IS DISTINCT FROM 'cheap'
@@ -914,6 +1042,8 @@ BEGIN
     current_setting('otlet.probe_worker_id'),
     1,
     current_setting('otlet.probe_runtime_hash'),
+    1048576,
+    6,
     1
   );
   SELECT job_status

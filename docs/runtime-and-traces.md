@@ -89,7 +89,26 @@ SELECT * FROM otlet.portable_claim_status ORDER BY claim_id DESC;
 SELECT * FROM otlet.portable_receipt_status ORDER BY receipt_id DESC;
 ```
 
-The [reference external worker](../crates/otlet_worker/README.md) runs the same database-built prompt with one local GGUF when the PostgreSQL host cannot load the native extension worker. It converts the database-issued `max_attempt_ms` to one monotonic deadline before the claim RPC and shares it across prompt decode, generation, renewal, and the llama abort callback. PostgreSQL exposes the claim-time attempt deadline and rejects renewal after it. Timeout records `attempt_timeout` in the job, receipt selection reason, and trace with no accepted output. Cancellation, pre-deadline claim loss, and database disconnect still interrupt work. PostgreSQL parses every returned envelope and owns validation and trusted-state writes
+PostgreSQL authors the portable option status before claim mutation and copies it from the claim into the linked receipt. `requested`, `honored`, `defaulted`, `rejected`, and `effective` distinguish task input from the settings the worker must execute. `envelope` binds the registered artifact, fixed context and batch shape, eager CPU-only load, current RSS, memory budget, and worker thread default
+
+```sql
+SELECT receipt_id,
+       runtime_options_status -> 'requested' AS requested,
+       runtime_options_status -> 'honored' AS honored,
+       runtime_options_status -> 'defaulted' AS defaulted,
+       runtime_options_status -> 'rejected' AS rejected,
+       runtime_options_status -> 'effective' AS effective,
+       runtime_options_status -> 'envelope' AS envelope,
+       model_cache_hit,
+       inference_cache_hit,
+       worker_process_rss_bytes,
+       worker_memory_budget_bytes
+FROM otlet.inference_receipt_trace_status
+WHERE runtime_name LIKE 'portable:%'
+ORDER BY receipt_id DESC;
+```
+
+The [reference external worker](../crates/otlet_worker/README.md) runs the same database-built prompt with one local GGUF when the PostgreSQL host cannot load the native extension worker. It rejects unknown options before claim, uses the database-normalized token and thread limits, keeps inference caching and generation tracing off, and enforces Linux VmRSS before and after inference. It converts the database-issued `max_attempt_ms` to one monotonic deadline before the claim RPC and shares it across prompt decode, generation, renewal, and the llama abort callback. PostgreSQL exposes the claim-time attempt deadline and rejects renewal after it. Timeout records `attempt_timeout` in the job, receipt selection reason, and trace with no accepted output. Cancellation, pre-deadline claim loss, and database disconnect still interrupt work. PostgreSQL parses every returned envelope and owns validation and trusted-state writes
 
 Receipt timing splits runtime preparation, model load, context creation, tokenization, prompt decode, generation, validation and post-processing, finish SQL, and semantic materialization. `otlet.runtime_stage_timing_status` aggregates every attempt for a job and leaves unmeasured worker work in `worker_overhead_ms`:
 

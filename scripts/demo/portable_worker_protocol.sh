@@ -1,5 +1,6 @@
 portable_protocol_task="portable_protocol_demo"
 portable_deadline_task="portable_deadline_demo"
+portable_runtime_incompatible_task="aaa_portable_runtime_incompatible"
 portable_worker_role="otlet_demo_portable_worker"
 portable_unauthorized_role="otlet_demo_portable_unauthorized"
 portable_worker_id="portable-demo-worker"
@@ -8,6 +9,7 @@ portable_denied_count=0
 cleanup_portable_protocol() {
   cleanup_task "$portable_protocol_task"
   cleanup_task "$portable_deadline_task"
+  cleanup_task "$portable_runtime_incompatible_task"
   psql_exec -qAt -v worker_id="$portable_worker_id" <<'SQL' >/dev/null
 DELETE FROM otlet.portable_workers WHERE worker_id = :'worker_id';
 DROP TABLE IF EXISTS public.otlet_demo_portable_protocol_source;
@@ -63,7 +65,12 @@ SELECT otlet.register_portable_worker(
   :'model_name',
   'reference-worker',
   '0.1.0',
-  '{"engine":"llama.cpp","build":"demo","transport":"postgres"}'::jsonb
+  jsonb_build_object(
+    'engine', 'llama.cpp',
+    'build', 'demo',
+    'transport', 'postgres',
+    'runtime_contract', otlet.portable_reference_runtime_contract()
+  )
 );
 CREATE TABLE public.otlet_demo_portable_protocol_source (
   id text PRIMARY KEY,
@@ -84,8 +91,19 @@ psql_exec -qAt \
   -v worker_id="$portable_worker_id" \
   -v identity_hash="$portable_identity_hash" \
   -v task_name="$portable_protocol_task" \
+  -v incompatible_task_name="$portable_runtime_incompatible_task" \
   -v model_name="$strong_model_name" <<'SQL'
 BEGIN;
+SELECT otlet.create_task(
+  :'incompatible_task_name',
+  NULL,
+  'Return status ok and no actions',
+  '{"type":"object","required":["status"],"additionalProperties":false,"properties":{"status":{"const":"ok"}}}'::jsonb,
+  :'model_name',
+  '{"reasoning":"off","max_tokens":16,"inference_cache":false,"max_worker_rss_bytes":1,"n_gpu_layers":1}'::jsonb
+) \g /dev/null
+INSERT INTO otlet.jobs (task_name, subject_id, input)
+VALUES (:'incompatible_task_name', 'runtime-incompatible', '{}'::jsonb);
 CREATE TEMP TABLE portable_created_task ON COMMIT DROP AS
 SELECT otlet.create_task(
   :'task_name',
@@ -93,7 +111,7 @@ SELECT otlet.create_task(
   'Return status ok and no actions',
   '{"type":"object","required":["status"],"additionalProperties":false,"properties":{"status":{"const":"ok"}}}'::jsonb,
   :'model_name',
-  '{"reasoning":"off","max_tokens":16,"inference_cache":false}'::jsonb,
+  '{"reasoning":"off","max_tokens":16,"inference_cache":false,"llama_threads":0}'::jsonb,
   '{"source_fields":["allowed","secret"],"strip_keys":["secret"]}'::jsonb
 );
 INSERT INTO otlet.jobs (task_name, subject_id, input)
@@ -114,7 +132,9 @@ SELECT 'portable_pause_contract=' || desired_state || '|' ||
          FROM otlet.portable_claim_jobs(
            pg_catalog.current_setting('otlet.demo_portable_worker_id'),
            1,
-           pg_catalog.current_setting('otlet.demo_portable_identity_hash')
+           pg_catalog.current_setting('otlet.demo_portable_identity_hash'),
+           1048576,
+           6
          )
        )::text
 FROM otlet.portable_worker_heartbeat(
@@ -142,7 +162,9 @@ BEGIN
     PERFORM * FROM otlet.portable_claim_jobs(
       pg_catalog.current_setting('otlet.demo_portable_worker_id'),
       2,
-      pg_catalog.current_setting('otlet.demo_portable_identity_hash')
+      pg_catalog.current_setting('otlet.demo_portable_identity_hash'),
+      1048576,
+      6
     );
     RAISE EXCEPTION 'incompatible portable runtime claimed work';
   EXCEPTION WHEN OTHERS THEN
@@ -164,7 +186,9 @@ BEGIN
     PERFORM * FROM otlet.portable_claim_jobs(
       pg_catalog.current_setting('otlet.demo_portable_worker_id'),
       1,
-      repeat('0', 64)
+      repeat('0', 64),
+      1048576,
+      6
     );
     RAISE EXCEPTION 'forged portable runtime identity claimed work';
   EXCEPTION WHEN OTHERS THEN
@@ -180,7 +204,9 @@ SELECT *
 FROM otlet.portable_claim_jobs(
   :'worker_id',
   1,
-  pg_catalog.current_setting('otlet.demo_portable_identity_hash')
+  pg_catalog.current_setting('otlet.demo_portable_identity_hash'),
+  1048576,
+  6
 );
 
 SELECT 'portable_snapshot_contract=' || count(*)::text || '|' ||
@@ -263,6 +289,25 @@ FROM otlet.portable_cancel_job(
   'portable cancellation'
 );
 RESET ROLE;
+DO $body$
+BEGIN
+  IF (
+    SELECT bool_and(
+      delivered.runtime_options @> '{"llama_threads":6,"llama_batch_threads":6}'::jsonb
+      AND claim.runtime_options_status #> '{requested,llama_threads}' = '0'::jsonb
+      AND NOT (claim.runtime_options_status -> 'requested' ? 'llama_batch_threads')
+      AND claim.runtime_options_status #> '{honored,llama_threads}' = '6'::jsonb
+      AND claim.runtime_options_status #> '{defaulted,llama_batch_threads}' = '6'::jsonb
+      AND claim.runtime_options_status -> 'effective' @>
+        '{"llama_threads":6,"llama_batch_threads":6}'::jsonb
+    )
+    FROM portable_demo_claims delivered
+    JOIN otlet.portable_claims claim ON claim.job_id = delivered.job_id
+  ) IS DISTINCT FROM true THEN
+    RAISE EXCEPTION 'portable claim did not normalize default thread settings';
+  END IF;
+END
+$body$;
 COMMIT;
 SQL
 
@@ -275,13 +320,15 @@ expect_portable_denied "$portable_worker_role" \
 expect_portable_denied "$portable_unauthorized_role" \
   "SELECT count(*) FROM otlet.portable_protocol_status" "unauthorized protocol status read"
 expect_portable_denied "$portable_unauthorized_role" \
-  "SELECT * FROM otlet.portable_claim_jobs('$portable_worker_id', 1, '$portable_identity_hash')" \
+  "SELECT * FROM otlet.portable_claim_jobs('$portable_worker_id', 1, '$portable_identity_hash', 1048576, 6)" \
   "unauthorized portable claim"
 
-portable_protocol_contract="$(psql_value \
+portable_protocol_contract_query() {
+  psql_value \
   -v worker_role="$portable_worker_role" \
   -v worker_id="$portable_worker_id" \
-  -v task_name="$portable_protocol_task" <<'SQL'
+  -v task_name="$portable_protocol_task" \
+  -v incompatible_task_name="$portable_runtime_incompatible_task" <<'SQL'
 WITH rpc_catalog AS (
   SELECT
     count(*) AS rpc_count,
@@ -324,6 +371,29 @@ WITH rpc_catalog AS (
   FROM otlet.portable_receipt_status r
   JOIN otlet.jobs j ON j.id = r.job_id
   WHERE j.task_name = :'task_name'
+), incompatible_state AS (
+  SELECT
+    job.status AS job_status,
+    job.attempts,
+    (SELECT count(*) FROM otlet.portable_claims claim WHERE claim.job_id = job.id) AS claims,
+    (SELECT count(*) FROM otlet.inference_receipts receipt WHERE receipt.job_id = job.id) AS receipts,
+    otlet.portable_runtime_option_status(
+      revision.definition,
+      revision.definition #> '{models,direct}',
+      jsonb_build_object(
+        'runtime_contract', worker.runtime_identity -> 'runtime_contract',
+        'model_artifact_hash', worker.model_artifact_hash,
+        'model_artifact_bytes', worker.model_artifact_bytes,
+        'current_rss_bytes', 1048576,
+        'default_llama_threads', 6
+      )
+    ) AS option_status
+  FROM otlet.jobs job
+  JOIN otlet.workload_revisions revision
+    ON revision.workload_revision_hash = job.workload_revision_hash
+  JOIN otlet.portable_workers worker ON worker.worker_id = :'worker_id'
+  WHERE job.task_name = :'incompatible_task_name'
+    AND job.subject_id = 'runtime-incompatible'
 )
 SELECT
   protocol.protocol_version || '|' || protocol.status || '|' ||
@@ -336,7 +406,12 @@ SELECT
   rpc.rpc_count || '|' || rpc.definer_count || '|' || rpc.fixed_path_count || '|' ||
   grants.table_grants || '|' || functions.function_grants || '|' ||
   pg_catalog.has_table_privilege(:'worker_role', 'otlet.jobs', 'SELECT')::text || '|' ||
-  pg_catalog.has_table_privilege(:'worker_role', 'public.otlet_demo_portable_protocol_source', 'SELECT')::text
+  pg_catalog.has_table_privilege(:'worker_role', 'public.otlet_demo_portable_protocol_source', 'SELECT')::text || '|' ||
+  incompatible.job_status || '|' || incompatible.attempts || '|' ||
+  incompatible.claims || '|' || incompatible.receipts || '|' ||
+  (incompatible.option_status ->> 'compatible') || '|' ||
+  (incompatible.option_status #>> '{rejected,max_worker_rss_bytes}') || '|' ||
+  (incompatible.option_status #>> '{rejected,n_gpu_layers}')::text
 FROM otlet.portable_protocol_status protocol
 JOIN otlet.portable_worker_status worker ON worker.worker_id = :'worker_id'
 CROSS JOIN claim_state claims
@@ -344,11 +419,13 @@ CROSS JOIN receipt_state receipts
 CROSS JOIN rpc_catalog rpc
 CROSS JOIN worker_grants grants
 CROSS JOIN function_grants functions
+CROSS JOIN incompatible_state incompatible
 WHERE protocol.protocol_version = 1;
 SQL
-)"
+}
+portable_protocol_contract="$(portable_protocol_contract_query)"
 echo "portable_protocol_contract=$portable_protocol_contract"
-expected_portable_protocol_contract="1|active|true|true|3|0|cancel:canceled:canceled,complete:complete:complete,fail:failed:failed|4|true|true|1|1|1|1|7|7|7|1|7|false|false"
+expected_portable_protocol_contract="1|active|true|true|3|0|cancel:canceled:canceled,complete:complete:complete,fail:failed:failed|4|true|true|1|1|1|1|7|7|7|1|7|false|false|queued|0|0|0|false|current_rss_exceeds_max_worker_rss_bytes|unsupported_runtime_option"
 [ "$portable_protocol_contract" = "$expected_portable_protocol_contract" ] || {
   echo "Unexpected portable protocol contract: $portable_protocol_contract" >&2
   exit 1
@@ -379,7 +456,7 @@ VALUES (:'task_name', 'deadline', '{}'::jsonb);
 SET LOCAL ROLE :worker_role;
 CREATE TEMP TABLE portable_deadline_claim ON COMMIT DROP AS
 SELECT *
-FROM otlet.portable_claim_jobs(:'worker_id', 1, :'identity_hash', 1);
+FROM otlet.portable_claim_jobs(:'worker_id', 1, :'identity_hash', 1048576, 6, 1);
 SELECT *
 FROM otlet.portable_renew_job(
   :'worker_id',

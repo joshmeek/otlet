@@ -22,11 +22,13 @@ The database keeps zero `otlet` extension objects and zero C-language Otlet func
 
 ## Register The Worker
 
-Create one dedicated login with `NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS`. Register the model first, then grant and bind the worker:
+Create one dedicated login with `NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS`. Register the model first. Read the exact runtime identity from the binary, then grant and bind the worker:
 
-```sql
+```sh
+runtime_identity="$(otlet_worker --print-runtime-identity)"
+
+psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -v runtime_identity="$runtime_identity" <<'SQL'
 SELECT otlet.grant_portable_worker_access('otlet_worker'::regrole);
-
 SELECT otlet.register_portable_worker(
   'customer-vpc-worker',
   'otlet_worker'::regrole,
@@ -34,14 +36,9 @@ SELECT otlet.register_portable_worker(
   'qwen35_4b',
   'otlet-portable-worker',
   '0.1.0',
-  '{"engine":"llama.cpp","protocol_version":1,"transport":"postgres_psql","worker":"otlet-portable-worker","worker_version":"0.1.0"}'::jsonb
+  :'runtime_identity'::jsonb
 );
-```
-
-Read the exact runtime identity from the binary:
-
-```sh
-otlet_worker --print-runtime-identity
+SQL
 ```
 
 The worker role receives schema usage, one protocol compatibility view, and seven fixed-search-path RPCs. It receives no table, source, owner, review, or action authority
@@ -63,7 +60,11 @@ export OTLET_PORTABLE_RENEW_MS='1000'
 otlet_worker
 ```
 
-The process runs deployment preflight before it can claim work, then verifies the GGUF digest before loading it. PostgreSQL assembles the exact prompt from the shaped snapshot and task contract, then recomputes and validates the terminal identities, schema result, output, actions, and receipt lineage
+The process runs deployment preflight before it can claim work, verifies the GGUF digest and registered byte size, then loads the model once at startup. The reference runtime uses a 4,096-token context, 512-token batches, 128-token microbatches, and zero GPU layers. It samples Linux VmRSS before claim, before inference, and after inference. A missing sample or budget overage fails the claim or attempt without trusted output
+
+Portable admission accepts `reasoning`, `max_tokens`, `max_attempt_ms`, `inference_cache`, `max_worker_rss_bytes`, `generation_trace`, `llama_threads`, and `llama_batch_threads`. Each task must set `inference_cache` to `false`. Tasks may omit `generation_trace` or set it to `false`. PostgreSQL rejects other options before it changes claim state, resolves missing or zero thread counts to the worker default, and returns the normalized settings for execution. The default production policy supplies a nonzero RSS budget
+
+PostgreSQL assembles the exact prompt from the shaped snapshot and immutable task contract, then recomputes and validates the terminal identities, schema result, output, actions, and receipt lineage. It stores the database-authored requested, honored, defaulted, rejected, effective, artifact, context, thread, and RSS evidence on the claim and linked receipt
 
 ## Enqueue One-Off Inference
 
@@ -75,7 +76,8 @@ SELECT otlet.enqueue_ask(
   'qwen35_4b',
   'Summarize the note',
   '{"note":"Customer requested a procurement summary"}',
-  '{"type":"object","required":["summary"],"additionalProperties":false,"properties":{"summary":{"type":"string"}}}'
+  '{"type":"object","required":["summary"],"additionalProperties":false,"properties":{"summary":{"type":"string"}}}',
+  '{"reasoning":"off","max_tokens":256,"inference_cache":false}'
 ) AS job_id \gset
 COMMIT;
 
@@ -119,6 +121,7 @@ SELECT otlet.create_watch(
   model_name => 'qwen35_4b',
   table_name => 'vendor_notes'::regclass,
   subject_column => 'vendor_id',
+  runtime_options => '{"reasoning":"off","max_tokens":256,"inference_cache":false}'::jsonb,
   trigger_policy => '{"on_change":"mark_stale_and_enqueue"}'::jsonb,
   input_columns => ARRAY['note']::text[]
 );
@@ -184,7 +187,7 @@ After `./scripts/otlet-setup.sh` has placed the demo GGUF in Docker, run:
 ./scripts/otlet-portable-worker-demo.sh
 ```
 
-The script creates a disposable SQL-only database, builds the worker, and runs real local inference through direct, cheap-to-strong, row-watch, and pair-watch paths. It also proves an absolute attempt timeout after a successful renewal with one receipt and no output, receipt lineage, semantic reads, update and delete reconciliation, pause, resume, cancellation, claim loss, process restart, database restart, reclaim, duplicate delivery, drain, source denial, and redacted structured logs before dropping the database and roles
+The script creates a disposable SQL-only database, builds the worker, and runs real local inference through direct, cheap-to-strong, row-watch, and pair-watch paths. It proves pre-claim rejection without claim mutation, normalized thread settings, exact artifact and context evidence, fail-closed RSS sampling, database-authored option status, and an absolute attempt timeout after a successful renewal with one receipt and no output. It also covers receipt lineage, semantic reads, update and delete reconciliation, worker controls, restart and reclaim, duplicate delivery, source denial, and redacted structured logs before dropping the database and roles
 
 Run the isolated deployment-preflight proof:
 

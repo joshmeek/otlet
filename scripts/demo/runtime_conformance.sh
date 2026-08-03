@@ -18,7 +18,12 @@ SELECT otlet.register_portable_worker(
   :'model_name',
   'runtime-conformance-worker',
   '0.1.0',
-  '{"engine":"llama.cpp","transport":"postgres","fixture":"runtime-conformance"}'::jsonb
+  jsonb_build_object(
+    'engine', 'llama.cpp',
+    'transport', 'postgres',
+    'fixture', 'runtime-conformance',
+    'runtime_contract', otlet.portable_reference_runtime_contract()
+  )
 ) \g /dev/null
 
 CREATE TABLE public.otlet_runtime_conformance_source (
@@ -174,6 +179,8 @@ FROM otlet.portable_claim_jobs(
   pg_catalog.current_setting('otlet.runtime_conformance_worker_id'),
   1,
   pg_catalog.current_setting('otlet.runtime_conformance_identity'),
+  1048576,
+  6,
   3
 );
 

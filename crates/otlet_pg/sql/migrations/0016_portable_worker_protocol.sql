@@ -22,6 +22,8 @@ CREATE TABLE otlet.portable_workers (
   database_role_oid oid NOT NULL,
   protocol_version integer NOT NULL REFERENCES otlet.portable_protocol_versions(protocol_version),
   model_name text NOT NULL REFERENCES otlet.models(name),
+  model_artifact_hash text NOT NULL CHECK (model_artifact_hash ~ '^[0-9a-f]{64}$'),
+  model_artifact_bytes bigint NOT NULL CHECK (model_artifact_bytes > 0),
   runtime_name text NOT NULL CHECK (runtime_name ~ '^[a-z0-9][a-z0-9_.-]{0,127}$'),
   runtime_version text NOT NULL CHECK (
     btrim(runtime_version) <> '' AND octet_length(runtime_version) <= 128
@@ -53,6 +55,7 @@ CREATE TABLE otlet.portable_workers (
   last_seen_at timestamptz,
   last_heartbeat_at timestamptz,
   last_claimed_at timestamptz,
+  current_rss_bytes bigint CHECK (current_rss_bytes > 0),
   process_started_at timestamptz,
   created_at timestamptz NOT NULL DEFAULT now(),
   updated_at timestamptz NOT NULL DEFAULT now()
@@ -73,6 +76,11 @@ CREATE TABLE otlet.portable_claims (
   claim_token_hash text NOT NULL UNIQUE CHECK (claim_token_hash ~ '^[0-9a-f]{64}$'),
   status text NOT NULL DEFAULT 'claimed' CHECK (
     status IN ('claimed', 'renewed', 'complete', 'failed', 'canceled', 'replaced')
+  ),
+  runtime_options_status jsonb NOT NULL CHECK (
+    jsonb_typeof(runtime_options_status) = 'object'
+    AND runtime_options_status @> '{"compatible":true}'::jsonb
+    AND octet_length(runtime_options_status::text) <= 65536
   ),
   claimed_at timestamptz NOT NULL DEFAULT now(),
   last_renewed_at timestamptz,
@@ -110,6 +118,7 @@ LANGUAGE plpgsql
 AS $$
 DECLARE
   role_row record;
+  model_row otlet.models%ROWTYPE;
   saved_worker otlet.portable_workers%ROWTYPE;
 BEGIN
   IF register_portable_worker.worker_id !~ '^[a-z0-9][a-z0-9_-]{0,62}$' THEN
@@ -123,6 +132,10 @@ BEGIN
   IF jsonb_typeof(register_portable_worker.runtime_identity) IS DISTINCT FROM 'object'
      OR octet_length(COALESCE(register_portable_worker.runtime_identity, '{}'::jsonb)::text) > 65536 THEN
     RAISE EXCEPTION 'otlet portable runtime identity must be a bounded object';
+  END IF;
+  IF register_portable_worker.runtime_identity -> 'runtime_contract'
+       IS DISTINCT FROM otlet.portable_reference_runtime_contract() THEN
+    RAISE EXCEPTION 'otlet portable runtime contract is incompatible';
   END IF;
 
   PERFORM 1
@@ -149,11 +162,21 @@ BEGIN
     RAISE EXCEPTION 'otlet portable worker database role is overprivileged';
   END IF;
 
+  SELECT m.*
+  INTO model_row
+  FROM otlet.models m
+  WHERE m.name = register_portable_worker.model_name;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'otlet portable worker model does not exist';
+  END IF;
+
   INSERT INTO otlet.portable_workers (
     worker_id,
     database_role_oid,
     protocol_version,
     model_name,
+    model_artifact_hash,
+    model_artifact_bytes,
     runtime_name,
     runtime_version,
     runtime_identity,
@@ -164,6 +187,8 @@ BEGIN
     register_portable_worker.target_role::oid,
     register_portable_worker.protocol_version,
     register_portable_worker.model_name,
+    model_row.artifact_hash,
+    (model_row.artifact_identity ->> 'bytes')::bigint,
     register_portable_worker.runtime_name,
     register_portable_worker.runtime_version,
     register_portable_worker.runtime_identity,
@@ -173,6 +198,8 @@ BEGIN
   SET database_role_oid = EXCLUDED.database_role_oid,
       protocol_version = EXCLUDED.protocol_version,
       model_name = EXCLUDED.model_name,
+      model_artifact_hash = EXCLUDED.model_artifact_hash,
+      model_artifact_bytes = EXCLUDED.model_artifact_bytes,
       runtime_name = EXCLUDED.runtime_name,
       runtime_version = EXCLUDED.runtime_version,
       runtime_identity = EXCLUDED.runtime_identity,
@@ -183,6 +210,7 @@ BEGIN
       model_status = 'unverified',
       last_error_code = NULL,
       last_heartbeat_at = NULL,
+      current_rss_bytes = NULL,
       process_started_at = NULL,
       updated_at = now()
   RETURNING * INTO saved_worker;
@@ -320,6 +348,7 @@ LANGUAGE plpgsql
 AS $$
 DECLARE
   existing_claim_id bigint;
+  stored_runtime_options_status jsonb;
 BEGIN
   IF link_portable_receipt.receipt_id IS NULL THEN
     RETURN;
@@ -336,6 +365,23 @@ BEGIN
     INSERT INTO otlet.portable_receipt_links (receipt_id, claim_id)
     VALUES (link_portable_receipt.receipt_id, link_portable_receipt.claim_id);
   END IF;
+
+  SELECT c.runtime_options_status
+  INTO stored_runtime_options_status
+  FROM otlet.portable_claims c
+  WHERE c.id = link_portable_receipt.claim_id;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'otlet portable receipt claim does not exist';
+  END IF;
+  UPDATE otlet.inference_receipts r
+  SET trace_summary = r.trace_summary || jsonb_build_object(
+    'runtime_options_status',
+    stored_runtime_options_status
+  )
+  WHERE r.id = link_portable_receipt.receipt_id;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'otlet portable receipt does not exist';
+  END IF;
 END;
 $$;
 
@@ -346,7 +392,12 @@ CREATE FUNCTION otlet.portable_worker_heartbeat(
   reported_state text,
   model_status text DEFAULT NULL,
   error_code text DEFAULT NULL
-) RETURNS TABLE (desired_state text, registered_model_name text)
+) RETURNS TABLE (
+  desired_state text,
+  registered_model_name text,
+  registered_model_artifact_hash text,
+  registered_model_artifact_bytes bigint
+)
 LANGUAGE plpgsql
 SECURITY DEFINER
 SET search_path = pg_catalog, otlet, pg_temp
@@ -386,7 +437,16 @@ BEGIN
       END,
       updated_at = now()
   WHERE w.worker_id = worker_row.worker_id
-  RETURNING w.desired_state, w.model_name INTO desired_state, registered_model_name;
+  RETURNING
+    w.desired_state,
+    w.model_name,
+    w.model_artifact_hash,
+    w.model_artifact_bytes
+  INTO
+    desired_state,
+    registered_model_name,
+    registered_model_artifact_hash,
+    registered_model_artifact_bytes;
   RETURN NEXT;
 END;
 $$;
@@ -395,6 +455,8 @@ CREATE FUNCTION otlet.portable_claim_jobs(
   requested_worker_id text,
   requested_protocol_version integer,
   requested_runtime_identity_hash text,
+  requested_current_rss_bytes bigint,
+  requested_default_llama_threads integer,
   requested_claim_limit integer DEFAULT NULL
 ) RETURNS TABLE (
   protocol_version integer,
@@ -429,8 +491,18 @@ DECLARE
   saved_claim otlet.portable_claims%ROWTYPE;
   revision_definition jsonb;
   selected_model jsonb;
+  claim_contract jsonb;
+  runtime_options_status jsonb;
   claim_selection_role text;
 BEGIN
+  IF portable_claim_jobs.requested_current_rss_bytes IS NULL
+     OR portable_claim_jobs.requested_current_rss_bytes <= 0 THEN
+    RAISE EXCEPTION 'otlet portable current RSS bytes must be positive';
+  END IF;
+  IF portable_claim_jobs.requested_default_llama_threads IS NULL
+     OR portable_claim_jobs.requested_default_llama_threads NOT BETWEEN 1 AND 1024 THEN
+    RAISE EXCEPTION 'otlet portable default llama threads must be between 1 and 1024';
+  END IF;
   IF portable_claim_jobs.requested_claim_limit IS NOT NULL
      AND portable_claim_jobs.requested_claim_limit NOT BETWEEN 1 AND 128 THEN
     RAISE EXCEPTION 'otlet portable claim limit must be between 1 and 128';
@@ -443,11 +515,27 @@ BEGIN
   IF worker_row.desired_state <> 'running' THEN
     RETURN;
   END IF;
+  UPDATE otlet.portable_workers w
+  SET current_rss_bytes = portable_claim_jobs.requested_current_rss_bytes,
+      updated_at = now()
+  WHERE w.worker_id = worker_row.worker_id
+  RETURNING * INTO worker_row;
+  claim_contract := jsonb_build_object(
+    'runtime_contract', worker_row.runtime_identity -> 'runtime_contract',
+    'model_artifact_hash', worker_row.model_artifact_hash,
+    'model_artifact_bytes', worker_row.model_artifact_bytes,
+    'current_rss_bytes', worker_row.current_rss_bytes,
+    'default_llama_threads', portable_claim_jobs.requested_default_llama_threads
+  );
   SELECT p.* INTO policy_row FROM otlet.production_policy p WHERE p.name = 'default';
 
   FOR claimed_job IN
     SELECT *
-    FROM otlet.claim_jobs(worker_row.model_name, portable_claim_jobs.requested_claim_limit)
+    FROM otlet.claim_jobs(
+      worker_row.model_name,
+      portable_claim_jobs.requested_claim_limit,
+      claim_contract
+    )
   LOOP
     SELECT revision.definition
     INTO revision_definition
@@ -460,6 +548,20 @@ BEGIN
       WHEN jsonb_typeof(revision_definition -> 'selection') = 'object' THEN 'cheap'
       ELSE 'direct'
     END;
+    selected_model := CASE claim_selection_role
+      WHEN 'cheap' THEN revision_definition #> '{models,cheap}'
+      WHEN 'strong' THEN revision_definition #> '{models,strong}'
+      ELSE revision_definition #> '{models,direct}'
+    END;
+    runtime_options_status := otlet.portable_runtime_option_status(
+      revision_definition,
+      selected_model,
+      claim_contract
+    );
+    IF selected_model ->> 'name' IS DISTINCT FROM worker_row.model_name
+       OR NOT COALESCE((runtime_options_status ->> 'compatible')::boolean, false) THEN
+      RAISE EXCEPTION 'otlet portable workload is incompatible with worker contract';
+    END IF;
 
     UPDATE otlet.portable_claims c
     SET status = 'replaced',
@@ -476,6 +578,7 @@ BEGIN
       attempt_index,
       selection_role,
       claim_token_hash,
+      runtime_options_status,
       claimed_at
     )
     VALUES (
@@ -487,6 +590,7 @@ BEGIN
       claimed_job.attempts,
       claim_selection_role,
       otlet.portable_text_hash(claimed_job.claim_token),
+      runtime_options_status,
       clock_timestamp()
     )
     RETURNING * INTO saved_claim;
@@ -496,15 +600,6 @@ BEGIN
         last_heartbeat_at = now(),
         reported_state = 'running'
     WHERE w.worker_id = worker_row.worker_id;
-
-    selected_model := CASE claim_selection_role
-      WHEN 'cheap' THEN revision_definition #> '{models,cheap}'
-      WHEN 'strong' THEN revision_definition #> '{models,strong}'
-      ELSE revision_definition #> '{models,direct}'
-    END;
-    IF selected_model ->> 'name' IS DISTINCT FROM worker_row.model_name THEN
-      RAISE EXCEPTION 'otlet portable worker model does not match workload revision';
-    END IF;
 
     protocol_version := worker_row.protocol_version;
     worker_id := worker_row.worker_id;
@@ -533,6 +628,7 @@ BEGIN
       decision_contract
     );
     prompt_hash := otlet.portable_text_hash(prompt);
+    runtime_options := runtime_options_status -> 'effective';
     model := selected_model;
     evidence_limits := jsonb_build_object(
       'max_input_bytes', policy_row.max_input_bytes_per_job,
@@ -1234,9 +1330,12 @@ SELECT
   pg_catalog.pg_get_userbyid(w.database_role_oid) AS database_role,
   w.protocol_version,
   w.model_name,
+  w.model_artifact_hash,
+  w.model_artifact_bytes,
   w.runtime_name,
   w.runtime_version,
   w.runtime_identity_hash,
+  w.runtime_identity -> 'runtime_contract' AS runtime_contract,
   w.enabled,
   w.desired_state,
   w.reported_state,
@@ -1245,6 +1344,7 @@ SELECT
   w.last_seen_at,
   w.last_heartbeat_at,
   w.last_claimed_at,
+  w.current_rss_bytes,
   w.process_started_at,
   CASE
     WHEN NOT w.enabled THEN 'disabled'
@@ -1301,9 +1401,12 @@ GROUP BY
   w.database_role_oid,
   w.protocol_version,
   w.model_name,
+  w.model_artifact_hash,
+  w.model_artifact_bytes,
   w.runtime_name,
   w.runtime_version,
   w.runtime_identity_hash,
+  w.runtime_identity,
   w.enabled,
   w.desired_state,
   w.reported_state,
@@ -1312,6 +1415,7 @@ GROUP BY
   w.last_seen_at,
   w.last_heartbeat_at,
   w.last_claimed_at,
+  w.current_rss_bytes,
   w.process_started_at,
   queue.queued_jobs,
   queue.suspended_revision_queued_jobs;
@@ -1326,6 +1430,7 @@ SELECT
   c.runtime_identity_hash,
   c.attempt_index,
   c.selection_role,
+  c.runtime_options_status,
   CASE
     WHEN c.status IN ('claimed', 'renewed')
       AND j.status IN ('complete', 'failed', 'canceled') THEN j.status
@@ -1362,6 +1467,7 @@ SELECT
   c.worker_id,
   c.protocol_version,
   c.runtime_identity_hash,
+  c.runtime_options_status,
   r.attempt_index,
   r.status AS receipt_status,
   r.selection_role,
@@ -1370,6 +1476,7 @@ SELECT
   r.model_name,
   r.runtime_name,
   r.runtime_endpoint,
+  r.trace_summary -> 'runtime_options_status' AS receipt_runtime_options_status,
   r.finished_at,
   l.linked_at
 FROM otlet.portable_receipt_links l

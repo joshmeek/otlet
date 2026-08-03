@@ -56,6 +56,50 @@ FROM otlet.jobs
 WHERE task_name = 'workload_revision_portable_probe'
   AND subject_id = 'old';
 
+CREATE ROLE otlet_revision_cheap_worker
+  NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS;
+CREATE ROLE otlet_revision_strong_worker
+  NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS;
+SELECT otlet.grant_portable_worker_access('otlet_revision_cheap_worker'::regrole) \g /dev/null
+SELECT otlet.grant_portable_worker_access('otlet_revision_strong_worker'::regrole) \g /dev/null
+SELECT otlet.register_portable_worker(
+  'revision-cheap-worker',
+  'otlet_revision_cheap_worker'::regrole,
+  1,
+  'revision_cheap',
+  'revision-proof',
+  '1',
+  jsonb_build_object(
+    'proof', 'workload-revision',
+    'role', 'cheap',
+    'runtime_contract', otlet.portable_reference_runtime_contract()
+  )
+) \g /dev/null
+SELECT otlet.register_portable_worker(
+  'revision-strong-worker',
+  'otlet_revision_strong_worker'::regrole,
+  1,
+  'revision_strong',
+  'revision-proof',
+  '1',
+  jsonb_build_object(
+    'proof', 'workload-revision',
+    'role', 'strong',
+    'runtime_contract', otlet.portable_reference_runtime_contract()
+  )
+) \g /dev/null
+
+SELECT pg_catalog.set_config(
+  'otlet.revision_cheap_identity',
+  (SELECT runtime_identity_hash FROM otlet.portable_workers WHERE worker_id = 'revision-cheap-worker'),
+  true
+) \g /dev/null
+SELECT pg_catalog.set_config(
+  'otlet.revision_strong_identity',
+  (SELECT runtime_identity_hash FROM otlet.portable_workers WHERE worker_id = 'revision-strong-worker'),
+  true
+) \g /dev/null
+
 SELECT otlet.register_model(
   'revision_cheap',
   '/tmp/revision-cheap-b.gguf',
@@ -158,42 +202,6 @@ VALUES (
   'revision_cheap'
 );
 
-CREATE ROLE otlet_revision_cheap_worker
-  NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS;
-CREATE ROLE otlet_revision_strong_worker
-  NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS;
-SELECT otlet.grant_portable_worker_access('otlet_revision_cheap_worker'::regrole) \g /dev/null
-SELECT otlet.grant_portable_worker_access('otlet_revision_strong_worker'::regrole) \g /dev/null
-SELECT otlet.register_portable_worker(
-  'revision-cheap-worker',
-  'otlet_revision_cheap_worker'::regrole,
-  1,
-  'revision_cheap',
-  'revision-proof',
-  '1',
-  '{"proof":"workload-revision","role":"cheap"}'::jsonb
-) \g /dev/null
-SELECT otlet.register_portable_worker(
-  'revision-strong-worker',
-  'otlet_revision_strong_worker'::regrole,
-  1,
-  'revision_strong',
-  'revision-proof',
-  '1',
-  '{"proof":"workload-revision","role":"strong"}'::jsonb
-) \g /dev/null
-
-SELECT pg_catalog.set_config(
-  'otlet.revision_cheap_identity',
-  (SELECT runtime_identity_hash FROM otlet.portable_workers WHERE worker_id = 'revision-cheap-worker'),
-  true
-) \g /dev/null
-SELECT pg_catalog.set_config(
-  'otlet.revision_strong_identity',
-  (SELECT runtime_identity_hash FROM otlet.portable_workers WHERE worker_id = 'revision-strong-worker'),
-  true
-) \g /dev/null
-
 SET LOCAL ROLE otlet_revision_cheap_worker;
 CREATE TEMP TABLE cheap_claim AS
 SELECT *
@@ -201,6 +209,8 @@ FROM otlet.portable_claim_jobs(
   'revision-cheap-worker',
   1,
   pg_catalog.current_setting('otlet.revision_cheap_identity'),
+  1048576,
+  6,
   1
 );
 CREATE TEMP TABLE cheap_result AS
@@ -224,6 +234,8 @@ FROM otlet.portable_claim_jobs(
   'revision-strong-worker',
   1,
   pg_catalog.current_setting('otlet.revision_strong_identity'),
+  1048576,
+  6,
   1
 );
 CREATE TEMP TABLE strong_result AS
@@ -253,6 +265,8 @@ FROM otlet.portable_claim_jobs(
   'revision-cheap-worker',
   1,
   pg_catalog.current_setting('otlet.revision_cheap_identity'),
+  1048576,
+  6,
   1
 );
 RESET ROLE;

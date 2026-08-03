@@ -101,10 +101,298 @@ SELECT
 FROM model_routes route
 LEFT JOIN claim_counts claim ON claim.model_name = route.model_name;
 
+CREATE FUNCTION otlet.portable_reference_runtime_contract() RETURNS jsonb
+LANGUAGE sql
+IMMUTABLE
+PARALLEL SAFE
+AS $$
+  SELECT jsonb_build_object(
+    'context_window_tokens', 4096,
+    'batch_tokens', 512,
+    'ubatch_tokens', 128,
+    'load_policy', 'eager_single_resident_model',
+    'device_policy', 'cpu_only_n_gpu_layers_0',
+    'rss_policy', 'linux_proc_status_vmrss_fail_closed',
+    'supported_runtime_options', jsonb_build_array(
+      'reasoning',
+      'max_tokens',
+      'max_attempt_ms',
+      'inference_cache',
+      'max_worker_rss_bytes',
+      'generation_trace',
+      'llama_threads',
+      'llama_batch_threads'
+    )
+  )
+$$;
+
+CREATE FUNCTION otlet.portable_runtime_option_status(
+  workload_definition jsonb,
+  selected_model jsonb,
+  claim_contract jsonb
+) RETURNS jsonb
+LANGUAGE plpgsql
+IMMUTABLE
+PARALLEL SAFE
+AS $$
+DECLARE
+  reference_contract constant jsonb := otlet.portable_reference_runtime_contract();
+  requested jsonb := COALESCE(
+    portable_runtime_option_status.workload_definition #> '{task,runtime_options}',
+    '{}'::jsonb
+  );
+  supplied_effective jsonb := COALESCE(
+    portable_runtime_option_status.workload_definition #> '{runtime,effective_options}',
+    '{}'::jsonb
+  );
+  runtime_contract jsonb := portable_runtime_option_status.claim_contract -> 'runtime_contract';
+  artifact_hash text := portable_runtime_option_status.claim_contract ->> 'model_artifact_hash';
+  artifact_bytes_text text := portable_runtime_option_status.claim_contract ->> 'model_artifact_bytes';
+  current_rss_text text := portable_runtime_option_status.claim_contract ->> 'current_rss_bytes';
+  default_llama_threads_text text := portable_runtime_option_status.claim_contract ->> 'default_llama_threads';
+  effective_attempt_text text := portable_runtime_option_status.workload_definition #>> '{runtime,effective_max_attempt_ms}';
+  option_name text;
+  artifact_bytes_valid boolean;
+  current_rss_valid boolean;
+  max_tokens_valid boolean;
+  effective_attempt_valid boolean;
+  max_worker_rss_valid boolean;
+  option_value_valid boolean;
+  default_llama_threads_valid boolean;
+  effective_llama_threads jsonb;
+  effective_llama_batch_threads jsonb;
+  effective jsonb;
+  honored jsonb := '{}'::jsonb;
+  defaulted jsonb := '{}'::jsonb;
+  rejected jsonb := '{}'::jsonb;
+BEGIN
+  IF jsonb_typeof(requested) IS DISTINCT FROM 'object' THEN
+    rejected := rejected || jsonb_build_object('runtime_options', 'requested_options_must_be_object');
+    requested := '{}'::jsonb;
+  END IF;
+  IF jsonb_typeof(supplied_effective) IS DISTINCT FROM 'object' THEN
+    rejected := rejected || jsonb_build_object('effective_options', 'effective_options_must_be_object');
+    supplied_effective := '{}'::jsonb;
+  END IF;
+  artifact_bytes_valid := COALESCE(artifact_bytes_text ~ '^[1-9][0-9]{0,18}$', false);
+  IF artifact_bytes_valid AND length(artifact_bytes_text) = 19 THEN
+    artifact_bytes_valid := artifact_bytes_text <= '9223372036854775807';
+  END IF;
+  current_rss_valid := COALESCE(current_rss_text ~ '^[1-9][0-9]{0,18}$', false);
+  IF current_rss_valid AND length(current_rss_text) = 19 THEN
+    current_rss_valid := current_rss_text <= '9223372036854775807';
+  END IF;
+  default_llama_threads_valid := COALESCE(
+    jsonb_typeof(portable_runtime_option_status.claim_contract -> 'default_llama_threads') = 'number'
+      AND default_llama_threads_text ~ '^[1-9][0-9]{0,3}$',
+    false
+  );
+  IF default_llama_threads_valid AND length(default_llama_threads_text) = 4 THEN
+    default_llama_threads_valid := default_llama_threads_text <= '1024';
+  END IF;
+  IF jsonb_typeof(portable_runtime_option_status.claim_contract) IS DISTINCT FROM 'object'
+     OR runtime_contract IS DISTINCT FROM reference_contract THEN
+    rejected := rejected || jsonb_build_object('runtime_contract', 'runtime_contract_mismatch');
+  END IF;
+  IF artifact_hash IS NULL
+     OR artifact_hash !~ '^[0-9a-f]{64}$'
+     OR artifact_hash IS DISTINCT FROM portable_runtime_option_status.selected_model ->> 'artifact_hash'
+     OR artifact_hash IS DISTINCT FROM portable_runtime_option_status.selected_model #>> '{artifact_identity,sha256}'
+     OR NOT artifact_bytes_valid
+     OR artifact_bytes_text IS DISTINCT FROM portable_runtime_option_status.selected_model #>> '{artifact_identity,bytes}' THEN
+    rejected := rejected || jsonb_build_object('model_artifact', 'model_artifact_identity_mismatch');
+  END IF;
+  IF NOT current_rss_valid THEN
+    rejected := rejected || jsonb_build_object('current_rss_bytes', 'current_rss_bytes_must_be_positive_integer');
+  END IF;
+  IF NOT default_llama_threads_valid THEN
+    rejected := rejected || jsonb_build_object(
+      'default_llama_threads',
+      'default_llama_threads_must_be_integer_1_to_1024'
+    );
+  END IF;
+
+  FOR option_name IN
+    SELECT key
+    FROM jsonb_object_keys(requested || supplied_effective) key
+    WHERE key <> ALL(ARRAY[
+      'reasoning', 'max_tokens', 'max_attempt_ms', 'inference_cache',
+      'max_worker_rss_bytes', 'generation_trace', 'llama_threads',
+      'llama_batch_threads'
+    ])
+    ORDER BY key
+  LOOP
+    rejected := rejected || jsonb_build_object(option_name, 'unsupported_runtime_option');
+  END LOOP;
+
+  IF supplied_effective ? 'reasoning'
+     AND (
+       jsonb_typeof(supplied_effective -> 'reasoning') IS DISTINCT FROM 'string'
+       OR supplied_effective ->> 'reasoning' NOT IN ('on', 'off')
+     ) THEN
+    rejected := rejected || jsonb_build_object('reasoning', 'reasoning_must_be_on_or_off');
+  END IF;
+  max_tokens_valid := NOT supplied_effective ? 'max_tokens';
+  IF NOT max_tokens_valid THEN
+    max_tokens_valid := jsonb_typeof(supplied_effective -> 'max_tokens') = 'number'
+      AND supplied_effective ->> 'max_tokens' ~ '^[1-9][0-9]{0,3}$';
+    IF max_tokens_valid AND length(supplied_effective ->> 'max_tokens') = 4 THEN
+      max_tokens_valid := supplied_effective ->> 'max_tokens' <= '4096';
+    END IF;
+  END IF;
+  IF NOT max_tokens_valid THEN
+    rejected := rejected || jsonb_build_object('max_tokens', 'max_tokens_must_be_integer_1_to_4096');
+  END IF;
+  effective_attempt_valid := COALESCE(effective_attempt_text ~ '^[1-9][0-9]{0,6}$', false);
+  IF effective_attempt_valid AND length(effective_attempt_text) = 7 THEN
+    effective_attempt_valid := effective_attempt_text <= '3600000';
+  END IF;
+  option_value_valid := COALESCE(
+    NOT supplied_effective ? 'max_attempt_ms'
+      OR supplied_effective ->> 'max_attempt_ms' ~ '^[0-9]+$',
+    false
+  );
+  IF NOT effective_attempt_valid OR NOT option_value_valid THEN
+    rejected := rejected || jsonb_build_object('max_attempt_ms', 'max_attempt_ms_must_be_non_negative_integer');
+  END IF;
+  IF NOT requested ? 'inference_cache'
+     OR jsonb_typeof(requested -> 'inference_cache') IS DISTINCT FROM 'boolean'
+     OR requested -> 'inference_cache' <> 'false'::jsonb
+     OR supplied_effective -> 'inference_cache' IS DISTINCT FROM 'false'::jsonb THEN
+    rejected := rejected || jsonb_build_object('inference_cache', 'inference_cache_must_be_explicitly_false');
+  END IF;
+  max_worker_rss_valid := supplied_effective ? 'max_worker_rss_bytes'
+    AND jsonb_typeof(supplied_effective -> 'max_worker_rss_bytes') = 'number'
+    AND supplied_effective ->> 'max_worker_rss_bytes' ~ '^[1-9][0-9]{0,13}$';
+  IF max_worker_rss_valid
+     AND length(supplied_effective ->> 'max_worker_rss_bytes') = 14 THEN
+    max_worker_rss_valid := supplied_effective ->> 'max_worker_rss_bytes' <= '70368744177664';
+  END IF;
+  IF NOT max_worker_rss_valid THEN
+    rejected := rejected || jsonb_build_object('max_worker_rss_bytes', 'max_worker_rss_bytes_must_be_integer_1_to_70368744177664');
+  ELSIF current_rss_valid THEN
+    IF current_rss_text::bigint > (supplied_effective ->> 'max_worker_rss_bytes')::bigint THEN
+      rejected := rejected || jsonb_build_object('max_worker_rss_bytes', 'current_rss_exceeds_max_worker_rss_bytes');
+    ELSIF artifact_bytes_valid THEN
+      IF artifact_bytes_text::bigint > (supplied_effective ->> 'max_worker_rss_bytes')::bigint THEN
+        rejected := rejected || jsonb_build_object('max_worker_rss_bytes', 'artifact_exceeds_max_worker_rss_bytes');
+      END IF;
+    END IF;
+  END IF;
+  IF supplied_effective ? 'generation_trace'
+     AND (
+       jsonb_typeof(supplied_effective -> 'generation_trace') IS DISTINCT FROM 'boolean'
+       OR supplied_effective -> 'generation_trace' <> 'false'::jsonb
+     ) THEN
+    rejected := rejected || jsonb_build_object('generation_trace', 'generation_trace_must_be_false');
+  END IF;
+  effective_llama_threads := CASE
+    WHEN default_llama_threads_valid THEN to_jsonb(default_llama_threads_text::integer)
+    ELSE '0'::jsonb
+  END;
+  FOREACH option_name IN ARRAY ARRAY['llama_threads', 'llama_batch_threads']
+  LOOP
+    option_value_valid := NOT supplied_effective ? option_name;
+    IF NOT option_value_valid THEN
+      option_value_valid := jsonb_typeof(supplied_effective -> option_name) = 'number'
+        AND supplied_effective ->> option_name ~ '^[0-9]{1,4}$';
+      IF option_value_valid AND length(supplied_effective ->> option_name) = 4 THEN
+        option_value_valid := supplied_effective ->> option_name <= '1024';
+      END IF;
+    END IF;
+    IF NOT option_value_valid THEN
+      rejected := rejected || jsonb_build_object(option_name, option_name || '_must_be_integer_0_to_1024');
+    ELSIF option_name = 'llama_threads' THEN
+      IF supplied_effective ? option_name
+         AND supplied_effective ->> option_name <> '0' THEN
+        effective_llama_threads := supplied_effective -> option_name;
+      END IF;
+    ELSE
+      effective_llama_batch_threads := effective_llama_threads;
+      IF supplied_effective ? option_name
+         AND supplied_effective ->> option_name <> '0' THEN
+        effective_llama_batch_threads := supplied_effective -> option_name;
+      END IF;
+    END IF;
+  END LOOP;
+
+  effective := jsonb_build_object(
+    'reasoning', CASE
+      WHEN supplied_effective ->> 'reasoning' IN ('on', 'off')
+        THEN supplied_effective -> 'reasoning'
+      ELSE '"off"'::jsonb
+    END,
+    'max_tokens', CASE
+      WHEN max_tokens_valid AND supplied_effective ? 'max_tokens'
+        THEN supplied_effective -> 'max_tokens'
+      ELSE '512'::jsonb
+    END,
+    'max_attempt_ms', CASE
+      WHEN effective_attempt_valid
+        THEN to_jsonb(effective_attempt_text::bigint)
+      ELSE '0'::jsonb
+    END,
+    'inference_cache', COALESCE(supplied_effective -> 'inference_cache', 'false'::jsonb),
+    'max_worker_rss_bytes', COALESCE(supplied_effective -> 'max_worker_rss_bytes', '0'::jsonb),
+    'generation_trace', COALESCE(supplied_effective -> 'generation_trace', 'false'::jsonb),
+    'llama_threads', effective_llama_threads,
+    'llama_batch_threads', effective_llama_batch_threads
+  );
+
+  FOREACH option_name IN ARRAY ARRAY[
+    'reasoning', 'max_tokens', 'max_attempt_ms', 'inference_cache',
+    'max_worker_rss_bytes', 'generation_trace', 'llama_threads',
+    'llama_batch_threads'
+  ]
+  LOOP
+    IF NOT rejected ? option_name THEN
+      IF requested ? option_name THEN
+        honored := honored || jsonb_build_object(option_name, effective -> option_name);
+      ELSE
+        defaulted := defaulted || jsonb_build_object(option_name, effective -> option_name);
+      END IF;
+    END IF;
+  END LOOP;
+
+  RETURN jsonb_build_object(
+    'version', 'otlet_portable_runtime_options_status_v1',
+    'compatible', rejected = '{}'::jsonb,
+    'requested', requested,
+    'honored', honored,
+    'defaulted', defaulted,
+    'rejected', rejected,
+    'effective', effective,
+    'envelope', jsonb_build_object(
+      'model_artifact_hash', artifact_hash,
+      'model_artifact_bytes', CASE
+        WHEN artifact_bytes_valid THEN to_jsonb(artifact_bytes_text::bigint)
+        ELSE 'null'::jsonb
+      END,
+      'context_window_tokens', reference_contract -> 'context_window_tokens',
+      'batch_tokens', reference_contract -> 'batch_tokens',
+      'ubatch_tokens', reference_contract -> 'ubatch_tokens',
+      'load_policy', reference_contract -> 'load_policy',
+      'device_policy', reference_contract -> 'device_policy',
+      'rss_policy', reference_contract -> 'rss_policy',
+      'default_llama_threads', CASE
+        WHEN default_llama_threads_valid THEN to_jsonb(default_llama_threads_text::integer)
+        ELSE 'null'::jsonb
+      END,
+      'current_rss_bytes', CASE
+        WHEN current_rss_valid THEN to_jsonb(current_rss_text::bigint)
+        ELSE 'null'::jsonb
+      END,
+      'max_worker_rss_bytes', effective -> 'max_worker_rss_bytes'
+    )
+  );
+END;
+$$;
+
 -- Atomic queue claim for the resident worker; returns zero rows when no work exists
 CREATE FUNCTION otlet.claim_jobs(
   requested_model_name text DEFAULT NULL,
-  requested_limit integer DEFAULT NULL
+  requested_limit integer DEFAULT NULL,
+  requested_portable_claim_contract jsonb DEFAULT NULL
 ) RETURNS SETOF otlet.jobs
 LANGUAGE plpgsql
 AS $$
@@ -250,6 +538,14 @@ BEGIN
         job.definition #> '{source,query_contract}',
         true
       ) IS NULL
+      AND (
+        claim_jobs.requested_portable_claim_contract IS NULL
+        OR COALESCE((otlet.portable_runtime_option_status(
+          job.definition,
+          job.selected_model,
+          claim_jobs.requested_portable_claim_contract
+        ) ->> 'compatible')::boolean, false)
+      )
       AND job.workload_revision_hash = job.active_workload_revision_hash
     GROUP BY
       job.task_name,
