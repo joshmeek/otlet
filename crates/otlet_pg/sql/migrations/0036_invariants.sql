@@ -595,6 +595,30 @@ BEGIN
 
   RETURN QUERY
   SELECT
+    'portable_terminal_claims_have_receipts'::text,
+    'portable_claim'::text,
+    c.id::text,
+    jsonb_build_object(
+      'job_id', c.job_id,
+      'worker_id', c.worker_id,
+      'claim_status', c.status,
+      'job_status', j.status
+    )
+  FROM otlet.portable_claims c
+  JOIN otlet.jobs j ON j.id = c.job_id
+  WHERE c.status IN ('complete', 'failed', 'canceled')
+    AND NOT EXISTS (
+      SELECT 1
+      FROM otlet.portable_receipt_links link
+      JOIN otlet.inference_receipts receipt ON receipt.id = link.receipt_id
+      WHERE link.claim_id = c.id
+        AND receipt.job_id = c.job_id
+        AND receipt.workload_revision_hash = c.workload_revision_hash
+        AND receipt.status = c.status
+    );
+
+  RETURN QUERY
+  SELECT
     'portable_receipts_match_claims'::text,
     'receipt'::text,
     r.id::text,

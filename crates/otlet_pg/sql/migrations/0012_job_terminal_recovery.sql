@@ -348,6 +348,7 @@ DECLARE
   revision_definition jsonb;
   policy_max_attempts integer;
   inactive_revision boolean;
+  portable_runtime boolean;
   swept bigint := 0;
   canceled_swept bigint := 0;
 BEGIN
@@ -410,6 +411,14 @@ BEGIN
     WHERE id = job_row.id
     RETURNING * INTO job_row;
 
+    SELECT EXISTS (
+      SELECT 1
+      FROM otlet.portable_claims claim
+      WHERE claim.job_id = job_row.id
+        AND claim.attempt_index = job_row.attempts
+        AND claim.status IN ('claimed', 'renewed')
+    ) INTO portable_runtime;
+
     PERFORM otlet.fail_job(
       job_row.id,
       CASE
@@ -431,7 +440,15 @@ BEGIN
         WHEN inactive_revision THEN 'workload_revision_changed_after_lease_expired'
         ELSE 'job_lease_expired_after_max_attempts'
       END,
-      expected_claim_token => job_row.claim_token
+      expected_claim_token => job_row.claim_token,
+      runtime_name => CASE
+        WHEN portable_runtime THEN 'portable:control'
+        ELSE 'linked_inproc'
+      END,
+      runtime_endpoint => CASE
+        WHEN portable_runtime THEN 'postgres_rpc'
+        ELSE 'linked'
+      END
     );
 
     swept := swept + 1;
@@ -491,10 +508,26 @@ BEGIN
     WHERE id = job_row.id
     RETURNING * INTO job_row;
 
+    SELECT EXISTS (
+      SELECT 1
+      FROM otlet.portable_claims claim
+      WHERE claim.job_id = job_row.id
+        AND claim.attempt_index = job_row.attempts
+        AND claim.status IN ('claimed', 'renewed')
+    ) INTO portable_runtime;
+
     PERFORM otlet.finish_canceled_job(
       job_row.id,
       release_runtime => true,
-      expected_claim_token => job_row.claim_token
+      expected_claim_token => job_row.claim_token,
+      runtime_name => CASE
+        WHEN portable_runtime THEN 'portable:control'
+        ELSE 'linked_inproc'
+      END,
+      runtime_endpoint => CASE
+        WHEN portable_runtime THEN 'postgres_rpc'
+        ELSE 'linked'
+      END
     );
     canceled_swept := canceled_swept + 1;
   END LOOP;

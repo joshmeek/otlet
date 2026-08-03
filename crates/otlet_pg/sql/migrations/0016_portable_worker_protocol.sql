@@ -109,6 +109,20 @@ CREATE TABLE otlet.portable_receipt_links (
 CREATE INDEX portable_receipt_links_claim_idx
 ON otlet.portable_receipt_links (claim_id, receipt_id);
 
+CREATE FUNCTION otlet.lock_portable_worker_claim_jobs(worker_id text) RETURNS void
+LANGUAGE plpgsql
+AS $$
+BEGIN
+  PERFORM job.id
+  FROM otlet.jobs job
+  JOIN otlet.portable_claims claim ON claim.job_id = job.id
+  WHERE claim.worker_id = lock_portable_worker_claim_jobs.worker_id
+    AND claim.status IN ('claimed', 'renewed')
+  ORDER BY job.id
+  FOR UPDATE OF job;
+END;
+$$;
+
 CREATE FUNCTION otlet.register_portable_worker(
   worker_id text,
   target_role regrole,
@@ -220,6 +234,7 @@ BEGIN
       updated_at = now()
   RETURNING * INTO saved_worker;
 
+  PERFORM otlet.lock_portable_worker_claim_jobs(saved_worker.worker_id);
   UPDATE otlet.portable_claims c
   SET status = 'replaced',
       finished_at = COALESCE(c.finished_at, now())
@@ -343,12 +358,6 @@ BEGIN
     portable_start_worker.requested_runtime_identity_hash
   );
 
-  UPDATE otlet.portable_claims c
-  SET status = 'replaced',
-      finished_at = COALESCE(c.finished_at, now())
-  WHERE c.worker_id = worker_row.worker_id
-    AND c.status IN ('claimed', 'renewed');
-
   UPDATE otlet.portable_workers w
   SET incarnation_nonce_hash = otlet.portable_text_hash(raw_nonce),
       reported_state = 'starting',
@@ -361,6 +370,13 @@ BEGIN
       updated_at = now()
   WHERE w.worker_id = worker_row.worker_id
   RETURNING * INTO worker_row;
+
+  PERFORM otlet.lock_portable_worker_claim_jobs(worker_row.worker_id);
+  UPDATE otlet.portable_claims c
+  SET status = 'replaced',
+      finished_at = COALESCE(c.finished_at, now())
+  WHERE c.worker_id = worker_row.worker_id
+    AND c.status IN ('claimed', 'renewed');
 
   incarnation_nonce := raw_nonce;
   desired_state := worker_row.desired_state;
@@ -411,13 +427,41 @@ CREATE FUNCTION otlet.authorized_portable_claim(
   worker_id text,
   incarnation_nonce_hash text,
   job_id bigint,
-  claim_token text
+  claim_token text,
+  lock_workload_revision boolean DEFAULT false
 ) RETURNS otlet.portable_claims
 LANGUAGE plpgsql
 AS $$
 DECLARE
   claim_row otlet.portable_claims%ROWTYPE;
+  claim_task_name text;
+  claim_selection_role text;
 BEGIN
+  SELECT j.task_name, c.selection_role
+  INTO claim_task_name, claim_selection_role
+  FROM otlet.portable_claims c
+  JOIN otlet.jobs j ON j.id = c.job_id
+  WHERE c.worker_id = authorized_portable_claim.worker_id
+    AND c.incarnation_nonce_hash = authorized_portable_claim.incarnation_nonce_hash
+    AND c.job_id = authorized_portable_claim.job_id
+    AND c.claim_token_hash = otlet.portable_text_hash(authorized_portable_claim.claim_token)
+    AND c.status <> 'replaced';
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'otlet portable job claim is stale or belongs to another worker';
+  END IF;
+
+  IF authorized_portable_claim.lock_workload_revision
+     AND claim_selection_role = 'cheap' THEN
+    PERFORM pg_advisory_xact_lock(
+      hashtextextended('otlet_workload_revision:' || claim_task_name, 0)
+    );
+  END IF;
+
+  PERFORM 1
+  FROM otlet.jobs j
+  WHERE j.id = authorized_portable_claim.job_id
+  FOR UPDATE;
+
   SELECT c.*
   INTO claim_row
   FROM otlet.portable_claims c
@@ -483,6 +527,73 @@ BEGIN
   END IF;
 END;
 $$;
+
+CREATE FUNCTION otlet.reconcile_portable_terminal_claim() RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  claim_row otlet.portable_claims%ROWTYPE;
+  terminal_receipt_id bigint;
+BEGIN
+  IF NEW.status NOT IN ('complete', 'failed', 'canceled')
+     OR NEW.status IS NOT DISTINCT FROM OLD.status THEN
+    RETURN NEW;
+  END IF;
+
+  SELECT claim.*
+  INTO claim_row
+  FROM otlet.portable_claims claim
+  WHERE claim.job_id = NEW.id
+    AND claim.status IN ('claimed', 'renewed')
+  ORDER BY claim.id DESC
+  LIMIT 1
+  FOR UPDATE;
+  IF NOT FOUND THEN
+    RETURN NEW;
+  END IF;
+
+  SELECT receipt.id
+  INTO terminal_receipt_id
+  FROM otlet.inference_receipts receipt
+  JOIN otlet.portable_workers worker ON worker.worker_id = claim_row.worker_id
+  WHERE receipt.job_id = NEW.id
+    AND receipt.workload_revision_hash = claim_row.workload_revision_hash
+    AND receipt.selection_role = claim_row.selection_role
+    AND receipt.model_name = worker.model_name
+    AND receipt.status = NEW.status
+    AND NOT EXISTS (
+      SELECT 1
+      FROM otlet.portable_receipt_links link
+      WHERE link.receipt_id = receipt.id
+    )
+  ORDER BY receipt.attempt_index DESC, receipt.id DESC
+  LIMIT 1;
+
+  IF terminal_receipt_id IS NULL THEN
+    RAISE EXCEPTION 'otlet portable terminal job has no matching receipt';
+  END IF;
+  UPDATE otlet.inference_receipts receipt
+  SET runtime_name = 'portable:control',
+      runtime_endpoint = 'postgres_rpc'
+  WHERE receipt.id = terminal_receipt_id
+    AND (
+      receipt.runtime_name IS NULL
+      OR receipt.runtime_name NOT LIKE 'portable:%'
+      OR receipt.runtime_endpoint IS DISTINCT FROM 'postgres_rpc'
+    );
+  PERFORM otlet.link_portable_receipt(claim_row.id, terminal_receipt_id);
+
+  UPDATE otlet.portable_claims claim
+  SET status = NEW.status,
+      finished_at = COALESCE(claim.finished_at, now())
+  WHERE claim.id = claim_row.id;
+  RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER portable_terminal_claim_reconcile
+AFTER UPDATE OF status ON otlet.jobs
+FOR EACH ROW EXECUTE FUNCTION otlet.reconcile_portable_terminal_claim();
 
 CREATE FUNCTION otlet.portable_worker_heartbeat(
   requested_worker_id text,
@@ -630,6 +741,12 @@ BEGIN
     portable_claim_jobs.requested_runtime_identity_hash,
     portable_claim_jobs.requested_incarnation_nonce
   );
+  PERFORM 1
+  FROM otlet.production_policy policy
+  WHERE policy.name = 'default'
+  FOR UPDATE OF policy;
+  PERFORM pg_advisory_xact_lock(hashtext('otlet_queue_admission'));
+  PERFORM otlet.sweep_expired_jobs();
   IF worker_row.desired_state <> 'running' THEN
     RETURN;
   END IF;
@@ -788,6 +905,7 @@ BEGIN
     portable_renew_job.requested_runtime_identity_hash,
     portable_renew_job.requested_incarnation_nonce
   );
+  PERFORM pg_advisory_xact_lock(hashtext('otlet_queue_admission'));
   claim_row := otlet.authorized_portable_claim(
     worker_row.worker_id,
     worker_row.incarnation_nonce_hash,
@@ -1126,6 +1244,7 @@ DECLARE
   worker_row otlet.portable_workers%ROWTYPE;
   claim_row otlet.portable_claims%ROWTYPE;
   receipt_row otlet.inference_receipts%ROWTYPE;
+  validated_identity jsonb;
   acceptance_accepted boolean;
   acceptance_reason text;
   current_job_status text;
@@ -1140,7 +1259,8 @@ BEGIN
     worker_row.worker_id,
     worker_row.incarnation_nonce_hash,
     portable_complete_job.requested_job_id,
-    portable_complete_job.requested_claim_token
+    portable_complete_job.requested_claim_token,
+    true
   );
   SELECT j.status
   INTO current_job_status
@@ -1149,7 +1269,7 @@ BEGIN
 
   IF claim_row.selection_role = 'cheap'
      AND current_job_status = 'running' THEN
-    PERFORM otlet.validate_portable_result(
+    validated_identity := otlet.validate_portable_result(
       portable_complete_job.requested_job_id,
       portable_complete_job.output,
       portable_complete_job.raw_output,
@@ -1178,10 +1298,10 @@ BEGIN
         worker_row.model_name,
         output => portable_complete_job.output,
         raw_output => portable_complete_job.raw_output,
-        prompt_hash => portable_complete_job.prompt_hash,
-        input_hash => portable_complete_job.input_hash,
-        output_schema_hash => portable_complete_job.output_schema_hash,
-        raw_output_hash => portable_complete_job.raw_output_hash,
+        prompt_hash => validated_identity ->> 'prompt_hash',
+        input_hash => validated_identity ->> 'input_hash',
+        output_schema_hash => validated_identity ->> 'output_schema_hash',
+        raw_output_hash => validated_identity ->> 'raw_output_hash',
         started_at => portable_complete_job.started_at,
         trace_summary => portable_complete_job.trace_summary,
         schema_validation_status => 'passed',
@@ -1302,7 +1422,8 @@ BEGIN
     worker_row.worker_id,
     worker_row.incarnation_nonce_hash,
     portable_fail_job.requested_job_id,
-    portable_fail_job.requested_claim_token
+    portable_fail_job.requested_claim_token,
+    true
   );
   SELECT j.status
   INTO current_job_status

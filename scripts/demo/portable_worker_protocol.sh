@@ -1,5 +1,6 @@
 portable_protocol_task="portable_protocol_demo"
 portable_deadline_task="portable_deadline_demo"
+portable_lock_task="portable_lock_order_demo"
 portable_runtime_incompatible_task="aaa_portable_runtime_incompatible"
 portable_worker_role="otlet_demo_portable_worker"
 portable_unauthorized_role="otlet_demo_portable_unauthorized"
@@ -9,6 +10,7 @@ portable_denied_count=0
 cleanup_portable_protocol() {
   cleanup_task "$portable_protocol_task"
   cleanup_task "$portable_deadline_task"
+  cleanup_task "$portable_lock_task"
   cleanup_task "$portable_runtime_incompatible_task"
   psql_exec -qAt -v worker_id="$portable_worker_id" <<'SQL' >/dev/null
 DELETE FROM otlet.portable_workers WHERE worker_id = :'worker_id';
@@ -23,6 +25,26 @@ SQL
       psql_exec -c "DROP OWNED BY $role" -c "DROP ROLE $role" >/dev/null
     fi
   done
+}
+
+wait_for_portable_delay() {
+  local application_name="$1"
+
+  for _ in $(seq 1 40); do
+    if [ "$(psql_value -v application_name="$application_name" <<'SQL'
+SELECT EXISTS (
+  SELECT 1
+  FROM pg_stat_activity
+  WHERE application_name = :'application_name'
+    AND wait_event = 'PgSleep'
+);
+SQL
+)" = "t" ]; then
+      return 0
+    fi
+    sleep 0.05
+  done
+  return 1
 }
 
 expect_portable_denied() {
@@ -339,6 +361,20 @@ FROM otlet.portable_complete_job(
   '{"output":{"status":"ok"},"actions":[]}',
   '[]'::jsonb,
   trace_summary => '{"schema_validation_status":"failed"}'::jsonb
+);
+
+SELECT 'portable_failed_attempt_contract=' || receipt_status || '|' || schema_status
+FROM otlet.portable_record_attempt(
+  :'worker_id',
+  1,
+  pg_catalog.current_setting('otlet.demo_portable_identity_hash'),
+  pg_catalog.current_setting('otlet.demo_portable_incarnation_nonce'),
+  (SELECT job_id FROM portable_demo_claims WHERE subject_id = 'fail'),
+  (SELECT claim_token FROM portable_demo_claims WHERE subject_id = 'fail'),
+  'failed',
+  'portable protocol failed attempt',
+  schema_validation_status => 'not_run',
+  error => 'portable protocol failed attempt'
 );
 
 SELECT 'portable_fail_contract=' || job_status || '|' || (receipt_id IS NOT NULL)::text
@@ -835,7 +871,7 @@ SQL
 }
 portable_protocol_contract="$(portable_protocol_contract_query)"
 echo "portable_protocol_contract=$portable_protocol_contract"
-expected_portable_protocol_contract="1|active|true|true|3|0|cancel:canceled:canceled,complete:complete:complete,fail:failed:failed|4|true|true|1|1|1|1|8|8|8|1|8|false|false"
+expected_portable_protocol_contract="1|active|true|true|3|0|cancel:canceled:canceled,complete:complete:complete,fail:failed:failed|5|true|true|1|1|2|1|8|8|8|1|8|false|false"
 [ "$portable_protocol_contract" = "$expected_portable_protocol_contract" ] || {
   echo "Unexpected portable protocol contract: $portable_protocol_contract" >&2
   exit 1
@@ -1148,6 +1184,196 @@ expected_portable_deadline_contract="1000|true|true|true|failed|attempt_timeout|
 echo "portable_deadline_contract=$portable_deadline_contract"
 [ "$portable_deadline_contract" = "$expected_portable_deadline_contract" ] || {
   echo "Unexpected portable deadline contract: $portable_deadline_contract" >&2
+  exit 1
+}
+
+portable_lock_state="$(psql_value \
+  -v worker_role="$portable_worker_role" \
+  -v worker_id="$portable_worker_id" \
+  -v identity_hash="$portable_identity_hash" \
+  -v task_name="$portable_lock_task" \
+  -v cheap_model_name="$cheap_model_name" \
+  -v strong_model_name="$strong_model_name" <<'SQL'
+BEGIN;
+SELECT otlet.register_portable_worker(
+  :'worker_id',
+  :'worker_role'::regrole,
+  1,
+  :'cheap_model_name',
+  'reference-worker',
+  '0.1.0',
+  jsonb_build_object(
+    'engine', 'llama.cpp',
+    'build', 'demo',
+    'transport', 'postgres',
+    'runtime_contract', otlet.portable_reference_runtime_contract()
+  )
+) \g /dev/null
+SELECT otlet.create_task(
+  :'task_name',
+  NULL,
+  'Return status ok and no actions',
+  '{"type":"object","required":["status"],"additionalProperties":false,"properties":{"status":{"const":"ok"}}}'::jsonb,
+  :'cheap_model_name',
+  '{"reasoning":"off","max_tokens":16,"inference_cache":false}'::jsonb
+) \g /dev/null
+SELECT otlet.set_model_selection_policy(
+  :'task_name',
+  :'cheap_model_name',
+  :'strong_model_name',
+  '{"confidence_field":"confidence","accepted_confidence":["high"]}'::jsonb
+) \g /dev/null
+INSERT INTO otlet.jobs (task_name, subject_id, input)
+VALUES
+  (:'task_name', 'renew-lock', '{}'::jsonb),
+  (:'task_name', 'fallback-lock', '{}'::jsonb);
+
+SET LOCAL ROLE :worker_role;
+SELECT incarnation_nonce AS portable_lock_incarnation
+FROM otlet.portable_start_worker(:'worker_id', 1, :'identity_hash') \gset
+CREATE TEMP TABLE portable_lock_claims ON COMMIT DROP AS
+SELECT *
+FROM otlet.portable_claim_jobs(
+  :'worker_id',
+  1,
+  :'identity_hash',
+  :'portable_lock_incarnation',
+  1048576,
+  6,
+  2
+);
+RESET ROLE;
+SELECT :'portable_lock_incarnation' || '|' ||
+       max(job_id) FILTER (WHERE subject_id = 'renew-lock') || '|' ||
+       max(claim_token) FILTER (WHERE subject_id = 'renew-lock') || '|' ||
+       max(job_id) FILTER (WHERE subject_id = 'fallback-lock') || '|' ||
+       max(claim_token) FILTER (WHERE subject_id = 'fallback-lock')
+FROM portable_lock_claims;
+COMMIT;
+SQL
+)"
+IFS='|' read -r portable_lock_incarnation \
+  portable_renew_job_id portable_renew_claim_token \
+  portable_fallback_job_id portable_fallback_claim_token <<<"$portable_lock_state"
+
+psql_exec -qAt \
+  -v job_id="$portable_renew_job_id" \
+  -v claim_token="$portable_renew_claim_token" >/dev/null <<'SQL' &
+SET application_name = 'otlet_portable_queue_lock';
+SET statement_timeout = '5s';
+BEGIN;
+SELECT pg_advisory_xact_lock(hashtext('otlet_queue_admission'));
+SELECT pg_sleep(1);
+SELECT 1 / count(*)
+FROM otlet.renew_job_lease(:'job_id'::bigint, :'claim_token');
+COMMIT;
+SQL
+portable_queue_lock_pid="$!"
+if ! wait_for_portable_delay otlet_portable_queue_lock; then
+  wait "$portable_queue_lock_pid" || true
+  echo "Portable queue lock race did not reach its controlled delay" >&2
+  exit 1
+fi
+portable_queue_lock_contract="$(psql_value \
+  -v worker_role="$portable_worker_role" \
+  -v worker_id="$portable_worker_id" \
+  -v identity_hash="$portable_identity_hash" \
+  -v incarnation_nonce="$portable_lock_incarnation" \
+  -v job_id="$portable_renew_job_id" \
+  -v claim_token="$portable_renew_claim_token" <<'SQL'
+SET statement_timeout = '5s';
+SET ROLE :worker_role;
+SELECT job_status || '|' || (leased_until > now())::text
+FROM otlet.portable_renew_job(
+  :'worker_id',
+  1,
+  :'identity_hash',
+  :'incarnation_nonce',
+  :'job_id'::bigint,
+  :'claim_token'
+);
+SQL
+)"
+wait "$portable_queue_lock_pid"
+
+psql_exec -qAt \
+  -v task_name="$portable_lock_task" \
+  -v subject_id=fallback-lock >/dev/null <<'SQL' &
+SET application_name = 'otlet_portable_workload_lock';
+SET statement_timeout = '5s';
+BEGIN;
+SELECT pg_advisory_xact_lock(
+  hashtextextended('otlet_workload_revision:' || :'task_name', 0)
+);
+SELECT pg_sleep(1);
+SELECT otlet.admit_task_input(:'task_name', :'subject_id', '{}'::jsonb);
+COMMIT;
+SQL
+portable_workload_lock_pid="$!"
+if ! wait_for_portable_delay otlet_portable_workload_lock; then
+  wait "$portable_workload_lock_pid" || true
+  echo "Portable workload lock race did not reach its controlled delay" >&2
+  exit 1
+fi
+portable_workload_lock_contract="$(psql_value \
+  -v worker_role="$portable_worker_role" \
+  -v worker_id="$portable_worker_id" \
+  -v identity_hash="$portable_identity_hash" \
+  -v incarnation_nonce="$portable_lock_incarnation" \
+  -v task_name="$portable_lock_task" \
+  -v strong_model_name="$strong_model_name" \
+  -v job_id="$portable_fallback_job_id" \
+  -v claim_token="$portable_fallback_claim_token" <<'SQL'
+SET statement_timeout = '5s';
+BEGIN;
+SET LOCAL ROLE :worker_role;
+SELECT
+  job_status AS fallback_status,
+  (receipt_id IS NOT NULL)::text AS fallback_receipt,
+  (output_id IS NULL)::text AS fallback_no_output
+FROM otlet.portable_complete_job(
+  :'worker_id',
+  1,
+  :'identity_hash',
+  :'incarnation_nonce',
+  :'job_id'::bigint,
+  :'claim_token',
+  '{"status":"ok"}'::jsonb,
+  '{"output":{"status":"ok"},"actions":[]}',
+  '[]'::jsonb
+) \gset
+RESET ROLE;
+SELECT :'fallback_status' || '|' || :'fallback_receipt' || '|' ||
+       :'fallback_no_output' || '|' || claim.status || '|' ||
+       (job.status = 'queued'
+        AND job.attempts = 0
+        AND job.routed_model_name = :'strong_model_name')::text || '|' ||
+       (NOT EXISTS (SELECT 1 FROM otlet.verify_invariants()))::text
+FROM otlet.jobs job
+JOIN otlet.portable_claims claim ON claim.job_id = job.id
+WHERE job.id = :'job_id'::bigint;
+DELETE FROM otlet.worker_events event
+USING otlet.jobs job
+WHERE event.job_id = job.id
+  AND job.task_name = :'task_name';
+DELETE FROM otlet.inference_receipts receipt
+USING otlet.jobs job
+WHERE receipt.job_id = job.id
+  AND job.task_name = :'task_name';
+DELETE FROM otlet.jobs WHERE task_name = :'task_name';
+COMMIT;
+SQL
+)"
+wait "$portable_workload_lock_pid"
+
+echo "portable_queue_lock_contract=$portable_queue_lock_contract"
+[ "$portable_queue_lock_contract" = "running|true" ] || {
+  echo "Unexpected portable queue lock contract: $portable_queue_lock_contract" >&2
+  exit 1
+}
+echo "portable_workload_lock_contract=$portable_workload_lock_contract"
+[ "$portable_workload_lock_contract" = "queued|true|true|replaced|true|true" ] || {
+  echo "Unexpected portable workload lock contract: $portable_workload_lock_contract" >&2
   exit 1
 }
 
