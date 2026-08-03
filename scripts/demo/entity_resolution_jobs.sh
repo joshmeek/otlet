@@ -125,7 +125,7 @@ SQL
 
 source_rows_before="$(psql_exec -qAt <<'SQL'
 SELECT count(*)::text || '|' ||
-       md5(string_agg(to_jsonb(v)::text, ',' ORDER BY v.id))
+       otlet.portable_json_hash(jsonb_agg(to_jsonb(v) - 'updated_at' ORDER BY v.id))
 FROM public.otlet_demo_vendor_entity v;
 SQL
 )"

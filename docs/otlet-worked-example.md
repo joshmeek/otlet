@@ -194,7 +194,7 @@ action_approve_contract=approved|approved|demo approval reason
 action_dry_run_contract=approved|approved|passed
 action_apply_contract=approved|approved|not_applicable|action type has no apply path
 action_reject_contract=rejected|rejected
-source_write_contract=5|fa7672627cd7ab2a22aba2d9d7035815|5|fa7672627cd7ab2a22aba2d9d7035815
+source_write_contract=5|9cec87d344fe2bcd631df2b59afcf2276b55ce8d68c66f7ef6586e11269d55dc|5|9cec87d344fe2bcd631df2b59afcf2276b55ce8d68c66f7ef6586e11269d55dc
 ```
 
 Otlet stores trusted actions. The application still owns merge authority

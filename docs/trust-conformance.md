@@ -31,6 +31,17 @@ Deployers trust the native worker and PostgreSQL extension code. The local model
 
 The redacted storage mode keeps source input in the job snapshot until retention cleanup but removes a canary from raw model output, structured redacted fields, action redacted fields, trace detail, and operational events. Diagnostic mode can retain raw model text for its configured interval, so do not use it when that retention conflicts with a secret-handling requirement
 
+## Identity Test Vectors
+
+Native and portable installs use the same canonical JSON, domain separation, version tag, and SHA-256 digest. Semantic, task, source, model, and mutation-authority identities use `otlet:v1:sha256:<digest>`. Artifact, prompt, input, output, schema, runtime, and claim-token checksums remain lowercase SHA-256 under their versioned contracts
+
+| Vector | Canonical UTF-8 payload | Identity |
+| --- | --- | --- |
+| JSON | `{"format":"otlet.identity.v1","kind":"test_vector","value":{"a":[1,"é"],"b":2}}` | `otlet:v1:sha256:118dc186d3433180c95a2bd91652a2bf78953c0c6aa376ad8559a13cdb0dd109` |
+| Unicode text | `{"format":"otlet.identity.v1","kind":"text_vector","value":"Otlet\n🙂"}` | `otlet:v1:sha256:96077dacfe042898c24b4f06ed6d91b8d21e13a52d36738fe1009032d0d13f72` |
+
+`./scripts/otlet-demo.sh` checks the vectors through the native install. `./scripts/otlet-portable-upgrade-demo.sh` checks them through the SQL-only install
+
 ## Native Threats
 
 - Prompt text tries to override the instruction or choose an action target

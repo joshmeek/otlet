@@ -229,7 +229,7 @@ BEGIN
   actual_runtime_options_hash := otlet.portable_json_hash(
     policy.default_runtime_options || task_row.runtime_options
   );
-  actual_model_identity_hash := otlet.portable_json_hash(jsonb_build_object(
+  actual_model_identity_hash := otlet.identity_hash('model_identity', jsonb_build_object(
     'name', model_row.name,
     'artifact_hash', model_row.artifact_hash,
     'artifact_identity', model_row.artifact_identity

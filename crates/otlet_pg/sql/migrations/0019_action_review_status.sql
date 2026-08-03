@@ -317,7 +317,7 @@ abstention_items AS (
     NULL::text AS review_reason,
     o.output,
     r.trace_summary #>> '{mvcc,table}' AS source_table,
-    COALESCE(r.trace_summary #>> '{mvcc,source_hash}', md5((r.trace_summary -> 'mvcc')::text)) AS source_hash,
+    otlet.semantic_source_hash(j.input) AS source_hash,
     hashed.content_hash,
     COALESCE(materialization.content_hash, hashed.content_hash) AS current_content_hash,
     (
@@ -387,7 +387,7 @@ direct_rejected_items AS (
     NULL::text AS review_reason,
     r.candidate_output AS output,
     r.trace_summary #>> '{mvcc,table}' AS source_table,
-    COALESCE(r.trace_summary #>> '{mvcc,source_hash}', md5((r.trace_summary -> 'mvcc')::text)) AS source_hash,
+    otlet.semantic_source_hash(j.input) AS source_hash,
     hashed.content_hash,
     COALESCE(materialization.content_hash, hashed.content_hash) AS current_content_hash,
     (

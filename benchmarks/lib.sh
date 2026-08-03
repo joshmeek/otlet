@@ -52,7 +52,7 @@ SQL
 }
 
 source_hash() {
-  psql_value -c "SELECT COALESCE(md5(string_agg(to_jsonb(v)::text, ',' ORDER BY v.id)), '') FROM otlet_bench_source.vendor_entity v;"
+  psql_value -c "SELECT COALESCE(otlet.portable_text_hash(string_agg(to_jsonb(v)::text, ',' ORDER BY v.id)), '') FROM otlet_bench_source.vendor_entity v;"
 }
 
 count_worker_crashes() {

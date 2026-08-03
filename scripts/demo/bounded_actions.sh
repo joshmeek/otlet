@@ -248,7 +248,7 @@ echo "bounded_proposal_contract=$bounded_proposal_contract"
 }
 
 bounded_rows_before_dry_run="$(psql_value <<'SQL'
-SELECT md5(string_agg(otlet.semantic_canonical_jsonb(to_jsonb(source))::text, '' ORDER BY id))
+SELECT otlet.portable_text_hash(string_agg(otlet.semantic_canonical_jsonb(to_jsonb(source))::text, '' ORDER BY id))
 FROM public.otlet_demo_bounded_actions source;
 SQL
 )"
@@ -263,7 +263,7 @@ WHERE j.task_name = :'task_name'
 SQL
 
 bounded_rows_after_dry_run="$(psql_value <<'SQL'
-SELECT md5(string_agg(otlet.semantic_canonical_jsonb(to_jsonb(source))::text, '' ORDER BY id))
+SELECT otlet.portable_text_hash(string_agg(otlet.semantic_canonical_jsonb(to_jsonb(source))::text, '' ORDER BY id))
 FROM public.otlet_demo_bounded_actions source;
 SQL
 )"

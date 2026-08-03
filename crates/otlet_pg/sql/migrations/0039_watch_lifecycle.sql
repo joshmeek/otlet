@@ -54,7 +54,10 @@ CREATE FUNCTION otlet.watch_semantic_change(
 LANGUAGE plpgsql
 AS $$
 DECLARE
-  trigger_name text := 'otlet_watch_' || substr(md5(table_name::text || ':' || subject_column || ':' || COALESCE(watch_name, '')), 1, 16);
+  trigger_name text := 'otlet_watch_v1_' || substr(right(otlet.identity_text_hash(
+    'watch_trigger',
+    table_name::text || ':' || subject_column || ':' || COALESCE(watch_name, '')
+  ), 64), 1, 16);
 BEGIN
   IF watch_name IS NULL OR watch_name = '' THEN
     RAISE EXCEPTION 'otlet watch name is required';
@@ -108,7 +111,10 @@ BEGIN
   IF watch_row.kind = 'row'
      AND watch_row.source_table IS NOT NULL
      AND to_regclass(watch_row.source_table) IS NOT NULL THEN
-    trigger_name := 'otlet_watch_' || substr(md5(to_regclass(watch_row.source_table)::text || ':' || watch_row.subject_column || ':' || watch_row.name), 1, 16);
+    trigger_name := 'otlet_watch_v1_' || substr(right(otlet.identity_text_hash(
+      'watch_trigger',
+      to_regclass(watch_row.source_table)::text || ':' || watch_row.subject_column || ':' || watch_row.name
+    ), 64), 1, 16);
     EXECUTE format('DROP TRIGGER IF EXISTS %I ON %s', trigger_name, watch_row.source_table);
   END IF;
 
@@ -144,11 +150,10 @@ BEGIN
            WHERE source.value ->> 'table' = pair_source_table
              AND COALESCE(NULLIF(source.value ->> 'subject_column', ''), 'id') = pair_source_subject_column
          ) THEN
-        trigger_name := 'otlet_stale_' || substr(
-          md5(pair_source_table::regclass::text || ':' || pair_source_subject_column),
-          1,
-          16
-        );
+        trigger_name := 'otlet_stale_v1_' || substr(right(otlet.identity_text_hash(
+          'semantic_stale_trigger',
+          pair_source_table::regclass::text || ':' || pair_source_subject_column
+        ), 64), 1, 16);
         EXECUTE format('DROP TRIGGER IF EXISTS %I ON %s', trigger_name, pair_source_table);
       END IF;
     END LOOP;
@@ -480,7 +485,10 @@ BEGIN
     IF COALESCE(saved.trigger_policy ->> 'on_change', 'mark_stale') = 'mark_stale_and_enqueue' THEN
       PERFORM otlet.watch_semantic_change(create_watch.table_name, saved.subject_column, saved.name);
     ELSIF saved.source_table IS NOT NULL AND to_regclass(saved.source_table) IS NOT NULL THEN
-      watch_trigger_name := 'otlet_watch_' || substr(md5(to_regclass(saved.source_table)::text || ':' || saved.subject_column || ':' || saved.name), 1, 16);
+      watch_trigger_name := 'otlet_watch_v1_' || substr(right(otlet.identity_text_hash(
+        'watch_trigger',
+        to_regclass(saved.source_table)::text || ':' || saved.subject_column || ':' || saved.name
+      ), 64), 1, 16);
       EXECUTE format('DROP TRIGGER IF EXISTS %I ON %s', watch_trigger_name, saved.source_table);
     END IF;
   ELSIF saved.kind = 'pair' THEN

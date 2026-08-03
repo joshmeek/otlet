@@ -248,7 +248,7 @@ SELECT otlet.fail_job(
   'not json',
   NULL,
   NULL,
-  md5('{"type":"object","required":["decision","confidence","reason"]}'),
+  otlet.portable_json_hash('{"type":"object","required":["decision","confidence","reason"]}'::jsonb),
   otlet.portable_text_hash('not json'),
   now(),
   'failed',

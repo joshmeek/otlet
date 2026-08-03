@@ -200,7 +200,7 @@ CREATE FUNCTION otlet.action_target_contract_hash(target_name text) RETURNS text
 LANGUAGE sql
 STABLE
 AS $$
-  SELECT md5(otlet.semantic_canonical_jsonb(jsonb_build_object(
+  SELECT otlet.identity_hash('action_target_contract', jsonb_build_object(
     'name', t.name,
     'target_table', t.target_table::oid,
     'identity_column', t.identity_column,
@@ -210,7 +210,7 @@ AS $$
       ORDER BY column_name
     )),
     'enabled', t.enabled
-  ))::text)
+  ))
   FROM otlet.action_targets t
   WHERE t.name = $1;
 $$;
@@ -222,13 +222,13 @@ CREATE FUNCTION otlet.default_action_authority_hash(
 LANGUAGE sql
 STABLE
 AS $$
-  SELECT md5(otlet.semantic_canonical_jsonb(jsonb_build_object(
+  SELECT otlet.identity_hash('default_action_authority', jsonb_build_object(
     'task_name', $1,
     'action_type', $2,
     'task_contract_hash', otlet.current_task_contract_hash($1),
     'authority_mode', 'recommendation_only',
     'evaluation_status', 'unevaluated'
-  ))::text);
+  ));
 $$;
 
 CREATE FUNCTION otlet.register_action_workflow_policy(
@@ -296,7 +296,7 @@ BEGIN
 
   task_hash := otlet.current_task_contract_hash(register_action_workflow_policy.task_name);
   target_hash := otlet.action_target_contract_hash(register_action_workflow_policy.target_name);
-  policy_hash := md5(otlet.semantic_canonical_jsonb(jsonb_build_object(
+  policy_hash := otlet.identity_hash('action_workflow_policy', jsonb_build_object(
     'task_name', register_action_workflow_policy.task_name,
     'action_type', register_action_workflow_policy.action_type,
     'target_name', register_action_workflow_policy.target_name,
@@ -305,7 +305,7 @@ BEGIN
     'evaluation_status', register_action_workflow_policy.evaluation_status,
     'task_contract_hash', task_hash,
     'target_contract_hash', target_hash
-  ))::text);
+  ));
 
   INSERT INTO otlet.action_workflow_policies (
     task_name,
@@ -441,15 +441,12 @@ LANGUAGE sql
 IMMUTABLE
 STRICT
 AS $$
-  SELECT md5(
-    concat_ws(
-      E'\x1f',
-      $1 ->> 'target',
-      otlet.semantic_canonical_jsonb($1 -> 'identity')::text,
-      $2,
-      otlet.semantic_canonical_jsonb($1 -> 'changes')::text
-    )
-  );
+  SELECT otlet.identity_hash('update_row_idempotency', jsonb_build_object(
+    'target', $1 ->> 'target',
+    'identity', $1 -> 'identity',
+    'source_content_hash', $2,
+    'changes', $1 -> 'changes'
+  ));
 $$;
 
 CREATE FUNCTION otlet.action_execution_error(sqlstate text) RETURNS text

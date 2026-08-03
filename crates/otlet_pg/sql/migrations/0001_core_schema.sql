@@ -202,7 +202,8 @@ CREATE TABLE otlet.jobs (
   CHECK (status IN ('queued', 'running', 'complete', 'failed', 'canceled', 'cancel_requested')),
   CHECK ((status IN ('running', 'cancel_requested')) = (claim_token IS NOT NULL)),
   CHECK ((terminal_claim_token IS NULL) = (terminal_request_hash IS NULL)),
-  CHECK (terminal_claim_token IS NULL OR status IN ('complete', 'failed', 'canceled'))
+  CHECK (terminal_claim_token IS NULL OR status IN ('complete', 'failed', 'canceled')),
+  CHECK (terminal_request_hash IS NULL OR terminal_request_hash ~ '^otlet:v1:sha256:[0-9a-f]{64}$')
 );
 
 CREATE UNIQUE INDEX jobs_active_subject_idx
@@ -267,7 +268,10 @@ CREATE TABLE otlet.inference_receipts (
   CHECK (attempt_index > 0),
   CHECK (selection_role IN ('direct', 'cheap', 'strong')),
   CHECK (selection_status IN ('accepted', 'rejected', 'failed')),
-  CHECK (candidate_output IS NULL OR jsonb_typeof(candidate_output) = 'object')
+  CHECK (candidate_output IS NULL OR jsonb_typeof(candidate_output) = 'object'),
+  CHECK (task_identity_hash IS NULL OR task_identity_hash ~ '^otlet:v1:sha256:[0-9a-f]{64}$'),
+  CHECK (source_identity_hash IS NULL OR source_identity_hash ~ '^otlet:v1:sha256:[0-9a-f]{64}$'),
+  CHECK (model_identity_hash IS NULL OR model_identity_hash ~ '^otlet:v1:sha256:[0-9a-f]{64}$')
 );
 
 CREATE INDEX inference_receipts_task_model_role_finished_idx

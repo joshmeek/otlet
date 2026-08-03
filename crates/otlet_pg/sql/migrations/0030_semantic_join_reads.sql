@@ -56,7 +56,7 @@ BEGIN
         SELECT
           subject_id,
           input,
-          md5(input::text) AS source_hash,
+          otlet.semantic_source_hash(input) AS source_hash,
           otlet.semantic_content_hash(input, %7$L::jsonb) AS content_hash
         FROM raw_inputs
       ),
@@ -185,7 +185,7 @@ BEGIN
     RETURN false;
   END IF;
 
-  current_source_hash := md5(current_input::text);
+  current_source_hash := otlet.semantic_source_hash(current_input);
   current_content_hash := otlet.semantic_content_hash(current_input, current_input_shaping);
 
   RETURN EXISTS (
@@ -249,4 +249,3 @@ BEGIN
   );
 END;
 $$;
-

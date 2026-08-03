@@ -423,7 +423,7 @@ BEGIN
         job_row.input #>> '{_otlet_mvcc,semantic_join_index}',
         job_row.input #>> '{otlet_mvcc,semantic_join_index}'
       ),
-      saved_receipt.source_identity_hash,
+      otlet.semantic_source_hash(job_row.input),
       otlet.semantic_content_hash(job_row.input, task_row.input_shaping),
       action_idempotency_key,
       action_error
@@ -507,17 +507,13 @@ BEGIN
     j.task_name,
     j.subject_id,
     COALESCE(a.source_table, r.trace_summary #>> '{mvcc,table}') AS source_table,
-    COALESCE(
-      a.source_hash,
-      r.trace_summary #>> '{mvcc,source_hash}',
-      md5((r.trace_summary -> 'mvcc')::text)
-    ) AS source_hash,
+    COALESCE(a.source_hash, otlet.semantic_source_hash(j.input)) AS source_hash,
     COALESCE(a.content_hash, otlet.semantic_content_hash(j.input, t.input_shaping)) AS content_hash,
     r.model_name,
     r.model_artifact_hash,
     r.prompt_hash,
-    COALESCE(r.output_schema_hash, md5(t.output_schema::text)) AS output_schema_hash,
-    COALESCE(r.raw_output_hash, md5(COALESCE(o.output, r.candidate_output, 'null'::jsonb)::text)) AS output_hash,
+    COALESCE(r.output_schema_hash, otlet.portable_json_hash(t.output_schema)) AS output_schema_hash,
+    COALESCE(r.raw_output_hash, otlet.portable_json_hash(COALESCE(o.output, r.candidate_output, 'null'::jsonb))) AS output_hash,
     r.trace_summary ->> 'runtime_fingerprint_hash' AS runtime_fingerprint_hash
   INTO target
   FROM otlet.inference_receipts r

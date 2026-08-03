@@ -76,7 +76,7 @@ WITH live AS (
 )
 SELECT (SELECT count(*) FROM otlet.semantic_join_index_current_rows(:'watch_name', true))::text || '|' ||
        (SELECT stale_subjects::text FROM otlet.semantic_join_index_plan(:'watch_name', true)) || '|' ||
-       (SELECT (materialized.source_hash IS DISTINCT FROM md5(live.input::text))::text FROM materialized, live) || '|' ||
+       (SELECT (materialized.source_hash IS DISTINCT FROM otlet.semantic_source_hash(live.input))::text FROM materialized, live) || '|' ||
        :'receipts_before' || '|' ||
        (
          SELECT count(*)::text

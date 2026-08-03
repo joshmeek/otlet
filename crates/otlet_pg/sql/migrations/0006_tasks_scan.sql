@@ -157,7 +157,7 @@ BEGIN
   IF preset_name IS NOT NULL THEN
     SELECT
       p.decision_contract,
-      md5(otlet.semantic_canonical_jsonb(p.decision_contract)::text)
+      otlet.identity_hash('decision_rule_preset', p.decision_contract)
     INTO preset_contract, preset_contract_hash
     FROM otlet.decision_rule_presets p
     WHERE p.name = preset_name;
@@ -289,21 +289,20 @@ BEGIN
   IF jsonb_typeof(actual_input) IS DISTINCT FROM 'object' THEN
     RAISE EXCEPTION 'otlet ask input must be a JSON object';
   END IF;
-  direct_task_name := 'ask_' || substr(md5(
-    ask.model_name || chr(10) ||
-    ask.instruction || chr(10) ||
-    actual_schema::text || chr(10) ||
-    actual_options::text || chr(10) ||
-    (
-      SELECT COALESCE(jsonb_agg(input_field ORDER BY input_field), '[]'::jsonb)::text
-      FROM jsonb_object_keys(actual_input) input_field
+  direct_task_name := 'ask_v1_' || substr(right(otlet.identity_hash(
+    'direct_task',
+    jsonb_build_object(
+      'model_name', ask.model_name,
+      'instruction', ask.instruction,
+      'output_schema', actual_schema,
+      'runtime_options', actual_options,
+      'input_fields', (
+        SELECT COALESCE(jsonb_agg(input_field ORDER BY input_field), '[]'::jsonb)
+        FROM jsonb_object_keys(actual_input) input_field
+      )
     )
-  ), 1, 24);
-  direct_subject_id := 'ask_' || substr(md5(
-    clock_timestamp()::text || chr(10) ||
-    random()::text || chr(10) ||
-    actual_input::text
-  ), 1, 24);
+  ), 64), 1, 24);
+  direct_subject_id := 'ask_' || gen_random_uuid()::text;
 
   completed_job_id := otlet.worker_infer_now(
     direct_task_name,
@@ -690,13 +689,16 @@ BEGIN
   INTO input_fields
   FROM jsonb_object_keys(actual_input) input_field;
 
-  direct_task_name := 'ask_' || substr(md5(
-    enqueue_ask.model_name || chr(10) ||
-    enqueue_ask.instruction || chr(10) ||
-    actual_schema::text || chr(10) ||
-    actual_options::text || chr(10) ||
-    input_fields::text
-  ), 1, 24);
+  direct_task_name := 'ask_v1_' || substr(right(otlet.identity_hash(
+    'direct_task',
+    jsonb_build_object(
+      'model_name', enqueue_ask.model_name,
+      'instruction', enqueue_ask.instruction,
+      'output_schema', actual_schema,
+      'runtime_options', actual_options,
+      'input_fields', input_fields
+    )
+  ), 64), 1, 24);
   direct_subject_id := 'ask_' || gen_random_uuid()::text;
 
   PERFORM otlet.create_task(

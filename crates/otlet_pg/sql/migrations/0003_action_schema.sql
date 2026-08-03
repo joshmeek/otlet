@@ -50,9 +50,9 @@ CREATE TABLE otlet.action_workflow_policies (
   CHECK (NULLIF(subject_namespace, '') IS NOT NULL),
   CHECK (authority_mode IN ('recommendation_only', 'bounded_mutation')),
   CHECK (evaluation_status IN ('unevaluated', 'evaluated', 'adversarial')),
-  CHECK (task_contract_hash ~ '^[0-9a-f]{32}$'),
-  CHECK (target_contract_hash ~ '^[0-9a-f]{32}$'),
-  CHECK (policy_hash ~ '^[0-9a-f]{32}$')
+  CHECK (task_contract_hash ~ '^otlet:v1:sha256:[0-9a-f]{64}$'),
+  CHECK (target_contract_hash ~ '^otlet:v1:sha256:[0-9a-f]{64}$'),
+  CHECK (policy_hash ~ '^otlet:v1:sha256:[0-9a-f]{64}$')
 );
 
 CREATE TABLE otlet.actions (
@@ -86,12 +86,15 @@ CREATE TABLE otlet.actions (
   CHECK (authority_origin IN ('workflow', 'system')),
   CHECK (authority_mode IN ('recommendation_only', 'bounded_mutation')),
   CHECK (evaluation_status IN ('unevaluated', 'evaluated', 'adversarial')),
-  CHECK (authority_policy_hash ~ '^[0-9a-f]{32}$'),
+  CHECK (authority_policy_hash ~ '^otlet:v1:sha256:[0-9a-f]{64}$'),
   CHECK (NULLIF(subject_namespace, '') IS NOT NULL),
   CHECK (approval_status IN ('not_required', 'required', 'approved', 'rejected')),
   CHECK (dry_run_status IN ('not_run', 'passed', 'failed')),
   CHECK (apply_status IN ('not_applicable', 'applied', 'replayed', 'failed')),
-  CHECK (action_type <> 'update_row' OR idempotency_key IS NOT NULL OR status = 'rejected')
+  CHECK (action_type <> 'update_row' OR idempotency_key IS NOT NULL OR status = 'rejected'),
+  CHECK (source_hash IS NULL OR source_hash ~ '^otlet:v1:sha256:[0-9a-f]{64}$'),
+  CHECK (content_hash IS NULL OR content_hash ~ '^otlet:v1:sha256:[0-9a-f]{64}$'),
+  CHECK (idempotency_key IS NULL OR idempotency_key ~ '^otlet:v1:sha256:[0-9a-f]{64}$')
 );
 
 CREATE INDEX actions_job_id_idx
@@ -123,7 +126,11 @@ CREATE TABLE otlet.action_execution_receipts (
   replay_of_receipt_id bigint REFERENCES otlet.action_execution_receipts(id),
   created_at timestamptz NOT NULL DEFAULT now(),
   CHECK ((status = 'failed') = (error IS NOT NULL)),
-  CHECK ((status = 'replayed') = (replay_of_receipt_id IS NOT NULL))
+  CHECK ((status = 'replayed') = (replay_of_receipt_id IS NOT NULL)),
+  CHECK (idempotency_key ~ '^otlet:v1:sha256:[0-9a-f]{64}$'),
+  CHECK (identity_hash ~ '^otlet:v1:sha256:[0-9a-f]{64}$'),
+  CHECK (before_hash IS NULL OR before_hash ~ '^otlet:v1:sha256:[0-9a-f]{64}$'),
+  CHECK (result_hash IS NULL OR result_hash ~ '^otlet:v1:sha256:[0-9a-f]{64}$')
 );
 
 CREATE INDEX action_execution_receipts_action_created_idx
@@ -164,7 +171,8 @@ CREATE TABLE otlet.eval_labels (
   reason text,
   created_at timestamptz NOT NULL DEFAULT now(),
   CHECK (expected_confidence IN ('high', 'medium', 'low')),
-  CHECK (label_source IN ('approved_action', 'rejected_action', 'manual_correction'))
+  CHECK (label_source IN ('approved_action', 'rejected_action', 'manual_correction')),
+  CHECK (source_hash IS NULL OR source_hash ~ '^otlet:v1:sha256:[0-9a-f]{64}$')
 );
 
 CREATE INDEX eval_labels_subject_idx
@@ -211,7 +219,10 @@ CREATE TABLE otlet.review_events (
   output_schema_hash text NOT NULL CHECK (NULLIF(output_schema_hash, '') IS NOT NULL),
   output_hash text NOT NULL CHECK (NULLIF(output_hash, '') IS NOT NULL),
   runtime_fingerprint_hash text,
-  reviewed_at timestamptz NOT NULL DEFAULT now()
+  reviewed_at timestamptz NOT NULL DEFAULT now(),
+  CHECK (source_hash IS NULL OR source_hash ~ '^otlet:v1:sha256:[0-9a-f]{64}$'),
+  CHECK (content_hash IS NULL OR content_hash ~ '^otlet:v1:sha256:[0-9a-f]{64}$'),
+  CHECK (current_content_hash IS NULL OR current_content_hash ~ '^otlet:v1:sha256:[0-9a-f]{64}$')
 );
 
 CREATE INDEX review_events_target_reviewed_idx

@@ -323,9 +323,9 @@ SELECT (
   r.schema_validation_status || '|' ||
   (r.trace_summary ->> 'schema_validation_status') || '|' ||
   (r.trace_summary #>> '{portable_validation,version}') || '|' ||
-  (length(r.task_identity_hash) = 64)::text || '|' ||
-  (length(r.source_identity_hash) = 64)::text || '|' ||
-  (length(r.model_identity_hash) = 64)::text || '|' ||
+  (r.task_identity_hash ~ '^otlet:v1:sha256:[0-9a-f]{64}$')::text || '|' ||
+  (r.source_identity_hash ~ '^otlet:v1:sha256:[0-9a-f]{64}$')::text || '|' ||
+  (r.model_identity_hash ~ '^otlet:v1:sha256:[0-9a-f]{64}$')::text || '|' ||
   (length(r.runtime_options_hash) = 64)::text || '|' ||
   (length(r.prompt_hash) = 64)::text || '|' ||
   (length(r.input_hash) = 64)::text || '|' ||

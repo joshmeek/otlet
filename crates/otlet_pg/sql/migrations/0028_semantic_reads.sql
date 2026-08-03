@@ -63,7 +63,7 @@ BEGIN
         SELECT
           subject_id,
           input,
-          md5(input::text) AS source_hash,
+          otlet.semantic_source_hash(input) AS source_hash,
           otlet.semantic_content_hash(input, %9$L::jsonb) AS content_hash
         FROM raw_inputs
       ),
@@ -196,7 +196,7 @@ BEGIN
         SELECT
           subject_id,
           input,
-          md5(input::text) AS source_hash,
+          otlet.semantic_source_hash(input) AS source_hash,
           otlet.semantic_content_hash(input, %6$L::jsonb) AS content_hash
         FROM raw_inputs
       ),

@@ -28,7 +28,10 @@ CREATE TABLE otlet.semantic_materializations (
     'revalidated_after_benign_update'
   )),
   created_at timestamptz NOT NULL DEFAULT now(),
-  updated_at timestamptz NOT NULL DEFAULT now()
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  CHECK (source_hash IS NULL OR source_hash ~ '^otlet:v1:sha256:[0-9a-f]{64}$'),
+  CHECK (content_hash IS NULL OR content_hash ~ '^otlet:v1:sha256:[0-9a-f]{64}$'),
+  CHECK (contract_hash IS NULL OR contract_hash ~ '^otlet:v1:sha256:[0-9a-f]{64}$')
 );
 
 CREATE INDEX semantic_materializations_lookup_idx

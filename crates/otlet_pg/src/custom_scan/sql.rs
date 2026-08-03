@@ -39,7 +39,7 @@ fn source_rows_sql(
     // Build the MVCC+row envelope once; both hashes read the same object.
     format!(
         "SELECT projected.subject_id, \
-                md5(projected.input_obj::text) AS source_hash, \
+                otlet.semantic_source_hash(projected.input_obj) AS source_hash, \
                 otlet.semantic_content_hash(projected.input_obj, {input_shaping_sql}::jsonb) AS content_hash \
          FROM ( \
            SELECT (src.{subject_identifier})::text AS subject_id, \

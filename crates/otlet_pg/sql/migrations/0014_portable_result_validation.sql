@@ -252,7 +252,7 @@ BEGIN
   expected_raw_hash := otlet.portable_text_hash(validate_portable_result.raw_output);
   output_hash := otlet.portable_json_hash(validate_portable_result.output);
   actions_hash := otlet.portable_json_hash(COALESCE(validate_portable_result.actions, '[]'::jsonb));
-  task_identity_hash := otlet.portable_json_hash(jsonb_build_object(
+  task_identity_hash := otlet.identity_hash('task_identity', jsonb_build_object(
     'name', task_row.name,
     'instruction', task_row.instruction,
     'output_schema', task_row.output_schema,
@@ -261,13 +261,13 @@ BEGIN
     'input_shaping', task_row.input_shaping,
     'decision_contract', task_row.decision_contract
   ));
-  source_identity_hash := otlet.portable_json_hash(jsonb_build_object(
+  source_identity_hash := otlet.identity_hash('source_identity', jsonb_build_object(
     'task_name', task_row.name,
     'subject_id', job_row.subject_id,
     'input_query_hash', otlet.portable_text_hash(COALESCE(task_row.input_query, '')),
     'snapshot', job_row.input
   ));
-  model_identity_hash := otlet.portable_json_hash(jsonb_build_object(
+  model_identity_hash := otlet.identity_hash('model_identity', jsonb_build_object(
     'name', model_row.name,
     'artifact_hash', model_row.artifact_hash,
     'artifact_identity', model_row.artifact_identity

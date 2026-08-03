@@ -55,6 +55,7 @@ DECLARE
   task_row otlet.tasks%ROWTYPE;
   output_body jsonb;
   receipt_trace jsonb;
+  job_input jsonb;
   saved_label otlet.eval_labels%ROWTYPE;
   answer_field text;
   confidence_field text;
@@ -86,6 +87,11 @@ BEGIN
   IF NOT FOUND THEN
     RAISE EXCEPTION 'otlet label_action could not find task for action %', action_row.id;
   END IF;
+
+  SELECT j.input
+  INTO job_input
+  FROM otlet.jobs j
+  WHERE j.id = action_row.job_id;
 
   SELECT *
   INTO schema_row
@@ -179,11 +185,7 @@ BEGIN
     action_row.receipt_id,
     COALESCE(action_row.source_table, receipt_trace #>> '{mvcc,table}'),
     COALESCE(action_row.subject_id, ''),
-    COALESCE(
-      action_row.source_hash,
-      receipt_trace #>> '{mvcc,source_hash}',
-      md5((receipt_trace -> 'mvcc')::text)
-    ),
+    COALESCE(action_row.source_hash, otlet.semantic_source_hash(job_input)),
     final_answer,
     final_confidence,
     final_action_type,

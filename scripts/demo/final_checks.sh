@@ -228,7 +228,7 @@ action_row AS (
     'complete',
     subject_id,
     'public.otlet_demo_colon_subject',
-    md5(input::text)
+    otlet.semantic_source_hash(input)
   FROM output_row
   RETURNING id, subject_id
 )
@@ -401,6 +401,35 @@ SQL
 echo "materialization_failure_status_contract=$materialization_failure_status_contract"
 [ "$materialization_failure_status_contract" = "true|true" ] || {
   echo "Expected materialization failure status contract true|true, got $materialization_failure_status_contract" >&2
+  exit 1
+}
+
+identity_vector_contract="$(psql_value <<'SQL'
+SELECT concat_ws('|',
+  otlet.identity_hash(
+    'test_vector',
+    '{"b":2.00,"a":[1.0,"é"]}'::jsonb
+  ) = 'otlet:v1:sha256:118dc186d3433180c95a2bd91652a2bf78953c0c6aa376ad8559a13cdb0dd109',
+  otlet.identity_hash(
+    'test_vector',
+    '{"a":[1.00,"é"],"b":2}'::jsonb
+  ) = 'otlet:v1:sha256:118dc186d3433180c95a2bd91652a2bf78953c0c6aa376ad8559a13cdb0dd109',
+  otlet.identity_hash(
+    'other_vector',
+    '{"b":2.00,"a":[1.0,"é"]}'::jsonb
+  ) <> 'otlet:v1:sha256:118dc186d3433180c95a2bd91652a2bf78953c0c6aa376ad8559a13cdb0dd109',
+  otlet.identity_text_hash(
+    'text_vector',
+    E'Otlet\n🙂'
+  ) = 'otlet:v1:sha256:96077dacfe042898c24b4f06ed6d91b8d21e13a52d36738fe1009032d0d13f72',
+  otlet.task_contract_hash('vector', '{"type":"object"}'::jsonb, 'vector_model')
+    ~ '^otlet:v1:sha256:[0-9a-f]{64}$'
+);
+SQL
+)"
+echo "identity_vector_contract=$identity_vector_contract"
+[ "$identity_vector_contract" = "t|t|t|t|t" ] || {
+  echo "Expected versioned identity vectors t|t|t|t|t, got $identity_vector_contract" >&2
   exit 1
 }
 

@@ -80,7 +80,7 @@ BEGIN
         ar.model_name,
         r.body,
         false,
-        md5(j.input::text),
+        otlet.semantic_source_hash(j.input),
         otlet.semantic_content_hash(j.input, %5$L::jsonb),
         %6$L,
         NULL,
@@ -310,7 +310,7 @@ BEGIN
         'complete',
         job_row.subject_id,
         index_row.source_table,
-        md5(job_row.input::text)
+        otlet.semantic_source_hash(job_row.input)
       )
       RETURNING id INTO saved_action_id;
     END IF;

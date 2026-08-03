@@ -252,7 +252,7 @@ BEGIN
       a.authority_origin <> 'workflow'
       OR a.authority_mode <> 'bounded_mutation'
       OR a.evaluation_status <> 'evaluated'
-      OR a.authority_policy_hash !~ '^[0-9a-f]{32}$'
+      OR a.authority_policy_hash !~ '^otlet:v1:sha256:[0-9a-f]{64}$'
       OR a.target_name IS NULL
       OR a.subject_namespace IS NULL
       OR a.payload #>> '{body,target}' IS DISTINCT FROM a.target_name

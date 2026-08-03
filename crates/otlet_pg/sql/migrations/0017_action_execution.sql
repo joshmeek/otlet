@@ -78,8 +78,8 @@ BEGIN
         validation_error := 'action target row does not exist';
       ELSIF validation_error IS NULL THEN
         proposed_row := before_row || normalized_changes;
-        before_hash := md5(otlet.semantic_canonical_jsonb(before_row)::text);
-        result_hash := md5(otlet.semantic_canonical_jsonb(proposed_row)::text);
+        before_hash := otlet.identity_hash('mutation_row', before_row);
+        result_hash := otlet.identity_hash('mutation_row', proposed_row);
       END IF;
     END IF;
 
@@ -99,12 +99,12 @@ BEGIN
     )
     VALUES (
       action_row.id,
-      COALESCE(action_row.idempotency_key, md5('invalid-action:' || action_row.id::text)),
+      COALESCE(action_row.idempotency_key, otlet.identity_text_hash('invalid_action', action_row.id::text)),
       'dry_run',
       CASE WHEN validation_error IS NULL THEN 'passed' ELSE 'failed' END,
       COALESCE(action_body ->> 'target', ''),
       COALESCE(target_row.target_table::text, action_row.source_table, ''),
-      md5(COALESCE(otlet.semantic_canonical_jsonb(action_body -> 'identity')::text, 'null')),
+      otlet.identity_hash('action_identity', COALESCE(action_body -> 'identity', 'null'::jsonb)),
       COALESCE(changed_columns, ARRAY[]::name[]),
       CASE WHEN validation_error IS NULL THEN 1 ELSE 0 END,
       before_hash,
@@ -317,7 +317,7 @@ BEGIN
       IF validation_error IS NULL AND before_row IS NULL THEN
         validation_error := 'action target row does not exist';
       ELSIF validation_error IS NULL THEN
-        before_hash := md5(otlet.semantic_canonical_jsonb(before_row)::text);
+        before_hash := otlet.identity_hash('mutation_row', before_row);
         IF before_hash IS DISTINCT FROM dry_run_receipt.before_hash THEN
           validation_error := 'source changed after dry run';
         END IF;
@@ -349,7 +349,7 @@ BEGIN
       IF validation_error IS NULL AND after_row IS NULL THEN
         validation_error := 'bounded update affected no row';
       ELSIF validation_error IS NULL THEN
-        after_hash := md5(otlet.semantic_canonical_jsonb(after_row)::text);
+        after_hash := otlet.identity_hash('mutation_row', after_row);
       END IF;
     END IF;
 
@@ -374,7 +374,7 @@ BEGIN
         'applied',
         action_body ->> 'target',
         target_row.target_table::text,
-        md5(otlet.semantic_canonical_jsonb(action_body -> 'identity')::text),
+        otlet.identity_hash('action_identity', action_body -> 'identity'),
         changed_columns,
         1,
         before_hash,
@@ -406,7 +406,7 @@ BEGIN
         'failed',
         COALESCE(action_body ->> 'target', ''),
         COALESCE(target_row.target_table::text, action_row.source_table, ''),
-        md5(COALESCE(otlet.semantic_canonical_jsonb(action_body -> 'identity')::text, 'null')),
+        otlet.identity_hash('action_identity', COALESCE(action_body -> 'identity', 'null'::jsonb)),
         COALESCE(changed_columns, ARRAY[]::name[]),
         0,
         before_hash,
@@ -448,12 +448,12 @@ BEGIN
     )
     VALUES (
       action_row.id,
-      COALESCE(action_row.idempotency_key, md5('invalid-action:' || action_row.id::text)),
+      COALESCE(action_row.idempotency_key, otlet.identity_text_hash('invalid_action', action_row.id::text)),
       'apply',
       'failed',
       COALESCE(action_body ->> 'target', ''),
       COALESCE(target_row.target_table::text, action_row.source_table, ''),
-      md5(COALESCE(otlet.semantic_canonical_jsonb(action_body -> 'identity')::text, 'null')),
+      otlet.identity_hash('action_identity', COALESCE(action_body -> 'identity', 'null'::jsonb)),
       COALESCE(changed_columns, ARRAY[]::name[]),
       0,
       next_error

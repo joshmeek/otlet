@@ -297,10 +297,10 @@ LANGUAGE sql
 IMMUTABLE
 PARALLEL SAFE
 AS $$
-  SELECT encode(
-    sha256(convert_to(job_terminal_request_hash.operation || ':' || job_terminal_request_hash.request::text, 'UTF8')),
-    'hex'
-  )
+  SELECT otlet.identity_hash('job_terminal_request', jsonb_build_object(
+    'operation', job_terminal_request_hash.operation,
+    'request', job_terminal_request_hash.request
+  ))
 $$;
 
 CREATE FUNCTION otlet.mark_job_started(job_id bigint) RETURNS void

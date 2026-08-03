@@ -95,12 +95,13 @@ SELECT (SELECT count(*) = 1 FROM otlet.redaction_policy_status)::text || '|' ||
        (SELECT count(*) = 1 FROM otlet.portable_protocol_status)::text || '|' ||
        (SELECT count(*) >= 0 FROM otlet.portable_worker_status)::text || '|' ||
        (SELECT count(*) >= 0 FROM otlet.portable_claim_status)::text || '|' ||
-       (SELECT count(*) >= 0 FROM otlet.portable_receipt_status)::text;
+       (SELECT count(*) >= 0 FROM otlet.portable_receipt_status)::text || '|' ||
+       (otlet.semantic_content_hash('{"signal":"auditor proof"}'::jsonb) ~ '^otlet:v1:sha256:[0-9a-f]{64}$')::text;
 ROLLBACK;
 SQL
 )"
 echo "auditor_read_contract=$auditor_read_contract"
-[ "$auditor_read_contract" = "true|true|true|true|true|true|true|true|true|true|true|true|true|true|true" ] || {
+[ "$auditor_read_contract" = "true|true|true|true|true|true|true|true|true|true|true|true|true|true|true|true" ] || {
   echo "Expected auditor access to all redacted exports, got $auditor_read_contract" >&2
   exit 1
 }
@@ -457,6 +458,10 @@ WITH table_grants AS (
       WHERE grantee = :'auditor_role'
         AND routine_name NOT IN (
           'semantic_canonical_jsonb',
+          'portable_canonical_json_text',
+          'portable_text_hash',
+          'portable_json_hash',
+          'identity_hash',
           'semantic_shaped_input',
           'semantic_content_hash'
         )
@@ -465,6 +470,10 @@ WITH table_grants AS (
       WHERE grantee = :'operator_role'
         AND routine_name NOT IN (
           'semantic_canonical_jsonb',
+          'portable_canonical_json_text',
+          'portable_text_hash',
+          'portable_json_hash',
+          'identity_hash',
           'semantic_shaped_input',
           'semantic_content_hash',
           'approve_action',
@@ -548,16 +557,16 @@ CROSS JOIN definer_status;
 SQL
 )"
 echo "permission_catalog_contract=$permission_catalog_contract"
-[ "$permission_catalog_contract" = "false|0|0|0|15|3|15|11|0|0|0|0|18|18|0|7|7|7|true" ] || {
+[ "$permission_catalog_contract" = "false|0|0|0|15|7|15|15|0|0|0|0|18|18|0|7|7|7|true" ] || {
   echo "Expected exact public, auditor, operator, and owner ACLs, got $permission_catalog_contract" >&2
   exit 1
 }
 
 source "$demo_dir/review_provenance.sh"
 
-permission_contract="public=0/0/0|auditor=15/3|operator=15/11|definer=18/18|portable=7/7/7|positive=7|denied=$permission_denied_count"
+permission_contract="public=0/0/0|auditor=15/7|operator=15/15|definer=18/18|portable=7/7/7|positive=7|denied=$permission_denied_count"
 echo "permission_contract=$permission_contract"
-[ "$permission_contract" = "public=0/0/0|auditor=15/3|operator=15/11|definer=18/18|portable=7/7/7|positive=7|denied=61" ] || {
+[ "$permission_contract" = "public=0/0/0|auditor=15/7|operator=15/15|definer=18/18|portable=7/7/7|positive=7|denied=61" ] || {
   echo "Expected complete permission contract, got $permission_contract" >&2
   exit 1
 }

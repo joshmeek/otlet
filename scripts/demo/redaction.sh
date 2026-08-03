@@ -44,7 +44,7 @@ FROM otlet.record_model_attempt(
   output => '{"status":"review"}'::jsonb,
   raw_output => 'RAW-SENTINEL-🙂-DO-NOT-STORE',
   raw_output_hash => otlet.portable_text_hash('RAW-SENTINEL-🙂-DO-NOT-STORE'),
-  prompt_hash => md5('PROMPT-SENTINEL-🙂-DO-NOT-STORE'),
+  prompt_hash => otlet.portable_text_hash('PROMPT-SENTINEL-🙂-DO-NOT-STORE'),
   trace_summary => '{
     "schema_validation_status":"passed",
     "prompt":"PROMPT-SENTINEL-🙂-DO-NOT-STORE",
