@@ -29,6 +29,12 @@ pub(crate) struct JobModel {
     pub(crate) artifact_identity: Value,
 }
 
+pub(crate) enum InferNowJobAdmission {
+    Inserted(Job),
+    Active,
+    Conflict,
+}
+
 pub(crate) struct ModelSelectionPolicy {
     pub(crate) cheap: JobModel,
     pub(crate) strong: JobModel,
@@ -141,7 +147,7 @@ pub(crate) fn insert_infer_now_job(
     subject_id: &str,
     expected_workload_revision_hash: Option<&str>,
     input_json: &str,
-) -> pgrx::spi::Result<Option<Job>> {
+) -> pgrx::spi::Result<InferNowJobAdmission> {
     pgrx::Spi::connect_mut(|client| {
         let active_rows = client.select(
             "SELECT otlet.ensure_active_workload_revision($1)",
@@ -154,7 +160,7 @@ pub(crate) fn insert_infer_now_job(
             .ok_or(pgrx::spi::SpiError::InvalidPosition)?;
         if expected_workload_revision_hash.is_some_and(|expected| expected != active_revision_hash)
         {
-            return Ok(None);
+            return Ok(InferNowJobAdmission::Active);
         }
         let args = [
             task_name.into(),
@@ -162,6 +168,32 @@ pub(crate) fn insert_infer_now_job(
             input_json.into(),
             active_revision_hash.as_str().into(),
         ];
+        client.select(
+            "SELECT pg_advisory_xact_lock(hashtext('otlet_queue_admission'))",
+            Some(1),
+            &[],
+        )?;
+        let active_rows = client.select(
+            r"
+SELECT
+  count(*)::bigint,
+  COALESCE(bool_or(j.input IS DISTINCT FROM $3::jsonb), false)
+FROM otlet.jobs j
+WHERE j.task_name = $1
+  AND j.workload_revision_hash = $4
+  AND j.subject_id = $2
+  AND j.status IN ('queued', 'running', 'cancel_requested')
+	",
+            Some(1),
+            &args,
+        )?;
+        let active_row = active_rows.first();
+        if active_row.get::<bool>(2)?.unwrap_or(false) {
+            return Ok(InferNowJobAdmission::Conflict);
+        }
+        if active_row.get::<i64>(1)?.unwrap_or(0) > 0 {
+            return Ok(InferNowJobAdmission::Active);
+        }
         let rows = client.update(
             r"
 WITH revision AS MATERIALIZED (
@@ -197,9 +229,6 @@ inserted AS (
     now(),
     NULL
   FROM revision
-  ON CONFLICT (task_name, workload_revision_hash, subject_id)
-  WHERE status IN ('queued', 'running', 'cancel_requested')
-  DO NOTHING
   RETURNING *
 )
 SELECT
@@ -245,11 +274,11 @@ FROM (
         )?;
 
         if rows.is_empty() {
-            return Ok(None);
+            return Ok(InferNowJobAdmission::Active);
         }
 
         let row = rows.first();
-        Ok(Some(job_from_row!(row)))
+        Ok(InferNowJobAdmission::Inserted(job_from_row!(row)))
     })
 }
 

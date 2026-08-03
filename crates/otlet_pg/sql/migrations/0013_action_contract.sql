@@ -1088,6 +1088,12 @@ BEGIN
     'task', jsonb_build_object(
       'name', t.name,
       'input_query', COALESCE(t.source_query_contract #>> '{query,resolved}', t.input_query),
+      'input_relation', jsonb_build_object(
+        'version', 'otlet_input_relation_v1',
+        'subject_id', 'non_null_unique_text',
+        'input', 'one_non_null_jsonb_per_subject',
+        'order', 'subject_id_collate_c_asc'
+      ),
       'instruction', t.instruction,
       'output_schema', t.output_schema,
       'runtime_options', t.runtime_options,
@@ -1263,6 +1269,12 @@ BEGIN
   IF NEW.definition ->> 'format' IS DISTINCT FROM 'otlet.workload.v1'
      OR NEW.definition #>> '{task,name}' IS DISTINCT FROM NEW.task_name THEN
     RAISE EXCEPTION 'otlet workload revision definition is invalid';
+  END IF;
+  IF NEW.definition #>> '{task,input_relation,version}' IS DISTINCT FROM 'otlet_input_relation_v1'
+     OR NEW.definition #>> '{task,input_relation,subject_id}' IS DISTINCT FROM 'non_null_unique_text'
+     OR NEW.definition #>> '{task,input_relation,input}' IS DISTINCT FROM 'one_non_null_jsonb_per_subject'
+     OR NEW.definition #>> '{task,input_relation,order}' IS DISTINCT FROM 'subject_id_collate_c_asc' THEN
+    RAISE EXCEPTION 'otlet workload revision input relation contract is invalid';
   END IF;
   IF NEW.workload_revision_hash IS DISTINCT FROM otlet.identity_hash(
     'workload_revision',

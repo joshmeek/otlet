@@ -515,6 +515,123 @@ BEGIN
 END;
 $$;
 
+CREATE FUNCTION otlet.require_task_input_relation(input_error text) RETURNS boolean
+LANGUAGE plpgsql
+AS $$
+BEGIN
+  IF require_task_input_relation.input_error IS NOT NULL THEN
+    RAISE EXCEPTION 'otlet %', require_task_input_relation.input_error;
+  END IF;
+  RETURN true;
+END;
+$$;
+
+CREATE FUNCTION otlet.validated_task_input_rows(
+  input_query text,
+  max_rows integer DEFAULT NULL,
+  active_task_name text DEFAULT NULL,
+  active_workload_revision_hash text DEFAULT NULL
+) RETURNS TABLE(subject_id text, input jsonb)
+LANGUAGE plpgsql
+VOLATILE
+AS $$
+DECLARE
+  candidate record;
+  previous_subject text;
+  previous_input jsonb;
+  seen_subject boolean := false;
+  returned_rows integer := 0;
+BEGIN
+  IF NULLIF(btrim(validated_task_input_rows.input_query), '') IS NULL THEN
+    RAISE EXCEPTION 'otlet input relation query is required';
+  END IF;
+  IF validated_task_input_rows.max_rows IS NOT NULL
+     AND validated_task_input_rows.max_rows < 1 THEN
+    RAISE EXCEPTION 'otlet input relation max_rows must be positive';
+  END IF;
+  IF (validated_task_input_rows.active_task_name IS NULL)
+     <> (validated_task_input_rows.active_workload_revision_hash IS NULL) THEN
+    RAISE EXCEPTION 'otlet active input filter requires task and workload revision';
+  END IF;
+
+  FOR candidate IN EXECUTE format(
+    $sql$
+      SELECT
+        source.subject_id::text AS subject_id,
+        source.input::jsonb AS input,
+        active.id AS active_job_id,
+        active.input AS active_input
+      FROM (%1$s) source
+      LEFT JOIN otlet.jobs active
+        ON %2$L IS NOT NULL
+       AND active.task_name = %2$L
+       AND active.workload_revision_hash = %3$L
+       AND active.subject_id = source.subject_id::text
+       AND active.status IN ('queued', 'running', 'cancel_requested')
+      ORDER BY source.subject_id::text COLLATE "C" NULLS FIRST
+    $sql$,
+    validated_task_input_rows.input_query,
+    validated_task_input_rows.active_task_name,
+    validated_task_input_rows.active_workload_revision_hash
+  ) LOOP
+    IF candidate.subject_id IS NULL THEN
+      RAISE EXCEPTION 'otlet input relation produced null subject_id';
+    END IF;
+    IF candidate.input IS NULL THEN
+      RAISE EXCEPTION 'otlet input relation produced null input';
+    END IF;
+    IF seen_subject AND candidate.subject_id = previous_subject THEN
+      IF candidate.input IS DISTINCT FROM previous_input THEN
+        RAISE EXCEPTION 'otlet input relation produced conflicting inputs for subject %',
+          candidate.subject_id;
+      END IF;
+      RAISE EXCEPTION 'otlet input relation produced duplicate subject_id %',
+        candidate.subject_id;
+    END IF;
+
+    seen_subject := true;
+    previous_subject := candidate.subject_id;
+    previous_input := candidate.input;
+
+    IF candidate.active_job_id IS NOT NULL THEN
+      IF candidate.active_input IS DISTINCT FROM candidate.input THEN
+        RAISE EXCEPTION 'otlet input relation conflicts with active input for subject %',
+          candidate.subject_id;
+      END IF;
+    ELSIF validated_task_input_rows.max_rows IS NULL
+       OR returned_rows < validated_task_input_rows.max_rows THEN
+      subject_id := candidate.subject_id;
+      input := candidate.input;
+      RETURN NEXT;
+      returned_rows := returned_rows + 1;
+    END IF;
+  END LOOP;
+END;
+$$;
+
+CREATE FUNCTION otlet.task_subject_input(
+  input_query text,
+  subject_id text
+) RETURNS jsonb
+LANGUAGE plpgsql
+VOLATILE
+AS $$
+DECLARE
+  selected_input jsonb;
+BEGIN
+  IF task_subject_input.subject_id IS NULL THEN
+    RAISE EXCEPTION 'otlet input relation produced null subject_id';
+  END IF;
+
+  SELECT candidate.input
+  INTO selected_input
+  FROM otlet.validated_task_input_rows(task_subject_input.input_query) candidate
+  WHERE candidate.subject_id = task_subject_input.subject_id;
+
+  RETURN selected_input;
+END;
+$$;
+
 CREATE FUNCTION otlet.available_model_queue_slots(model_name text)
 RETURNS integer
 LANGUAGE sql
@@ -607,15 +724,22 @@ AS $$
 DECLARE
   task_model_name text;
   revision_hash text;
+  existing_input jsonb;
   input_bytes bigint := octet_length(admit_task_input.input::text);
   policy otlet.production_policy%ROWTYPE;
   queued_jobs bigint;
   model_queued_bytes bigint;
   total_queued_bytes bigint;
-  inserted bigint := 0;
   rejection_reason text;
   rejection_limit bigint;
 BEGIN
+  IF admit_task_input.subject_id IS NULL THEN
+    RAISE EXCEPTION 'otlet input relation produced null subject_id';
+  END IF;
+  IF admit_task_input.input IS NULL THEN
+    RAISE EXCEPTION 'otlet input relation produced null input';
+  END IF;
+
   revision_hash := otlet.ensure_active_workload_revision(admit_task_input.task_name);
   IF admit_task_input.workload_revision_hash IS NOT NULL
      AND admit_task_input.workload_revision_hash IS DISTINCT FROM revision_hash THEN
@@ -631,6 +755,22 @@ BEGIN
     RAISE EXCEPTION 'otlet workload revision does not belong to task %', admit_task_input.task_name;
   END IF;
   PERFORM pg_advisory_xact_lock(hashtext('otlet_queue_admission'));
+
+  SELECT active.input
+  INTO existing_input
+  FROM otlet.jobs active
+  WHERE active.task_name = admit_task_input.task_name
+    AND active.workload_revision_hash = revision_hash
+    AND active.subject_id = admit_task_input.subject_id
+    AND active.status IN ('queued', 'running', 'cancel_requested')
+  FOR UPDATE;
+  IF FOUND THEN
+    IF existing_input IS DISTINCT FROM admit_task_input.input THEN
+      RAISE EXCEPTION 'otlet input relation conflicts with active input for subject %',
+        admit_task_input.subject_id;
+    END IF;
+    RETURN false;
+  END IF;
 
   SELECT *
   INTO policy
@@ -694,11 +834,9 @@ BEGIN
     revision_hash,
     admit_task_input.subject_id,
     admit_task_input.input
-  )
-  ON CONFLICT DO NOTHING;
-  GET DIAGNOSTICS inserted = ROW_COUNT;
+  );
 
-  RETURN inserted > 0;
+  RETURN true;
 END;
 $$;
 
@@ -851,20 +989,15 @@ BEGIN
      ),
      bounded_input AS MATERIALIZED (
        SELECT
-         subject_id::text AS subject_id,
-         input::jsonb AS input,
-         octet_length(input::jsonb::text)::bigint AS input_bytes
-       FROM (%2$s) otlet_input
-       WHERE NOT EXISTS (
-         SELECT 1
-         FROM otlet.jobs active_job
-         WHERE active_job.task_name = %3$L
-           AND active_job.workload_revision_hash = %4$L
-           AND active_job.subject_id = otlet_input.subject_id::text
-           AND active_job.status IN (''queued'', ''running'', ''cancel_requested'')
-       )
-       ORDER BY subject_id
-       LIMIT (SELECT max_admission_rows + 1 FROM policy)
+         otlet_input.subject_id,
+         otlet_input.input,
+         octet_length(otlet_input.input::text)::bigint AS input_bytes
+       FROM otlet.validated_task_input_rows(
+         %2$L,
+         (SELECT max_admission_rows + 1 FROM policy),
+         %3$L,
+         %4$L
+       ) otlet_input
      ),
      candidate_state AS (
        SELECT
@@ -901,10 +1034,7 @@ BEGIN
        FROM bounded_input pending
        CROSS JOIN decision d
        WHERE d.rejection_reason IS NULL
-       ORDER BY pending.subject_id
-       ON CONFLICT (task_name, workload_revision_hash, subject_id)
-       WHERE status IN (''queued'', ''running'', ''cancel_requested'')
-       DO NOTHING
+       ORDER BY pending.subject_id COLLATE "C"
        RETURNING 1
      )
      SELECT
@@ -968,7 +1098,6 @@ DECLARE
   source_kind text;
   semantic_join_index_name text;
   pending_input jsonb;
-  pending_rows bigint;
   queued boolean;
 BEGIN
   revision_hash := otlet.ensure_active_workload_revision(run_task_subject.task_name);
@@ -1001,24 +1130,13 @@ BEGIN
   END IF;
 
   PERFORM otlet.require_candidate_query_timeout(run_task_subject.task_name);
-  EXECUTE format(
-    'SELECT input::jsonb
-     FROM (%s) otlet_input
-     WHERE subject_id::text = %L
-     LIMIT 1',
+  pending_input := otlet.task_subject_input(
     query,
     run_task_subject.subject_id
-  )
-  INTO pending_input;
-  GET DIAGNOSTICS pending_rows = ROW_COUNT;
+  );
 
-  IF pending_rows = 0 THEN
-    RETURN 0;
-  END IF;
   IF pending_input IS NULL THEN
-    RAISE EXCEPTION 'otlet task % produced null input for subject %',
-      run_task_subject.task_name,
-      run_task_subject.subject_id;
+    RETURN 0;
   END IF;
 
   queued := otlet.admit_task_input(
@@ -1046,6 +1164,19 @@ BEGIN
   IF cardinality(run_task_subjects.subject_ids) > 64 THEN
     RAISE EXCEPTION 'otlet.run_task_subjects accepts at most 64 subjects';
   END IF;
+  IF EXISTS (
+    SELECT 1
+    FROM unnest(COALESCE(run_task_subjects.subject_ids, ARRAY[]::text[])) requested(subject_id)
+    WHERE requested.subject_id IS NULL
+  ) THEN
+    RAISE EXCEPTION 'otlet input relation produced null subject_id';
+  END IF;
+  IF cardinality(COALESCE(run_task_subjects.subject_ids, ARRAY[]::text[])) IS DISTINCT FROM (
+    SELECT count(DISTINCT requested.subject_id)
+    FROM unnest(COALESCE(run_task_subjects.subject_ids, ARRAY[]::text[])) requested(subject_id)
+  ) THEN
+    RAISE EXCEPTION 'otlet input relation produced duplicate requested subject_id';
+  END IF;
 
   RETURN QUERY
   SELECT requested.subject_id,
@@ -1056,7 +1187,6 @@ BEGIN
          ) > 0
   FROM unnest(COALESCE(run_task_subjects.subject_ids, ARRAY[]::text[])) WITH ORDINALITY
     AS requested(subject_id, ordinal)
-  WHERE requested.subject_id IS NOT NULL
   ORDER BY requested.ordinal;
 END;
 $$;

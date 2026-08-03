@@ -31,6 +31,9 @@ $$;
 \set portable_migration_file ../../../otlet_pg/sql/migrations/0002_identity_contract.sql
 \ir migrations/apply.sql
 
+\set portable_migration_file ../../../otlet_pg/sql/migrations/0044_source_query_contract.sql
+\ir migrations/apply.sql
+
 \set portable_migration_file ../../../otlet_pg/sql/migrations/0003_action_schema.sql
 \ir migrations/apply.sql
 

@@ -1,5 +1,6 @@
 use crate::job::{
-    Job, ModelSelectionPolicy, claim_jobs, insert_infer_now_job, model_selection_policy,
+    InferNowJobAdmission, Job, ModelSelectionPolicy, claim_jobs, insert_infer_now_job,
+    model_selection_policy,
 };
 use crate::model::{
     ModelError, ModelMetrics, ModelPreload, ModelRun, preload_model, run_job, run_job_with_model,
@@ -413,12 +414,22 @@ fn process_infer_now_request(request: crate::infer_now::InferNowRequest) {
             &input_json,
         )
     }) {
-        Ok(Some(job)) => job,
-        Ok(None) => {
+        Ok(InferNowJobAdmission::Inserted(job)) => job,
+        Ok(InferNowJobAdmission::Active) => {
             crate::infer_now::finish_request(
                 id,
                 0,
                 Some("infer-now active job exists or workload revision changed"),
+            );
+            return;
+        }
+        Ok(InferNowJobAdmission::Conflict) => {
+            crate::infer_now::finish_request(
+                id,
+                0,
+                Some(&format!(
+                    "input relation conflicts with active input for subject {subject_id}"
+                )),
             );
             return;
         }

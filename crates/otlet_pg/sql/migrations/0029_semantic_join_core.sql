@@ -61,12 +61,7 @@ BEGIN
           candidate.subject_id,
           candidate.input,
           otlet.semantic_content_hash(candidate.input, %6$L::jsonb) AS content_hash
-        FROM (
-          SELECT subject_id::text AS subject_id, input::jsonb AS input
-          FROM (%1$s) otlet_join_candidate
-          ORDER BY subject_id
-          LIMIT %2$s
-        ) candidate
+        FROM otlet.validated_task_input_rows(%1$L, %2$s) candidate
       ),
       candidate_materializations AS (
         SELECT
@@ -153,7 +148,7 @@ BEGIN
         FROM matched_inputs matched
         WHERE matched.subject_id = ci.subject_id
       )
-      ORDER BY ci.subject_id
+      ORDER BY ci.subject_id COLLATE "C"
     $sql$,
     index_row.candidate_query,
     index_row.max_candidate_rows,
@@ -348,13 +343,8 @@ BEGIN
 
   input_query := format(
     $sql$
-        SELECT subject_id, input
-        FROM (
-          SELECT subject_id::text AS subject_id, input::jsonb AS input
-          FROM (%1$s) otlet_join_candidate
-          ORDER BY subject_id
-          LIMIT %2$s
-        ) otlet_join_input
+      SELECT subject_id, input
+      FROM otlet.validated_task_input_rows(%1$L, %2$s)
     $sql$,
     index_row.candidate_query,
     index_row.max_candidate_rows
@@ -417,14 +407,9 @@ BEGIN
 
   input_query := format(
     $sql$
-        SELECT subject_id, input
-        FROM (
-          SELECT subject_id::text AS subject_id, input::jsonb AS input
-          FROM (%1$s) otlet_join_candidate
-          ORDER BY subject_id
-          LIMIT %2$s
-        ) otlet_join_input
-        WHERE subject_id = %3$L
+      SELECT subject_id, input
+      FROM otlet.validated_task_input_rows(%1$L, %2$s)
+      WHERE subject_id = %3$L
     $sql$,
     index_row.candidate_query,
     index_row.max_candidate_rows,

@@ -11,6 +11,7 @@ DECLARE
   index_row otlet.semantic_indexes%ROWTYPE;
   revision_definition jsonb;
   source_kind text;
+  current_input_query text;
   current_input jsonb;
 BEGIN
   IF current_task_subject_content_hash.workload_revision_hash IS NULL THEN
@@ -44,7 +45,7 @@ BEGIN
       ) field(field_name);
     ELSIF source_kind = 'pair' THEN
       task_row.input_query := format(
-        'SELECT subject_id::text, input::jsonb FROM (%s) otlet_pair_input ORDER BY subject_id LIMIT %s',
+        'SELECT subject_id, input FROM otlet.validated_task_input_rows(%L, %s)',
         revision_definition #>> '{source,candidate_query}',
         (revision_definition #>> '{source,max_candidate_rows}')::integer
       );
@@ -68,29 +69,31 @@ BEGIN
   END IF;
 
   IF index_row.source_table IS NOT NULL THEN
-    EXECUTE format(
+    current_input_query := format(
       $sql$
-        SELECT jsonb_build_object(
-          '_otlet_mvcc', jsonb_build_object(
+        SELECT
+          (src.%1$I)::text AS subject_id,
+          jsonb_build_object(
+            '_otlet_mvcc', jsonb_build_object(
+              'table', %2$L,
+              'subject_id', (src.%1$I)::text,
+              'ctid', src.ctid::text,
+              'xmin', src.xmin::text
+            ),
             'table', %2$L,
-            'subject_id', (src.%1$I)::text,
-            'ctid', src.ctid::text,
-            'xmin', src.xmin::text
-          ),
-          'table', %2$L,
-          'row', otlet.semantic_project_row(to_jsonb(src), %4$L::text[])
-        )
+            'row', otlet.semantic_project_row(to_jsonb(src), %4$L::text[])
+          ) AS input
         FROM %3$s AS src
-        WHERE (src.%1$I)::text = $1
-        LIMIT 1
       $sql$,
       index_row.subject_column,
       index_row.source_table,
       index_row.source_table,
       index_row.input_columns
-    )
-    INTO current_input
-    USING current_task_subject_content_hash.subject_id;
+    );
+    current_input := otlet.task_subject_input(
+      current_input_query,
+      current_task_subject_content_hash.subject_id
+    );
 
     IF current_input IS NULL THEN
       RETURN NULL;
@@ -103,12 +106,10 @@ BEGIN
     RETURN NULL;
   END IF;
 
-  EXECUTE format(
-    'SELECT q.input FROM (%s) AS q WHERE q.subject_id = $1 LIMIT 1',
-    task_row.input_query
-  )
-  INTO current_input
-  USING current_task_subject_content_hash.subject_id;
+  current_input := otlet.task_subject_input(
+    task_row.input_query,
+    current_task_subject_content_hash.subject_id
+  );
 
   IF current_input IS NULL THEN
     RETURN NULL;

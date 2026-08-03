@@ -20,21 +20,39 @@ DECLARE
   semantic_task_name text := index_name || '_task';
   actual_input_shaping jsonb := COALESCE(input_shaping, '{}'::jsonb);
   actual_input_columns text[];
+  subject_attnum smallint;
+  subject_not_null boolean;
   query text;
 BEGIN
   IF semantic_task_name !~ '^[a-z0-9][a-z0-9_-]*$' THEN
     RAISE EXCEPTION 'semantic index name % creates invalid task name %', index_name, semantic_task_name;
   END IF;
 
-  IF NOT EXISTS (
-    SELECT 1
-    FROM pg_attribute
-    WHERE attrelid = table_name
-      AND attname = subject_column
-      AND attnum > 0
-      AND NOT attisdropped
-  ) THEN
+  SELECT attribute.attnum, attribute.attnotnull
+  INTO subject_attnum, subject_not_null
+  FROM pg_attribute attribute
+  WHERE attribute.attrelid = table_name
+    AND attribute.attname = subject_column
+    AND attribute.attnum > 0
+    AND NOT attribute.attisdropped;
+  IF NOT FOUND THEN
     RAISE EXCEPTION 'otlet subject column % does not exist on %', subject_column, table_name;
+  END IF;
+  IF NOT subject_not_null OR NOT EXISTS (
+    SELECT 1
+    FROM pg_index key_index
+    WHERE key_index.indrelid = table_name
+      AND key_index.indisunique
+      AND key_index.indisvalid
+      AND key_index.indisready
+      AND key_index.indimmediate
+      AND key_index.indnkeyatts = 1
+      AND key_index.indkey[0] = subject_attnum
+      AND key_index.indexprs IS NULL
+      AND key_index.indpred IS NULL
+  ) THEN
+    RAISE EXCEPTION 'otlet subject column % must be NOT NULL with an immediate unique key',
+      subject_column;
   END IF;
 
   SELECT format('%I.%I', n.nspname, c.relname)

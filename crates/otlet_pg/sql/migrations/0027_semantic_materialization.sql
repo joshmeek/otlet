@@ -38,8 +38,8 @@ BEGIN
   EXECUTE format(
     $sql$
       WITH current_inputs AS (
-        SELECT subject_id::text AS subject_id, input::jsonb AS input
-        FROM (%1$s) otlet_current_input
+        SELECT subject_id, input
+        FROM otlet.validated_task_input_rows(%1$L)
       ),
       latest_jobs AS (
         SELECT DISTINCT ON (j.subject_id)

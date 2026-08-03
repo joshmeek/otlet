@@ -783,12 +783,7 @@ BEGIN
         $sql$
           WITH source_inputs AS (
             SELECT subject_id, input
-            FROM (
-              SELECT subject_id::text AS subject_id, input::jsonb AS input
-              FROM (%1$s) otlet_join_candidate
-              ORDER BY subject_id
-              LIMIT %2$s
-            ) otlet_join_input
+            FROM otlet.validated_task_input_rows(%1$L, %2$s)
           ),
           current_inputs AS (
             SELECT *

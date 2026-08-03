@@ -57,12 +57,7 @@ BEGIN
     $sql$
       WITH raw_inputs AS (
         SELECT subject_id, input
-        FROM (
-          SELECT subject_id::text AS subject_id, input::jsonb AS input
-          FROM (%1$s) otlet_join_candidate
-          ORDER BY subject_id
-          LIMIT %2$s
-        ) otlet_join_input
+        FROM otlet.validated_task_input_rows(%1$L, %2$s)
       ),
       current_inputs AS (
         SELECT
@@ -185,20 +180,14 @@ BEGIN
 
   PERFORM otlet.require_workload_source_contract(index_row.task_name, current_contract_hash);
 
-  EXECUTE format(
-    $sql$
-      SELECT input
-      FROM (
-        SELECT subject_id::text AS subject_id, input::jsonb AS input
-        FROM (%s) otlet_join_candidate
-      ) otlet_join_input
-      WHERE subject_id = $1
-      LIMIT 1
-    $sql$,
-    index_row.candidate_query
-  )
-  INTO current_input
-  USING semantic_join_matches.subject_id;
+  current_input := otlet.task_subject_input(
+    format(
+      'SELECT subject_id, input FROM otlet.validated_task_input_rows(%L, %s)',
+      index_row.candidate_query,
+      index_row.max_candidate_rows
+    ),
+    semantic_join_matches.subject_id
+  );
 
   IF current_input IS NULL THEN
     RETURN false;
