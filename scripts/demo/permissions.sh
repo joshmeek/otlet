@@ -357,6 +357,13 @@ SELECT otlet.register_action_target(
   'id',
   ARRAY['review_state', 'review_reason', 'priority']::name[]
 );
+SELECT otlet.register_action_workflow_policy(
+  'bounded_action_demo_task',
+  'update_row',
+  :'target_name',
+  'bounded_mutation',
+  'evaluated'
+);
 SQL
 
 bounded_execution_contract="$(psql_value -v task_name="$bounded_action_task" <<'SQL'
@@ -466,6 +473,11 @@ WITH table_grants AS (
           'semantic_source_hash',
           'semantic_shaped_input',
           'semantic_content_hash',
+          'action_execution_role_oid',
+          'action_target_contract_descriptor',
+          'action_target_contract_hash',
+          'action_target_validation_error',
+          'action_workflow_policy_error',
           'source_role_descriptor',
           'source_relation_descriptor',
           'source_function_descriptor',
@@ -485,6 +497,11 @@ WITH table_grants AS (
           'semantic_source_hash',
           'semantic_shaped_input',
           'semantic_content_hash',
+          'action_execution_role_oid',
+          'action_target_contract_descriptor',
+          'action_target_contract_hash',
+          'action_target_validation_error',
+          'action_workflow_policy_error',
           'source_role_descriptor',
           'source_relation_descriptor',
           'source_function_descriptor',
@@ -520,6 +537,7 @@ WITH table_grants AS (
           'otlet.abstain_review(bigint,text)'::regprocedure,
           'otlet.dry_run_action(bigint)'::regprocedure,
           'otlet.apply_action(bigint)'::regprocedure,
+          'otlet.action_workflow_policy_error(text,text,text,text,text,boolean)'::regprocedure,
           'otlet.grant_auditor_access(regrole)'::regprocedure,
           'otlet.grant_operator_access(regrole)'::regprocedure,
           'otlet.grant_portable_worker_access(regrole)'::regprocedure
@@ -571,16 +589,16 @@ CROSS JOIN definer_status;
 SQL
 )"
 echo "permission_catalog_contract=$permission_catalog_contract"
-[ "$permission_catalog_contract" = "false|0|0|0|15|14|15|22|0|0|0|0|18|18|0|7|7|7|true" ] || {
+[ "$permission_catalog_contract" = "false|0|0|0|15|19|15|27|0|0|0|0|19|19|0|7|7|7|true" ] || {
   echo "Expected exact public, auditor, operator, and owner ACLs, got $permission_catalog_contract" >&2
   exit 1
 }
 
 source "$demo_dir/review_provenance.sh"
 
-permission_contract="public=0/0/0|auditor=15/14|operator=15/22|definer=18/18|portable=7/7/7|positive=7|denied=$permission_denied_count"
+permission_contract="public=0/0/0|auditor=15/19|operator=15/27|definer=19/19|portable=7/7/7|positive=7|denied=$permission_denied_count"
 echo "permission_contract=$permission_contract"
-[ "$permission_contract" = "public=0/0/0|auditor=15/14|operator=15/22|definer=18/18|portable=7/7/7|positive=7|denied=61" ] || {
+[ "$permission_contract" = "public=0/0/0|auditor=15/19|operator=15/27|definer=19/19|portable=7/7/7|positive=7|denied=61" ] || {
   echo "Expected complete permission contract, got $permission_contract" >&2
   exit 1
 }

@@ -26,10 +26,12 @@ CREATE TABLE otlet.action_targets (
   identity_column name NOT NULL,
   allowed_columns name[] NOT NULL,
   enabled boolean NOT NULL DEFAULT true,
+  contract_generation bigint NOT NULL DEFAULT 1,
   created_at timestamptz NOT NULL DEFAULT now(),
   updated_at timestamptz NOT NULL DEFAULT now(),
   CHECK (cardinality(allowed_columns) BETWEEN 1 AND 16),
-  CHECK (NOT identity_column = ANY(allowed_columns))
+  CHECK (NOT identity_column = ANY(allowed_columns)),
+  CHECK (contract_generation > 0)
 );
 
 CREATE TABLE otlet.action_workflow_policies (
@@ -40,6 +42,7 @@ CREATE TABLE otlet.action_workflow_policies (
   authority_mode text NOT NULL DEFAULT 'recommendation_only',
   evaluation_status text NOT NULL DEFAULT 'unevaluated',
   task_contract_hash text NOT NULL,
+  target_contract jsonb NOT NULL,
   target_contract_hash text NOT NULL,
   policy_hash text NOT NULL,
   enabled boolean NOT NULL DEFAULT true,
@@ -51,6 +54,7 @@ CREATE TABLE otlet.action_workflow_policies (
   CHECK (authority_mode IN ('recommendation_only', 'bounded_mutation')),
   CHECK (evaluation_status IN ('unevaluated', 'evaluated', 'adversarial')),
   CHECK (task_contract_hash ~ '^otlet:v1:sha256:[0-9a-f]{64}$'),
+  CHECK (jsonb_typeof(target_contract) = 'object'),
   CHECK (target_contract_hash ~ '^otlet:v1:sha256:[0-9a-f]{64}$'),
   CHECK (policy_hash ~ '^otlet:v1:sha256:[0-9a-f]{64}$')
 );

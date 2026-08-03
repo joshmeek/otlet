@@ -723,6 +723,9 @@ RETURNS TABLE (
 )
 LANGUAGE plpgsql
 AS $$
+DECLARE
+  target_table regclass;
+  target_authority_error text;
 BEGIN
   PERFORM 1
   FROM otlet.actions locked_action
@@ -731,16 +734,44 @@ BEGIN
   WHERE locked_action.id = validated_action_context.action_id
   FOR UPDATE OF head;
 
-  PERFORM otlet.source_query_contract_guard(
-    revision.definition #> '{source,query_contract}',
-    true
+  SELECT target.target_table
+  INTO target_table
+  FROM otlet.actions locked_action
+  JOIN otlet.action_targets target ON target.name = locked_action.target_name
+  WHERE locked_action.id = validated_action_context.action_id
+    AND locked_action.action_type = 'update_row'
+  FOR UPDATE OF target;
+  IF FOUND THEN
+    -- ponytail: Target-wide DDL fence, narrow only if mutation throughput demands it
+    EXECUTE format('LOCK TABLE %s IN SHARE UPDATE EXCLUSIVE MODE', target_table);
+  END IF;
+
+  SELECT otlet.action_workflow_policy_guard(
+    job.task_name,
+    locked_action.action_type,
+    locked_action.authority_policy_hash,
+    locked_action.target_name,
+    locked_action.subject_namespace
   )
+  INTO target_authority_error
   FROM otlet.actions locked_action
   JOIN otlet.jobs job ON job.id = locked_action.job_id
-  JOIN otlet.workload_revisions revision
-    ON revision.task_name = job.task_name
-   AND revision.workload_revision_hash = job.workload_revision_hash
-  WHERE locked_action.id = validated_action_context.action_id;
+  WHERE locked_action.id = validated_action_context.action_id
+    AND locked_action.action_type = 'update_row'
+    AND locked_action.authority_origin = 'workflow';
+
+  IF target_authority_error IS DISTINCT FROM 'action workflow target contract changed' THEN
+    PERFORM otlet.source_query_contract_guard(
+      revision.definition #> '{source,query_contract}',
+      true
+    )
+    FROM otlet.actions locked_action
+    JOIN otlet.jobs job ON job.id = locked_action.job_id
+    JOIN otlet.workload_revisions revision
+      ON revision.task_name = job.task_name
+     AND revision.workload_revision_hash = job.workload_revision_hash
+    WHERE locked_action.id = validated_action_context.action_id;
+  END IF;
 
   RETURN QUERY
   SELECT
@@ -784,14 +815,7 @@ BEGIN
       WHEN j.workload_revision_hash IS DISTINCT FROM head.active_workload_revision_hash THEN
         'action workload revision is not active'
       WHEN a.authority_origin = 'workflow' AND a.action_type = 'update_row' THEN
-        otlet.action_workflow_policy_error(
-          j.task_name,
-          a.action_type,
-          a.authority_policy_hash,
-          a.target_name,
-          a.subject_namespace,
-          false
-        )
+        target_authority_error
       ELSE NULL
     END
   FROM otlet.actions a

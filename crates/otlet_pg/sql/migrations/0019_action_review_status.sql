@@ -99,7 +99,19 @@ SELECT
     WHEN j.workload_revision_hash = head.active_workload_revision_hash
      AND otlet.source_query_contract_error(
        revision.definition #> '{source,query_contract}'
-     ) IS NULL THEN 'active'
+     ) IS NULL
+     AND (
+       a.action_type <> 'update_row'
+       OR a.authority_origin <> 'workflow'
+       OR otlet.action_workflow_policy_error(
+         j.task_name,
+         a.action_type,
+         a.authority_policy_hash,
+         a.target_name,
+         a.subject_namespace,
+         false
+       ) IS NULL
+     ) THEN 'active'
     ELSE 'suspended'
   END AS authority_status,
   j.task_name,
@@ -173,17 +185,23 @@ SELECT
   p.evaluation_status,
   p.policy_hash,
   p.task_contract_hash,
+  p.target_contract,
   p.target_contract_hash,
   p.enabled,
   active.active_workload_revision_hash,
   p.policy_hash IS NOT DISTINCT FROM active.definition #>> ARRAY[
     'action_policies', p.action_type, 'authority', 'policy_hash'
   ] AS task_contract_current,
-  active.definition #>> ARRAY[
-    'action_policies', p.action_type, 'authority', 'target_contract_hash'
-  ] IS NOT DISTINCT FROM otlet.action_target_contract_hash(
+  active.definition #> ARRAY[
+    'action_policies', p.action_type, 'authority', 'target_contract'
+  ] IS NOT DISTINCT FROM otlet.action_target_contract_descriptor(
     active.definition #>> ARRAY['action_policies', p.action_type, 'authority', 'target_name']
   )
+    AND active.definition #>> ARRAY[
+      'action_policies', p.action_type, 'authority', 'target_contract_hash'
+    ] IS NOT DISTINCT FROM otlet.action_target_contract_hash(
+      active.definition #>> ARRAY['action_policies', p.action_type, 'authority', 'target_name']
+    )
     AS target_contract_current,
   otlet.action_target_validation_error(
     active.definition #>> ARRAY['action_policies', p.action_type, 'authority', 'target_name']
@@ -197,6 +215,11 @@ SELECT
     AND active.definition #>> ARRAY[
       'action_policies', p.action_type, 'authority', 'evaluation_status'
     ] = 'evaluated'
+    AND active.definition #> ARRAY[
+      'action_policies', p.action_type, 'authority', 'target_contract'
+    ] IS NOT DISTINCT FROM otlet.action_target_contract_descriptor(
+      active.definition #>> ARRAY['action_policies', p.action_type, 'authority', 'target_name']
+    )
     AND active.definition #>> ARRAY[
       'action_policies', p.action_type, 'authority', 'target_contract_hash'
     ] IS NOT DISTINCT FROM otlet.action_target_contract_hash(
@@ -253,6 +276,16 @@ WITH action_items AS (
   SELECT
     CASE
       WHEN j.workload_revision_hash IS DISTINCT FROM head.active_workload_revision_hash THEN 'suspended_authority'
+      WHEN a.action_type = 'update_row'
+       AND a.authority_origin = 'workflow'
+       AND otlet.action_workflow_policy_error(
+         j.task_name,
+         a.action_type,
+         a.authority_policy_hash,
+         a.target_name,
+         a.subject_namespace,
+         false
+       ) IS NOT NULL THEN 'suspended_authority'
       WHEN otlet.source_query_contract_error(
         revision.definition #> '{source,query_contract}'
       ) IS NOT NULL THEN 'suspended_authority'
@@ -263,6 +296,16 @@ WITH action_items AS (
     END AS queue_kind,
     CASE
       WHEN j.workload_revision_hash IS DISTINCT FROM head.active_workload_revision_hash THEN 'review'
+      WHEN a.action_type = 'update_row'
+       AND a.authority_origin = 'workflow'
+       AND otlet.action_workflow_policy_error(
+         j.task_name,
+         a.action_type,
+         a.authority_policy_hash,
+         a.target_name,
+         a.subject_namespace,
+         false
+       ) IS NOT NULL THEN 'review'
       WHEN otlet.source_query_contract_error(
         revision.definition #> '{source,query_contract}'
       ) IS NOT NULL THEN 'review'

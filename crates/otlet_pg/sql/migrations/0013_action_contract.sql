@@ -1,3 +1,293 @@
+CREATE FUNCTION otlet.action_execution_role_oid() RETURNS oid
+LANGUAGE sql
+STABLE
+SET search_path = pg_catalog, pg_temp
+AS $$
+  SELECT (array_agg(function_row.proowner ORDER BY function_row.proowner))[1]
+  FROM pg_proc function_row
+  WHERE function_row.oid IN (
+    to_regprocedure('otlet.dry_run_action(bigint)'),
+    to_regprocedure('otlet.apply_action(bigint)')
+  )
+  HAVING count(*) = 2
+     AND count(DISTINCT function_row.proowner) = 1
+     AND bool_and(function_row.prosecdef)
+     AND bool_and(
+       COALESCE(
+         function_row.proconfig @> ARRAY['search_path=pg_catalog, otlet, pg_temp'],
+         false
+       )
+     );
+$$;
+
+CREATE FUNCTION otlet.action_target_contract_descriptor(target_name text) RETURNS jsonb
+LANGUAGE sql
+STABLE
+SET search_path = pg_catalog, pg_temp
+AS $$
+  WITH target AS (
+    SELECT
+      target_row.*,
+      otlet.action_execution_role_oid() AS execution_role_oid
+    FROM otlet.action_targets target_row
+    WHERE target_row.name = action_target_contract_descriptor.target_name
+  )
+  SELECT jsonb_build_object(
+    'name', target.name,
+    'target_table_oid', target.target_table::oid::text,
+    'identity_column', target.identity_column,
+    'allowed_columns', to_jsonb(ARRAY(
+      SELECT column_name::text
+      FROM unnest(target.allowed_columns) column_name
+      ORDER BY column_name
+    )),
+    'enabled', target.enabled,
+    'contract_generation', target.contract_generation,
+    'executors', COALESCE((
+      SELECT jsonb_agg(jsonb_build_object(
+        'function', function_row.proname,
+        'owner_oid', function_row.proowner::text,
+        'security_definer', function_row.prosecdef,
+        'config', COALESCE(to_jsonb(function_row.proconfig), '[]'::jsonb)
+      ) ORDER BY function_row.proname)
+      FROM pg_proc function_row
+      WHERE function_row.oid IN (
+        to_regprocedure('otlet.dry_run_action(bigint)'),
+        to_regprocedure('otlet.apply_action(bigint)')
+      )
+    ), '[]'::jsonb),
+    'execution_role', otlet.source_role_descriptor(target.execution_role_oid),
+    'relation', COALESCE(otlet.source_relation_descriptor(
+      target.target_table::oid,
+      target.execution_role_oid,
+      '[0]'::jsonb
+    ), '{}'::jsonb) || jsonb_build_object(
+      'acl', COALESCE((
+        SELECT jsonb_agg(jsonb_build_object(
+          'grantor_oid', acl.grantor::text,
+          'grantee_oid', acl.grantee::text,
+          'privilege', acl.privilege_type,
+          'grantable', acl.is_grantable
+        ) ORDER BY acl.grantee, acl.privilege_type, acl.grantor)
+        FROM pg_class relation
+        CROSS JOIN LATERAL aclexplode(COALESCE(
+          relation.relacl,
+          acldefault('r', relation.relowner)
+        )) acl
+        WHERE relation.oid = target.target_table::oid
+          AND (
+            acl.grantee = 0
+            OR acl.grantee = target.execution_role_oid
+            OR pg_has_role(target.execution_role_oid, acl.grantee, 'MEMBER')
+          )
+      ), '[]'::jsonb)
+    ),
+    'column_details', COALESCE((
+      SELECT jsonb_agg(jsonb_build_object(
+        'number', attribute.attnum,
+        'name', attribute.attname,
+        'expression', pg_get_expr(default_row.adbin, default_row.adrelid, false),
+        'acl', COALESCE((
+          SELECT jsonb_agg(jsonb_build_object(
+            'grantor_oid', acl.grantor::text,
+            'grantee_oid', acl.grantee::text,
+            'privilege', acl.privilege_type,
+            'grantable', acl.is_grantable
+          ) ORDER BY acl.grantee, acl.privilege_type, acl.grantor)
+          FROM aclexplode(attribute.attacl) acl
+          WHERE acl.grantee = 0
+             OR acl.grantee = target.execution_role_oid
+             OR pg_has_role(target.execution_role_oid, acl.grantee, 'MEMBER')
+        ), '[]'::jsonb)
+      ) ORDER BY attribute.attnum)
+      FROM pg_attribute attribute
+      LEFT JOIN pg_attrdef default_row
+        ON default_row.adrelid = attribute.attrelid
+       AND default_row.adnum = attribute.attnum
+      WHERE attribute.attrelid = target.target_table::oid
+        AND attribute.attnum > 0
+        AND NOT attribute.attisdropped
+    ), '[]'::jsonb),
+    'types', COALESCE((
+      SELECT jsonb_agg(jsonb_build_object(
+        'oid', type_row.oid::text,
+        'name', format('%I.%I', type_namespace.nspname, type_row.typname),
+        'kind', type_row.typtype,
+        'category', type_row.typcategory,
+        'base_type_oid', type_row.typbasetype::text,
+        'not_null', type_row.typnotnull,
+        'collation_oid', type_row.typcollation::text,
+        'enum_labels', COALESCE((
+          SELECT jsonb_agg(enum_row.enumlabel ORDER BY enum_row.enumsortorder)
+          FROM pg_enum enum_row
+          WHERE enum_row.enumtypid = type_row.oid
+        ), '[]'::jsonb),
+        'constraints', COALESCE((
+          SELECT jsonb_agg(jsonb_build_object(
+            'definition', pg_get_constraintdef(domain_constraint.oid, false),
+            'validated', domain_constraint.convalidated
+          ) ORDER BY pg_get_constraintdef(domain_constraint.oid, false))
+          FROM pg_constraint domain_constraint
+          WHERE domain_constraint.contypid = type_row.oid
+        ), '[]'::jsonb)
+      ) ORDER BY type_row.oid)
+      FROM pg_type type_row
+      JOIN pg_namespace type_namespace ON type_namespace.oid = type_row.typnamespace
+      WHERE type_row.oid IN (
+        SELECT DISTINCT attribute.atttypid
+        FROM pg_attribute attribute
+        WHERE attribute.attrelid = target.target_table::oid
+          AND attribute.attnum > 0
+          AND NOT attribute.attisdropped
+        UNION
+        SELECT DISTINCT column_type.typbasetype
+        FROM pg_attribute attribute
+        JOIN pg_type column_type ON column_type.oid = attribute.atttypid
+        WHERE attribute.attrelid = target.target_table::oid
+          AND attribute.attnum > 0
+          AND NOT attribute.attisdropped
+          AND column_type.typbasetype <> 0
+        UNION
+        SELECT DISTINCT column_type.typelem
+        FROM pg_attribute attribute
+        JOIN pg_type column_type ON column_type.oid = attribute.atttypid
+        WHERE attribute.attrelid = target.target_table::oid
+          AND attribute.attnum > 0
+          AND NOT attribute.attisdropped
+          AND column_type.typelem <> 0
+      )
+    ), '[]'::jsonb),
+    'inheritance', jsonb_build_object(
+      'parents', COALESCE((
+        SELECT jsonb_agg(inheritance.inhparent::text ORDER BY inheritance.inhseqno)
+        FROM pg_inherits inheritance
+        WHERE inheritance.inhrelid = target.target_table::oid
+      ), '[]'::jsonb),
+      'children', COALESCE((
+        SELECT jsonb_agg(inheritance.inhrelid::text ORDER BY inheritance.inhrelid)
+        FROM pg_inherits inheritance
+        WHERE inheritance.inhparent = target.target_table::oid
+      ), '[]'::jsonb)
+    ),
+    'identity', (
+      SELECT jsonb_build_object(
+        'number', attribute.attnum,
+        'name', attribute.attname,
+        'type_oid', attribute.atttypid::text,
+        'type_modifier', attribute.atttypmod,
+        'not_null', attribute.attnotnull,
+        'collation_oid', attribute.attcollation::text,
+        'generated', attribute.attgenerated,
+        'identity', attribute.attidentity,
+        'select_allowed', has_column_privilege(
+          target.execution_role_oid,
+          target.target_table::oid,
+          attribute.attnum,
+          'SELECT'
+        ),
+        'expression', pg_get_expr(default_row.adbin, default_row.adrelid, false)
+      )
+      FROM pg_attribute attribute
+      LEFT JOIN pg_attrdef default_row
+        ON default_row.adrelid = attribute.attrelid
+       AND default_row.adnum = attribute.attnum
+      WHERE attribute.attrelid = target.target_table::oid
+        AND attribute.attname = target.identity_column
+        AND attribute.attnum > 0
+        AND NOT attribute.attisdropped
+    ),
+    'writable_columns', COALESCE((
+      SELECT jsonb_agg(jsonb_build_object(
+        'configured_name', configured.name,
+        'number', attribute.attnum,
+        'name', attribute.attname,
+        'type_oid', attribute.atttypid::text,
+        'type_modifier', attribute.atttypmod,
+        'not_null', attribute.attnotnull,
+        'collation_oid', attribute.attcollation::text,
+        'generated', attribute.attgenerated,
+        'identity', attribute.attidentity,
+        'select_allowed', CASE WHEN attribute.attnum IS NULL THEN false ELSE has_column_privilege(
+          target.execution_role_oid,
+          target.target_table::oid,
+          attribute.attnum,
+          'SELECT'
+        ) END,
+        'update_allowed', CASE WHEN attribute.attnum IS NULL THEN false ELSE has_column_privilege(
+          target.execution_role_oid,
+          target.target_table::oid,
+          attribute.attnum,
+          'UPDATE'
+        ) END,
+        'expression', pg_get_expr(default_row.adbin, default_row.adrelid, false)
+      ) ORDER BY configured.name)
+      FROM unnest(target.allowed_columns) configured(name)
+      LEFT JOIN pg_attribute attribute
+        ON attribute.attrelid = target.target_table::oid
+       AND attribute.attname = configured.name
+       AND attribute.attnum > 0
+       AND NOT attribute.attisdropped
+      LEFT JOIN pg_attrdef default_row
+        ON default_row.adrelid = attribute.attrelid
+       AND default_row.adnum = attribute.attnum
+    ), '[]'::jsonb),
+    'constraints', COALESCE((
+      SELECT jsonb_agg(jsonb_build_object(
+        'type', constraint_row.contype,
+        'relation_oid', constraint_row.conrelid::text,
+        'referenced_relation_oid', constraint_row.confrelid::text,
+        'definition', pg_get_constraintdef(constraint_row.oid, false),
+        'deferrable', constraint_row.condeferrable,
+        'deferred', constraint_row.condeferred,
+        'validated', constraint_row.convalidated,
+        'no_inherit', constraint_row.connoinherit
+      ) ORDER BY
+        constraint_row.conrelid,
+        constraint_row.confrelid,
+        constraint_row.contype,
+        pg_get_constraintdef(constraint_row.oid, false),
+        constraint_row.oid)
+      FROM pg_constraint constraint_row
+      WHERE constraint_row.conrelid = target.target_table::oid
+         OR constraint_row.confrelid = target.target_table::oid
+    ), '[]'::jsonb),
+    'indexes', COALESCE((
+      SELECT jsonb_agg(index_contract.value ORDER BY index_contract.value::text)
+      FROM (
+        SELECT jsonb_build_object(
+          'method', access_method.amname,
+          'key_columns', index_row.indnkeyatts,
+          'total_columns', index_row.indnatts,
+          'attribute_numbers', index_row.indkey::text,
+          'operator_classes', index_row.indclass::text,
+          'collations', index_row.indcollation::text,
+          'options', index_row.indoption::text,
+          'expressions', pg_get_expr(index_row.indexprs, index_row.indrelid, false),
+          'predicate', pg_get_expr(index_row.indpred, index_row.indrelid, false),
+          'unique', index_row.indisunique,
+          'primary', index_row.indisprimary,
+          'exclusion', index_row.indisexclusion,
+          'immediate', index_row.indimmediate,
+          'nulls_not_distinct', index_row.indnullsnotdistinct,
+          'valid', index_row.indisvalid,
+          'ready', index_row.indisready,
+          'live', index_row.indislive
+        ) AS value
+        FROM pg_index index_row
+        JOIN pg_class index_relation ON index_relation.oid = index_row.indexrelid
+        JOIN pg_am access_method ON access_method.oid = index_relation.relam
+        WHERE index_row.indrelid = target.target_table::oid
+          AND (
+            index_row.indisunique
+            OR index_row.indisprimary
+            OR index_row.indisexclusion
+          )
+      ) index_contract
+    ), '[]'::jsonb)
+  )
+  FROM target;
+$$;
+
 CREATE FUNCTION otlet.action_target_validation_error(target_name text) RETURNS text
 LANGUAGE plpgsql
 STABLE
@@ -6,6 +296,7 @@ DECLARE
   target otlet.action_targets%ROWTYPE;
   relation_row record;
   column_name name;
+  execution_role_oid oid;
 BEGIN
   SELECT * INTO target
   FROM otlet.action_targets t
@@ -17,13 +308,25 @@ BEGIN
     RETURN 'action target is disabled';
   END IF;
 
+  execution_role_oid := otlet.action_execution_role_oid();
+  IF execution_role_oid IS NULL THEN
+    RETURN 'action execution identity is invalid';
+  END IF;
+
   SELECT
     c.relkind,
     c.relpersistence,
     c.relispartition,
     c.relrowsecurity,
     c.relforcerowsecurity,
-    n.nspname
+    EXISTS (
+      SELECT 1
+      FROM pg_catalog.pg_inherits inheritance
+      WHERE inheritance.inhparent = c.oid
+         OR inheritance.inhrelid = c.oid
+    ) AS uses_inheritance,
+    n.nspname,
+    n.oid AS namespace_oid
   INTO relation_row
   FROM pg_catalog.pg_class c
   JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
@@ -35,6 +338,8 @@ BEGIN
     RETURN 'action target must be an ordinary table';
   ELSIF relation_row.relispartition THEN
     RETURN 'action target cannot be a partition';
+  ELSIF relation_row.uses_inheritance THEN
+    RETURN 'action target cannot use inheritance';
   ELSIF relation_row.relpersistence = 't' THEN
     RETURN 'action target cannot be temporary';
   ELSIF relation_row.nspname IN ('pg_catalog', 'information_schema', 'otlet')
@@ -42,6 +347,12 @@ BEGIN
     RETURN 'action target schema is not allowed';
   ELSIF relation_row.relrowsecurity OR relation_row.relforcerowsecurity THEN
     RETURN 'action target cannot use row level security';
+  ELSIF NOT pg_catalog.has_schema_privilege(
+    execution_role_oid,
+    relation_row.namespace_oid,
+    'USAGE'
+  ) THEN
+    RETURN 'action target schema privilege is missing';
   END IF;
 
   IF NOT EXISTS (
@@ -82,12 +393,7 @@ BEGIN
     ) THEN
       RETURN 'action target column is not writable';
     ELSIF NOT pg_catalog.has_column_privilege(
-      current_user,
-      target.target_table,
-      column_name,
-      'SELECT'
-    ) OR NOT pg_catalog.has_column_privilege(
-      current_user,
+      execution_role_oid,
       target.target_table,
       column_name,
       'UPDATE'
@@ -96,13 +402,20 @@ BEGIN
     END IF;
   END LOOP;
 
-  IF NOT pg_catalog.has_column_privilege(
-    current_user,
-    target.target_table,
-    target.identity_column,
-    'SELECT'
+  IF EXISTS (
+    SELECT 1
+    FROM pg_catalog.pg_attribute attribute
+    WHERE attribute.attrelid = target.target_table
+      AND attribute.attnum > 0
+      AND NOT attribute.attisdropped
+      AND NOT pg_catalog.has_column_privilege(
+        execution_role_oid,
+        target.target_table,
+        attribute.attnum,
+        'SELECT'
+      )
   ) THEN
-    RETURN 'action target identity privilege is missing';
+    RETURN 'action target row privilege is missing';
   END IF;
 
   RETURN NULL;
@@ -129,27 +442,32 @@ BEGIN
   SELECT array_agg(c ORDER BY c) INTO normalized_columns
   FROM unnest(allowed_columns) c;
 
-  INSERT INTO otlet.action_targets (
+  INSERT INTO otlet.action_targets AS existing (
     name,
     target_table,
     identity_column,
     allowed_columns,
-    enabled
+    enabled,
+    contract_generation
   )
   VALUES (
     target_name,
     target_table,
     identity_column,
     normalized_columns,
-    true
+    true,
+    1
   )
   ON CONFLICT (name) DO UPDATE
     SET target_table = EXCLUDED.target_table,
         identity_column = EXCLUDED.identity_column,
         allowed_columns = EXCLUDED.allowed_columns,
         enabled = true,
+        contract_generation = existing.contract_generation + 1,
         updated_at = now()
   RETURNING * INTO saved;
+
+  EXECUTE format('LOCK TABLE %s IN SHARE UPDATE EXCLUSIVE MODE', saved.target_table);
 
   validation_error := otlet.action_target_validation_error(saved.name);
   IF validation_error IS NOT NULL THEN
@@ -200,19 +518,10 @@ CREATE FUNCTION otlet.action_target_contract_hash(target_name text) RETURNS text
 LANGUAGE sql
 STABLE
 AS $$
-  SELECT otlet.identity_hash('action_target_contract', jsonb_build_object(
-    'name', t.name,
-    'target_table', t.target_table::oid,
-    'identity_column', t.identity_column,
-    'allowed_columns', to_jsonb(ARRAY(
-      SELECT column_name::text
-      FROM unnest(t.allowed_columns) column_name
-      ORDER BY column_name
-    )),
-    'enabled', t.enabled
-  ))
-  FROM otlet.action_targets t
-  WHERE t.name = $1;
+  SELECT otlet.identity_hash(
+    'action_target_contract',
+    otlet.action_target_contract_descriptor($1)
+  );
 $$;
 
 CREATE FUNCTION otlet.default_action_authority_hash(
@@ -246,6 +555,7 @@ DECLARE
   target_row otlet.action_targets%ROWTYPE;
   saved otlet.action_workflow_policies%ROWTYPE;
   task_hash text;
+  target_contract jsonb;
   target_hash text;
   policy_hash text;
   target_error text;
@@ -282,10 +592,12 @@ BEGIN
 
   SELECT * INTO target_row
   FROM otlet.action_targets t
-  WHERE t.name = register_action_workflow_policy.target_name;
+  WHERE t.name = register_action_workflow_policy.target_name
+  FOR UPDATE;
   IF NOT FOUND THEN
     RAISE EXCEPTION 'otlet action target % does not exist', register_action_workflow_policy.target_name;
   END IF;
+  EXECUTE format('LOCK TABLE %s IN SHARE UPDATE EXCLUSIVE MODE', target_row.target_table);
   target_error := otlet.action_target_validation_error(register_action_workflow_policy.target_name);
   IF target_error IS NOT NULL THEN
     RAISE EXCEPTION 'otlet %', target_error;
@@ -295,7 +607,10 @@ BEGIN
   END IF;
 
   task_hash := otlet.current_task_contract_hash(register_action_workflow_policy.task_name);
-  target_hash := otlet.action_target_contract_hash(register_action_workflow_policy.target_name);
+  target_contract := otlet.action_target_contract_descriptor(
+    register_action_workflow_policy.target_name
+  );
+  target_hash := otlet.identity_hash('action_target_contract', target_contract);
   policy_hash := otlet.identity_hash('action_workflow_policy', jsonb_build_object(
     'task_name', register_action_workflow_policy.task_name,
     'action_type', register_action_workflow_policy.action_type,
@@ -315,6 +630,7 @@ BEGIN
     authority_mode,
     evaluation_status,
     task_contract_hash,
+    target_contract,
     target_contract_hash,
     policy_hash,
     enabled
@@ -327,6 +643,7 @@ BEGIN
     register_action_workflow_policy.authority_mode,
     register_action_workflow_policy.evaluation_status,
     task_hash,
+    target_contract,
     target_hash,
     policy_hash,
     true
@@ -337,6 +654,7 @@ BEGIN
       authority_mode = EXCLUDED.authority_mode,
       evaluation_status = EXCLUDED.evaluation_status,
       task_contract_hash = EXCLUDED.task_contract_hash,
+      target_contract = EXCLUDED.target_contract,
       target_contract_hash = EXCLUDED.target_contract_hash,
       policy_hash = EXCLUDED.policy_hash,
       enabled = true,
@@ -382,6 +700,8 @@ CREATE FUNCTION otlet.action_workflow_policy_error(
 ) RETURNS text
 LANGUAGE plpgsql
 STABLE
+SECURITY DEFINER
+SET search_path = pg_catalog, otlet, pg_temp
 AS $$
 DECLARE
   revision_definition jsonb;
@@ -407,6 +727,10 @@ BEGIN
     RETURN 'action has no registered workflow authority';
   ELSIF COALESCE((policy ->> 'enabled')::boolean, false) IS NOT TRUE THEN
     RETURN 'action workflow authority is disabled';
+  ELSIF policy -> 'target_contract' IS DISTINCT FROM otlet.action_target_contract_descriptor(
+    policy ->> 'target_name'
+  ) THEN
+    RETURN 'action workflow target contract changed';
   ELSIF policy ->> 'target_contract_hash' IS DISTINCT FROM otlet.action_target_contract_hash(policy ->> 'target_name') THEN
     RETURN 'action workflow target contract changed';
   ELSIF policy ->> 'policy_hash' IS DISTINCT FROM action_workflow_policy_error.authority_policy_hash THEN
@@ -430,6 +754,50 @@ BEGIN
   END IF;
 
   RETURN NULL;
+END;
+$$;
+
+CREATE FUNCTION otlet.action_workflow_policy_guard(
+  task_name text,
+  action_type text,
+  authority_policy_hash text,
+  target_name text,
+  subject_namespace text
+) RETURNS text
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  authority_error text;
+  approved_generation bigint;
+BEGIN
+  authority_error := otlet.action_workflow_policy_error(
+    action_workflow_policy_guard.task_name,
+    action_workflow_policy_guard.action_type,
+    action_workflow_policy_guard.authority_policy_hash,
+    action_workflow_policy_guard.target_name,
+    action_workflow_policy_guard.subject_namespace,
+    false
+  );
+  IF authority_error = 'action workflow target contract changed' THEN
+    SELECT (
+      active.definition #>> ARRAY[
+        'action_policies',
+        action_workflow_policy_guard.action_type,
+        'authority',
+        'target_contract',
+        'contract_generation'
+      ]
+    )::bigint
+    INTO approved_generation
+    FROM otlet.active_workload_revision(action_workflow_policy_guard.task_name) active;
+
+    UPDATE otlet.action_targets target
+    SET contract_generation = target.contract_generation + 1,
+        updated_at = now()
+    WHERE target.name = action_workflow_policy_guard.target_name
+      AND target.contract_generation = approved_generation;
+  END IF;
+  RETURN authority_error;
 END;
 $$;
 
@@ -847,6 +1215,7 @@ BEGIN
             'evaluation_status', workflow.evaluation_status,
             'policy_hash', workflow.policy_hash,
             'target_name', workflow.target_name,
+            'target_contract', workflow.target_contract,
             'target_contract_hash', workflow.target_contract_hash,
             'subject_namespace', workflow.subject_namespace
           ) END
@@ -918,6 +1287,14 @@ BEGIN
        OR jsonb_typeof(NEW.definition #> ARRAY[
          'action_policies', required_action.action_type, 'authority'
        ]) IS DISTINCT FROM 'object'
+       OR (
+         NEW.definition #>> ARRAY[
+           'action_policies', required_action.action_type, 'authority', 'origin'
+         ] = 'workflow'
+         AND jsonb_typeof(NEW.definition #> ARRAY[
+           'action_policies', required_action.action_type, 'authority', 'target_contract'
+         ]) IS DISTINCT FROM 'object'
+       )
   ) THEN
     RAISE EXCEPTION 'otlet workload revision action contract is incomplete';
   END IF;
