@@ -222,13 +222,15 @@ cleanup_task "$entity_task"
 cleanup_task "$join_task"
 
 model_queue_status_contract="$(psql_exec -qAt -v model_name="$cheap_model_name" <<'SQL'
-SELECT queue_state || '|' || queued_jobs::text || '|' || running_jobs::text
+SELECT queue_state || '|' || queued_jobs::text || '|' || running_jobs::text || '|' ||
+       active_claimed_jobs::text || '|' || max_active_jobs::text || '|' ||
+       available_active_job_slots::text
 FROM otlet.model_queue_status
 WHERE model_name = :'model_name';
 SQL
 )"
 echo "model_queue_status_contract=$model_queue_status_contract"
-[ "$model_queue_status_contract" = "queue_accepting|0|0" ] || {
+[ "$model_queue_status_contract" = "queue_accepting|0|0|0|8|8" ] || {
   echo "Expected empty accepting model queue, got $model_queue_status_contract" >&2
   exit 1
 }
@@ -275,6 +277,10 @@ echo "queue_underfill_contract=$queue_underfill_contract"
 
 scheduler_decision_contract="$(psql_value <<'SQL'
 BEGIN;
+SELECT 1
+FROM otlet.production_policy
+WHERE name = 'default'
+FOR UPDATE \g /dev/null
 LOCK TABLE otlet.jobs IN SHARE ROW EXCLUSIVE MODE;
 
 INSERT INTO otlet.models (name, artifact_path, artifact_hash, artifact_identity)
@@ -407,6 +413,10 @@ queue_fairness_output="$(
     -v small_task="$queue_fairness_small_task" \
     -v model_name="$strong_model_name" <<'SQL'
 BEGIN;
+SELECT 1
+FROM otlet.production_policy
+WHERE name = 'default'
+FOR UPDATE \g /dev/null
 LOCK TABLE otlet.jobs IN SHARE ROW EXCLUSIVE MODE;
 
 CREATE TEMP TABLE queue_fairness_params (

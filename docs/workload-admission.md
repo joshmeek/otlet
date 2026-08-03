@@ -14,7 +14,9 @@ The default production policy sets these limits:
 | Candidate plan cost | 1,000,000 |
 | Candidate statement timeout | 2,000 ms |
 
-`otlet.model_queue_status`, `otlet.production_policy_status`, and `otlet.production_status` expose current limits and queue bytes. `otlet.verify_invariants()` checks queue depth, per-job bytes, per-model bytes, and total bytes
+Each model registration sets `max_active_jobs`, with a default of one. The limit counts live claimed leases. A `running` or `cancel_requested` job consumes a slot while its lease is live. Queued, terminal, null-lease, and expired-lease jobs consume none
+
+`otlet.model_queue_status`, `otlet.production_policy_status`, and `otlet.production_status` expose current limits and queue bytes. Model and worker status also expose `active_claimed_jobs` and `available_active_job_slots`. `otlet.verify_invariants()` checks live claims, queue depth, per-job bytes, per-model bytes, and total bytes
 
 Pair-watch creation runs `EXPLAIN (FORMAT JSON)` without executing candidate rows. Otlet stores the accepted plan, total cost, and preflight timestamp on the immutable workload revision and rejects invalid or over-cost plans before watch mutation
 

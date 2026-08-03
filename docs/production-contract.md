@@ -90,6 +90,8 @@ The production policy row and status views expose SQL state under `otlet`: `prod
 
 Native and portable claims share the task-cursor ring. Within each ring segment and task, expired claims rank before queued work, reclaim replaces the claim token, cancellation state survives reclaim, and model residency does not change the order
 
+`max_active_jobs` caps live claimed leases per model across native claims, portable claims, and infer-now. A `running` or `cancel_requested` job consumes one slot while `leased_until >= now()`; an expired or null lease consumes none. Claims stop at the smaller of the requested batch and the remaining slots. Claims, infer-now admission, and renewal share the queue-admission fence. Otlet locks the lease row before it checks wall time and rejects a renewal if its lease expired while waiting. `model_queue_status` and `worker_throughput_status` expose `active_claimed_jobs` and `available_active_job_slots`, and `verify_invariants()` reports `active_claimed_jobs_within_model_cap`
+
 The resident worker can preload one registered local model and context at startup. The default is unset. Configure the model, then restart the Postgres worker process:
 
 ```sql
@@ -158,8 +160,8 @@ Contract output:
 ```text
 production_policy_contract=default|refresh_then_fail_closed|3|300000|8|redacted
 production_status_contract=true|true|true|true
-model_queue_status_contract=queue_accepting|0|0
-throughput_status_contract=queue_accepting|0|0|4|4|0
+model_queue_status_contract=queue_accepting|0|0|0|8|8
+throughput_status_contract=queue_accepting|0|0|4|4|0|0|8
 cleanup_policy_dry_run=0|0|0|0|0|0|0|0|0|0|true
 ```
 

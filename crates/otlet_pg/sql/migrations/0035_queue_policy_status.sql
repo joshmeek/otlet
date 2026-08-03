@@ -39,40 +39,12 @@ FROM otlet.production_policy p
 WHERE p.name = 'default';
 
 CREATE VIEW otlet.model_queue_status AS
-WITH active_revision_models AS (
-  SELECT
-    COALESCE(
-      j.routed_model_name,
-      revision.definition #>> '{models,direct,name}'
-    ) AS model_name,
-    CASE
-      WHEN j.routed_model_name = revision.definition #>> '{selection,strong_model_name}'
-        THEN revision.definition #> '{models,strong}'
-      WHEN j.routed_model_name = revision.definition #>> '{selection,cheap_model_name}'
-        THEN revision.definition #> '{models,cheap}'
-      ELSE revision.definition #> '{models,direct}'
-    END AS model_definition
-  FROM otlet.jobs j
-  JOIN otlet.workload_revisions revision
-    ON revision.workload_revision_hash = j.workload_revision_hash
-  WHERE j.status IN ('queued', 'running', 'cancel_requested')
-), model_routes AS (
-  SELECT m.name, m.max_active_jobs
-  FROM otlet.models m
-  UNION ALL
-  SELECT
-    active.model_name,
-    max((active.model_definition ->> 'max_active_jobs')::integer) AS max_active_jobs
-  FROM active_revision_models active
-  WHERE NOT EXISTS (
-    SELECT 1 FROM otlet.models current_model WHERE current_model.name = active.model_name
-  )
-  GROUP BY active.model_name
-)
 SELECT
   'linked_inproc'::text AS runtime_name,
-  m.name AS model_name,
+  m.model_name,
   m.max_active_jobs,
+  m.active_claimed_jobs,
+  m.available_active_job_slots,
   p.max_queued_jobs_per_model,
   p.max_queued_input_bytes_per_model,
   p.max_queued_input_bytes_total,
@@ -130,7 +102,7 @@ SELECT
     WHERE j.status = 'queued'
       AND j.workload_revision_hash IS DISTINCT FROM head.active_workload_revision_hash
   )::bigint AS suspended_revision_queued_jobs
-FROM model_routes m
+FROM otlet.model_claim_capacity m
 CROSS JOIN otlet.production_policy p
 LEFT JOIN otlet.workload_revisions revision ON true
 LEFT JOIN otlet.jobs j
@@ -138,7 +110,7 @@ LEFT JOIN otlet.jobs j
  AND COALESCE(
    j.routed_model_name,
    revision.definition #>> '{models,direct,name}'
- ) = m.name
+ ) = m.model_name
  AND j.status IN ('queued', 'running', 'cancel_requested')
 LEFT JOIN otlet.workload_revision_heads head ON head.task_name = j.task_name
 LEFT JOIN LATERAL (
@@ -156,12 +128,14 @@ LEFT JOIN LATERAL (
   FROM otlet.worker_events e
   WHERE e.event_type = 'queue_admission_suppressed'
     AND e.detail ? 'model_name'
-    AND e.detail ->> 'model_name' = m.name
+    AND e.detail ->> 'model_name' = m.model_name
 ) suppressed ON true
 WHERE p.name = 'default'
 GROUP BY
-  m.name,
+  m.model_name,
   m.max_active_jobs,
+  m.active_claimed_jobs,
+  m.available_active_job_slots,
   p.max_queued_jobs_per_model,
   p.max_queued_input_bytes_per_model,
   p.max_queued_input_bytes_total,
@@ -177,6 +151,8 @@ SELECT
   COALESCE(q.queued_jobs, 0) AS queued_jobs,
   COALESCE(q.running_jobs, 0) AS running_jobs,
   COALESCE(q.cancel_requested_jobs, 0) AS cancel_requested_jobs,
+  COALESCE(q.active_claimed_jobs, 0) AS active_claimed_jobs,
+  COALESCE(q.available_active_job_slots, m.max_active_jobs) AS available_active_job_slots,
   COALESCE(q.available_queue_slots, 0) AS available_queue_slots,
   COALESCE((last_batch.detail ->> 'job_count')::bigint, 0) AS last_batch_jobs,
   COALESCE((last_batch.detail ->> 'completed_jobs')::bigint, 0) AS last_batch_completed_jobs,
@@ -238,6 +214,8 @@ GROUP BY
   q.queued_jobs,
   q.running_jobs,
   q.cancel_requested_jobs,
+  q.active_claimed_jobs,
+  q.available_active_job_slots,
   q.available_queue_slots,
   last_batch.detail,
   last_batch.created_at,

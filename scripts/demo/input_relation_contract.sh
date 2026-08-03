@@ -451,12 +451,28 @@ echo "input_relation_contract=$input_relation_contract"
 }
 
 infer_now_task="input_relation_infer_now_demo"
+infer_now_model="input_relation_infer_now_model"
 cleanup_task "$infer_now_task"
 psql_exec -qAt -v task_name="$infer_now_task" >/dev/null <<'SQL'
 DELETE FROM otlet.workload_revision_heads WHERE task_name = :'task_name';
 SQL
 
-psql_exec -qAt -v task_name="$infer_now_task" -v model_name="$cheap_model_name" >/dev/null <<'SQL'
+psql_exec -qAt -v task_name="$infer_now_task" -v model_name="$infer_now_model" >/dev/null <<'SQL'
+SELECT otlet.register_model(
+  :'model_name',
+  '/tmp/input_relation_infer_now_model.gguf',
+  repeat('2', 64),
+  jsonb_build_object(
+    'sha256', repeat('2', 64),
+    'bytes', 1,
+    'source', 'native-demo',
+    'revision', 'model-concurrency-v1',
+    'quantization', 'test',
+    'license', 'test'
+  ),
+  1
+) \g /dev/null
+
 SELECT otlet.create_task(
   task_name => :'task_name',
   input_query => NULL,
@@ -506,11 +522,34 @@ SQL
 infer_now_conflict_exit=$?
 set -e
 
-infer_now_conflict_state="$(psql_value -v task_name="$infer_now_task" <<'SQL'
-SELECT status || '|' || (input = '{"value":1}'::jsonb)::text || '|' ||
-       count(*) OVER ()::text
-FROM otlet.jobs
-WHERE task_name = :'task_name';
+set +e
+infer_now_capacity_output="$(psql_exec -qAt -v task_name="$infer_now_task" 2>&1 <<'SQL'
+SELECT otlet.worker_infer_now(
+  :'task_name',
+  'capacity-blocked',
+  '{"value":2}'::jsonb,
+  5000
+);
+SQL
+)"
+infer_now_capacity_exit=$?
+set -e
+
+infer_now_contract_state="$(psql_value -v task_name="$infer_now_task" -v model_name="$infer_now_model" <<'SQL'
+SELECT concat_ws('|',
+  job.status,
+  job.input = '{"value":1}'::jsonb,
+  job.job_count,
+  status.active_claimed_jobs,
+  status.max_active_jobs,
+  status.available_active_job_slots
+)
+FROM (
+  SELECT status, input, count(*) OVER () AS job_count
+  FROM otlet.jobs
+  WHERE task_name = :'task_name'
+) job
+JOIN otlet.model_queue_status status ON status.model_name = :'model_name';
 SQL
 )"
 
@@ -521,10 +560,18 @@ SQL
 
 if [ "$infer_now_conflict_exit" -eq 0 ] \
    || [[ "$infer_now_conflict_output" != *"input relation conflicts with active input for subject active"* ]] \
-   || [ "$infer_now_conflict_state" != "running|true|1" ]; then
+   || [ "$infer_now_contract_state" != "running|t|1|1|1|0" ]; then
   echo "Native infer-now did not reject the active input conflict atomically" >&2
   printf '%s\n' "$infer_now_conflict_output" >&2
-  echo "state=$infer_now_conflict_state" >&2
+  echo "state=$infer_now_contract_state" >&2
   exit 1
 fi
-echo "infer_now_input_conflict_contract=failed|$infer_now_conflict_state"
+if [ "$infer_now_capacity_exit" -eq 0 ] \
+   || [[ "$infer_now_capacity_output" != *"infer-now model active-job capacity exhausted"* ]]; then
+  echo "Native infer-now did not enforce model claim capacity" >&2
+  printf '%s\n' "$infer_now_capacity_output" >&2
+  echo "state=$infer_now_contract_state" >&2
+  exit 1
+fi
+echo "infer_now_input_conflict_contract=failed|$infer_now_contract_state"
+echo "infer_now_model_capacity_contract=failed|$infer_now_contract_state"

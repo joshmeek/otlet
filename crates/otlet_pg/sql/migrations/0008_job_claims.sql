@@ -1,21 +1,131 @@
+CREATE VIEW otlet.model_claim_capacity AS
+WITH policy AS (
+  SELECT max_attempts
+  FROM otlet.production_policy
+  WHERE name = 'default'
+), job_models AS (
+  SELECT
+    COALESCE(
+      j.routed_model_name,
+      revision.definition #>> '{models,direct,name}'
+    ) AS model_name,
+    ((CASE
+        WHEN j.routed_model_name = revision.definition #>> '{selection,strong_model_name}'
+          THEN revision.definition #> '{models,strong}'
+        WHEN j.routed_model_name = revision.definition #>> '{selection,cheap_model_name}'
+          THEN revision.definition #> '{models,cheap}'
+        ELSE revision.definition #> '{models,direct}'
+      END) ->> 'max_active_jobs')::integer AS max_active_jobs,
+    j.status,
+    j.attempts,
+    j.leased_until,
+    j.workload_revision_hash = head.active_workload_revision_hash AS active_revision
+  FROM otlet.jobs j
+  JOIN otlet.workload_revisions revision
+    ON revision.workload_revision_hash = j.workload_revision_hash
+   AND revision.task_name = j.task_name
+  LEFT JOIN otlet.workload_revision_heads head ON head.task_name = j.task_name
+  WHERE j.status IN ('queued', 'running', 'cancel_requested')
+), revision_routes AS (
+  SELECT model_name, min(max_active_jobs) AS max_active_jobs
+  FROM job_models
+  GROUP BY model_name
+), relevant_limits AS (
+  SELECT model_name, min(max_active_jobs) AS max_active_jobs
+  FROM job_models
+  CROSS JOIN policy
+  WHERE (
+      status IN ('running', 'cancel_requested')
+      AND leased_until >= now()
+    )
+    OR (
+      active_revision
+      AND (
+        status = 'queued'
+        OR (
+          status IN ('running', 'cancel_requested')
+          AND (leased_until IS NULL OR leased_until < now())
+          AND attempts < policy.max_attempts
+        )
+      )
+    )
+  GROUP BY model_name
+), model_routes AS (
+  SELECT
+    model.name AS model_name,
+    LEAST(
+      model.max_active_jobs,
+      COALESCE(relevant.max_active_jobs, model.max_active_jobs)
+    ) AS max_active_jobs,
+    true AS registered
+  FROM otlet.models model
+  LEFT JOIN relevant_limits relevant ON relevant.model_name = model.name
+  UNION ALL
+  SELECT
+    revision.model_name,
+    COALESCE(relevant.max_active_jobs, revision.max_active_jobs),
+    false
+  FROM revision_routes revision
+  LEFT JOIN relevant_limits relevant ON relevant.model_name = revision.model_name
+  WHERE NOT EXISTS (
+    SELECT 1 FROM otlet.models model WHERE model.name = revision.model_name
+  )
+), claim_counts AS (
+  SELECT
+    model_name,
+    count(*) FILTER (
+      WHERE status = 'running' AND leased_until >= now()
+    )::bigint AS live_running_jobs,
+    count(*) FILTER (
+      WHERE status = 'cancel_requested' AND leased_until >= now()
+    )::bigint AS live_cancel_requested_jobs
+  FROM job_models
+  GROUP BY model_name
+)
+SELECT
+  route.model_name,
+  route.max_active_jobs,
+  COALESCE(claim.live_running_jobs, 0) AS live_running_jobs,
+  COALESCE(claim.live_cancel_requested_jobs, 0) AS live_cancel_requested_jobs,
+  COALESCE(claim.live_running_jobs, 0)
+    + COALESCE(claim.live_cancel_requested_jobs, 0) AS active_claimed_jobs,
+  CASE
+    WHEN route.registered THEN GREATEST(
+      route.max_active_jobs::bigint
+        - COALESCE(claim.live_running_jobs, 0)
+        - COALESCE(claim.live_cancel_requested_jobs, 0),
+      0
+    )
+    ELSE 0::bigint
+  END AS available_active_job_slots
+FROM model_routes route
+LEFT JOIN claim_counts claim ON claim.model_name = route.model_name;
+
 -- Atomic queue claim for the resident worker; returns zero rows when no work exists
 CREATE FUNCTION otlet.claim_jobs(
   requested_model_name text DEFAULT NULL,
   requested_limit integer DEFAULT NULL
 ) RETURNS SETOF otlet.jobs
-LANGUAGE sql
+LANGUAGE plpgsql
 AS $$
+BEGIN
+  PERFORM 1
+  FROM otlet.production_policy p
+  WHERE p.name = 'default'
+  FOR UPDATE OF p;
+  PERFORM pg_advisory_xact_lock(hashtext('otlet_queue_admission'));
+
+  RETURN QUERY
   WITH policy AS (
     SELECT
       CASE
-        WHEN claim_jobs.requested_limit IS NULL THEN worker_claim_batch_size
-        ELSE LEAST(worker_claim_batch_size, GREATEST(claim_jobs.requested_limit, 1))
+        WHEN claim_jobs.requested_limit IS NULL THEN p.worker_claim_batch_size
+        ELSE LEAST(p.worker_claim_batch_size, GREATEST(claim_jobs.requested_limit, 1))
       END AS batch_size,
-      worker_claim_task_cursor AS task_cursor,
-      max_attempts
-    FROM otlet.production_policy
-    WHERE name = 'default'
-    FOR UPDATE
+      p.worker_claim_task_cursor AS task_cursor,
+      p.max_attempts
+    FROM otlet.production_policy p
+    WHERE p.name = 'default'
   ),
   invalid_heads AS MATERIALIZED (
     SELECT
@@ -97,28 +207,6 @@ AS $$
       ON revision.workload_revision_hash = j.workload_revision_hash
     JOIN otlet.workload_revision_heads head ON head.task_name = j.task_name
   ),
-  active_model AS (
-    SELECT
-      COALESCE(
-        job.routed_model_name,
-        job.definition #>> '{models,direct,name}'
-      ) AS model_name,
-      -- Occupied only while a live lease holds; NULL / expired leases are reclaimable.
-      count(*) FILTER (
-        WHERE job.status = 'running'
-          AND job.leased_until >= now()
-      ) AS running_jobs,
-      count(*) FILTER (
-        WHERE job.status = 'cancel_requested'
-          AND job.leased_until >= now()
-      ) AS cancel_requested_jobs
-    FROM job_contracts job
-    WHERE job.status IN ('running', 'cancel_requested')
-    GROUP BY COALESCE(
-      job.routed_model_name,
-      job.definition #>> '{models,direct,name}'
-    )
-  ),
   eligible_tasks AS (
     SELECT
       job.task_name,
@@ -127,12 +215,14 @@ AS $$
       job.selected_model ->> 'artifact_path' AS artifact_path,
       job.definition #>> '{selection,cheap_model_name}' AS policy_cheap_model_name,
       job.definition #>> '{selection,strong_model_name}' AS policy_strong_model_name,
+      capacity.available_active_job_slots,
       min(CASE WHEN job.status IN ('running', 'cancel_requested') AND (job.leased_until IS NULL OR job.leased_until < now()) THEN 0 ELSE 1 END) AS retry_rank,
       min(job.created_at) AS first_created_at,
       min(job.id) AS first_job_id
     FROM job_contracts job
     CROSS JOIN policy p
-    LEFT JOIN active_model ON active_model.model_name = job.selected_model ->> 'name'
+    JOIN otlet.model_claim_capacity capacity
+      ON capacity.model_name = job.selected_model ->> 'name'
     WHERE (
         job.status = 'queued'
         OR (
@@ -146,10 +236,7 @@ AS $$
           AND job.attempts < p.max_attempts
         )
       )
-      AND (
-        COALESCE(active_model.running_jobs, 0)
-        + COALESCE(active_model.cancel_requested_jobs, 0)
-      ) < (job.selected_model ->> 'max_active_jobs')::integer
+      AND capacity.available_active_job_slots > 0
       AND (
         claim_jobs.requested_model_name IS NULL
         OR job.selected_model ->> 'name' = claim_jobs.requested_model_name
@@ -168,7 +255,8 @@ AS $$
       job.active_workload_revision_hash,
       job.selected_model,
       job.definition #>> '{selection,cheap_model_name}',
-      job.definition #>> '{selection,strong_model_name}'
+      job.definition #>> '{selection,strong_model_name}',
+      capacity.available_active_job_slots
   ),
   selected_task AS (
     SELECT e.*
@@ -312,7 +400,11 @@ AS $$
       candidate.task_job_rank,
       candidate.task_rank
     FOR UPDATE OF j SKIP LOCKED
-    LIMIT (SELECT batch_size FROM policy)
+    LIMIT COALESCE((
+      SELECT LEAST(p.batch_size::bigint, task.available_active_job_slots)
+      FROM policy p
+      CROSS JOIN selected_task task
+    ), 0)
   ),
   advance_cursor AS (
     UPDATE otlet.production_policy p
@@ -347,6 +439,7 @@ AS $$
   JOIN claimable ON claimable.id = updated.id
   CROSS JOIN (SELECT count(*) FROM rejected_claim_input) rejected
   ORDER BY claimable.task_rank, claimable.task_job_rank;
+END;
 $$;
 
 CREATE FUNCTION otlet.renew_job_lease(
@@ -356,8 +449,18 @@ CREATE FUNCTION otlet.renew_job_lease(
   status text,
   leased_until timestamptz
 )
-LANGUAGE sql
+LANGUAGE plpgsql
 AS $$
+BEGIN
+  PERFORM pg_advisory_xact_lock(hashtext('otlet_queue_admission'));
+  PERFORM 1
+  FROM otlet.jobs j
+  WHERE j.id = renew_job_lease.job_id
+    AND j.claim_token = renew_job_lease.expected_claim_token
+    AND j.status IN ('running', 'cancel_requested')
+  FOR UPDATE OF j;
+
+  RETURN QUERY
   WITH locked_job AS MATERIALIZED (
     SELECT
       j.id,
@@ -372,12 +475,11 @@ AS $$
       AND j.claim_token = renew_job_lease.expected_claim_token
       AND j.status IN ('running', 'cancel_requested')
       AND j.leased_until IS NOT NULL
-      AND j.leased_until >= now()
+      AND j.leased_until >= clock_timestamp()
       AND otlet.source_query_contract_error(
         revision.definition #> '{source,query_contract}',
         true
       ) IS NULL
-    FOR UPDATE OF j
   ),
   guarded_job AS MATERIALIZED (
     SELECT locked_job.id, locked_job.lease_interval
@@ -388,11 +490,12 @@ AS $$
     )::text = ''
   )
   UPDATE otlet.jobs j
-  SET leased_until = now()
+  SET leased_until = clock_timestamp()
     + guarded_job.lease_interval
   FROM guarded_job
   WHERE j.id = guarded_job.id
   RETURNING j.status, j.leased_until;
+END;
 $$;
 
 CREATE FUNCTION otlet.job_terminal_request_hash(

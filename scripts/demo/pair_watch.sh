@@ -76,7 +76,9 @@ SELECT q.queue_state || '|' ||
        w.running_jobs::text || '|' ||
        w.last_batch_jobs::text || '|' ||
        w.last_batch_completed_jobs::text || '|' ||
-       w.last_batch_failed_jobs::text
+       w.last_batch_failed_jobs::text || '|' ||
+       w.active_claimed_jobs::text || '|' ||
+       w.available_active_job_slots::text
 FROM otlet.worker_throughput_status w
 JOIN otlet.model_queue_status q ON q.model_name = w.model_name
 WHERE w.model_name = :'model_name';
@@ -98,8 +100,8 @@ echo "semantic_join_auto_materialized=$materialized"
 }
 
 echo "throughput_status_contract=$throughput_status_contract"
-[ "$throughput_status_contract" = "queue_accepting|0|0|4|4|0" ] || {
-  echo "Expected throughput status contract queue_accepting|0|0|4|4|0, got $throughput_status_contract" >&2
+[ "$throughput_status_contract" = "queue_accepting|0|0|4|4|0|0|8" ] || {
+  echo "Expected throughput status contract queue_accepting|0|0|4|4|0|0|8, got $throughput_status_contract" >&2
   exit 1
 }
 

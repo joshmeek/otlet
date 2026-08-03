@@ -32,6 +32,7 @@ pub(crate) struct JobModel {
 pub(crate) enum InferNowJobAdmission {
     Inserted(Job),
     Active,
+    Capacity,
     Conflict,
 }
 
@@ -84,35 +85,25 @@ macro_rules! job_from_row {
 
 pub(crate) fn claim_jobs() -> pgrx::spi::Result<Vec<Job>> {
     pgrx::Spi::connect_mut(|client| {
-        let rows = client.update(
+        let claimed_rows = client.update("SELECT id FROM otlet.claim_jobs()", None, &[])?;
+        let mut claimed_ids = Vec::with_capacity(claimed_rows.len());
+        for row in claimed_rows {
+            claimed_ids.push(required_col!(row, i64, 1));
+        }
+        if claimed_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let rows = client.select(
             r"
 WITH claimed AS (
-  SELECT
-    j.id,
-    j.task_name,
-    j.subject_id,
-    j.input,
-    j.workload_revision_hash,
-    revision.definition,
-    CASE
-      WHEN j.routed_model_name IS NOT NULL THEN revision.definition #> '{models,strong}'
-      ELSE revision.definition #> '{models,direct}'
-    END AS selected_model,
-    CASE WHEN j.routed_model_name IS NOT NULL THEN 'strong' ELSE 'direct' END AS selection_role,
-    j.claim_token,
-    otlet.semantic_shaped_input(
-      j.input,
-      revision.definition #> '{task,input_shaping}'
-    ) AS shaped_input
-  FROM otlet.claim_jobs() j
-  JOIN otlet.workload_revisions revision
-    ON revision.task_name = j.task_name
-   AND revision.workload_revision_hash = j.workload_revision_hash
+  SELECT id, claim_order
+  FROM unnest($1::bigint[]) WITH ORDINALITY AS claimed(id, claim_order)
 )
 SELECT
-  id,
-  task_name,
-  subject_id,
+  j.id,
+  j.task_name,
+  j.subject_id,
   definition #>> '{task,instruction}',
   definition #> '{task,output_schema}',
   shaped_input,
@@ -121,17 +112,33 @@ SELECT
   selected_model ->> 'artifact_hash',
   selected_model -> 'artifact_identity',
   selected_model ->> 'name',
-  selection_role,
+  CASE WHEN j.routed_model_name IS NOT NULL THEN 'strong' ELSE 'direct' END,
   definition #> '{runtime,effective_options}',
   definition #> '{task,input_shaping}',
   definition #> '{task,decision_contract}',
   (definition #>> '{runtime,effective_max_attempt_ms}')::integer,
-  claim_token,
-  workload_revision_hash
+  j.claim_token,
+  j.workload_revision_hash
 FROM claimed
-	",
+JOIN otlet.jobs j ON j.id = claimed.id
+JOIN otlet.workload_revisions revision
+  ON revision.task_name = j.task_name
+ AND revision.workload_revision_hash = j.workload_revision_hash
+CROSS JOIN LATERAL (
+  SELECT
+    CASE
+      WHEN j.routed_model_name IS NOT NULL THEN definition #> '{models,strong}'
+      ELSE definition #> '{models,direct}'
+    END AS selected_model,
+    otlet.semantic_shaped_input(
+      j.input,
+      definition #> '{task,input_shaping}'
+    ) AS shaped_input
+) selected
+ORDER BY claimed.claim_order
+",
             None,
-            &[],
+            &[claimed_ids.as_slice().into()],
         )?;
 
         let mut jobs = Vec::with_capacity(rows.len());
@@ -176,13 +183,20 @@ pub(crate) fn insert_infer_now_job(
         let active_rows = client.select(
             r"
 SELECT
-  count(*)::bigint,
-  COALESCE(bool_or(j.input IS DISTINCT FROM $3::jsonb), false)
-FROM otlet.jobs j
-WHERE j.task_name = $1
-  AND j.workload_revision_hash = $4
-  AND j.subject_id = $2
-  AND j.status IN ('queued', 'running', 'cancel_requested')
+  count(j.id)::bigint,
+  COALESCE(bool_or(j.id IS NOT NULL AND j.input IS DISTINCT FROM $3::jsonb), false),
+  capacity.available_active_job_slots
+FROM otlet.workload_revisions revision
+LEFT JOIN otlet.model_claim_capacity capacity
+  ON capacity.model_name = revision.definition #>> '{models,direct,name}'
+LEFT JOIN otlet.jobs j
+  ON j.task_name = revision.task_name
+ AND j.workload_revision_hash = revision.workload_revision_hash
+ AND j.subject_id = $2
+ AND j.status IN ('queued', 'running', 'cancel_requested')
+WHERE revision.task_name = $1
+  AND revision.workload_revision_hash = $4
+GROUP BY capacity.available_active_job_slots
 	",
             Some(1),
             &args,
@@ -193,6 +207,9 @@ WHERE j.task_name = $1
         }
         if active_row.get::<i64>(1)?.unwrap_or(0) > 0 {
             return Ok(InferNowJobAdmission::Active);
+        }
+        if active_row.get::<i64>(3)?.unwrap_or(0) <= 0 {
+            return Ok(InferNowJobAdmission::Capacity);
         }
         let rows = client.update(
             r"

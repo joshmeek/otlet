@@ -245,6 +245,20 @@ BEGIN
 
   RETURN QUERY
   SELECT
+    'active_claimed_jobs_within_model_cap'::text,
+    'model'::text,
+    capacity.model_name,
+    jsonb_build_object(
+      'active_claimed_jobs', capacity.active_claimed_jobs,
+      'max_active_jobs', capacity.max_active_jobs,
+      'live_running_jobs', capacity.live_running_jobs,
+      'live_cancel_requested_jobs', capacity.live_cancel_requested_jobs
+    )
+  FROM otlet.model_claim_capacity capacity
+  WHERE capacity.active_claimed_jobs > capacity.max_active_jobs;
+
+  RETURN QUERY
+  SELECT
     'queued_input_bytes_within_model_cap'::text,
     'model'::text,
     q.model_name,

@@ -113,7 +113,7 @@ The task-cursor scheduler at `962dcc49` opened one claim per task even when seve
 | 4 | 4 | 1 | 1 | 4 | 0.690ms | 0.435ms |
 | 16 | 16 | 2 | 1 | 8 | 3.264ms | 0.877ms |
 
-The retained claim fills each batch by task round, advances the cursor to the last claimed task, and groups only tasks with the same base model, artifact, and cheap/strong policy models. Two simultaneous claimers took eight unique jobs each from a 16-task queue. Expired running jobs, cancel-requested jobs, per-task FIFO order, model-policy separation, queue caps, and the full demo stayed valid. Batch events now include every claimed task in `task_names`
+The retained claim fills each batch by task round, advances the cursor to the last claimed task, and groups only tasks with the same base model, artifact, and cheap/strong policy models. Two simultaneous claimers took eight unique jobs each from a 16-task queue. Reproducing both eight-job claims now requires `max_active_jobs >= 16`; lower caps stop at the remaining slots. Expired running jobs, cancel-requested jobs, per-task FIFO order, model-policy separation, queue caps, and the full demo stayed valid. Batch events now include every claimed task in `task_names`
 
 ### Bounded fallback window
 

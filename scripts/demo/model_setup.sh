@@ -92,7 +92,8 @@ SELECT otlet.register_model(
     'revision', :'cheap_model_revision',
     'quantization', :'cheap_model_quantization',
     'license', :'cheap_model_license'
-  )
+  ),
+  8
 );
 SELECT otlet.register_model(
   :'strong_model_name',
@@ -105,7 +106,8 @@ SELECT otlet.register_model(
     'revision', :'strong_model_revision',
     'quantization', :'strong_model_quantization',
     'license', :'strong_model_license'
-  )
+  ),
+  8
 );
 SELECT otlet.register_model(
   :'strong_alias_model_name',
@@ -118,7 +120,8 @@ SELECT otlet.register_model(
     'revision', :'strong_model_revision',
     'quantization', :'strong_model_quantization',
     'license', :'strong_model_license'
-  )
+  ),
+  8
 );
 SQL
 }

@@ -423,6 +423,14 @@ fn process_infer_now_request(request: crate::infer_now::InferNowRequest) {
             );
             return;
         }
+        Ok(InferNowJobAdmission::Capacity) => {
+            crate::infer_now::finish_request(
+                id,
+                0,
+                Some("infer-now model active-job capacity exhausted"),
+            );
+            return;
+        }
         Ok(InferNowJobAdmission::Conflict) => {
             crate::infer_now::finish_request(
                 id,
