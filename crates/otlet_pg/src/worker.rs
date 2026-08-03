@@ -401,15 +401,25 @@ fn process_infer_now_request(request: crate::infer_now::InferNowRequest) {
         id,
         task_name,
         subject_id,
+        expected_workload_revision_hash,
         input_json,
         ..
     } = request;
     let job = match BackgroundWorker::transaction(|| {
-        insert_infer_now_job(&task_name, &subject_id, &input_json)
+        insert_infer_now_job(
+            &task_name,
+            &subject_id,
+            expected_workload_revision_hash.as_deref(),
+            &input_json,
+        )
     }) {
         Ok(Some(job)) => job,
         Ok(None) => {
-            crate::infer_now::finish_request(id, 0, Some("infer-now active job already exists"));
+            crate::infer_now::finish_request(
+                id,
+                0,
+                Some("infer-now active job exists or workload revision changed"),
+            );
             return;
         }
         Err(err) => {
@@ -423,6 +433,7 @@ fn process_infer_now_request(request: crate::infer_now::InferNowRequest) {
     };
 
     let job_id = job.id;
+    let workload_revision_hash = job.workload_revision_hash.clone();
     // Reuse request-owned strings; insert_infer_now_job stores them verbatim.
     crate::infer_now::mark_request_job_started(id, job_id);
     let mut process_result = process_job(job);
@@ -441,7 +452,8 @@ fn process_infer_now_request(request: crate::infer_now::InferNowRequest) {
     // Skip the follow-up subject materialize when that SPI succeeded; keep the
     // fallback when it failed so infer-now still fail-closes on missing state.
     if !process_result.semantic_materialized
-        && let Err(err) = materialize_infer_now_subject(&task_name, &subject_id)
+        && let Err(err) =
+            materialize_infer_now_subject(&task_name, &subject_id, &workload_revision_hash)
     {
         crate::infer_now::finish_request(
             id,
@@ -531,21 +543,37 @@ fn infer_now_job_error(job_id: i64) -> String {
     }
 }
 
-fn materialize_infer_now_subject(task_name: &str, subject_id: &str) -> pgrx::spi::Result<i64> {
+fn materialize_infer_now_subject(
+    task_name: &str,
+    subject_id: &str,
+    workload_revision_hash: &str,
+) -> pgrx::spi::Result<i64> {
     BackgroundWorker::transaction(|| {
         pgrx::Spi::connect_mut(|client| {
-            let args = [task_name.into(), subject_id.into()];
+            let args = [
+                task_name.into(),
+                subject_id.into(),
+                workload_revision_hash.into(),
+            ];
             // Match materialize_completed_semantic_job: refresh both row and join indexes.
             let rows = client.select(
                 "SELECT COALESCE(sum(refreshed), 0)::bigint AS materialized \
                  FROM ( \
-                   SELECT otlet.materialize_semantic_index_subject(si.name, $2) AS refreshed \
-                   FROM otlet.semantic_indexes si \
-                   WHERE si.task_name = $1 \
+                   SELECT otlet.materialize_semantic_index_subject( \
+                     revision.definition #>> '{source,semantic_index_name}', $2, $3 \
+                   ) AS refreshed \
+                   FROM otlet.workload_revisions revision \
+                   WHERE revision.task_name = $1 \
+                     AND revision.workload_revision_hash = $3 \
+                     AND revision.definition #>> '{source,kind}' = 'row' \
                    UNION ALL \
-                   SELECT otlet.materialize_semantic_join_index_subject(sji.name, $2) AS refreshed \
-                   FROM otlet.semantic_join_indexes sji \
-                   WHERE sji.task_name = $1 \
+                   SELECT otlet.materialize_semantic_join_index_subject( \
+                     revision.definition #>> '{source,semantic_join_index_name}', $2, $3 \
+                   ) AS refreshed \
+                   FROM otlet.workload_revisions revision \
+                   WHERE revision.task_name = $1 \
+                     AND revision.workload_revision_hash = $3 \
+                     AND revision.definition #>> '{source,kind}' = 'pair' \
                  ) m",
                 Some(1),
                 &args,

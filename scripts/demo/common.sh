@@ -86,7 +86,6 @@ USING otlet.jobs j
 WHERE r.job_id = j.id
   AND j.task_name = :'task_name';
 DELETE FROM otlet.jobs WHERE task_name = :'task_name';
-DELETE FROM otlet.tasks WHERE name = :'task_name';
 SQL
 }
 

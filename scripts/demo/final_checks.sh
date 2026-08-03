@@ -375,8 +375,8 @@ SQL
 )"
 prepared_metadata_contract="$(head -n 1 <<<"$prepared_metadata_output")|$(tail -n 1 <<<"$prepared_metadata_output")"
 echo "prepared_metadata_contract=$prepared_metadata_contract"
-[ "$prepared_metadata_contract" = "1|0" ] || {
-  echo "Expected prepared CustomScan to reload current semantic metadata, got $prepared_metadata_contract" >&2
+[ "$prepared_metadata_contract" = "1|1" ] || {
+  echo "Expected prepared CustomScan to ignore unpromoted metadata, got $prepared_metadata_contract" >&2
   exit 1
 }
 

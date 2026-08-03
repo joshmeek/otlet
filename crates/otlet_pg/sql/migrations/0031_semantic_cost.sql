@@ -89,21 +89,28 @@ DECLARE
     ELSE 'linked_inproc'
   END;
   v_stale_reasons jsonb := COALESCE(p_stale_reasons, '{}'::jsonb);
+  v_schema_drift boolean := COALESCE((p_stale_reasons ->> 'schema_drift')::bigint, 0) > 0;
 BEGIN
   v_refresh_subjects := v_stale_subjects + v_missing_subjects;
 
   SELECT
     count(DISTINCT j.subject_id) FILTER (
       WHERE j.task_name = p_task_name
+        AND j.workload_revision_hash = head.active_workload_revision_hash
     )::bigint,
-    count(j.id)::bigint,
+    count(j.id) FILTER (
+      WHERE j.status IN ('running', 'cancel_requested')
+         OR j.workload_revision_hash = head.active_workload_revision_hash
+    )::bigint,
     COALESCE(otlet.available_model_queue_slots(p_model_name), 0)::bigint
   INTO v_inflight_subjects, v_worker_queue_depth, v_available_queue_slots
-  FROM otlet.tasks t
-  LEFT JOIN otlet.jobs j
-    ON j.task_name = t.name
-   AND j.status IN ('queued', 'running', 'cancel_requested')
-  WHERE t.model_name = p_model_name;
+  FROM otlet.jobs j
+  JOIN otlet.workload_revisions revision
+    ON revision.task_name = j.task_name
+   AND revision.workload_revision_hash = j.workload_revision_hash
+  LEFT JOIN otlet.workload_revision_heads head ON head.task_name = j.task_name
+  WHERE j.status IN ('queued', 'running', 'cancel_requested')
+    AND COALESCE(j.routed_model_name, revision.definition #>> '{models,direct,name}') = p_model_name;
 
   SELECT
     COALESCE(task_cost.generate_ms, slot_cost.last_generate_ms, model_cost.generate_ms, 2500)::numeric,
@@ -157,19 +164,20 @@ BEGIN
   FROM otlet.production_policy policy
   WHERE policy.name = 'default';
 
-  IF NOT v_portable
+  IF NOT v_schema_drift
+     AND NOT v_portable
      AND COALESCE(v_auto_infer_ms, 0) > 0
      AND COALESCE(v_auto_max_rows, 0) > 0 THEN
     v_infer_now_subjects := LEAST(v_refresh_subjects, v_auto_max_rows::bigint);
   END IF;
 
-  IF COALESCE(v_auto_wait_ms, 0) > 0 THEN
+  IF NOT v_schema_drift AND COALESCE(v_auto_wait_ms, 0) > 0 THEN
     v_wait_subjects := COALESCE(v_inflight_subjects, 0);
   END IF;
 
   v_remaining_refresh_subjects := GREATEST(v_refresh_subjects - v_infer_now_subjects, 0);
 
-  IF v_stale_policy = 'refresh_then_fail_closed' THEN
+  IF NOT v_schema_drift AND v_stale_policy = 'refresh_then_fail_closed' THEN
     v_queue_subjects := LEAST(v_remaining_refresh_subjects, COALESCE(v_available_queue_slots, 0));
   END IF;
 
@@ -181,6 +189,9 @@ BEGIN
   IF v_total_subjects = 0 THEN
     v_selected_path := p_lookup_path;
     v_reason := p_empty_reason;
+  ELSIF v_schema_drift THEN
+    v_selected_path := 'lookup_fail_closed';
+    v_reason := 'source schema drift requires watch revision';
   ELSIF v_infer_now_subjects > 0 THEN
     v_selected_path := 'bounded_infer_now';
     v_reason := format(

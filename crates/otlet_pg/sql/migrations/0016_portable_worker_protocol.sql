@@ -742,15 +742,37 @@ CREATE FUNCTION otlet.requeue_portable_job_to_strong(
   job_id bigint,
   claim_id bigint,
   expected_claim_token text
-) RETURNS void
+) RETURNS text
 LANGUAGE plpgsql
 AS $$
 DECLARE
+  job_task_name text;
   strong_model_name text;
+  revision_active boolean;
+  terminal_status text;
+  terminal_receipt_id bigint;
   changed bigint;
 BEGIN
-  SELECT revision.definition #>> '{selection,strong_model_name}'
-  INTO strong_model_name
+  SELECT j.task_name
+  INTO job_task_name
+  FROM otlet.jobs j
+  WHERE j.id = requeue_portable_job_to_strong.job_id;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'otlet portable job does not exist';
+  END IF;
+
+  PERFORM pg_advisory_xact_lock(
+    hashtextextended('otlet_workload_revision:' || job_task_name, 0)
+  );
+  SELECT
+    revision.definition #>> '{selection,strong_model_name}',
+    EXISTS (
+      SELECT 1
+      FROM otlet.workload_revision_heads head
+      WHERE head.task_name = j.task_name
+        AND head.active_workload_revision_hash = j.workload_revision_hash
+    )
+  INTO strong_model_name, revision_active
   FROM otlet.jobs j
   JOIN otlet.workload_revisions revision
     ON revision.workload_revision_hash = j.workload_revision_hash
@@ -758,6 +780,37 @@ BEGIN
 
   IF NOT FOUND OR strong_model_name IS NULL THEN
     RAISE EXCEPTION 'otlet portable job has no strong model route';
+  END IF;
+
+  IF NOT revision_active THEN
+    SELECT canceled.status
+    INTO terminal_status
+    FROM otlet.cancel_job(
+      requeue_portable_job_to_strong.job_id,
+      requeue_portable_job_to_strong.expected_claim_token,
+      'workload revision changed before portable strong fallback',
+      'portable:control',
+      'postgres_rpc'
+    ) canceled;
+    IF terminal_status IS NULL THEN
+      RAISE EXCEPTION 'otlet portable job claim is stale';
+    END IF;
+
+    SELECT receipt.id
+    INTO terminal_receipt_id
+    FROM otlet.inference_receipts receipt
+    WHERE receipt.job_id = requeue_portable_job_to_strong.job_id
+    ORDER BY receipt.id DESC
+    LIMIT 1;
+    PERFORM otlet.link_portable_receipt(
+      requeue_portable_job_to_strong.claim_id,
+      terminal_receipt_id
+    );
+    UPDATE otlet.portable_claims claim
+    SET status = 'canceled',
+        finished_at = COALESCE(claim.finished_at, now())
+    WHERE claim.id = requeue_portable_job_to_strong.claim_id;
+    RETURN terminal_status;
   END IF;
 
   UPDATE otlet.jobs j
@@ -784,6 +837,7 @@ BEGIN
       finished_at = COALESCE(c.finished_at, now())
   WHERE c.id = requeue_portable_job_to_strong.claim_id;
   PERFORM otlet.wake_worker();
+  RETURN 'queued';
 END;
 $$;
 
@@ -900,13 +954,12 @@ BEGIN
         runtime_endpoint => 'postgres_rpc'
       );
       PERFORM otlet.link_portable_receipt(claim_row.id, receipt_row.id);
-      PERFORM otlet.requeue_portable_job_to_strong(
+      job_status := otlet.requeue_portable_job_to_strong(
         portable_complete_job.requested_job_id,
         claim_row.id,
         portable_complete_job.requested_claim_token
       );
       job_id := portable_complete_job.requested_job_id;
-      job_status := 'queued';
       receipt_id := receipt_row.id;
       output_id := NULL;
       RETURN NEXT;
@@ -1040,13 +1093,12 @@ BEGIN
       runtime_endpoint => 'postgres_rpc'
     );
     PERFORM otlet.link_portable_receipt(claim_row.id, receipt_row.id);
-    PERFORM otlet.requeue_portable_job_to_strong(
+    job_status := otlet.requeue_portable_job_to_strong(
       portable_fail_job.requested_job_id,
       claim_row.id,
       portable_fail_job.requested_claim_token
     );
     job_id := portable_fail_job.requested_job_id;
-    job_status := 'queued';
     receipt_id := receipt_row.id;
     RETURN NEXT;
     RETURN;
@@ -1188,17 +1240,7 @@ SELECT
     WHEN w.desired_state = 'draining' THEN 'draining'
     ELSE 'healthy'
   END AS worker_health,
-  (
-    SELECT count(*)
-    FROM otlet.jobs queued_job
-    JOIN otlet.workload_revisions queued_revision
-      ON queued_revision.workload_revision_hash = queued_job.workload_revision_hash
-    WHERE COALESCE(
-      queued_job.routed_model_name,
-      queued_revision.definition #>> '{models,direct,name}'
-    ) = w.model_name
-      AND queued_job.status = 'queued'
-  ) AS queued_jobs,
+  queue.queued_jobs,
   count(c.id) AS claims,
   count(c.id) FILTER (
     WHERE c.status IN ('claimed', 'renewed')
@@ -1214,8 +1256,29 @@ SELECT
     WHERE c.status IN ('claimed', 'renewed')
       AND j.status IN ('running', 'cancel_requested')
   ) AS earliest_lease_expires_at,
-  max(c.claimed_at) AS latest_claimed_at
+  max(c.claimed_at) AS latest_claimed_at,
+  queue.suspended_revision_queued_jobs
 FROM otlet.portable_workers w
+LEFT JOIN LATERAL (
+  SELECT
+    count(*) FILTER (
+      WHERE queued_job.workload_revision_hash = queued_head.active_workload_revision_hash
+    )::bigint AS queued_jobs,
+    count(*) FILTER (
+      WHERE queued_job.workload_revision_hash IS DISTINCT FROM queued_head.active_workload_revision_hash
+    )::bigint AS suspended_revision_queued_jobs
+  FROM otlet.jobs queued_job
+  JOIN otlet.workload_revisions queued_revision
+    ON queued_revision.task_name = queued_job.task_name
+   AND queued_revision.workload_revision_hash = queued_job.workload_revision_hash
+  LEFT JOIN otlet.workload_revision_heads queued_head
+    ON queued_head.task_name = queued_job.task_name
+  WHERE queued_job.status = 'queued'
+    AND COALESCE(
+      queued_job.routed_model_name,
+      queued_revision.definition #>> '{models,direct,name}'
+    ) = w.model_name
+) queue ON true
 LEFT JOIN otlet.portable_claims c ON c.worker_id = w.worker_id
 LEFT JOIN otlet.jobs j ON j.id = c.job_id
 GROUP BY
@@ -1234,7 +1297,9 @@ GROUP BY
   w.last_seen_at,
   w.last_heartbeat_at,
   w.last_claimed_at,
-  w.process_started_at;
+  w.process_started_at,
+  queue.queued_jobs,
+  queue.suspended_revision_queued_jobs;
 
 CREATE VIEW otlet.portable_claim_status AS
 SELECT

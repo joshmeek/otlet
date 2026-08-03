@@ -76,8 +76,14 @@ SELECT
   p.max_queued_jobs_per_model,
   p.max_queued_input_bytes_per_model,
   p.max_queued_input_bytes_total,
-  count(j.id) FILTER (WHERE j.status = 'queued')::bigint AS queued_jobs,
-  COALESCE(sum(octet_length(j.input::text)) FILTER (WHERE j.status = 'queued'), 0)::bigint AS queued_input_bytes,
+  count(j.id) FILTER (
+    WHERE j.status = 'queued'
+      AND j.workload_revision_hash = head.active_workload_revision_hash
+  )::bigint AS queued_jobs,
+  COALESCE(sum(octet_length(j.input::text)) FILTER (
+    WHERE j.status = 'queued'
+      AND j.workload_revision_hash = head.active_workload_revision_hash
+  ), 0)::bigint AS queued_input_bytes,
   total_queue.queued_input_bytes AS total_queued_input_bytes,
   count(j.id) FILTER (WHERE j.status = 'running')::bigint AS running_jobs,
   count(j.id) FILTER (WHERE j.status = 'cancel_requested')::bigint AS cancel_requested_jobs,
@@ -87,12 +93,18 @@ SELECT
   )::bigint AS expired_running_jobs,
   GREATEST(
     p.max_queued_jobs_per_model::bigint
-      - count(j.id) FILTER (WHERE j.status = 'queued'),
+      - count(j.id) FILTER (
+        WHERE j.status = 'queued'
+          AND j.workload_revision_hash = head.active_workload_revision_hash
+      ),
     0
   ) AS available_queue_slots,
   GREATEST(
     p.max_queued_input_bytes_per_model
-      - COALESCE(sum(octet_length(j.input::text)) FILTER (WHERE j.status = 'queued'), 0),
+      - COALESCE(sum(octet_length(j.input::text)) FILTER (
+        WHERE j.status = 'queued'
+          AND j.workload_revision_hash = head.active_workload_revision_hash
+      ), 0),
     0
   )::bigint AS available_model_queue_input_bytes,
   GREATEST(
@@ -100,14 +112,24 @@ SELECT
     0
   )::bigint AS available_total_queue_input_bytes,
   CASE
-    WHEN count(j.id) FILTER (WHERE j.status = 'queued') >= p.max_queued_jobs_per_model
-      OR COALESCE(sum(octet_length(j.input::text)) FILTER (WHERE j.status = 'queued'), 0) >= p.max_queued_input_bytes_per_model
+    WHEN count(j.id) FILTER (
+      WHERE j.status = 'queued'
+        AND j.workload_revision_hash = head.active_workload_revision_hash
+    ) >= p.max_queued_jobs_per_model
+      OR COALESCE(sum(octet_length(j.input::text)) FILTER (
+        WHERE j.status = 'queued'
+          AND j.workload_revision_hash = head.active_workload_revision_hash
+      ), 0) >= p.max_queued_input_bytes_per_model
       OR total_queue.queued_input_bytes >= p.max_queued_input_bytes_total
     THEN 'queue_full'
     ELSE 'queue_accepting'
   END AS queue_state,
   COALESCE(suppressed.suppressed_events, 0)::bigint AS queue_admission_suppressed_events,
-  suppressed.last_suppressed_at AS queue_admission_last_suppressed_at
+  suppressed.last_suppressed_at AS queue_admission_last_suppressed_at,
+  count(j.id) FILTER (
+    WHERE j.status = 'queued'
+      AND j.workload_revision_hash IS DISTINCT FROM head.active_workload_revision_hash
+  )::bigint AS suspended_revision_queued_jobs
 FROM model_routes m
 CROSS JOIN otlet.production_policy p
 LEFT JOIN otlet.workload_revisions revision ON true
@@ -118,9 +140,13 @@ LEFT JOIN otlet.jobs j
    revision.definition #>> '{models,direct,name}'
  ) = m.name
  AND j.status IN ('queued', 'running', 'cancel_requested')
+LEFT JOIN otlet.workload_revision_heads head ON head.task_name = j.task_name
 LEFT JOIN LATERAL (
   SELECT COALESCE(sum(octet_length(queued.input::text)), 0)::bigint AS queued_input_bytes
   FROM otlet.jobs queued
+  JOIN otlet.workload_revision_heads queued_head
+    ON queued_head.task_name = queued.task_name
+   AND queued_head.active_workload_revision_hash = queued.workload_revision_hash
   WHERE queued.status = 'queued'
 ) total_queue ON true
 LEFT JOIN LATERAL (

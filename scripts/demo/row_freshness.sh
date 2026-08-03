@@ -80,25 +80,6 @@ SET blockers = 2,
     evidence = 'Wire instructions changed after invoice approval and the requester used urgent payment language'
 WHERE id = 'triage-1';
 SQL
-psql_exec -v task_name="$row_triage_task" >/dev/null <<'SQL'
-INSERT INTO otlet.jobs (task_name, subject_id, input)
-SELECT
-  :'task_name',
-  (src.id)::text,
-  jsonb_build_object(
-    '_otlet_mvcc', jsonb_build_object(
-      'table', 'public.otlet_demo_triage_signal',
-      'subject_id', (src.id)::text,
-      'ctid', src.ctid::text,
-      'xmin', src.xmin::text
-    ),
-    'table', 'public.otlet_demo_triage_signal',
-    'row', otlet.semantic_project_row(to_jsonb(src), NULL::text[])
-  )
-FROM public.otlet_demo_triage_signal AS src
-WHERE src.id = 'triage-1';
-SELECT otlet.wake_worker();
-SQL
 wait_task_complete "$row_triage_task" 3 900 1
 row_cache_revert_contract="$(psql_exec -qAt \
   -v task_name="$row_triage_task" \
@@ -146,6 +127,7 @@ SELECT (otlet.create_task(
     decision_contract
   )).name
 FROM current_task;
+SELECT otlet.promote_configured_workload_revision(:'task_name');
 
 INSERT INTO otlet.jobs (task_name, subject_id, input)
 SELECT

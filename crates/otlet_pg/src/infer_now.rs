@@ -9,6 +9,7 @@ const STATE_FAILED: u32 = 4;
 
 const TASK_CAP: usize = 128;
 const SUBJECT_CAP: usize = 256;
+const WORKLOAD_REVISION_CAP: usize = 96;
 const INLINE_TASK_CAP: usize = 12 * 1024;
 const INPUT_CAP: usize = 8192;
 const ERROR_CAP: usize = 512;
@@ -33,11 +34,13 @@ struct InferNowSlot {
     last_worker_run_ms: u64,
     task_len: u32,
     subject_len: u32,
+    workload_revision_len: u32,
     inline_task_len: u32,
     input_len: u32,
     error_len: u32,
     task: [u8; TASK_CAP],
     subject: [u8; SUBJECT_CAP],
+    workload_revision: [u8; WORKLOAD_REVISION_CAP],
     inline_task: [u8; INLINE_TASK_CAP],
     input: [u8; INPUT_CAP],
     error: [u8; ERROR_CAP],
@@ -59,11 +62,13 @@ impl Default for InferNowSlot {
             last_worker_run_ms: 0,
             task_len: 0,
             subject_len: 0,
+            workload_revision_len: 0,
             inline_task_len: 0,
             input_len: 0,
             error_len: 0,
             task: [0; TASK_CAP],
             subject: [0; SUBJECT_CAP],
+            workload_revision: [0; WORKLOAD_REVISION_CAP],
             inline_task: [0; INLINE_TASK_CAP],
             input: [0; INPUT_CAP],
             error: [0; ERROR_CAP],
@@ -124,6 +129,7 @@ pub(crate) struct InferNowRequest {
     pub(crate) id: u64,
     pub(crate) task_name: String,
     pub(crate) subject_id: String,
+    pub(crate) expected_workload_revision_hash: Option<String>,
     /// Raw slot JSON for create_task field extraction via `$n::jsonb`.
     pub(crate) inline_task_json: Option<String>,
     /// Canonical JSON text from the shared-memory slot (no parse/re-serialize).
@@ -167,6 +173,8 @@ pub(crate) fn take_request() -> Option<InferNowRequest> {
     let id = slot.request_id;
     let task_name = read_buf(&slot.task, slot.task_len as usize);
     let subject_id = read_buf(&slot.subject, slot.subject_len as usize);
+    let expected_workload_revision_hash =
+        read_optional_buf(&slot.workload_revision, slot.workload_revision_len as usize);
     let inline_task_text = read_optional_buf(&slot.inline_task, slot.inline_task_len as usize);
     let input_text = read_buf(&slot.input, slot.input_len as usize);
     if let Some(text) = inline_task_text.as_deref()
@@ -210,6 +218,7 @@ pub(crate) fn take_request() -> Option<InferNowRequest> {
         id,
         task_name,
         subject_id,
+        expected_workload_revision_hash,
         inline_task_json: inline_task_text,
         input_json: input_text,
     })

@@ -87,8 +87,8 @@ CREATE TEMP TABLE evidence_row_run AS SELECT otlet.run_task('evidence_row_allowl
 SELECT
   (SELECT bool_and(passed) FROM source_allowlist_results)::text || '|' ||
   (SELECT count(*) = 0 FROM otlet.jobs WHERE task_name IN ('evidence_source_single_demo', 'evidence_source_bulk_demo'))::text || '|' ||
-  (SELECT count(*) = 0 FROM evidence_claimed)::text || '|' ||
-  (SELECT status = 'failed' AND error = 'source field allowlist violation' FROM otlet.jobs WHERE task_name = 'evidence_source_claim_demo')::text || '|' ||
+  (SELECT count(*) = 1 FROM evidence_claimed)::text || '|' ||
+  (SELECT status = 'running' AND input = '{"approved":"ok"}'::jsonb FROM otlet.jobs WHERE task_name = 'evidence_source_claim_demo')::text || '|' ||
   (SELECT input_columns = ARRAY['approved', 'id']::text[] FROM otlet.semantic_indexes WHERE name = 'evidence_row_allowlist_demo')::text || '|' ||
   (SELECT (input #> '{row}') ? 'approved'
           AND NOT ((input #> '{row}') ? 'unapproved')

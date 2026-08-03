@@ -28,7 +28,8 @@ BEGIN
 
   action_row := context_row.action_row;
   validation_error := COALESCE(context_row.validation_error, context_row.authority_error);
-  IF action_row.content_hash IS NOT NULL
+  IF validation_error IS NULL
+     AND action_row.content_hash IS NOT NULL
      AND context_row.current_content_hash IS DISTINCT FROM action_row.content_hash THEN
     validation_error := 'source identity stale';
   END IF;
@@ -160,7 +161,7 @@ BEGIN
 
   action_row := context_row.action_row;
   schema_row := context_row.schema_row;
-  validation_error := context_row.validation_error;
+  validation_error := COALESCE(context_row.validation_error, context_row.authority_error);
   next_status := action_row.status;
   next_apply_status := action_row.apply_status;
   next_error := action_row.error;
@@ -243,7 +244,8 @@ BEGIN
     END IF;
   END IF;
 
-  IF action_row.content_hash IS NOT NULL
+  IF validation_error IS NULL
+     AND action_row.content_hash IS NOT NULL
      AND context_row.current_content_hash IS DISTINCT FROM action_row.content_hash THEN
     validation_error := 'source identity stale';
   END IF;

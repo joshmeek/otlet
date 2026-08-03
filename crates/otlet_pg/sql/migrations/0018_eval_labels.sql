@@ -79,12 +79,13 @@ BEGIN
   END IF;
 
   SELECT
+    revision.definition #>> '{task,name}',
     revision.definition #> '{task,output_schema}',
     revision.definition #> '{task,decision_contract}',
     COALESCE((revision.definition #>> ARRAY[
       'action_policies', action_row.action_type, 'schema', 'requires_approval'
     ])::boolean, false)
-  INTO task_row.output_schema, task_row.decision_contract, action_requires_approval
+  INTO task_row.name, task_row.output_schema, task_row.decision_contract, action_requires_approval
   FROM otlet.jobs j
   JOIN otlet.workload_revisions revision
     ON revision.workload_revision_hash = j.workload_revision_hash

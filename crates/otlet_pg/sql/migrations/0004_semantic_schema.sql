@@ -5,13 +5,13 @@ CREATE TABLE otlet.semantic_materializations (
   source_table text,
   subject_id text,
   source_dependencies jsonb NOT NULL DEFAULT '[]'::jsonb CHECK (jsonb_typeof(source_dependencies) = 'array'),
-  task_name text NOT NULL,
+  task_name text NOT NULL REFERENCES otlet.tasks(name),
   model_name text NOT NULL,
   body jsonb NOT NULL,
   stale boolean NOT NULL DEFAULT false,
   source_hash text,
   content_hash text,
-  contract_hash text,
+  contract_hash text NOT NULL,
   stale_reason text CHECK (stale_reason IN (
     'source_update',
     'source_delete',
@@ -31,7 +31,9 @@ CREATE TABLE otlet.semantic_materializations (
   updated_at timestamptz NOT NULL DEFAULT now(),
   CHECK (source_hash IS NULL OR source_hash ~ '^otlet:v1:sha256:[0-9a-f]{64}$'),
   CHECK (content_hash IS NULL OR content_hash ~ '^otlet:v1:sha256:[0-9a-f]{64}$'),
-  CHECK (contract_hash IS NULL OR contract_hash ~ '^otlet:v1:sha256:[0-9a-f]{64}$')
+  CHECK (contract_hash ~ '^otlet:v1:sha256:[0-9a-f]{64}$'),
+  FOREIGN KEY (task_name, contract_hash)
+    REFERENCES otlet.workload_revisions(task_name, workload_revision_hash)
 );
 
 CREATE INDEX semantic_materializations_lookup_idx
@@ -59,9 +61,7 @@ CREATE TABLE otlet.semantic_indexes (
   record_type text NOT NULL,
   model_name text NOT NULL REFERENCES otlet.models(name),
   created_at timestamptz NOT NULL DEFAULT now(),
-  updated_at timestamptz NOT NULL DEFAULT now(),
-  last_refresh_at timestamptz,
-  last_lookup_at timestamptz
+  updated_at timestamptz NOT NULL DEFAULT now()
 );
 
 CREATE TABLE otlet.semantic_join_indexes (
@@ -75,10 +75,7 @@ CREATE TABLE otlet.semantic_join_indexes (
   candidate_plan_cost numeric NOT NULL CHECK (candidate_plan_cost >= 0),
   candidate_preflight_at timestamptz NOT NULL,
   created_at timestamptz NOT NULL DEFAULT now(),
-  updated_at timestamptz NOT NULL DEFAULT now(),
-  last_refresh_at timestamptz,
-  last_lookup_at timestamptz,
-  last_materialized_at timestamptz
+  updated_at timestamptz NOT NULL DEFAULT now()
 );
 
 CREATE TABLE otlet.watches (

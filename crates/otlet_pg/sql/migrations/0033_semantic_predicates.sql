@@ -14,24 +14,23 @@ DECLARE
   current_content_hash text;
 BEGIN
   SELECT
-    si.source_table,
-    si.subject_column,
-    si.input_columns,
-    si.task_name,
-    si.record_type,
-    t.input_shaping,
-    otlet.task_contract_hash(
-      t.instruction,
-      t.output_schema,
-      t.model_name,
-      t.runtime_options,
-      t.input_shaping,
-      t.decision_contract
-    ) AS contract_hash
+    revision.definition #>> '{source,source_table}' AS source_table,
+    revision.definition #>> '{source,subject_column}' AS subject_column,
+    ARRAY(
+      SELECT value
+      FROM jsonb_array_elements_text(COALESCE(revision.definition #> '{source,input_columns}', '[]'::jsonb)) value
+    ) AS input_columns,
+    revision.definition #>> '{task,name}' AS task_name,
+    revision.definition #>> '{source,record_type}' AS record_type,
+    revision.definition #> '{task,input_shaping}' AS input_shaping,
+    head.active_workload_revision_hash AS contract_hash
   INTO index_row
-  FROM otlet.semantic_indexes si
-  JOIN otlet.tasks t ON t.name = si.task_name
-  WHERE si.name = semantic_matches.index_name;
+  FROM otlet.workload_revision_heads head
+  JOIN otlet.workload_revisions revision
+    ON revision.task_name = head.task_name
+   AND revision.workload_revision_hash = head.active_workload_revision_hash
+  WHERE revision.definition #>> '{source,semantic_index_name}' = semantic_matches.index_name
+    AND revision.definition #>> '{source,kind}' = 'row';
 
   IF NOT FOUND THEN
     RAISE EXCEPTION 'otlet semantic index % does not exist', semantic_matches.index_name;
@@ -82,6 +81,7 @@ BEGIN
       WHERE sm.task_name = index_row.task_name
         AND sm.record_type = index_row.record_type
         AND sm.subject_id = semantic_matches.subject_id
+        AND sm.contract_hash = index_row.contract_hash
       ORDER BY
         sm.subject_id,
         (

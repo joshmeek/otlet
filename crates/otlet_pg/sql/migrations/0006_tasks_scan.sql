@@ -244,21 +244,6 @@ BEGIN
     )
   RETURNING * INTO saved_task;
 
-  UPDATE otlet.semantic_materializations sm
-  SET stale = true,
-      stale_reason = 'contract_changed',
-      updated_at = now()
-  WHERE sm.task_name = saved_task.name
-    AND sm.contract_hash IS NOT NULL
-    AND sm.contract_hash IS DISTINCT FROM otlet.task_contract_hash(
-      saved_task.instruction,
-      saved_task.output_schema,
-      saved_task.model_name,
-      saved_task.runtime_options,
-      saved_task.input_shaping,
-      saved_task.decision_contract
-    );
-
   RETURN saved_task;
 END;
 $$;
@@ -491,9 +476,13 @@ DECLARE
 BEGIN
   SELECT p.candidate_query_statement_timeout_ms
   INTO timeout_limit
-  FROM otlet.semantic_join_indexes sji
+  FROM otlet.workload_revision_heads head
+  JOIN otlet.workload_revisions revision
+    ON revision.task_name = head.task_name
+   AND revision.workload_revision_hash = head.active_workload_revision_hash
   CROSS JOIN otlet.production_policy p
-  WHERE sji.task_name = require_candidate_query_timeout.task_name
+  WHERE head.task_name = require_candidate_query_timeout.task_name
+    AND revision.definition #>> '{source,kind}' = 'pair'
     AND p.name = 'default';
 
   IF NOT FOUND THEN
@@ -523,8 +512,12 @@ AS $$
       - (
         SELECT count(*)
         FROM otlet.jobs j
+        JOIN otlet.workload_revision_heads head
+          ON head.task_name = j.task_name
+         AND head.active_workload_revision_hash = j.workload_revision_hash
         JOIN otlet.workload_revisions revision
-          ON revision.workload_revision_hash = j.workload_revision_hash
+          ON revision.task_name = j.task_name
+         AND revision.workload_revision_hash = j.workload_revision_hash
         WHERE j.status = 'queued'
           AND COALESCE(
             j.routed_model_name,
@@ -610,10 +603,11 @@ DECLARE
   rejection_reason text;
   rejection_limit bigint;
 BEGIN
-  revision_hash := COALESCE(
-    admit_task_input.workload_revision_hash,
-    otlet.capture_workload_revision(admit_task_input.task_name)
-  );
+  revision_hash := otlet.ensure_active_workload_revision(admit_task_input.task_name);
+  IF admit_task_input.workload_revision_hash IS NOT NULL
+     AND admit_task_input.workload_revision_hash IS DISTINCT FROM revision_hash THEN
+    RAISE EXCEPTION 'otlet workload revision is not active for task %', admit_task_input.task_name;
+  END IF;
   SELECT revision.definition #>> '{models,direct,name}'
   INTO task_model_name
   FROM otlet.workload_revisions revision
@@ -644,8 +638,12 @@ BEGIN
     COALESCE(sum(octet_length(j.input::text)), 0)
   INTO queued_jobs, model_queued_bytes, total_queued_bytes
   FROM otlet.jobs j
+  JOIN otlet.workload_revision_heads head
+    ON head.task_name = j.task_name
+   AND head.active_workload_revision_hash = j.workload_revision_hash
   JOIN otlet.workload_revisions revision
-    ON revision.workload_revision_hash = j.workload_revision_hash
+    ON revision.task_name = j.task_name
+   AND revision.workload_revision_hash = j.workload_revision_hash
   WHERE j.status = 'queued';
 
   IF input_bytes > policy.max_input_bytes_per_job THEN
@@ -779,7 +777,7 @@ DECLARE
   rejection_reason text;
   rejection_limit bigint;
 BEGIN
-  revision_hash := otlet.capture_workload_revision(run_task.task_name);
+  revision_hash := otlet.ensure_active_workload_revision(run_task.task_name);
   SELECT
     revision.definition #>> '{task,input_query}',
     revision.definition #>> '{models,direct,name}',
@@ -830,8 +828,12 @@ BEGIN
          ), 0)::bigint AS model_queued_bytes,
          COALESCE(sum(octet_length(j.input::text)), 0)::bigint AS total_queued_bytes
        FROM otlet.jobs j
+       JOIN otlet.workload_revision_heads queued_heads
+         ON queued_heads.task_name = j.task_name
+        AND queued_heads.active_workload_revision_hash = j.workload_revision_hash
        JOIN otlet.workload_revisions queued_revisions
-         ON queued_revisions.workload_revision_hash = j.workload_revision_hash
+         ON queued_revisions.task_name = j.task_name
+        AND queued_revisions.workload_revision_hash = j.workload_revision_hash
        WHERE j.status = ''queued''
      ),
      bounded_input AS MATERIALIZED (
@@ -844,6 +846,7 @@ BEGIN
          SELECT 1
          FROM otlet.jobs active_job
          WHERE active_job.task_name = %3$L
+           AND active_job.workload_revision_hash = %4$L
            AND active_job.subject_id = otlet_input.subject_id::text
            AND active_job.status IN (''queued'', ''running'', ''cancel_requested'')
        )
@@ -886,7 +889,7 @@ BEGIN
        CROSS JOIN decision d
        WHERE d.rejection_reason IS NULL
        ORDER BY pending.subject_id
-       ON CONFLICT (task_name, subject_id)
+       ON CONFLICT (task_name, workload_revision_hash, subject_id)
        WHERE status IN (''queued'', ''running'', ''cancel_requested'')
        DO NOTHING
        RETURNING 1
@@ -937,11 +940,12 @@ END;
 $$;
 
 COMMENT ON FUNCTION otlet.run_task(text) IS
-  'Queues all current bounded task source rows or none. Completed subjects are eligible for a new job on direct rerun; queued, running, and cancel-requested subjects are not duplicated.';
+  'Queues all current bounded task source rows or none. Completed subjects are eligible for a new job on direct rerun; live subjects in the active workload revision are not duplicated.';
 
 CREATE FUNCTION otlet.run_task_subject(
   task_name text,
-  subject_id text
+  subject_id text,
+  expected_workload_revision_hash text DEFAULT NULL
 ) RETURNS bigint
 LANGUAGE plpgsql
 AS $$
@@ -954,7 +958,11 @@ DECLARE
   pending_rows bigint;
   queued boolean;
 BEGIN
-  revision_hash := otlet.capture_workload_revision(run_task_subject.task_name);
+  revision_hash := otlet.ensure_active_workload_revision(run_task_subject.task_name);
+  IF run_task_subject.expected_workload_revision_hash IS NOT NULL
+     AND run_task_subject.expected_workload_revision_hash IS DISTINCT FROM revision_hash THEN
+    RAISE EXCEPTION 'otlet workload revision changed during subject admission for task %', run_task_subject.task_name;
+  END IF;
   SELECT
     revision.definition #>> '{task,input_query}',
     revision.definition #>> '{source,kind}',
@@ -1016,7 +1024,8 @@ $$;
 
 CREATE FUNCTION otlet.run_task_subjects(
   task_name text,
-  subject_ids text[]
+  subject_ids text[],
+  expected_workload_revision_hash text DEFAULT NULL
 ) RETURNS TABLE(subject_id text, queued boolean)
 LANGUAGE plpgsql
 AS $$
@@ -1027,7 +1036,11 @@ BEGIN
 
   RETURN QUERY
   SELECT requested.subject_id,
-         otlet.run_task_subject(run_task_subjects.task_name, requested.subject_id) > 0
+         otlet.run_task_subject(
+           run_task_subjects.task_name,
+           requested.subject_id,
+           run_task_subjects.expected_workload_revision_hash
+         ) > 0
   FROM unnest(COALESCE(run_task_subjects.subject_ids, ARRAY[]::text[])) WITH ORDINALITY
     AS requested(subject_id, ordinal)
   WHERE requested.subject_id IS NOT NULL
@@ -1035,5 +1048,5 @@ BEGIN
 END;
 $$;
 
-COMMENT ON FUNCTION otlet.run_task_subjects(text, text[]) IS
+COMMENT ON FUNCTION otlet.run_task_subjects(text, text[], text) IS
   'Queues a bounded subject array in order through the existing per-subject task and admission contract';

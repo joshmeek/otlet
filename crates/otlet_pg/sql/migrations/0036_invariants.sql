@@ -46,6 +46,54 @@ BEGIN
 
   RETURN QUERY
   SELECT
+    'fresh_materialization_uses_active_workload_revision'::text,
+    'semantic_materialization'::text,
+    materialization.id::text,
+    jsonb_build_object(
+      'task_name', materialization.task_name,
+      'materialization_revision', materialization.contract_hash,
+      'active_revision', head.active_workload_revision_hash
+    )
+  FROM otlet.semantic_materializations materialization
+  JOIN otlet.workload_revision_heads head ON head.task_name = materialization.task_name
+  WHERE NOT materialization.stale
+    AND materialization.contract_hash IS DISTINCT FROM head.active_workload_revision_hash;
+
+  RETURN QUERY
+  SELECT
+    'jobs_created_after_promotion_use_active_revision'::text,
+    'job'::text,
+    job.id::text,
+    jsonb_build_object(
+      'task_name', job.task_name,
+      'job_revision', job.workload_revision_hash,
+      'active_revision', head.active_workload_revision_hash,
+      'promoted_at', head.promoted_at
+    )
+  FROM otlet.jobs job
+  JOIN otlet.workload_revision_heads head ON head.task_name = job.task_name
+  WHERE job.created_at >= head.promoted_at
+    AND job.workload_revision_hash IS DISTINCT FROM head.active_workload_revision_hash;
+
+  RETURN QUERY
+  SELECT
+    'inactive_action_is_not_actionable'::text,
+    'action'::text,
+    queue.action_id::text,
+    jsonb_build_object(
+      'task_name', queue.task_name,
+      'workload_revision_hash', queue.workload_revision_hash,
+      'queue_kind', queue.queue_kind,
+      'next_operator_step', queue.next_operator_step
+    )
+  FROM otlet.review_queue queue
+  JOIN otlet.workload_revision_heads head ON head.task_name = queue.task_name
+  WHERE queue.action_id IS NOT NULL
+    AND queue.workload_revision_hash IS DISTINCT FROM head.active_workload_revision_hash
+    AND queue.next_operator_step IN ('dry_run', 'approve', 'apply');
+
+  RETURN QUERY
+  SELECT
     'receipt_workload_revision_matches_job'::text,
     'receipt'::text,
     receipt.id::text,
@@ -162,6 +210,9 @@ BEGIN
     JOIN otlet.jobs j ON j.status = 'queued'
     JOIN otlet.workload_revisions revision
       ON revision.workload_revision_hash = j.workload_revision_hash
+    JOIN otlet.workload_revision_heads head
+      ON head.task_name = j.task_name
+     AND head.active_workload_revision_hash = j.workload_revision_hash
     CROSS JOIN LATERAL (
       SELECT COALESCE(
         j.routed_model_name,
@@ -190,6 +241,9 @@ BEGIN
     JOIN otlet.jobs j ON j.status = 'queued'
     JOIN otlet.workload_revisions revision
       ON revision.workload_revision_hash = j.workload_revision_hash
+    JOIN otlet.workload_revision_heads head
+      ON head.task_name = j.task_name
+     AND head.active_workload_revision_hash = j.workload_revision_hash
     CROSS JOIN LATERAL (
       SELECT COALESCE(
         j.routed_model_name,
@@ -213,6 +267,9 @@ BEGIN
   CROSS JOIN LATERAL (
     SELECT COALESCE(sum(octet_length(j.input::text)), 0)::bigint AS queued_input_bytes
     FROM otlet.jobs j
+    JOIN otlet.workload_revision_heads head
+      ON head.task_name = j.task_name
+     AND head.active_workload_revision_hash = j.workload_revision_hash
     WHERE j.status = 'queued'
   ) q
   WHERE q.queued_input_bytes > p.max_queued_input_bytes_total;
@@ -227,6 +284,9 @@ BEGIN
       'max_input_bytes_per_job', p.max_input_bytes_per_job
     )
   FROM otlet.jobs j
+  JOIN otlet.workload_revision_heads head
+    ON head.task_name = j.task_name
+   AND head.active_workload_revision_hash = j.workload_revision_hash
   CROSS JOIN otlet.production_policy p
   WHERE j.status = 'queued'
     AND octet_length(j.input::text) > p.max_input_bytes_per_job;
@@ -573,29 +633,24 @@ BEGIN
 
   FOR index_row IN
     SELECT
-      si.name,
-      si.task_name,
-      si.source_table,
-      si.subject_column,
-      si.input_columns,
-      si.record_type,
-      t.instruction,
-      t.output_schema,
-      t.model_name,
-      t.runtime_options,
-      t.input_shaping,
-      t.decision_contract
-    FROM otlet.semantic_indexes si
-    JOIN otlet.tasks t ON t.name = si.task_name
+      revision.definition #>> '{source,semantic_index_name}' AS name,
+      revision.definition #>> '{task,name}' AS task_name,
+      revision.definition #>> '{source,source_table}' AS source_table,
+      revision.definition #>> '{source,subject_column}' AS subject_column,
+      ARRAY(
+        SELECT value
+        FROM jsonb_array_elements_text(COALESCE(revision.definition #> '{source,input_columns}', '[]'::jsonb)) value
+      ) AS input_columns,
+      revision.definition #>> '{source,record_type}' AS record_type,
+      revision.definition #> '{task,input_shaping}' AS input_shaping,
+      head.active_workload_revision_hash AS contract_hash
+    FROM otlet.workload_revision_heads head
+    JOIN otlet.workload_revisions revision
+      ON revision.task_name = head.task_name
+     AND revision.workload_revision_hash = head.active_workload_revision_hash
+    WHERE revision.definition #>> '{source,kind}' = 'row'
   LOOP
-    current_contract_hash := otlet.task_contract_hash(
-      index_row.instruction,
-      index_row.output_schema,
-      index_row.model_name,
-      index_row.runtime_options,
-      index_row.input_shaping,
-      index_row.decision_contract
-    );
+    current_contract_hash := index_row.contract_hash;
 
     BEGIN
       RETURN QUERY EXECUTE format(
@@ -682,28 +737,20 @@ BEGIN
 
   FOR join_row IN
     SELECT
-      sji.name,
-      sji.task_name,
-      sji.candidate_query,
-      sji.record_type,
-      sji.max_candidate_rows,
-      t.instruction,
-      t.output_schema,
-      t.model_name,
-      t.runtime_options,
-      t.input_shaping,
-      t.decision_contract
-    FROM otlet.semantic_join_indexes sji
-    JOIN otlet.tasks t ON t.name = sji.task_name
+      revision.definition #>> '{source,semantic_join_index_name}' AS name,
+      revision.definition #>> '{task,name}' AS task_name,
+      revision.definition #>> '{source,candidate_query}' AS candidate_query,
+      revision.definition #>> '{source,record_type}' AS record_type,
+      (revision.definition #>> '{source,max_candidate_rows}')::integer AS max_candidate_rows,
+      revision.definition #> '{task,input_shaping}' AS input_shaping,
+      head.active_workload_revision_hash AS contract_hash
+    FROM otlet.workload_revision_heads head
+    JOIN otlet.workload_revisions revision
+      ON revision.task_name = head.task_name
+     AND revision.workload_revision_hash = head.active_workload_revision_hash
+    WHERE revision.definition #>> '{source,kind}' = 'pair'
   LOOP
-    current_contract_hash := otlet.task_contract_hash(
-      join_row.instruction,
-      join_row.output_schema,
-      join_row.model_name,
-      join_row.runtime_options,
-      join_row.input_shaping,
-      join_row.decision_contract
-    );
+    current_contract_hash := join_row.contract_hash;
 
     BEGIN
       RETURN QUERY EXECUTE format(

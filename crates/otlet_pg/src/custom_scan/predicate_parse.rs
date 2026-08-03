@@ -20,7 +20,7 @@ unsafe fn find_semantic_match_predicate(
                     if rte_kind != pg_sys::RTEKind::RTE_RELATION {
                         continue;
                     }
-                    let stats = validate_semantic_index_source(
+                    let (stats, workload_revision_hash) = validate_semantic_index_source(
                         &predicate.index_name,
                         relid,
                         predicate.subject_attno,
@@ -31,13 +31,13 @@ unsafe fn find_semantic_match_predicate(
                         predicate.infer_max_rows,
                         predicate.auto_policy,
                     )?;
-                    Some(stats)
+                    Some((stats, workload_revision_hash))
                 }
                 SemanticIndexKind::Join => {
                     if rte_kind != pg_sys::RTEKind::RTE_SUBQUERY {
                         continue;
                     }
-                    let stats = validate_semantic_join_index_source(
+                    let (stats, workload_revision_hash) = validate_semantic_join_index_source(
                         &predicate.index_name,
                         &predicate.expected_json,
                         predicate.allow_refresh,
@@ -46,12 +46,13 @@ unsafe fn find_semantic_match_predicate(
                         predicate.infer_max_rows,
                         predicate.auto_policy,
                     )?;
-                    Some(stats)
+                    Some((stats, workload_revision_hash))
                 }
             };
-            if let Some(stats) = stats {
+            if let Some((stats, workload_revision_hash)) = stats {
                 predicate.estimated_rows = estimated_result_rows(&stats, &predicate);
                 predicate.planner_stats = stats;
+                predicate.workload_revision_hash = workload_revision_hash;
                 return Some(predicate);
             }
         }
@@ -75,6 +76,7 @@ unsafe fn semantic_match_from_clause(
         Some(SemanticMatchPredicate {
             index_kind: parts.index_kind,
             index_name: parts.index_name,
+            workload_revision_hash: String::new(),
             expected_json: parts.expected_json,
             auto_policy: parts.auto_policy,
             allow_refresh: parts.allow_refresh,

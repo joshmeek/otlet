@@ -53,6 +53,7 @@ unsafe extern "C-unwind" fn begin_semantic_custom_scan(
             private.index_kind,
             &private.index_name,
             &private.expected_json,
+            &private.workload_revision_hash,
         )
         .unwrap_or_else(|err| pgrx::error!("{err}"));
         // Prefer plan-time vocabulary from custom_private; overlay exact preload
@@ -101,6 +102,7 @@ unsafe extern "C-unwind" fn begin_semantic_custom_scan(
             planner_fail_closed_decision_rows: planner_stats.fail_closed_decision_rows,
             source_table: loaded_state.source_table,
             task_name: loaded_state.task_name,
+            workload_revision_hash: loaded_state.workload_revision_hash,
             record_type: loaded_state.record_type,
             // Filled after child_plan is set so provider/policy strings match runtime.
             infer_now_executor_context_json: String::new(),

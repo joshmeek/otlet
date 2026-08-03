@@ -385,11 +385,11 @@ requester_timeout_contract=canceled|true|canceled|canceled|0|0|true|true|true|1|
 
 Otlet leaves failed jobs visible. A failed job is terminal, so you can requeue that task and subject
 
-The partial unique index blocks duplicate active work and leaves terminal history reusable:
+The partial unique index blocks duplicate active work for one task revision and subject while leaving terminal history reusable:
 
 ```sql
 CREATE UNIQUE INDEX jobs_active_subject_idx
-ON otlet.jobs (task_name, subject_id)
+ON otlet.jobs (task_name, workload_revision_hash, subject_id)
 WHERE status IN ('queued', 'running', 'cancel_requested');
 ```
 

@@ -75,6 +75,7 @@ fn freeze_infer_now_executor_context_json(runtime: &RuntimeState) -> String {
         ),
         "semantic_index_kind": runtime.index_kind.as_str(),
         "semantic_index_name": runtime.index_name,
+        "workload_revision_hash": runtime.workload_revision_hash,
     })
     .to_string()
 }

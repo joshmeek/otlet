@@ -59,7 +59,11 @@ fn flush_refresh_queue(runtime: &mut RuntimeState) -> Result<(), String> {
         Vec::with_capacity(CUSTOM_SCAN_REFRESH_BATCH_SIZE),
     );
     runtime.refresh_queue_batches = runtime.refresh_queue_batches.saturating_add(1);
-    let results = match queue_subject_refreshes(&runtime.task_name, &subjects) {
+    let results = match queue_subject_refreshes(
+        &runtime.task_name,
+        &runtime.workload_revision_hash,
+        &subjects,
+    ) {
         Ok(results) => results,
         Err(err) => {
             runtime.refresh_queue_errors = runtime
@@ -81,14 +85,19 @@ fn flush_refresh_queue(runtime: &mut RuntimeState) -> Result<(), String> {
 
 fn queue_subject_refreshes(
     task_name: &str,
+    workload_revision_hash: &str,
     subject_ids: &[String],
 ) -> Result<Vec<(String, bool)>, String> {
     pgrx::Spi::connect(|client| {
         let subject_refs = subject_ids.iter().map(String::as_str).collect::<Vec<_>>();
-        let args = [task_name.into(), subject_refs.as_slice().into()];
+        let args = [
+            task_name.into(),
+            subject_refs.as_slice().into(),
+            workload_revision_hash.into(),
+        ];
         let table = client
             .select(
-                "SELECT subject_id, queued FROM otlet.run_task_subjects($1, $2::text[])",
+                "SELECT subject_id, queued FROM otlet.run_task_subjects($1, $2::text[], $3)",
                 Some(subject_ids.len() as i64),
                 &args,
             )
@@ -184,13 +193,18 @@ fn wait_poll_active_or_materialize(
     };
     pgrx::Spi::connect(|client| {
         if !active_seen {
-            let active_args = [runtime.task_name.as_str().into(), subject_id.into()];
+            let active_args = [
+                runtime.task_name.as_str().into(),
+                subject_id.into(),
+                runtime.workload_revision_hash.as_str().into(),
+            ];
             let active_table = client
                 .select(
                     "SELECT true AS active \
                      FROM otlet.jobs \
                      WHERE task_name = $1 \
                        AND subject_id = $2 \
+                       AND workload_revision_hash = $3 \
                        AND status IN ('queued', 'running', 'cancel_requested') \
                      LIMIT 1",
                     Some(1),
@@ -211,12 +225,15 @@ fn wait_poll_active_or_materialize(
                 runtime.expected_json.as_str().into(),
                 runtime.task_name.as_str().into(),
                 runtime.record_type.as_str().into(),
+                runtime.workload_revision_hash.as_str().into(),
             ],
             SemanticIndexKind::Join => vec![
                 runtime.index_name.as_str().into(),
                 subject_id.into(),
                 runtime.expected_json.as_str().into(),
                 runtime.task_name.as_str().into(),
+                runtime.workload_revision_hash.as_str().into(),
+                runtime.record_type.as_str().into(),
             ],
         };
         let state_table = client

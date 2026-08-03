@@ -167,6 +167,7 @@ struct RuntimeState {
     planner_fail_closed_decision_rows: u64,
     source_table: String,
     task_name: String,
+    workload_revision_hash: String,
     record_type: String,
     /// Frozen once at begin-scan for infer-now receipt stamping (pre-serialized JSON text).
     infer_now_executor_context_json: String,
@@ -308,6 +309,7 @@ enum SemanticResolution {
 struct LoadedSemanticState {
     source_table: String,
     task_name: String,
+    workload_revision_hash: String,
     record_type: String,
     input_columns: Option<Vec<String>>,
     freshness_basis_counts: String,
@@ -335,6 +337,7 @@ impl SubjectSemanticState {
 struct SemanticMatchPredicate {
     index_kind: SemanticIndexKind,
     index_name: String,
+    workload_revision_hash: String,
     expected_json: String,
     auto_policy: bool,
     allow_refresh: bool,

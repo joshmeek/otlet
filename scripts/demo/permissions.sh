@@ -462,6 +462,7 @@ WITH table_grants AS (
           'portable_text_hash',
           'portable_json_hash',
           'identity_hash',
+          'semantic_source_hash',
           'semantic_shaped_input',
           'semantic_content_hash'
         )
@@ -474,6 +475,7 @@ WITH table_grants AS (
           'portable_text_hash',
           'portable_json_hash',
           'identity_hash',
+          'semantic_source_hash',
           'semantic_shaped_input',
           'semantic_content_hash',
           'approve_action',
@@ -557,16 +559,16 @@ CROSS JOIN definer_status;
 SQL
 )"
 echo "permission_catalog_contract=$permission_catalog_contract"
-[ "$permission_catalog_contract" = "false|0|0|0|15|7|15|15|0|0|0|0|18|18|0|7|7|7|true" ] || {
+[ "$permission_catalog_contract" = "false|0|0|0|15|8|15|16|0|0|0|0|18|18|0|7|7|7|true" ] || {
   echo "Expected exact public, auditor, operator, and owner ACLs, got $permission_catalog_contract" >&2
   exit 1
 }
 
 source "$demo_dir/review_provenance.sh"
 
-permission_contract="public=0/0/0|auditor=15/7|operator=15/15|definer=18/18|portable=7/7/7|positive=7|denied=$permission_denied_count"
+permission_contract="public=0/0/0|auditor=15/8|operator=15/16|definer=18/18|portable=7/7/7|positive=7|denied=$permission_denied_count"
 echo "permission_contract=$permission_contract"
-[ "$permission_contract" = "public=0/0/0|auditor=15/7|operator=15/15|definer=18/18|portable=7/7/7|positive=7|denied=61" ] || {
+[ "$permission_contract" = "public=0/0/0|auditor=15/8|operator=15/16|definer=18/18|portable=7/7/7|positive=7|denied=61" ] || {
   echo "Expected complete permission contract, got $permission_contract" >&2
   exit 1
 }

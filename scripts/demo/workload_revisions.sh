@@ -100,15 +100,11 @@ SELECT otlet.set_model_selection_policy(
 ) \g /dev/null
 DELETE FROM otlet.action_type_schemas WHERE action_type = 'review_flag';
 
-INSERT INTO otlet.jobs (task_name, subject_id, input)
-VALUES ('workload_revision_portable_probe', 'new', '{"y":"b"}'::jsonb);
-INSERT INTO otlet.jobs (task_name, workload_revision_hash, subject_id, input)
-SELECT
-  'workload_revision_portable_probe',
-  revision_a,
-  'old-after-b',
-  '{"x":"a","y":"hidden"}'::jsonb
-FROM revision_probe;
+ALTER TABLE revision_probe ADD COLUMN revision_b text;
+UPDATE revision_probe
+SET revision_b = otlet.capture_workload_revision(
+  'workload_revision_portable_probe'
+);
 DO $$
 BEGIN
   UPDATE otlet.tasks
@@ -244,6 +240,45 @@ FROM otlet.portable_complete_job(
 );
 RESET ROLE;
 
+INSERT INTO otlet.jobs (task_name, subject_id, input)
+VALUES (
+  'workload_revision_portable_probe',
+  'inactive-fallback',
+  '{"x":"a","y":"hidden"}'::jsonb
+);
+SET LOCAL ROLE otlet_revision_cheap_worker;
+CREATE TEMP TABLE inactive_cheap_claim AS
+SELECT *
+FROM otlet.portable_claim_jobs(
+  'revision-cheap-worker',
+  1,
+  pg_catalog.current_setting('otlet.revision_cheap_identity'),
+  1
+);
+RESET ROLE;
+
+SELECT otlet.promote_workload_revision(
+  'workload_revision_portable_probe',
+  (SELECT revision_b FROM revision_probe),
+  (SELECT revision_a FROM revision_probe)
+) \g /dev/null
+SET LOCAL ROLE otlet_revision_cheap_worker;
+CREATE TEMP TABLE inactive_cheap_result AS
+SELECT *
+FROM otlet.portable_complete_job(
+  'revision-cheap-worker',
+  1,
+  pg_catalog.current_setting('otlet.revision_cheap_identity'),
+  (SELECT job_id FROM inactive_cheap_claim),
+  (SELECT claim_token FROM inactive_cheap_claim),
+  '{"old":"a","confidence":"low"}'::jsonb,
+  '{"output":{"old":"a","confidence":"low"},"actions":[]}',
+  '[]'::jsonb
+);
+RESET ROLE;
+INSERT INTO otlet.jobs (task_name, subject_id, input)
+VALUES ('workload_revision_portable_probe', 'new', '{"y":"b"}'::jsonb);
+
 DO $$
 DECLARE
   cheap_record record;
@@ -294,15 +329,6 @@ BEGIN
      OR revision_b = (SELECT revision_a FROM revision_probe) THEN
     RAISE EXCEPTION 'workload revision lineage drifted';
   END IF;
-  IF NOT EXISTS (
-    SELECT 1
-    FROM otlet.jobs job
-    JOIN revision_probe probe ON probe.revision_a = job.workload_revision_hash
-    WHERE job.subject_id = 'old-after-b'
-      AND job.input = '{"x":"a","y":"hidden"}'::jsonb
-  ) THEN
-    RAISE EXCEPTION 'job evidence validation ignored its pinned revision';
-  END IF;
   IF cheap_record.instruction <> 'Return the old decision'
      OR (cheap_record.output_schema #> '{properties}') ? 'new'
      OR cheap_record.runtime_options ->> 'max_tokens' <> '35'
@@ -318,6 +344,28 @@ BEGIN
   IF (SELECT job_status FROM cheap_result) <> 'queued'
      OR (SELECT job_status FROM strong_result) <> 'complete' THEN
     RAISE EXCEPTION 'selection routing did not use revision A';
+  END IF;
+  IF (SELECT job_status FROM inactive_cheap_result) <> 'canceled'
+     OR NOT EXISTS (
+       SELECT 1
+       FROM inactive_cheap_claim claim
+       JOIN inactive_cheap_result result ON result.job_id = claim.job_id
+       JOIN otlet.jobs job ON job.id = result.job_id
+       JOIN otlet.portable_claims portable_claim
+         ON portable_claim.job_id = claim.job_id
+        AND portable_claim.claim_token_hash = otlet.portable_text_hash(claim.claim_token)
+       JOIN otlet.inference_receipts receipt ON receipt.id = result.receipt_id
+       JOIN otlet.portable_receipt_links link
+         ON link.receipt_id = receipt.id
+        AND link.claim_id = portable_claim.id
+       JOIN revision_probe probe
+         ON probe.revision_a = receipt.workload_revision_hash
+       WHERE job.status = 'canceled'
+         AND receipt.selection_role = 'cheap'
+         AND receipt.selection_status = 'rejected'
+         AND receipt.selection_reason = 'confidence_below_policy'
+     ) THEN
+    RAISE EXCEPTION 'inactive revision portable fallback was requeued or lost its receipt';
   END IF;
   IF NOT EXISTS (
     SELECT 1
@@ -344,8 +392,8 @@ BEGIN
        FROM otlet.model_selection_status status
        JOIN revision_probe probe
          ON probe.revision_a = status.workload_revision_hash
-       WHERE status.cheap_attempts = 1
-         AND status.cheap_rejected = 1
+       WHERE status.cheap_attempts = 3
+         AND status.cheap_rejected = 2
          AND status.strong_attempts = 1
          AND status.strong_accepted = 1
      ) THEN
@@ -363,17 +411,6 @@ BEGIN
         revision.definition #>> '{action_policies,review_flag,authority,policy_hash}'
   ) THEN
     RAISE EXCEPTION 'action authority did not preserve revision A';
-  END IF;
-  IF NOT EXISTS (
-    SELECT 1
-    FROM otlet.actions action
-    CROSS JOIN LATERAL otlet.validated_action_context(action.id) context
-    JOIN revision_probe probe ON probe.old_job_id = action.job_id
-    WHERE action.action_type = 'review_flag'
-      AND context.validation_error IS NULL
-      AND NOT (context.schema_row).requires_approval
-  ) THEN
-    RAISE EXCEPTION 'historical action validation did not preserve revision A';
   END IF;
 END
 $$;
@@ -428,6 +465,11 @@ CREATE TEMP TABLE semantic_revision_b AS
 SELECT otlet.capture_workload_revision(
   'workload_revision_semantic_probe_task'
 ) AS workload_revision_hash;
+SELECT otlet.promote_workload_revision(
+  'workload_revision_semantic_probe_task',
+  (SELECT workload_revision_hash FROM semantic_revision_b),
+  (SELECT workload_revision_hash FROM semantic_claim)
+) \g /dev/null
 SELECT otlet.record_queue_admission_suppressed(
   'workload_revision_semantic_probe_task',
   'revision_semantic',

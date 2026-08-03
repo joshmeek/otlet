@@ -96,7 +96,11 @@ SQL
   echo "Expected requester timeout smoke to fail closed" >&2
   exit 1
 fi
-require_contains "$requester_timeout_error" "otlet ask worker is busy" "Expected requester timeout smoke to report no synchronous result"
+if [[ "$requester_timeout_error" != *"otlet ask worker is busy"* \
+   && "$requester_timeout_error" != *"otlet infer-now request failed: canceled"* ]]; then
+  echo "Expected requester timeout smoke to report no synchronous result" >&2
+  exit 1
+fi
 requester_timeout_job_id="$(psql_exec -qAt -c "SELECT otlet.worker_infer_now_state() ->> 'last_cancel_job_id';")"
 [ -n "$requester_timeout_job_id" ] && [ "$requester_timeout_job_id" != "0" ] || {
   echo "Expected requester timeout smoke to identify the canceled job" >&2

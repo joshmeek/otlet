@@ -343,6 +343,7 @@ BEGIN
       updated_at = now()
   RETURNING * INTO saved;
 
+  PERFORM otlet.promote_configured_workload_revision(saved.task_name);
   RETURN saved;
 END;
 $$;
@@ -366,6 +367,7 @@ BEGIN
   IF NOT FOUND THEN
     RAISE EXCEPTION 'otlet action workflow policy does not exist';
   END IF;
+  PERFORM otlet.promote_configured_workload_revision(saved.task_name);
   RETURN saved;
 END;
 $$;
@@ -382,50 +384,48 @@ LANGUAGE plpgsql
 STABLE
 AS $$
 DECLARE
-  task_row otlet.tasks%ROWTYPE;
-  policy_row otlet.action_workflow_policies%ROWTYPE;
+  revision_definition jsonb;
+  policy jsonb;
   target_error text;
 BEGIN
-  SELECT * INTO task_row
-  FROM otlet.tasks t
-  WHERE t.name = action_workflow_policy_error.task_name;
+  SELECT active.definition
+  INTO revision_definition
+  FROM otlet.active_workload_revision(action_workflow_policy_error.task_name) active;
   IF NOT FOUND THEN
-    RETURN 'action task does not exist';
+    RETURN 'action workload revision is not active';
   END IF;
-  IF NOT COALESCE(task_row.decision_contract -> 'action_types', '[]'::jsonb)
+  IF NOT COALESCE(revision_definition #> '{task,decision_contract,action_types}', '[]'::jsonb)
     ? action_workflow_policy_error.action_type THEN
     RETURN 'action type is not allowed by workflow';
   END IF;
 
-  SELECT * INTO policy_row
-  FROM otlet.action_workflow_policies p
-  WHERE p.task_name = action_workflow_policy_error.task_name
-    AND p.action_type = action_workflow_policy_error.action_type;
-  IF NOT FOUND THEN
+  policy := revision_definition #> ARRAY[
+    'action_policies', action_workflow_policy_error.action_type, 'authority'
+  ];
+  IF jsonb_typeof(policy) IS DISTINCT FROM 'object'
+     OR policy ->> 'origin' IS DISTINCT FROM 'workflow' THEN
     RETURN 'action has no registered workflow authority';
-  ELSIF NOT policy_row.enabled THEN
+  ELSIF COALESCE((policy ->> 'enabled')::boolean, false) IS NOT TRUE THEN
     RETURN 'action workflow authority is disabled';
-  ELSIF policy_row.task_contract_hash IS DISTINCT FROM otlet.current_task_contract_hash(policy_row.task_name) THEN
-    RETURN 'action workflow task contract changed';
-  ELSIF policy_row.target_contract_hash IS DISTINCT FROM otlet.action_target_contract_hash(policy_row.target_name) THEN
+  ELSIF policy ->> 'target_contract_hash' IS DISTINCT FROM otlet.action_target_contract_hash(policy ->> 'target_name') THEN
     RETURN 'action workflow target contract changed';
-  ELSIF policy_row.policy_hash IS DISTINCT FROM action_workflow_policy_error.authority_policy_hash THEN
+  ELSIF policy ->> 'policy_hash' IS DISTINCT FROM action_workflow_policy_error.authority_policy_hash THEN
     RETURN 'action workflow authority changed';
-  ELSIF policy_row.target_name IS DISTINCT FROM action_workflow_policy_error.target_name THEN
+  ELSIF policy ->> 'target_name' IS DISTINCT FROM action_workflow_policy_error.target_name THEN
     RETURN 'action target does not match workflow authority';
-  ELSIF policy_row.subject_namespace IS DISTINCT FROM action_workflow_policy_error.subject_namespace THEN
+  ELSIF policy ->> 'subject_namespace' IS DISTINCT FROM action_workflow_policy_error.subject_namespace THEN
     RETURN 'action subject namespace does not match workflow authority';
   END IF;
 
-  target_error := otlet.action_target_validation_error(policy_row.target_name);
+  target_error := otlet.action_target_validation_error(policy ->> 'target_name');
   IF target_error IS NOT NULL THEN
     RETURN target_error;
   END IF;
   IF action_workflow_policy_error.require_mutation
-     AND policy_row.authority_mode <> 'bounded_mutation' THEN
+     AND policy ->> 'mode' IS DISTINCT FROM 'bounded_mutation' THEN
     RETURN 'action workflow is recommendation only';
   ELSIF action_workflow_policy_error.require_mutation
-     AND policy_row.evaluation_status <> 'evaluated' THEN
+     AND policy ->> 'evaluation_status' IS DISTINCT FROM 'evaluated' THEN
     RETURN 'action workflow is not evaluated for mutation';
   END IF;
 
@@ -971,19 +971,315 @@ BEGIN
 END;
 $$;
 
+CREATE FUNCTION otlet.active_workload_revision(task_name text)
+RETURNS TABLE (
+  workload_revision_hash text,
+  definition jsonb
+)
+LANGUAGE sql
+STABLE
+AS $$
+  SELECT head.active_workload_revision_hash, revision.definition
+  FROM otlet.workload_revision_heads head
+  JOIN otlet.workload_revisions revision
+    ON revision.task_name = head.task_name
+   AND revision.workload_revision_hash = head.active_workload_revision_hash
+  WHERE head.task_name = active_workload_revision.task_name;
+$$;
+
+CREATE FUNCTION otlet.ensure_active_workload_revision(task_name text) RETURNS text
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  active_hash text;
+BEGIN
+  PERFORM pg_advisory_xact_lock(
+    hashtextextended('otlet_workload_revision:' || ensure_active_workload_revision.task_name, 0)
+  );
+
+  SELECT head.active_workload_revision_hash
+  INTO active_hash
+  FROM otlet.workload_revision_heads head
+  WHERE head.task_name = ensure_active_workload_revision.task_name;
+  IF FOUND THEN
+    RETURN active_hash;
+  END IF;
+
+  active_hash := otlet.capture_workload_revision(ensure_active_workload_revision.task_name);
+  INSERT INTO otlet.workload_revision_heads (
+    task_name,
+    active_workload_revision_hash
+  )
+  VALUES (
+    ensure_active_workload_revision.task_name,
+    active_hash
+  );
+  RETURN active_hash;
+END;
+$$;
+
+CREATE FUNCTION otlet.promote_workload_revision(
+  task_name text,
+  target_workload_revision_hash text,
+  expected_active_workload_revision_hash text DEFAULT NULL
+) RETURNS text
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  active_hash text;
+BEGIN
+  PERFORM 1
+  FROM otlet.production_policy policy
+  WHERE policy.name = 'default'
+  FOR UPDATE;
+  PERFORM pg_advisory_xact_lock(
+    hashtextextended('otlet_workload_revision:' || promote_workload_revision.task_name, 0)
+  );
+
+  IF NOT EXISTS (
+    SELECT 1
+    FROM otlet.workload_revisions revision
+    WHERE revision.task_name = promote_workload_revision.task_name
+      AND revision.workload_revision_hash = promote_workload_revision.target_workload_revision_hash
+  ) THEN
+    RAISE EXCEPTION 'otlet workload revision does not belong to task %', promote_workload_revision.task_name;
+  END IF;
+
+  SELECT head.active_workload_revision_hash
+  INTO active_hash
+  FROM otlet.workload_revision_heads head
+  WHERE head.task_name = promote_workload_revision.task_name
+  FOR UPDATE;
+
+  IF NOT FOUND THEN
+    IF promote_workload_revision.expected_active_workload_revision_hash IS NOT NULL THEN
+      RAISE EXCEPTION 'otlet workload revision promotion conflict: task % has no active revision', promote_workload_revision.task_name;
+    END IF;
+    INSERT INTO otlet.workload_revision_heads (
+      task_name,
+      active_workload_revision_hash
+    )
+    VALUES (
+      promote_workload_revision.task_name,
+      promote_workload_revision.target_workload_revision_hash
+    );
+  ELSE
+    IF promote_workload_revision.expected_active_workload_revision_hash IS NULL
+       OR active_hash IS DISTINCT FROM promote_workload_revision.expected_active_workload_revision_hash THEN
+      RAISE EXCEPTION 'otlet workload revision promotion conflict for task %', promote_workload_revision.task_name;
+    END IF;
+    IF active_hash = promote_workload_revision.target_workload_revision_hash THEN
+      RETURN active_hash;
+    END IF;
+
+    UPDATE otlet.workload_revision_heads head
+    SET previous_workload_revision_hash = active_hash,
+        active_workload_revision_hash = promote_workload_revision.target_workload_revision_hash,
+        promoted_at = now()
+    WHERE head.task_name = promote_workload_revision.task_name;
+  END IF;
+
+  UPDATE otlet.semantic_materializations materialization
+  SET stale = true,
+      stale_reason = 'contract_changed',
+      updated_at = now()
+  WHERE materialization.task_name = promote_workload_revision.task_name
+    AND materialization.contract_hash IS DISTINCT FROM promote_workload_revision.target_workload_revision_hash;
+
+  RETURN promote_workload_revision.target_workload_revision_hash;
+END;
+$$;
+
+CREATE FUNCTION otlet.promote_configured_workload_revision(task_name text) RETURNS text
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  active_hash text;
+  target_hash text;
+BEGIN
+  PERFORM 1
+  FROM otlet.production_policy policy
+  WHERE policy.name = 'default'
+  FOR UPDATE;
+  PERFORM pg_advisory_xact_lock(
+    hashtextextended('otlet_workload_revision:' || promote_configured_workload_revision.task_name, 0)
+  );
+  target_hash := otlet.capture_workload_revision(promote_configured_workload_revision.task_name);
+  SELECT head.active_workload_revision_hash
+  INTO active_hash
+  FROM otlet.workload_revision_heads head
+  WHERE head.task_name = promote_configured_workload_revision.task_name;
+
+  IF active_hash IS NOT DISTINCT FROM target_hash THEN
+    RETURN target_hash;
+  END IF;
+  RETURN otlet.promote_workload_revision(
+    promote_configured_workload_revision.task_name,
+    target_hash,
+    active_hash
+  );
+END;
+$$;
+
+CREATE FUNCTION otlet.rollback_workload_revision(
+  task_name text,
+  expected_active_workload_revision_hash text,
+  target_workload_revision_hash text DEFAULT NULL
+) RETURNS text
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  rollback_hash text;
+BEGIN
+  PERFORM 1
+  FROM otlet.production_policy policy
+  WHERE policy.name = 'default'
+  FOR UPDATE;
+  PERFORM pg_advisory_xact_lock(
+    hashtextextended('otlet_workload_revision:' || rollback_workload_revision.task_name, 0)
+  );
+  SELECT COALESCE(
+    rollback_workload_revision.target_workload_revision_hash,
+    head.previous_workload_revision_hash
+  )
+  INTO rollback_hash
+  FROM otlet.workload_revision_heads head
+  WHERE head.task_name = rollback_workload_revision.task_name
+    AND head.active_workload_revision_hash = rollback_workload_revision.expected_active_workload_revision_hash;
+
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'otlet workload revision rollback conflict for task %', rollback_workload_revision.task_name;
+  END IF;
+  IF rollback_hash IS NULL THEN
+    RAISE EXCEPTION 'otlet task % has no workload revision to roll back to', rollback_workload_revision.task_name;
+  END IF;
+
+  RETURN otlet.promote_workload_revision(
+    rollback_workload_revision.task_name,
+    rollback_hash,
+    rollback_workload_revision.expected_active_workload_revision_hash
+  );
+END;
+$$;
+
+CREATE FUNCTION otlet.workload_revision_diff(
+  task_name text,
+  from_workload_revision_hash text,
+  to_workload_revision_hash text
+) RETURNS TABLE (
+  path text,
+  old_value jsonb,
+  new_value jsonb
+)
+LANGUAGE plpgsql
+STABLE
+AS $$
+DECLARE
+  old_definition jsonb;
+  new_definition jsonb;
+BEGIN
+  SELECT revision.definition
+  INTO old_definition
+  FROM otlet.workload_revisions revision
+  WHERE revision.task_name = workload_revision_diff.task_name
+    AND revision.workload_revision_hash = workload_revision_diff.from_workload_revision_hash;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'otlet workload revision does not belong to task %', workload_revision_diff.task_name;
+  END IF;
+
+  SELECT revision.definition
+  INTO new_definition
+  FROM otlet.workload_revisions revision
+  WHERE revision.task_name = workload_revision_diff.task_name
+    AND revision.workload_revision_hash = workload_revision_diff.to_workload_revision_hash;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'otlet workload revision does not belong to task %', workload_revision_diff.task_name;
+  END IF;
+
+  RETURN QUERY
+  WITH RECURSIVE nodes(node_path, old_node, new_node) AS (
+    SELECT ''::text, old_definition, new_definition
+    UNION ALL
+    SELECT
+      nodes.node_path || '/' || replace(replace(child.key, '~', '~0'), '/', '~1'),
+      nodes.old_node -> child.key,
+      nodes.new_node -> child.key
+    FROM nodes
+    CROSS JOIN LATERAL (
+      SELECT key
+      FROM jsonb_object_keys(
+        CASE WHEN jsonb_typeof(nodes.old_node) = 'object' THEN nodes.old_node ELSE '{}'::jsonb END
+      ) key
+      UNION
+      SELECT key
+      FROM jsonb_object_keys(
+        CASE WHEN jsonb_typeof(nodes.new_node) = 'object' THEN nodes.new_node ELSE '{}'::jsonb END
+      ) key
+    ) child
+    WHERE jsonb_typeof(nodes.old_node) = 'object'
+      AND jsonb_typeof(nodes.new_node) = 'object'
+  )
+  SELECT nodes.node_path, nodes.old_node, nodes.new_node
+  FROM nodes
+  WHERE nodes.node_path <> ''
+    AND nodes.old_node IS DISTINCT FROM nodes.new_node
+    AND (
+      jsonb_typeof(nodes.old_node) IS DISTINCT FROM 'object'
+      OR jsonb_typeof(nodes.new_node) IS DISTINCT FROM 'object'
+    )
+  ORDER BY nodes.node_path;
+END;
+$$;
+
+CREATE FUNCTION otlet.repair_workload_revision(
+  task_name text,
+  expected_active_workload_revision_hash text
+) RETURNS bigint
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  revision_definition jsonb;
+BEGIN
+  PERFORM pg_advisory_xact_lock(
+    hashtextextended('otlet_workload_revision:' || repair_workload_revision.task_name, 0)
+  );
+  SELECT revision.definition
+  INTO revision_definition
+  FROM otlet.workload_revision_heads head
+  JOIN otlet.workload_revisions revision
+    ON revision.task_name = head.task_name
+   AND revision.workload_revision_hash = head.active_workload_revision_hash
+  WHERE head.task_name = repair_workload_revision.task_name
+    AND head.active_workload_revision_hash = repair_workload_revision.expected_active_workload_revision_hash;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'otlet workload revision repair conflict for task %', repair_workload_revision.task_name;
+  END IF;
+
+  IF revision_definition #>> '{source,kind}' NOT IN ('row', 'pair')
+     OR NULLIF(revision_definition #>> '{task,input_query}', '') IS NULL THEN
+    RETURN 0;
+  END IF;
+
+  RETURN otlet.materialize_semantic_records(
+    repair_workload_revision.task_name,
+    revision_definition #>> '{source,record_type}',
+    revision_definition #>> '{source,source_table}',
+    revision_definition #>> '{task,input_query}'
+  );
+END;
+$$;
+
 CREATE FUNCTION otlet.bind_job_workload_revision() RETURNS trigger
 LANGUAGE plpgsql
 AS $$
+DECLARE
+  active_hash text;
 BEGIN
+  active_hash := otlet.ensure_active_workload_revision(NEW.task_name);
   IF NEW.workload_revision_hash IS NULL THEN
-    NEW.workload_revision_hash := otlet.capture_workload_revision(NEW.task_name);
-  ELSIF NOT EXISTS (
-    SELECT 1
-    FROM otlet.workload_revisions r
-    WHERE r.task_name = NEW.task_name
-      AND r.workload_revision_hash = NEW.workload_revision_hash
-  ) THEN
-    RAISE EXCEPTION 'otlet workload revision does not belong to task %', NEW.task_name;
+    NEW.workload_revision_hash := active_hash;
+  ELSIF NEW.workload_revision_hash IS DISTINCT FROM active_hash THEN
+    RAISE EXCEPTION 'otlet job workload revision is not active for task %', NEW.task_name;
   END IF;
   RETURN NEW;
 END;

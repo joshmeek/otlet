@@ -50,10 +50,35 @@ DECLARE
   current_contract_hash text;
   current_input_shaping jsonb := '{}'::jsonb;
 BEGIN
-  SELECT *
-  INTO index_row
-  FROM otlet.semantic_indexes si
-  WHERE si.name = semantic_index_plan.index_name;
+  SELECT
+    revision.definition #>> '{source,semantic_index_name}',
+    revision.definition #>> '{task,name}',
+    revision.definition #>> '{source,source_table}',
+    revision.definition #>> '{source,subject_column}',
+    ARRAY(
+      SELECT value
+      FROM jsonb_array_elements_text(COALESCE(revision.definition #> '{source,input_columns}', '[]'::jsonb)) value
+    ),
+    revision.definition #>> '{source,record_type}',
+    revision.definition #>> '{models,direct,name}',
+    head.active_workload_revision_hash,
+    revision.definition #> '{task,input_shaping}'
+  INTO
+    index_row.name,
+    index_row.task_name,
+    index_row.source_table,
+    index_row.subject_column,
+    index_row.input_columns,
+    index_row.record_type,
+    index_row.model_name,
+    current_contract_hash,
+    current_input_shaping
+  FROM otlet.workload_revision_heads head
+  JOIN otlet.workload_revisions revision
+    ON revision.task_name = head.task_name
+   AND revision.workload_revision_hash = head.active_workload_revision_hash
+  WHERE revision.definition #>> '{source,semantic_index_name}' = semantic_index_plan.index_name
+    AND revision.definition #>> '{source,kind}' = 'row';
 
   IF NOT FOUND THEN
     RAISE EXCEPTION 'otlet semantic index % does not exist', semantic_index_plan.index_name;
@@ -62,20 +87,6 @@ BEGIN
   IF exact THEN
     PERFORM otlet.mark_semantic_schema_drift(index_row.name);
   END IF;
-
-  SELECT
-    otlet.task_contract_hash(
-      t.instruction,
-      t.output_schema,
-      t.model_name,
-      t.runtime_options,
-      t.input_shaping,
-      t.decision_contract
-    ),
-    t.input_shaping
-  INTO current_contract_hash, current_input_shaping
-  FROM otlet.tasks t
-  WHERE t.name = index_row.task_name;
 
   IF exact THEN
     EXECUTE format(
@@ -118,6 +129,7 @@ BEGIN
             ON sm.subject_id = ci.subject_id
           WHERE sm.task_name = %4$L
             AND sm.record_type = %5$L
+            AND sm.contract_hash = %7$L
           ORDER BY
             sm.subject_id,
             (
@@ -190,6 +202,7 @@ BEGIN
       FROM otlet.semantic_materializations sm
       WHERE sm.task_name = index_row.task_name
         AND sm.record_type = index_row.record_type
+        AND sm.contract_hash = current_contract_hash
       ORDER BY
         sm.subject_id,
         (
@@ -282,12 +295,10 @@ SELECT
   plan.name,
   plan.task_name,
   plan.source_relation,
-  si.subject_column,
-  si.record_type,
-  si.model_name,
+  revision.definition #>> '{source,subject_column}' AS subject_column,
+  revision.definition #>> '{source,record_type}' AS record_type,
+  revision.definition #>> '{models,direct,name}' AS model_name,
   plan.runtime_name,
-  si.last_refresh_at,
-  si.last_lookup_at,
   plan.total_subjects,
   plan.fresh_subjects,
   plan.stale_subjects,
@@ -311,10 +322,17 @@ SELECT
   (
     SELECT max(sm.updated_at)
     FROM otlet.semantic_materializations sm
-    WHERE sm.task_name = si.task_name
-      AND sm.record_type = si.record_type
+    WHERE sm.task_name = head.task_name
+      AND sm.record_type = revision.definition #>> '{source,record_type}'
+      AND sm.contract_hash = head.active_workload_revision_hash
   ) AS last_materialized_at,
   plan.effective_stale_policy,
   plan.checked_at
-FROM otlet.semantic_indexes si
-JOIN LATERAL otlet.semantic_index_plan(si.name) plan ON true;
+FROM otlet.workload_revision_heads head
+JOIN otlet.workload_revisions revision
+  ON revision.task_name = head.task_name
+ AND revision.workload_revision_hash = head.active_workload_revision_hash
+JOIN LATERAL otlet.semantic_index_plan(
+  revision.definition #>> '{source,semantic_index_name}'
+) plan ON true
+WHERE revision.definition #>> '{source,kind}' = 'row';

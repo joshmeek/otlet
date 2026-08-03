@@ -132,7 +132,7 @@ fn validate_semantic_index_source(
     infer_ms: u32,
     infer_max_rows: u32,
     auto_policy: bool,
-) -> Option<SemanticPlannerStats> {
+) -> Option<(SemanticPlannerStats, String)> {
     match pgrx::Spi::connect(|client| {
         // One SELECT: metadata + plan/current_rows stats (same fail-closed gates).
         let args = [
@@ -144,10 +144,16 @@ fn validate_semantic_index_source(
             .select(
                 "WITH meta AS ( \
                    SELECT \
-                     si.source_table, \
-                     si.subject_column \
-                   FROM otlet.semantic_indexes si \
-                   WHERE si.name = $1 AND si.source_table::regclass = $2::oid \
+                     revision.definition #>> '{source,source_table}' AS source_table, \
+                     revision.definition #>> '{source,subject_column}' AS subject_column, \
+                     head.active_workload_revision_hash AS workload_revision_hash \
+                   FROM otlet.workload_revision_heads head \
+                   JOIN otlet.workload_revisions revision \
+                     ON revision.task_name = head.task_name \
+                    AND revision.workload_revision_hash = head.active_workload_revision_hash \
+                   WHERE revision.definition #>> '{source,semantic_index_name}' = $1 \
+                     AND revision.definition #>> '{source,kind}' = 'row' \
+                     AND (revision.definition #>> '{source,source_table}')::regclass = $2::oid \
                    LIMIT 1 \
                  ), \
                  plan AS ( \
@@ -165,12 +171,15 @@ fn validate_semantic_index_source(
                  ), \
                  current_rows AS ( \
                    SELECT subject_id, body, stale \
-                   FROM otlet.semantic_index_current_rows($1, false) \
-                   WHERE EXISTS (SELECT 1 FROM meta) \
+                   FROM meta m \
+                   CROSS JOIN LATERAL otlet.semantic_index_current_rows( \
+                     $1, false, m.workload_revision_hash \
+                   ) \
                  ) \
                  SELECT \
                    (SELECT source_table FROM meta) AS source_table, \
                    (SELECT subject_column FROM meta) AS subject_column, \
+                   (SELECT workload_revision_hash FROM meta) AS workload_revision_hash, \
                    COALESCE((SELECT total_subjects FROM plan), 0)::bigint AS source_rows, \
                    (SELECT count(*) FROM current_rows WHERE stale = false AND body @> $3::jsonb)::bigint AS fresh_matches, \
                    (SELECT count(*) FROM current_rows WHERE stale = false AND NOT (body @> $3::jsonb))::bigint AS fresh_non_matches, \
@@ -187,28 +196,34 @@ fn validate_semantic_index_source(
             )
             .map_err(to_string)?;
         if table.is_empty() {
-            return Ok::<Option<SemanticPlannerStats>, String>(None);
+            return Ok::<Option<(SemanticPlannerStats, String)>, String>(None);
         }
         let row = table.first();
         let Some(source_table) = row
             .get_by_name::<String, _>("source_table")
             .map_err(to_string)?
         else {
-            return Ok::<Option<SemanticPlannerStats>, String>(None);
+            return Ok::<Option<(SemanticPlannerStats, String)>, String>(None);
         };
         let Some(subject_column) = row
             .get_by_name::<String, _>("subject_column")
             .map_err(to_string)?
         else {
-            return Ok::<Option<SemanticPlannerStats>, String>(None);
+            return Ok::<Option<(SemanticPlannerStats, String)>, String>(None);
         };
         if source_table.is_empty() || subject_column.is_empty() {
-            return Ok::<Option<SemanticPlannerStats>, String>(None);
+            return Ok::<Option<(SemanticPlannerStats, String)>, String>(None);
         }
+        let Some(workload_revision_hash) = row
+            .get_by_name::<String, _>("workload_revision_hash")
+            .map_err(to_string)?
+        else {
+            return Ok::<Option<(SemanticPlannerStats, String)>, String>(None);
+        };
         let subject_column_cstr = CString::new(subject_column.as_str()).map_err(to_string)?;
         let indexed_attno = unsafe { pg_sys::get_attnum(relid, subject_column_cstr.as_ptr()) };
         if indexed_attno != subject_attno {
-            return Ok::<Option<SemanticPlannerStats>, String>(None);
+            return Ok::<Option<(SemanticPlannerStats, String)>, String>(None);
         }
 
         let mut stats = SemanticPlannerStats {
@@ -271,7 +286,10 @@ fn validate_semantic_index_source(
             infer_max_rows,
             auto_policy,
         );
-        Ok::<Option<SemanticPlannerStats>, String>(Some(stats))
+        Ok::<Option<(SemanticPlannerStats, String)>, String>(Some((
+            stats,
+            workload_revision_hash,
+        )))
     }) {
         Ok(stats) => stats,
         Err(err) => {
@@ -289,15 +307,21 @@ fn validate_semantic_join_index_source(
     infer_ms: u32,
     infer_max_rows: u32,
     auto_policy: bool,
-) -> Option<SemanticPlannerStats> {
+) -> Option<(SemanticPlannerStats, String)> {
     match pgrx::Spi::connect(|client| {
         let stats_args = [index_name.into(), expected_json.into()];
         let stats_table = client
             .select(
                  "WITH meta AS ( \
-                   SELECT true AS ok \
-                   FROM otlet.semantic_join_indexes sji \
-                   WHERE sji.name = $1 \
+                   SELECT \
+                     true AS ok, \
+                     head.active_workload_revision_hash AS workload_revision_hash \
+                   FROM otlet.workload_revision_heads head \
+                   JOIN otlet.workload_revisions revision \
+                     ON revision.task_name = head.task_name \
+                    AND revision.workload_revision_hash = head.active_workload_revision_hash \
+                   WHERE revision.definition #>> '{source,semantic_join_index_name}' = $1 \
+                     AND revision.definition #>> '{source,kind}' = 'pair' \
                    LIMIT 1 \
                  ), \
                  plan AS ( \
@@ -315,11 +339,14 @@ fn validate_semantic_join_index_source(
                  ), \
                  current_rows AS ( \
                    SELECT subject_id, body, stale \
-                   FROM otlet.semantic_join_index_current_rows($1, false) \
-                   WHERE EXISTS (SELECT 1 FROM meta) \
+                   FROM meta m \
+                   CROSS JOIN LATERAL otlet.semantic_join_index_current_rows( \
+                     $1, false, m.workload_revision_hash \
+                   ) \
                  ) \
                  SELECT \
                    (SELECT ok FROM meta) AS meta_ok, \
+                   (SELECT workload_revision_hash FROM meta) AS workload_revision_hash, \
                    COALESCE((SELECT total_subjects FROM plan), 0)::bigint AS source_rows, \
                    (SELECT count(*) FROM current_rows WHERE stale = false AND body @> $2::jsonb)::bigint AS fresh_matches, \
                    (SELECT count(*) FROM current_rows WHERE stale = false AND NOT (body @> $2::jsonb))::bigint AS fresh_non_matches, \
@@ -336,7 +363,7 @@ fn validate_semantic_join_index_source(
             )
             .map_err(to_string)?;
         if stats_table.is_empty() {
-            return Ok::<Option<SemanticPlannerStats>, String>(None);
+            return Ok::<Option<(SemanticPlannerStats, String)>, String>(None);
         }
         let row = stats_table.first();
         if row
@@ -344,8 +371,14 @@ fn validate_semantic_join_index_source(
             .map_err(to_string)?
             .is_none()
         {
-            return Ok::<Option<SemanticPlannerStats>, String>(None);
+            return Ok::<Option<(SemanticPlannerStats, String)>, String>(None);
         }
+        let Some(workload_revision_hash) = row
+            .get_by_name::<String, _>("workload_revision_hash")
+            .map_err(to_string)?
+        else {
+            return Ok::<Option<(SemanticPlannerStats, String)>, String>(None);
+        };
         let mut stats = SemanticPlannerStats {
             selected_path: "semantic_lookup".to_owned(),
             reason: String::new(),
@@ -410,7 +443,10 @@ fn validate_semantic_join_index_source(
             stats.selected_path = "semantic_join_lookup".to_owned();
         }
         stats.reason = format!("semantic join candidate row-source: {}", stats.reason);
-        Ok::<Option<SemanticPlannerStats>, String>(Some(stats))
+        Ok::<Option<(SemanticPlannerStats, String)>, String>(Some((
+            stats,
+            workload_revision_hash,
+        )))
     }) {
         Ok(stats) => stats,
         Err(err) => {

@@ -44,17 +44,24 @@ pub(crate) fn submit_infer_now(
     input: &Value,
 ) -> Result<Option<SubmittedInferNow>, String> {
     let input_text = serde_json::to_string(input).map_err(|err| err.to_string())?;
-    submit_infer_now_text(task_name, subject_id, None, &input_text)
+    submit_infer_now_text(task_name, subject_id, None, None, &input_text)
 }
 
 pub(crate) fn submit_infer_now_bytes(
     task_name: &str,
     subject_id: &str,
+    expected_workload_revision_hash: &str,
     input_json: &[u8],
 ) -> Result<Option<SubmittedInferNow>, String> {
     let input_text = std::str::from_utf8(input_json)
         .map_err(|err| format!("infer-now input is not valid UTF-8: {err}"))?;
-    submit_infer_now_text(task_name, subject_id, None, input_text)
+    submit_infer_now_text(
+        task_name,
+        subject_id,
+        Some(expected_workload_revision_hash),
+        None,
+        input_text,
+    )
 }
 
 fn submit_infer_now_with_inline_task(
@@ -82,17 +89,27 @@ fn submit_infer_now_with_inline_task(
     }))
     .map_err(|err| err.to_string())?;
     let input_text = serde_json::to_string(input).map_err(|err| err.to_string())?;
-    submit_infer_now_text(task_name, subject_id, Some(&inline_task_text), &input_text)
+    submit_infer_now_text(
+        task_name,
+        subject_id,
+        None,
+        Some(&inline_task_text),
+        &input_text,
+    )
 }
 
 fn submit_infer_now_text(
     task_name: &str,
     subject_id: &str,
+    expected_workload_revision_hash: Option<&str>,
     inline_task_text: Option<&str>,
     input_text: &str,
 ) -> Result<Option<SubmittedInferNow>, String> {
     check_len("task_name", task_name.len(), TASK_CAP)?;
     check_len("subject_id", subject_id.len(), SUBJECT_CAP)?;
+    if let Some(hash) = expected_workload_revision_hash {
+        check_len("workload_revision_hash", hash.len(), WORKLOAD_REVISION_CAP)?;
+    }
     if let Some(inline_task_text) = inline_task_text {
         check_len("inline_task", inline_task_text.len(), INLINE_TASK_CAP)?;
     }
@@ -126,6 +143,12 @@ fn submit_infer_now_text(
         slot.error_len = 0;
         slot.task_len = write_buf(&mut slot.task, task_name.as_bytes());
         slot.subject_len = write_buf(&mut slot.subject, subject_id.as_bytes());
+        slot.workload_revision_len = if let Some(hash) = expected_workload_revision_hash {
+            write_buf(&mut slot.workload_revision, hash.as_bytes())
+        } else {
+            slot.workload_revision.fill(0);
+            0
+        };
         slot.inline_task_len = if let Some(text) = inline_task_text {
             write_buf(&mut slot.inline_task, text.as_bytes())
         } else {

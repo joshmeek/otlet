@@ -108,6 +108,24 @@ BEGIN
     RETURN false;
   END IF;
 
+  PERFORM 1
+  FROM otlet.production_policy policy
+  WHERE policy.name = 'default'
+  FOR UPDATE;
+  PERFORM pg_advisory_xact_lock(
+    hashtextextended('otlet_workload_revision:' || watch_row.task_name, 0)
+  );
+
+  SELECT *
+  INTO watch_row
+  FROM otlet.watches w
+  WHERE w.name = drop_watch.watch_name
+  FOR UPDATE;
+
+  IF NOT FOUND THEN
+    RETURN false;
+  END IF;
+
   IF watch_row.kind = 'row'
      AND watch_row.source_table IS NOT NULL
      AND to_regclass(watch_row.source_table) IS NOT NULL THEN
@@ -158,6 +176,9 @@ BEGIN
       END IF;
     END LOOP;
   END IF;
+
+  DELETE FROM otlet.workload_revision_heads head
+  WHERE head.task_name = watch_row.task_name;
 
   RETURN true;
 END;
@@ -503,6 +524,7 @@ BEGIN
     END LOOP;
   END IF;
 
+  PERFORM otlet.promote_configured_workload_revision(saved.task_name);
   RETURN saved;
 END;
 $$;

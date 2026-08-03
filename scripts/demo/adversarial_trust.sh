@@ -244,7 +244,7 @@ BEGIN
       raw_output => repeat('x', 33),
       actions => '[]'::jsonb,
       trace_summary => '{"schema_validation_status":"passed"}'::jsonb,
-      model_name => (SELECT model_name FROM adversarial_params),
+      model_name => (SELECT forged_model_name FROM adversarial_params),
       expected_claim_token => (SELECT claim_token FROM oversized_job)
     );
   EXCEPTION WHEN OTHERS THEN

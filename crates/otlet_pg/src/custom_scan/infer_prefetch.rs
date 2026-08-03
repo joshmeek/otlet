@@ -106,7 +106,12 @@ fn submit_prefetched_infer_row(
         let submitted_at = unsafe { pg_sys::GetCurrentTimestamp() };
         let snapshot_before = crate::infer_now::snapshot();
         let Some(submitted) =
-            crate::infer_now::submit_infer_now_bytes(&runtime.task_name, subject_id, input_bytes)?
+            crate::infer_now::submit_infer_now_bytes(
+                &runtime.task_name,
+                subject_id,
+                &runtime.workload_revision_hash,
+                input_bytes,
+            )?
         else {
             return Ok(false);
         };
@@ -276,7 +281,12 @@ fn infer_now_if_allowed(
     let start = unsafe { pg_sys::GetCurrentTimestamp() };
     let infer_state_before = crate::infer_now::snapshot();
     let submitted = match with_semantic_slot_input_bytes(runtime, subject_id, slot, |input_bytes| {
-        crate::infer_now::submit_infer_now_bytes(&runtime.task_name, subject_id, input_bytes)
+        crate::infer_now::submit_infer_now_bytes(
+            &runtime.task_name,
+            subject_id,
+            &runtime.workload_revision_hash,
+            input_bytes,
+        )
     }) {
         Ok(Some(submitted)) => submitted,
         Ok(None) => {
@@ -352,6 +362,7 @@ fn finish_infer_now_success_spi(
         let update_args = [
             job_id.into(),
             runtime.infer_now_executor_context_json.as_str().into(),
+            runtime.workload_revision_hash.as_str().into(),
         ];
         client
             .update(INFER_NOW_STAMP_EXECUTOR_CONTEXT_SQL, None, &update_args)
@@ -363,6 +374,7 @@ fn finish_infer_now_success_spi(
                 runtime.expected_json.as_str().into(),
                 runtime.task_name.as_str().into(),
                 runtime.record_type.as_str().into(),
+                runtime.workload_revision_hash.as_str().into(),
             ],
             SemanticIndexKind::Join => vec![
                 job_id.into(),
@@ -370,6 +382,8 @@ fn finish_infer_now_success_spi(
                 subject_id.into(),
                 runtime.expected_json.as_str().into(),
                 runtime.task_name.as_str().into(),
+                runtime.workload_revision_hash.as_str().into(),
+                runtime.record_type.as_str().into(),
             ],
         };
         let fused_table = client

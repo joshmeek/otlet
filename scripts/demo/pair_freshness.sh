@@ -112,6 +112,7 @@ SELECT (otlet.create_task(
     decision_contract
   )).name
 FROM current_task;
+SELECT otlet.promote_configured_workload_revision(:'task_name');
 SQL
 contract_change_contract="$(psql_exec -qAt \
   -v task_name="$join_task" \

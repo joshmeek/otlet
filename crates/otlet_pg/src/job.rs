@@ -139,20 +139,36 @@ FROM claimed
 pub(crate) fn insert_infer_now_job(
     task_name: &str,
     subject_id: &str,
+    expected_workload_revision_hash: Option<&str>,
     input_json: &str,
 ) -> pgrx::spi::Result<Option<Job>> {
     pgrx::Spi::connect_mut(|client| {
-        let args = [task_name.into(), subject_id.into(), input_json.into()];
+        let active_rows = client.select(
+            "SELECT otlet.ensure_active_workload_revision($1)",
+            Some(1),
+            &[task_name.into()],
+        )?;
+        let active_revision_hash = active_rows
+            .first()
+            .get::<String>(1)?
+            .ok_or(pgrx::spi::SpiError::InvalidPosition)?;
+        if expected_workload_revision_hash.is_some_and(|expected| expected != active_revision_hash)
+        {
+            return Ok(None);
+        }
+        let args = [
+            task_name.into(),
+            subject_id.into(),
+            input_json.into(),
+            active_revision_hash.as_str().into(),
+        ];
         let rows = client.update(
             r"
-WITH captured AS MATERIALIZED (
-  SELECT otlet.capture_workload_revision($1) AS workload_revision_hash
-),
-revision AS MATERIALIZED (
+WITH revision AS MATERIALIZED (
   SELECT r.workload_revision_hash, r.definition
-  FROM captured
-  JOIN otlet.workload_revisions r USING (workload_revision_hash)
+  FROM otlet.workload_revisions r
   WHERE r.task_name = $1
+    AND r.workload_revision_hash = $4
 ),
 inserted AS (
   INSERT INTO otlet.jobs (
@@ -181,7 +197,7 @@ inserted AS (
     now(),
     NULL
   FROM revision
-  ON CONFLICT (task_name, subject_id)
+  ON CONFLICT (task_name, workload_revision_hash, subject_id)
   WHERE status IN ('queued', 'running', 'cancel_requested')
   DO NOTHING
   RETURNING *

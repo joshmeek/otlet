@@ -366,12 +366,14 @@ unsafe fn pg_output_text(
 
 // Wait-path: skip materialize while a job is still active; otherwise materialize
 // then re-read state in one statement (pure SELECT).
-// $1=index_name, $2=subject_id, $3=expected_json, $4=task_name, $5=record_type
+// $1=index_name, $2=subject_id, $3=expected_json, $4=task_name, $5=record_type,
+// $6=workload_revision_hash
 const SEMANTIC_ROW_WAIT_MATERIALIZE_STATE_SQL: &str = "WITH active AS ( \
                    SELECT EXISTS ( \
                      SELECT 1 FROM otlet.jobs j \
                      WHERE j.task_name = $4 \
                        AND j.subject_id = $2 \
+                       AND j.workload_revision_hash = $6 \
                        AND j.status IN ('queued', 'running', 'cancel_requested') \
                      LIMIT 1 \
                    ) AS is_active \
@@ -379,7 +381,7 @@ const SEMANTIC_ROW_WAIT_MATERIALIZE_STATE_SQL: &str = "WITH active AS ( \
                  materialized AS ( \
                    SELECT CASE \
                      WHEN a.is_active THEN 0::bigint \
-                     ELSE otlet.materialize_semantic_index_subject($1, $2)::bigint \
+                     ELSE otlet.materialize_semantic_index_subject($1, $2, $6)::bigint \
                    END AS n \
                    FROM active a \
                  ), \
@@ -393,6 +395,7 @@ const SEMANTIC_ROW_WAIT_MATERIALIZE_STATE_SQL: &str = "WITH active AS ( \
                        AND sm.task_name = $4 \
                        AND sm.record_type = $5 \
                        AND sm.subject_id = $2 \
+                       AND sm.contract_hash = $6 \
                      ORDER BY sm.updated_at DESC, sm.id DESC \
                      LIMIT 1 \
                    ) sm ON true \
@@ -409,12 +412,14 @@ const SEMANTIC_ROW_WAIT_MATERIALIZE_STATE_SQL: &str = "WITH active AS ( \
                  FROM materialized, active \
                  LEFT JOIN latest l ON true";
 
-// $1=index_name, $2=subject_id, $3=expected_json, $4=task_name
+// $1=index_name, $2=subject_id, $3=expected_json, $4=task_name,
+// $5=workload_revision_hash, $6=record_type
 const SEMANTIC_JOIN_WAIT_MATERIALIZE_STATE_SQL: &str = "WITH active AS ( \
                    SELECT EXISTS ( \
                      SELECT 1 FROM otlet.jobs j \
                      WHERE j.task_name = $4 \
                        AND j.subject_id = $2 \
+                       AND j.workload_revision_hash = $5 \
                        AND j.status IN ('queued', 'running', 'cancel_requested') \
                      LIMIT 1 \
                    ) AS is_active \
@@ -422,7 +427,7 @@ const SEMANTIC_JOIN_WAIT_MATERIALIZE_STATE_SQL: &str = "WITH active AS ( \
                  materialized AS ( \
                    SELECT CASE \
                      WHEN a.is_active THEN 0::bigint \
-                     ELSE otlet.materialize_semantic_join_index_subject($1, $2)::bigint \
+                     ELSE otlet.materialize_semantic_join_index_subject($1, $2, $5)::bigint \
                    END AS n \
                    FROM active a \
                  ), \
@@ -432,12 +437,11 @@ const SEMANTIC_JOIN_WAIT_MATERIALIZE_STATE_SQL: &str = "WITH active AS ( \
                    LEFT JOIN LATERAL ( \
                      SELECT sm.subject_id, sm.stale, sm.body \
                      FROM otlet.semantic_materializations sm \
-                     JOIN otlet.semantic_join_indexes sji \
-                       ON sji.task_name = sm.task_name \
-                      AND sji.record_type = sm.record_type \
                      WHERE NOT active.is_active \
-                       AND sji.name = $1 \
+                       AND sm.task_name = $4 \
+                       AND sm.record_type = $6 \
                        AND sm.subject_id = $2 \
+                       AND sm.contract_hash = $5 \
                      ORDER BY sm.updated_at DESC, sm.id DESC \
                      LIMIT 1 \
                    ) sm ON true \

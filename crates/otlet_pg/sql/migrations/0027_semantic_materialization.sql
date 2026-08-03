@@ -9,35 +9,24 @@ AS $$
 DECLARE
   refreshed bigint;
   current_contract_hash text;
-  current_workload_revision_hash text;
   current_input_shaping jsonb;
 BEGIN
   IF NULLIF(materialize_semantic_records.current_input_query, '') IS NULL THEN
     RAISE EXCEPTION 'otlet materialize_semantic_records requires current_input_query';
   END IF;
 
-  SELECT
-    otlet.task_contract_hash(
-      t.instruction,
-      t.output_schema,
-      t.model_name,
-      t.runtime_options,
-      t.input_shaping,
-      t.decision_contract
-    ),
-    t.input_shaping
+  SELECT head.active_workload_revision_hash, revision.definition #> '{task,input_shaping}'
   INTO current_contract_hash, current_input_shaping
-  FROM otlet.tasks t
-  WHERE t.name = materialize_semantic_records.task_name;
+  FROM otlet.workload_revision_heads head
+  JOIN otlet.workload_revisions revision
+    ON revision.task_name = head.task_name
+   AND revision.workload_revision_hash = head.active_workload_revision_hash
+  WHERE head.task_name = materialize_semantic_records.task_name
+  FOR UPDATE OF head;
 
   IF NOT FOUND THEN
     RAISE EXCEPTION 'otlet task % does not exist', materialize_semantic_records.task_name;
   END IF;
-  current_workload_revision_hash := otlet.identity_hash(
-    'workload_revision',
-    otlet.current_workload_revision_definition(materialize_semantic_records.task_name)
-  );
-
   EXECUTE format(
     $sql$
       WITH current_inputs AS (
@@ -120,7 +109,7 @@ BEGIN
     materialize_semantic_records.record_type,
     current_input_shaping,
     current_contract_hash,
-    current_workload_revision_hash
+    current_contract_hash
   );
 
   GET DIAGNOSTICS refreshed = ROW_COUNT;
@@ -136,20 +125,28 @@ AS $$
 DECLARE
   index_row otlet.semantic_indexes%ROWTYPE;
   input_query text;
+  revision_definition jsonb;
 BEGIN
-  SELECT *
-  INTO index_row
-  FROM otlet.semantic_indexes
-  WHERE name = materialize_semantic_index.index_name;
+  SELECT
+    revision.definition #>> '{source,semantic_index_name}',
+    revision.definition #>> '{task,name}'
+  INTO index_row.name, index_row.task_name
+  FROM otlet.workload_revision_heads head
+  JOIN otlet.workload_revisions revision
+    ON revision.task_name = head.task_name
+   AND revision.workload_revision_hash = head.active_workload_revision_hash
+  WHERE revision.definition #>> '{source,semantic_index_name}' = materialize_semantic_index.index_name
+    AND revision.definition #>> '{source,kind}' = 'row'
+  FOR UPDATE OF head;
 
   IF NOT FOUND THEN
     RAISE EXCEPTION 'otlet semantic index % does not exist', materialize_semantic_index.index_name;
   END IF;
 
-  SELECT t.input_query
-  INTO input_query
-  FROM otlet.tasks t
-  WHERE t.name = index_row.task_name;
+  SELECT active.definition
+  INTO revision_definition
+  FROM otlet.active_workload_revision(index_row.task_name) active;
+  input_query := revision_definition #>> '{task,input_query}';
 
   IF input_query IS NULL THEN
     RAISE EXCEPTION 'otlet semantic index % task % does not exist', materialize_semantic_index.index_name, index_row.task_name;
@@ -157,8 +154,8 @@ BEGIN
 
   RETURN otlet.materialize_semantic_records(
     index_row.task_name,
-    index_row.record_type,
-    index_row.source_table,
+    revision_definition #>> '{source,record_type}',
+    revision_definition #>> '{source,source_table}',
     input_query
   );
 END;
@@ -166,59 +163,58 @@ $$;
 
 CREATE FUNCTION otlet.materialize_semantic_index_subject(
   index_name text,
-  subject_id text
+  subject_id text,
+  expected_workload_revision_hash text DEFAULT NULL
 ) RETURNS bigint
 LANGUAGE plpgsql
 AS $$
 DECLARE
   index_row otlet.semantic_indexes%ROWTYPE;
   input_query text;
+  revision_definition jsonb;
+  active_revision_hash text;
 BEGIN
-  SELECT *
-  INTO index_row
-  FROM otlet.semantic_indexes
-  WHERE name = materialize_semantic_index_subject.index_name;
+  SELECT
+    revision.definition #>> '{source,semantic_index_name}',
+    revision.definition #>> '{task,name}',
+    head.active_workload_revision_hash
+  INTO index_row.name, index_row.task_name, active_revision_hash
+  FROM otlet.workload_revision_heads head
+  JOIN otlet.workload_revisions revision
+    ON revision.task_name = head.task_name
+   AND revision.workload_revision_hash = head.active_workload_revision_hash
+  WHERE revision.definition #>> '{source,semantic_index_name}' = materialize_semantic_index_subject.index_name
+    AND revision.definition #>> '{source,kind}' = 'row'
+  FOR UPDATE OF head;
 
   IF NOT FOUND THEN
     RAISE EXCEPTION 'otlet semantic index % does not exist', materialize_semantic_index_subject.index_name;
   END IF;
 
-  IF NOT EXISTS (
-    SELECT 1
-    FROM otlet.tasks t
-    WHERE t.name = index_row.task_name
-  ) THEN
-    RAISE EXCEPTION 'otlet semantic index % task % does not exist', materialize_semantic_index_subject.index_name, index_row.task_name;
+  IF materialize_semantic_index_subject.expected_workload_revision_hash IS NOT NULL
+     AND materialize_semantic_index_subject.expected_workload_revision_hash IS DISTINCT FROM active_revision_hash THEN
+    RAISE EXCEPTION 'otlet workload revision changed during semantic materialization for index %', index_row.name;
   END IF;
 
-  input_query := format(
-    $sql$
-        SELECT
-          (src.%1$I)::text AS subject_id,
-          jsonb_build_object(
-            '_otlet_mvcc', jsonb_build_object(
-              'table', %2$L,
-              'subject_id', (src.%1$I)::text,
-              'ctid', src.ctid::text,
-              'xmin', src.xmin::text
-            ),
-            'table', %2$L,
-            'row', otlet.semantic_project_row(to_jsonb(src), %5$L::text[])
-          ) AS input
-        FROM %3$s AS src
-        WHERE (src.%1$I)::text = %4$L
-    $sql$,
-    index_row.subject_column,
-    index_row.source_table,
-    index_row.source_table,
-    materialize_semantic_index_subject.subject_id,
-    index_row.input_columns
-  );
+  SELECT active.definition
+  INTO revision_definition
+  FROM otlet.active_workload_revision(index_row.task_name) active;
+
+  SELECT format(
+    'SELECT subject_id, input FROM (%s) otlet_active_input WHERE subject_id::text = %L',
+    revision_definition #>> '{task,input_query}',
+    materialize_semantic_index_subject.subject_id
+  )
+  INTO input_query;
+
+  IF input_query IS NULL THEN
+    RAISE EXCEPTION 'otlet semantic index % has no active workload revision', index_row.name;
+  END IF;
 
   RETURN otlet.materialize_semantic_records(
     index_row.task_name,
-    index_row.record_type,
-    index_row.source_table,
+    revision_definition #>> '{source,record_type}',
+    revision_definition #>> '{source,source_table}',
     input_query
   );
 END;
@@ -260,9 +256,15 @@ BEGIN
     RETURN 0;
   END IF;
 
-  IF job_row.workload_revision_hash IS DISTINCT FROM otlet.identity_hash(
-    'workload_revision',
-    otlet.current_workload_revision_definition(job_row.task_name)
+  PERFORM 1
+  FROM otlet.workload_revision_heads head
+  WHERE head.task_name = job_row.task_name
+  FOR UPDATE;
+
+  IF job_row.workload_revision_hash IS DISTINCT FROM (
+    SELECT head.active_workload_revision_hash
+    FROM otlet.workload_revision_heads head
+    WHERE head.task_name = job_row.task_name
   ) THEN
     RETURN 0;
   END IF;
@@ -345,9 +347,10 @@ BEGIN
         index_row.source_table,
         otlet.semantic_source_hash(job_row.input)
       WHERE action_authority ->> 'origin' = 'system'
-        AND job_row.workload_revision_hash = otlet.identity_hash(
-          'workload_revision',
-          otlet.current_workload_revision_definition(job_row.task_name)
+        AND job_row.workload_revision_hash = (
+          SELECT head.active_workload_revision_hash
+          FROM otlet.workload_revision_heads head
+          WHERE head.task_name = job_row.task_name
         )
       RETURNING id INTO saved_action_id;
 

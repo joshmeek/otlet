@@ -1,17 +1,28 @@
 CREATE VIEW otlet.production_status AS
 WITH queue AS (
   SELECT
-    count(*) FILTER (WHERE status = 'queued')::bigint AS queued_jobs,
-    COALESCE(sum(octet_length(input::text)) FILTER (WHERE status = 'queued'), 0)::bigint AS queued_input_bytes,
-    count(*) FILTER (WHERE status = 'running')::bigint AS running_jobs,
-    count(*) FILTER (WHERE status = 'cancel_requested')::bigint AS cancel_requested_jobs,
     count(*) FILTER (
-      WHERE status IN ('running', 'cancel_requested')
-        AND (leased_until IS NULL OR leased_until < now())
+      WHERE j.status = 'queued'
+        AND j.workload_revision_hash = head.active_workload_revision_hash
+    )::bigint AS queued_jobs,
+    COALESCE(sum(octet_length(j.input::text)) FILTER (
+      WHERE j.status = 'queued'
+        AND j.workload_revision_hash = head.active_workload_revision_hash
+    ), 0)::bigint AS queued_input_bytes,
+    count(*) FILTER (WHERE j.status = 'running')::bigint AS running_jobs,
+    count(*) FILTER (WHERE j.status = 'cancel_requested')::bigint AS cancel_requested_jobs,
+    count(*) FILTER (
+      WHERE j.status IN ('running', 'cancel_requested')
+        AND (j.leased_until IS NULL OR j.leased_until < now())
     )::bigint AS expired_running_jobs,
-    count(*) FILTER (WHERE status = 'failed')::bigint AS failed_jobs,
-    count(*) FILTER (WHERE status = 'canceled')::bigint AS canceled_jobs
-  FROM otlet.jobs
+    count(*) FILTER (WHERE j.status = 'failed')::bigint AS failed_jobs,
+    count(*) FILTER (WHERE j.status = 'canceled')::bigint AS canceled_jobs,
+    count(*) FILTER (
+      WHERE j.status = 'queued'
+        AND j.workload_revision_hash IS DISTINCT FROM head.active_workload_revision_hash
+    )::bigint AS suspended_revision_queued_jobs
+  FROM otlet.jobs j
+  LEFT JOIN otlet.workload_revision_heads head ON head.task_name = j.task_name
 ),
 receipts AS (
   SELECT
@@ -139,7 +150,8 @@ SELECT
   (COALESCE(runtime.error_runtime_slots, 0) = 0) AS no_runtime_slot_errors,
   (COALESCE(runtime.cache_entries_within_cap, true) AND COALESCE(runtime.cache_bytes_within_cap, true)) AS cache_within_bounds,
   (COALESCE(trace.max_detailed_trace_tokens, 0) <= 256 AND COALESCE(trace.max_detailed_trace_top_k, 0) <= 16) AS trace_within_bounds,
-  now() AS checked_at
+  now() AS checked_at,
+  q.suspended_revision_queued_jobs
 FROM otlet.production_policy p
 CROSS JOIN queue q
 CROSS JOIN receipts r

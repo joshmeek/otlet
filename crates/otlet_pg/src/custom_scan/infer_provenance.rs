@@ -24,7 +24,9 @@ fn record_infer_now_failed_provenance(
     runtime: &mut RuntimeState,
     job_id: i64,
 ) -> Result<(), String> {
-    let provenance = with_latest_snapshot(|| infer_now_failed_provenance_counts(job_id))?;
+    let provenance = with_latest_snapshot(|| {
+        infer_now_failed_provenance_counts(job_id, &runtime.workload_revision_hash)
+    })?;
     runtime.infer_failed_receipts = runtime
         .infer_failed_receipts
         .saturating_add(provenance.receipts);
@@ -34,9 +36,10 @@ fn record_infer_now_failed_provenance(
 
 fn infer_now_failed_provenance_counts(
     job_id: i64,
+    workload_revision_hash: &str,
 ) -> Result<InferNowFailedProvenanceCounts, String> {
     pgrx::Spi::connect(|client| {
-        let args = [job_id.into()];
+        let args = [job_id.into(), workload_revision_hash.into()];
         let table = client
             .select(
                 // Always one row (like count(*)); empty peek still yields 0|0.
@@ -46,7 +49,9 @@ fn infer_now_failed_provenance_counts(
                  LEFT JOIN LATERAL ( \
                    SELECT id \
                    FROM otlet.inference_receipts \
-                   WHERE job_id = $1 AND status = 'failed' \
+                   WHERE job_id = $1 \
+                     AND workload_revision_hash = $2 \
+                     AND status = 'failed' \
                    ORDER BY attempt_index DESC, id DESC \
                    LIMIT 1 \
                  ) r ON true",
@@ -70,7 +75,8 @@ fn infer_now_failed_provenance_counts(
 
 // Pure SELECT — CustomScan infer-now can run under a non-volatile planner/executor
 // context, so UPDATE must stay on client.update(), not inside SELECT.
-// Args: $1=job_id, $2=subject_id, $3=expected_json, $4=task_name, $5=record_type
+// Args: $1=job_id, $2=subject_id, $3=expected_json, $4=task_name,
+// $5=record_type, $6=workload_revision_hash
 const INFER_NOW_PROVENANCE_AND_ROW_STATE_SQL: &str = "WITH receipt AS ( \
                    SELECT \
                      id, \
@@ -87,7 +93,9 @@ const INFER_NOW_PROVENANCE_AND_ROW_STATE_SQL: &str = "WITH receipt AS ( \
                      NULLIF(trace_summary #>> '{detailed_trace,captured_tokens}', '')::bigint AS detailed_trace_captured_tokens, \
                      NULLIF(trace_summary #>> '{detailed_trace,top_k}', '')::bigint AS detailed_trace_top_k \
                    FROM otlet.inference_receipts \
-                   WHERE job_id = $1 AND status = 'complete' \
+                   WHERE job_id = $1 \
+                     AND workload_revision_hash = $6 \
+                     AND status = 'complete' \
                    ORDER BY attempt_index DESC, id DESC \
                    LIMIT 1 \
                  ), \
@@ -98,15 +106,26 @@ const INFER_NOW_PROVENANCE_AND_ROW_STATE_SQL: &str = "WITH receipt AS ( \
                    WHERE sm.task_name = $4 \
                      AND sm.record_type = $5 \
                      AND sm.subject_id = $2 \
+                     AND sm.contract_hash = $6 \
                    ORDER BY sm.updated_at DESC, sm.id DESC \
                    LIMIT 1 \
                  ), \
                  state AS ( \
                    SELECT CASE \
+                     WHEN NOT EXISTS ( \
+                       SELECT 1 \
+                       FROM otlet.jobs j \
+                       JOIN otlet.workload_revision_heads head ON head.task_name = j.task_name \
+                       WHERE j.id = $1 \
+                         AND j.task_name = $4 \
+                         AND j.workload_revision_hash = $6 \
+                         AND head.active_workload_revision_hash = $6 \
+                     ) THEN 'missing' \
                      WHEN EXISTS ( \
                        SELECT 1 FROM otlet.jobs j \
                        WHERE j.task_name = $4 \
                          AND j.subject_id = $2 \
+                         AND j.workload_revision_hash = $6 \
                          AND j.status IN ('queued', 'running', 'cancel_requested') \
                        LIMIT 1 \
                      ) AND (l.subject_id IS NULL OR l.stale) THEN 'in_flight' \
@@ -137,7 +156,8 @@ const INFER_NOW_PROVENANCE_AND_ROW_STATE_SQL: &str = "WITH receipt AS ( \
                  FROM state s \
                  LEFT JOIN receipt r ON true";
 
-// Args: $1=job_id, $2=index_name, $3=subject_id, $4=expected_json, $5=task_name
+// Args: $1=job_id, $2=index_name, $3=subject_id, $4=expected_json,
+// $5=task_name, $6=workload_revision_hash, $7=record_type
 const INFER_NOW_PROVENANCE_AND_JOIN_STATE_SQL: &str = "WITH receipt AS ( \
                    SELECT \
                      id, \
@@ -154,27 +174,38 @@ const INFER_NOW_PROVENANCE_AND_JOIN_STATE_SQL: &str = "WITH receipt AS ( \
                      NULLIF(trace_summary #>> '{detailed_trace,captured_tokens}', '')::bigint AS detailed_trace_captured_tokens, \
                      NULLIF(trace_summary #>> '{detailed_trace,top_k}', '')::bigint AS detailed_trace_top_k \
                    FROM otlet.inference_receipts \
-                   WHERE job_id = $1 AND status = 'complete' \
+                   WHERE job_id = $1 \
+                     AND workload_revision_hash = $6 \
+                     AND status = 'complete' \
                    ORDER BY attempt_index DESC, id DESC \
                    LIMIT 1 \
                  ), \
                  current_row AS ( \
                    SELECT sm.subject_id, sm.body, sm.stale \
                    FROM otlet.semantic_materializations sm \
-                   JOIN otlet.semantic_join_indexes sji \
-                     ON sji.task_name = sm.task_name \
-                    AND sji.record_type = sm.record_type \
-                   WHERE sji.name = $2 \
+                   WHERE sm.task_name = $5 \
+                     AND sm.record_type = $7 \
                      AND sm.subject_id = $3 \
+                     AND sm.contract_hash = $6 \
                    ORDER BY sm.updated_at DESC, sm.id DESC \
                    LIMIT 1 \
                  ), \
                  state AS ( \
                    SELECT CASE \
+                     WHEN NOT EXISTS ( \
+                       SELECT 1 \
+                       FROM otlet.jobs j \
+                       JOIN otlet.workload_revision_heads head ON head.task_name = j.task_name \
+                       WHERE j.id = $1 \
+                         AND j.task_name = $5 \
+                         AND j.workload_revision_hash = $6 \
+                         AND head.active_workload_revision_hash = $6 \
+                     ) THEN 'missing' \
                      WHEN EXISTS ( \
                        SELECT 1 FROM otlet.jobs j \
                        WHERE j.task_name = $5 \
                          AND j.subject_id = $3 \
+                         AND j.workload_revision_hash = $6 \
                          AND j.status IN ('queued', 'running', 'cancel_requested') \
                        LIMIT 1 \
                      ) AND (c.subject_id IS NULL OR c.stale) THEN 'in_flight' \
@@ -210,6 +241,7 @@ const INFER_NOW_STAMP_EXECUTOR_CONTEXT_SQL: &str = "UPDATE otlet.inference_recei
                  WHERE id = ( \
                    SELECT r.id FROM otlet.inference_receipts r \
                    WHERE r.job_id = $1 AND r.status = 'complete' \
+                     AND r.workload_revision_hash = $3 \
                    ORDER BY r.attempt_index DESC, r.id DESC \
                    LIMIT 1 \
                  )";

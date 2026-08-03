@@ -133,6 +133,7 @@ BEGIN
     'otlet.portable_text_hash(text), '
     'otlet.portable_json_hash(jsonb), '
     'otlet.identity_hash(text, jsonb), '
+    'otlet.semantic_source_hash(jsonb), '
     'otlet.semantic_shaped_input(jsonb, jsonb), '
     'otlet.semantic_content_hash(jsonb, jsonb) TO %I',
     role_name

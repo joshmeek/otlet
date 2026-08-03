@@ -17,11 +17,42 @@ AS $$
     WHERE name = 'default'
     FOR UPDATE
   ),
+  invalid_heads AS MATERIALIZED (
+    SELECT
+      head.task_name,
+      head.active_workload_revision_hash
+    FROM otlet.workload_revision_heads head
+    WHERE EXISTS (
+      SELECT 1
+      FROM otlet.jobs j
+      JOIN otlet.workload_revisions revision
+        ON revision.workload_revision_hash = j.workload_revision_hash
+      WHERE j.task_name = head.task_name
+        AND j.workload_revision_hash = head.active_workload_revision_hash
+        AND j.status IN ('queued', 'running', 'cancel_requested')
+        AND (
+          claim_jobs.requested_model_name IS NULL
+          OR COALESCE(
+            j.routed_model_name,
+            revision.definition #>> '{models,direct,name}'
+          ) = claim_jobs.requested_model_name
+        )
+        AND NOT otlet.source_fields_are_allowed(
+          j.input,
+          revision.definition #> '{task,input_shaping}'
+        )
+    )
+    ORDER BY head.task_name
+    FOR UPDATE OF head
+  ),
   invalid_claim_input AS MATERIALIZED (
     SELECT j.id
     FROM otlet.jobs j
     JOIN otlet.workload_revisions revision
       ON revision.workload_revision_hash = j.workload_revision_hash
+    JOIN invalid_heads head
+      ON head.task_name = j.task_name
+     AND head.active_workload_revision_hash = j.workload_revision_hash
     WHERE j.status IN ('queued', 'running', 'cancel_requested')
       AND (
         claim_jobs.requested_model_name IS NULL
@@ -53,6 +84,7 @@ AS $$
     SELECT
       j.*,
       revision.definition,
+      head.active_workload_revision_hash,
       CASE
         WHEN j.routed_model_name = revision.definition #>> '{selection,strong_model_name}'
           THEN revision.definition #> '{models,strong}'
@@ -63,6 +95,7 @@ AS $$
     FROM otlet.jobs j
     JOIN otlet.workload_revisions revision
       ON revision.workload_revision_hash = j.workload_revision_hash
+    JOIN otlet.workload_revision_heads head ON head.task_name = j.task_name
   ),
   active_model AS (
     SELECT
@@ -89,6 +122,7 @@ AS $$
   eligible_tasks AS (
     SELECT
       job.task_name,
+      job.active_workload_revision_hash AS workload_revision_hash,
       job.selected_model ->> 'name' AS model_name,
       job.selected_model ->> 'artifact_path' AS artifact_path,
       job.definition #>> '{selection,cheap_model_name}' AS policy_cheap_model_name,
@@ -116,6 +150,7 @@ AS $$
         OR (
           job.status = 'cancel_requested'
           AND (job.leased_until IS NULL OR job.leased_until < now())
+          AND job.attempts < p.max_attempts
         )
       )
       AND (
@@ -130,8 +165,10 @@ AS $$
         job.input,
         job.definition #> '{task,input_shaping}'
       )
+      AND job.workload_revision_hash = job.active_workload_revision_hash
     GROUP BY
       job.task_name,
+      job.active_workload_revision_hash,
       job.selected_model,
       job.definition #>> '{selection,cheap_model_name}',
       job.definition #>> '{selection,strong_model_name}'
@@ -177,10 +214,20 @@ AS $$
      AND f.policy_strong_model_name IS NOT DISTINCT FROM e.policy_strong_model_name
     CROSS JOIN policy p
   ),
+  locked_tasks AS MATERIALIZED (
+    SELECT task.*
+    FROM same_model_tasks task
+    JOIN otlet.workload_revision_heads head
+      ON head.task_name = task.task_name
+     AND head.active_workload_revision_hash = task.workload_revision_hash
+    ORDER BY task.task_rank
+    FOR UPDATE OF head
+  ),
   ranked_candidates AS (
     SELECT
       job.id,
       job.task_name,
+      job.workload_revision_hash,
       (job.definition #>> '{runtime,lease_ms}')::bigint
         * interval '1 millisecond' AS lease_interval,
       f.task_rank,
@@ -192,7 +239,7 @@ AS $$
           job.id
       ) AS task_job_rank
     FROM job_contracts job
-    JOIN same_model_tasks f
+    JOIN locked_tasks f
       ON f.task_name = job.task_name
      AND f.model_name = job.selected_model ->> 'name'
      AND f.artifact_path IS NOT DISTINCT FROM job.selected_model ->> 'artifact_path'
@@ -207,12 +254,14 @@ AS $$
         OR (
           job.status = 'cancel_requested'
           AND (job.leased_until IS NULL OR job.leased_until < now())
+          AND job.attempts < p.max_attempts
         )
       )
       AND otlet.source_fields_are_allowed(
         job.input,
         job.definition #> '{task,input_shaping}'
       )
+      AND job.workload_revision_hash = job.active_workload_revision_hash
   ),
   claimable AS (
     SELECT
@@ -234,12 +283,20 @@ AS $$
         OR (
           j.status = 'cancel_requested'
           AND (j.leased_until IS NULL OR j.leased_until < now())
+          AND j.attempts < p.max_attempts
         )
       )
+      AND j.task_name = candidate.task_name
+      AND j.workload_revision_hash = candidate.workload_revision_hash
       AND EXISTS (
         SELECT 1
-        FROM job_contracts job
-        WHERE job.id = j.id
+        FROM locked_tasks task
+        JOIN job_contracts job
+          ON job.id = j.id
+         AND job.task_name = task.task_name
+         AND job.workload_revision_hash = task.workload_revision_hash
+        WHERE task.task_name = candidate.task_name
+          AND task.workload_revision_hash = candidate.workload_revision_hash
           AND otlet.source_fields_are_allowed(
             j.input,
             job.definition #> '{task,input_shaping}'

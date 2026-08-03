@@ -1,6 +1,7 @@
 CREATE FUNCTION otlet.semantic_join_index_current_rows(
   index_name text,
-  fresh_only boolean DEFAULT true
+  fresh_only boolean DEFAULT true,
+  expected_workload_revision_hash text DEFAULT NULL
 ) RETURNS TABLE (
   subject_id text,
   body jsonb,
@@ -18,28 +19,37 @@ DECLARE
   current_contract_hash text;
   current_input_shaping jsonb := '{}'::jsonb;
 BEGIN
-  SELECT *
-  INTO index_row
-  FROM otlet.semantic_join_indexes sji
-  WHERE sji.name = semantic_join_index_current_rows.index_name;
+  SELECT
+    revision.definition #>> '{source,semantic_join_index_name}',
+    revision.definition #>> '{task,name}',
+    revision.definition #>> '{source,candidate_query}',
+    revision.definition #>> '{source,record_type}',
+    (revision.definition #>> '{source,max_candidate_rows}')::integer,
+    head.active_workload_revision_hash,
+    revision.definition #> '{task,input_shaping}'
+  INTO
+    index_row.name,
+    index_row.task_name,
+    index_row.candidate_query,
+    index_row.record_type,
+    index_row.max_candidate_rows,
+    current_contract_hash,
+    current_input_shaping
+  FROM otlet.workload_revision_heads head
+  JOIN otlet.workload_revisions revision
+    ON revision.task_name = head.task_name
+   AND revision.workload_revision_hash = head.active_workload_revision_hash
+  WHERE revision.definition #>> '{source,semantic_join_index_name}' = semantic_join_index_current_rows.index_name
+    AND revision.definition #>> '{source,kind}' = 'pair';
 
   IF NOT FOUND THEN
     RAISE EXCEPTION 'otlet semantic join index % does not exist', semantic_join_index_current_rows.index_name;
   END IF;
 
-  SELECT
-    otlet.task_contract_hash(
-      t.instruction,
-      t.output_schema,
-      t.model_name,
-      t.runtime_options,
-      t.input_shaping,
-      t.decision_contract
-    ),
-    t.input_shaping
-  INTO current_contract_hash, current_input_shaping
-  FROM otlet.tasks t
-  WHERE t.name = index_row.task_name;
+  IF semantic_join_index_current_rows.expected_workload_revision_hash IS NOT NULL
+     AND semantic_join_index_current_rows.expected_workload_revision_hash IS DISTINCT FROM current_contract_hash THEN
+    RAISE EXCEPTION 'otlet workload revision changed during semantic read for index %', index_row.name;
+  END IF;
 
   RETURN QUERY EXECUTE format(
     $sql$
@@ -77,6 +87,7 @@ BEGIN
           ON sm.subject_id = ci.subject_id
         WHERE sm.task_name = %3$L
           AND sm.record_type = %4$L
+          AND sm.contract_hash = %5$L
         ORDER BY
           sm.subject_id,
           (
@@ -143,28 +154,32 @@ DECLARE
   current_source_hash text;
   current_content_hash text;
 BEGIN
-  SELECT *
-  INTO index_row
-  FROM otlet.semantic_join_indexes sji
-  WHERE sji.name = semantic_join_matches.index_name;
+  SELECT
+    revision.definition #>> '{source,semantic_join_index_name}',
+    revision.definition #>> '{task,name}',
+    revision.definition #>> '{source,candidate_query}',
+    revision.definition #>> '{source,record_type}',
+    (revision.definition #>> '{source,max_candidate_rows}')::integer,
+    head.active_workload_revision_hash,
+    revision.definition #> '{task,input_shaping}'
+  INTO
+    index_row.name,
+    index_row.task_name,
+    index_row.candidate_query,
+    index_row.record_type,
+    index_row.max_candidate_rows,
+    current_contract_hash,
+    current_input_shaping
+  FROM otlet.workload_revision_heads head
+  JOIN otlet.workload_revisions revision
+    ON revision.task_name = head.task_name
+   AND revision.workload_revision_hash = head.active_workload_revision_hash
+  WHERE revision.definition #>> '{source,semantic_join_index_name}' = semantic_join_matches.index_name
+    AND revision.definition #>> '{source,kind}' = 'pair';
 
   IF NOT FOUND THEN
     RAISE EXCEPTION 'otlet semantic join index % does not exist', semantic_join_matches.index_name;
   END IF;
-
-  SELECT
-    otlet.task_contract_hash(
-      t.instruction,
-      t.output_schema,
-      t.model_name,
-      t.runtime_options,
-      t.input_shaping,
-      t.decision_contract
-    ),
-    t.input_shaping
-  INTO current_contract_hash, current_input_shaping
-  FROM otlet.tasks t
-  WHERE t.name = index_row.task_name;
 
   EXECUTE format(
     $sql$
@@ -206,6 +221,7 @@ BEGIN
       WHERE sm.task_name = index_row.task_name
         AND sm.record_type = index_row.record_type
         AND sm.subject_id = semantic_join_matches.subject_id
+        AND sm.contract_hash = current_contract_hash
       ORDER BY
         sm.subject_id,
         (

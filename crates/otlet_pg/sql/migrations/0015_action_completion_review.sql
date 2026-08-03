@@ -139,6 +139,10 @@ BEGIN
     ELSE revision_definition #> '{models,direct}'
   END;
   model_row.name := model_definition ->> 'name';
+  IF complete_job.model_name IS NOT NULL
+     AND complete_job.model_name IS DISTINCT FROM model_row.name THEN
+    RAISE EXCEPTION 'otlet model identity does not match task selection role';
+  END IF;
 
   -- Fail before mutating job/receipt state on a bad envelope.
   IF jsonb_typeof(COALESCE(complete_job.actions, '[]'::jsonb)) IS DISTINCT FROM 'array' THEN
@@ -631,7 +635,21 @@ SET search_path = pg_catalog, otlet, pg_temp
 AS $$
 DECLARE
   action_row otlet.actions%ROWTYPE;
+  context_row record;
 BEGIN
+  SELECT *
+  INTO context_row
+  FROM otlet.validated_action_context(approve_action.action_id);
+  IF NOT FOUND
+     OR context_row.validation_error IS NOT NULL
+     OR context_row.authority_error IS NOT NULL
+     OR (
+       (context_row.action_row).content_hash IS NOT NULL
+       AND context_row.current_content_hash IS DISTINCT FROM (context_row.action_row).content_hash
+     ) THEN
+    RETURN;
+  END IF;
+
   UPDATE otlet.actions
   SET status = 'approved',
       approval_status = 'approved',
@@ -702,6 +720,13 @@ RETURNS TABLE (
 LANGUAGE plpgsql
 AS $$
 BEGIN
+  PERFORM 1
+  FROM otlet.actions locked_action
+  JOIN otlet.jobs job ON job.id = locked_action.job_id
+  JOIN otlet.workload_revision_heads head ON head.task_name = job.task_name
+  WHERE locked_action.id = validated_action_context.action_id
+  FOR UPDATE OF head;
+
   RETURN QUERY
   SELECT
     a,
@@ -721,11 +746,15 @@ BEGIN
     j,
     j.task_name,
     o.output,
-    otlet.current_task_subject_content_hash(
-      j.task_name,
-      j.subject_id,
-      j.workload_revision_hash
-    ),
+    CASE
+      WHEN j.workload_revision_hash = head.active_workload_revision_hash THEN
+        otlet.current_task_subject_content_hash(
+          j.task_name,
+          j.subject_id,
+          j.workload_revision_hash
+        )
+      ELSE NULL
+    END,
     otlet.action_validation_error(
       a.payload,
       o.output,
@@ -737,6 +766,8 @@ BEGIN
       )
     ),
     CASE
+      WHEN j.workload_revision_hash IS DISTINCT FROM head.active_workload_revision_hash THEN
+        'action workload revision is not active'
       WHEN a.authority_origin = 'workflow' AND a.action_type = 'update_row' THEN
         otlet.action_workflow_policy_error(
           j.task_name,
@@ -752,8 +783,11 @@ BEGIN
   JOIN otlet.jobs j ON j.id = a.job_id
   JOIN otlet.workload_revisions revision
     ON revision.workload_revision_hash = j.workload_revision_hash
+   AND revision.task_name = j.task_name
+  JOIN otlet.workload_revision_heads head
+    ON head.task_name = j.task_name
   LEFT JOIN otlet.outputs o ON o.id = a.output_id
   WHERE a.id = validated_action_context.action_id
-  FOR UPDATE OF a;
+  FOR UPDATE OF a, head;
 END;
 $$;

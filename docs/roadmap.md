@@ -41,6 +41,7 @@ Every shipped track needs SQL-visible state, a closed failure path, executable D
 | Artifact and runtime identity | Model registration records digest, size, source, revision, quantization, and license. Native receipts bind the effective runtime fingerprint, and portable receipts link to a registered worker identity |
 | Versioned identity algorithms | PostgreSQL domain-separates semantic, task, source, model, and mutation-authority identities in canonical JSON and stores them as `otlet:v1:sha256` digests. Native and SQL-only installs share fixed JSON and Unicode vectors while protocol payload checksums remain raw SHA-256 |
 | Immutable workload revisions | PostgreSQL captures candidate SQL and sources, task contracts, prompt and validator versions, deterministic decode settings, effective runtime options, direct and routed model artifacts, selection checks, and action authority in one content-addressed revision before candidate execution. Jobs, native claims, portable claims, receipts, actions, materialization, review, and historical status keep that revision |
+| Complete revision invalidation | PostgreSQL marks dependent materializations `contract_changed` after output-affecting changes, suspends stale action authority, and keeps old receipt attribution. Revision diff, promotion, rollback, repair, claim fencing, input-query invalidation, and watch retirement have executable proof |
 | Bounded runtime reuse | The native worker keeps one resident model, a bounded exact-output cache, bounded prompt-prefix state, and a bounded task-contract cache with identity-based invalidation |
 | Native same-model cross-task claims | The native task-cursor path can fill one bounded batch from compatible tasks while preserving FIFO order within retry class, claim fencing, and model-policy separation. The reference portable worker requests one claim at a time |
 | Optional native model preload | An owner can preload one registered model with normal artifact, memory, cgroup, fingerprint, and failure checks when predictable first-request latency justifies resident memory |
@@ -68,7 +69,6 @@ Work in this section closes demonstrated correctness and trust gaps before Otlet
 
 | Feature | Explanation |
 | --- | --- |
-| Complete revision invalidation | Mark dependent materializations `contract_changed` for every output-affecting revision change, suspend stale action authority, preserve old receipt attribution, and support revision diff, promotion, rollback, and repair. An input-query-only change must invalidate current semantic state |
 | Source-query and dependency drift | Bind stored query bytes, declared source relations, the current fixed execution identity, and `search_path`; require read-only execution; require declared pair sources to cover actual reads; and revalidate relevant schema, function, privilege, and RLS state for that identity before use. Suspend and repair drifted workloads, and add deeper extension or collation fingerprints only after a concrete case requires them |
 | Action-target DDL and privilege drift | Bind target column types, constraints, identity, writable columns, privileges, and RLS state in the authority contract. Suspend and require reapproval after incompatible DDL or privilege change before dry run or apply |
 | Deterministic input-relation contract | Require non-null unique subject IDs, one canonical input per subject, and deterministic ordering or cursor semantics. Reject conflicting duplicates atomically instead of relying on `LIMIT 1`, `ON CONFLICT DO NOTHING`, or an unstable tie |
@@ -296,7 +296,7 @@ Start these tracks only for deployments whose authority or regulatory model requ
 | Feature | Explanation |
 | --- | --- |
 | Source ownership | Application rows stay in application tables and derived Otlet state stays under `otlet` |
-| Database authority | PostgreSQL remains the authority for workload definition, source identity, validation, claim fencing, freshness, action policy, review state, and trusted evidence. Immutable workload revision becomes part of that authority only after its release blocker ships |
+| Database authority | PostgreSQL remains the authority for workload definition, immutable revision identity, source identity, validation, claim fencing, freshness, action policy, review state, and trusted evidence |
 | Query availability | Normal application queries and reads of fresh materialized results do not require a live model worker |
 | Deterministic first, model last | SQL, rules, search, and specialized matchers should narrow candidates and settle easy cases. Otlet belongs on the bounded ambiguous tail where local model judgment adds measured value |
 | Local-first execution | Native and portable local runtimes remain the default. Remote execution requires an explicit deployment policy and the same PostgreSQL validation path |

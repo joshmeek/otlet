@@ -157,6 +157,21 @@ CREATE TABLE otlet.workload_revisions (
 CREATE INDEX workload_revisions_task_created_idx
 ON otlet.workload_revisions (task_name, created_at DESC, workload_revision_hash);
 
+CREATE TABLE otlet.workload_revision_heads (
+  task_name text PRIMARY KEY REFERENCES otlet.tasks(name),
+  active_workload_revision_hash text NOT NULL,
+  previous_workload_revision_hash text,
+  promoted_at timestamptz NOT NULL DEFAULT now(),
+  CHECK (
+    previous_workload_revision_hash IS NULL
+    OR previous_workload_revision_hash <> active_workload_revision_hash
+  ),
+  FOREIGN KEY (task_name, active_workload_revision_hash)
+    REFERENCES otlet.workload_revisions(task_name, workload_revision_hash),
+  FOREIGN KEY (task_name, previous_workload_revision_hash)
+    REFERENCES otlet.workload_revisions(task_name, workload_revision_hash)
+);
+
 CREATE TABLE otlet.runtime_slots (
   model_name text PRIMARY KEY REFERENCES otlet.models(name),
   artifact_path text,
@@ -224,7 +239,7 @@ CREATE TABLE otlet.jobs (
 );
 
 CREATE UNIQUE INDEX jobs_active_subject_idx
-ON otlet.jobs (task_name, subject_id)
+ON otlet.jobs (task_name, workload_revision_hash, subject_id)
 WHERE status IN ('queued', 'running', 'cancel_requested');
 
 CREATE INDEX jobs_task_status_idx

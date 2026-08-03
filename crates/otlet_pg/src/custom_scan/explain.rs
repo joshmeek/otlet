@@ -58,6 +58,11 @@ unsafe extern "C-unwind" fn explain_semantic_custom_scan(
             );
             explain_text("Source Relation", &runtime.source_table, es);
             explain_text("Task", &runtime.task_name, es);
+            explain_text(
+                "Workload Revision Hash",
+                &runtime.workload_revision_hash,
+                es,
+            );
             explain_text("Record Type", &runtime.record_type, es);
             explain_counter(
                 "Known Semantic Subjects",
@@ -186,6 +191,11 @@ unsafe extern "C-unwind" fn explain_semantic_custom_scan(
             }
             explain_pg_cstr("Source Relation", (*state).source_table, es);
             explain_pg_cstr("Task", (*state).task_name, es);
+            explain_text(
+                "Workload Revision Hash",
+                &private.workload_revision_hash,
+                es,
+            );
             explain_pg_cstr("Record Type", (*state).record_type, es);
             explain_counter("Known Semantic Subjects", (*state).known_subjects, es);
             let preloaded_fresh = (*state)

@@ -2,32 +2,45 @@ fn load_semantic_states(
     index_kind: SemanticIndexKind,
     index_name: &str,
     expected_json: &str,
+    workload_revision_hash: &str,
 ) -> Result<LoadedSemanticState, String> {
     if index_kind == SemanticIndexKind::Join {
-        return load_semantic_join_states(index_name, expected_json);
+        return load_semantic_join_states(index_name, expected_json, workload_revision_hash);
     }
     pgrx::Spi::connect(|client| {
-        let metadata_args = [index_name.into()];
+        let metadata_args = [index_name.into(), workload_revision_hash.into()];
         let metadata = client
             .select(
                 "SELECT \
-                   si.source_table, \
-                   si.subject_column, \
-                   CASE WHEN si.input_columns IS NULL THEN NULL ELSE to_jsonb(si.input_columns)::text END AS input_columns_json, \
-                   quote_nullable(si.input_columns)::text AS input_columns_sql, \
-                   quote_nullable(t.input_shaping::text)::text AS input_shaping_sql, \
-                   si.task_name, \
-                   si.record_type, \
-                   otlet.task_contract_hash(t.instruction, t.output_schema, t.model_name, t.runtime_options, t.input_shaping, t.decision_contract) AS contract_hash, \
+                   revision.definition #>> '{source,source_table}' AS source_table, \
+                   revision.definition #>> '{source,subject_column}' AS subject_column, \
+                   (revision.definition #> '{source,input_columns}')::text AS input_columns_json, \
+                   CASE \
+                     WHEN revision.definition #> '{source,input_columns}' IS NULL THEN 'NULL' \
+                     ELSE quote_nullable(ARRAY( \
+                       SELECT jsonb_array_elements_text( \
+                         revision.definition #> '{source,input_columns}' \
+                       ) \
+                     ))::text \
+                   END AS input_columns_sql, \
+                   quote_nullable((revision.definition #> '{task,input_shaping}')::text)::text AS input_shaping_sql, \
+                   revision.task_name, \
+                   revision.definition #>> '{source,record_type}' AS record_type, \
+                   revision.workload_revision_hash AS contract_hash, \
                    COALESCE(NULLIF(rs.last_generate_ms, 0), 2500)::float8 AS model_ms, \
                    CASE \
                      WHEN COALESCE(rs.last_generate_ms, 0) > 0 THEN 'runtime_slot' \
                      ELSE 'static_fallback' \
                    END AS model_cost_source \
-                 FROM otlet.semantic_indexes si \
-                 JOIN otlet.tasks t ON t.name = si.task_name \
-                 LEFT JOIN otlet.runtime_slots rs ON rs.model_name = t.model_name \
-                 WHERE si.name = $1 \
+                 FROM otlet.workload_revisions revision \
+                 JOIN otlet.workload_revision_heads head \
+                   ON head.task_name = revision.task_name \
+                  AND head.active_workload_revision_hash = revision.workload_revision_hash \
+                 LEFT JOIN otlet.runtime_slots rs \
+                   ON rs.model_name = revision.definition #>> '{models,direct,name}' \
+                 WHERE revision.definition #>> '{source,semantic_index_name}' = $1 \
+                   AND revision.definition #>> '{source,kind}' = 'row' \
+                   AND revision.workload_revision_hash = $2 \
                  LIMIT 1",
                 Some(1),
                 &metadata_args,
@@ -117,6 +130,7 @@ fn load_semantic_states(
              ON sm.subject_id = src.subject_id \
            WHERE sm.task_name = $1 \
              AND sm.record_type = $2 \
+             AND sm.contract_hash = $3 \
            ORDER BY sm.subject_id, \
              (sm.content_hash IS NOT DISTINCT FROM src.content_hash AND sm.contract_hash IS NOT DISTINCT FROM $3::text) DESC, \
              sm.updated_at DESC, sm.id DESC \
@@ -126,6 +140,7 @@ fn load_semantic_states(
            FROM otlet.jobs j \
            JOIN source_rows src ON src.subject_id = j.subject_id \
            WHERE j.task_name = $1 \
+             AND j.workload_revision_hash = $3 \
              AND j.status IN ('queued', 'running', 'cancel_requested') \
          ), \
          semantic_state AS ( \
@@ -210,6 +225,7 @@ fn load_semantic_states(
         Ok(LoadedSemanticState {
             source_table,
             task_name,
+            workload_revision_hash: contract_hash,
             record_type,
             input_columns,
             freshness_basis_counts: freshness_basis_counts_json(&freshness_basis_counts),
@@ -226,13 +242,19 @@ fn load_semantic_states(
 fn load_semantic_join_states(
     index_name: &str,
     expected_json: &str,
+    workload_revision_hash: &str,
 ) -> Result<LoadedSemanticState, String> {
     pgrx::Spi::connect(|client| {
-        let args = [index_name.into(), expected_json.into()];
+        let args = [
+            index_name.into(),
+            expected_json.into(),
+            workload_revision_hash.into(),
+        ];
         let query = "WITH meta AS ( \
                    SELECT \
-                     sji.task_name, \
-                     sji.record_type, \
+                     revision.task_name, \
+                     revision.definition #>> '{source,record_type}' AS record_type, \
+                     revision.workload_revision_hash, \
                      COALESCE(NULLIF(rs.last_generate_ms, 0), 2500)::float8 AS model_ms, \
                      CASE \
                        WHEN COALESCE(rs.last_generate_ms, 0) > 0 THEN 'runtime_slot' \
@@ -244,22 +266,28 @@ fn load_semantic_join_states(
                         LIMIT 1), \
                        '{}' \
                      ) AS stale_reasons \
-                   FROM otlet.semantic_join_indexes sji \
-                   JOIN otlet.tasks t ON t.name = sji.task_name \
-                   LEFT JOIN otlet.runtime_slots rs ON rs.model_name = t.model_name \
-                   WHERE sji.name = $1 \
+                   FROM otlet.workload_revisions revision \
+                   JOIN otlet.workload_revision_heads head \
+                     ON head.task_name = revision.task_name \
+                    AND head.active_workload_revision_hash = revision.workload_revision_hash \
+                   LEFT JOIN otlet.runtime_slots rs \
+                     ON rs.model_name = revision.definition #>> '{models,direct,name}' \
+                   WHERE revision.definition #>> '{source,semantic_join_index_name}' = $1 \
+                     AND revision.definition #>> '{source,kind}' = 'pair' \
+                     AND revision.workload_revision_hash = $3 \
                    LIMIT 1 \
                  ), \
                  current_rows AS ( \
                    SELECT subject_id, body, stale, freshness_basis \
-                   FROM otlet.semantic_join_index_current_rows($1, false) \
+                   FROM otlet.semantic_join_index_current_rows($1, false, $3) \
                    WHERE EXISTS (SELECT 1 FROM meta) \
                  ), \
                  active_jobs AS ( \
                    SELECT DISTINCT j.subject_id \
                    FROM otlet.jobs j \
                    JOIN meta m ON m.task_name = j.task_name \
-                   WHERE j.status IN ('queued', 'running', 'cancel_requested') \
+                   WHERE j.workload_revision_hash = $3 \
+                     AND j.status IN ('queued', 'running', 'cancel_requested') \
                  ), \
                  subjects AS ( \
                    SELECT \
@@ -278,6 +306,7 @@ fn load_semantic_join_states(
                  SELECT \
                    m.task_name, \
                    m.record_type, \
+                   m.workload_revision_hash, \
                    m.model_ms, \
                    m.model_cost_source, \
                    m.stale_reasons, \
@@ -297,6 +326,7 @@ fn load_semantic_join_states(
         }
         let mut task_name = None;
         let mut record_type = None;
+        let mut loaded_workload_revision_hash = None;
         let mut model_ms = 2500.0;
         let mut model_cost_source = "static_fallback".to_owned();
         let mut stale_reasons = "{}".to_owned();
@@ -314,6 +344,9 @@ fn load_semantic_join_states(
                     .map_err(to_string)?;
                 record_type = row
                     .get_by_name::<String, _>("record_type")
+                    .map_err(to_string)?;
+                loaded_workload_revision_hash = row
+                    .get_by_name::<String, _>("workload_revision_hash")
                     .map_err(to_string)?;
                 model_ms = row
                     .get_by_name::<f64, _>("model_ms")
@@ -361,9 +394,13 @@ fn load_semantic_join_states(
             .ok_or_else(|| format!("otlet semantic join index {index_name} has no task"))?;
         let record_type = record_type
             .ok_or_else(|| format!("otlet semantic join index {index_name} has no record type"))?;
+        let loaded_workload_revision_hash = loaded_workload_revision_hash.ok_or_else(|| {
+            format!("otlet semantic join index {index_name} has no active workload revision")
+        })?;
         Ok(LoadedSemanticState {
             source_table: format!("otlet.semantic_join:{index_name}"),
             task_name,
+            workload_revision_hash: loaded_workload_revision_hash,
             record_type,
             input_columns: None,
             freshness_basis_counts: freshness_basis_counts_json(&freshness_basis_counts),

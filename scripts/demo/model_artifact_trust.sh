@@ -189,7 +189,5 @@ done
 psql_exec >/dev/null <<'SQL'
 DELETE FROM otlet.runtime_slots
 WHERE model_name IN ('artifact_malformed_smoke', 'artifact_tampered_smoke', 'artifact_truncated_smoke', 'artifact_parser_malformed_smoke', 'artifact_unreadable_smoke');
-DELETE FROM otlet.models
-WHERE name IN ('artifact_malformed_smoke', 'artifact_tampered_smoke', 'artifact_truncated_smoke', 'artifact_parser_malformed_smoke', 'artifact_unreadable_smoke');
 SQL
 docker exec "$container" rm -rf "$artifact_test_dir"

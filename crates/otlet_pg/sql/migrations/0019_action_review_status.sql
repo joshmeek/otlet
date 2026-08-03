@@ -94,6 +94,11 @@ SELECT
   a.id AS action_id,
   a.job_id,
   j.workload_revision_hash,
+  head.active_workload_revision_hash,
+  CASE
+    WHEN j.workload_revision_hash = head.active_workload_revision_hash THEN 'active'
+    ELSE 'suspended'
+  END AS authority_status,
   j.task_name,
   j.subject_id AS job_subject_id,
   a.subject_id,
@@ -131,6 +136,7 @@ SELECT
   execution.replay_of_receipt_id
 FROM otlet.actions a
 JOIN otlet.jobs j ON j.id = a.job_id
+LEFT JOIN otlet.workload_revision_heads head ON head.task_name = j.task_name
 LEFT JOIN otlet.outputs o ON o.id = a.output_id
 LEFT JOIN otlet.inference_receipts r ON r.id = a.receipt_id
 LEFT JOIN LATERAL (
@@ -142,6 +148,16 @@ LEFT JOIN LATERAL (
 ) execution ON true;
 
 CREATE VIEW otlet.action_workflow_policy_status AS
+WITH active AS (
+  SELECT
+    head.task_name,
+    head.active_workload_revision_hash,
+    revision.definition
+  FROM otlet.workload_revision_heads head
+  JOIN otlet.workload_revisions revision
+    ON revision.task_name = head.task_name
+   AND revision.workload_revision_hash = head.active_workload_revision_hash
+)
 SELECT
   p.task_name,
   p.action_type,
@@ -153,21 +169,41 @@ SELECT
   p.task_contract_hash,
   p.target_contract_hash,
   p.enabled,
-  p.task_contract_hash IS NOT DISTINCT FROM otlet.current_task_contract_hash(p.task_name)
-    AS task_contract_current,
-  p.target_contract_hash IS NOT DISTINCT FROM otlet.action_target_contract_hash(p.target_name)
+  active.active_workload_revision_hash,
+  p.policy_hash IS NOT DISTINCT FROM active.definition #>> ARRAY[
+    'action_policies', p.action_type, 'authority', 'policy_hash'
+  ] AS task_contract_current,
+  active.definition #>> ARRAY[
+    'action_policies', p.action_type, 'authority', 'target_contract_hash'
+  ] IS NOT DISTINCT FROM otlet.action_target_contract_hash(
+    active.definition #>> ARRAY['action_policies', p.action_type, 'authority', 'target_name']
+  )
     AS target_contract_current,
-  otlet.action_target_validation_error(p.target_name) AS target_error,
-  p.enabled
-    AND p.authority_mode = 'bounded_mutation'
-    AND p.evaluation_status = 'evaluated'
-    AND p.task_contract_hash IS NOT DISTINCT FROM otlet.current_task_contract_hash(p.task_name)
-    AND p.target_contract_hash IS NOT DISTINCT FROM otlet.action_target_contract_hash(p.target_name)
-    AND otlet.action_target_validation_error(p.target_name) IS NULL
+  otlet.action_target_validation_error(
+    active.definition #>> ARRAY['action_policies', p.action_type, 'authority', 'target_name']
+  ) AS target_error,
+  COALESCE((active.definition #>> ARRAY[
+    'action_policies', p.action_type, 'authority', 'enabled'
+  ])::boolean, false)
+    AND active.definition #>> ARRAY[
+      'action_policies', p.action_type, 'authority', 'mode'
+    ] = 'bounded_mutation'
+    AND active.definition #>> ARRAY[
+      'action_policies', p.action_type, 'authority', 'evaluation_status'
+    ] = 'evaluated'
+    AND active.definition #>> ARRAY[
+      'action_policies', p.action_type, 'authority', 'target_contract_hash'
+    ] IS NOT DISTINCT FROM otlet.action_target_contract_hash(
+      active.definition #>> ARRAY['action_policies', p.action_type, 'authority', 'target_name']
+    )
+    AND otlet.action_target_validation_error(
+      active.definition #>> ARRAY['action_policies', p.action_type, 'authority', 'target_name']
+    ) IS NULL
     AS mutation_authorized,
   p.created_at,
   p.updated_at
-FROM otlet.action_workflow_policies p;
+FROM otlet.action_workflow_policies p
+LEFT JOIN active ON active.task_name = p.task_name;
 
 CREATE VIEW otlet.eval_label_status AS
 SELECT
@@ -210,12 +246,14 @@ CREATE VIEW otlet.review_queue AS
 WITH action_items AS (
   SELECT
     CASE
+      WHEN j.workload_revision_hash IS DISTINCT FROM head.active_workload_revision_hash THEN 'suspended_authority'
       WHEN a.action_type = 'update_row' AND a.dry_run_status = 'not_run' THEN 'pending_dry_run'
       WHEN a.approval_status = 'required' AND a.status = 'proposed' THEN 'pending_approval'
       WHEN a.action_type = 'update_row' AND a.status = 'approved' THEN 'ready_to_apply'
       ELSE 'review_flag'
     END AS queue_kind,
     CASE
+      WHEN j.workload_revision_hash IS DISTINCT FROM head.active_workload_revision_hash THEN 'review'
       WHEN a.action_type = 'update_row' AND a.dry_run_status = 'not_run' THEN 'dry_run'
       WHEN a.action_type = 'update_row' AND a.dry_run_status = 'failed' THEN 'review_failure'
       WHEN a.action_type = 'update_row' AND a.status = 'proposed' THEN 'approve'
@@ -265,6 +303,7 @@ WITH action_items AS (
     a.created_at
   FROM otlet.actions a
   JOIN otlet.jobs j ON j.id = a.job_id
+  LEFT JOIN otlet.workload_revision_heads head ON head.task_name = j.task_name
   JOIN otlet.workload_revisions revision
     ON revision.workload_revision_hash = j.workload_revision_hash
   LEFT JOIN otlet.outputs o ON o.id = a.output_id
@@ -280,6 +319,7 @@ WITH action_items AS (
     FROM otlet.semantic_materializations sm
     WHERE sm.task_name = j.task_name
       AND sm.subject_id = j.subject_id
+      AND sm.contract_hash = j.workload_revision_hash
       AND (
         revision.definition #>> '{source,record_type}' IS NULL
         OR sm.record_type = revision.definition #>> '{source,record_type}'
@@ -368,6 +408,7 @@ abstention_items AS (
     FROM otlet.semantic_materializations sm
     WHERE sm.task_name = j.task_name
       AND sm.subject_id = j.subject_id
+      AND sm.contract_hash = j.workload_revision_hash
       AND (
         revision.definition #>> '{source,record_type}' IS NULL
         OR sm.record_type = revision.definition #>> '{source,record_type}'
@@ -453,6 +494,7 @@ direct_rejected_items AS (
     FROM otlet.semantic_materializations sm
     WHERE sm.task_name = j.task_name
       AND sm.subject_id = j.subject_id
+      AND sm.contract_hash = j.workload_revision_hash
       AND (
         revision.definition #>> '{source,record_type}' IS NULL
         OR sm.record_type = revision.definition #>> '{source,record_type}'

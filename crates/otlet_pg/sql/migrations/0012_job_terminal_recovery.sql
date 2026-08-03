@@ -39,9 +39,9 @@ BEGIN
       ) field(field_name);
     ELSIF source_kind = 'pair' THEN
       task_row.input_query := format(
-        'SELECT subject_id, input FROM otlet.semantic_join_refresh_inputs(%L, %L)',
-        revision_definition #>> '{source,semantic_join_index_name}',
-        current_task_subject_content_hash.workload_revision_hash
+        'SELECT subject_id::text, input::jsonb FROM (%s) otlet_pair_input ORDER BY subject_id LIMIT %s',
+        revision_definition #>> '{source,candidate_query}',
+        (revision_definition #>> '{source,max_candidate_rows}')::integer
       );
     END IF;
   END IF;
@@ -320,20 +320,43 @@ DECLARE
   task_row otlet.tasks%ROWTYPE;
   model_row otlet.models%ROWTYPE;
   revision_definition jsonb;
+  policy_max_attempts integer;
+  inactive_revision boolean;
   swept bigint := 0;
   canceled_swept bigint := 0;
 BEGIN
+  SELECT p.max_attempts
+  INTO policy_max_attempts
+  FROM otlet.production_policy p
+  WHERE p.name = 'default';
+
   FOR job_row IN
     SELECT j.*
     FROM otlet.jobs j
-    CROSS JOIN otlet.production_policy p
-    WHERE p.name = 'default'
-      AND j.status = 'running'
+    WHERE j.status = 'running'
       AND (j.leased_until IS NULL OR j.leased_until < now())
-      AND j.attempts >= p.max_attempts
+      AND (
+        j.attempts >= policy_max_attempts
+        OR NOT EXISTS (
+          SELECT 1
+          FROM otlet.workload_revision_heads head
+          WHERE head.task_name = j.task_name
+            AND head.active_workload_revision_hash = j.workload_revision_hash
+        )
+      )
     ORDER BY j.id
     FOR UPDATE OF j
   LOOP
+    SELECT NOT EXISTS (
+      SELECT 1
+      FROM otlet.workload_revision_heads head
+      WHERE head.task_name = job_row.task_name
+        AND head.active_workload_revision_hash = job_row.workload_revision_hash
+    ) INTO inactive_revision;
+    IF NOT inactive_revision AND job_row.attempts < policy_max_attempts THEN
+      CONTINUE;
+    END IF;
+
     SELECT revision.definition
     INTO revision_definition
     FROM otlet.workload_revisions revision
@@ -363,7 +386,10 @@ BEGIN
 
     PERFORM otlet.fail_job(
       job_row.id,
-      'job lease expired after max attempts',
+      CASE
+        WHEN inactive_revision THEN 'job lease expired after workload revision changed'
+        ELSE 'job lease expired after max attempts'
+      END,
       raw_output_hash => otlet.portable_text_hash(''),
       trace_summary => jsonb_build_object('schema_validation_status', 'not_run'),
       schema_validation_status => 'not_run',
@@ -375,26 +401,43 @@ BEGIN
         ELSE 'direct'
       END,
       selection_status => 'failed',
-      selection_reason => 'job_lease_expired_after_max_attempts',
+      selection_reason => CASE
+        WHEN inactive_revision THEN 'workload_revision_changed_after_lease_expired'
+        ELSE 'job_lease_expired_after_max_attempts'
+      END,
       expected_claim_token => job_row.claim_token
     );
 
     swept := swept + 1;
   END LOOP;
 
-  -- Symmetric terminalization for cancel_requested rows that exhausted attempts
-  -- and lost their lease (prevents infinite reclaim under nested SPI failure).
   FOR job_row IN
     SELECT j.*
     FROM otlet.jobs j
-    CROSS JOIN otlet.production_policy p
-    WHERE p.name = 'default'
-      AND j.status = 'cancel_requested'
+    WHERE j.status = 'cancel_requested'
       AND (j.leased_until IS NULL OR j.leased_until < now())
-      AND j.attempts >= p.max_attempts
+      AND (
+        j.attempts >= policy_max_attempts
+        OR NOT EXISTS (
+          SELECT 1
+          FROM otlet.workload_revision_heads head
+          WHERE head.task_name = j.task_name
+            AND head.active_workload_revision_hash = j.workload_revision_hash
+        )
+      )
     ORDER BY j.id
     FOR UPDATE OF j
   LOOP
+    SELECT NOT EXISTS (
+      SELECT 1
+      FROM otlet.workload_revision_heads head
+      WHERE head.task_name = job_row.task_name
+        AND head.active_workload_revision_hash = job_row.workload_revision_hash
+    ) INTO inactive_revision;
+    IF NOT inactive_revision AND job_row.attempts < policy_max_attempts THEN
+      CONTINUE;
+    END IF;
+
     SELECT revision.definition
     INTO revision_definition
     FROM otlet.workload_revisions revision
@@ -435,7 +478,7 @@ BEGIN
       'expired_job_sweep',
       NULL,
       NULL,
-      'otlet expired running jobs failed after max attempts',
+      'otlet expired running jobs terminalized',
       jsonb_build_object('failed_jobs', swept)
     );
   END IF;
@@ -445,7 +488,7 @@ BEGIN
       'expired_cancel_requested_sweep',
       NULL,
       NULL,
-      'otlet expired cancel_requested jobs finished after max attempts',
+      'otlet expired cancel_requested jobs terminalized',
       jsonb_build_object('canceled_jobs', canceled_swept)
     );
   END IF;

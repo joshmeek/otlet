@@ -1,6 +1,7 @@
 struct CustomScanPrivate {
     index_kind: SemanticIndexKind,
     index_name: String,
+    workload_revision_hash: String,
     expected_json: String,
     auto_policy: bool,
     allow_refresh: bool,
@@ -17,6 +18,7 @@ unsafe fn custom_private_from_predicate(predicate: &SemanticMatchPredicate) -> *
         let payload = json!({
             "index_kind": predicate.index_kind.as_str(),
             "index_name": &predicate.index_name,
+            "workload_revision_hash": &predicate.workload_revision_hash,
             "expected_json": &predicate.expected_json,
             "auto_policy": predicate.auto_policy,
             "allow_refresh": predicate.allow_refresh,
@@ -66,6 +68,10 @@ unsafe fn custom_private_from_list(private: *mut pg_sys::List) -> Option<CustomS
                 .and_then(SemanticIndexKind::from_str)
                 .unwrap_or(SemanticIndexKind::Row),
             index_name: payload.get("index_name")?.as_str()?.to_owned(),
+            workload_revision_hash: payload
+                .get("workload_revision_hash")?
+                .as_str()?
+                .to_owned(),
             expected_json: payload.get("expected_json")?.as_str()?.to_owned(),
             auto_policy: payload
                 .get("auto_policy")
@@ -99,7 +105,10 @@ unsafe fn custom_private_from_list(private: *mut pg_sys::List) -> Option<CustomS
 
 fn reload_private_planner_stats_plan_only(private: &CustomScanPrivate) -> SemanticPlannerStats {
     pgrx::Spi::connect(|client| {
-        let args = [private.index_name.as_str().into()];
+        let args = [
+            private.index_name.as_str().into(),
+            private.workload_revision_hash.as_str().into(),
+        ];
         let query = match private.index_kind {
             SemanticIndexKind::Row => {
                 "SELECT \
@@ -118,7 +127,16 @@ fn reload_private_planner_stats_plan_only(private: &CustomScanPrivate) -> Semant
                    COALESCE(path_cost, 1)::float8 AS path_cost, \
                    COALESCE(stale_reasons::text, '{}')::text AS stale_reasons, \
                    COALESCE(count_basis, 'exact')::text AS count_basis \
-                 FROM otlet.semantic_index_plan($1, true)"
+                 FROM otlet.semantic_index_plan($1, true) \
+                 WHERE EXISTS ( \
+                   SELECT 1 \
+                   FROM otlet.workload_revision_heads head \
+                   JOIN otlet.workload_revisions revision \
+                     ON revision.task_name = head.task_name \
+                    AND revision.workload_revision_hash = head.active_workload_revision_hash \
+                   WHERE head.active_workload_revision_hash = $2 \
+                     AND revision.definition #>> '{source,semantic_index_name}' = $1 \
+                 )"
             }
             SemanticIndexKind::Join => {
                 "SELECT \
@@ -137,7 +155,16 @@ fn reload_private_planner_stats_plan_only(private: &CustomScanPrivate) -> Semant
                    COALESCE(path_cost, 1)::float8 AS path_cost, \
                    COALESCE(stale_reasons::text, '{}')::text AS stale_reasons, \
                    COALESCE(count_basis, 'exact')::text AS count_basis \
-                 FROM otlet.semantic_join_index_plan($1)"
+                 FROM otlet.semantic_join_index_plan($1) \
+                 WHERE EXISTS ( \
+                   SELECT 1 \
+                   FROM otlet.workload_revision_heads head \
+                   JOIN otlet.workload_revisions revision \
+                     ON revision.task_name = head.task_name \
+                    AND revision.workload_revision_hash = head.active_workload_revision_hash \
+                   WHERE head.active_workload_revision_hash = $2 \
+                     AND revision.definition #>> '{source,semantic_join_index_name}' = $1 \
+                 )"
             }
         };
         let table = client.select(query, Some(1), &args).map_err(to_string)?;

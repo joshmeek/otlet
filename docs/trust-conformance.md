@@ -54,6 +54,13 @@ workload_revision_semantic_contract=ok
 workload_revision_status_contract=ok
 ```
 
+`./scripts/demo/revision_invalidation.sh` makes an input-query-only revision, promotes it, rolls back, repairs semantic state, and drops the watch. It checks `contract_changed` materializations, suspended action authority, and revision-bound receipts. The proof fences inactive queues, serializes claims with promotion, and rejects an active source query after watch removal
+
+```text
+revision_invalidation_contract=ok
+revision_claim_serialization_contract=true|true
+```
+
 ## Native Threats
 
 - Prompt text tries to override the instruction or choose an action target
