@@ -28,6 +28,64 @@ BEGIN
 
   RETURN QUERY
   SELECT
+    'workload_revisions_are_content_addressed'::text,
+    'workload_revision'::text,
+    revision.workload_revision_hash,
+    jsonb_build_object(
+      'task_name', revision.task_name,
+      'definition_task_name', revision.definition #>> '{task,name}',
+      'format', revision.definition ->> 'format'
+    )
+  FROM otlet.workload_revisions revision
+  WHERE revision.workload_revision_hash IS DISTINCT FROM otlet.identity_hash(
+      'workload_revision',
+      revision.definition
+    )
+     OR revision.definition ->> 'format' IS DISTINCT FROM 'otlet.workload.v1'
+     OR revision.definition #>> '{task,name}' IS DISTINCT FROM revision.task_name;
+
+  RETURN QUERY
+  SELECT
+    'receipt_workload_revision_matches_job'::text,
+    'receipt'::text,
+    receipt.id::text,
+    jsonb_build_object(
+      'job_id', receipt.job_id,
+      'receipt_revision', receipt.workload_revision_hash,
+      'job_revision', job.workload_revision_hash
+    )
+  FROM otlet.inference_receipts receipt
+  JOIN otlet.jobs job ON job.id = receipt.job_id
+  WHERE receipt.workload_revision_hash IS DISTINCT FROM job.workload_revision_hash;
+
+  RETURN QUERY
+  SELECT
+    'receipt_artifact_matches_workload_revision'::text,
+    'receipt'::text,
+    receipt.id::text,
+    jsonb_build_object(
+      'selection_role', receipt.selection_role,
+      'receipt_model_name', receipt.model_name,
+      'receipt_artifact_hash', receipt.model_artifact_hash,
+      'revision_model', model.definition
+    )
+  FROM otlet.inference_receipts receipt
+  JOIN otlet.workload_revisions revision
+    ON revision.workload_revision_hash = receipt.workload_revision_hash
+  CROSS JOIN LATERAL (
+    SELECT CASE receipt.selection_role
+      WHEN 'cheap' THEN revision.definition #> '{models,cheap}'
+      WHEN 'strong' THEN revision.definition #> '{models,strong}'
+      ELSE revision.definition #> '{models,direct}'
+    END AS definition
+  ) model
+  WHERE receipt.model_name IS DISTINCT FROM model.definition ->> 'name'
+     OR receipt.model_artifact_path IS DISTINCT FROM model.definition ->> 'artifact_path'
+     OR receipt.model_artifact_hash IS DISTINCT FROM model.definition ->> 'artifact_hash'
+     OR receipt.model_artifact_identity IS DISTINCT FROM model.definition -> 'artifact_identity';
+
+  RETURN QUERY
+  SELECT
     'one_accepted_output_per_job'::text,
     'job'::text,
     o.job_id::text,
@@ -101,12 +159,15 @@ BEGIN
       count(j.id)::bigint AS queued_jobs,
       p.max_queued_jobs_per_model
     FROM otlet.production_policy p
-    JOIN otlet.models m ON true
-    LEFT JOIN otlet.tasks t ON true
-    LEFT JOIN otlet.jobs j
-      ON j.task_name = t.name
-     AND COALESCE(j.routed_model_name, t.model_name) = m.name
-     AND j.status = 'queued'
+    JOIN otlet.jobs j ON j.status = 'queued'
+    JOIN otlet.workload_revisions revision
+      ON revision.workload_revision_hash = j.workload_revision_hash
+    CROSS JOIN LATERAL (
+      SELECT COALESCE(
+        j.routed_model_name,
+        revision.definition #>> '{models,direct,name}'
+      ) AS name
+    ) m
     GROUP BY m.name, p.max_queued_jobs_per_model
   ) q
   WHERE q.queued_jobs > q.max_queued_jobs_per_model;
@@ -126,12 +187,15 @@ BEGIN
       COALESCE(sum(octet_length(j.input::text)), 0)::bigint AS queued_input_bytes,
       p.max_queued_input_bytes_per_model
     FROM otlet.production_policy p
-    CROSS JOIN otlet.models m
-    LEFT JOIN otlet.tasks t ON true
-    LEFT JOIN otlet.jobs j
-      ON j.task_name = t.name
-     AND COALESCE(j.routed_model_name, t.model_name) = m.name
-     AND j.status = 'queued'
+    JOIN otlet.jobs j ON j.status = 'queued'
+    JOIN otlet.workload_revisions revision
+      ON revision.workload_revision_hash = j.workload_revision_hash
+    CROSS JOIN LATERAL (
+      SELECT COALESCE(
+        j.routed_model_name,
+        revision.definition #>> '{models,direct,name}'
+      ) AS name
+    ) m
     GROUP BY m.name, p.max_queued_input_bytes_per_model
   ) q
   WHERE q.queued_input_bytes > q.max_queued_input_bytes_per_model;
@@ -194,10 +258,14 @@ BEGIN
     )
   FROM otlet.actions a
   JOIN otlet.jobs j ON j.id = a.job_id
-  JOIN otlet.tasks t ON t.name = j.task_name
+  JOIN otlet.workload_revisions revision
+    ON revision.workload_revision_hash = j.workload_revision_hash
   WHERE a.authority_origin = 'workflow'
     AND a.status <> 'rejected'
-    AND NOT COALESCE(t.decision_contract -> 'action_types', '[]'::jsonb) ? a.action_type;
+    AND NOT COALESCE(
+      revision.definition #> '{task,decision_contract,action_types}',
+      '[]'::jsonb
+    ) ? a.action_type;
 
   RETURN QUERY
   SELECT
@@ -208,29 +276,28 @@ BEGIN
       'task_name', j.task_name,
       'target_name', a.target_name,
       'subject_namespace', a.subject_namespace,
-      'authority_error', otlet.action_workflow_policy_error(
-        j.task_name,
-        a.action_type,
-        a.authority_policy_hash,
-        a.target_name,
-        a.subject_namespace,
-        false
-      )
+      'revision_authority', revision.definition #> '{action_policies,update_row,authority}'
     )
   FROM otlet.actions a
   JOIN otlet.jobs j ON j.id = a.job_id
+  JOIN otlet.workload_revisions revision
+    ON revision.workload_revision_hash = j.workload_revision_hash
   WHERE a.action_type = 'update_row'
     AND a.status <> 'rejected'
     AND (
       a.authority_origin <> 'workflow'
-      OR otlet.action_workflow_policy_error(
-        j.task_name,
-        a.action_type,
-        a.authority_policy_hash,
-        a.target_name,
-        a.subject_namespace,
-        false
-      ) IS NOT NULL
+      OR revision.definition #>> '{action_policies,update_row,authority,origin}' <> 'workflow'
+      OR COALESCE((revision.definition #>> '{action_policies,update_row,authority,enabled}')::boolean, false) IS NOT TRUE
+      OR a.authority_policy_hash IS DISTINCT FROM
+        revision.definition #>> '{action_policies,update_row,authority,policy_hash}'
+      OR a.target_name IS DISTINCT FROM
+        revision.definition #>> '{action_policies,update_row,authority,target_name}'
+      OR a.subject_namespace IS DISTINCT FROM
+        revision.definition #>> '{action_policies,update_row,authority,subject_namespace}'
+      OR a.authority_mode IS DISTINCT FROM
+        revision.definition #>> '{action_policies,update_row,authority,mode}'
+      OR a.evaluation_status IS DISTINCT FROM
+        revision.definition #>> '{action_policies,update_row,authority,evaluation_status}'
     );
 
   RETURN QUERY
@@ -388,6 +455,8 @@ BEGIN
       OR r.actions_hash IS NULL
       OR r.trace_summary #>> '{portable_validation,version}'
         IS DISTINCT FROM 'otlet_portable_validation_v1'
+      OR r.trace_summary #>> '{portable_validation,workload_revision_hash}'
+        IS DISTINCT FROM r.workload_revision_hash
     );
 
   RETURN QUERY
@@ -442,6 +511,7 @@ BEGIN
   JOIN otlet.portable_claims c ON c.id = l.claim_id
   JOIN otlet.inference_receipts r ON r.id = l.receipt_id
   WHERE r.job_id IS DISTINCT FROM c.job_id
+     OR r.workload_revision_hash IS DISTINCT FROM c.workload_revision_hash
      OR r.runtime_name NOT LIKE 'portable:%'
      OR r.runtime_endpoint IS DISTINCT FROM 'postgres_rpc';
 

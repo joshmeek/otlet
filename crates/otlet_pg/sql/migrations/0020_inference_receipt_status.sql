@@ -14,13 +14,19 @@ WITH receipt_counts AS (
 output_counts AS (
   SELECT
     count(*) FILTER (
-      WHERE COALESCE(t.decision_contract -> 'abstain_values', '["unclear"]'::jsonb)
-        ? (o.output ->> COALESCE(NULLIF(t.decision_contract ->> 'answer_field', ''), 'match'))
+      WHERE COALESCE(
+        revision.definition #> '{task,decision_contract,abstain_values}',
+        '["unclear"]'::jsonb
+      ) ? (o.output ->> COALESCE(
+        NULLIF(revision.definition #>> '{task,decision_contract,answer_field}', ''),
+        'match'
+      ))
     )::bigint AS abstained_outputs,
     count(*)::bigint AS trusted_outputs
   FROM otlet.outputs o
   JOIN otlet.jobs j ON j.id = o.job_id
-  JOIN otlet.tasks t ON t.name = j.task_name
+  JOIN otlet.workload_revisions revision
+    ON revision.workload_revision_hash = j.workload_revision_hash
 ),
 action_counts AS (
   SELECT
@@ -58,6 +64,7 @@ WITH latest_materialization AS (
 SELECT
   r.id AS receipt_id,
   r.job_id,
+  r.workload_revision_hash,
   r.task_name,
   r.subject_id,
   r.attempt_index,

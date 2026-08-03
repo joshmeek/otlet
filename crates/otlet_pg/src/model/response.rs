@@ -119,6 +119,7 @@ mod output_tests {
         Job {
             id: 1,
             task_name: "contract_test".to_owned(),
+            workload_revision_hash: format!("otlet:v1:sha256:{}", "0".repeat(64)),
             subject_id: "subject".to_owned(),
             instruction: "classify the record ".repeat(8),
             output_schema: json!({"type": "object", "properties": properties}),

@@ -93,8 +93,9 @@ DECLARE
   task_row otlet.tasks%ROWTYPE;
   model_row otlet.models%ROWTYPE;
   policy otlet.production_policy%ROWTYPE;
-  selection_policy otlet.model_selection_policies%ROWTYPE;
-  workflow_policy otlet.action_workflow_policies%ROWTYPE;
+  revision_definition jsonb;
+  model_definition jsonb;
+  workflow_authority jsonb;
   effective_runtime_options jsonb;
   shaped_input jsonb;
   raw_envelope jsonb;
@@ -130,13 +131,22 @@ BEGIN
     RAISE EXCEPTION 'otlet job % does not exist', validate_portable_result.job_id;
   END IF;
 
-  SELECT t.*
-  INTO task_row
-  FROM otlet.tasks t
-  WHERE t.name = job_row.task_name;
+  SELECT revision.definition
+  INTO revision_definition
+  FROM otlet.workload_revisions revision
+  WHERE revision.workload_revision_hash = job_row.workload_revision_hash
+    AND revision.task_name = job_row.task_name;
   IF NOT FOUND THEN
-    RAISE EXCEPTION 'otlet task % does not exist', job_row.task_name;
+    RAISE EXCEPTION 'otlet job workload revision is missing';
   END IF;
+  task_row.name := job_row.task_name;
+  task_row.input_query := revision_definition #>> '{task,input_query}';
+  task_row.instruction := revision_definition #>> '{task,instruction}';
+  task_row.output_schema := revision_definition #> '{task,output_schema}';
+  task_row.model_name := revision_definition #>> '{models,direct,name}';
+  task_row.runtime_options := revision_definition #> '{task,runtime_options}';
+  task_row.input_shaping := revision_definition #> '{task,input_shaping}';
+  task_row.decision_contract := revision_definition #> '{task,decision_contract}';
 
   SELECT p.*
   INTO policy
@@ -145,25 +155,25 @@ BEGIN
   IF NOT FOUND THEN
     RAISE EXCEPTION 'otlet default production policy does not exist';
   END IF;
-  effective_runtime_options := policy.default_runtime_options || task_row.runtime_options;
+  effective_runtime_options := revision_definition #> '{runtime,effective_options}';
 
   IF COALESCE(validate_portable_result.selection_role, 'direct') = 'direct' THEN
     expected_model_name := task_row.model_name;
+    model_definition := revision_definition #> '{models,direct}';
   ELSE
-    SELECT p.*
-    INTO selection_policy
-    FROM otlet.model_selection_policies p
-    WHERE p.task_name = task_row.name;
-    IF NOT FOUND THEN
-      RAISE EXCEPTION 'otlet task % has no model selection policy', task_row.name;
-    END IF;
     expected_model_name := CASE validate_portable_result.selection_role
-      WHEN 'cheap' THEN selection_policy.cheap_model_name
-      WHEN 'strong' THEN selection_policy.strong_model_name
+      WHEN 'cheap' THEN revision_definition #>> '{selection,cheap_model_name}'
+      WHEN 'strong' THEN revision_definition #>> '{selection,strong_model_name}'
+      ELSE NULL
+    END;
+    model_definition := CASE validate_portable_result.selection_role
+      WHEN 'cheap' THEN revision_definition #> '{models,cheap}'
+      WHEN 'strong' THEN revision_definition #> '{models,strong}'
       ELSE NULL
     END;
   END IF;
-  IF expected_model_name IS NULL THEN
+  IF expected_model_name IS NULL OR model_definition IS NULL
+     OR jsonb_typeof(model_definition) = 'null' THEN
     RAISE EXCEPTION 'otlet portable result selection role is invalid';
   END IF;
   IF COALESCE(validate_portable_result.model_name, expected_model_name)
@@ -171,13 +181,10 @@ BEGIN
     RAISE EXCEPTION 'otlet portable result model identity is forged';
   END IF;
 
-  SELECT m.*
-  INTO model_row
-  FROM otlet.models m
-  WHERE m.name = expected_model_name;
-  IF NOT FOUND THEN
-    RAISE EXCEPTION 'otlet model % does not exist', expected_model_name;
-  END IF;
+  model_row.name := model_definition ->> 'name';
+  model_row.artifact_path := model_definition ->> 'artifact_path';
+  model_row.artifact_hash := model_definition ->> 'artifact_hash';
+  model_row.artifact_identity := model_definition -> 'artifact_identity';
 
   IF jsonb_typeof(COALESCE(validate_portable_result.actions, '[]'::jsonb)) IS DISTINCT FROM 'array' THEN
     RAISE EXCEPTION 'otlet portable result actions must be an array';
@@ -252,15 +259,7 @@ BEGIN
   expected_raw_hash := otlet.portable_text_hash(validate_portable_result.raw_output);
   output_hash := otlet.portable_json_hash(validate_portable_result.output);
   actions_hash := otlet.portable_json_hash(COALESCE(validate_portable_result.actions, '[]'::jsonb));
-  task_identity_hash := otlet.identity_hash('task_identity', jsonb_build_object(
-    'name', task_row.name,
-    'instruction', task_row.instruction,
-    'output_schema', task_row.output_schema,
-    'model_name', task_row.model_name,
-    'runtime_options', task_row.runtime_options,
-    'input_shaping', task_row.input_shaping,
-    'decision_contract', task_row.decision_contract
-  ));
+  task_identity_hash := job_row.workload_revision_hash;
   source_identity_hash := otlet.identity_hash('source_identity', jsonb_build_object(
     'task_name', task_row.name,
     'subject_id', job_row.subject_id,
@@ -312,7 +311,11 @@ BEGIN
 
   snapshot_content_hash := otlet.semantic_content_hash(job_row.input, task_row.input_shaping);
   IF jsonb_typeof(COALESCE(job_row.input -> '_otlet_mvcc', job_row.input -> 'otlet_mvcc')) = 'object' THEN
-    current_content_hash := otlet.current_task_subject_content_hash(task_row.name, job_row.subject_id);
+    current_content_hash := otlet.current_task_subject_content_hash(
+      task_row.name,
+      job_row.subject_id,
+      job_row.workload_revision_hash
+    );
     IF current_content_hash IS NULL THEN
       RAISE EXCEPTION 'otlet portable result source is unavailable';
     END IF;
@@ -345,16 +348,16 @@ BEGIN
     END;
     authority_target_name := NULL;
     IF action_error IS NULL AND action_type_name = 'update_row' THEN
-      SELECT p.*
-      INTO workflow_policy
-      FROM otlet.action_workflow_policies p
-      WHERE p.task_name = task_row.name
-        AND p.action_type = action_type_name
-        AND p.enabled;
-      IF NOT FOUND THEN
+      workflow_authority := revision_definition #> ARRAY[
+        'action_policies',
+        action_type_name,
+        'authority'
+      ];
+      IF workflow_authority ->> 'origin' IS DISTINCT FROM 'workflow'
+         OR COALESCE((workflow_authority ->> 'enabled')::boolean, false) IS NOT TRUE THEN
         action_error := 'update_row requires registered workflow authority';
       ELSE
-        authority_target_name := workflow_policy.target_name;
+        authority_target_name := workflow_authority ->> 'target_name';
         proposed_target_name := NULLIF(action_body ->> 'target', '');
         IF proposed_target_name IS NOT NULL
            AND proposed_target_name IS DISTINCT FROM authority_target_name THEN
@@ -374,7 +377,11 @@ BEGIN
         action_payload,
         validate_portable_result.output,
         job_row.subject_id,
-        job_row.input
+        job_row.input,
+        COALESCE(
+          revision_definition #> ARRAY['action_policies', action_type_name, 'schema'],
+          'null'::jsonb
+        )
       );
     END IF;
     action_validation := action_validation || jsonb_build_array(jsonb_build_object(
@@ -388,6 +395,7 @@ BEGIN
 
   RETURN jsonb_build_object(
     'version', 'otlet_portable_validation_v1',
+    'workload_revision_hash', job_row.workload_revision_hash,
     'task_identity_hash', task_identity_hash,
     'input_hash', expected_input_hash,
     'input_content_hash', snapshot_content_hash,

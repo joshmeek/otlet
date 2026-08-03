@@ -23,6 +23,7 @@ const CLAIM_LOST: u8 = 2;
 #[derive(Deserialize)]
 struct Claim {
     job_id: i64,
+    workload_revision_hash: String,
     claim_token: String,
     claim_status: String,
     selection_role: String,
@@ -251,6 +252,7 @@ impl Database {
         let sql = format!(
             "SELECT jsonb_build_object(\
                'job_id', c.job_id, \
+               'workload_revision_hash', c.workload_revision_hash, \
                'claim_token', c.claim_token, \
                'claim_status', c.claim_status, \
                'selection_role', c.selection_role, \
@@ -268,10 +270,7 @@ impl Database {
         );
         self.query(&sql)?
             .into_iter()
-            .map(|line| {
-                serde_json::from_str(&line)
-                    .map_err(|err| format!("portable claim response is invalid: {err}"))
-            })
+            .map(|line| parse_claim(&line))
             .collect()
     }
 
@@ -724,6 +723,7 @@ impl LeaseGuard {
         let job_id = claim.job_id;
         let claim_token = claim.claim_token.clone();
         let task_name = claim.task_name.clone();
+        let workload_revision_hash = claim.workload_revision_hash.clone();
         let handle = thread::spawn(move || {
             while !thread_stop.load(Ordering::Acquire) {
                 thread::park_timeout(config.renew_interval);
@@ -733,7 +733,13 @@ impl LeaseGuard {
                 match database.renew(&config, job_id, &claim_token) {
                     Ok(state) if state == "cancel_requested" => {
                         thread_signal.set(CLAIM_CANCELED);
-                        log_job("job_cancel_observed", job_id, &task_name, None);
+                        log_job(
+                            "job_cancel_observed",
+                            job_id,
+                            &task_name,
+                            &workload_revision_hash,
+                            None,
+                        );
                         break;
                     }
                     Ok(_) => {}
@@ -743,6 +749,7 @@ impl LeaseGuard {
                             "job_claim_lost",
                             job_id,
                             &task_name,
+                            &workload_revision_hash,
                             Some(if is_connection_error(&error) {
                                 "database_unavailable"
                             } else {
@@ -1013,6 +1020,7 @@ fn process_claim(
     };
     let trace = json!({
         "trace_version": "otlet_portable_worker_trace_v1",
+        "workload_revision_hash": claim.workload_revision_hash,
         "prompt_hash": claim.prompt_hash,
         "prompt_tokens": inference.prompt_tokens,
         "generated_tokens": inference.generated_tokens,
@@ -1302,16 +1310,29 @@ fn heartbeat_until_available(
 }
 
 fn log_event(event: &str, claim: &Claim, reason: Option<&str>) {
-    log_job(event, claim.job_id, &claim.task_name, reason);
+    log_job(
+        event,
+        claim.job_id,
+        &claim.task_name,
+        &claim.workload_revision_hash,
+        reason,
+    );
 }
 
-fn log_job(event: &str, job_id: i64, task_name: &str, reason: Option<&str>) {
+fn log_job(
+    event: &str,
+    job_id: i64,
+    task_name: &str,
+    workload_revision_hash: &str,
+    reason: Option<&str>,
+) {
     eprintln!(
         "{}",
         json!({
             "event": event,
             "job_id": job_id,
             "task_name": task_name,
+            "workload_revision_hash": workload_revision_hash,
             "reason": reason,
             "timestamp_ms": timestamp_ms()
         })
@@ -1411,6 +1432,24 @@ fn is_sha256(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn is_identity_hash(value: &str) -> bool {
+    value
+        .strip_prefix("otlet:v1:sha256:")
+        .is_some_and(is_sha256)
+}
+
+fn parse_claim(line: &str) -> Result<Claim, String> {
+    let claim: Claim = serde_json::from_str(line)
+        .map_err(|err| format!("portable claim response is invalid: {err}"))?;
+    if !is_identity_hash(&claim.workload_revision_hash) {
+        return Err(coded(
+            "database_contract_invalid",
+            "portable claim workload revision hash is invalid",
+        ));
+    }
+    Ok(claim)
 }
 
 fn is_connection_error(error: &str) -> bool {
@@ -1527,5 +1566,29 @@ mod tests {
         signal.set(CLAIM_CANCELED);
         signal.set(CLAIM_LOST);
         assert_eq!(signal.state(), CLAIM_CANCELED);
+    }
+
+    #[test]
+    fn portable_claim_requires_versioned_workload_revision() {
+        let mut claim = json!({
+            "job_id": 1,
+            "workload_revision_hash": format!("otlet:v1:sha256:{}", "a".repeat(64)),
+            "claim_token": "token",
+            "claim_status": "running",
+            "selection_role": "direct",
+            "task_name": "task",
+            "prompt": "prompt",
+            "prompt_hash": "prompt-hash",
+            "runtime_options": {},
+            "model": {},
+            "evidence_limits": {}
+        });
+        assert!(parse_claim(&claim.to_string()).is_ok());
+
+        claim["workload_revision_hash"] = json!("a".repeat(64));
+        let error = parse_claim(&claim.to_string())
+            .err()
+            .expect("unversioned revision hash should be rejected");
+        assert_eq!(error_code(&error), "database_contract_invalid");
     }
 }

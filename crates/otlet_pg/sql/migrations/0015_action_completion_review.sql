@@ -26,6 +26,10 @@ DECLARE
   task_row otlet.tasks%ROWTYPE;
   model_row otlet.models%ROWTYPE;
   policy otlet.production_policy%ROWTYPE;
+  revision_definition jsonb;
+  model_definition jsonb;
+  action_policy jsonb;
+  action_schema jsonb;
   action jsonb;
   action_payload jsonb;
   action_validation_payload jsonb;
@@ -48,7 +52,7 @@ DECLARE
   action_record_type text;
   action_record_body jsonb;
   action_idempotency_key text;
-  workflow_policy otlet.action_workflow_policies%ROWTYPE;
+  authority_origin text;
   authority_mode text;
   authority_evaluation_status text;
   authority_policy_hash text;
@@ -111,13 +115,17 @@ BEGIN
     RAISE EXCEPTION 'otlet job claim is stale';
   END IF;
 
-  SELECT t.model_name, t.input_shaping, t.decision_contract
-  INTO task_row.model_name, task_row.input_shaping, task_row.decision_contract
-  FROM otlet.tasks t
-  WHERE t.name = job_row.task_name;
+  SELECT revision.definition
+  INTO revision_definition
+  FROM otlet.workload_revisions revision
+  WHERE revision.workload_revision_hash = job_row.workload_revision_hash
+    AND revision.task_name = job_row.task_name;
   IF NOT FOUND THEN
-    RAISE EXCEPTION 'otlet task % does not exist', job_row.task_name;
+    RAISE EXCEPTION 'otlet job workload revision is missing';
   END IF;
+  task_row.model_name := revision_definition #>> '{models,direct,name}';
+  task_row.input_shaping := revision_definition #> '{task,input_shaping}';
+  task_row.decision_contract := revision_definition #> '{task,decision_contract}';
   SELECT *
   INTO policy
   FROM otlet.production_policy
@@ -125,22 +133,12 @@ BEGIN
   IF NOT FOUND THEN
     RAISE EXCEPTION 'otlet default production policy does not exist';
   END IF;
-  SELECT m.name
-  INTO model_row.name
-  FROM otlet.models m
-  WHERE m.name = COALESCE(
-    complete_job.model_name,
-    job_row.routed_model_name,
-    task_row.model_name
-  );
-  IF NOT FOUND THEN
-    RAISE EXCEPTION 'otlet model % does not exist',
-      COALESCE(
-        complete_job.model_name,
-        job_row.routed_model_name,
-        task_row.model_name
-      );
-  END IF;
+  model_definition := CASE COALESCE(complete_job.selection_role, 'direct')
+    WHEN 'cheap' THEN revision_definition #> '{models,cheap}'
+    WHEN 'strong' THEN revision_definition #> '{models,strong}'
+    ELSE revision_definition #> '{models,direct}'
+  END;
+  model_row.name := model_definition ->> 'name';
 
   -- Fail before mutating job/receipt state on a bad envelope.
   IF jsonb_typeof(COALESCE(complete_job.actions, '[]'::jsonb)) IS DISTINCT FROM 'array' THEN
@@ -283,23 +281,34 @@ BEGIN
       ELSE '{}'::jsonb
     END;
     action_type_name := COALESCE(NULLIF(action ->> 'type', ''), 'invalid');
-    authority_mode := 'recommendation_only';
-    authority_evaluation_status := 'unevaluated';
-    authority_policy_hash := otlet.default_action_authority_hash(job_row.task_name, action_type_name);
-    authority_subject_namespace := 'task:' || job_row.task_name;
-    authority_target_name := NULL;
-    SELECT * INTO workflow_policy
-    FROM otlet.action_workflow_policies p
-    WHERE p.task_name = job_row.task_name
-      AND p.action_type = action_type_name
-      AND p.enabled;
-    IF FOUND THEN
-      authority_mode := workflow_policy.authority_mode;
-      authority_evaluation_status := workflow_policy.evaluation_status;
-      authority_policy_hash := workflow_policy.policy_hash;
-      authority_subject_namespace := workflow_policy.subject_namespace;
-      authority_target_name := workflow_policy.target_name;
-    END IF;
+    action_policy := revision_definition #> ARRAY[
+      'action_policies',
+      action_type_name,
+      'authority'
+    ];
+    action_schema := revision_definition #> ARRAY[
+      'action_policies',
+      action_type_name,
+      'schema'
+    ];
+    authority_origin := COALESCE(action_policy ->> 'origin', 'system');
+    authority_mode := COALESCE(action_policy ->> 'mode', 'recommendation_only');
+    authority_evaluation_status := COALESCE(
+      action_policy ->> 'evaluation_status',
+      'unevaluated'
+    );
+    authority_policy_hash := COALESCE(
+      action_policy ->> 'policy_hash',
+      otlet.identity_hash('rejected_action_authority', jsonb_build_object(
+        'workload_revision_hash', job_row.workload_revision_hash,
+        'action_type', action_type_name
+      ))
+    );
+    authority_subject_namespace := COALESCE(
+      action_policy ->> 'subject_namespace',
+      'task:' || job_row.task_name
+    );
+    authority_target_name := action_policy ->> 'target_name';
 
     action_error := CASE
       WHEN NOT COALESCE(task_row.decision_contract -> 'action_types', '[]'::jsonb) ? action_type_name
@@ -309,7 +318,9 @@ BEGIN
     action_validation_payload := action_payload;
     IF action_type_name = 'update_row' THEN
       proposed_target_name := NULLIF(action_body ->> 'target', '');
-      IF authority_target_name IS NULL THEN
+      IF authority_origin IS DISTINCT FROM 'workflow'
+         OR COALESCE((action_policy ->> 'enabled')::boolean, false) IS NOT TRUE
+         OR authority_target_name IS NULL THEN
         action_error := COALESCE(action_error, 'update_row requires registered workflow authority');
       ELSE
         IF proposed_target_name IS NOT NULL
@@ -331,19 +342,22 @@ BEGIN
         action_validation_payload,
         complete_job.output,
         job_row.subject_id,
-        job_row.input
+        job_row.input,
+        COALESCE(action_schema, 'null'::jsonb)
       );
     END IF;
     action_requires_approval := false;
     action_creates_record := false;
     action_idempotency_key := NULL;
     IF action_error IS NULL THEN
-      SELECT
-        COALESCE(s.requires_approval, false),
-        COALESCE(s.creates_record, false)
-      INTO action_requires_approval, action_creates_record
-      FROM (SELECT 1) seed
-      LEFT JOIN otlet.action_type_schemas s ON s.action_type = action_type_name;
+      action_requires_approval := COALESCE(
+        (action_schema ->> 'requires_approval')::boolean,
+        false
+      );
+      action_creates_record := COALESCE(
+        (action_schema ->> 'creates_record')::boolean,
+        false
+      );
     END IF;
     action_subject_id := COALESCE(
       NULLIF(action_payload ->> 'subject_id', ''),
@@ -407,7 +421,7 @@ BEGIN
       saved_output.id,
       saved_receipt.id,
       action_type_name,
-      'workflow',
+      authority_origin,
       authority_mode,
       authority_evaluation_status,
       authority_policy_hash,
@@ -506,19 +520,27 @@ BEGIN
     j.id AS job_id,
     j.task_name,
     j.subject_id,
+    j.workload_revision_hash,
     COALESCE(a.source_table, r.trace_summary #>> '{mvcc,table}') AS source_table,
     COALESCE(a.source_hash, otlet.semantic_source_hash(j.input)) AS source_hash,
-    COALESCE(a.content_hash, otlet.semantic_content_hash(j.input, t.input_shaping)) AS content_hash,
+    COALESCE(
+      a.content_hash,
+      otlet.semantic_content_hash(j.input, revision.definition #> '{task,input_shaping}')
+    ) AS content_hash,
     r.model_name,
     r.model_artifact_hash,
     r.prompt_hash,
-    COALESCE(r.output_schema_hash, otlet.portable_json_hash(t.output_schema)) AS output_schema_hash,
+    COALESCE(
+      r.output_schema_hash,
+      otlet.portable_json_hash(revision.definition #> '{task,output_schema}')
+    ) AS output_schema_hash,
     COALESCE(r.raw_output_hash, otlet.portable_json_hash(COALESCE(o.output, r.candidate_output, 'null'::jsonb))) AS output_hash,
     r.trace_summary ->> 'runtime_fingerprint_hash' AS runtime_fingerprint_hash
   INTO target
   FROM otlet.inference_receipts r
   JOIN otlet.jobs j ON j.id = r.job_id
-  JOIN otlet.tasks t ON t.name = j.task_name
+  JOIN otlet.workload_revisions revision
+    ON revision.workload_revision_hash = j.workload_revision_hash
   LEFT JOIN otlet.actions a ON a.id = record_review_event.action_id
   LEFT JOIN otlet.outputs o ON o.receipt_id = r.id
   WHERE r.id = COALESCE(a.receipt_id, record_review_event.receipt_id)
@@ -528,7 +550,11 @@ BEGIN
     RAISE EXCEPTION 'otlet review target does not exist';
   END IF;
 
-  current_hash := otlet.current_task_subject_content_hash(target.task_name, target.subject_id);
+  current_hash := otlet.current_task_subject_content_hash(
+    target.task_name,
+    target.subject_id,
+    target.workload_revision_hash
+  );
   freshness := CASE
     WHEN target.content_hash IS NULL OR current_hash IS NULL THEN 'unavailable'
     WHEN target.content_hash = current_hash THEN 'fresh'
@@ -679,12 +705,37 @@ BEGIN
   RETURN QUERY
   SELECT
     a,
-    s,
+    ROW(
+      a.action_type,
+      COALESCE((revision.definition #>> ARRAY[
+        'action_policies', a.action_type, 'schema', 'requires_approval'
+      ])::boolean, false),
+      COALESCE((revision.definition #>> ARRAY[
+        'action_policies', a.action_type, 'schema', 'creates_record'
+      ])::boolean, false),
+      COALESCE((revision.definition #>> ARRAY[
+        'action_policies', a.action_type, 'schema', 'applyable'
+      ])::boolean, false),
+      NULL::timestamptz
+    )::otlet.action_type_schemas,
     j,
     j.task_name,
     o.output,
-    otlet.current_task_subject_content_hash(j.task_name, j.subject_id),
-    otlet.action_validation_error(a.payload, o.output, j.subject_id, j.input),
+    otlet.current_task_subject_content_hash(
+      j.task_name,
+      j.subject_id,
+      j.workload_revision_hash
+    ),
+    otlet.action_validation_error(
+      a.payload,
+      o.output,
+      j.subject_id,
+      j.input,
+      COALESCE(
+        revision.definition #> ARRAY['action_policies', a.action_type, 'schema'],
+        'null'::jsonb
+      )
+    ),
     CASE
       WHEN a.authority_origin = 'workflow' AND a.action_type = 'update_row' THEN
         otlet.action_workflow_policy_error(
@@ -699,7 +750,8 @@ BEGIN
     END
   FROM otlet.actions a
   JOIN otlet.jobs j ON j.id = a.job_id
-  LEFT JOIN otlet.action_type_schemas s ON s.action_type = a.action_type
+  JOIN otlet.workload_revisions revision
+    ON revision.workload_revision_hash = j.workload_revision_hash
   LEFT JOIN otlet.outputs o ON o.id = a.output_id
   WHERE a.id = validated_action_context.action_id
   FOR UPDATE OF a;

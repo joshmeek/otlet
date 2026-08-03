@@ -62,14 +62,19 @@ struct ModelSelectionPolicyCache {
 }
 
 impl ModelSelectionPolicyCache {
-    fn get(&mut self, task_name: &str) -> pgrx::spi::Result<Option<&ModelSelectionPolicy>> {
+    fn get(
+        &mut self,
+        workload_revision_hash: &str,
+    ) -> pgrx::spi::Result<Option<&ModelSelectionPolicy>> {
         if self
             .cached
             .as_ref()
-            .is_none_or(|(cached_task, _)| cached_task != task_name)
+            .is_none_or(|(cached_revision, _)| cached_revision != workload_revision_hash)
         {
-            let policy = BackgroundWorker::transaction(|| model_selection_policy(task_name))?;
-            self.cached = Some((task_name.to_owned(), policy));
+            let policy = BackgroundWorker::transaction(|| {
+                model_selection_policy(workload_revision_hash)
+            })?;
+            self.cached = Some((workload_revision_hash.to_owned(), policy));
         }
         Ok(self.cached.as_ref().and_then(|(_, policy)| policy.as_ref()))
     }
@@ -100,7 +105,7 @@ fn process_job_batch(jobs: Vec<Job>) -> BatchProcessResult {
     for job in jobs {
         let mut result = process_job_deferred(&job, &mut policy_cache, true);
         if let Some(reason) = result.strong_fallback.take() {
-            // Move the original Job; strong model comes from the batch policy cache.
+            // Move the original Job; strong model comes from its revision policy.
             strong_jobs.push((result, job, reason));
         } else {
             batch.add_finished(&result);
@@ -108,7 +113,7 @@ fn process_job_batch(jobs: Vec<Job>) -> BatchProcessResult {
     }
 
     for (mut result, job, reason) in strong_jobs {
-        let strong_result = match policy_cache.get(&job.task_name) {
+        let strong_result = match policy_cache.get(&job.workload_revision_hash) {
             Ok(Some(policy)) => run_strong_attempt_with_model(&job, &policy.strong, reason),
             Ok(None) => {
                 let err = ModelError::new("strong_fallback_missing_policy");
@@ -147,7 +152,7 @@ fn process_job(job: Job) -> JobProcessResult {
     let mut policy_cache = ModelSelectionPolicyCache::default();
     let mut result = process_job_deferred(&job, &mut policy_cache, false);
     if let Some(reason) = result.strong_fallback.take() {
-        let strong_result = match policy_cache.get(&job.task_name) {
+        let strong_result = match policy_cache.get(&job.workload_revision_hash) {
             Ok(Some(policy)) => run_strong_attempt_with_model(&job, &policy.strong, reason),
             Ok(None) => {
                 let err = ModelError::new("strong_fallback_missing_policy");
@@ -192,7 +197,7 @@ fn process_job_deferred(
     }
 
     if job.selection_role == "strong" {
-        return match policy_cache.get(&job.task_name) {
+        return match policy_cache.get(&job.workload_revision_hash) {
             Ok(Some(policy)) => {
                 run_strong_attempt_with_model(job, &policy.strong, "cheap_attempt_rejected")
             }
@@ -213,7 +218,7 @@ fn process_job_deferred(
         };
     }
 
-    match policy_cache.get(&job.task_name) {
+    match policy_cache.get(&job.workload_revision_hash) {
         Ok(Some(policy)) => process_selected_job(job, policy),
         Ok(None) => process_direct_job(job),
         Err(err) => {

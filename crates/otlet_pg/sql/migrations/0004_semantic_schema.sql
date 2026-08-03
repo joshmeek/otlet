@@ -238,10 +238,15 @@ BEGIN
         OR NEW.input IS DISTINCT FROM OLD.input;
     END IF;
     IF validate_source_input THEN
-      SELECT t.input_shaping
+      SELECT revision.definition #> '{task,input_shaping}'
       INTO task_input_shaping
-      FROM otlet.tasks t
-      WHERE t.name = NEW.task_name;
+      FROM otlet.workload_revisions revision
+      WHERE revision.task_name = NEW.task_name
+        AND revision.workload_revision_hash = NEW.workload_revision_hash;
+
+      IF NOT FOUND THEN
+        RAISE EXCEPTION 'otlet job workload revision is missing';
+      END IF;
 
       IF NOT otlet.source_fields_are_allowed(NEW.input, task_input_shaping) THEN
         RAISE EXCEPTION 'otlet job input contains a field outside the task source-field allowlist';

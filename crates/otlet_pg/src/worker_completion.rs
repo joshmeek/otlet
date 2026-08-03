@@ -313,13 +313,18 @@ fn fail_attempt_result_with_model(
     result
 }
 
-fn force_terminal_job_failure(job_id: i64, claim_token: &str, error: &str) {
+fn force_terminal_job_failure(job_id: i64, claim_token: &str, model_name: &str, error: &str) {
     // Emergency fallback terminalizes the row when fail_job SPI fails
     // No receipt, metric, or event can be recorded through the failing path
     // A cancel request becomes canceled and other live work becomes failed
     let recovery: pgrx::spi::Result<()> = BackgroundWorker::transaction(|| {
         pgrx::Spi::connect_mut(|client| {
-            let args = [job_id.into(), error.into(), claim_token.into()];
+            let args = [
+                job_id.into(),
+                error.into(),
+                claim_token.into(),
+                model_name.into(),
+            ];
             client.update(
                 "UPDATE otlet.jobs \
                  SET status = CASE \
@@ -344,10 +349,8 @@ fn force_terminal_job_failure(job_id: i64, claim_token: &str, error: &str) {
             )?;
             // Best-effort slot release so active_jobs does not stay stuck at 1.
             let _ = client.update(
-                "SELECT otlet.touch_runtime_slot(m.name, 'error', 0, $2) \
+                "SELECT otlet.touch_runtime_slot($4, 'error', 0, $2) \
                  FROM otlet.jobs j \
-                 JOIN otlet.tasks t ON t.name = j.task_name \
-                 JOIN otlet.models m ON m.name = t.model_name \
                  WHERE j.id = $1 AND j.status IN ('failed', 'canceled')",
                 Some(1),
                 &args,
@@ -429,6 +432,7 @@ fn fail_attempt_with_model(
         force_terminal_job_failure(
             job.id,
             job.claim_token.as_str(),
+            model_name,
             &recovery_error,
         );
     }

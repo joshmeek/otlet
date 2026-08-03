@@ -110,6 +110,8 @@ DECLARE
   job_row otlet.jobs%ROWTYPE;
   task_row otlet.tasks%ROWTYPE;
   model_row otlet.models%ROWTYPE;
+  revision_definition jsonb;
+  model_definition jsonb;
   policy otlet.production_policy%ROWTYPE;
   next_attempt int;
   actual_selection_status text := COALESCE(record_model_attempt.selection_status, 'accepted');
@@ -129,6 +131,7 @@ DECLARE
   actual_output_schema_hash text;
   actual_runtime_options_hash text;
   actual_model_identity_hash text;
+  effective_runtime_options jsonb;
 BEGIN
   SELECT j.*
   INTO job_row
@@ -148,13 +151,23 @@ BEGIN
     RAISE EXCEPTION 'otlet job claim is stale';
   END IF;
 
-  SELECT t.model_name, t.runtime_options, t.decision_contract, t.output_schema
-  INTO task_row.model_name, task_row.runtime_options, task_row.decision_contract, task_row.output_schema
-  FROM otlet.tasks t
-  WHERE t.name = job_row.task_name;
+  SELECT revision.definition
+  INTO revision_definition
+  FROM otlet.workload_revisions revision
+  WHERE revision.workload_revision_hash = job_row.workload_revision_hash
+    AND revision.task_name = job_row.task_name;
   IF NOT FOUND THEN
-    RAISE EXCEPTION 'otlet task % does not exist', job_row.task_name;
+    RAISE EXCEPTION 'otlet job workload revision is missing';
   END IF;
+  task_row.name := job_row.task_name;
+  task_row.input_query := revision_definition #>> '{task,input_query}';
+  task_row.instruction := revision_definition #>> '{task,instruction}';
+  task_row.output_schema := revision_definition #> '{task,output_schema}';
+  task_row.model_name := revision_definition #>> '{models,direct,name}';
+  task_row.runtime_options := revision_definition #> '{task,runtime_options}';
+  task_row.input_shaping := revision_definition #> '{task,input_shaping}';
+  task_row.decision_contract := revision_definition #> '{task,decision_contract}';
+  effective_runtime_options := revision_definition #> '{runtime,effective_options}';
   SELECT *
   INTO policy
   FROM otlet.production_policy
@@ -163,14 +176,6 @@ BEGIN
     RAISE EXCEPTION 'otlet default production policy does not exist';
   END IF;
   policy_mode := policy.sensitive_evidence_mode;
-  SELECT name, artifact_path, artifact_hash, artifact_identity
-  INTO model_row.name, model_row.artifact_path, model_row.artifact_hash, model_row.artifact_identity
-  FROM otlet.models
-  WHERE name = record_model_attempt.model_name;
-  IF NOT FOUND THEN
-    RAISE EXCEPTION 'otlet model % does not exist', record_model_attempt.model_name;
-  END IF;
-
   IF jsonb_typeof(COALESCE(record_model_attempt.trace_summary, '{}'::jsonb)) IS DISTINCT FROM 'object' THEN
     RAISE EXCEPTION 'otlet record_model_attempt trace_summary must be a JSON object';
   END IF;
@@ -179,19 +184,25 @@ BEGIN
   END IF;
   IF COALESCE(record_model_attempt.selection_role, 'direct') = 'direct' THEN
     expected_model_name := task_row.model_name;
+    model_definition := revision_definition #> '{models,direct}';
   ELSE
-    SELECT CASE record_model_attempt.selection_role
-      WHEN 'cheap' THEN selection_policy.cheap_model_name
-      ELSE selection_policy.strong_model_name
-    END
-    INTO expected_model_name
-    FROM otlet.model_selection_policies selection_policy
-    WHERE selection_policy.task_name = job_row.task_name;
-
-    IF NOT FOUND THEN
+    expected_model_name := CASE record_model_attempt.selection_role
+      WHEN 'cheap' THEN revision_definition #>> '{selection,cheap_model_name}'
+      ELSE revision_definition #>> '{selection,strong_model_name}'
+    END;
+    model_definition := CASE record_model_attempt.selection_role
+      WHEN 'cheap' THEN revision_definition #> '{models,cheap}'
+      ELSE revision_definition #> '{models,strong}'
+    END;
+    IF expected_model_name IS NULL OR model_definition IS NULL
+       OR jsonb_typeof(model_definition) = 'null' THEN
       RAISE EXCEPTION 'otlet task % has no model selection policy', job_row.task_name;
     END IF;
   END IF;
+  model_row.name := model_definition ->> 'name';
+  model_row.artifact_path := model_definition ->> 'artifact_path';
+  model_row.artifact_hash := model_definition ->> 'artifact_hash';
+  model_row.artifact_identity := model_definition -> 'artifact_identity';
   IF model_row.name IS DISTINCT FROM expected_model_name THEN
     RAISE EXCEPTION 'otlet model identity does not match task selection role';
   END IF;
@@ -226,9 +237,7 @@ BEGIN
     RAISE EXCEPTION 'otlet record_model_attempt raw output hash is forged';
   END IF;
   actual_output_schema_hash := otlet.portable_json_hash(task_row.output_schema);
-  actual_runtime_options_hash := otlet.portable_json_hash(
-    policy.default_runtime_options || task_row.runtime_options
-  );
+  actual_runtime_options_hash := otlet.portable_json_hash(effective_runtime_options);
   actual_model_identity_hash := otlet.identity_hash('model_identity', jsonb_build_object(
     'name', model_row.name,
     'artifact_hash', model_row.artifact_hash,
@@ -308,6 +317,7 @@ BEGIN
 
   INSERT INTO otlet.inference_receipts (
     job_id,
+    workload_revision_hash,
     attempt_index,
     selection_role,
     selection_status,
@@ -345,6 +355,7 @@ BEGIN
   )
   VALUES (
     job_row.id,
+    job_row.workload_revision_hash,
     next_attempt,
     COALESCE(record_model_attempt.selection_role, 'direct'),
     actual_selection_status,
@@ -357,8 +368,8 @@ BEGIN
     model_row.artifact_identity,
     COALESCE(record_model_attempt.runtime_name, 'linked_inproc'),
     COALESCE(record_model_attempt.runtime_endpoint, 'linked'),
-    policy.default_runtime_options || task_row.runtime_options,
-    portable_identity ->> 'task_identity_hash',
+    effective_runtime_options,
+    COALESCE(portable_identity ->> 'task_identity_hash', job_row.workload_revision_hash),
     portable_identity ->> 'source_identity_hash',
     COALESCE(portable_identity ->> 'model_identity_hash', actual_model_identity_hash),
     COALESCE(portable_identity ->> 'runtime_options_hash', actual_runtime_options_hash),

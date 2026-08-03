@@ -523,9 +523,13 @@ AS $$
       - (
         SELECT count(*)
         FROM otlet.jobs j
-        JOIN otlet.tasks t ON t.name = j.task_name
+        JOIN otlet.workload_revisions revision
+          ON revision.workload_revision_hash = j.workload_revision_hash
         WHERE j.status = 'queued'
-          AND COALESCE(j.routed_model_name, t.model_name) = $1
+          AND COALESCE(
+            j.routed_model_name,
+            revision.definition #>> '{models,direct,name}'
+          ) = $1
       ),
     0
   )::integer
@@ -541,7 +545,8 @@ CREATE FUNCTION otlet.record_queue_admission_suppressed(
   suppressed_queue_slots integer DEFAULT NULL,
   suppressed_reason text DEFAULT 'queue_depth_cap',
   suppressed_input_bytes bigint DEFAULT NULL,
-  suppressed_limit_bytes bigint DEFAULT NULL
+  suppressed_limit_bytes bigint DEFAULT NULL,
+  suppressed_workload_revision_hash text DEFAULT NULL
 ) RETURNS boolean
 LANGUAGE plpgsql
 AS $$
@@ -553,6 +558,7 @@ BEGIN
     'task_name', suppressed_task_name,
     'subject_id', suppressed_subject_id,
     'model_name', suppressed_model_name,
+    'workload_revision_hash', suppressed_workload_revision_hash,
     'reason', suppressed_reason,
     'queued_jobs', suppressed_queued_jobs,
     'queue_slots', suppressed_queue_slots,
@@ -573,6 +579,8 @@ BEGIN
       AND e.detail ->> 'model_name' = suppressed_model_name
       AND e.detail ? 'task_name'
       AND e.detail ->> 'task_name' = suppressed_task_name
+      AND e.detail ->> 'workload_revision_hash' IS NOT DISTINCT FROM
+        suppressed_workload_revision_hash
       AND e.detail ->> 'reason' = suppressed_reason
       AND e.created_at > now() - interval '1 minute'
   );
@@ -585,12 +593,14 @@ $$;
 CREATE FUNCTION otlet.admit_task_input(
   task_name text,
   subject_id text,
-  input jsonb
+  input jsonb,
+  workload_revision_hash text DEFAULT NULL
 ) RETURNS boolean
 LANGUAGE plpgsql
 AS $$
 DECLARE
   task_model_name text;
+  revision_hash text;
   input_bytes bigint := octet_length(admit_task_input.input::text);
   policy otlet.production_policy%ROWTYPE;
   queued_jobs bigint;
@@ -600,13 +610,18 @@ DECLARE
   rejection_reason text;
   rejection_limit bigint;
 BEGIN
-  SELECT t.model_name
+  revision_hash := COALESCE(
+    admit_task_input.workload_revision_hash,
+    otlet.capture_workload_revision(admit_task_input.task_name)
+  );
+  SELECT revision.definition #>> '{models,direct,name}'
   INTO task_model_name
-  FROM otlet.tasks t
-  WHERE t.name = admit_task_input.task_name;
+  FROM otlet.workload_revisions revision
+  WHERE revision.task_name = admit_task_input.task_name
+    AND revision.workload_revision_hash = revision_hash;
 
   IF NOT FOUND THEN
-    RAISE EXCEPTION 'otlet task % does not exist', admit_task_input.task_name;
+    RAISE EXCEPTION 'otlet workload revision does not belong to task %', admit_task_input.task_name;
   END IF;
   PERFORM pg_advisory_xact_lock(hashtext('otlet_queue_admission'));
 
@@ -616,14 +631,21 @@ BEGIN
   WHERE name = 'default';
 
   SELECT
-    count(*) FILTER (WHERE COALESCE(j.routed_model_name, t.model_name) = task_model_name),
+    count(*) FILTER (WHERE COALESCE(
+      j.routed_model_name,
+      revision.definition #>> '{models,direct,name}'
+    ) = task_model_name),
     COALESCE(sum(octet_length(j.input::text)) FILTER (
-      WHERE COALESCE(j.routed_model_name, t.model_name) = task_model_name
+      WHERE COALESCE(
+        j.routed_model_name,
+        revision.definition #>> '{models,direct,name}'
+      ) = task_model_name
     ), 0),
     COALESCE(sum(octet_length(j.input::text)), 0)
   INTO queued_jobs, model_queued_bytes, total_queued_bytes
   FROM otlet.jobs j
-  JOIN otlet.tasks t ON t.name = j.task_name
+  JOIN otlet.workload_revisions revision
+    ON revision.workload_revision_hash = j.workload_revision_hash
   WHERE j.status = 'queued';
 
   IF input_bytes > policy.max_input_bytes_per_job THEN
@@ -649,13 +671,19 @@ BEGIN
       GREATEST(policy.max_queued_jobs_per_model - queued_jobs, 0)::integer,
       rejection_reason,
       input_bytes,
-      rejection_limit
+      rejection_limit,
+      revision_hash
     );
     RETURN false;
   END IF;
 
-  INSERT INTO otlet.jobs (task_name, subject_id, input)
-  VALUES (admit_task_input.task_name, admit_task_input.subject_id, admit_task_input.input)
+  INSERT INTO otlet.jobs (task_name, workload_revision_hash, subject_id, input)
+  VALUES (
+    admit_task_input.task_name,
+    revision_hash,
+    admit_task_input.subject_id,
+    admit_task_input.input
+  )
   ON CONFLICT DO NOTHING;
   GET DIAGNOSTICS inserted = ROW_COUNT;
 
@@ -740,6 +768,9 @@ AS $$
 DECLARE
   query text;
   task_model_name text;
+  revision_hash text;
+  source_kind text;
+  semantic_join_index_name text;
   queue_slots integer;
   queued bigint := 0;
   candidate_rows bigint;
@@ -748,10 +779,16 @@ DECLARE
   rejection_reason text;
   rejection_limit bigint;
 BEGIN
-  SELECT input_query, tasks.model_name
-  INTO query, task_model_name
-  FROM otlet.tasks
-  WHERE name = task_name;
+  revision_hash := otlet.capture_workload_revision(run_task.task_name);
+  SELECT
+    revision.definition #>> '{task,input_query}',
+    revision.definition #>> '{models,direct,name}',
+    revision.definition #>> '{source,kind}',
+    revision.definition #>> '{source,semantic_join_index_name}'
+  INTO query, task_model_name, source_kind, semantic_join_index_name
+  FROM otlet.workload_revisions revision
+  WHERE revision.task_name = run_task.task_name
+    AND revision.workload_revision_hash = revision_hash;
 
   IF NOT FOUND THEN
     RAISE EXCEPTION 'otlet task % does not exist', task_name;
@@ -759,6 +796,13 @@ BEGIN
 
   IF query IS NULL THEN
     RAISE EXCEPTION 'otlet task % has no input_query', task_name;
+  END IF;
+  IF source_kind = 'pair' THEN
+    query := format(
+      'SELECT subject_id, input FROM otlet.semantic_join_refresh_inputs(%L, %L)',
+      semantic_join_index_name,
+      revision_hash
+    );
   END IF;
 
   PERFORM otlet.require_candidate_query_timeout(run_task.task_name);
@@ -773,14 +817,21 @@ BEGIN
      queue_state AS (
        SELECT
          count(*) FILTER (
-           WHERE COALESCE(j.routed_model_name, queued_tasks.model_name) = %1$L
+           WHERE COALESCE(
+             j.routed_model_name,
+             queued_revisions.definition #>> ''{models,direct,name}''
+           ) = %1$L
          )::bigint AS model_queued_jobs,
          COALESCE(sum(octet_length(j.input::text)) FILTER (
-           WHERE COALESCE(j.routed_model_name, queued_tasks.model_name) = %1$L
+           WHERE COALESCE(
+             j.routed_model_name,
+             queued_revisions.definition #>> ''{models,direct,name}''
+           ) = %1$L
          ), 0)::bigint AS model_queued_bytes,
          COALESCE(sum(octet_length(j.input::text)), 0)::bigint AS total_queued_bytes
        FROM otlet.jobs j
-       JOIN otlet.tasks queued_tasks ON queued_tasks.name = j.task_name
+       JOIN otlet.workload_revisions queued_revisions
+         ON queued_revisions.workload_revision_hash = j.workload_revision_hash
        WHERE j.status = ''queued''
      ),
      bounded_input AS MATERIALIZED (
@@ -829,8 +880,8 @@ BEGIN
        CROSS JOIN candidate_state c
      ),
      inserted AS (
-       INSERT INTO otlet.jobs (task_name, subject_id, input)
-       SELECT %3$L, pending.subject_id, pending.input
+       INSERT INTO otlet.jobs (task_name, workload_revision_hash, subject_id, input)
+       SELECT %3$L, %4$L, pending.subject_id, pending.input
        FROM bounded_input pending
        CROSS JOIN decision d
        WHERE d.rejection_reason IS NULL
@@ -851,7 +902,8 @@ BEGIN
      FROM decision',
     task_model_name,
     query,
-    task_name
+    task_name,
+    revision_hash
   )
   INTO queued, candidate_rows, candidate_bytes, largest_input_bytes, queue_slots, rejection_reason, rejection_limit;
 
@@ -866,7 +918,8 @@ BEGIN
         WHEN rejection_reason = 'input_byte_cap' THEN largest_input_bytes
         ELSE candidate_bytes
       END,
-      suppressed_limit_bytes => rejection_limit
+      suppressed_limit_bytes => rejection_limit,
+      suppressed_workload_revision_hash => revision_hash
     );
     RETURN 0;
   END IF;
@@ -894,14 +947,22 @@ LANGUAGE plpgsql
 AS $$
 DECLARE
   query text;
+  revision_hash text;
+  source_kind text;
+  semantic_join_index_name text;
   pending_input jsonb;
   pending_rows bigint;
   queued boolean;
 BEGIN
-  SELECT input_query
-  INTO query
-  FROM otlet.tasks
-  WHERE name = run_task_subject.task_name;
+  revision_hash := otlet.capture_workload_revision(run_task_subject.task_name);
+  SELECT
+    revision.definition #>> '{task,input_query}',
+    revision.definition #>> '{source,kind}',
+    revision.definition #>> '{source,semantic_join_index_name}'
+  INTO query, source_kind, semantic_join_index_name
+  FROM otlet.workload_revisions revision
+  WHERE revision.task_name = run_task_subject.task_name
+    AND revision.workload_revision_hash = revision_hash;
 
   IF NOT FOUND THEN
     RAISE EXCEPTION 'otlet task % does not exist', run_task_subject.task_name;
@@ -909,6 +970,13 @@ BEGIN
 
   IF query IS NULL THEN
     RAISE EXCEPTION 'otlet task % has no input_query', run_task_subject.task_name;
+  END IF;
+  IF source_kind = 'pair' THEN
+    query := format(
+      'SELECT subject_id, input FROM otlet.semantic_join_refresh_inputs(%L, %L)',
+      semantic_join_index_name,
+      revision_hash
+    );
   END IF;
 
   PERFORM otlet.require_candidate_query_timeout(run_task_subject.task_name);
@@ -935,7 +1003,8 @@ BEGIN
   queued := otlet.admit_task_input(
     run_task_subject.task_name,
     run_task_subject.subject_id,
-    pending_input
+    pending_input,
+    revision_hash
   );
   IF queued THEN
     PERFORM otlet.wake_worker();

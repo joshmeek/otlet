@@ -22,8 +22,8 @@ Deployers trust the native worker and PostgreSQL extension code. The local model
 | --- | --- | --- | --- |
 | Configuration to registry | Task, watch, runtime, shaping, decision, and candidate SQL fields | JSON type checks, identifier constraints, allowlists, bounded candidate `EXPLAIN`, statement timeout, and transaction rollback | Reject the definition without a task, watch, or queue mutation |
 | Artifact to native runtime | File path, bytes, digest, size, and GGUF structure | Registered identity, streamed SHA-256, byte count, parser check, and recheck before each load | Fail the job with a receipt and keep the worker available |
-| Source to job snapshot | Candidate query rows and source fields | Row, byte, queue, plan-cost, timeout, and source-field admission | Queue every eligible row or none |
-| Job snapshot to model | Prompt and row text | Input shaping, prompt and context bounds, local execution, and no model database credential | Fail the attempt without output or action state |
+| Source to job snapshot | Candidate query rows and source fields | Immutable workload revision, row, byte, queue, plan-cost, timeout, and source-field admission | Queue every eligible row under one captured contract or none |
+| Job snapshot to model | Prompt and row text | Revision-bound shaping, prompt, schema, model artifact, selection, runtime and action contracts, local execution, and no model database credential | Fail the attempt without output or action state |
 | Model response to evidence | Raw text, JSON, trace detail, and claimed model identity | Output envelope, JSON Schema, decision contract, evidence bounds, redaction, registered model role, and receipt hashes | Store a rejected or failed receipt, or one validated output |
 | Model action to workflow state | Action type, subject, target, identity, and changes | Task action allowlist, registered workflow authority, target binding, source identity, and recommendation-only default | Reject the action or keep it non-applyable |
 | Worker claim to terminal state | Worker identity, protocol version, job ID, attempt number, and lease | Role-bound runtime allowlist, fixed-search-path RPC, attempt fence, and live-lease check | Reject unauthorized, incompatible, reclaimed, or expired workers without partial trusted state |
@@ -41,6 +41,18 @@ Native and portable installs use the same canonical JSON, domain separation, ver
 | Unicode text | `{"format":"otlet.identity.v1","kind":"text_vector","value":"Otlet\n🙂"}` | `otlet:v1:sha256:96077dacfe042898c24b4f06ed6d91b8d21e13a52d36738fe1009032d0d13f72` |
 
 `./scripts/otlet-demo.sh` checks the vectors through the native install. `./scripts/otlet-portable-upgrade-demo.sh` checks them through the SQL-only install
+
+## Workload Revision Contract
+
+PostgreSQL captures `otlet.workload.v1` before it runs candidate SQL. Its `otlet:v1:sha256` identity binds the query and sources, task fields, prompt builder, validator, deterministic decode mode, effective runtime options, direct and routed model artifacts, selection checks, and action authority. The job stores that identity; native and portable claims, receipts, actions, materialization, review, and historical status follow it instead of rereading mutable registry rows
+
+`./scripts/demo/workload_revisions.sh` mutates a queued workload from A to B without model inference. A still uses its original shaped input, schema, runtime, cheap rejection rule, strong artifact, receipt identity, and action authority while a new job receives B. A superseded semantic completion cannot create current materialization state
+
+```text
+workload_revision_contract=ok
+workload_revision_semantic_contract=ok
+workload_revision_status_contract=ok
+```
 
 ## Native Threats
 

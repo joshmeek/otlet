@@ -125,6 +125,7 @@ CREATE VIEW otlet.audit_receipt_export AS
 SELECT
   s.receipt_id,
   s.job_id,
+  s.workload_revision_hash,
   s.task_name,
   s.subject_id,
   s.attempt_index,
@@ -209,6 +210,7 @@ SELECT
   q.queue_kind,
   q.next_operator_step,
   q.task_name,
+  q.workload_revision_hash,
   q.watch_name,
   q.job_subject_id,
   q.subject_id,

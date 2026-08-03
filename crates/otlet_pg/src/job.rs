@@ -4,6 +4,7 @@ use serde_json::Value;
 pub(crate) struct Job {
     pub(crate) id: i64,
     pub(crate) task_name: String,
+    pub(crate) workload_revision_hash: String,
     pub(crate) subject_id: String,
     pub(crate) instruction: String,
     pub(crate) output_schema: Value,
@@ -70,6 +71,7 @@ macro_rules! job_from_row {
             decision_contract: required_col!($row, JsonB, 15).0,
             max_attempt_ms: i64::from(required_col!($row, i32, 16)),
             claim_token: required_col!($row, String, 17),
+            workload_revision_hash: required_col!($row, String, 18),
         }
     };
 }
@@ -84,44 +86,42 @@ WITH claimed AS (
     j.task_name,
     j.subject_id,
     j.input,
-    t.instruction,
-    t.output_schema,
-    t.input_shaping,
-    t.decision_contract,
-    t.runtime_options,
-    m.artifact_path,
-    m.artifact_hash,
-    m.artifact_identity,
-    m.name AS model_name,
+    j.workload_revision_hash,
+    revision.definition,
+    CASE
+      WHEN j.routed_model_name IS NOT NULL THEN revision.definition #> '{models,strong}'
+      ELSE revision.definition #> '{models,direct}'
+    END AS selected_model,
     CASE WHEN j.routed_model_name IS NOT NULL THEN 'strong' ELSE 'direct' END AS selection_role,
-    p.default_runtime_options,
-    p.max_attempt_ms,
     j.claim_token,
-    otlet.semantic_shaped_input(j.input, t.input_shaping) AS shaped_input
+    otlet.semantic_shaped_input(
+      j.input,
+      revision.definition #> '{task,input_shaping}'
+    ) AS shaped_input
   FROM otlet.claim_jobs() j
-  JOIN otlet.tasks t ON t.name = j.task_name
-  JOIN otlet.models m ON m.name = COALESCE(j.routed_model_name, t.model_name)
-  CROSS JOIN otlet.production_policy p
-  WHERE p.name = 'default'
+  JOIN otlet.workload_revisions revision
+    ON revision.task_name = j.task_name
+   AND revision.workload_revision_hash = j.workload_revision_hash
 )
 SELECT
   id,
   task_name,
   subject_id,
-  instruction,
-  output_schema,
+  definition #>> '{task,instruction}',
+  definition #> '{task,output_schema}',
   shaped_input,
   otlet.semantic_content_hash(shaped_input),
-  artifact_path,
-  artifact_hash,
-  artifact_identity,
-  model_name,
+  selected_model ->> 'artifact_path',
+  selected_model ->> 'artifact_hash',
+  selected_model -> 'artifact_identity',
+  selected_model ->> 'name',
   selection_role,
-  default_runtime_options || runtime_options,
-  input_shaping,
-  decision_contract,
-  otlet.effective_task_max_attempt_ms(default_runtime_options || runtime_options, max_attempt_ms),
-  claim_token
+  definition #> '{runtime,effective_options}',
+  definition #> '{task,input_shaping}',
+  definition #> '{task,decision_contract}',
+  (definition #>> '{runtime,effective_max_attempt_ms}')::integer,
+  claim_token,
+  workload_revision_hash
 FROM claimed
 	",
             None,
@@ -145,14 +145,19 @@ pub(crate) fn insert_infer_now_job(
         let args = [task_name.into(), subject_id.into(), input_json.into()];
         let rows = client.update(
             r"
-WITH policy AS (
-  SELECT job_lease_interval, default_runtime_options, max_attempt_ms
-  FROM otlet.production_policy
-  WHERE name = 'default'
+WITH captured AS MATERIALIZED (
+  SELECT otlet.capture_workload_revision($1) AS workload_revision_hash
+),
+revision AS MATERIALIZED (
+  SELECT r.workload_revision_hash, r.definition
+  FROM captured
+  JOIN otlet.workload_revisions r USING (workload_revision_hash)
+  WHERE r.task_name = $1
 ),
 inserted AS (
   INSERT INTO otlet.jobs (
     task_name,
+    workload_revision_hash,
     subject_id,
     input,
     status,
@@ -164,20 +169,18 @@ inserted AS (
   )
   SELECT
     $1,
+    revision.workload_revision_hash,
     $2,
     $3::jsonb,
     'running',
     1,
-    now() + otlet.effective_job_lease_interval(
-      p.default_runtime_options || t.runtime_options,
-      p.max_attempt_ms,
-      p.job_lease_interval
+    now() + make_interval(
+      secs => (revision.definition #>> '{runtime,lease_ms}')::double precision / 1000.0
     ),
     gen_random_uuid()::text,
     now(),
     NULL
-  FROM policy p
-  JOIN otlet.tasks t ON t.name = $1
+  FROM revision
   ON CONFLICT (task_name, subject_id)
   WHERE status IN ('queued', 'running', 'cancel_requested')
   DO NOTHING
@@ -187,43 +190,38 @@ SELECT
   id,
   task_name,
   subject_id,
-  instruction,
-  output_schema,
+  definition #>> '{task,instruction}',
+  definition #> '{task,output_schema}',
   shaped_input,
   otlet.semantic_content_hash(shaped_input),
-  artifact_path,
-  artifact_hash,
-  artifact_identity,
-  model_name,
+  selected_model ->> 'artifact_path',
+  selected_model ->> 'artifact_hash',
+  selected_model -> 'artifact_identity',
+  selected_model ->> 'name',
   selection_role,
-  default_runtime_options || runtime_options,
-  input_shaping,
-  decision_contract,
-  otlet.effective_task_max_attempt_ms(default_runtime_options || runtime_options, max_attempt_ms),
-  claim_token
+  definition #> '{runtime,effective_options}',
+  definition #> '{task,input_shaping}',
+  definition #> '{task,decision_contract}',
+  (definition #>> '{runtime,effective_max_attempt_ms}')::integer,
+  claim_token,
+  workload_revision_hash
 FROM (
   SELECT
     j.id,
     j.task_name,
     j.subject_id,
-    t.instruction,
-    t.output_schema,
-    t.input_shaping,
-    t.decision_contract,
-    t.runtime_options,
-    m.artifact_path,
-    m.artifact_hash,
-    m.artifact_identity,
-    m.name AS model_name,
+    j.workload_revision_hash,
+    revision.definition,
+    revision.definition #> '{models,direct}' AS selected_model,
     'direct'::text AS selection_role,
-    p.default_runtime_options,
-    p.max_attempt_ms,
     j.claim_token,
-    otlet.semantic_shaped_input(j.input, t.input_shaping) AS shaped_input
+    otlet.semantic_shaped_input(
+      j.input,
+      revision.definition #> '{task,input_shaping}'
+    ) AS shaped_input
   FROM inserted j
-  JOIN otlet.tasks t ON t.name = j.task_name
-  JOIN otlet.models m ON m.name = t.model_name
-  CROSS JOIN policy p
+  JOIN revision
+    ON revision.workload_revision_hash = j.workload_revision_hash
 ) shaped
 	",
             Some(1),
@@ -240,27 +238,26 @@ FROM (
 }
 
 pub(crate) fn model_selection_policy(
-    task_name: &str,
+    workload_revision_hash: &str,
 ) -> pgrx::spi::Result<Option<ModelSelectionPolicy>> {
     pgrx::Spi::connect(|client| {
-        let args = [task_name.into()];
+        let args = [workload_revision_hash.into()];
         let rows = client.select(
             r"
 SELECT
-  cheap.name,
-  cheap.artifact_path,
-  cheap.artifact_hash,
-  cheap.artifact_identity,
-  strong.name,
-  strong.artifact_path,
-  strong.artifact_hash,
-  strong.artifact_identity,
-  p.accept_field_checks
-FROM otlet.model_selection_policies p
-JOIN otlet.models cheap ON cheap.name = p.cheap_model_name
-JOIN otlet.models strong ON strong.name = p.strong_model_name
-WHERE p.task_name = $1
-	",
+  revision.definition #>> '{models,cheap,name}',
+  revision.definition #>> '{models,cheap,artifact_path}',
+  revision.definition #>> '{models,cheap,artifact_hash}',
+  revision.definition #> '{models,cheap,artifact_identity}',
+  revision.definition #>> '{models,strong,name}',
+  revision.definition #>> '{models,strong,artifact_path}',
+  revision.definition #>> '{models,strong,artifact_hash}',
+  revision.definition #> '{models,strong,artifact_identity}',
+  revision.definition #> '{selection,accept_field_checks}'
+FROM otlet.workload_revisions revision
+WHERE revision.workload_revision_hash = $1
+  AND jsonb_typeof(revision.definition -> 'selection') = 'object'
+		",
             Some(1),
             &args,
         )?;

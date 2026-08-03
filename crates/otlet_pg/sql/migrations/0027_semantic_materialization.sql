@@ -9,6 +9,7 @@ AS $$
 DECLARE
   refreshed bigint;
   current_contract_hash text;
+  current_workload_revision_hash text;
   current_input_shaping jsonb;
 BEGIN
   IF NULLIF(materialize_semantic_records.current_input_query, '') IS NULL THEN
@@ -32,6 +33,10 @@ BEGIN
   IF NOT FOUND THEN
     RAISE EXCEPTION 'otlet task % does not exist', materialize_semantic_records.task_name;
   END IF;
+  current_workload_revision_hash := otlet.identity_hash(
+    'workload_revision',
+    otlet.current_workload_revision_definition(materialize_semantic_records.task_name)
+  );
 
   EXECUTE format(
     $sql$
@@ -50,6 +55,7 @@ BEGIN
           ON ci.subject_id = j.subject_id
          AND ci.input IS NOT DISTINCT FROM j.input
         WHERE j.task_name = %2$L
+          AND j.workload_revision_hash = %7$L
           AND j.status = 'complete'
         ORDER BY j.subject_id, j.finished_at DESC NULLS LAST, j.id DESC
       )
@@ -113,7 +119,8 @@ BEGIN
     materialize_semantic_records.source_table,
     materialize_semantic_records.record_type,
     current_input_shaping,
-    current_contract_hash
+    current_contract_hash,
+    current_workload_revision_hash
   );
 
   GET DIAGNOSTICS refreshed = ROW_COUNT;
@@ -225,6 +232,8 @@ AS $$
 DECLARE
   job_row otlet.jobs%ROWTYPE;
   output_row otlet.outputs%ROWTYPE;
+  revision_definition jsonb;
+  action_authority jsonb;
   index_row record;
   saved_action_id bigint;
   refreshed bigint := 0;
@@ -241,6 +250,23 @@ BEGIN
     RETURN 0;
   END IF;
 
+  SELECT revision.definition
+  INTO revision_definition
+  FROM otlet.workload_revisions revision
+  WHERE revision.workload_revision_hash = job_row.workload_revision_hash
+    AND revision.task_name = job_row.task_name;
+
+  IF NOT FOUND THEN
+    RETURN 0;
+  END IF;
+
+  IF job_row.workload_revision_hash IS DISTINCT FROM otlet.identity_hash(
+    'workload_revision',
+    otlet.current_workload_revision_definition(job_row.task_name)
+  ) THEN
+    RETURN 0;
+  END IF;
+
   -- outputs_one_per_job_idx guarantees at most one row per job
   SELECT *
   INTO output_row
@@ -251,14 +277,21 @@ BEGIN
     RETURN 0;
   END IF;
 
+  action_authority := revision_definition #> '{action_policies,create_record,authority}';
+
   FOR index_row IN
-    SELECT 'row'::text AS index_kind, si.name, si.record_type, si.source_table
-    FROM otlet.semantic_indexes si
-    WHERE si.task_name = job_row.task_name
-    UNION ALL
-    SELECT 'join'::text AS index_kind, sji.name, sji.record_type, NULL::text AS source_table
-    FROM otlet.semantic_join_indexes sji
-    WHERE sji.task_name = job_row.task_name
+    SELECT
+      CASE revision_definition #>> '{source,kind}'
+        WHEN 'row' THEN 'row'
+        WHEN 'pair' THEN 'join'
+      END AS index_kind,
+      COALESCE(
+        revision_definition #>> '{source,semantic_index_name}',
+        revision_definition #>> '{source,semantic_join_index_name}'
+      ) AS name,
+      revision_definition #>> '{source,record_type}' AS record_type,
+      revision_definition #>> '{source,source_table}' AS source_table
+    WHERE revision_definition #>> '{source,kind}' IN ('row', 'pair')
   LOOP
     IF jsonb_typeof(output_row.output) IS DISTINCT FROM 'object' THEN
       RAISE EXCEPTION 'otlet semantic job % output must be a JSON object to materialize', job_row.id;
@@ -291,16 +324,16 @@ BEGIN
         source_table,
         source_hash
       )
-      VALUES (
+      SELECT
         job_row.id,
         output_row.id,
         output_row.receipt_id,
         'create_record',
-        'system',
-        'recommendation_only',
-        'unevaluated',
-        otlet.default_action_authority_hash(job_row.task_name, 'create_record'),
-        COALESCE(index_row.source_table, 'task:' || job_row.task_name),
+        action_authority ->> 'origin',
+        action_authority ->> 'mode',
+        action_authority ->> 'evaluation_status',
+        action_authority ->> 'policy_hash',
+        action_authority ->> 'subject_namespace',
         jsonb_build_object(
           'type', 'create_record',
           'record_type', index_row.record_type,
@@ -311,8 +344,16 @@ BEGIN
         job_row.subject_id,
         index_row.source_table,
         otlet.semantic_source_hash(job_row.input)
-      )
+      WHERE action_authority ->> 'origin' = 'system'
+        AND job_row.workload_revision_hash = otlet.identity_hash(
+          'workload_revision',
+          otlet.current_workload_revision_definition(job_row.task_name)
+        )
       RETURNING id INTO saved_action_id;
+
+      IF NOT FOUND THEN
+        RETURN 0;
+      END IF;
     END IF;
 
     INSERT INTO otlet.records (action_id, record_type, subject_id, body)

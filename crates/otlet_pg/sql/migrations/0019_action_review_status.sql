@@ -1,6 +1,7 @@
 CREATE VIEW otlet.model_selection_attempts AS
 SELECT
   r.job_id,
+  r.workload_revision_hash,
   r.task_name,
   r.subject_id,
   r.attempt_index,
@@ -38,6 +39,7 @@ WITH receipt_attempts AS (
 )
 SELECT
   j.id AS job_id,
+  j.workload_revision_hash,
   j.task_name,
   j.subject_id,
   j.status,
@@ -91,6 +93,7 @@ CREATE VIEW otlet.action_status AS
 SELECT
   a.id AS action_id,
   a.job_id,
+  j.workload_revision_hash,
   j.task_name,
   j.subject_id AS job_subject_id,
   a.subject_id,
@@ -183,8 +186,14 @@ SELECT
   a.action_type AS observed_action_type,
   a.status AS action_status,
   a.approval_status,
-  o.output ->> COALESCE(NULLIF(t.decision_contract ->> 'answer_field', ''), 'match') AS observed_answer,
-  o.output ->> COALESCE(NULLIF(t.decision_contract ->> 'confidence_field', ''), 'confidence') AS observed_confidence,
+  o.output ->> COALESCE(
+    NULLIF(revision.definition #>> '{task,decision_contract,answer_field}', ''),
+    'match'
+  ) AS observed_answer,
+  o.output ->> COALESCE(
+    NULLIF(revision.definition #>> '{task,decision_contract,confidence_field}', ''),
+    'confidence'
+  ) AS observed_confidence,
   r.model_name,
   r.selection_role,
   r.selection_status,
@@ -192,7 +201,8 @@ SELECT
 FROM otlet.eval_labels l
 LEFT JOIN otlet.actions a ON a.id = l.action_id
 LEFT JOIN otlet.jobs j ON j.id = a.job_id
-LEFT JOIN otlet.tasks t ON t.name = j.task_name
+LEFT JOIN otlet.workload_revisions revision
+  ON revision.workload_revision_hash = j.workload_revision_hash
 LEFT JOIN otlet.outputs o ON o.id = l.output_id
 LEFT JOIN otlet.inference_receipts r ON r.id = l.receipt_id;
 
@@ -214,7 +224,12 @@ WITH action_items AS (
       ELSE 'review'
     END AS next_operator_step,
     j.task_name,
-    w.name AS watch_name,
+    j.workload_revision_hash,
+    COALESCE(
+      revision.definition #>> '{source,watch_name}',
+      revision.definition #>> '{source,semantic_index_name}',
+      revision.definition #>> '{source,semantic_join_index_name}'
+    ) AS watch_name,
     j.subject_id AS job_subject_id,
     a.subject_id,
     a.id AS action_id,
@@ -250,7 +265,8 @@ WITH action_items AS (
     a.created_at
   FROM otlet.actions a
   JOIN otlet.jobs j ON j.id = a.job_id
-  LEFT JOIN otlet.watches w ON w.task_name = j.task_name
+  JOIN otlet.workload_revisions revision
+    ON revision.workload_revision_hash = j.workload_revision_hash
   LEFT JOIN otlet.outputs o ON o.id = a.output_id
   LEFT JOIN LATERAL (
     SELECT er.*
@@ -264,7 +280,10 @@ WITH action_items AS (
     FROM otlet.semantic_materializations sm
     WHERE sm.task_name = j.task_name
       AND sm.subject_id = j.subject_id
-      AND (w.record_type IS NULL OR sm.record_type = w.record_type)
+      AND (
+        revision.definition #>> '{source,record_type}' IS NULL
+        OR sm.record_type = revision.definition #>> '{source,record_type}'
+      )
     ORDER BY sm.updated_at DESC, sm.id DESC
     LIMIT 1
   ) materialization ON true
@@ -295,7 +314,12 @@ abstention_items AS (
     'abstention_output'::text AS queue_kind,
     'review'::text AS next_operator_step,
     j.task_name,
-    w.name AS watch_name,
+    j.workload_revision_hash,
+    COALESCE(
+      revision.definition #>> '{source,watch_name}',
+      revision.definition #>> '{source,semantic_index_name}',
+      revision.definition #>> '{source,semantic_join_index_name}'
+    ) AS watch_name,
     j.subject_id AS job_subject_id,
     j.subject_id AS subject_id,
     NULL::bigint AS action_id,
@@ -330,23 +354,34 @@ abstention_items AS (
     o.created_at
   FROM otlet.outputs o
   JOIN otlet.jobs j ON j.id = o.job_id
-  JOIN otlet.tasks t ON t.name = j.task_name
+  JOIN otlet.workload_revisions revision
+    ON revision.workload_revision_hash = j.workload_revision_hash
   JOIN otlet.inference_receipts r ON r.id = o.receipt_id
-  LEFT JOIN otlet.watches w ON w.task_name = j.task_name
   CROSS JOIN LATERAL (
-    SELECT otlet.semantic_content_hash(j.input, t.input_shaping) AS content_hash
+    SELECT otlet.semantic_content_hash(
+      j.input,
+      revision.definition #> '{task,input_shaping}'
+    ) AS content_hash
   ) hashed
   LEFT JOIN LATERAL (
     SELECT sm.content_hash, sm.stale
     FROM otlet.semantic_materializations sm
     WHERE sm.task_name = j.task_name
       AND sm.subject_id = j.subject_id
-      AND (w.record_type IS NULL OR sm.record_type = w.record_type)
+      AND (
+        revision.definition #>> '{source,record_type}' IS NULL
+        OR sm.record_type = revision.definition #>> '{source,record_type}'
+      )
     ORDER BY sm.updated_at DESC, sm.id DESC
     LIMIT 1
   ) materialization ON true
-  WHERE COALESCE(t.decision_contract -> 'abstain_values', '["unclear"]'::jsonb)
-      ? (o.output ->> COALESCE(NULLIF(t.decision_contract ->> 'answer_field', ''), 'match'))
+  WHERE COALESCE(
+      revision.definition #> '{task,decision_contract,abstain_values}',
+      '["unclear"]'::jsonb
+    ) ? (o.output ->> COALESCE(
+      NULLIF(revision.definition #>> '{task,decision_contract,answer_field}', ''),
+      'match'
+    ))
     AND NOT EXISTS (
       SELECT 1
       FROM otlet.eval_labels l
@@ -365,7 +400,12 @@ direct_rejected_items AS (
     'direct_rejected_output'::text AS queue_kind,
     'review'::text AS next_operator_step,
     j.task_name,
-    w.name AS watch_name,
+    j.workload_revision_hash,
+    COALESCE(
+      revision.definition #>> '{source,watch_name}',
+      revision.definition #>> '{source,semantic_index_name}',
+      revision.definition #>> '{source,semantic_join_index_name}'
+    ) AS watch_name,
     j.subject_id AS job_subject_id,
     j.subject_id AS subject_id,
     NULL::bigint AS action_id,
@@ -400,17 +440,23 @@ direct_rejected_items AS (
     r.finished_at AS created_at
   FROM otlet.inference_receipts r
   JOIN otlet.jobs j ON j.id = r.job_id
-  JOIN otlet.tasks t ON t.name = j.task_name
-  LEFT JOIN otlet.watches w ON w.task_name = j.task_name
+  JOIN otlet.workload_revisions revision
+    ON revision.workload_revision_hash = j.workload_revision_hash
   CROSS JOIN LATERAL (
-    SELECT otlet.semantic_content_hash(j.input, t.input_shaping) AS content_hash
+    SELECT otlet.semantic_content_hash(
+      j.input,
+      revision.definition #> '{task,input_shaping}'
+    ) AS content_hash
   ) hashed
   LEFT JOIN LATERAL (
     SELECT sm.content_hash, sm.stale
     FROM otlet.semantic_materializations sm
     WHERE sm.task_name = j.task_name
       AND sm.subject_id = j.subject_id
-      AND (w.record_type IS NULL OR sm.record_type = w.record_type)
+      AND (
+        revision.definition #>> '{source,record_type}' IS NULL
+        OR sm.record_type = revision.definition #>> '{source,record_type}'
+      )
     ORDER BY sm.updated_at DESC, sm.id DESC
     LIMIT 1
   ) materialization ON true
@@ -436,6 +482,7 @@ SELECT
   queue_kind,
   next_operator_step,
   task_name,
+  workload_revision_hash,
   watch_name,
   job_subject_id,
   subject_id,
@@ -469,6 +516,7 @@ SELECT
   queue_kind,
   next_operator_step,
   task_name,
+  workload_revision_hash,
   watch_name,
   job_subject_id,
   subject_id,
@@ -502,6 +550,7 @@ SELECT
   queue_kind,
   next_operator_step,
   task_name,
+  workload_revision_hash,
   watch_name,
   job_subject_id,
   subject_id,

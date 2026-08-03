@@ -144,6 +144,19 @@ CREATE TABLE otlet.model_selection_policies (
   CHECK (cheap_model_name <> strong_model_name)
 );
 
+CREATE TABLE otlet.workload_revisions (
+  workload_revision_hash text PRIMARY KEY CHECK (
+    workload_revision_hash ~ '^otlet:v1:sha256:[0-9a-f]{64}$'
+  ),
+  task_name text NOT NULL REFERENCES otlet.tasks(name),
+  definition jsonb NOT NULL CHECK (jsonb_typeof(definition) = 'object'),
+  created_at timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (task_name, workload_revision_hash)
+);
+
+CREATE INDEX workload_revisions_task_created_idx
+ON otlet.workload_revisions (task_name, created_at DESC, workload_revision_hash);
+
 CREATE TABLE otlet.runtime_slots (
   model_name text PRIMARY KEY REFERENCES otlet.models(name),
   artifact_path text,
@@ -185,6 +198,7 @@ CREATE TABLE otlet.runtime_slots (
 CREATE TABLE otlet.jobs (
   id bigserial PRIMARY KEY,
   task_name text NOT NULL REFERENCES otlet.tasks(name),
+  workload_revision_hash text NOT NULL,
   subject_id text NOT NULL,
   input jsonb NOT NULL,
   routed_model_name text REFERENCES otlet.models(name),
@@ -203,7 +217,10 @@ CREATE TABLE otlet.jobs (
   CHECK ((status IN ('running', 'cancel_requested')) = (claim_token IS NOT NULL)),
   CHECK ((terminal_claim_token IS NULL) = (terminal_request_hash IS NULL)),
   CHECK (terminal_claim_token IS NULL OR status IN ('complete', 'failed', 'canceled')),
-  CHECK (terminal_request_hash IS NULL OR terminal_request_hash ~ '^otlet:v1:sha256:[0-9a-f]{64}$')
+  CHECK (terminal_request_hash IS NULL OR terminal_request_hash ~ '^otlet:v1:sha256:[0-9a-f]{64}$'),
+  FOREIGN KEY (task_name, workload_revision_hash)
+    REFERENCES otlet.workload_revisions(task_name, workload_revision_hash),
+  UNIQUE (id, workload_revision_hash)
 );
 
 CREATE UNIQUE INDEX jobs_active_subject_idx
@@ -227,7 +244,8 @@ WHERE status = 'complete';
 
 CREATE TABLE otlet.inference_receipts (
   id bigserial PRIMARY KEY,
-  job_id bigint NOT NULL REFERENCES otlet.jobs(id),
+  job_id bigint NOT NULL,
+  workload_revision_hash text NOT NULL,
   attempt_index int NOT NULL,
   selection_role text NOT NULL DEFAULT 'direct',
   selection_status text NOT NULL DEFAULT 'accepted',
@@ -271,7 +289,9 @@ CREATE TABLE otlet.inference_receipts (
   CHECK (candidate_output IS NULL OR jsonb_typeof(candidate_output) = 'object'),
   CHECK (task_identity_hash IS NULL OR task_identity_hash ~ '^otlet:v1:sha256:[0-9a-f]{64}$'),
   CHECK (source_identity_hash IS NULL OR source_identity_hash ~ '^otlet:v1:sha256:[0-9a-f]{64}$'),
-  CHECK (model_identity_hash IS NULL OR model_identity_hash ~ '^otlet:v1:sha256:[0-9a-f]{64}$')
+  CHECK (model_identity_hash IS NULL OR model_identity_hash ~ '^otlet:v1:sha256:[0-9a-f]{64}$'),
+  FOREIGN KEY (job_id, workload_revision_hash)
+    REFERENCES otlet.jobs(id, workload_revision_hash)
 );
 
 CREATE INDEX inference_receipts_task_model_role_finished_idx

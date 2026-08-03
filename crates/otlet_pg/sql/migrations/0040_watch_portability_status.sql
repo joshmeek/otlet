@@ -336,6 +336,14 @@ WITH watch_sources AS (
 ), watch_tasks AS (
   SELECT DISTINCT task_name
   FROM watch_sources
+), watch_revisions AS (
+  SELECT
+    task.task_name,
+    otlet.identity_hash(
+      'workload_revision',
+      otlet.current_workload_revision_definition(task.task_name)
+    ) AS workload_revision_hash
+  FROM watch_tasks task
 ), watch_materialization_keys AS (
   SELECT DISTINCT task_name, record_type
   FROM watch_sources
@@ -347,7 +355,9 @@ WITH watch_sources AS (
     count(*) FILTER (WHERE j.status = 'complete')::bigint AS complete_jobs,
     count(*) FILTER (WHERE j.status IN ('failed', 'canceled'))::bigint AS failed_jobs
   FROM otlet.jobs j
-  JOIN watch_tasks USING (task_name)
+  JOIN watch_revisions revision
+    ON revision.task_name = j.task_name
+   AND revision.workload_revision_hash = j.workload_revision_hash
   GROUP BY j.task_name
 ), action_counts AS (
   SELECT
@@ -357,7 +367,9 @@ WITH watch_sources AS (
     count(*) FILTER (WHERE a.status = 'rejected')::bigint AS rejected_actions
   FROM otlet.actions a
   JOIN otlet.jobs j ON j.id = a.job_id
-  JOIN watch_tasks USING (task_name)
+  JOIN watch_revisions revision
+    ON revision.task_name = j.task_name
+   AND revision.workload_revision_hash = j.workload_revision_hash
   GROUP BY j.task_name
 ), suppression AS (
   SELECT
@@ -365,7 +377,9 @@ WITH watch_sources AS (
     count(*)::bigint AS suppressed_events,
     max(e.created_at) AS last_suppressed_at
   FROM otlet.worker_events e
-  JOIN watch_tasks ON watch_tasks.task_name = e.detail ->> 'task_name'
+  JOIN watch_revisions revision
+    ON revision.task_name = e.detail ->> 'task_name'
+   AND revision.workload_revision_hash = e.detail ->> 'workload_revision_hash'
   WHERE e.event_type = 'queue_admission_suppressed'
     AND e.detail ? 'task_name'
   GROUP BY e.detail ->> 'task_name'
@@ -383,6 +397,7 @@ SELECT
   w.watch_name,
   w.kind,
   w.task_name,
+  revision.workload_revision_hash,
   w.semantic_index_name,
   w.semantic_join_index_name,
   w.source_table,
@@ -427,6 +442,7 @@ SELECT
   COALESCE(materialized.revalidated_materializations, 0)::bigint AS revalidated_materializations,
   COALESCE(plan.checked_at, now()) AS checked_at
 FROM watch_sources w
+JOIN watch_revisions revision ON revision.task_name = w.task_name
 LEFT JOIN otlet.semantic_indexes row_index ON row_index.name = w.semantic_index_name
 LEFT JOIN otlet.semantic_join_indexes join_index ON join_index.name = w.semantic_join_index_name
 LEFT JOIN watch_plans plan ON plan.watch_name = w.watch_name

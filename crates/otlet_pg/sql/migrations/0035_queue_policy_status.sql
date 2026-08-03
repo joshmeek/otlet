@@ -39,6 +39,36 @@ FROM otlet.production_policy p
 WHERE p.name = 'default';
 
 CREATE VIEW otlet.model_queue_status AS
+WITH active_revision_models AS (
+  SELECT
+    COALESCE(
+      j.routed_model_name,
+      revision.definition #>> '{models,direct,name}'
+    ) AS model_name,
+    CASE
+      WHEN j.routed_model_name = revision.definition #>> '{selection,strong_model_name}'
+        THEN revision.definition #> '{models,strong}'
+      WHEN j.routed_model_name = revision.definition #>> '{selection,cheap_model_name}'
+        THEN revision.definition #> '{models,cheap}'
+      ELSE revision.definition #> '{models,direct}'
+    END AS model_definition
+  FROM otlet.jobs j
+  JOIN otlet.workload_revisions revision
+    ON revision.workload_revision_hash = j.workload_revision_hash
+  WHERE j.status IN ('queued', 'running', 'cancel_requested')
+), model_routes AS (
+  SELECT m.name, m.max_active_jobs
+  FROM otlet.models m
+  UNION ALL
+  SELECT
+    active.model_name,
+    max((active.model_definition ->> 'max_active_jobs')::integer) AS max_active_jobs
+  FROM active_revision_models active
+  WHERE NOT EXISTS (
+    SELECT 1 FROM otlet.models current_model WHERE current_model.name = active.model_name
+  )
+  GROUP BY active.model_name
+)
 SELECT
   'linked_inproc'::text AS runtime_name,
   m.name AS model_name,
@@ -78,12 +108,15 @@ SELECT
   END AS queue_state,
   COALESCE(suppressed.suppressed_events, 0)::bigint AS queue_admission_suppressed_events,
   suppressed.last_suppressed_at AS queue_admission_last_suppressed_at
-FROM otlet.models m
+FROM model_routes m
 CROSS JOIN otlet.production_policy p
-LEFT JOIN otlet.tasks t ON true
+LEFT JOIN otlet.workload_revisions revision ON true
 LEFT JOIN otlet.jobs j
-  ON j.task_name = t.name
- AND COALESCE(j.routed_model_name, t.model_name) = m.name
+  ON j.workload_revision_hash = revision.workload_revision_hash
+ AND COALESCE(
+   j.routed_model_name,
+   revision.definition #>> '{models,direct,name}'
+ ) = m.name
  AND j.status IN ('queued', 'running', 'cancel_requested')
 LEFT JOIN LATERAL (
   SELECT COALESCE(sum(octet_length(queued.input::text)), 0)::bigint AS queued_input_bytes
@@ -219,18 +252,27 @@ LEFT JOIN otlet.model_queue_status cheap_q ON cheap_q.model_name = p.cheap_model
 WHERE policy.name = 'default';
 
 CREATE VIEW otlet.model_selection_status AS
-WITH job_counts AS (
+WITH selection_revisions AS (
+  SELECT DISTINCT j.task_name, j.workload_revision_hash
+  FROM otlet.jobs j
+  JOIN otlet.workload_revisions revision
+    ON revision.workload_revision_hash = j.workload_revision_hash
+  WHERE jsonb_typeof(revision.definition -> 'selection') = 'object'
+),
+job_counts AS (
   SELECT
     j.task_name,
+    j.workload_revision_hash,
     count(*)::bigint AS total_jobs,
     count(*) FILTER (WHERE j.status = 'complete')::bigint AS complete_jobs,
     count(*) FILTER (WHERE j.status = 'failed')::bigint AS failed_jobs
   FROM otlet.jobs j
-  GROUP BY j.task_name
+  GROUP BY j.task_name, j.workload_revision_hash
 ),
 attempt_counts AS (
   SELECT
     r.task_name,
+    r.workload_revision_hash,
     count(*) FILTER (WHERE r.selection_role = 'cheap')::bigint AS cheap_attempts,
     count(*) FILTER (
       WHERE r.selection_role = 'cheap'
@@ -255,10 +297,11 @@ attempt_counts AS (
     )::bigint AS strong_failed,
     count(DISTINCT r.job_id) FILTER (WHERE r.selection_role = 'strong')::bigint AS escalated_jobs
   FROM otlet.inference_receipts r
-  GROUP BY r.task_name
+  GROUP BY r.task_name, r.workload_revision_hash
 )
 SELECT
-  p.task_name,
+  revision.task_name,
+  revision.workload_revision_hash,
   COALESCE(j.total_jobs, 0)::bigint AS total_jobs,
   COALESCE(j.complete_jobs, 0)::bigint AS complete_jobs,
   COALESCE(j.failed_jobs, 0)::bigint AS failed_jobs,
@@ -270,6 +313,10 @@ SELECT
   COALESCE(a.strong_accepted, 0)::bigint AS strong_accepted,
   COALESCE(a.strong_failed, 0)::bigint AS strong_failed,
   COALESCE(a.escalated_jobs, 0)::bigint AS escalated_jobs
-FROM otlet.model_selection_policies p
-LEFT JOIN job_counts j ON j.task_name = p.task_name
-LEFT JOIN attempt_counts a ON a.task_name = p.task_name;
+FROM selection_revisions revision
+LEFT JOIN job_counts j
+  ON j.task_name = revision.task_name
+ AND j.workload_revision_hash = revision.workload_revision_hash
+LEFT JOIN attempt_counts a
+  ON a.task_name = revision.task_name
+ AND a.workload_revision_hash = revision.workload_revision_hash;

@@ -12,10 +12,7 @@ AS $$
         ELSE LEAST(worker_claim_batch_size, GREATEST(claim_jobs.requested_limit, 1))
       END AS batch_size,
       worker_claim_task_cursor AS task_cursor,
-      max_attempts,
-      max_attempt_ms,
-      default_runtime_options,
-      job_lease_interval
+      max_attempts
     FROM otlet.production_policy
     WHERE name = 'default'
     FOR UPDATE
@@ -23,13 +20,20 @@ AS $$
   invalid_claim_input AS MATERIALIZED (
     SELECT j.id
     FROM otlet.jobs j
-    JOIN otlet.tasks t ON t.name = j.task_name
+    JOIN otlet.workload_revisions revision
+      ON revision.workload_revision_hash = j.workload_revision_hash
     WHERE j.status IN ('queued', 'running', 'cancel_requested')
       AND (
         claim_jobs.requested_model_name IS NULL
-        OR COALESCE(j.routed_model_name, t.model_name) = claim_jobs.requested_model_name
+        OR COALESCE(
+          j.routed_model_name,
+          revision.definition #>> '{models,direct,name}'
+        ) = claim_jobs.requested_model_name
       )
-      AND NOT otlet.source_fields_are_allowed(j.input, t.input_shaping)
+      AND NOT otlet.source_fields_are_allowed(
+        j.input,
+        revision.definition #> '{task,input_shaping}'
+      )
     ORDER BY j.created_at, j.id
     FOR UPDATE OF j SKIP LOCKED
     LIMIT (SELECT batch_size FROM policy)
@@ -45,73 +49,92 @@ AS $$
     WHERE j.id = invalid.id
     RETURNING j.id
   ),
+  job_contracts AS MATERIALIZED (
+    SELECT
+      j.*,
+      revision.definition,
+      CASE
+        WHEN j.routed_model_name = revision.definition #>> '{selection,strong_model_name}'
+          THEN revision.definition #> '{models,strong}'
+        WHEN j.routed_model_name = revision.definition #>> '{selection,cheap_model_name}'
+          THEN revision.definition #> '{models,cheap}'
+        ELSE revision.definition #> '{models,direct}'
+      END AS selected_model
+    FROM otlet.jobs j
+    JOIN otlet.workload_revisions revision
+      ON revision.workload_revision_hash = j.workload_revision_hash
+  ),
   active_model AS (
     SELECT
-      COALESCE(j.routed_model_name, t.model_name) AS model_name,
+      COALESCE(
+        job.routed_model_name,
+        job.definition #>> '{models,direct,name}'
+      ) AS model_name,
       -- Occupied only while a live lease holds; NULL / expired leases are reclaimable.
       count(*) FILTER (
-        WHERE j.status = 'running'
-          AND j.leased_until >= now()
+        WHERE job.status = 'running'
+          AND job.leased_until >= now()
       ) AS running_jobs,
       count(*) FILTER (
-        WHERE j.status = 'cancel_requested'
-          AND j.leased_until >= now()
+        WHERE job.status = 'cancel_requested'
+          AND job.leased_until >= now()
       ) AS cancel_requested_jobs
-    FROM otlet.jobs j
-    JOIN otlet.tasks t ON t.name = j.task_name
-    WHERE j.status IN ('running', 'cancel_requested')
-    GROUP BY COALESCE(j.routed_model_name, t.model_name)
+    FROM job_contracts job
+    WHERE job.status IN ('running', 'cancel_requested')
+    GROUP BY COALESCE(
+      job.routed_model_name,
+      job.definition #>> '{models,direct,name}'
+    )
   ),
   eligible_tasks AS (
     SELECT
-      j.task_name,
-      m.name AS model_name,
-      m.artifact_path,
-      selection.cheap_model_name AS policy_cheap_model_name,
-      selection.strong_model_name AS policy_strong_model_name,
+      job.task_name,
+      job.selected_model ->> 'name' AS model_name,
+      job.selected_model ->> 'artifact_path' AS artifact_path,
+      job.definition #>> '{selection,cheap_model_name}' AS policy_cheap_model_name,
+      job.definition #>> '{selection,strong_model_name}' AS policy_strong_model_name,
       EXISTS (
         SELECT 1
         FROM otlet.runtime_slots s
-        WHERE s.model_name = m.name
+        WHERE s.model_name = job.selected_model ->> 'name'
           AND s.status = 'ready'
-          AND s.artifact_path IS NOT DISTINCT FROM m.artifact_path
+          AND s.artifact_path IS NOT DISTINCT FROM job.selected_model ->> 'artifact_path'
       ) AS warm_model,
-      min(CASE WHEN j.status IN ('running', 'cancel_requested') AND (j.leased_until IS NULL OR j.leased_until < now()) THEN 0 ELSE 1 END) AS retry_rank,
-      min(j.created_at) AS first_created_at,
-      min(j.id) AS first_job_id
-    FROM otlet.jobs j
-    JOIN otlet.tasks t ON t.name = j.task_name
-    JOIN otlet.models m ON m.name = COALESCE(j.routed_model_name, t.model_name)
-    LEFT JOIN otlet.model_selection_policies selection ON selection.task_name = t.name
+      min(CASE WHEN job.status IN ('running', 'cancel_requested') AND (job.leased_until IS NULL OR job.leased_until < now()) THEN 0 ELSE 1 END) AS retry_rank,
+      min(job.created_at) AS first_created_at,
+      min(job.id) AS first_job_id
+    FROM job_contracts job
     CROSS JOIN policy p
-    LEFT JOIN active_model ON active_model.model_name = m.name
+    LEFT JOIN active_model ON active_model.model_name = job.selected_model ->> 'name'
     WHERE (
-        j.status = 'queued'
+        job.status = 'queued'
         OR (
-          j.status = 'running'
-          AND (j.leased_until IS NULL OR j.leased_until < now())
-          AND j.attempts < p.max_attempts
+          job.status = 'running'
+          AND (job.leased_until IS NULL OR job.leased_until < now())
+          AND job.attempts < p.max_attempts
         )
         OR (
-          j.status = 'cancel_requested'
-          AND (j.leased_until IS NULL OR j.leased_until < now())
+          job.status = 'cancel_requested'
+          AND (job.leased_until IS NULL OR job.leased_until < now())
         )
       )
       AND (
         COALESCE(active_model.running_jobs, 0)
         + COALESCE(active_model.cancel_requested_jobs, 0)
-      ) < m.max_active_jobs
+      ) < (job.selected_model ->> 'max_active_jobs')::integer
       AND (
         claim_jobs.requested_model_name IS NULL
-        OR m.name = claim_jobs.requested_model_name
+        OR job.selected_model ->> 'name' = claim_jobs.requested_model_name
       )
-      AND otlet.source_fields_are_allowed(j.input, t.input_shaping)
+      AND otlet.source_fields_are_allowed(
+        job.input,
+        job.definition #> '{task,input_shaping}'
+      )
     GROUP BY
-      j.task_name,
-      m.name,
-      m.artifact_path,
-      selection.cheap_model_name,
-      selection.strong_model_name
+      job.task_name,
+      job.selected_model,
+      job.definition #>> '{selection,cheap_model_name}',
+      job.definition #>> '{selection,strong_model_name}'
   ),
   selected_task AS (
     SELECT e.*
@@ -156,42 +179,40 @@ AS $$
   ),
   ranked_candidates AS (
     SELECT
-      j.id,
-      j.task_name,
-      otlet.effective_job_lease_interval(
-        p.default_runtime_options || t.runtime_options,
-        p.max_attempt_ms,
-        p.job_lease_interval
-      ) AS lease_interval,
+      job.id,
+      job.task_name,
+      (job.definition #>> '{runtime,lease_ms}')::bigint
+        * interval '1 millisecond' AS lease_interval,
       f.task_rank,
       row_number() OVER (
-        PARTITION BY j.task_name
+        PARTITION BY job.task_name
         ORDER BY
-          CASE WHEN j.status IN ('running', 'cancel_requested') AND (j.leased_until IS NULL OR j.leased_until < now()) THEN 0 ELSE 1 END,
-          j.created_at,
-          j.id
+          CASE WHEN job.status IN ('running', 'cancel_requested') AND (job.leased_until IS NULL OR job.leased_until < now()) THEN 0 ELSE 1 END,
+          job.created_at,
+          job.id
       ) AS task_job_rank
-    FROM otlet.jobs j
-    JOIN otlet.tasks t ON t.name = j.task_name
-    JOIN otlet.models m ON m.name = COALESCE(j.routed_model_name, t.model_name)
+    FROM job_contracts job
     JOIN same_model_tasks f
-      ON f.task_name = j.task_name
-     AND f.model_name = m.name
-     AND f.artifact_path IS NOT DISTINCT FROM m.artifact_path
+      ON f.task_name = job.task_name
+     AND f.model_name = job.selected_model ->> 'name'
+     AND f.artifact_path IS NOT DISTINCT FROM job.selected_model ->> 'artifact_path'
     CROSS JOIN policy p
     WHERE (
-        j.status = 'queued'
+        job.status = 'queued'
         OR (
-          j.status = 'running'
-          AND (j.leased_until IS NULL OR j.leased_until < now())
-          AND j.attempts < p.max_attempts
+          job.status = 'running'
+          AND (job.leased_until IS NULL OR job.leased_until < now())
+          AND job.attempts < p.max_attempts
         )
         OR (
-          j.status = 'cancel_requested'
-          AND (j.leased_until IS NULL OR j.leased_until < now())
+          job.status = 'cancel_requested'
+          AND (job.leased_until IS NULL OR job.leased_until < now())
         )
       )
-      AND otlet.source_fields_are_allowed(j.input, t.input_shaping)
+      AND otlet.source_fields_are_allowed(
+        job.input,
+        job.definition #> '{task,input_shaping}'
+      )
   ),
   claimable AS (
     SELECT
@@ -217,9 +238,12 @@ AS $$
       )
       AND EXISTS (
         SELECT 1
-        FROM otlet.tasks t
-        WHERE t.name = j.task_name
-          AND otlet.source_fields_are_allowed(j.input, t.input_shaping)
+        FROM job_contracts job
+        WHERE job.id = j.id
+          AND otlet.source_fields_are_allowed(
+            j.input,
+            job.definition #> '{task,input_shaping}'
+          )
       )
     ORDER BY
       candidate.task_job_rank,
@@ -272,20 +296,15 @@ CREATE FUNCTION otlet.renew_job_lease(
 LANGUAGE sql
 AS $$
   UPDATE otlet.jobs j
-  SET leased_until = now() + otlet.effective_job_lease_interval(
-    p.default_runtime_options || t.runtime_options,
-    p.max_attempt_ms,
-    p.job_lease_interval
-  )
-  FROM otlet.tasks t
-  CROSS JOIN otlet.production_policy p
+  SET leased_until = now()
+    + (revision.definition #>> '{runtime,lease_ms}')::bigint * interval '1 millisecond'
+  FROM otlet.workload_revisions revision
   WHERE j.id = renew_job_lease.job_id
     AND j.claim_token = renew_job_lease.expected_claim_token
     AND j.status IN ('running', 'cancel_requested')
     AND j.leased_until IS NOT NULL
     AND j.leased_until >= now()
-    AND t.name = j.task_name
-    AND p.name = 'default'
+    AND revision.workload_revision_hash = j.workload_revision_hash
   RETURNING j.status, j.leased_until;
 $$;
 
@@ -314,10 +333,18 @@ DECLARE
 BEGIN
   -- claim_jobs / insert_infer_now_job already stamp started_at; this only
   -- records the runtime slot + worker event for the claimed/running job.
-  SELECT j.id, j.task_name, j.subject_id, t.model_name
+  SELECT
+    j.id,
+    j.task_name,
+    j.subject_id,
+    COALESCE(
+      j.routed_model_name,
+      revision.definition #>> '{models,direct,name}'
+    )
   INTO v_id, v_task_name, v_subject_id, model_name
   FROM otlet.jobs j
-  LEFT JOIN otlet.tasks t ON t.name = j.task_name
+  JOIN otlet.workload_revisions revision
+    ON revision.workload_revision_hash = j.workload_revision_hash
   WHERE j.id = mark_job_started.job_id;
   IF NOT FOUND THEN
     RETURN;

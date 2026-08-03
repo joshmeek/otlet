@@ -1,5 +1,6 @@
 CREATE FUNCTION otlet.semantic_join_refresh_inputs(
-  index_name text
+  index_name text,
+  workload_revision_hash text DEFAULT NULL
 ) RETURNS TABLE (
   subject_id text,
   input jsonb
@@ -11,29 +12,59 @@ DECLARE
   index_row otlet.semantic_join_indexes%ROWTYPE;
   current_contract_hash text;
   current_input_shaping jsonb := '{}'::jsonb;
+  revision_definition jsonb;
 BEGIN
-  SELECT *
-  INTO index_row
-  FROM otlet.semantic_join_indexes sji
-  WHERE sji.name = semantic_join_refresh_inputs.index_name;
+  IF semantic_join_refresh_inputs.workload_revision_hash IS NULL THEN
+    SELECT *
+    INTO index_row
+    FROM otlet.semantic_join_indexes sji
+    WHERE sji.name = semantic_join_refresh_inputs.index_name;
 
-  IF NOT FOUND THEN
-    RAISE EXCEPTION 'otlet semantic join index % does not exist', semantic_join_refresh_inputs.index_name;
+    IF NOT FOUND THEN
+      RAISE EXCEPTION 'otlet semantic join index % does not exist', semantic_join_refresh_inputs.index_name;
+    END IF;
+
+    SELECT
+      otlet.task_contract_hash(
+        t.instruction,
+        t.output_schema,
+        t.model_name,
+        t.runtime_options,
+        t.input_shaping,
+        t.decision_contract
+      ),
+      t.input_shaping
+    INTO current_contract_hash, current_input_shaping
+    FROM otlet.tasks t
+    WHERE t.name = index_row.task_name;
+  ELSE
+    SELECT revision.definition
+    INTO revision_definition
+    FROM otlet.workload_revisions revision
+    WHERE revision.workload_revision_hash = semantic_join_refresh_inputs.workload_revision_hash
+      AND revision.definition #>> '{source,semantic_join_index_name}' = semantic_join_refresh_inputs.index_name
+      AND revision.definition #>> '{source,kind}' = 'pair';
+
+    IF NOT FOUND THEN
+      RAISE EXCEPTION 'otlet workload revision does not define semantic join index %',
+        semantic_join_refresh_inputs.index_name;
+    END IF;
+
+    index_row.name := revision_definition #>> '{source,semantic_join_index_name}';
+    index_row.task_name := revision_definition #>> '{task,name}';
+    index_row.candidate_query := revision_definition #>> '{source,candidate_query}';
+    index_row.record_type := revision_definition #>> '{source,record_type}';
+    index_row.max_candidate_rows := (revision_definition #>> '{source,max_candidate_rows}')::integer;
+    current_input_shaping := revision_definition #> '{task,input_shaping}';
+    current_contract_hash := otlet.task_contract_hash(
+      revision_definition #>> '{task,instruction}',
+      revision_definition #> '{task,output_schema}',
+      revision_definition #>> '{models,direct,name}',
+      revision_definition #> '{task,runtime_options}',
+      current_input_shaping,
+      revision_definition #> '{task,decision_contract}'
+    );
   END IF;
-
-  SELECT
-    otlet.task_contract_hash(
-      t.instruction,
-      t.output_schema,
-      t.model_name,
-      t.runtime_options,
-      t.input_shaping,
-      t.decision_contract
-    ),
-    t.input_shaping
-  INTO current_contract_hash, current_input_shaping
-  FROM otlet.tasks t
-  WHERE t.name = index_row.task_name;
 
   RETURN QUERY EXECUTE format(
     $sql$
@@ -451,10 +482,10 @@ BEGIN
   END IF;
 
   BEGIN
-    PERFORM otlet.materialize_completed_semantic_job(
+    SELECT otlet.materialize_completed_semantic_job(
       complete_and_materialize_job.job_id
-    );
-    semantic_materialized := true;
+    ) > 0
+    INTO semantic_materialized;
   EXCEPTION WHEN OTHERS THEN
     materialization_error := SQLERRM;
     BEGIN

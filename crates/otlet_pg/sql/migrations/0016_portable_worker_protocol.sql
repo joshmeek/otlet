@@ -63,7 +63,8 @@ ON otlet.portable_workers (database_role_oid, runtime_identity_hash);
 
 CREATE TABLE otlet.portable_claims (
   id bigserial PRIMARY KEY,
-  job_id bigint NOT NULL REFERENCES otlet.jobs(id) ON DELETE CASCADE,
+  job_id bigint NOT NULL,
+  workload_revision_hash text NOT NULL,
   worker_id text NOT NULL REFERENCES otlet.portable_workers(worker_id),
   protocol_version integer NOT NULL,
   runtime_identity_hash text NOT NULL,
@@ -75,7 +76,9 @@ CREATE TABLE otlet.portable_claims (
   ),
   claimed_at timestamptz NOT NULL DEFAULT now(),
   last_renewed_at timestamptz,
-  finished_at timestamptz
+  finished_at timestamptz,
+  FOREIGN KEY (job_id, workload_revision_hash)
+    REFERENCES otlet.jobs(id, workload_revision_hash) ON DELETE CASCADE
 );
 
 CREATE UNIQUE INDEX portable_claims_live_job_idx
@@ -397,6 +400,7 @@ CREATE FUNCTION otlet.portable_claim_jobs(
   protocol_version integer,
   worker_id text,
   job_id bigint,
+  workload_revision_hash text,
   claim_token text,
   claim_status text,
   selection_role text,
@@ -421,9 +425,9 @@ AS $$
 DECLARE
   worker_row otlet.portable_workers%ROWTYPE;
   claimed_job otlet.jobs%ROWTYPE;
-  task_row otlet.tasks%ROWTYPE;
   policy_row otlet.production_policy%ROWTYPE;
   saved_claim otlet.portable_claims%ROWTYPE;
+  revision_definition jsonb;
   selected_model jsonb;
   claim_selection_role text;
 BEGIN
@@ -445,18 +449,15 @@ BEGIN
     SELECT *
     FROM otlet.claim_jobs(worker_row.model_name, portable_claim_jobs.requested_claim_limit)
   LOOP
-    SELECT t.*
-    INTO task_row
-    FROM otlet.tasks t
-    WHERE t.name = claimed_job.task_name;
+    SELECT revision.definition
+    INTO revision_definition
+    FROM otlet.workload_revisions revision
+    WHERE revision.workload_revision_hash = claimed_job.workload_revision_hash
+      AND revision.task_name = claimed_job.task_name;
 
     claim_selection_role := CASE
       WHEN claimed_job.routed_model_name IS NOT NULL THEN 'strong'
-      WHEN EXISTS (
-        SELECT 1
-        FROM otlet.model_selection_policies selection
-        WHERE selection.task_name = claimed_job.task_name
-      ) THEN 'cheap'
+      WHEN jsonb_typeof(revision_definition -> 'selection') = 'object' THEN 'cheap'
       ELSE 'direct'
     END;
 
@@ -468,6 +469,7 @@ BEGIN
 
     INSERT INTO otlet.portable_claims (
       job_id,
+      workload_revision_hash,
       worker_id,
       protocol_version,
       runtime_identity_hash,
@@ -477,6 +479,7 @@ BEGIN
     )
     VALUES (
       claimed_job.id,
+      claimed_job.workload_revision_hash,
       worker_row.worker_id,
       worker_row.protocol_version,
       worker_row.runtime_identity_hash,
@@ -492,18 +495,19 @@ BEGIN
         reported_state = 'running'
     WHERE w.worker_id = worker_row.worker_id;
 
-    SELECT jsonb_build_object(
-      'name', m.name,
-      'artifact_hash', m.artifact_hash,
-      'artifact_identity', m.artifact_identity
-    )
-    INTO selected_model
-    FROM otlet.models m
-    WHERE m.name = worker_row.model_name;
+    selected_model := CASE claim_selection_role
+      WHEN 'cheap' THEN revision_definition #> '{models,cheap}'
+      WHEN 'strong' THEN revision_definition #> '{models,strong}'
+      ELSE revision_definition #> '{models,direct}'
+    END;
+    IF selected_model ->> 'name' IS DISTINCT FROM worker_row.model_name THEN
+      RAISE EXCEPTION 'otlet portable worker model does not match workload revision';
+    END IF;
 
     protocol_version := worker_row.protocol_version;
     worker_id := worker_row.worker_id;
     job_id := claimed_job.id;
+    workload_revision_hash := claimed_job.workload_revision_hash;
     claim_token := claimed_job.claim_token;
     claim_status := claimed_job.status;
     selection_role := saved_claim.selection_role;
@@ -511,17 +515,20 @@ BEGIN
     leased_until := claimed_job.leased_until;
     task_name := claimed_job.task_name;
     subject_id := claimed_job.subject_id;
-    instruction := task_row.instruction;
-    output_schema := task_row.output_schema;
-    runtime_options := policy_row.default_runtime_options || task_row.runtime_options;
-    decision_contract := task_row.decision_contract;
-    input_snapshot := otlet.semantic_shaped_input(claimed_job.input, task_row.input_shaping);
+    instruction := revision_definition #>> '{task,instruction}';
+    output_schema := revision_definition #> '{task,output_schema}';
+    runtime_options := revision_definition #> '{runtime,effective_options}';
+    decision_contract := revision_definition #> '{task,decision_contract}';
+    input_snapshot := otlet.semantic_shaped_input(
+      claimed_job.input,
+      revision_definition #> '{task,input_shaping}'
+    );
     prompt := otlet.portable_prompt_text(
-      task_row.instruction,
-      task_row.output_schema,
+      instruction,
+      output_schema,
       input_snapshot,
       runtime_options,
-      task_row.decision_contract
+      decision_contract
     );
     prompt_hash := otlet.portable_text_hash(prompt);
     model := selected_model;
@@ -533,7 +540,7 @@ BEGIN
       'max_action_bytes', policy_row.max_action_bytes,
       'max_trace_bytes', policy_row.max_trace_bytes,
       'max_error_bytes', policy_row.max_error_bytes,
-      'max_attempt_ms', policy_row.max_attempt_ms
+      'max_attempt_ms', (revision_definition #>> '{runtime,effective_max_attempt_ms}')::integer
     );
     RETURN NEXT;
   END LOOP;
@@ -742,13 +749,14 @@ DECLARE
   strong_model_name text;
   changed bigint;
 BEGIN
-  SELECT selection.strong_model_name
+  SELECT revision.definition #>> '{selection,strong_model_name}'
   INTO strong_model_name
   FROM otlet.jobs j
-  JOIN otlet.model_selection_policies selection ON selection.task_name = j.task_name
+  JOIN otlet.workload_revisions revision
+    ON revision.workload_revision_hash = j.workload_revision_hash
   WHERE j.id = requeue_portable_job_to_strong.job_id;
 
-  IF NOT FOUND THEN
+  IF NOT FOUND OR strong_model_name IS NULL THEN
     RAISE EXCEPTION 'otlet portable job has no strong model route';
   END IF;
 
@@ -865,10 +873,9 @@ BEGIN
     FROM otlet.portable_selection_acceptance(
       portable_complete_job.output,
       (
-        SELECT selection.accept_field_checks
-        FROM otlet.jobs j
-        JOIN otlet.model_selection_policies selection ON selection.task_name = j.task_name
-        WHERE j.id = portable_complete_job.requested_job_id
+        SELECT revision.definition #> '{selection,accept_field_checks}'
+        FROM otlet.workload_revisions revision
+        WHERE revision.workload_revision_hash = claim_row.workload_revision_hash
       )
     );
     IF NOT acceptance_accepted THEN
@@ -1184,8 +1191,12 @@ SELECT
   (
     SELECT count(*)
     FROM otlet.jobs queued_job
-    JOIN otlet.tasks queued_task ON queued_task.name = queued_job.task_name
-    WHERE COALESCE(queued_job.routed_model_name, queued_task.model_name) = w.model_name
+    JOIN otlet.workload_revisions queued_revision
+      ON queued_revision.workload_revision_hash = queued_job.workload_revision_hash
+    WHERE COALESCE(
+      queued_job.routed_model_name,
+      queued_revision.definition #>> '{models,direct,name}'
+    ) = w.model_name
       AND queued_job.status = 'queued'
   ) AS queued_jobs,
   count(c.id) AS claims,
@@ -1229,6 +1240,7 @@ CREATE VIEW otlet.portable_claim_status AS
 SELECT
   c.id AS claim_id,
   c.job_id,
+  c.workload_revision_hash,
   c.worker_id,
   c.protocol_version,
   c.runtime_identity_hash,
@@ -1260,6 +1272,8 @@ SELECT
   l.receipt_id,
   l.claim_id,
   c.job_id,
+  c.workload_revision_hash,
+  r.workload_revision_hash AS receipt_workload_revision_hash,
   c.worker_id,
   c.protocol_version,
   c.runtime_identity_hash,

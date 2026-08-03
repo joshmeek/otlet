@@ -469,7 +469,8 @@ CREATE FUNCTION otlet.action_validation_error(
   action jsonb,
   output jsonb DEFAULT NULL,
   job_subject_id text DEFAULT NULL,
-  job_input jsonb DEFAULT NULL
+  job_input jsonb DEFAULT NULL,
+  declared_action_schema jsonb DEFAULT NULL
 ) RETURNS text
 LANGUAGE plpgsql
 STABLE
@@ -477,7 +478,6 @@ AS $$
 DECLARE
   v_action_type text := COALESCE(action ->> 'type', '');
   body jsonb;
-  schema_row otlet.action_type_schemas%ROWTYPE;
   expected_left_id text;
   expected_right_id text;
   output_confidence text := NULLIF(output ->> 'confidence', '');
@@ -499,12 +499,14 @@ BEGIN
     RETURN 'action missing type';
   END IF;
 
-  SELECT *
-  INTO schema_row
-  FROM otlet.action_type_schemas s
-  WHERE s.action_type = v_action_type;
-
-  IF NOT FOUND THEN
+  IF action_validation_error.declared_action_schema IS NULL THEN
+    PERFORM 1
+    FROM otlet.action_type_schemas s
+    WHERE s.action_type = v_action_type;
+    IF NOT FOUND THEN
+      RETURN 'unsupported action type';
+    END IF;
+  ELSIF jsonb_typeof(action_validation_error.declared_action_schema) IS DISTINCT FROM 'object' THEN
     RETURN 'unsupported action type';
   END IF;
 
@@ -689,3 +691,320 @@ BEGIN
   RETURN NULL;
 END;
 $$;
+
+CREATE FUNCTION otlet.workload_model_definition(model_name text) RETURNS jsonb
+LANGUAGE sql
+STABLE
+STRICT
+AS $$
+  SELECT jsonb_build_object(
+    'name', m.name,
+    'artifact_path', m.artifact_path,
+    'artifact_hash', m.artifact_hash,
+    'artifact_identity', m.artifact_identity,
+    'max_active_jobs', m.max_active_jobs
+  )
+  FROM otlet.models m
+  WHERE m.name = $1;
+$$;
+
+CREATE FUNCTION otlet.current_workload_revision_definition(task_name text) RETURNS jsonb
+LANGUAGE plpgsql
+STABLE
+AS $$
+DECLARE
+  definition jsonb;
+BEGIN
+  SELECT jsonb_build_object(
+    'format', 'otlet.workload.v1',
+    'task', jsonb_build_object(
+      'name', t.name,
+      'input_query', t.input_query,
+      'instruction', t.instruction,
+      'output_schema', t.output_schema,
+      'runtime_options', t.runtime_options,
+      'input_shaping', t.input_shaping,
+      'decision_contract', t.decision_contract
+    ),
+    'source', COALESCE((
+      SELECT jsonb_strip_nulls(jsonb_build_object(
+        'watch_name', w.name,
+        'kind', w.kind,
+        'semantic_index_name', w.semantic_index_name,
+        'semantic_join_index_name', w.semantic_join_index_name,
+        'source_table', w.source_table,
+        'subject_column', w.subject_column,
+        'input_columns', to_jsonb(w.input_columns),
+        'candidate_query', w.candidate_query,
+        'pair_sources', w.pair_sources,
+        'max_candidate_rows', w.max_candidate_rows,
+        'record_type', w.record_type
+      ))
+      FROM otlet.watches w
+      WHERE w.task_name = t.name
+    ), (
+      SELECT jsonb_build_object(
+        'kind', 'row',
+        'semantic_index_name', si.name,
+        'source_table', si.source_table,
+        'subject_column', si.subject_column,
+        'input_columns', to_jsonb(si.input_columns),
+        'record_type', si.record_type
+      )
+      FROM otlet.semantic_indexes si
+      WHERE si.task_name = t.name
+    ), (
+      SELECT jsonb_build_object(
+        'kind', 'pair',
+        'semantic_join_index_name', sji.name,
+        'candidate_query', sji.candidate_query,
+        'max_candidate_rows', sji.max_candidate_rows,
+        'record_type', sji.record_type
+      )
+      FROM otlet.semantic_join_indexes sji
+      WHERE sji.task_name = t.name
+    ), 'null'::jsonb),
+    'prompt_builder', jsonb_build_object(
+      'version', 'otlet_raw_json_worker_v1'
+    ),
+    'validator', jsonb_build_object(
+      'version', 'otlet_portable_validation_v1',
+      'schema_force', 'postgres_portable_json_schema_validation'
+    ),
+    'decode', jsonb_build_object(
+      'mode', 'deterministic',
+      'sampler', 'greedy',
+      'constraint', 'greedy_with_balanced_json_object_stop_post_generation_schema_check'
+    ),
+    'runtime', jsonb_build_object(
+      'effective_options', p.default_runtime_options || t.runtime_options,
+      'effective_max_attempt_ms', otlet.effective_task_max_attempt_ms(
+        p.default_runtime_options || t.runtime_options,
+        p.max_attempt_ms
+      ),
+      'lease_ms', round(EXTRACT(epoch FROM otlet.effective_job_lease_interval(
+        p.default_runtime_options || t.runtime_options,
+        p.max_attempt_ms,
+        p.job_lease_interval
+      )) * 1000)::bigint,
+      'output_options', jsonb_build_object(
+        'reasoning', COALESCE((p.default_runtime_options || t.runtime_options) ->> 'reasoning', 'off'),
+        'max_tokens', COALESCE(
+          (p.default_runtime_options || t.runtime_options) -> 'max_tokens',
+          '512'::jsonb
+        )
+      )
+    ),
+    'models', jsonb_build_object(
+      'direct', otlet.workload_model_definition(t.model_name),
+      'cheap', otlet.workload_model_definition(selection.cheap_model_name),
+      'strong', otlet.workload_model_definition(selection.strong_model_name)
+    ),
+    'selection', CASE WHEN selection.task_name IS NULL THEN 'null'::jsonb ELSE jsonb_build_object(
+      'cheap_model_name', selection.cheap_model_name,
+      'strong_model_name', selection.strong_model_name,
+      'accept_field_checks', selection.accept_field_checks
+    ) END,
+    'action_policies', COALESCE((
+      SELECT jsonb_object_agg(
+        action_type.action_type,
+        jsonb_build_object(
+          'schema', jsonb_build_object(
+            'requires_approval', action_schema.requires_approval,
+            'creates_record', action_schema.creates_record,
+            'applyable', action_schema.applyable
+          ),
+          'authority', CASE WHEN workflow.task_name IS NULL THEN jsonb_build_object(
+            'origin', 'system',
+            'enabled', true,
+            'mode', 'recommendation_only',
+            'evaluation_status', 'unevaluated',
+            'policy_hash', otlet.default_action_authority_hash(t.name, action_type.action_type),
+            'subject_namespace', COALESCE((
+              SELECT si.source_table
+              FROM otlet.semantic_indexes si
+              WHERE si.task_name = t.name
+            ), 'task:' || t.name)
+          ) ELSE jsonb_build_object(
+            'origin', 'workflow',
+            'enabled', workflow.enabled,
+            'mode', workflow.authority_mode,
+            'evaluation_status', workflow.evaluation_status,
+            'policy_hash', workflow.policy_hash,
+            'target_name', workflow.target_name,
+            'target_contract_hash', workflow.target_contract_hash,
+            'subject_namespace', workflow.subject_namespace
+          ) END
+        )
+        ORDER BY action_type.action_type
+      )
+      FROM (
+        SELECT DISTINCT relevant.action_type
+        FROM (
+          SELECT declared.value AS action_type
+          FROM jsonb_array_elements_text(
+            COALESCE(t.decision_contract -> 'action_types', '[]'::jsonb)
+          ) declared(value)
+          UNION ALL
+          SELECT 'create_record'
+          WHERE EXISTS (
+            SELECT 1 FROM otlet.semantic_indexes si WHERE si.task_name = t.name
+          ) OR EXISTS (
+            SELECT 1 FROM otlet.semantic_join_indexes sji WHERE sji.task_name = t.name
+          )
+        ) relevant
+      ) action_type
+      JOIN otlet.action_type_schemas action_schema
+        ON action_schema.action_type = action_type.action_type
+      LEFT JOIN otlet.action_workflow_policies workflow
+        ON workflow.task_name = t.name
+       AND workflow.action_type = action_type.action_type
+    ), '{}'::jsonb)
+  )
+  INTO definition
+  FROM otlet.tasks t
+  CROSS JOIN otlet.production_policy p
+  LEFT JOIN otlet.model_selection_policies selection ON selection.task_name = t.name
+  WHERE t.name = current_workload_revision_definition.task_name
+    AND p.name = 'default';
+
+  RETURN definition;
+END;
+$$;
+
+CREATE FUNCTION otlet.validate_workload_revision() RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+BEGIN
+  IF NEW.definition ->> 'format' IS DISTINCT FROM 'otlet.workload.v1'
+     OR NEW.definition #>> '{task,name}' IS DISTINCT FROM NEW.task_name THEN
+    RAISE EXCEPTION 'otlet workload revision definition is invalid';
+  END IF;
+  IF NEW.workload_revision_hash IS DISTINCT FROM otlet.identity_hash(
+    'workload_revision',
+    NEW.definition
+  ) THEN
+    RAISE EXCEPTION 'otlet workload revision hash does not match its definition';
+  END IF;
+  IF EXISTS (
+    SELECT 1
+    FROM (
+      SELECT declared.value AS action_type
+      FROM jsonb_array_elements_text(
+        COALESCE(NEW.definition #> '{task,decision_contract,action_types}', '[]'::jsonb)
+      ) declared(value)
+      UNION
+      SELECT 'create_record'
+      WHERE NEW.definition #>> '{source,kind}' IN ('row', 'pair')
+    ) required_action
+    WHERE jsonb_typeof(NEW.definition #> ARRAY[
+      'action_policies', required_action.action_type, 'schema'
+    ]) IS DISTINCT FROM 'object'
+       OR jsonb_typeof(NEW.definition #> ARRAY[
+         'action_policies', required_action.action_type, 'authority'
+       ]) IS DISTINCT FROM 'object'
+  ) THEN
+    RAISE EXCEPTION 'otlet workload revision action contract is incomplete';
+  END IF;
+  RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER workload_revisions_validate
+BEFORE INSERT ON otlet.workload_revisions
+FOR EACH ROW EXECUTE FUNCTION otlet.validate_workload_revision();
+
+CREATE FUNCTION otlet.reject_workload_revision_change() RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+BEGIN
+  RAISE EXCEPTION 'otlet workload revisions are immutable';
+END;
+$$;
+
+CREATE TRIGGER workload_revisions_immutable
+BEFORE UPDATE OR DELETE ON otlet.workload_revisions
+FOR EACH ROW EXECUTE FUNCTION otlet.reject_workload_revision_change();
+
+CREATE TRIGGER workload_revisions_truncate_immutable
+BEFORE TRUNCATE ON otlet.workload_revisions
+FOR EACH STATEMENT EXECUTE FUNCTION otlet.reject_workload_revision_change();
+
+CREATE FUNCTION otlet.capture_workload_revision(task_name text) RETURNS text
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  revision_definition jsonb;
+  revision_hash text;
+  stored_definition jsonb;
+BEGIN
+  revision_definition := otlet.current_workload_revision_definition(
+    capture_workload_revision.task_name
+  );
+  IF revision_definition IS NULL THEN
+    RAISE EXCEPTION 'otlet task % does not exist', capture_workload_revision.task_name;
+  END IF;
+
+  revision_hash := otlet.identity_hash('workload_revision', revision_definition);
+  INSERT INTO otlet.workload_revisions (
+    workload_revision_hash,
+    task_name,
+    definition
+  )
+  VALUES (
+    revision_hash,
+    capture_workload_revision.task_name,
+    revision_definition
+  )
+  ON CONFLICT (workload_revision_hash) DO NOTHING;
+
+  SELECT r.definition
+  INTO stored_definition
+  FROM otlet.workload_revisions r
+  WHERE r.workload_revision_hash = revision_hash
+    AND r.task_name = capture_workload_revision.task_name;
+  IF NOT FOUND OR stored_definition IS DISTINCT FROM revision_definition THEN
+    RAISE EXCEPTION 'otlet workload revision hash collision';
+  END IF;
+
+  RETURN revision_hash;
+END;
+$$;
+
+CREATE FUNCTION otlet.bind_job_workload_revision() RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+BEGIN
+  IF NEW.workload_revision_hash IS NULL THEN
+    NEW.workload_revision_hash := otlet.capture_workload_revision(NEW.task_name);
+  ELSIF NOT EXISTS (
+    SELECT 1
+    FROM otlet.workload_revisions r
+    WHERE r.task_name = NEW.task_name
+      AND r.workload_revision_hash = NEW.workload_revision_hash
+  ) THEN
+    RAISE EXCEPTION 'otlet workload revision does not belong to task %', NEW.task_name;
+  END IF;
+  RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER jobs_bind_workload_revision
+BEFORE INSERT ON otlet.jobs
+FOR EACH ROW EXECUTE FUNCTION otlet.bind_job_workload_revision();
+
+CREATE FUNCTION otlet.reject_job_workload_revision_change() RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+BEGIN
+  IF NEW.task_name IS DISTINCT FROM OLD.task_name
+     OR NEW.workload_revision_hash IS DISTINCT FROM OLD.workload_revision_hash THEN
+    RAISE EXCEPTION 'otlet job workload revision is immutable';
+  END IF;
+  RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER jobs_workload_revision_immutable
+BEFORE UPDATE OF task_name, workload_revision_hash ON otlet.jobs
+FOR EACH ROW EXECUTE FUNCTION otlet.reject_job_workload_revision_change();
