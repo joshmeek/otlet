@@ -101,7 +101,7 @@ The paired A/B workload alternated four tasks across qwen3_1_7b and qwen35_4b, q
 | 3 | task cursor | 6 | 34.155s | 62.892s | 61.235s |
 | 3 | warm preference | 5 | 34.583s | 86.740s | 75.488s |
 
-The candidate median reduced model loads from six to five and load time from 35.940s to 34.583s. Median wall time regressed from 66.059s to 86.740s, and median maximum queue wait regressed from 64.631s to 75.488s. The candidate also passed focused task-turn, continuous-arrival starvation, lease, cancellation, and concurrent-claim checks, but failed the wall-time and queue-wait retention gate. No scheduler code was retained
+The candidate median reduced model loads from six to five and load time from 35.940s to 34.583s. Median wall time regressed from 66.059s to 86.740s, and median maximum queue wait regressed from 64.631s to 75.488s. The candidate also passed focused task-turn, continuous-arrival starvation, lease, cancellation, and concurrent-claim checks, but failed the wall-time and queue-wait retention gate. Live claims retain no warm preference, and the model-free production-policy fixture pins cursor order, retry reclaim, cancellation, and victim progress
 
 ### Same-model cross-task claims
 

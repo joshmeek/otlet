@@ -273,6 +273,129 @@ echo "queue_underfill_contract=$queue_underfill_contract"
   exit 1
 }
 
+scheduler_decision_contract="$(psql_value <<'SQL'
+BEGIN;
+LOCK TABLE otlet.jobs IN SHARE ROW EXCLUSIVE MODE;
+
+INSERT INTO otlet.models (name, artifact_path, artifact_hash, artifact_identity)
+VALUES
+  (
+    'scheduler_cold_model',
+    '/tmp/scheduler-cold.gguf',
+    repeat('1', 64),
+    jsonb_build_object('sha256', repeat('1', 64), 'bytes', 24, 'source', 'smoke', 'revision', 'v1', 'quantization', 'test', 'license', 'test')
+  ),
+  (
+    'scheduler_warm_model',
+    '/tmp/scheduler-warm.gguf',
+    repeat('2', 64),
+    jsonb_build_object('sha256', repeat('2', 64), 'bytes', 24, 'source', 'smoke', 'revision', 'v1', 'quantization', 'test', 'license', 'test')
+  );
+INSERT INTO otlet.runtime_slots (model_name, artifact_path, status)
+VALUES ('scheduler_warm_model', '/tmp/scheduler-warm.gguf', 'ready');
+INSERT INTO otlet.tasks (name, input_query, instruction, output_schema, model_name)
+VALUES
+  ('scheduler_a_retry', 'SELECT NULL::text AS subject_id, ''{}''::jsonb AS input WHERE false', 'Scheduler contract placeholder', '{"type":"object"}'::jsonb, 'scheduler_cold_model'),
+  ('scheduler_b_cancel', 'SELECT NULL::text AS subject_id, ''{}''::jsonb AS input WHERE false', 'Scheduler contract placeholder', '{"type":"object"}'::jsonb, 'scheduler_warm_model'),
+  ('scheduler_c_hot', 'SELECT NULL::text AS subject_id, ''{}''::jsonb AS input WHERE false', 'Scheduler contract placeholder', '{"type":"object"}'::jsonb, 'scheduler_cold_model'),
+  ('scheduler_d_victim', 'SELECT NULL::text AS subject_id, ''{}''::jsonb AS input WHERE false', 'Scheduler contract placeholder', '{"type":"object"}'::jsonb, 'scheduler_cold_model');
+UPDATE otlet.production_policy
+SET worker_claim_batch_size = 1,
+    worker_claim_task_cursor = '',
+    max_attempts = 3
+WHERE name = 'default';
+INSERT INTO otlet.jobs (
+  task_name,
+  subject_id,
+  input,
+  status,
+  attempts,
+  leased_until,
+  claim_token,
+  error,
+  started_at,
+  cancel_requested_at
+)
+VALUES
+  (
+    'scheduler_a_retry',
+    'retry',
+    '{}'::jsonb,
+    'running',
+    1,
+    now() - interval '1 minute',
+    'scheduler-retry-owner',
+    NULL,
+    now() - interval '2 minutes',
+    NULL
+  ),
+  (
+    'scheduler_b_cancel',
+    'cancel',
+    '{}'::jsonb,
+    'cancel_requested',
+    1,
+    now() - interval '1 minute',
+    'scheduler-cancel-owner',
+    'scheduler cancellation',
+    now() - interval '2 minutes',
+    now() - interval '90 seconds'
+  ),
+  ('scheduler_c_hot', 'hot-1', '{}'::jsonb, 'queued', 0, NULL, NULL, NULL, NULL, NULL),
+  ('scheduler_d_victim', 'victim', '{}'::jsonb, 'queued', 0, NULL, NULL, NULL, NULL, NULL);
+
+CREATE TEMP TABLE scheduler_decision_claims (
+  claim_no integer PRIMARY KEY,
+  job_id bigint NOT NULL,
+  subject_id text NOT NULL,
+  status text NOT NULL,
+  attempts integer NOT NULL,
+  claim_token text NOT NULL,
+  error text
+);
+
+INSERT INTO scheduler_decision_claims
+SELECT 1, id, subject_id, status, attempts, claim_token, error
+FROM otlet.claim_jobs(NULL, 1);
+DELETE FROM otlet.jobs
+WHERE id = (SELECT job_id FROM scheduler_decision_claims WHERE claim_no = 1);
+INSERT INTO scheduler_decision_claims
+SELECT 2, id, subject_id, status, attempts, claim_token, error
+FROM otlet.claim_jobs(NULL, 1);
+DELETE FROM otlet.jobs
+WHERE id = (SELECT job_id FROM scheduler_decision_claims WHERE claim_no = 2);
+INSERT INTO scheduler_decision_claims
+SELECT 3, id, subject_id, status, attempts, claim_token, error
+FROM otlet.claim_jobs(NULL, 1);
+DELETE FROM otlet.jobs
+WHERE id = (SELECT job_id FROM scheduler_decision_claims WHERE claim_no = 3);
+INSERT INTO otlet.jobs (task_name, subject_id, input)
+VALUES ('scheduler_c_hot', 'hot-2', '{}'::jsonb);
+INSERT INTO scheduler_decision_claims
+SELECT 4, id, subject_id, status, attempts, claim_token, error
+FROM otlet.claim_jobs(NULL, 1);
+DELETE FROM otlet.jobs
+WHERE id = (SELECT job_id FROM scheduler_decision_claims WHERE claim_no = 4);
+INSERT INTO scheduler_decision_claims
+SELECT 5, id, subject_id, status, attempts, claim_token, error
+FROM otlet.claim_jobs(NULL, 1);
+
+SELECT string_agg(subject_id, ',' ORDER BY claim_no) || '|' ||
+       (SELECT status || '|' || attempts::text || '|' || (claim_token <> 'scheduler-retry-owner')::text
+        FROM scheduler_decision_claims WHERE claim_no = 1) || '|' ||
+       (SELECT status || '|' || attempts::text || '|' || (claim_token <> 'scheduler-cancel-owner')::text || '|' || COALESCE(error = 'scheduler cancellation', false)::text
+        FROM scheduler_decision_claims WHERE claim_no = 2) || '|' ||
+       (SELECT worker_claim_task_cursor FROM otlet.production_policy WHERE name = 'default')
+FROM scheduler_decision_claims;
+ROLLBACK;
+SQL
+)"
+echo "scheduler_decision_contract=$scheduler_decision_contract"
+[ "$scheduler_decision_contract" = "retry,cancel,hot-1,victim,hot-2|running|2|true|cancel_requested|2|true|true|scheduler_c_hot" ] || {
+  echo "Expected measured scheduler order, reclaim, cancellation, cursor rotation, and starvation bounds, got $scheduler_decision_contract" >&2
+  exit 1
+}
+
 queue_fairness_big_task="queue_fairness_big_demo"
 queue_fairness_small_task="queue_fairness_small_demo"
 cleanup_task "$queue_fairness_big_task"

@@ -88,6 +88,8 @@ preload_admission_contract=failed|model_load_admission_rejected|rejected|true|tr
 
 The production policy row and status views expose SQL state under `otlet`: `production_policy_status`, `production_status`, `model_queue_status`, `worker_throughput_status`, and `cleanup_policy_state(true)`. Cross-task batch entries expose every claimed task through `task_names`
 
+Native and portable claims share the task-cursor ring. Within each ring segment and task, expired claims rank before queued work, reclaim replaces the claim token, cancellation state survives reclaim, and model residency does not change the order
+
 The resident worker can preload one registered local model and context at startup. The default is unset. Configure the model, then restart the Postgres worker process:
 
 ```sql

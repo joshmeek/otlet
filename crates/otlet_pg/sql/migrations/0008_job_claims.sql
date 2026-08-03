@@ -127,13 +127,6 @@ AS $$
       job.selected_model ->> 'artifact_path' AS artifact_path,
       job.definition #>> '{selection,cheap_model_name}' AS policy_cheap_model_name,
       job.definition #>> '{selection,strong_model_name}' AS policy_strong_model_name,
-      EXISTS (
-        SELECT 1
-        FROM otlet.runtime_slots s
-        WHERE s.model_name = job.selected_model ->> 'name'
-          AND s.status = 'ready'
-          AND s.artifact_path IS NOT DISTINCT FROM job.selected_model ->> 'artifact_path'
-      ) AS warm_model,
       min(CASE WHEN job.status IN ('running', 'cancel_requested') AND (job.leased_until IS NULL OR job.leased_until < now()) THEN 0 ELSE 1 END) AS retry_rank,
       min(job.created_at) AS first_created_at,
       min(job.id) AS first_job_id
@@ -188,7 +181,6 @@ AS $$
         ELSE 1
       END,
       e.retry_rank,
-      CASE WHEN e.warm_model THEN 0 ELSE 1 END,
       e.task_name,
       e.first_created_at,
       e.first_job_id
@@ -205,7 +197,6 @@ AS $$
             ELSE 1
           END,
           e.retry_rank,
-          CASE WHEN e.warm_model THEN 0 ELSE 1 END,
           e.task_name,
           e.first_created_at,
           e.first_job_id
