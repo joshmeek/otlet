@@ -57,11 +57,29 @@ fn ensure_linked_model(
         llama_cpp_sys_4::llama_backend_init();
     });
 
+    let mut model_params = unsafe { llama_cpp_sys_4::llama_model_default_params() };
+    model_params.n_gpu_layers = 0;
+    model_params.use_mmap = linked_env_bool("OTLET_LLAMA_MMAP", model_params.use_mmap);
+    model_params.use_mlock = linked_env_bool("OTLET_LLAMA_MLOCK", model_params.use_mlock);
+
     let cache_hit = cache.as_ref().is_some_and(|cached| {
         cached.artifact_path == job_model.artifact_path
             && cached.model_fingerprint_hash.as_ref() == model_fingerprint_hash
     });
     let memory_before = process_memory_sample();
+    let resident_reclaim_bytes = if !cache_hit && model_params.use_mmap && !model_params.use_mlock {
+        cache
+            .as_ref()
+            .filter(|cached| cached.use_mmap && !cached.use_mlock)
+            .map(|cached| {
+                linked_mapped_file_rss_bytes(&cached.artifact_path)
+                    .min(cached.model_memory_bytes.max(0))
+                    .min(memory_before.rss_bytes.max(0))
+            })
+            .unwrap_or(0)
+    } else {
+        0
+    };
     let memory_admission = if cache_hit {
         ModelLoadAdmission::not_required(
             "resident_model_reused",
@@ -69,7 +87,12 @@ fn ensure_linked_model(
             &memory_before,
         )
     } else {
-        linked_model_load_admission(job_model.artifact_path, options, &memory_before)
+        linked_model_load_admission(
+            job_model.artifact_path,
+            options,
+            &memory_before,
+            resident_reclaim_bytes,
+        )
     };
     if memory_admission.rejected() {
         let memory_after = process_memory_sample();
@@ -96,10 +119,6 @@ fn ensure_linked_model(
     if !cache_hit {
         let model_path = CString::new(job_model.artifact_path.as_bytes())
             .map_err(|_| ModelError::new("linked llama.cpp model path is invalid"))?;
-        let mut model_params = unsafe { llama_cpp_sys_4::llama_model_default_params() };
-        model_params.n_gpu_layers = 0;
-        model_params.use_mmap = linked_env_bool("OTLET_LLAMA_MMAP", model_params.use_mmap);
-        model_params.use_mlock = linked_env_bool("OTLET_LLAMA_MLOCK", model_params.use_mlock);
         let prompt_batch_tokens = linked_prompt_batch_tokens();
         let prompt_micro_batch_tokens = linked_prompt_ubatch_tokens(prompt_batch_tokens);
         let decode_threads = linked_decode_threads(options);
@@ -161,6 +180,8 @@ fn ensure_linked_model(
             context_window_tokens,
             model_device_policy: LINKED_MODEL_DEVICE_POLICY,
             memory_accounting_policy: LINKED_MEMORY_ACCOUNTING_POLICY,
+            use_mmap: model_params.use_mmap,
+            use_mlock: model_params.use_mlock,
         });
     }
 
@@ -175,6 +196,7 @@ fn linked_model_load_admission(
     artifact_path: &str,
     options: &crate::runtime::RuntimeOptions,
     sample: &ProcessMemorySample,
+    resident_reclaim_bytes: i64,
 ) -> ModelLoadAdmission {
     let artifact_bytes = fs::metadata(artifact_path)
         .ok()
@@ -185,6 +207,7 @@ fn linked_model_load_admission(
         .saturating_sub(sample.rss_bytes)
         .max(0);
     let cgroup_headroom_bytes = cgroup_memory_headroom(sample);
+    let resident_reclaim_bytes = resident_reclaim_bytes.max(0);
     let mut admission = ModelLoadAdmission {
         decision: "not_required",
         reason: "unbounded_worker_rss_reporting_only",
@@ -199,6 +222,7 @@ fn linked_model_load_admission(
         projected_context_kv_bytes: 0,
         projected_batch_compute_bytes: 0,
         projected_total_bytes: 0,
+        resident_reclaim_bytes,
         llama_projected_fit: false,
     };
     if options.max_worker_rss_bytes == 0 {
@@ -217,11 +241,25 @@ fn linked_model_load_admission(
         admission.reason = "current_worker_rss_meets_or_exceeds_budget";
         return admission;
     }
-    let mut allowed_additional_bytes = worker_budget_headroom_bytes
+    let mut original_allowed_additional_bytes = worker_budget_headroom_bytes
         .min(sample.system_memory_available_bytes)
         .min(sample.system_memory_total_bytes);
     if sample.cgroup_memory_max_bytes > 0 {
-        allowed_additional_bytes = allowed_additional_bytes.min(cgroup_headroom_bytes);
+        original_allowed_additional_bytes =
+            original_allowed_additional_bytes.min(cgroup_headroom_bytes);
+    }
+    let replacement_worker_headroom = worker_budget_headroom_bytes
+        .saturating_add(resident_reclaim_bytes)
+        .min(worker_budget_bytes);
+    let mut allowed_additional_bytes = replacement_worker_headroom
+        .min(sample.system_memory_available_bytes)
+        .min(sample.system_memory_total_bytes);
+    if sample.cgroup_memory_max_bytes > 0 {
+        allowed_additional_bytes = allowed_additional_bytes.min(
+            cgroup_headroom_bytes
+                .saturating_add(resident_reclaim_bytes)
+                .min(sample.cgroup_memory_max_bytes),
+        );
     }
     admission.allowed_additional_bytes = allowed_additional_bytes.max(0);
     if admission.allowed_additional_bytes < artifact_bytes {
@@ -238,14 +276,77 @@ fn linked_model_load_admission(
     admission.projected_context_kv_bytes = projection.context_kv_bytes;
     admission.projected_batch_compute_bytes = projection.batch_compute_bytes;
     admission.projected_total_bytes = projection.total_bytes;
-    admission.llama_projected_fit = projection.total_bytes <= admission.allowed_additional_bytes;
+    admission.llama_projected_fit = projection.total_bytes <= admission.allowed_additional_bytes
+        && projection
+            .context_kv_bytes
+            .saturating_add(projection.batch_compute_bytes)
+            <= original_allowed_additional_bytes;
     if admission.llama_projected_fit {
         admission.decision = "allowed";
         admission.reason = "llama_projected_model_kv_batch_fit";
+    } else if resident_reclaim_bytes > 0
+        && projection
+            .context_kv_bytes
+            .saturating_add(projection.batch_compute_bytes)
+            > original_allowed_additional_bytes
+    {
+        admission.reason = "replacement_anonymous_projection_exceeds_headroom";
     } else {
         admission.reason = "llama_projected_model_kv_batch_exceeds_headroom";
     }
     admission
+}
+
+fn linked_mapped_file_rss_bytes(path: &str) -> i64 {
+    fs::read_to_string("/proc/self/smaps")
+        .ok()
+        .map_or(0, |smaps| linked_mapped_file_rss_bytes_from(&smaps, path))
+}
+
+fn linked_mapped_file_rss_bytes_from(smaps: &str, path: &str) -> i64 {
+    let mut matched = false;
+    let mut bytes = 0_i64;
+    for line in smaps.lines() {
+        let mapping_header = line
+            .split_ascii_whitespace()
+            .next()
+            .and_then(|range| range.split_once('-'))
+            .is_some_and(|(start, end)| {
+                !start.is_empty()
+                    && !end.is_empty()
+                    && start.bytes().all(|byte| byte.is_ascii_hexdigit())
+                    && end.bytes().all(|byte| byte.is_ascii_hexdigit())
+        });
+        if mapping_header {
+            let mut fields = line.split_ascii_whitespace();
+            for _ in 0..5 {
+                fields.next();
+            }
+            matched = fields.next() == Some(path) && fields.next().is_none();
+        } else if matched
+            && let Some(kib) = line
+                .strip_prefix("Rss:")
+                .and_then(|value| value.split_ascii_whitespace().next())
+                .and_then(|value| value.parse::<i64>().ok())
+        {
+            bytes = bytes.saturating_add(kib.saturating_mul(1024));
+        }
+    }
+    bytes
+}
+
+#[cfg(test)]
+mod linked_load_tests {
+    use super::linked_mapped_file_rss_bytes_from;
+
+    #[test]
+    fn sums_only_exact_live_model_mappings() {
+        let smaps = "1000-2000 r--s 00000000 00:01 1 /models/current.gguf\nRss: 12 kB\n2000-3000 r--s 00000000 00:01 1 /models/current.gguf (deleted)\nRss: 20 kB\n3000-4000 rw-p 00000000 00:00 0\nRss: 30 kB\n";
+        assert_eq!(
+            linked_mapped_file_rss_bytes_from(smaps, "/models/current.gguf"),
+            12 * 1024
+        );
+    }
 }
 
 struct LinkedModelLoadProjection {

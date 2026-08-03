@@ -28,6 +28,8 @@ struct LinkedCache {
     context_window_tokens: i64,
     model_device_policy: &'static str,
     memory_accounting_policy: &'static str,
+    use_mmap: bool,
+    use_mlock: bool,
 }
 
 unsafe impl Send for LinkedCache {}
@@ -323,4 +325,3 @@ fn linked_clear_context(context: *mut llama_cpp_sys_4::llama_context) {
         }
     }
 }
-

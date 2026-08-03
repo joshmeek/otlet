@@ -134,7 +134,7 @@ SELECT otlet.create_task(
   :'instruction',
   :'output_schema'::jsonb,
   :'model_name',
-  '{"max_tokens":32,"reasoning":"off","inference_cache":false,"max_worker_rss_bytes":7200000000}'::jsonb
+  '{"max_tokens":32,"reasoning":"off","inference_cache":false,"max_worker_rss_bytes":5500000000}'::jsonb
 );
 SELECT otlet.run_task(:'task_name');
 SQL
@@ -152,8 +152,20 @@ WITH evidence AS (
 SELECT job_status || '|' ||
        COALESCE(stop_reason, '') || '|' ||
        COALESCE(model_load_admission_decision, '') || '|' ||
-       (model_load_admission_reason = 'llama_projected_model_kv_batch_exceeds_headroom')::text || '|' ||
-       (model_load_allowed_additional_bytes < jsonb_extract_path_text(memory_evidence, 'admission', 'projected_total_bytes')::bigint)::text || '|' ||
+       (model_load_admission_reason IN (
+         'current_worker_rss_meets_or_exceeds_budget',
+         'artifact_floor_exceeds_available_headroom',
+         'replacement_anonymous_projection_exceeds_headroom',
+         'llama_projected_model_kv_batch_exceeds_headroom'
+       ))::text || '|' ||
+       (COALESCE(
+         jsonb_extract_path_text(
+           memory_evidence,
+           'admission',
+           'llama_projected_fit'
+         )::boolean,
+         false
+       ) IS FALSE)::text || '|' ||
        (worker_process_rss_bytes > 0)::text || '|' ||
        (system_memory_available_bytes > 0)::text || '|' ||
        (SELECT count(*) FROM otlet.outputs WHERE job_id = evidence.job_id)::text
@@ -246,3 +258,33 @@ JOIN otlet.runtime_status rs
 SQL
 )"
 echo "oversized_prompt_worker_contract=$oversized_prompt_contract"
+oversized_prompt_swap_contract="$(psql_exec -qAt \
+  -v task_name="$oversized_prompt_task" \
+  -v model_name="$strong_model_name" <<'SQL'
+WITH job_row AS (
+  SELECT id
+  FROM otlet.jobs
+  WHERE task_name = :'task_name'
+  ORDER BY id DESC
+  LIMIT 1
+)
+SELECT count(*)::text || '|' ||
+       COALESCE(bool_and(e.detail ->> 'model_name' = :'model_name'), false)::text || '|' ||
+       COALESCE(bool_and((e.detail ->> 'model_memory_bytes')::bigint > 0), false)::text || '|' ||
+       COALESCE(bool_and((e.detail ->> 'worker_process_rss_bytes')::bigint > 0), false)::text || '|' ||
+       COALESCE(bool_and(
+         jsonb_extract_path_text(e.detail, 'memory', 'admission', 'decision') IN (
+           'allowed',
+           'not_required'
+         )
+       ), false)::text
+FROM otlet.worker_events e
+WHERE e.job_id = (SELECT id FROM job_row)
+  AND e.event_type = 'model_swap';
+SQL
+)"
+echo "oversized_prompt_swap_contract=$oversized_prompt_swap_contract"
+[ "$oversized_prompt_swap_contract" = "1|true|true|true|true" ] || {
+  echo "Expected failed post-load attempt to record strong-model residency, got $oversized_prompt_swap_contract" >&2
+  exit 1
+}

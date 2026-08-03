@@ -13,13 +13,47 @@ fn run_linked(
         .lock()
         .map_err(|_| ModelError::new("linked llama.cpp cache lock poisoned"))?;
     let load = ensure_linked_model(&mut cache, job_model, options, model_fingerprint_hash)?;
-    let cache_hit = load.cache_hit;
-    let memory_before = load.memory_before;
-    let memory_admission = load.memory_admission;
-
     let cache = cache
         .as_mut()
         .ok_or_else(|| ModelError::new("linked llama.cpp cache did not initialize"))?;
+    let result = run_loaded_linked(
+        job,
+        cache,
+        prompt,
+        prompt_prefix,
+        options,
+        attempt_deadline,
+        &load,
+    );
+    match result {
+        Err(err) if !load.cache_hit => {
+            let worker_memory = process_memory_sample();
+            let memory_trace = build_memory_trace(
+                &load.memory_before,
+                &worker_memory,
+                &load.memory_admission,
+                options.max_worker_rss_bytes,
+            );
+            Err(err.with_memory_trace(memory_trace.clone()).with_metrics(
+                linked_residency_metrics(cache, false, &worker_memory, memory_trace, options),
+            ))
+        }
+        result => result,
+    }
+}
+
+fn run_loaded_linked(
+    job: &Job,
+    cache: &mut LinkedCache,
+    prompt: &str,
+    prompt_prefix: &str,
+    options: &crate::runtime::RuntimeOptions,
+    attempt_deadline: Option<Instant>,
+    load: &LinkedLoadEvidence,
+) -> Result<LinkedRun, ModelError> {
+    let cache_hit = load.cache_hit;
+    let memory_before = &load.memory_before;
+    let memory_admission = &load.memory_admission;
     let decode_threads = linked_decode_threads(options);
     let batch_threads = linked_batch_threads(options, decode_threads);
     unsafe {
@@ -299,19 +333,6 @@ fn run_linked(
     Ok(LinkedRun {
         raw_output: output,
         metrics: ModelMetrics {
-            artifact_path: cache.artifact_path.clone(),
-            load_ms: cache.load_ms,
-            ctx_ms: cache.ctx_ms,
-            model_memory_bytes: cache.model_memory_bytes,
-            model_parameters: cache.model_parameters,
-            context_window_tokens: cache.context_window_tokens,
-            model_device_policy: cache.model_device_policy,
-            memory_accounting_policy: cache.memory_accounting_policy,
-            worker_process_rss_bytes: worker_memory.rss_bytes,
-            worker_process_virtual_bytes: worker_memory.virtual_bytes,
-            worker_memory_sample_policy: worker_memory.policy,
-            worker_memory_budget_bytes: u64_to_i64_saturating(options.max_worker_rss_bytes),
-            memory_trace,
             prompt_tokens: usize_to_i64_saturating(tokens.len()),
             prompt_cached_tokens_before: usize_to_i64_saturating(prompt_cached_tokens_before),
             prompt_reused_tokens: usize_to_i64_saturating(prompt_reused_tokens),
@@ -325,27 +346,73 @@ fn run_linked(
             effective_llama_threads: i64::from(decode_threads),
             effective_llama_batch_threads: i64::from(batch_threads),
             generated_tokens,
-            runtime_prepare_ms: 0,
             tokenize_ms,
             prompt_decode_ms,
             first_token_ms,
             ttft_ms,
             generate_ms,
-            postprocess_ms: 0,
-            cache_hit,
-            inference_cache_hit: false,
-            inference_cache_entries: 0,
-            inference_cache_bytes: 0,
-            inference_cache_max_entries: inference_cache_max_entries(),
-            inference_cache_max_bytes: inference_cache_max_bytes(),
-            inference_cache_evictions: 0,
-            inference_cache_eviction_reason: "none",
-            inference_cache_invalidation_reason: "miss",
             probability_summary: probability_trace.summary(),
             detailed_trace: detailed_trace.summary(stop_reason),
             stop_reason,
+            ..linked_residency_metrics(cache, cache_hit, &worker_memory, memory_trace, options)
         },
     })
+}
+
+fn linked_residency_metrics(
+    cache: &LinkedCache,
+    cache_hit: bool,
+    worker_memory: &ProcessMemorySample,
+    memory_trace: Value,
+    options: &crate::runtime::RuntimeOptions,
+) -> ModelMetrics {
+    ModelMetrics {
+        artifact_path: cache.artifact_path.clone(),
+        load_ms: cache.load_ms,
+        ctx_ms: cache.ctx_ms,
+        model_memory_bytes: cache.model_memory_bytes,
+        model_parameters: cache.model_parameters,
+        context_window_tokens: cache.context_window_tokens,
+        model_device_policy: cache.model_device_policy,
+        memory_accounting_policy: cache.memory_accounting_policy,
+        worker_process_rss_bytes: worker_memory.rss_bytes,
+        worker_process_virtual_bytes: worker_memory.virtual_bytes,
+        worker_memory_sample_policy: worker_memory.policy,
+        worker_memory_budget_bytes: u64_to_i64_saturating(options.max_worker_rss_bytes),
+        memory_trace,
+        prompt_tokens: 0,
+        prompt_cached_tokens_before: 0,
+        prompt_reused_tokens: 0,
+        prompt_decoded_tokens: 0,
+        prompt_reuse_strategy: "attempt_failed_after_model_load",
+        prompt_prefix_state_bytes: 0,
+        prompt_prefix_cache_entries: usize_to_i64_saturating(cache.prompt_prefix_states.len()),
+        prompt_prefix_cache_bytes: usize_to_i64_saturating(linked_prompt_prefix_cache_bytes(
+            &cache.prompt_prefix_states,
+        )),
+        effective_llama_threads: 0,
+        effective_llama_batch_threads: 0,
+        generated_tokens: 0,
+        runtime_prepare_ms: 0,
+        tokenize_ms: 0,
+        prompt_decode_ms: 0,
+        first_token_ms: 0,
+        ttft_ms: 0,
+        generate_ms: 0,
+        postprocess_ms: 0,
+        cache_hit,
+        inference_cache_hit: false,
+        inference_cache_entries: 0,
+        inference_cache_bytes: 0,
+        inference_cache_max_entries: inference_cache_max_entries(),
+        inference_cache_max_bytes: inference_cache_max_bytes(),
+        inference_cache_evictions: 0,
+        inference_cache_eviction_reason: "none",
+        inference_cache_invalidation_reason: "miss",
+        probability_summary: probability_unavailable("attempt_failed_after_model_load"),
+        detailed_trace: detailed_trace_unavailable("attempt_failed_after_model_load", options),
+        stop_reason: "attempt_failed_after_model_load",
+    }
 }
 
 fn linked_decode_prompt_tokens(
@@ -425,4 +492,3 @@ fn validate_linked_token_budget(
 
     Ok(())
 }
-

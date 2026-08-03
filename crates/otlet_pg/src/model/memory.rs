@@ -247,6 +247,7 @@ struct ModelLoadAdmission {
     projected_context_kv_bytes: i64,
     projected_batch_compute_bytes: i64,
     projected_total_bytes: i64,
+    resident_reclaim_bytes: i64,
     llama_projected_fit: bool,
 }
 
@@ -272,6 +273,7 @@ impl ModelLoadAdmission {
             projected_context_kv_bytes: 0,
             projected_batch_compute_bytes: 0,
             projected_total_bytes: 0,
+            resident_reclaim_bytes: 0,
             llama_projected_fit: false,
         }
     }
@@ -295,6 +297,7 @@ impl ModelLoadAdmission {
             "projected_context_kv_bytes": self.projected_context_kv_bytes,
             "projected_batch_compute_bytes": self.projected_batch_compute_bytes,
             "projected_total_bytes": self.projected_total_bytes,
+            "resident_reclaim_bytes": self.resident_reclaim_bytes,
             "llama_projected_fit": self.llama_projected_fit
         })
     }
@@ -352,4 +355,3 @@ fn build_memory_trace(
         "admission": admission.as_json()
     })
 }
-
