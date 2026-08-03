@@ -92,6 +92,13 @@ Native and portable claims share the task-cursor ring. Within each ring segment 
 
 `max_active_jobs` caps live claimed leases per model across native claims, portable claims, and infer-now. A `running` or `cancel_requested` job consumes one slot while `leased_until >= now()`; an expired or null lease consumes none. Claims stop at the smaller of the requested batch and the remaining slots. Claims, infer-now admission, and renewal share the queue-admission fence. Otlet locks the lease row before it checks wall time and rejects a renewal if its lease expired while waiting. `model_queue_status` and `worker_throughput_status` expose `active_claimed_jobs` and `available_active_job_slots`, and `verify_invariants()` reports `active_claimed_jobs_within_model_cap`
 
+Native batches contain only claims with the same immutable lease horizon. Before each direct, cheap, or deferred strong attempt, the worker locks and validates every claim it still holds, then renews the full set in one transaction. The worker stops the batch without a partial renewal when any claim is stale. The worker renews the current token before Otlet records `job_started` or touches runtime state. The Docker test expires the old visible deadlines while the worker holds renewal locks; a second claimer and the sweeper return zero without changing attempts or ownership, and each job receives one start event and one receipt
+
+```text
+claimed_batch_pre_contract=4|0|0|1|2
+claimed_batch_lease_contract=0|0|4|true|true|true|true|true|true
+```
+
 The resident worker can preload one registered local model and context at startup. The default is unset. Configure the model, then restart the Postgres worker process:
 
 ```sql

@@ -215,6 +215,7 @@ BEGIN
       job.selected_model ->> 'artifact_path' AS artifact_path,
       job.definition #>> '{selection,cheap_model_name}' AS policy_cheap_model_name,
       job.definition #>> '{selection,strong_model_name}' AS policy_strong_model_name,
+      (job.definition #>> '{runtime,lease_ms}')::bigint AS lease_ms,
       capacity.available_active_job_slots,
       min(CASE WHEN job.status IN ('running', 'cancel_requested') AND (job.leased_until IS NULL OR job.leased_until < now()) THEN 0 ELSE 1 END) AS retry_rank,
       min(job.created_at) AS first_created_at,
@@ -256,6 +257,7 @@ BEGIN
       job.selected_model,
       job.definition #>> '{selection,cheap_model_name}',
       job.definition #>> '{selection,strong_model_name}',
+      job.definition #>> '{runtime,lease_ms}',
       capacity.available_active_job_slots
   ),
   selected_task AS (
@@ -295,6 +297,7 @@ BEGIN
      AND f.artifact_path IS NOT DISTINCT FROM e.artifact_path
      AND f.policy_cheap_model_name IS NOT DISTINCT FROM e.policy_cheap_model_name
      AND f.policy_strong_model_name IS NOT DISTINCT FROM e.policy_strong_model_name
+     AND f.lease_ms = e.lease_ms
     CROSS JOIN policy p
   ),
   locked_tasks AS MATERIALIZED (
@@ -442,6 +445,121 @@ BEGIN
 END;
 $$;
 
+CREATE FUNCTION otlet.renew_job_leases(
+  job_ids bigint[],
+  expected_claim_tokens text[]
+) RETURNS bigint
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  claim_count integer := COALESCE(cardinality(renew_job_leases.job_ids), 0);
+  locked_count bigint;
+  valid_count bigint;
+  renewed_count bigint := 0;
+  updated_count bigint;
+  claim_row record;
+BEGIN
+  IF claim_count <> COALESCE(cardinality(renew_job_leases.expected_claim_tokens), 0) THEN
+    RAISE EXCEPTION 'otlet job lease renewal arrays must have equal length';
+  END IF;
+  IF claim_count = 0 THEN
+    RETURN 0;
+  END IF;
+  IF claim_count > 128 THEN
+    RAISE EXCEPTION 'otlet can renew at most 128 job leases at once';
+  END IF;
+  IF (
+    SELECT count(DISTINCT job_id)
+    FROM unnest(renew_job_leases.job_ids) job_id
+  ) <> claim_count THEN
+    RETURN 0;
+  END IF;
+
+  PERFORM pg_advisory_xact_lock(hashtext('otlet_queue_admission'));
+  PERFORM 1
+  FROM unnest(
+    renew_job_leases.job_ids,
+    renew_job_leases.expected_claim_tokens
+  ) claim(job_id, claim_token)
+  JOIN otlet.jobs j
+    ON j.id = claim.job_id
+   AND j.claim_token = claim.claim_token
+   AND j.status IN ('running', 'cancel_requested')
+  ORDER BY j.id
+  FOR UPDATE OF j;
+  GET DIAGNOSTICS locked_count = ROW_COUNT;
+  IF locked_count <> claim_count THEN
+    RETURN 0;
+  END IF;
+
+  WITH live_claims AS MATERIALIZED (
+    SELECT j.id, revision.definition
+    FROM unnest(
+      renew_job_leases.job_ids,
+      renew_job_leases.expected_claim_tokens
+    ) claim(job_id, claim_token)
+    JOIN otlet.jobs j
+      ON j.id = claim.job_id
+     AND j.claim_token = claim.claim_token
+     AND j.status IN ('running', 'cancel_requested')
+    JOIN otlet.workload_revisions revision
+      ON revision.workload_revision_hash = j.workload_revision_hash
+     AND revision.task_name = j.task_name
+    WHERE j.leased_until IS NOT NULL
+      AND j.leased_until >= clock_timestamp()
+      AND otlet.source_query_contract_error(
+        revision.definition #> '{source,query_contract}',
+        true
+      ) IS NULL
+  ), guarded_claims AS MATERIALIZED (
+    SELECT live_claims.id
+    FROM live_claims
+    WHERE otlet.source_query_contract_guard(
+      live_claims.definition #> '{source,query_contract}',
+      true
+    )::text = ''
+  )
+  SELECT count(*) INTO valid_count
+  FROM guarded_claims;
+  IF valid_count <> claim_count THEN
+    RETURN 0;
+  END IF;
+
+  -- ponytail: Policy caps batches at 128, so ordered row renewal stays bounded
+  FOR claim_row IN
+    SELECT
+      j.id,
+      claim.claim_token,
+      (revision.definition #>> '{runtime,lease_ms}')::bigint
+        * interval '1 millisecond' AS lease_interval
+    FROM unnest(
+      renew_job_leases.job_ids,
+      renew_job_leases.expected_claim_tokens
+    ) claim(job_id, claim_token)
+    JOIN otlet.jobs j
+      ON j.id = claim.job_id
+     AND j.claim_token = claim.claim_token
+     AND j.status IN ('running', 'cancel_requested')
+    JOIN otlet.workload_revisions revision
+      ON revision.task_name = j.task_name
+     AND revision.workload_revision_hash = j.workload_revision_hash
+    ORDER BY j.id
+  LOOP
+    UPDATE otlet.jobs j
+    SET leased_until = clock_timestamp() + claim_row.lease_interval
+    WHERE j.id = claim_row.id
+      AND j.claim_token = claim_row.claim_token
+      AND j.status IN ('running', 'cancel_requested');
+    GET DIAGNOSTICS updated_count = ROW_COUNT;
+    IF updated_count <> 1 THEN
+      RAISE EXCEPTION 'otlet lost job % during lease renewal', claim_row.id;
+    END IF;
+    renewed_count := renewed_count + 1;
+  END LOOP;
+  RETURN renewed_count;
+END;
+$$;
+
 CREATE FUNCTION otlet.renew_job_lease(
   job_id bigint,
   expected_claim_token text
@@ -452,49 +570,19 @@ CREATE FUNCTION otlet.renew_job_lease(
 LANGUAGE plpgsql
 AS $$
 BEGIN
-  PERFORM pg_advisory_xact_lock(hashtext('otlet_queue_admission'));
-  PERFORM 1
+  IF otlet.renew_job_leases(
+    ARRAY[renew_job_lease.job_id],
+    ARRAY[renew_job_lease.expected_claim_token]
+  ) <> 1 THEN
+    RETURN;
+  END IF;
+
+  RETURN QUERY
+  SELECT j.status, j.leased_until
   FROM otlet.jobs j
   WHERE j.id = renew_job_lease.job_id
     AND j.claim_token = renew_job_lease.expected_claim_token
-    AND j.status IN ('running', 'cancel_requested')
-  FOR UPDATE OF j;
-
-  RETURN QUERY
-  WITH locked_job AS MATERIALIZED (
-    SELECT
-      j.id,
-      revision.definition,
-      (revision.definition #>> '{runtime,lease_ms}')::bigint
-        * interval '1 millisecond' AS lease_interval
-    FROM otlet.jobs j
-    JOIN otlet.workload_revisions revision
-      ON revision.workload_revision_hash = j.workload_revision_hash
-     AND revision.task_name = j.task_name
-    WHERE j.id = renew_job_lease.job_id
-      AND j.claim_token = renew_job_lease.expected_claim_token
-      AND j.status IN ('running', 'cancel_requested')
-      AND j.leased_until IS NOT NULL
-      AND j.leased_until >= clock_timestamp()
-      AND otlet.source_query_contract_error(
-        revision.definition #> '{source,query_contract}',
-        true
-      ) IS NULL
-  ),
-  guarded_job AS MATERIALIZED (
-    SELECT locked_job.id, locked_job.lease_interval
-    FROM locked_job
-    WHERE otlet.source_query_contract_guard(
-      locked_job.definition #> '{source,query_contract}',
-      true
-    )::text = ''
-  )
-  UPDATE otlet.jobs j
-  SET leased_until = clock_timestamp()
-    + guarded_job.lease_interval
-  FROM guarded_job
-  WHERE j.id = guarded_job.id
-  RETURNING j.status, j.leased_until;
+    AND j.status IN ('running', 'cancel_requested');
 END;
 $$;
 
@@ -512,15 +600,29 @@ AS $$
   ))
 $$;
 
-CREATE FUNCTION otlet.mark_job_started(job_id bigint) RETURNS void
+CREATE FUNCTION otlet.mark_job_started(
+  job_id bigint,
+  expected_claim_token text
+) RETURNS boolean
 LANGUAGE plpgsql
 AS $$
 DECLARE
+  claim_status text;
   v_id bigint;
   v_task_name text;
   v_subject_id text;
   model_name text;
 BEGIN
+  SELECT renewed.status
+  INTO claim_status
+  FROM otlet.renew_job_lease(
+    mark_job_started.job_id,
+    mark_job_started.expected_claim_token
+  ) renewed;
+  IF NOT FOUND THEN
+    RETURN false;
+  END IF;
+
   -- claim_jobs / insert_infer_now_job already stamp started_at; this only
   -- records the runtime slot + worker event for the claimed/running job.
   SELECT
@@ -535,13 +637,15 @@ BEGIN
   FROM otlet.jobs j
   JOIN otlet.workload_revisions revision
     ON revision.workload_revision_hash = j.workload_revision_hash
-  WHERE j.id = mark_job_started.job_id;
+  WHERE j.id = mark_job_started.job_id
+    AND j.claim_token = mark_job_started.expected_claim_token
+    AND j.status = claim_status;
   IF NOT FOUND THEN
-    RETURN;
+    RETURN false;
   END IF;
   -- Warn-only path: skip slot/event noise when the task row is missing.
   IF model_name IS NULL THEN
-    RETURN;
+    RETURN false;
   END IF;
 
   PERFORM otlet.touch_runtime_slot(model_name, 'running', 1, NULL);
@@ -556,5 +660,6 @@ BEGIN
       'model_name', model_name
     )
   );
+  RETURN true;
 END;
 $$;
