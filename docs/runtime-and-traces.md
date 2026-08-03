@@ -89,7 +89,7 @@ SELECT * FROM otlet.portable_claim_status ORDER BY claim_id DESC;
 SELECT * FROM otlet.portable_receipt_status ORDER BY receipt_id DESC;
 ```
 
-The [reference external worker](../crates/otlet_worker/README.md) runs the same database-built prompt with one local GGUF when the PostgreSQL host cannot load the native extension worker. It renews the lease during decode and interrupts work after cancellation, claim loss, or database disconnect. PostgreSQL still parses the returned envelope and owns every validation and trusted-state write
+The [reference external worker](../crates/otlet_worker/README.md) runs the same database-built prompt with one local GGUF when the PostgreSQL host cannot load the native extension worker. It converts the database-issued `max_attempt_ms` to one monotonic deadline before the claim RPC and shares it across prompt decode, generation, renewal, and the llama abort callback. PostgreSQL exposes the claim-time attempt deadline and rejects renewal after it. Timeout records `attempt_timeout` in the job, receipt selection reason, and trace with no accepted output. Cancellation, pre-deadline claim loss, and database disconnect still interrupt work. PostgreSQL parses every returned envelope and owns validation and trusted-state writes
 
 Receipt timing splits runtime preparation, model load, context creation, tokenization, prompt decode, generation, validation and post-processing, finish SQL, and semantic materialization. `otlet.runtime_stage_timing_status` aggregates every attempt for a job and leaves unmeasured worker work in `worker_overhead_ms`:
 

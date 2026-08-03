@@ -1,4 +1,5 @@
 portable_protocol_task="portable_protocol_demo"
+portable_deadline_task="portable_deadline_demo"
 portable_worker_role="otlet_demo_portable_worker"
 portable_unauthorized_role="otlet_demo_portable_unauthorized"
 portable_worker_id="portable-demo-worker"
@@ -6,6 +7,7 @@ portable_denied_count=0
 
 cleanup_portable_protocol() {
   cleanup_task "$portable_protocol_task"
+  cleanup_task "$portable_deadline_task"
   psql_exec -qAt -v worker_id="$portable_worker_id" <<'SQL' >/dev/null
 DELETE FROM otlet.portable_workers WHERE worker_id = :'worker_id';
 DROP TABLE IF EXISTS public.otlet_demo_portable_protocol_source;
@@ -353,6 +355,148 @@ expected_portable_protocol_contract="1|active|true|true|3|0|cancel:canceled:canc
 }
 [ "$portable_denied_count" = "5" ] || {
   echo "Expected five portable permission denials, got $portable_denied_count" >&2
+  exit 1
+}
+
+portable_deadline_contract="$(psql_value \
+  -v worker_role="$portable_worker_role" \
+  -v worker_id="$portable_worker_id" \
+  -v identity_hash="$portable_identity_hash" \
+  -v task_name="$portable_deadline_task" \
+  -v model_name="$strong_model_name" <<'SQL'
+BEGIN;
+SELECT otlet.create_task(
+  :'task_name',
+  NULL,
+  'Return status ok and no actions',
+  '{"type":"object","required":["status"],"additionalProperties":false,"properties":{"status":{"const":"ok"}}}'::jsonb,
+  :'model_name',
+  '{"reasoning":"off","max_tokens":16,"max_attempt_ms":1000,"inference_cache":false}'::jsonb
+) \g /dev/null
+INSERT INTO otlet.jobs (task_name, subject_id, input)
+VALUES (:'task_name', 'deadline', '{}'::jsonb);
+
+SET LOCAL ROLE :worker_role;
+CREATE TEMP TABLE portable_deadline_claim ON COMMIT DROP AS
+SELECT *
+FROM otlet.portable_claim_jobs(:'worker_id', 1, :'identity_hash', 1);
+SELECT *
+FROM otlet.portable_renew_job(
+  :'worker_id',
+  1,
+  :'identity_hash',
+  (SELECT job_id FROM portable_deadline_claim),
+  (SELECT claim_token FROM portable_deadline_claim)
+) \g /dev/null
+RESET ROLE;
+
+CREATE TEMP TABLE portable_deadline_renewal_baseline ON COMMIT DROP AS
+SELECT job.leased_until
+FROM otlet.jobs job
+WHERE job.id = (SELECT job_id FROM portable_deadline_claim);
+SELECT
+  pg_catalog.set_config('otlet.demo_portable_deadline_worker_id', :'worker_id', true),
+  pg_catalog.set_config('otlet.demo_portable_deadline_identity_hash', :'identity_hash', true),
+  pg_catalog.set_config(
+    'otlet.demo_portable_deadline_job_id',
+    (SELECT job_id::text FROM portable_deadline_claim),
+    true
+  )
+\g /dev/null
+CREATE TEMP SEQUENCE portable_deadline_trigger_calls;
+GRANT USAGE, SELECT ON SEQUENCE portable_deadline_trigger_calls TO :worker_role;
+CREATE FUNCTION public.portable_deadline_renew_delay()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $function$
+BEGIN
+  IF NEW.id = pg_catalog.current_setting('otlet.demo_portable_deadline_job_id')::bigint THEN
+    PERFORM pg_catalog.nextval('pg_temp.portable_deadline_trigger_calls'::regclass);
+    PERFORM pg_sleep(1);
+  END IF;
+  RETURN NEW;
+END
+$function$;
+CREATE TRIGGER portable_deadline_renew_delay
+AFTER UPDATE OF leased_until ON otlet.jobs
+FOR EACH ROW
+EXECUTE FUNCTION public.portable_deadline_renew_delay();
+UPDATE otlet.portable_claims claim
+SET claimed_at = clock_timestamp() - interval '200 milliseconds'
+WHERE claim.job_id = (SELECT job_id FROM portable_deadline_claim);
+
+SET LOCAL ROLE :worker_role;
+DO $body$
+BEGIN
+  BEGIN
+    PERFORM *
+    FROM otlet.portable_renew_job(
+      pg_catalog.current_setting('otlet.demo_portable_deadline_worker_id'),
+      1,
+      pg_catalog.current_setting('otlet.demo_portable_deadline_identity_hash'),
+      (SELECT job_id FROM portable_deadline_claim),
+      (SELECT claim_token FROM portable_deadline_claim)
+    );
+    RAISE EXCEPTION 'expired portable attempt renewed';
+  EXCEPTION WHEN OTHERS THEN
+    IF SQLERRM NOT LIKE '%portable attempt deadline expired%' THEN
+      RAISE;
+    END IF;
+  END;
+END
+$body$;
+RESET ROLE;
+CREATE TEMP TABLE portable_deadline_lease_check ON COMMIT DROP AS
+SELECT job.leased_until = baseline.leased_until AS lease_unchanged
+FROM otlet.jobs job
+JOIN portable_deadline_claim claim ON claim.job_id = job.id
+CROSS JOIN portable_deadline_renewal_baseline baseline;
+DROP TRIGGER portable_deadline_renew_delay ON otlet.jobs;
+DROP FUNCTION public.portable_deadline_renew_delay();
+
+SET LOCAL ROLE :worker_role;
+SELECT *
+FROM otlet.portable_fail_job(
+  :'worker_id',
+  1,
+  :'identity_hash',
+  (SELECT job_id FROM portable_deadline_claim),
+  (SELECT claim_token FROM portable_deadline_claim),
+  'attempt_timeout',
+  prompt_hash => (SELECT prompt_hash FROM portable_deadline_claim),
+  schema_validation_status => 'failed',
+  trace_summary => '{"trace_version":"otlet_portable_worker_trace_v1","schema_validation_status":"failed","schema_force":"attempt_timeout_before_schema_validation","stop_reason":"attempt_timeout"}'::jsonb,
+  selection_reason => 'attempt_timeout'
+) \g /dev/null
+RESET ROLE;
+
+SELECT concat_ws('|',
+  claim.evidence_limits ->> 'max_attempt_ms',
+  (portable_claim.last_renewed_at IS NOT NULL)::text,
+  (SELECT lease_unchanged::text FROM portable_deadline_lease_check),
+  (SELECT is_called::text FROM portable_deadline_trigger_calls),
+  job.status,
+  job.error,
+  receipt.selection_reason,
+  receipt.trace_summary ->> 'stop_reason',
+  receipt.schema_validation_status,
+  portable_claim.status,
+  (SELECT count(*) FROM otlet.inference_receipts r WHERE r.job_id = job.id),
+  (SELECT count(*) FROM otlet.outputs output WHERE output.job_id = job.id),
+  (status.attempt_deadline_at <= clock_timestamp())::text
+)
+FROM portable_deadline_claim claim
+JOIN otlet.jobs job ON job.id = claim.job_id
+JOIN otlet.portable_claims portable_claim ON portable_claim.job_id = job.id
+JOIN otlet.portable_claim_status status ON status.claim_id = portable_claim.id
+JOIN otlet.inference_receipts receipt ON receipt.job_id = job.id;
+ROLLBACK;
+SQL
+)"
+expected_portable_deadline_contract="1000|true|true|true|failed|attempt_timeout|attempt_timeout|attempt_timeout|failed|failed|1|0|true"
+echo "portable_deadline_contract=$portable_deadline_contract"
+[ "$portable_deadline_contract" = "$expected_portable_deadline_contract" ] || {
+  echo "Unexpected portable deadline contract: $portable_deadline_contract" >&2
   exit 1
 }
 

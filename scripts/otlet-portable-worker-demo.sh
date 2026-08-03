@@ -149,6 +149,7 @@ run_worker_once_for() {
   local active_model_artifact="$4"
   local active_model_sha256="$5"
   local expected_event="$6"
+  local renew_ms="${7:-1000}"
 
   : >"$worker_log"
   if ! docker exec \
@@ -161,6 +162,7 @@ run_worker_once_for() {
     -e "OTLET_MODEL_SHA256=$active_model_sha256" \
     -e OTLET_PORTABLE_REQUIRE_TLS=0 \
     -e OTLET_PORTABLE_ONCE=1 \
+    -e "OTLET_PORTABLE_RENEW_MS=$renew_ms" \
     -e "OTLET_LLAMA_THREADS=${OTLET_LLAMA_THREADS:-4}" \
     "$container" /target/release/otlet_worker --once >"$worker_log" 2>&1; then
     tail -n 120 "$worker_log" >&2
@@ -595,6 +597,76 @@ if [ "$non_watch_scalar_contract" != "true" ]; then
   echo "Expected scalar non-watch output to skip semantic materialization, got $non_watch_scalar_contract" >&2
   exit 1
 fi
+
+deadline_job_id="$(
+  docker exec -i "$container" psql -U postgres -d "$portable_database" \
+    -X -qAt -v ON_ERROR_STOP=1 -v model_name="$model_name" <<'SQL'
+SELECT otlet.create_task(
+  'portable_attempt_deadline_demo',
+  NULL,
+  'Read the full signal and return decision keep',
+  '{"type":"object","required":["decision"],"additionalProperties":false,"properties":{"decision":{"const":"keep"}}}'::jsonb,
+  :'model_name',
+  '{"reasoning":"off","max_tokens":512,"max_attempt_ms":1000,"inference_cache":false}'::jsonb,
+  '{"source_fields":["signal"]}'::jsonb
+) \g /dev/null
+INSERT INTO otlet.jobs (task_name, subject_id, input)
+VALUES (
+  'portable_attempt_deadline_demo',
+  'deadline',
+  jsonb_build_object('signal', repeat('bounded portable deadline input ', 400))
+)
+RETURNING id;
+SQL
+)"
+if [[ ! "$deadline_job_id" =~ ^[1-9][0-9]*$ ]]; then
+  echo "Expected portable deadline job ID, got $deadline_job_id" >&2
+  exit 1
+fi
+
+run_worker_once_for \
+  "$worker_id" \
+  "$worker_database_url" \
+  "$model_name" \
+  "$model_artifact" \
+  "$model_sha256" \
+  job_failed \
+  250
+
+if ! grep -q '"reason":"attempt_timeout"' "$worker_log"; then
+  tail -n 120 "$worker_log" >&2
+  echo "Portable deadline worker did not report attempt_timeout" >&2
+  exit 1
+fi
+
+portable_deadline_contract="$(
+  docker exec -i "$container" psql -U postgres -d "$portable_database" \
+    -X -qAt -v ON_ERROR_STOP=1 -v job_id="$deadline_job_id" <<'SQL'
+SELECT concat_ws('|',
+  job.status,
+  job.error,
+  receipt.selection_reason,
+  receipt.trace_summary ->> 'stop_reason',
+  receipt.schema_validation_status,
+  claim.status,
+  (claim.last_renewed_at IS NOT NULL)::text,
+  (claim.last_renewed_at < status.attempt_deadline_at)::text,
+  (SELECT count(*) FROM otlet.inference_receipts r WHERE r.job_id = job.id),
+  (SELECT count(*) FROM otlet.outputs output WHERE output.job_id = job.id)
+)
+FROM otlet.jobs job
+JOIN otlet.portable_claims claim ON claim.job_id = job.id
+JOIN otlet.portable_claim_status status ON status.claim_id = claim.id
+JOIN otlet.inference_receipts receipt ON receipt.job_id = job.id
+WHERE job.id = :'job_id'::bigint;
+SQL
+)"
+expected_portable_deadline_contract="failed|attempt_timeout|attempt_timeout|attempt_timeout|failed|failed|true|true|1|0"
+if [ "$portable_deadline_contract" != "$expected_portable_deadline_contract" ]; then
+  echo "Expected portable deadline contract $expected_portable_deadline_contract, got $portable_deadline_contract" >&2
+  exit 1
+fi
+echo "portable_deadline_contract=$portable_deadline_contract"
 
 run_worker_once_for \
   "$cheap_worker_id" \

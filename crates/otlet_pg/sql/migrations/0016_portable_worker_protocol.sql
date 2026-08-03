@@ -475,7 +475,8 @@ BEGIN
       runtime_identity_hash,
       attempt_index,
       selection_role,
-      claim_token_hash
+      claim_token_hash,
+      claimed_at
     )
     VALUES (
       claimed_job.id,
@@ -485,7 +486,8 @@ BEGIN
       worker_row.runtime_identity_hash,
       claimed_job.attempts,
       claim_selection_role,
-      otlet.portable_text_hash(claimed_job.claim_token)
+      otlet.portable_text_hash(claimed_job.claim_token),
+      clock_timestamp()
     )
     RETURNING * INTO saved_claim;
 
@@ -561,6 +563,7 @@ AS $$
 DECLARE
   worker_row otlet.portable_workers%ROWTYPE;
   claim_row otlet.portable_claims%ROWTYPE;
+  attempt_deadline timestamptz;
 BEGIN
   worker_row := otlet.authorized_portable_worker(
     portable_renew_job.requested_worker_id,
@@ -572,6 +575,15 @@ BEGIN
     portable_renew_job.requested_job_id,
     portable_renew_job.requested_claim_token
   );
+  SELECT claim_row.claimed_at
+         + (revision.definition #>> '{runtime,effective_max_attempt_ms}')::bigint
+           * interval '1 millisecond'
+  INTO attempt_deadline
+  FROM otlet.workload_revisions revision
+  WHERE revision.workload_revision_hash = claim_row.workload_revision_hash;
+  IF attempt_deadline IS NULL OR clock_timestamp() >= attempt_deadline THEN
+    RAISE EXCEPTION 'otlet portable attempt deadline expired';
+  END IF;
 
   SELECT renewed.status, renewed.leased_until
   INTO job_status, portable_renew_job.leased_until
@@ -581,6 +593,9 @@ BEGIN
   ) renewed;
   IF NOT FOUND THEN
     RAISE EXCEPTION 'otlet portable job claim is stale';
+  END IF;
+  IF clock_timestamp() >= attempt_deadline THEN
+    RAISE EXCEPTION 'otlet portable attempt deadline expired';
   END IF;
 
   UPDATE otlet.portable_claims c
@@ -1320,6 +1335,9 @@ SELECT
   j.task_name,
   j.subject_id,
   j.leased_until,
+  c.claimed_at
+    + (revision.definition #>> '{runtime,effective_max_attempt_ms}')::bigint
+      * interval '1 millisecond' AS attempt_deadline_at,
   CASE
     WHEN c.status NOT IN ('claimed', 'renewed')
       OR j.status IN ('complete', 'failed', 'canceled') THEN 'terminal'
@@ -1330,7 +1348,9 @@ SELECT
   c.last_renewed_at,
   c.finished_at
 FROM otlet.portable_claims c
-JOIN otlet.jobs j ON j.id = c.job_id;
+JOIN otlet.jobs j ON j.id = c.job_id
+JOIN otlet.workload_revisions revision
+  ON revision.workload_revision_hash = c.workload_revision_hash;
 
 CREATE VIEW otlet.portable_receipt_status AS
 SELECT

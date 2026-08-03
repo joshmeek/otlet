@@ -161,7 +161,7 @@ SELECT otlet.set_portable_worker_control('customer-vpc-worker', 'draining');
 
 Pause lets the current claim finish and blocks the next claim. Drain also lets the current claim finish, records `drained`, and exits the process. A supervisor can then restart or replace the container
 
-The worker renews each live claim while llama.cpp runs. Cancellation interrupts decode and finishes through the fenced cancel RPC. A rejected renewal or database disconnect interrupts decode without a terminal write, leaving the lease available for safe reclaim. Exact terminal requests retry three times, and PostgreSQL returns the stored terminal result for duplicate delivery
+The worker converts the database-issued `max_attempt_ms` to one monotonic deadline before the claim RPC. Prompt decode, generation, the llama abort callback, and renewal share it. PostgreSQL refuses renewal after its claim-time deadline, and a timeout records `attempt_timeout` in the job, receipt selection reason, failed schema status, and trace. Cancellation interrupts decode and finishes through the fenced cancel RPC. A renewal rejected before the deadline or a database disconnect interrupts decode without a terminal write, leaving the lease available for safe reclaim. Exact terminal requests retry three times, and PostgreSQL returns the stored terminal result for duplicate delivery
 
 The continuous process reconnects after PostgreSQL restarts. `--once` fails on a database disconnect so batch callers receive a nonzero exit instead of an indefinite wait
 
@@ -184,7 +184,7 @@ After `./scripts/otlet-setup.sh` has placed the demo GGUF in Docker, run:
 ./scripts/otlet-portable-worker-demo.sh
 ```
 
-The script creates a disposable SQL-only database, builds the worker, and runs real local inference through direct, cheap-to-strong, row-watch, and pair-watch paths. It also proves receipt lineage, semantic reads, update and delete reconciliation, pause, resume, cancellation, claim loss, process restart, database restart, reclaim, duplicate delivery, drain, source denial, and redacted structured logs before dropping the database and roles
+The script creates a disposable SQL-only database, builds the worker, and runs real local inference through direct, cheap-to-strong, row-watch, and pair-watch paths. It also proves an absolute attempt timeout after a successful renewal with one receipt and no output, receipt lineage, semantic reads, update and delete reconciliation, pause, resume, cancellation, claim loss, process restart, database restart, reclaim, duplicate delivery, drain, source denial, and redacted structured logs before dropping the database and roles
 
 Run the isolated deployment-preflight proof:
 

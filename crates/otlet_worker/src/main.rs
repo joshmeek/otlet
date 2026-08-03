@@ -19,6 +19,7 @@ const MAX_TOKEN_PIECE_BYTES: usize = 16 * 1024;
 const CLAIM_ACTIVE: u8 = 0;
 const CLAIM_CANCELED: u8 = 1;
 const CLAIM_LOST: u8 = 2;
+const CLAIM_TIMED_OUT: u8 = 3;
 
 #[derive(Deserialize)]
 struct Claim {
@@ -33,6 +34,8 @@ struct Claim {
     runtime_options: Value,
     model: Value,
     evidence_limits: Value,
+    #[serde(skip, default = "Instant::now")]
+    attempt_deadline: Instant,
 }
 
 #[derive(Clone)]
@@ -249,6 +252,7 @@ impl Database {
     }
 
     fn claim(&self, config: &Config) -> Result<Vec<Claim>, String> {
+        let attempt_start = Instant::now();
         let sql = format!(
             "SELECT jsonb_build_object(\
                'job_id', c.job_id, \
@@ -270,7 +274,7 @@ impl Database {
         );
         self.query(&sql)?
             .into_iter()
-            .map(|line| parse_claim(&line))
+            .map(|line| parse_claim(&line, attempt_start))
             .collect()
     }
 
@@ -341,12 +345,29 @@ impl Database {
         let candidate = candidate_output
             .map(|output| format!("{}::jsonb", sql_text(&output.to_string())))
             .unwrap_or_else(|| "NULL".to_owned());
+        let timeout = error == "attempt_timeout";
+        let selection_reason = timeout
+            .then(|| sql_text("attempt_timeout"))
+            .unwrap_or_else(|| "NULL".to_owned());
+        let trace_summary = if timeout {
+            json!({
+                "trace_version": "otlet_portable_worker_trace_v1",
+                "schema_validation_status": "failed",
+                "schema_force": "attempt_timeout_before_schema_validation",
+                "stop_reason": "attempt_timeout"
+            })
+        } else {
+            json!({
+                "trace_version": "otlet_portable_worker_trace_v1",
+                "schema_validation_status": "failed"
+            })
+        };
         let sql = format!(
             "SELECT job_status \
              FROM otlet.portable_fail_job(\
                {}, {}, {}, {}, {}, {}, raw_output => {}, \
                prompt_hash => {}, schema_validation_status => 'failed', \
-               trace_summary => '{{\"trace_version\":\"otlet_portable_worker_trace_v1\",\"schema_validation_status\":\"failed\"}}'::jsonb, \
+               trace_summary => {}::jsonb, selection_reason => {}, \
                candidate_output => {}\
              );\n",
             sql_text(&config.worker_id),
@@ -357,6 +378,8 @@ impl Database {
             sql_text(error),
             raw,
             sql_text(&claim.prompt_hash),
+            sql_text(&trace_summary.to_string()),
+            selection_reason,
             candidate
         );
         let rows = self.terminal_query(&sql)?;
@@ -549,8 +572,8 @@ unsafe extern "C" fn discard_llama_log(
 }
 
 unsafe extern "C" fn abort_on_claim_change(data: *mut std::ffi::c_void) -> bool {
-    let state = unsafe { &*data.cast::<AtomicU8>() };
-    state.load(Ordering::Acquire) != CLAIM_ACTIVE
+    let state = unsafe { &*data.cast::<ClaimState>() };
+    state.value() != CLAIM_ACTIVE
 }
 
 struct AbortGuard<'a> {
@@ -679,31 +702,64 @@ struct Inference {
 
 #[derive(Clone)]
 struct ClaimSignal {
-    state: Arc<AtomicU8>,
+    state: Arc<ClaimState>,
+}
+
+struct ClaimState {
+    value: AtomicU8,
+    deadline: Instant,
+}
+
+impl ClaimState {
+    fn value(&self) -> u8 {
+        if self.value.load(Ordering::Acquire) == CLAIM_ACTIVE && Instant::now() >= self.deadline {
+            let _ = self.value.compare_exchange(
+                CLAIM_ACTIVE,
+                CLAIM_TIMED_OUT,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
+        }
+        self.value.load(Ordering::Acquire)
+    }
 }
 
 impl ClaimSignal {
-    fn new() -> Self {
+    fn new(deadline: Instant) -> Self {
         Self {
-            state: Arc::new(AtomicU8::new(CLAIM_ACTIVE)),
+            state: Arc::new(ClaimState {
+                value: AtomicU8::new(CLAIM_ACTIVE),
+                deadline,
+            }),
         }
     }
 
     fn set(&self, state: u8) {
-        let _ =
-            self.state
-                .compare_exchange(CLAIM_ACTIVE, state, Ordering::AcqRel, Ordering::Acquire);
+        self.state.value();
+        let _ = self.state.value.compare_exchange(
+            CLAIM_ACTIVE,
+            state,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
     }
 
     fn state(&self) -> u8 {
-        self.state.load(Ordering::Acquire)
+        self.state.value()
+    }
+
+    fn remaining(&self) -> Duration {
+        self.state
+            .deadline
+            .saturating_duration_since(Instant::now())
     }
 
     fn ensure_active(&self) -> Result<(), String> {
         match self.state() {
             CLAIM_ACTIVE => Ok(()),
             CLAIM_CANCELED => Err("portable claim was canceled".to_owned()),
-            _ => Err("portable claim was lost".to_owned()),
+            CLAIM_LOST => Err("portable claim was lost".to_owned()),
+            _ => Err("attempt_timeout".to_owned()),
         }
     }
 }
@@ -716,7 +772,7 @@ struct LeaseGuard {
 
 impl LeaseGuard {
     fn start(database: Database, config: Config, claim: &Claim) -> Self {
-        let signal = ClaimSignal::new();
+        let signal = ClaimSignal::new(claim.attempt_deadline);
         let thread_signal = signal.clone();
         let stop = Arc::new(AtomicBool::new(false));
         let thread_stop = Arc::clone(&stop);
@@ -726,8 +782,16 @@ impl LeaseGuard {
         let workload_revision_hash = claim.workload_revision_hash.clone();
         let handle = thread::spawn(move || {
             while !thread_stop.load(Ordering::Acquire) {
-                thread::park_timeout(config.renew_interval);
+                let remaining = thread_signal.remaining();
+                if remaining.is_zero() {
+                    thread_signal.set(CLAIM_TIMED_OUT);
+                    break;
+                }
+                thread::park_timeout(config.renew_interval.min(remaining));
                 if thread_stop.load(Ordering::Acquire) {
+                    break;
+                }
+                if thread_signal.state() == CLAIM_TIMED_OUT {
                     break;
                 }
                 match database.renew(&config, job_id, &claim_token) {
@@ -744,13 +808,20 @@ impl LeaseGuard {
                     }
                     Ok(_) => {}
                     Err(error) => {
-                        thread_signal.set(CLAIM_LOST);
+                        let timeout = error.contains("portable attempt deadline expired");
+                        thread_signal.set(if timeout { CLAIM_TIMED_OUT } else { CLAIM_LOST });
                         log_job(
-                            "job_claim_lost",
+                            if timeout {
+                                "job_attempt_timed_out"
+                            } else {
+                                "job_claim_lost"
+                            },
                             job_id,
                             &task_name,
                             &workload_revision_hash,
-                            Some(if is_connection_error(&error) {
+                            Some(if timeout {
+                                "attempt_timeout"
+                            } else if is_connection_error(&error) {
                                 "database_unavailable"
                             } else {
                                 "lease_renewal_rejected"
@@ -972,6 +1043,7 @@ fn process_claim(
     let lease = LeaseGuard::start(database.clone(), config.clone(), claim);
     let signal = lease.signal();
     let inference = model.infer(&claim.prompt, max_tokens, max_output_bytes, &signal);
+    let inference_state = signal.state();
     drop(lease);
     match signal.state() {
         CLAIM_CANCELED => {
@@ -981,6 +1053,11 @@ fn process_claim(
         }
         CLAIM_LOST => {
             log_event("job_abandoned", claim, Some("claim_lost"));
+            return Ok(());
+        }
+        CLAIM_TIMED_OUT if inference_state == CLAIM_TIMED_OUT => {
+            let state = database.fail(config, claim, "attempt_timeout", None, None)?;
+            log_failure_state(&state, claim, "attempt_timeout");
             return Ok(());
         }
         _ => {}
@@ -1440,8 +1517,8 @@ fn is_identity_hash(value: &str) -> bool {
         .is_some_and(is_sha256)
 }
 
-fn parse_claim(line: &str) -> Result<Claim, String> {
-    let claim: Claim = serde_json::from_str(line)
+fn parse_claim(line: &str, attempt_start: Instant) -> Result<Claim, String> {
+    let mut claim: Claim = serde_json::from_str(line)
         .map_err(|err| format!("portable claim response is invalid: {err}"))?;
     if !is_identity_hash(&claim.workload_revision_hash) {
         return Err(coded(
@@ -1449,6 +1526,25 @@ fn parse_claim(line: &str) -> Result<Claim, String> {
             "portable claim workload revision hash is invalid",
         ));
     }
+    let attempt_budget_ms = claim
+        .evidence_limits
+        .get("max_attempt_ms")
+        .and_then(Value::as_u64)
+        .filter(|value| (1..=3_600_000).contains(value))
+        .ok_or_else(|| {
+            coded(
+                "database_contract_invalid",
+                "portable claim attempt budget is invalid",
+            )
+        })?;
+    claim.attempt_deadline = attempt_start
+        .checked_add(Duration::from_millis(attempt_budget_ms))
+        .ok_or_else(|| {
+            coded(
+                "database_contract_invalid",
+                "portable claim attempt deadline overflowed",
+            )
+        })?;
     Ok(claim)
 }
 
@@ -1562,14 +1658,22 @@ mod tests {
 
     #[test]
     fn claim_signal_keeps_the_first_terminal_change() {
-        let signal = ClaimSignal::new();
+        let signal = ClaimSignal::new(Instant::now() + Duration::from_secs(1));
         signal.set(CLAIM_CANCELED);
         signal.set(CLAIM_LOST);
         assert_eq!(signal.state(), CLAIM_CANCELED);
     }
 
     #[test]
-    fn portable_claim_requires_versioned_workload_revision() {
+    fn claim_signal_expires_against_its_monotonic_deadline() {
+        let signal = ClaimSignal::new(Instant::now() - Duration::from_millis(1));
+        signal.set(CLAIM_LOST);
+        assert_eq!(signal.state(), CLAIM_TIMED_OUT);
+        assert_eq!(signal.ensure_active(), Err("attempt_timeout".to_owned()));
+    }
+
+    #[test]
+    fn portable_claim_requires_versioned_revision_and_attempt_budget() {
         let mut claim = json!({
             "job_id": 1,
             "workload_revision_hash": format!("otlet:v1:sha256:{}", "a".repeat(64)),
@@ -1581,12 +1685,19 @@ mod tests {
             "prompt_hash": "prompt-hash",
             "runtime_options": {},
             "model": {},
-            "evidence_limits": {}
+            "evidence_limits": {"max_attempt_ms": 30000}
         });
-        assert!(parse_claim(&claim.to_string()).is_ok());
+        assert!(parse_claim(&claim.to_string(), Instant::now()).is_ok());
 
+        claim["evidence_limits"] = json!({});
+        let error = parse_claim(&claim.to_string(), Instant::now())
+            .err()
+            .expect("missing attempt budget should be rejected");
+        assert_eq!(error_code(&error), "database_contract_invalid");
+
+        claim["evidence_limits"] = json!({"max_attempt_ms": 30000});
         claim["workload_revision_hash"] = json!("a".repeat(64));
-        let error = parse_claim(&claim.to_string())
+        let error = parse_claim(&claim.to_string(), Instant::now())
             .err()
             .expect("unversioned revision hash should be rejected");
         assert_eq!(error_code(&error), "database_contract_invalid");
