@@ -283,6 +283,9 @@ queue_fairness_output="$(
     -v big_task="$queue_fairness_big_task" \
     -v small_task="$queue_fairness_small_task" \
     -v model_name="$strong_model_name" <<'SQL'
+BEGIN;
+LOCK TABLE otlet.jobs IN SHARE ROW EXCLUSIVE MODE;
+
 CREATE TEMP TABLE queue_fairness_params (
   big_task text,
   small_task text,
@@ -429,6 +432,11 @@ SELECT (small_claimed = 4)::text || '|' ||
        cross_task_batch::text || '|' ||
        (has_big AND has_small)::text
 FROM summary, visible_batches;
+
+DELETE FROM otlet.jobs
+WHERE task_name IN (:'big_task', :'small_task')
+  AND status = 'queued';
+COMMIT;
 SQL
 )"
 queue_fairness_contract="$(tail -n 1 <<<"$queue_fairness_output")"

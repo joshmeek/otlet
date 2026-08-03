@@ -89,7 +89,6 @@ DECLARE
     ELSE 'linked_inproc'
   END;
   v_stale_reasons jsonb := COALESCE(p_stale_reasons, '{}'::jsonb);
-  v_schema_drift boolean := COALESCE((p_stale_reasons ->> 'schema_drift')::bigint, 0) > 0;
 BEGIN
   v_refresh_subjects := v_stale_subjects + v_missing_subjects;
 
@@ -164,20 +163,19 @@ BEGIN
   FROM otlet.production_policy policy
   WHERE policy.name = 'default';
 
-  IF NOT v_schema_drift
-     AND NOT v_portable
+  IF NOT v_portable
      AND COALESCE(v_auto_infer_ms, 0) > 0
      AND COALESCE(v_auto_max_rows, 0) > 0 THEN
     v_infer_now_subjects := LEAST(v_refresh_subjects, v_auto_max_rows::bigint);
   END IF;
 
-  IF NOT v_schema_drift AND COALESCE(v_auto_wait_ms, 0) > 0 THEN
+  IF COALESCE(v_auto_wait_ms, 0) > 0 THEN
     v_wait_subjects := COALESCE(v_inflight_subjects, 0);
   END IF;
 
   v_remaining_refresh_subjects := GREATEST(v_refresh_subjects - v_infer_now_subjects, 0);
 
-  IF NOT v_schema_drift AND v_stale_policy = 'refresh_then_fail_closed' THEN
+  IF v_stale_policy = 'refresh_then_fail_closed' THEN
     v_queue_subjects := LEAST(v_remaining_refresh_subjects, COALESCE(v_available_queue_slots, 0));
   END IF;
 
@@ -189,9 +187,6 @@ BEGIN
   IF v_total_subjects = 0 THEN
     v_selected_path := p_lookup_path;
     v_reason := p_empty_reason;
-  ELSIF v_schema_drift THEN
-    v_selected_path := 'lookup_fail_closed';
-    v_reason := 'source schema drift requires watch revision';
   ELSIF v_infer_now_subjects > 0 THEN
     v_selected_path := 'bounded_infer_now';
     v_reason := format(

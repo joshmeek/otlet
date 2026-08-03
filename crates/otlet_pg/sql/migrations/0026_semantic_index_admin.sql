@@ -137,7 +137,8 @@ BEGIN
     model_name,
     runtime_options,
     actual_input_shaping,
-    decision_contract
+    decision_contract,
+    jsonb_build_array(jsonb_build_object('table', source_table))
   );
 
   INSERT INTO otlet.semantic_indexes (

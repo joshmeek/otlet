@@ -78,6 +78,8 @@ BEGIN
     RAISE EXCEPTION 'otlet semantic join index % does not exist', semantic_join_index_plan.index_name;
   END IF;
 
+  PERFORM otlet.require_workload_source_contract(index_row.task_name, current_contract_hash);
+
   IF exact THEN
     EXECUTE format(
       $sql$

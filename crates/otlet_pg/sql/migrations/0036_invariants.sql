@@ -28,6 +28,26 @@ BEGIN
 
   RETURN QUERY
   SELECT
+    'active_workload_source_dependencies_are_current'::text,
+    'workload_revision'::text,
+    head.active_workload_revision_hash,
+    jsonb_build_object(
+      'task_name', head.task_name,
+      'error', dependency.error
+    )
+  FROM otlet.workload_revision_heads head
+  JOIN otlet.workload_revisions revision
+    ON revision.task_name = head.task_name
+   AND revision.workload_revision_hash = head.active_workload_revision_hash
+  CROSS JOIN LATERAL (
+    SELECT otlet.source_query_contract_error(
+      revision.definition #> '{source,query_contract}'
+    ) AS error
+  ) dependency
+  WHERE dependency.error IS NOT NULL;
+
+  RETURN QUERY
+  SELECT
     'workload_revisions_are_content_addressed'::text,
     'workload_revision'::text,
     revision.workload_revision_hash,
@@ -649,6 +669,9 @@ BEGIN
       ON revision.task_name = head.task_name
      AND revision.workload_revision_hash = head.active_workload_revision_hash
     WHERE revision.definition #>> '{source,kind}' = 'row'
+      AND otlet.source_query_contract_error(
+        revision.definition #> '{source,query_contract}'
+      ) IS NULL
   LOOP
     current_contract_hash := index_row.contract_hash;
 
@@ -749,6 +772,9 @@ BEGIN
       ON revision.task_name = head.task_name
      AND revision.workload_revision_hash = head.active_workload_revision_hash
     WHERE revision.definition #>> '{source,kind}' = 'pair'
+      AND otlet.source_query_contract_error(
+        revision.definition #> '{source,query_contract}'
+      ) IS NULL
   LOOP
     current_contract_hash := join_row.contract_hash;
 

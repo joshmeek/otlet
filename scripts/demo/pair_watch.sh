@@ -36,7 +36,11 @@ FROM otlet.create_watch(
   action_types => ARRAY['merge_candidate', 'new_entity', 'review_flag'],
   input_shaping => '{"source_fields":["_otlet_mvcc","action_ids","candidate_evidence","evidence_counts"],"evidence_fields":["candidate_evidence"],"action_id_fields":{"left_id":"left_id","right_id":"right_id"}}'::jsonb,
   decision_contract => '{"preset":"entity_resolution_evidence_v1"}'::jsonb,
-  max_candidate_rows => 10
+  max_candidate_rows => 10,
+  pair_sources => '[
+    {"table":"public.otlet_demo_vendor_entity","subject_column":"id"},
+    {"table":"public.otlet_demo_vendor_pair","subject_column":"pair_id"}
+  ]'::jsonb
 );
 SQL
 

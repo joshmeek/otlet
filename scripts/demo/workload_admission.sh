@@ -92,8 +92,10 @@ SELECT otlet.create_watch(
   output_schema => '{"type":"object"}'::jsonb,
   model_name => :'model_name',
   candidate_query => $$
-    SELECT 'slow-candidate'::text AS subject_id, '{}'::jsonb AS input
-    FROM (SELECT pg_sleep(1)) AS delayed
+    SELECT
+      'slow-candidate'::text AS subject_id,
+      jsonb_build_object('digest', max(md5(i::text))) AS input
+    FROM generate_series(1, 5000000) AS delayed(i)
   $$,
   max_candidate_rows => 1
 );

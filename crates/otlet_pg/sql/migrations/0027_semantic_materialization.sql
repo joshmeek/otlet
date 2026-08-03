@@ -10,13 +10,17 @@ DECLARE
   refreshed bigint;
   current_contract_hash text;
   current_input_shaping jsonb;
+  revision_definition jsonb;
 BEGIN
   IF NULLIF(materialize_semantic_records.current_input_query, '') IS NULL THEN
     RAISE EXCEPTION 'otlet materialize_semantic_records requires current_input_query';
   END IF;
 
-  SELECT head.active_workload_revision_hash, revision.definition #> '{task,input_shaping}'
-  INTO current_contract_hash, current_input_shaping
+  SELECT
+    head.active_workload_revision_hash,
+    revision.definition #> '{task,input_shaping}',
+    revision.definition
+  INTO current_contract_hash, current_input_shaping, revision_definition
   FROM otlet.workload_revision_heads head
   JOIN otlet.workload_revisions revision
     ON revision.task_name = head.task_name
@@ -27,6 +31,10 @@ BEGIN
   IF NOT FOUND THEN
     RAISE EXCEPTION 'otlet task % does not exist', materialize_semantic_records.task_name;
   END IF;
+  PERFORM otlet.source_query_contract_guard(
+    revision_definition #> '{source,query_contract}',
+    true
+  );
   EXECUTE format(
     $sql$
       WITH current_inputs AS (
@@ -268,6 +276,11 @@ BEGIN
   ) THEN
     RETURN 0;
   END IF;
+
+  PERFORM otlet.require_workload_source_contract(
+    job_row.task_name,
+    job_row.workload_revision_hash
+  );
 
   -- outputs_one_per_job_idx guarantees at most one row per job
   SELECT *

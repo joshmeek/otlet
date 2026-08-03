@@ -133,9 +133,15 @@ BEGIN
     'otlet.portable_text_hash(text), '
     'otlet.portable_json_hash(jsonb), '
     'otlet.identity_hash(text, jsonb), '
+    'otlet.identity_text_hash(text, text), '
     'otlet.semantic_source_hash(jsonb), '
     'otlet.semantic_shaped_input(jsonb, jsonb), '
-    'otlet.semantic_content_hash(jsonb, jsonb) TO %I',
+    'otlet.semantic_content_hash(jsonb, jsonb), '
+    'otlet.source_role_descriptor(oid), '
+    'otlet.source_relation_descriptor(oid, oid, jsonb), '
+    'otlet.source_function_descriptor(oid, oid), '
+    'otlet.source_query_binding_descriptor(jsonb, jsonb, jsonb, jsonb), '
+    'otlet.source_query_contract_error(jsonb, boolean) TO %I',
     role_name
   );
 END;

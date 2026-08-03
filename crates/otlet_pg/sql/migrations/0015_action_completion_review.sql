@@ -123,6 +123,10 @@ BEGIN
   IF NOT FOUND THEN
     RAISE EXCEPTION 'otlet job workload revision is missing';
   END IF;
+  PERFORM otlet.source_query_contract_guard(
+    revision_definition #> '{source,query_contract}',
+    true
+  );
   task_row.model_name := revision_definition #>> '{models,direct,name}';
   task_row.input_shaping := revision_definition #> '{task,input_shaping}';
   task_row.decision_contract := revision_definition #> '{task,decision_contract}';
@@ -726,6 +730,17 @@ BEGIN
   JOIN otlet.workload_revision_heads head ON head.task_name = job.task_name
   WHERE locked_action.id = validated_action_context.action_id
   FOR UPDATE OF head;
+
+  PERFORM otlet.source_query_contract_guard(
+    revision.definition #> '{source,query_contract}',
+    true
+  )
+  FROM otlet.actions locked_action
+  JOIN otlet.jobs job ON job.id = locked_action.job_id
+  JOIN otlet.workload_revisions revision
+    ON revision.task_name = job.task_name
+   AND revision.workload_revision_hash = job.workload_revision_hash
+  WHERE locked_action.id = validated_action_context.action_id;
 
   RETURN QUERY
   SELECT

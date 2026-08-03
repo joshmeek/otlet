@@ -118,6 +118,12 @@ FOR EACH ROW EXECUTE FUNCTION otlet.reject_decision_rule_preset_update();
 CREATE TABLE otlet.tasks (
   name text PRIMARY KEY CHECK (name ~ '^[a-z0-9][a-z0-9_-]*$'),
   input_query text,
+  source_relations jsonb CHECK (
+    source_relations IS NULL OR jsonb_typeof(source_relations) = 'array'
+  ),
+  source_query_contract jsonb CHECK (
+    source_query_contract IS NULL OR jsonb_typeof(source_query_contract) = 'object'
+  ),
   instruction text NOT NULL,
   output_schema jsonb NOT NULL,
   model_name text NOT NULL REFERENCES otlet.models(name),

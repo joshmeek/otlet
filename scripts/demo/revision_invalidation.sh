@@ -244,8 +244,18 @@ BEGIN
       proof.revision_a,
       proof.revision_b
     )
-  ) IS DISTINCT FROM ARRAY['/task/input_query']::text[] THEN
-    RAISE EXCEPTION 'revision diff did not isolate /task/input_query';
+  ) IS DISTINCT FROM ARRAY[
+    '/source/query_contract/query/raw',
+    '/source/query_contract/query/raw_hash'
+  ]::text[] THEN
+    RAISE EXCEPTION 'revision diff did not isolate the bound input query: %', ARRAY(
+      SELECT path
+      FROM otlet.workload_revision_diff(
+        'revision_invalidation_probe_task',
+        proof.revision_a,
+        proof.revision_b
+      )
+    );
   END IF;
 
   SELECT jsonb_set(

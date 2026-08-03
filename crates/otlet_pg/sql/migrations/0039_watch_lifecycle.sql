@@ -401,7 +401,8 @@ BEGIN
       runtime_options => actual_runtime_options,
       max_candidate_rows => actual_max_candidate_rows,
       input_shaping => actual_input_shaping,
-      decision_contract => actual_decision_contract
+      decision_contract => actual_decision_contract,
+      pair_sources => actual_pair_sources
     );
     task_name := join_index.task_name;
   END IF;

@@ -20,8 +20,9 @@ DECLARE
 BEGIN
   SELECT
     revision.definition #>> '{source,semantic_index_name}',
-    revision.definition #>> '{task,name}'
-  INTO index_row.name, index_row.task_name
+    revision.definition #>> '{task,name}',
+    head.active_workload_revision_hash
+  INTO index_row.name, index_row.task_name, current_contract_hash
   FROM otlet.workload_revision_heads head
   JOIN otlet.workload_revisions revision
     ON revision.task_name = head.task_name
@@ -33,6 +34,7 @@ BEGIN
     RAISE EXCEPTION 'otlet semantic index % does not exist', semantic_index_current_rows.index_name;
   END IF;
 
+  PERFORM otlet.require_workload_source_contract(index_row.task_name, current_contract_hash);
   PERFORM otlet.mark_semantic_schema_drift(index_row.name);
 
   SELECT
@@ -171,8 +173,9 @@ DECLARE
 BEGIN
   SELECT
     revision.definition #>> '{source,semantic_index_name}',
-    revision.definition #>> '{task,name}'
-  INTO index_row.name, index_row.task_name
+    revision.definition #>> '{task,name}',
+    head.active_workload_revision_hash
+  INTO index_row.name, index_row.task_name, current_contract_hash
   FROM otlet.workload_revision_heads head
   JOIN otlet.workload_revisions revision
     ON revision.task_name = head.task_name
@@ -183,6 +186,8 @@ BEGIN
   IF NOT FOUND THEN
     RAISE EXCEPTION 'otlet semantic index % does not exist', revalidate_semantic_subjects.index_name;
   END IF;
+
+  PERFORM otlet.require_workload_source_contract(index_row.task_name, current_contract_hash);
 
   SELECT
     active.workload_revision_hash,

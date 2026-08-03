@@ -12,7 +12,7 @@ CREATE TABLE public.otlet_demo_pair_strip (
 );
 INSERT INTO public.otlet_demo_pair_strip
 VALUES ('pair-strip-1', 'Northstar Logistics LLC', 'N-Star Freight Services', 'first volatile note');
-CREATE VIEW public.otlet_demo_pair_strip_input AS
+CREATE VIEW public.otlet_demo_pair_strip_input WITH (security_invoker = true) AS
 SELECT
   id AS subject_id,
   jsonb_build_object(
@@ -41,7 +41,8 @@ SELECT otlet.create_watch(
   trigger_policy => '{"on_change":"mark_stale"}'::jsonb,
   input_shaping => '{"source_fields":["_otlet_mvcc","left_name","right_name","volatile_note"],"strip_keys":["volatile_note"]}'::jsonb,
   decision_contract => '{"answer_field":"status","abstain_values":[],"confidence_field":"confidence","accepted_confidence":["high"]}'::jsonb,
-  max_candidate_rows => 5
+  max_candidate_rows => 5,
+  pair_sources => '[{"table":"public.otlet_demo_pair_strip","subject_column":"id"}]'::jsonb
 );
 SELECT otlet.refresh_semantic_join_index(:'watch_name');
 SQL

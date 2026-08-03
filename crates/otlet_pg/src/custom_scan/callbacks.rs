@@ -12,6 +12,27 @@ unsafe extern "C-unwind" fn create_semantic_custom_scan_state(
     }
 }
 
+fn require_custom_scan_source_contract(workload_revision_hash: &str) -> Result<(), String> {
+    pgrx::Spi::connect(|client| {
+        let args = [workload_revision_hash.into()];
+        let table = client
+            .select(
+                "SELECT otlet.require_workload_source_contract(\
+                   revision.task_name, revision.workload_revision_hash\
+                 ) \
+                 FROM otlet.workload_revisions revision \
+                 WHERE revision.workload_revision_hash = $1",
+                Some(1),
+                &args,
+            )
+            .map_err(to_string)?;
+        if table.is_empty() {
+            return Err("otlet semantic CustomScan workload revision is missing".to_owned());
+        }
+        Ok(())
+    })
+}
+
 #[pgrx::pg_guard]
 unsafe extern "C-unwind" fn begin_semantic_custom_scan(
     node: *mut pg_sys::CustomScanState,
@@ -23,6 +44,8 @@ unsafe extern "C-unwind" fn begin_semantic_custom_scan(
         let Some(mut private) = custom_private_from_plan(node) else {
             return;
         };
+        require_custom_scan_source_contract(&private.workload_revision_hash)
+            .unwrap_or_else(|err| pgrx::error!("{err}"));
         let relation = (*node).ss.ss_currentRelation;
         if relation.is_null() && private.index_kind == SemanticIndexKind::Row {
             pgrx::error!("otlet semantic CustomScan could not open source relation");

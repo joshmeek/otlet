@@ -36,6 +36,8 @@ BEGIN
     RAISE EXCEPTION 'otlet semantic index % does not exist', semantic_matches.index_name;
   END IF;
 
+  PERFORM otlet.require_workload_source_contract(index_row.task_name, index_row.contract_hash);
+
   EXECUTE format(
     $sql$
       SELECT otlet.semantic_content_hash(jsonb_build_object(

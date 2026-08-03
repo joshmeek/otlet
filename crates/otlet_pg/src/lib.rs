@@ -21,9 +21,14 @@ pgrx::extension_sql_file!(
     requires = ["schema"]
 );
 pgrx::extension_sql_file!(
+    "../sql/migrations/0044_source_query_contract.sql",
+    name = "source_query_contract",
+    requires = ["identity_contract"]
+);
+pgrx::extension_sql_file!(
     "../sql/migrations/0003_action_schema.sql",
     name = "action_schema",
-    requires = ["identity_contract"]
+    requires = ["source_query_contract"]
 );
 pgrx::extension_sql_file!(
     "../sql/migrations/0004_semantic_schema.sql",

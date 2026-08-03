@@ -84,6 +84,8 @@ BEGIN
     RAISE EXCEPTION 'otlet semantic index % does not exist', semantic_index_plan.index_name;
   END IF;
 
+  PERFORM otlet.require_workload_source_contract(index_row.task_name, current_contract_hash);
+
   IF exact THEN
     PERFORM otlet.mark_semantic_schema_drift(index_row.name);
   END IF;

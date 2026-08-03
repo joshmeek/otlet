@@ -165,6 +165,10 @@ AS $$
         job.input,
         job.definition #> '{task,input_shaping}'
       )
+      AND otlet.source_query_contract_error(
+        job.definition #> '{source,query_contract}',
+        true
+      ) IS NULL
       AND job.workload_revision_hash = job.active_workload_revision_hash
     GROUP BY
       job.task_name,
@@ -223,6 +227,17 @@ AS $$
     ORDER BY task.task_rank
     FOR UPDATE OF head
   ),
+  guarded_tasks AS MATERIALIZED (
+    SELECT task.*
+    FROM locked_tasks task
+    JOIN otlet.workload_revisions revision
+      ON revision.task_name = task.task_name
+     AND revision.workload_revision_hash = task.workload_revision_hash
+    WHERE otlet.source_query_contract_guard(
+      revision.definition #> '{source,query_contract}',
+      true
+    )::text = ''
+  ),
   ranked_candidates AS (
     SELECT
       job.id,
@@ -239,7 +254,7 @@ AS $$
           job.id
       ) AS task_job_rank
     FROM job_contracts job
-    JOIN locked_tasks f
+    JOIN guarded_tasks f
       ON f.task_name = job.task_name
      AND f.model_name = job.selected_model ->> 'name'
      AND f.artifact_path IS NOT DISTINCT FROM job.selected_model ->> 'artifact_path'
@@ -290,7 +305,7 @@ AS $$
       AND j.workload_revision_hash = candidate.workload_revision_hash
       AND EXISTS (
         SELECT 1
-        FROM locked_tasks task
+        FROM guarded_tasks task
         JOIN job_contracts job
           ON job.id = j.id
          AND job.task_name = task.task_name
@@ -352,16 +367,40 @@ CREATE FUNCTION otlet.renew_job_lease(
 )
 LANGUAGE sql
 AS $$
+  WITH locked_job AS MATERIALIZED (
+    SELECT
+      j.id,
+      revision.definition,
+      (revision.definition #>> '{runtime,lease_ms}')::bigint
+        * interval '1 millisecond' AS lease_interval
+    FROM otlet.jobs j
+    JOIN otlet.workload_revisions revision
+      ON revision.workload_revision_hash = j.workload_revision_hash
+     AND revision.task_name = j.task_name
+    WHERE j.id = renew_job_lease.job_id
+      AND j.claim_token = renew_job_lease.expected_claim_token
+      AND j.status IN ('running', 'cancel_requested')
+      AND j.leased_until IS NOT NULL
+      AND j.leased_until >= now()
+      AND otlet.source_query_contract_error(
+        revision.definition #> '{source,query_contract}',
+        true
+      ) IS NULL
+    FOR UPDATE OF j
+  ),
+  guarded_job AS MATERIALIZED (
+    SELECT locked_job.id, locked_job.lease_interval
+    FROM locked_job
+    WHERE otlet.source_query_contract_guard(
+      locked_job.definition #> '{source,query_contract}',
+      true
+    )::text = ''
+  )
   UPDATE otlet.jobs j
   SET leased_until = now()
-    + (revision.definition #>> '{runtime,lease_ms}')::bigint * interval '1 millisecond'
-  FROM otlet.workload_revisions revision
-  WHERE j.id = renew_job_lease.job_id
-    AND j.claim_token = renew_job_lease.expected_claim_token
-    AND j.status IN ('running', 'cancel_requested')
-    AND j.leased_until IS NOT NULL
-    AND j.leased_until >= now()
-    AND revision.workload_revision_hash = j.workload_revision_hash
+    + guarded_job.lease_interval
+  FROM guarded_job
+  WHERE j.id = guarded_job.id
   RETURNING j.status, j.leased_until;
 $$;
 

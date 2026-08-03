@@ -45,7 +45,8 @@ CREATE FUNCTION otlet.create_task(
   model_name text,
   runtime_options jsonb DEFAULT '{}'::jsonb,
   input_shaping jsonb DEFAULT '{}'::jsonb,
-  decision_contract jsonb DEFAULT '{}'::jsonb
+  decision_contract jsonb DEFAULT '{}'::jsonb,
+  source_relations jsonb DEFAULT NULL
 ) RETURNS otlet.tasks
 LANGUAGE plpgsql
 AS $$
@@ -53,6 +54,7 @@ DECLARE
   actual_runtime_options jsonb := COALESCE(create_task.runtime_options, '{}'::jsonb);
   actual_input_shaping jsonb := COALESCE(create_task.input_shaping, '{}'::jsonb);
   actual_decision_contract jsonb := COALESCE(create_task.decision_contract, '{}'::jsonb);
+  actual_source_relations jsonb := create_task.source_relations;
   preset_name text;
   preset_contract jsonb;
   preset_contract_hash text;
@@ -109,6 +111,10 @@ BEGIN
   END IF;
   IF jsonb_typeof(actual_decision_contract) IS DISTINCT FROM 'object' THEN
     RAISE EXCEPTION 'otlet decision_contract must be a JSON object';
+  END IF;
+  IF actual_source_relations IS NOT NULL
+     AND jsonb_typeof(actual_source_relations) IS DISTINCT FROM 'array' THEN
+    RAISE EXCEPTION 'otlet source_relations must be a JSON array';
   END IF;
   FOREACH contract_field IN ARRAY ARRAY['redact_output_fields', 'redact_action_fields', 'identity_fields'] LOOP
     IF actual_decision_contract ? contract_field
@@ -215,6 +221,7 @@ BEGIN
   INSERT INTO otlet.tasks (
     name,
     input_query,
+    source_relations,
     instruction,
     output_schema,
     model_name,
@@ -225,6 +232,7 @@ BEGIN
   VALUES (
     create_task.task_name,
     create_task.input_query,
+    actual_source_relations,
     create_task.instruction,
     create_task.output_schema,
     create_task.model_name,
@@ -233,8 +241,9 @@ BEGIN
     actual_decision_contract
   )
   ON CONFLICT (name) DO UPDATE
-    SET (input_query, instruction, output_schema, model_name, runtime_options, input_shaping, decision_contract) = (
+    SET (input_query, source_relations, instruction, output_schema, model_name, runtime_options, input_shaping, decision_contract) = (
       EXCLUDED.input_query,
+      EXCLUDED.source_relations,
       EXCLUDED.instruction,
       EXCLUDED.output_schema,
       EXCLUDED.model_name,
@@ -434,6 +443,7 @@ LANGUAGE plpgsql
 AS $$
 DECLARE
   policy otlet.production_policy%ROWTYPE;
+  query_contract jsonb;
 BEGIN
   IF NULLIF(btrim(preflight_candidate_query.candidate_query), '') IS NULL THEN
     RAISE EXCEPTION 'otlet candidate query is required';
@@ -445,9 +455,12 @@ BEGIN
   WHERE name = 'default';
 
   BEGIN
+    query_contract := otlet.build_source_query_contract(
+      preflight_candidate_query.candidate_query
+    );
     EXECUTE format(
       'EXPLAIN (FORMAT JSON) SELECT subject_id::text, input::jsonb FROM (%s) otlet_candidate',
-      preflight_candidate_query.candidate_query
+      query_contract #>> '{query,resolved}'
     ) INTO candidate_plan;
   EXCEPTION WHEN OTHERS THEN
     RAISE EXCEPTION 'otlet candidate query EXPLAIN failed: %', SQLERRM;

@@ -46,6 +46,8 @@ BEGIN
     RAISE EXCEPTION 'otlet semantic join index % does not exist', semantic_join_index_current_rows.index_name;
   END IF;
 
+  PERFORM otlet.require_workload_source_contract(index_row.task_name, current_contract_hash);
+
   IF semantic_join_index_current_rows.expected_workload_revision_hash IS NOT NULL
      AND semantic_join_index_current_rows.expected_workload_revision_hash IS DISTINCT FROM current_contract_hash THEN
     RAISE EXCEPTION 'otlet workload revision changed during semantic read for index %', index_row.name;
@@ -180,6 +182,8 @@ BEGIN
   IF NOT FOUND THEN
     RAISE EXCEPTION 'otlet semantic join index % does not exist', semantic_join_matches.index_name;
   END IF;
+
+  PERFORM otlet.require_workload_source_contract(index_row.task_name, current_contract_hash);
 
   EXECUTE format(
     $sql$

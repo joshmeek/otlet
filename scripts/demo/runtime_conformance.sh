@@ -34,7 +34,7 @@ VALUES
   ('native-malformed', 'malformed'),
   ('portable-malformed', 'malformed');
 
-CREATE VIEW public.otlet_runtime_conformance_snapshot AS
+CREATE VIEW public.otlet_runtime_conformance_snapshot WITH (security_invoker = true) AS
 SELECT
   source.subject_id,
   jsonb_build_object(

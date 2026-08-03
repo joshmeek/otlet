@@ -462,9 +462,15 @@ WITH table_grants AS (
           'portable_text_hash',
           'portable_json_hash',
           'identity_hash',
+          'identity_text_hash',
           'semantic_source_hash',
           'semantic_shaped_input',
-          'semantic_content_hash'
+          'semantic_content_hash',
+          'source_role_descriptor',
+          'source_relation_descriptor',
+          'source_function_descriptor',
+          'source_query_binding_descriptor',
+          'source_query_contract_error'
         )
     )::bigint AS unexpected_auditor_grants,
     count(*) FILTER (
@@ -475,9 +481,15 @@ WITH table_grants AS (
           'portable_text_hash',
           'portable_json_hash',
           'identity_hash',
+          'identity_text_hash',
           'semantic_source_hash',
           'semantic_shaped_input',
           'semantic_content_hash',
+          'source_role_descriptor',
+          'source_relation_descriptor',
+          'source_function_descriptor',
+          'source_query_binding_descriptor',
+          'source_query_contract_error',
           'approve_action',
           'reject_action',
           'label_action',
@@ -559,16 +571,16 @@ CROSS JOIN definer_status;
 SQL
 )"
 echo "permission_catalog_contract=$permission_catalog_contract"
-[ "$permission_catalog_contract" = "false|0|0|0|15|8|15|16|0|0|0|0|18|18|0|7|7|7|true" ] || {
+[ "$permission_catalog_contract" = "false|0|0|0|15|14|15|22|0|0|0|0|18|18|0|7|7|7|true" ] || {
   echo "Expected exact public, auditor, operator, and owner ACLs, got $permission_catalog_contract" >&2
   exit 1
 }
 
 source "$demo_dir/review_provenance.sh"
 
-permission_contract="public=0/0/0|auditor=15/8|operator=15/16|definer=18/18|portable=7/7/7|positive=7|denied=$permission_denied_count"
+permission_contract="public=0/0/0|auditor=15/14|operator=15/22|definer=18/18|portable=7/7/7|positive=7|denied=$permission_denied_count"
 echo "permission_contract=$permission_contract"
-[ "$permission_contract" = "public=0/0/0|auditor=15/8|operator=15/16|definer=18/18|portable=7/7/7|positive=7|denied=61" ] || {
+[ "$permission_contract" = "public=0/0/0|auditor=15/14|operator=15/22|definer=18/18|portable=7/7/7|positive=7|denied=61" ] || {
   echo "Expected complete permission contract, got $permission_contract" >&2
   exit 1
 }

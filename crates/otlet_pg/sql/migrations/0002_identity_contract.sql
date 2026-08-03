@@ -196,9 +196,12 @@ CREATE FUNCTION otlet.semantic_content_hash(
 LANGUAGE sql
 IMMUTABLE
 STRICT
-AS $$
-  SELECT otlet.identity_hash('semantic_content', otlet.semantic_shaped_input($1, $2));
-$$;
+BEGIN ATOMIC
+  SELECT otlet.identity_hash(
+    'semantic_content',
+    otlet.semantic_shaped_input(input, input_shaping)
+  );
+END;
 
 CREATE FUNCTION otlet.semantic_source_hash(input jsonb) RETURNS text
 LANGUAGE sql
@@ -215,19 +218,19 @@ CREATE FUNCTION otlet.semantic_project_row(
 ) RETURNS jsonb
 LANGUAGE sql
 IMMUTABLE
-AS $$
+BEGIN ATOMIC
   SELECT CASE
-    WHEN $2 IS NULL THEN COALESCE($1, '{}'::jsonb)
+    WHEN input_columns IS NULL THEN COALESCE(row_data, '{}'::jsonb)
     ELSE COALESCE(
       (
         SELECT jsonb_object_agg(key, value ORDER BY key)
-        FROM jsonb_each(COALESCE($1, '{}'::jsonb))
-        WHERE key = ANY($2)
+        FROM jsonb_each(COALESCE(row_data, '{}'::jsonb))
+        WHERE key = ANY(input_columns)
       ),
       '{}'::jsonb
     )
   END;
-$$;
+END;
 
 CREATE FUNCTION otlet.task_contract_hash(
   instruction text,

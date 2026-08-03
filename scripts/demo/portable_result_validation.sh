@@ -366,4 +366,8 @@ SQL
 cleanup_task "portable_validation_demo"
 cleanup_task "portable_unsupported_demo"
 cleanup_task "portable_stale_demo"
-psql_exec -qAt -c "DROP TABLE IF EXISTS public.otlet_demo_portable_source" >/dev/null
+psql_exec -qAt >/dev/null <<'SQL'
+DELETE FROM otlet.workload_revision_heads
+WHERE task_name = 'portable_stale_demo';
+DROP TABLE IF EXISTS public.otlet_demo_portable_source;
+SQL

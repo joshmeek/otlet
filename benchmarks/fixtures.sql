@@ -848,7 +848,7 @@ SELECT
   'review_flag'
 FROM generate_series(1, 4) AS n;
 
-CREATE VIEW otlet_bench_source.case_input AS
+CREATE VIEW otlet_bench_source.case_input WITH (security_invoker = true) AS
 SELECT
   p.pair_id AS subject_id,
   jsonb_build_object(
@@ -876,7 +876,7 @@ FROM otlet_bench_source.vendor_pair p
 JOIN otlet_bench_source.vendor_entity l ON l.id = p.left_id
 JOIN otlet_bench_source.vendor_entity r ON r.id = p.right_id;
 
-CREATE VIEW otlet_bench_source.triage_input AS
+CREATE VIEW otlet_bench_source.triage_input WITH (security_invoker = true) AS
 SELECT
   t.subject_id,
   jsonb_build_object(
@@ -893,7 +893,7 @@ SELECT
   ) AS input
 FROM otlet_bench_source.triage_case t;
 
-CREATE VIEW otlet_bench_source.numeric_evidence_input AS
+CREATE VIEW otlet_bench_source.numeric_evidence_input WITH (security_invoker = true) AS
 SELECT
   n.subject_id,
   jsonb_build_object(
@@ -912,7 +912,7 @@ SELECT
   ) AS input
 FROM otlet_bench_source.numeric_evidence_case n;
 
-CREATE VIEW otlet_bench_source.extraction_input AS
+CREATE VIEW otlet_bench_source.extraction_input WITH (security_invoker = true) AS
 SELECT
   e.subject_id,
   jsonb_build_object(
@@ -922,7 +922,7 @@ SELECT
   ) AS input
 FROM otlet_bench_source.extraction_case e;
 
-CREATE VIEW otlet_bench_source.policy_check_input AS
+CREATE VIEW otlet_bench_source.policy_check_input WITH (security_invoker = true) AS
 SELECT
   p.subject_id,
   jsonb_build_object(
@@ -1103,7 +1103,11 @@ $instruction$,
   input_shaping => '{"source_fields":["_otlet_mvcc","action_ids","candidate_evidence","evidence_counts"],"evidence_fields":["candidate_evidence"],"action_id_fields":{"left_id":"left_id","right_id":"right_id"}}'::jsonb,
   trigger_policy => '{"on_change":"mark_stale"}'::jsonb,
   action_types => ARRAY['merge_candidate', 'new_entity', 'review_flag'],
-  max_candidate_rows => 1000
+  max_candidate_rows => 1000,
+  pair_sources => '[
+    {"table":"otlet_bench_source.vendor_entity","subject_column":"id"},
+    {"table":"otlet_bench_source.vendor_pair","subject_column":"pair_id"}
+  ]'::jsonb
 );
 
 SELECT otlet.create_watch(

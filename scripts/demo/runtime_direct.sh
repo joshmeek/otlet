@@ -397,6 +397,8 @@ echo "input_shape_sql_contract=$input_shape_sql_contract"
 }
 
 psql_exec >/dev/null <<'SQL'
+DELETE FROM otlet.workload_revision_heads
+WHERE task_name = 'direct_decision_gate_demo';
 DROP TABLE IF EXISTS public.readme_vendor_note;
 DROP TABLE IF EXISTS public.otlet_demo_direct_gate;
 SQL

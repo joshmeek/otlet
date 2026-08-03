@@ -41,6 +41,11 @@ BEGIN
       semantic_join_refresh_inputs.index_name;
   END IF;
 
+  PERFORM otlet.require_workload_source_contract(
+    revision_definition #>> '{task,name}',
+    requested_revision_hash
+  );
+
   index_row.name := revision_definition #>> '{source,semantic_join_index_name}';
   index_row.task_name := revision_definition #>> '{task,name}';
   index_row.candidate_query := revision_definition #>> '{source,candidate_query}';
@@ -170,7 +175,8 @@ CREATE FUNCTION otlet.create_watch_pair_index(
   runtime_options jsonb DEFAULT '{}'::jsonb,
   max_candidate_rows integer DEFAULT 1000,
   input_shaping jsonb DEFAULT '{}'::jsonb,
-  decision_contract jsonb DEFAULT '{}'::jsonb
+  decision_contract jsonb DEFAULT '{}'::jsonb,
+  pair_sources jsonb DEFAULT '[]'::jsonb
 ) RETURNS otlet.semantic_join_indexes
 LANGUAGE plpgsql
 AS $$
@@ -179,7 +185,6 @@ DECLARE
   semantic_record_type text := COALESCE(record_type, index_name);
   semantic_task_name text := index_name || '_task';
   bounded_rows integer := GREATEST(1, LEAST(COALESCE(max_candidate_rows, 1000), 100000));
-  wrapped_query text;
   candidate_plan jsonb;
   candidate_plan_cost numeric;
 BEGIN
@@ -195,20 +200,16 @@ BEGIN
   INTO candidate_plan, candidate_plan_cost
   FROM otlet.preflight_candidate_query(candidate_query) preflight;
 
-  wrapped_query := format(
-    'SELECT subject_id, input FROM otlet.semantic_join_refresh_inputs(%L)',
-    index_name
-  );
-
   PERFORM otlet.create_task(
     semantic_task_name,
-    wrapped_query,
+    candidate_query,
     instruction,
     output_schema,
     model_name,
     runtime_options,
     input_shaping,
-    decision_contract
+    decision_contract,
+    pair_sources
   );
 
   INSERT INTO otlet.semantic_join_indexes (

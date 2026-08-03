@@ -719,7 +719,7 @@ BEGIN
     'format', 'otlet.workload.v1',
     'task', jsonb_build_object(
       'name', t.name,
-      'input_query', t.input_query,
+      'input_query', COALESCE(t.source_query_contract #>> '{query,resolved}', t.input_query),
       'instruction', t.instruction,
       'output_schema', t.output_schema,
       'runtime_options', t.runtime_options,
@@ -735,7 +735,13 @@ BEGIN
         'source_table', w.source_table,
         'subject_column', w.subject_column,
         'input_columns', to_jsonb(w.input_columns),
-        'candidate_query', w.candidate_query,
+        'candidate_query', CASE
+          WHEN w.kind = 'pair' THEN COALESCE(
+            t.source_query_contract #>> '{query,resolved}',
+            w.candidate_query
+          )
+          ELSE NULL
+        END,
         'pair_sources', w.pair_sources,
         'max_candidate_rows', w.max_candidate_rows,
         'record_type', w.record_type
@@ -757,13 +763,22 @@ BEGIN
       SELECT jsonb_build_object(
         'kind', 'pair',
         'semantic_join_index_name', sji.name,
-        'candidate_query', sji.candidate_query,
+        'candidate_query', COALESCE(
+          t.source_query_contract #>> '{query,resolved}',
+          sji.candidate_query
+        ),
         'max_candidate_rows', sji.max_candidate_rows,
         'record_type', sji.record_type
       )
       FROM otlet.semantic_join_indexes sji
       WHERE sji.task_name = t.name
-    ), 'null'::jsonb),
+    ), '{}'::jsonb)
+      || CASE WHEN t.source_relations IS NULL THEN '{}'::jsonb ELSE jsonb_build_object(
+        'declared_relations', t.source_relations
+      ) END
+      || CASE WHEN t.source_query_contract IS NULL THEN '{}'::jsonb ELSE jsonb_build_object(
+        'query_contract', t.source_query_contract
+      ) END,
     'prompt_builder', jsonb_build_object(
       'version', 'otlet_raw_json_worker_v1'
     ),
@@ -992,16 +1007,24 @@ LANGUAGE plpgsql
 AS $$
 DECLARE
   active_hash text;
+  active_definition jsonb;
 BEGIN
   PERFORM pg_advisory_xact_lock(
     hashtextextended('otlet_workload_revision:' || ensure_active_workload_revision.task_name, 0)
   );
 
-  SELECT head.active_workload_revision_hash
-  INTO active_hash
+  SELECT head.active_workload_revision_hash, revision.definition
+  INTO active_hash, active_definition
   FROM otlet.workload_revision_heads head
+  JOIN otlet.workload_revisions revision
+    ON revision.task_name = head.task_name
+   AND revision.workload_revision_hash = head.active_workload_revision_hash
   WHERE head.task_name = ensure_active_workload_revision.task_name;
   IF FOUND THEN
+    PERFORM otlet.source_query_contract_guard(
+      active_definition #> '{source,query_contract}',
+      true
+    );
     RETURN active_hash;
   END IF;
 
@@ -1027,6 +1050,7 @@ LANGUAGE plpgsql
 AS $$
 DECLARE
   active_hash text;
+  target_definition jsonb;
 BEGIN
   PERFORM 1
   FROM otlet.production_policy policy
@@ -1036,14 +1060,18 @@ BEGIN
     hashtextextended('otlet_workload_revision:' || promote_workload_revision.task_name, 0)
   );
 
-  IF NOT EXISTS (
-    SELECT 1
+  SELECT revision.definition
+  INTO target_definition
     FROM otlet.workload_revisions revision
     WHERE revision.task_name = promote_workload_revision.task_name
-      AND revision.workload_revision_hash = promote_workload_revision.target_workload_revision_hash
-  ) THEN
+      AND revision.workload_revision_hash = promote_workload_revision.target_workload_revision_hash;
+  IF NOT FOUND THEN
     RAISE EXCEPTION 'otlet workload revision does not belong to task %', promote_workload_revision.task_name;
   END IF;
+  PERFORM otlet.source_query_contract_guard(
+    target_definition #> '{source,query_contract}',
+    true
+  );
 
   SELECT head.active_workload_revision_hash
   INTO active_hash
@@ -1118,6 +1146,167 @@ BEGIN
     target_hash,
     active_hash
   );
+END;
+$$;
+
+CREATE FUNCTION otlet.repair_source_query_contract(
+  task_name text,
+  expected_active_workload_revision_hash text
+) RETURNS text
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  active_definition jsonb;
+  active_contract jsonb;
+  repaired_contract jsonb;
+  repaired_definition jsonb;
+  raw_search_path text := current_setting('search_path');
+  repaired_hash text;
+  repaired_relation regclass;
+  pair_source jsonb;
+  watch_row otlet.watches%ROWTYPE;
+BEGIN
+  PERFORM 1
+  FROM otlet.tasks task
+  WHERE task.name = repair_source_query_contract.task_name
+  FOR UPDATE;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'otlet task % does not exist', repair_source_query_contract.task_name;
+  END IF;
+  PERFORM 1
+  FROM otlet.production_policy policy
+  WHERE policy.name = 'default'
+  FOR UPDATE;
+  PERFORM pg_advisory_xact_lock(
+    hashtextextended('otlet_workload_revision:' || repair_source_query_contract.task_name, 0)
+  );
+
+  SELECT revision.definition
+  INTO active_definition
+  FROM otlet.workload_revision_heads head
+  JOIN otlet.workload_revisions revision
+    ON revision.task_name = head.task_name
+   AND revision.workload_revision_hash = head.active_workload_revision_hash
+  WHERE head.task_name = repair_source_query_contract.task_name
+    AND head.active_workload_revision_hash =
+      repair_source_query_contract.expected_active_workload_revision_hash
+  FOR UPDATE OF head;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'otlet source query repair conflict for task %',
+      repair_source_query_contract.task_name;
+  END IF;
+  active_contract := active_definition #> '{source,query_contract}';
+  IF active_contract IS NULL OR jsonb_typeof(active_contract) = 'null' THEN
+    RAISE EXCEPTION 'otlet task % has no source query contract',
+      repair_source_query_contract.task_name;
+  END IF;
+  IF current_user::regrole::oid IS DISTINCT FROM
+     (active_contract #>> '{identity,oid}')::oid THEN
+    RAISE EXCEPTION 'otlet source query repair requires the bound execution identity';
+  END IF;
+
+  PERFORM set_config(
+    'search_path',
+    active_contract #>> '{search_path,raw}',
+    true
+  );
+  repaired_contract := otlet.build_source_query_contract(
+    active_contract #>> '{query,raw}',
+    NULLIF(active_contract -> 'declared_sources', 'null'::jsonb)
+  );
+
+  UPDATE otlet.tasks task
+  SET source_relations = NULLIF(repaired_contract -> 'declared_sources', 'null'::jsonb),
+      source_query_contract = repaired_contract
+  WHERE task.name = repair_source_query_contract.task_name
+    AND task.input_query IS NOT DISTINCT FROM active_contract #>> '{query,raw}'
+    AND task.source_relations IS NOT DISTINCT FROM
+      NULLIF(active_contract -> 'declared_sources', 'null'::jsonb);
+
+  repaired_definition := jsonb_set(
+    active_definition,
+    '{task,input_query}',
+    to_jsonb(repaired_contract #>> '{query,resolved}')
+  );
+  repaired_definition := jsonb_set(
+    repaired_definition,
+    '{source,query_contract}',
+    repaired_contract
+  );
+  repaired_definition := jsonb_set(
+    repaired_definition,
+    '{source,declared_relations}',
+    COALESCE(repaired_contract -> 'declared_sources', 'null'::jsonb)
+  );
+  IF repaired_definition #>> '{source,kind}' = 'pair' THEN
+    repaired_definition := jsonb_set(
+      repaired_definition,
+      '{source,candidate_query}',
+      to_jsonb(repaired_contract #>> '{query,resolved}')
+    );
+  END IF;
+  PERFORM set_config('search_path', raw_search_path, true);
+
+  repaired_hash := otlet.identity_hash('workload_revision', repaired_definition);
+  INSERT INTO otlet.workload_revisions (
+    workload_revision_hash,
+    task_name,
+    definition
+  ) VALUES (
+    repaired_hash,
+    repair_source_query_contract.task_name,
+    repaired_definition
+  )
+  ON CONFLICT (workload_revision_hash) DO NOTHING;
+
+  repaired_hash := otlet.promote_workload_revision(
+    repair_source_query_contract.task_name,
+    repaired_hash,
+    repair_source_query_contract.expected_active_workload_revision_hash
+  );
+
+  SELECT watch.*
+  INTO watch_row
+  FROM otlet.watches watch
+  WHERE watch.task_name = repair_source_query_contract.task_name;
+
+  IF repaired_definition #>> '{source,kind}' = 'row' THEN
+    repaired_relation := to_regclass(repaired_definition #>> '{source,source_table}');
+    IF repaired_relation IS NULL THEN
+      RAISE EXCEPTION 'otlet repaired row source relation is missing for task %',
+        repair_source_query_contract.task_name;
+    END IF;
+    PERFORM otlet.watch_semantic_stale(
+      repaired_relation,
+      repaired_definition #>> '{source,subject_column}'
+    );
+    IF watch_row.name IS NOT NULL
+       AND COALESCE(watch_row.trigger_policy ->> 'on_change', 'mark_stale') =
+         'mark_stale_and_enqueue' THEN
+      PERFORM otlet.watch_semantic_change(
+        repaired_relation,
+        repaired_definition #>> '{source,subject_column}',
+        watch_row.name
+      );
+    END IF;
+  ELSIF repaired_definition #>> '{source,kind}' = 'pair'
+        AND watch_row.name IS NOT NULL THEN
+    FOR pair_source IN
+      SELECT value
+      FROM jsonb_array_elements(
+        COALESCE(repaired_definition #> '{source,pair_sources}', '[]'::jsonb)
+      ) source(value)
+    LOOP
+      PERFORM otlet.watch_semantic_stale(
+        (pair_source ->> 'table')::regclass,
+        COALESCE(NULLIF(pair_source ->> 'subject_column', ''), 'id')
+      );
+    END LOOP;
+  END IF;
+  RETURN repaired_hash;
+EXCEPTION WHEN OTHERS THEN
+  PERFORM set_config('search_path', raw_search_path, true);
+  RAISE;
 END;
 $$;
 

@@ -274,6 +274,34 @@ BEGIN
 END;
 $$;
 
+CREATE VIEW otlet.source_query_dependency_status AS
+SELECT
+  head.task_name,
+  head.active_workload_revision_hash AS workload_revision_hash,
+  revision.definition #> '{source,query_contract,query}' AS query_identity,
+  revision.definition #> '{source,query_contract,identity}' AS execution_identity,
+  revision.definition #> '{source,query_contract,search_path}' AS search_path_identity,
+  jsonb_array_length(COALESCE(
+    revision.definition #> '{source,query_contract,relations}',
+    '[]'::jsonb
+  ))::integer AS relation_dependencies,
+  jsonb_array_length(COALESCE(
+    revision.definition #> '{source,query_contract,functions}',
+    '[]'::jsonb
+  ))::integer AS function_dependencies,
+  CASE WHEN dependency.error IS NULL THEN 'ready' ELSE 'suspended' END AS dependency_status,
+  dependency.error AS dependency_error,
+  now() AS checked_at
+FROM otlet.workload_revision_heads head
+JOIN otlet.workload_revisions revision
+  ON revision.task_name = head.task_name
+ AND revision.workload_revision_hash = head.active_workload_revision_hash
+LEFT JOIN LATERAL (
+  SELECT otlet.source_query_contract_error(
+    revision.definition #> '{source,query_contract}'
+  ) AS error
+) dependency ON true;
+
 CREATE VIEW otlet.workload_revision_status AS
 SELECT
   task.name AS task_name,
@@ -281,6 +309,8 @@ SELECT
   head.previous_workload_revision_hash,
   configured.workload_revision_hash AS configured_workload_revision_hash,
   configured.workload_revision_hash IS DISTINCT FROM head.active_workload_revision_hash AS configured_drift,
+  CASE WHEN dependency.error IS NULL THEN 'ready' ELSE 'suspended' END AS source_dependency_status,
+  dependency.error AS source_dependency_error,
   head.promoted_at,
   active.created_at AS active_revision_created_at,
   COALESCE(materialization.fresh_materializations, 0)::bigint AS fresh_materializations,
@@ -292,6 +322,11 @@ LEFT JOIN otlet.workload_revision_heads head ON head.task_name = task.name
 LEFT JOIN otlet.workload_revisions active
   ON active.task_name = head.task_name
  AND active.workload_revision_hash = head.active_workload_revision_hash
+LEFT JOIN LATERAL (
+  SELECT otlet.source_query_contract_error(
+    active.definition #> '{source,query_contract}'
+  ) AS error
+) dependency ON true
 LEFT JOIN LATERAL (
   SELECT otlet.identity_hash(
     'workload_revision',
@@ -315,14 +350,20 @@ LEFT JOIN LATERAL (
   FROM otlet.jobs job
   WHERE job.task_name = task.name
     AND job.status = 'queued'
-    AND job.workload_revision_hash IS DISTINCT FROM head.active_workload_revision_hash
+    AND (
+      job.workload_revision_hash IS DISTINCT FROM head.active_workload_revision_hash
+      OR dependency.error IS NOT NULL
+    )
 ) queue ON true
 LEFT JOIN LATERAL (
   SELECT count(*)::bigint AS suspended_actions
   FROM otlet.actions action_row
   JOIN otlet.jobs job ON job.id = action_row.job_id
   WHERE job.task_name = task.name
-    AND job.workload_revision_hash IS DISTINCT FROM head.active_workload_revision_hash
+    AND (
+      job.workload_revision_hash IS DISTINCT FROM head.active_workload_revision_hash
+      OR dependency.error IS NOT NULL
+    )
     AND action_row.status <> 'applied'
 ) action ON true;
 
@@ -353,6 +394,9 @@ WITH watch_sources AS (
     join_index.candidate_plan,
     join_index.candidate_plan_cost,
     join_index.candidate_preflight_at,
+    otlet.source_query_contract_error(
+      revision.definition #> '{source,query_contract}'
+    ) AS source_dependency_error,
     COALESCE(w.stale_policy, 'refresh_then_fail_closed') AS stale_policy,
     COALESCE(w.trigger_policy, '{"on_change":"mark_stale"}'::jsonb) AS trigger_policy,
     COALESCE(w.selection_policy, '{}'::jsonb) AS selection_policy
@@ -372,6 +416,7 @@ WITH watch_sources AS (
     SELECT *
     FROM watch_sources
     WHERE kind = 'row'
+      AND source_dependency_error IS NULL
   ) w
   JOIN LATERAL otlet.semantic_index_plan(w.semantic_index_name) p ON true
   UNION ALL
@@ -380,6 +425,7 @@ WITH watch_sources AS (
     SELECT *
     FROM watch_sources
     WHERE kind = 'pair'
+      AND source_dependency_error IS NULL
   ) w
   JOIN LATERAL otlet.semantic_join_index_plan(w.semantic_join_index_name) p ON true
 ), watch_revisions AS (
@@ -458,6 +504,8 @@ SELECT
   w.stale_policy,
   w.trigger_policy,
   w.selection_policy,
+  CASE WHEN w.source_dependency_error IS NULL THEN 'ready' ELSE 'suspended' END AS source_dependency_status,
+  w.source_dependency_error,
   COALESCE(plan.total_subjects, 0)::bigint AS total_subjects,
   COALESCE(plan.fresh_subjects, 0)::bigint AS fresh_subjects,
   COALESCE(plan.stale_subjects, 0)::bigint AS stale_subjects,
@@ -465,8 +513,8 @@ SELECT
   COALESCE(plan.inflight_subjects, 0)::bigint AS inflight_subjects,
   COALESCE(plan.queue_subjects, 0)::bigint AS queue_subjects,
   COALESCE(plan.fail_closed_subjects, 0)::bigint AS fail_closed_subjects,
-  plan.selected_path,
-  plan.reason,
+  CASE WHEN w.source_dependency_error IS NULL THEN plan.selected_path ELSE 'suspended' END AS selected_path,
+  COALESCE(w.source_dependency_error, plan.reason) AS reason,
   COALESCE(plan.stale_reasons, '{}'::jsonb) AS stale_reasons,
   COALESCE(plan.freshness, 0)::numeric AS freshness,
   COALESCE(plan.worker_queue_depth, 0)::bigint AS worker_queue_depth,

@@ -14,8 +14,8 @@ DECLARE
   current_input jsonb;
 BEGIN
   IF current_task_subject_content_hash.workload_revision_hash IS NULL THEN
-    SELECT t.name, t.input_shaping, t.input_query
-    INTO task_row.name, task_row.input_shaping, task_row.input_query
+    SELECT t.name, t.input_shaping, t.input_query, t.source_query_contract
+    INTO task_row.name, task_row.input_shaping, task_row.input_query, task_row.source_query_contract
     FROM otlet.tasks t
     WHERE t.name = current_task_subject_content_hash.task_name;
   ELSE
@@ -24,6 +24,11 @@ BEGIN
     FROM otlet.workload_revisions revision
     WHERE revision.task_name = current_task_subject_content_hash.task_name
       AND revision.workload_revision_hash = current_task_subject_content_hash.workload_revision_hash;
+
+    PERFORM otlet.source_query_contract_guard(
+      revision_definition #> '{source,query_contract}',
+      true
+    );
 
     task_row.name := revision_definition #>> '{task,name}';
     task_row.input_shaping := revision_definition #> '{task,input_shaping}';
@@ -48,6 +53,10 @@ BEGIN
 
   IF task_row.name IS NULL THEN
     RETURN NULL;
+  END IF;
+
+  IF current_task_subject_content_hash.workload_revision_hash IS NULL THEN
+    PERFORM otlet.source_query_contract_guard(task_row.source_query_contract, true);
   END IF;
 
   IF current_task_subject_content_hash.workload_revision_hash IS NULL

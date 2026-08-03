@@ -35,7 +35,7 @@ VALUES
   ('vendor-1001:vendor-77', 'vendor-1001', 'vendor-77'),
   ('vendor-1001:vendor-313', 'vendor-1001', 'vendor-313'),
   ('vendor-1001:vendor-314', 'vendor-1001', 'vendor-314');
-CREATE VIEW public.otlet_demo_vendor_pair_input AS
+CREATE VIEW public.otlet_demo_vendor_pair_input WITH (security_invoker = true) AS
 SELECT
   p.pair_id AS subject_id,
   jsonb_build_object(
