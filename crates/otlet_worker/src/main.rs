@@ -7,7 +7,7 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{
-    Arc,
+    Arc, Mutex, TryLockError,
     atomic::{AtomicBool, AtomicU8, Ordering},
 };
 use std::thread::{self, JoinHandle};
@@ -17,6 +17,14 @@ const CONTEXT_TOKENS: u32 = 4096;
 const BATCH_TOKENS: usize = 512;
 const UBATCH_TOKENS: u32 = 128;
 const MAX_TOKEN_PIECE_BYTES: usize = 16 * 1024;
+const MAX_PSQL_REQUEST_BYTES: usize = 128 * 1024 * 1024;
+const MAX_PSQL_STDOUT_BYTES: usize = 64 * 1024 * 1024;
+const MAX_PSQL_STDERR_BYTES: usize = 64 * 1024;
+const MAX_PSQL_RESULT_BYTES: usize = 32 * 1024 * 1024;
+const PSQL_CONNECT_TIMEOUT_SECONDS: &str = "5";
+const PSQL_QUERY_TIMEOUT: Duration = Duration::from_secs(30);
+const PSQL_TERMINAL_TIMEOUT: Duration = Duration::from_secs(30);
+const PSQL_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const LOAD_POLICY: &str = "eager_single_resident_model";
 const DEVICE_POLICY: &str = "cpu_only_n_gpu_layers_0";
 const RSS_POLICY: &str = "linux_proc_status_vmrss_fail_closed";
@@ -61,6 +69,7 @@ struct Config {
     worker_id: String,
     protocol_version: i32,
     runtime_identity_hash: String,
+    incarnation_nonce: Option<String>,
     model_name: String,
     model_path: PathBuf,
     model_sha256: String,
@@ -101,11 +110,12 @@ impl Config {
             .clamp(100, 60_000);
 
         Ok(Self {
-            database_url: env_required("OTLET_DATABASE_URL")?,
+            database_url: passwordless_database_url(env_required("OTLET_DATABASE_URL")?)?,
             psql: std::env::var("OTLET_PSQL").unwrap_or_else(|_| "psql".to_owned()),
             worker_id: env_required("OTLET_PORTABLE_WORKER_ID")?,
             protocol_version,
             runtime_identity_hash,
+            incarnation_nonce: None,
             model_name: env_required("OTLET_MODEL_NAME")?,
             model_path: PathBuf::from(env_required("OTLET_MODEL_PATH")?),
             model_sha256,
@@ -223,56 +233,169 @@ fn bounded_runtime_integer(
 struct Database {
     url: String,
     psql: String,
+    child: Arc<Mutex<()>>,
 }
 
 impl Database {
     fn query(&self, sql: &str) -> Result<Vec<String>, String> {
-        let mut child = Command::new(&self.psql)
+        self.query_until(sql, Instant::now() + PSQL_QUERY_TIMEOUT)
+    }
+
+    fn command(&self) -> Command {
+        let mut command = Command::new(&self.psql);
+        command
             .args([
                 "--no-psqlrc",
+                "--no-password",
                 "--quiet",
                 "--tuples-only",
                 "--no-align",
                 "--set",
                 "ON_ERROR_STOP=1",
-                "--dbname",
-                &self.url,
             ])
+            .arg("--dbname")
+            .arg(&self.url)
+            .env("PGCONNECT_TIMEOUT", PSQL_CONNECT_TIMEOUT_SECONDS);
+        command
+    }
+
+    fn query_until(&self, sql: &str, deadline: Instant) -> Result<Vec<String>, String> {
+        if sql.len() > MAX_PSQL_REQUEST_BYTES {
+            return Err(coded(
+                "database_request_too_large",
+                "database request exceeds the portable byte limit",
+            ));
+        }
+        let _child = loop {
+            match self.child.try_lock() {
+                Ok(child) => break child,
+                Err(TryLockError::WouldBlock) => {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        return Err(database_request_timeout());
+                    }
+                    thread::sleep(PSQL_POLL_INTERVAL.min(remaining));
+                }
+                Err(TryLockError::Poisoned(_)) => {
+                    return Err(coded(
+                        "database_child_unavailable",
+                        "database child process lock is poisoned",
+                    ));
+                }
+            }
+        };
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(database_request_timeout());
+        }
+        let statement_timeout_ms = u64::try_from(remaining.as_millis())
+            .unwrap_or(u64::MAX)
+            .max(1);
+        let prefix = format!(
+            "SET statement_timeout = {statement_timeout_ms};\nSET lock_timeout = {statement_timeout_ms};\n"
+        );
+        if prefix.len().saturating_add(sql.len()) > MAX_PSQL_REQUEST_BYTES {
+            return Err(coded(
+                "database_request_too_large",
+                "database request exceeds the portable byte limit",
+            ));
+        }
+
+        let mut child = self
+            .command()
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
             .map_err(|err| format!("could not start psql: {err}"))?;
-        child
-            .stdin
-            .as_mut()
-            .ok_or("psql stdin is unavailable")?
-            .write_all(sql.as_bytes())
-            .map_err(|err| format!("could not write psql request: {err}"))?;
-        let output = child
-            .wait_with_output()
-            .map_err(|err| format!("could not wait for psql: {err}"))?;
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
+        let Some(mut stdin) = child.stdin.take() else {
+            kill_and_reap(&mut child);
+            return Err("psql stdin is unavailable".to_owned());
+        };
+        let Some(stdout) = child.stdout.take() else {
+            kill_and_reap(&mut child);
+            return Err("psql stdout is unavailable".to_owned());
+        };
+        let Some(stderr) = child.stderr.take() else {
+            kill_and_reap(&mut child);
+            return Err("psql stderr is unavailable".to_owned());
+        };
+
+        let (status, written, stdout, stderr, timed_out) = thread::scope(|scope| {
+            let writer = scope.spawn(move || {
+                stdin
+                    .write_all(prefix.as_bytes())
+                    .and_then(|()| stdin.write_all(sql.as_bytes()))
+                    .map_err(|err| format!("could not write psql request: {err}"))
+            });
+            let stdout_reader =
+                scope.spawn(move || read_bounded(stdout, MAX_PSQL_STDOUT_BYTES, "stdout"));
+            let stderr_reader =
+                scope.spawn(move || read_bounded(stderr, MAX_PSQL_STDERR_BYTES, "stderr"));
+            let mut timed_out = false;
+            let status = loop {
+                match child.try_wait() {
+                    Ok(Some(status)) => break Ok(status),
+                    Ok(None) => {
+                        let remaining = deadline.saturating_duration_since(Instant::now());
+                        if remaining.is_zero() {
+                            timed_out = true;
+                            let _ = child.kill();
+                            break child
+                                .wait()
+                                .map_err(|err| format!("could not reap psql: {err}"));
+                        }
+                        thread::sleep(PSQL_POLL_INTERVAL.min(remaining));
+                    }
+                    Err(err) => {
+                        kill_and_reap(&mut child);
+                        break Err(format!("could not wait for psql: {err}"));
+                    }
+                }
+            };
+            (
+                status,
+                writer
+                    .join()
+                    .map_err(|_| "psql stdin writer panicked".to_owned())
+                    .and_then(|result| result),
+                stdout_reader
+                    .join()
+                    .map_err(|_| "psql stdout reader panicked".to_owned())
+                    .and_then(|result| result),
+                stderr_reader
+                    .join()
+                    .map_err(|_| "psql stderr reader panicked".to_owned())
+                    .and_then(|result| result),
+                timed_out,
+            )
+        });
+        if timed_out || Instant::now() >= deadline {
+            return Err(database_request_timeout());
+        }
+        let status = status?;
+        let stdout = stdout?;
+        let stderr = stderr?;
+        if !status.success() {
+            let stderr = String::from_utf8_lossy(&stderr);
             let message = stderr.lines().next().unwrap_or("database request failed");
             return Err(format!("psql failed: {}", truncate(message, 512)));
         }
-        let stdout = String::from_utf8(output.stdout)
-            .map_err(|_| "psql returned non-UTF-8 output".to_owned())?;
-        Ok(stdout
-            .lines()
-            .map(str::trim)
-            .filter(|line| !line.is_empty())
-            .map(str::to_owned)
-            .collect())
+        written?;
+        parse_rows(stdout, MAX_PSQL_RESULT_BYTES)
     }
 
     fn terminal_query(&self, sql: &str) -> Result<Vec<String>, String> {
+        let deadline = Instant::now() + PSQL_TERMINAL_TIMEOUT;
         for attempt in 0..3 {
-            match self.query(sql) {
+            match self.query_until(sql, deadline) {
                 Ok(rows) => return Ok(rows),
                 Err(error) if attempt < 2 && is_connection_error(&error) => {
-                    std::thread::sleep(Duration::from_millis(200));
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        return Err(database_request_timeout());
+                    }
+                    thread::sleep(Duration::from_millis(200).min(remaining));
                 }
                 Err(error) => return Err(error),
             }
@@ -289,11 +412,16 @@ impl Database {
     ) -> Result<String, String> {
         let model_status = model_status.map_or_else(|| "NULL".to_owned(), sql_text);
         let error_code = error_code.map_or_else(|| "NULL".to_owned(), sql_text);
+        let incarnation_nonce = config
+            .incarnation_nonce
+            .as_deref()
+            .map_or_else(|| "NULL".to_owned(), sql_text);
         let sql = format!(
-            "SELECT desired_state, registered_model_name, registered_model_artifact_hash, registered_model_artifact_bytes FROM otlet.portable_worker_heartbeat({}, {}, {}, {}, {}, {});\n",
+            "SELECT desired_state, registered_model_name, registered_model_artifact_hash, registered_model_artifact_bytes FROM otlet.portable_worker_heartbeat({}, {}, {}, {}, {}, {}, {});\n",
             sql_text(&config.worker_id),
             config.protocol_version,
             sql_text(&config.runtime_identity_hash),
+            incarnation_nonce,
             sql_text(state),
             model_status,
             error_code
@@ -321,44 +449,60 @@ impl Database {
                         "portable heartbeat returned an invalid row",
                     ));
                 };
-                if model_name != config.model_name {
-                    return Err(coded(
-                        "model_not_allowlisted",
-                        "portable worker is registered for another model",
-                    ));
-                }
-                if artifact_hash != config.model_sha256 {
-                    return Err(coded(
-                        "model_hash_mismatch",
-                        "portable worker model hash does not match its registration",
-                    ));
-                }
-                let artifact_bytes = artifact_bytes.parse::<u64>().map_err(|_| {
-                    coded(
-                        "database_contract_invalid",
-                        "portable heartbeat returned invalid model bytes",
-                    )
-                })?;
-                let local_bytes = std::fs::metadata(&config.model_path)
-                    .map_err(|_| {
-                        coded(
-                            "model_artifact_unreadable",
-                            "local GGUF metadata is unavailable",
-                        )
-                    })?
-                    .len();
-                if artifact_bytes != local_bytes {
-                    return Err(coded(
-                        "model_artifact_size_mismatch",
-                        "portable worker model bytes do not match its registration",
-                    ));
-                }
+                validate_registered_model(config, model_name, artifact_hash, artifact_bytes)?;
                 Ok(state.to_owned())
             }
-            _ => Err(format!(
-                "portable heartbeat returned unexpected state: {rows:?}"
+            _ => Err(coded(
+                "database_contract_invalid",
+                "portable heartbeat returned an unexpected row count",
             )),
         }
+    }
+
+    fn start(&self, config: &Config) -> Result<(String, String), String> {
+        let sql = format!(
+            "SELECT incarnation_nonce, desired_state, registered_model_name, registered_model_artifact_hash, registered_model_artifact_bytes FROM otlet.portable_start_worker({}, {}, {});\n",
+            sql_text(&config.worker_id),
+            config.protocol_version,
+            sql_text(&config.runtime_identity_hash)
+        );
+        let rows = self.query(&sql)?;
+        let [row] = rows.as_slice() else {
+            return Err(coded(
+                "database_contract_invalid",
+                "portable start returned an unexpected row count",
+            ));
+        };
+        let mut fields = row.split('|');
+        let (
+            Some(incarnation_nonce),
+            Some(state),
+            Some(model_name),
+            Some(artifact_hash),
+            Some(artifact_bytes),
+            None,
+        ) = (
+            fields.next(),
+            fields.next(),
+            fields.next(),
+            fields.next(),
+            fields.next(),
+            fields.next(),
+        )
+        else {
+            return Err(coded(
+                "database_contract_invalid",
+                "portable start returned an invalid row",
+            ));
+        };
+        if !is_uuid(incarnation_nonce) {
+            return Err(coded(
+                "database_contract_invalid",
+                "portable start returned an invalid incarnation nonce",
+            ));
+        }
+        validate_registered_model(config, model_name, artifact_hash, artifact_bytes)?;
+        Ok((incarnation_nonce.to_owned(), state.to_owned()))
     }
 
     fn preflight_contract(&self, config: &Config) -> Result<(), String> {
@@ -372,7 +516,7 @@ impl Database {
                JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace \
                WHERE n.nspname = 'otlet' \
                  AND p.proname IN (\
-                   'portable_claim_jobs', 'portable_renew_job', 'portable_record_attempt', \
+                   'portable_start_worker', 'portable_claim_jobs', 'portable_renew_job', 'portable_record_attempt', \
                    'portable_complete_job', 'portable_fail_job', 'portable_cancel_job', \
                    'portable_worker_heartbeat'\
                  )\
@@ -386,7 +530,7 @@ impl Database {
             config.protocol_version
         );
         match self.query(&sql)?.as_slice() {
-            [row] if row == "7|7|7|7|1" => Ok(()),
+            [row] if row == "8|8|8|8|1" => Ok(()),
             [row] if row.ends_with("|0") => Err(coded(
                 "protocol_incompatible",
                 "portable protocol version is not active",
@@ -422,10 +566,11 @@ impl Database {
                'model', c.model, \
                'evidence_limits', c.evidence_limits\
              )::text \
-             FROM otlet.portable_claim_jobs({}, {}, {}, {}, {}, 1) c;\n",
+             FROM otlet.portable_claim_jobs({}, {}, {}, {}, {}, {}, 1) c;\n",
             sql_text(&config.worker_id),
             config.protocol_version,
             sql_text(&config.runtime_identity_hash),
+            sql_text(required_incarnation_nonce(config)?),
             claim_rss_bytes,
             default_llama_threads
         );
@@ -435,16 +580,23 @@ impl Database {
             .collect()
     }
 
-    fn renew(&self, config: &Config, job_id: i64, claim_token: &str) -> Result<String, String> {
+    fn renew(
+        &self,
+        config: &Config,
+        job_id: i64,
+        claim_token: &str,
+        timeout: Duration,
+    ) -> Result<String, String> {
         let sql = format!(
-            "SELECT job_status FROM otlet.portable_renew_job({}, {}, {}, {}, {});\n",
+            "SELECT job_status FROM otlet.portable_renew_job({}, {}, {}, {}, {}, {});\n",
             sql_text(&config.worker_id),
             config.protocol_version,
             sql_text(&config.runtime_identity_hash),
+            sql_text(required_incarnation_nonce(config)?),
             job_id,
             sql_text(claim_token)
         );
-        let rows = self.query(&sql)?;
+        let rows = self.query_until(&sql, Instant::now() + timeout)?;
         match rows.as_slice() {
             [state] if state == "running" || state == "cancel_requested" => Ok(state.clone()),
             _ => Err(format!(
@@ -465,12 +617,13 @@ impl Database {
         let sql = format!(
             "SELECT job_status \
              FROM otlet.portable_complete_job(\
-               {}, {}, {}, {}, {}, {}::jsonb, {}, {}::jsonb, \
+               {}, {}, {}, {}, {}, {}, {}::jsonb, {}, {}::jsonb, \
                prompt_hash => {}, trace_summary => {}::jsonb\
              );\n",
             sql_text(&config.worker_id),
             config.protocol_version,
             sql_text(&config.runtime_identity_hash),
+            sql_text(required_incarnation_nonce(config)?),
             claim.job_id,
             sql_text(&claim.claim_token),
             sql_text(&output.to_string()),
@@ -530,7 +683,7 @@ impl Database {
         let sql = format!(
             "SELECT job_status \
              FROM otlet.portable_fail_job(\
-               {}, {}, {}, {}, {}, {}, raw_output => {}, \
+               {}, {}, {}, {}, {}, {}, {}, raw_output => {}, \
                prompt_hash => {}, schema_validation_status => 'failed', \
                trace_summary => {}::jsonb, selection_reason => {}, \
                candidate_output => {}\
@@ -538,6 +691,7 @@ impl Database {
             sql_text(&config.worker_id),
             config.protocol_version,
             sql_text(&config.runtime_identity_hash),
+            sql_text(required_incarnation_nonce(config)?),
             claim.job_id,
             sql_text(&claim.claim_token),
             sql_text(error),
@@ -560,10 +714,11 @@ impl Database {
 
     fn cancel(&self, config: &Config, claim: &Claim) -> Result<(), String> {
         let sql = format!(
-            "SELECT job_status FROM otlet.portable_cancel_job({}, {}, {}, {}, {}, 'canceled before portable inference');\n",
+            "SELECT job_status FROM otlet.portable_cancel_job({}, {}, {}, {}, {}, {}, 'canceled before portable inference');\n",
             sql_text(&config.worker_id),
             config.protocol_version,
             sql_text(&config.runtime_identity_hash),
+            sql_text(required_incarnation_nonce(config)?),
             claim.job_id,
             sql_text(&claim.claim_token)
         );
@@ -575,6 +730,105 @@ impl Database {
         }
         Ok(())
     }
+}
+
+fn database_request_timeout() -> String {
+    coded(
+        "database_request_timeout",
+        "database request exceeded its deadline",
+    )
+}
+
+fn kill_and_reap(child: &mut std::process::Child) {
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+fn read_bounded(reader: impl Read, limit: usize, stream: &str) -> Result<Vec<u8>, String> {
+    let mut bytes = Vec::new();
+    reader
+        .take(u64::try_from(limit).unwrap_or(u64::MAX).saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|err| format!("could not read psql {stream}: {err}"))?;
+    if bytes.len() > limit {
+        return Err(coded(
+            &format!("database_{stream}_too_large"),
+            &format!("psql {stream} exceeds the portable byte limit"),
+        ));
+    }
+    Ok(bytes)
+}
+
+fn parse_rows(stdout: Vec<u8>, limit: usize) -> Result<Vec<String>, String> {
+    let stdout =
+        String::from_utf8(stdout).map_err(|_| "psql returned non-UTF-8 output".to_owned())?;
+    let mut result_bytes = 0_usize;
+    let mut rows = Vec::new();
+    for row in stdout
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+    {
+        result_bytes = result_bytes.saturating_add(row.len());
+        if result_bytes > limit {
+            return Err(coded(
+                "database_result_too_large",
+                "database result exceeds the portable byte limit",
+            ));
+        }
+        rows.push(row.to_owned());
+    }
+    Ok(rows)
+}
+
+fn required_incarnation_nonce(config: &Config) -> Result<&str, String> {
+    config.incarnation_nonce.as_deref().ok_or_else(|| {
+        coded(
+            "worker_not_started",
+            "portable worker incarnation has not started",
+        )
+    })
+}
+
+fn validate_registered_model(
+    config: &Config,
+    model_name: &str,
+    artifact_hash: &str,
+    artifact_bytes: &str,
+) -> Result<(), String> {
+    if model_name != config.model_name {
+        return Err(coded(
+            "model_not_allowlisted",
+            "portable worker is registered for another model",
+        ));
+    }
+    if artifact_hash != config.model_sha256 {
+        return Err(coded(
+            "model_hash_mismatch",
+            "portable worker model hash does not match its registration",
+        ));
+    }
+    let artifact_bytes = artifact_bytes.parse::<u64>().map_err(|_| {
+        coded(
+            "database_contract_invalid",
+            "portable worker returned invalid model bytes",
+        )
+    })?;
+    let local_bytes = std::fs::metadata(&config.model_path)
+        .map_err(|_| {
+            coded(
+                "model_artifact_unreadable",
+                "local GGUF metadata is unavailable",
+            )
+        })?
+        .len();
+    if artifact_bytes != local_bytes {
+        return Err(coded(
+            "model_artifact_size_mismatch",
+            "portable worker model bytes do not match its registration",
+        ));
+    }
+    Ok(())
 }
 
 struct LocalModel {
@@ -993,7 +1247,12 @@ impl LeaseGuard {
                 if thread_signal.state() == CLAIM_TIMED_OUT {
                     break;
                 }
-                match database.renew(&config, job_id, &claim_token) {
+                let renew_timeout = PSQL_QUERY_TIMEOUT.min(thread_signal.remaining());
+                if renew_timeout.is_zero() {
+                    thread_signal.set(CLAIM_TIMED_OUT);
+                    break;
+                }
+                match database.renew(&config, job_id, &claim_token, renew_timeout) {
                     Ok(state) if state == "cancel_requested" => {
                         thread_signal.set(CLAIM_CANCELED);
                         log_job(
@@ -1007,8 +1266,12 @@ impl LeaseGuard {
                     }
                     Ok(_) => {}
                     Err(error) => {
-                        let timeout = error.contains("portable attempt deadline expired");
-                        thread_signal.set(if timeout { CLAIM_TIMED_OUT } else { CLAIM_LOST });
+                        if error.contains("portable attempt deadline expired") {
+                            thread_signal.set(CLAIM_TIMED_OUT);
+                        } else {
+                            thread_signal.set(CLAIM_LOST);
+                        }
+                        let timeout = thread_signal.state() == CLAIM_TIMED_OUT;
                         log_job(
                             if timeout {
                                 "job_attempt_timed_out"
@@ -1657,22 +1920,24 @@ fn main() {
 }
 
 fn run() -> Result<(), String> {
-    let config = Config::from_env()?;
+    let mut config = Config::from_env()?;
     let database = Database {
         url: config.database_url.clone(),
         psql: config.psql.clone(),
+        child: Arc::new(Mutex::new(())),
     };
     let mut database_unavailable = false;
-    let desired =
-        deployment_preflight_until_available(&database, &config, &mut database_unavailable)?;
-    if desired == "draining" {
-        database.heartbeat(&config, "drained", Some("verified"), None)?;
-        log_worker("worker_drained", &config, None);
-        return Ok(());
-    }
+    deployment_preflight_until_available(&database, &config, &mut database_unavailable)?;
     log_preflight(&config);
     if config.preflight_only {
         database.heartbeat(&config, "stopped", Some("verified"), None)?;
+        return Ok(());
+    }
+    let (incarnation_nonce, desired) = database.start(&config)?;
+    config.incarnation_nonce = Some(incarnation_nonce);
+    if desired == "draining" {
+        database.heartbeat(&config, "drained", Some("verified"), None)?;
+        log_worker("worker_drained", &config, None);
         return Ok(());
     }
     heartbeat_until_available(
@@ -1936,6 +2201,74 @@ fn env_required(name: &str) -> Result<String, String> {
     std::env::var(name).map_err(|_| format!("{name} is required"))
 }
 
+fn passwordless_database_url(url: String) -> Result<String, String> {
+    let Some(rest) = url
+        .strip_prefix("postgresql://")
+        .or_else(|| url.strip_prefix("postgres://"))
+    else {
+        return Err("OTLET_DATABASE_URL must be a PostgreSQL URI".to_owned());
+    };
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    if rest[..authority_end]
+        .rsplit_once('@')
+        .is_some_and(|(userinfo, _)| userinfo.contains(':'))
+    {
+        return Err(
+            "OTLET_DATABASE_URL must not contain a password; use a libpq credential source"
+                .to_owned(),
+        );
+    }
+    if let Some(query) = url.split_once('?').map(|(_, query)| query) {
+        for parameter in query.split('#').next().unwrap_or(query).split('&') {
+            let name = parameter
+                .split_once('=')
+                .map_or(parameter, |(name, _)| name);
+            let Some(name) = percent_decode(name) else {
+                continue;
+            };
+            if name.eq_ignore_ascii_case(b"password") || name.eq_ignore_ascii_case(b"sslpassword") {
+                return Err(
+                    "OTLET_DATABASE_URL must not contain a password; use a libpq credential source"
+                        .to_owned(),
+                );
+            }
+            if name.eq_ignore_ascii_case(b"connect_timeout") {
+                return Err(
+                    "OTLET_DATABASE_URL must not set connect_timeout; the worker fixes it at 5 seconds"
+                        .to_owned(),
+                );
+            }
+        }
+    }
+    Ok(url)
+}
+
+fn percent_decode(value: &str) -> Option<Vec<u8>> {
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            decoded
+                .push(hex_value(*bytes.get(index + 1)?)? * 16 + hex_value(*bytes.get(index + 2)?)?);
+            index += 3;
+        } else {
+            decoded.push(bytes[index]);
+            index += 1;
+        }
+    }
+    Some(decoded)
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
 fn env_bool(name: &str) -> Option<bool> {
     match std::env::var(name).ok()?.as_str() {
         "1" | "true" | "on" | "yes" => Some(true),
@@ -1965,6 +2298,17 @@ fn is_sha256(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn is_uuid(value: &str) -> bool {
+    value.len() == 36
+        && value.bytes().enumerate().all(|(index, byte)| {
+            if matches!(index, 8 | 13 | 18 | 23) {
+                byte == b'-'
+            } else {
+                byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)
+            }
+        })
 }
 
 fn is_identity_hash(value: &str) -> bool {
@@ -2008,8 +2352,12 @@ fn parse_claim(line: &str, attempt_start: Instant, claim_rss_bytes: u64) -> Resu
 fn is_connection_error(error: &str) -> bool {
     let error = error.to_ascii_lowercase();
     [
+        "otlet_error:database_request_timeout:",
+        "canceling statement due to lock timeout",
+        "canceling statement due to statement timeout",
         "connection refused",
         "connection timed out",
+        "timeout expired",
         "could not connect to server",
         "could not translate host name",
         "server closed the connection unexpectedly",
@@ -2024,10 +2372,12 @@ fn is_connection_error(error: &str) -> bool {
 
 fn is_claim_loss(error: &str) -> bool {
     let error = error.to_ascii_lowercase();
-    error.contains("claim is stale")
+    error.contains("otlet_error:claim_lost:")
+        || error.contains("claim is stale")
         || error.contains("claim token")
         || error.contains("belongs to another worker")
         || error.contains("identity is not authorized")
+        || error.contains("incarnation")
 }
 
 fn coded(code: &str, message: &str) -> String {
@@ -2075,6 +2425,78 @@ fn truncate(value: &str, limit: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Cursor;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+    use std::sync::{Barrier, atomic::AtomicU64};
+
+    static TEST_DIRECTORY_ID: AtomicU64 = AtomicU64::new(0);
+
+    struct TestDirectory(PathBuf);
+
+    impl TestDirectory {
+        fn new() -> Self {
+            let id = TEST_DIRECTORY_ID.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "otlet-worker-test-{}-{}-{id}",
+                std::process::id(),
+                timestamp_ms()
+            ));
+            std::fs::create_dir(&path).expect("test directory should be created");
+            Self(path)
+        }
+
+        fn path(&self, name: &str) -> PathBuf {
+            self.0.join(name)
+        }
+
+        #[cfg(unix)]
+        fn script(&self, body: &str) -> PathBuf {
+            let path = self.path("psql");
+            std::fs::write(&path, format!("#!/bin/sh\n{body}\n"))
+                .expect("fake psql should be written");
+            let mut permissions = std::fs::metadata(&path)
+                .expect("fake psql metadata should exist")
+                .permissions();
+            permissions.set_mode(0o700);
+            std::fs::set_permissions(&path, permissions).expect("fake psql should be executable");
+            path
+        }
+    }
+
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn test_database(psql: PathBuf, url: &str) -> Database {
+        Database {
+            url: url.to_owned(),
+            psql: psql.to_string_lossy().into_owned(),
+            child: Arc::new(Mutex::new(())),
+        }
+    }
+
+    fn test_config(model_path: PathBuf) -> Config {
+        Config {
+            database_url: "postgresql://worker@database/app".to_owned(),
+            psql: "psql".to_owned(),
+            worker_id: "worker".to_owned(),
+            protocol_version: 1,
+            runtime_identity_hash: "a".repeat(64),
+            incarnation_nonce: None,
+            model_name: "model".to_owned(),
+            model_path,
+            model_sha256: "b".repeat(64),
+            poll_interval: Duration::from_secs(1),
+            renew_interval: Duration::from_secs(1),
+            once: true,
+            preflight_only: false,
+            require_tls: false,
+            runtime_dir: std::env::temp_dir(),
+        }
+    }
 
     #[test]
     fn json_completion_handles_split_escapes() {
@@ -2096,6 +2518,201 @@ mod tests {
         let error = "psql failed: connection to server failed: Connection refused";
         assert!(is_connection_error(error));
         assert_eq!(error_code(error), "database_unavailable");
+        assert_eq!(
+            error_code("psql failed: connection to server failed: timeout expired"),
+            "database_unavailable"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn psql_uses_passwordless_url_and_fixed_connect_timeout() {
+        let directory = TestDirectory::new();
+        let psql = directory.script(
+            r#"
+[ "$PGCONNECT_TIMEOUT" = "5" ] || exit 92
+case " $* " in
+  *" --no-password "*) ;;
+  *) exit 93 ;;
+esac
+cat >/dev/null
+printf 'ok\n'
+"#,
+        );
+        let url = "postgresql://worker@database/app";
+        let database = test_database(psql, url);
+        assert_eq!(database.query("SELECT 1;\n"), Ok(vec!["ok".to_owned()]));
+        let command = database.command();
+        assert!(
+            command
+                .get_args()
+                .any(|argument| argument.to_string_lossy() == url)
+        );
+    }
+
+    #[test]
+    fn database_url_rejects_embedded_passwords() {
+        assert!(passwordless_database_url("postgresql://worker@database/app".to_owned()).is_ok());
+        for url in [
+            "postgresql://worker:secret@database/app",
+            "postgresql://worker@database/app?password=secret",
+            "postgresql://worker@database/app?pass%77ord=secret",
+            "postgresql://worker@database/app?sslpassword=secret",
+            "postgresql://worker@database/app?sslpass%77ord=secret",
+            "postgresql://worker@database/app?connect_timeout=3",
+            "postgresql://worker@database/app?connect%5ftimeout=3",
+        ] {
+            assert!(passwordless_database_url(url.to_owned()).is_err());
+        }
+    }
+
+    #[test]
+    fn psql_stream_and_result_limits_fail_at_limit_plus_one() {
+        assert_eq!(
+            read_bounded(Cursor::new(b"abc"), 3, "stdout"),
+            Ok(b"abc".to_vec())
+        );
+        let stdout_error = read_bounded(Cursor::new(b"abcd"), 3, "stdout")
+            .expect_err("oversized stdout should fail");
+        assert_eq!(error_code(&stdout_error), "database_stdout_too_large");
+        let stderr_error = read_bounded(Cursor::new(b"abcd"), 3, "stderr")
+            .expect_err("oversized stderr should fail");
+        assert_eq!(error_code(&stderr_error), "database_stderr_too_large");
+        assert_eq!(
+            parse_rows(b"a\nbc\n".to_vec(), 3),
+            Ok(vec!["a".to_owned(), "bc".to_owned()])
+        );
+        let result_error =
+            parse_rows(b"a\nbc\n".to_vec(), 2).expect_err("oversized result should fail");
+        assert_eq!(error_code(&result_error), "database_result_too_large");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stuck_psql_is_killed_and_reaped_at_the_deadline() {
+        let directory = TestDirectory::new();
+        let pid_path = directory.path("pid");
+        let psql = directory.script(&format!(
+            "printf '%s\\n' \"$$\" > '{}'\ncat >/dev/null\nwhile :; do :; done",
+            pid_path.display()
+        ));
+        let database = test_database(psql, "postgresql://worker@database/app");
+        let error = database
+            .query_until("SELECT 1;\n", Instant::now() + Duration::from_millis(500))
+            .expect_err("stuck psql should time out");
+        assert_eq!(error_code(&error), "database_request_timeout");
+        let pid = std::fs::read_to_string(pid_path)
+            .expect("fake psql should record its pid")
+            .trim()
+            .to_owned();
+        let running = Command::new("kill")
+            .args(["-0", &pid])
+            .stderr(Stdio::null())
+            .status()
+            .expect("kill probe should run")
+            .success();
+        assert!(!running, "timed-out psql should be reaped");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn database_clones_share_one_child_slot() {
+        let directory = TestDirectory::new();
+        let lock_path = directory.path("child-lock");
+        let overlap_path = directory.path("overlap");
+        let psql = directory.script(&format!(
+            "cat >/dev/null\nif mkdir '{}'; then\n  sleep 0.1\n  rmdir '{}'\n  printf 'ok\\n'\nelse\n  : > '{}'\n  exit 94\nfi",
+            lock_path.display(),
+            lock_path.display(),
+            overlap_path.display()
+        ));
+        let database = test_database(psql, "postgresql://worker@database/app");
+        let barrier = Arc::new(Barrier::new(3));
+        let handles: Vec<_> = (0..2)
+            .map(|_| {
+                let database = database.clone();
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    barrier.wait();
+                    database.query_until("SELECT 1;\n", Instant::now() + Duration::from_secs(2))
+                })
+            })
+            .collect();
+        barrier.wait();
+        for handle in handles {
+            assert_eq!(
+                handle.join().expect("database query thread should join"),
+                Ok(vec!["ok".to_owned()])
+            );
+        }
+        assert!(!overlap_path.exists(), "psql children should not overlap");
+    }
+
+    #[test]
+    fn bounded_rpc_timeout_and_incarnation_errors_are_classified() {
+        let timeout = database_request_timeout();
+        assert!(is_connection_error(&timeout));
+        assert_eq!(error_code(&timeout), "database_request_timeout");
+        assert!(is_claim_loss(
+            "psql failed: otlet portable worker incarnation is fenced"
+        ));
+        assert_eq!(
+            error_code("psql failed: otlet portable worker incarnation is fenced"),
+            "claim_lost"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn incarnation_rpc_sql_uses_null_before_start_and_nonce_after_start() {
+        let directory = TestDirectory::new();
+        let capture_path = directory.path("requests");
+        let model_path = directory.path("model.gguf");
+        std::fs::write(&model_path, b"model").expect("test model should be written");
+        let nonce = "123e4567-e89b-12d3-a456-426614174000";
+        let model_hash = "b".repeat(64);
+        let psql = directory.script(&format!(
+            r#"
+request="$(cat)"
+printf '%s\n--request--\n' "$request" >> '{}'
+case "$request" in
+  *portable_start_worker*) printf '{}|running|model|{}|5\n' ;;
+  *portable_worker_heartbeat*) printf 'running|model|{}|5\n' ;;
+  *) exit 95 ;;
+esac
+"#,
+            capture_path.display(),
+            nonce,
+            model_hash,
+            model_hash
+        ));
+        let database = test_database(psql, "postgresql://worker@database/app");
+        let mut config = test_config(model_path);
+        assert_eq!(
+            database.heartbeat(&config, "starting", Some("verifying"), None),
+            Ok("running".to_owned())
+        );
+        let (started_nonce, desired) = database.start(&config).expect("start should pass");
+        assert_eq!(started_nonce, nonce);
+        assert_eq!(desired, "running");
+        config.incarnation_nonce = Some(started_nonce);
+        assert_eq!(
+            database.heartbeat(&config, "idle", Some("ready"), None),
+            Ok("running".to_owned())
+        );
+        let requests = std::fs::read_to_string(capture_path)
+            .expect("captured psql requests should be readable");
+        let worker = sql_text(&config.worker_id);
+        let runtime = sql_text(&config.runtime_identity_hash);
+        assert!(requests.contains(&format!(
+            "portable_worker_heartbeat({worker}, 1, {runtime}, NULL,"
+        )));
+        assert!(requests.contains(&format!("portable_start_worker({worker}, 1, {runtime})")));
+        assert!(requests.contains(&format!(
+            "portable_worker_heartbeat({worker}, 1, {runtime}, {},",
+            sql_text(nonce)
+        )));
+        assert!(!requests.contains(nonce));
     }
 
     #[test]

@@ -36,6 +36,9 @@ CREATE TABLE otlet.portable_workers (
     runtime_identity_hash ~ '^[0-9a-f]{64}$'
     AND runtime_identity_hash = otlet.portable_json_hash(runtime_identity)
   ),
+  incarnation_nonce_hash text CHECK (
+    incarnation_nonce_hash IS NULL OR incarnation_nonce_hash ~ '^[0-9a-f]{64}$'
+  ),
   enabled boolean NOT NULL DEFAULT true,
   desired_state text NOT NULL DEFAULT 'running' CHECK (
     desired_state IN ('running', 'paused', 'draining')
@@ -71,6 +74,7 @@ CREATE TABLE otlet.portable_claims (
   worker_id text NOT NULL REFERENCES otlet.portable_workers(worker_id),
   protocol_version integer NOT NULL,
   runtime_identity_hash text NOT NULL,
+  incarnation_nonce_hash text NOT NULL CHECK (incarnation_nonce_hash ~ '^[0-9a-f]{64}$'),
   attempt_index integer NOT NULL CHECK (attempt_index > 0),
   selection_role text NOT NULL CHECK (selection_role IN ('direct', 'cheap', 'strong')),
   claim_token_hash text NOT NULL UNIQUE CHECK (claim_token_hash ~ '^[0-9a-f]{64}$'),
@@ -204,6 +208,7 @@ BEGIN
       runtime_version = EXCLUDED.runtime_version,
       runtime_identity = EXCLUDED.runtime_identity,
       runtime_identity_hash = EXCLUDED.runtime_identity_hash,
+      incarnation_nonce_hash = NULL,
       enabled = true,
       desired_state = 'running',
       reported_state = 'registered',
@@ -214,6 +219,12 @@ BEGIN
       process_started_at = NULL,
       updated_at = now()
   RETURNING * INTO saved_worker;
+
+  UPDATE otlet.portable_claims c
+  SET status = 'replaced',
+      finished_at = COALESCE(c.finished_at, now())
+  WHERE c.worker_id = saved_worker.worker_id
+    AND c.status IN ('claimed', 'renewed');
 
   RETURN saved_worker;
 END;
@@ -257,7 +268,7 @@ BEGIN
 END;
 $$;
 
-CREATE FUNCTION otlet.authorized_portable_worker(
+CREATE FUNCTION otlet.registered_portable_worker(
   worker_id text,
   protocol_version integer,
   runtime_identity_hash text
@@ -271,11 +282,11 @@ DECLARE
 BEGIN
   PERFORM 1
   FROM otlet.portable_protocol_versions p
-  WHERE p.protocol_version = authorized_portable_worker.protocol_version
+  WHERE p.protocol_version = registered_portable_worker.protocol_version
     AND p.status = 'active';
   IF NOT FOUND THEN
     RAISE EXCEPTION 'otlet portable protocol version % is incompatible',
-      authorized_portable_worker.protocol_version;
+      registered_portable_worker.protocol_version;
   END IF;
 
   IF role_setting IS NULL OR role_setting = 'none' THEN
@@ -293,14 +304,98 @@ BEGIN
   SELECT w.*
   INTO worker_row
   FROM otlet.portable_workers w
-  WHERE w.worker_id = authorized_portable_worker.worker_id
-    AND w.protocol_version = authorized_portable_worker.protocol_version
-    AND w.runtime_identity_hash = authorized_portable_worker.runtime_identity_hash
+  WHERE w.worker_id = registered_portable_worker.worker_id
+    AND w.protocol_version = registered_portable_worker.protocol_version
+    AND w.runtime_identity_hash = registered_portable_worker.runtime_identity_hash
     AND w.database_role_oid = invoker_role_oid
     AND w.enabled
   FOR UPDATE;
   IF NOT FOUND THEN
     RAISE EXCEPTION 'otlet portable worker identity is not authorized';
+  END IF;
+
+  RETURN worker_row;
+END;
+$$;
+
+CREATE FUNCTION otlet.portable_start_worker(
+  requested_worker_id text,
+  requested_protocol_version integer,
+  requested_runtime_identity_hash text
+) RETURNS TABLE (
+  incarnation_nonce text,
+  desired_state text,
+  registered_model_name text,
+  registered_model_artifact_hash text,
+  registered_model_artifact_bytes bigint
+)
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, otlet, pg_temp
+AS $$
+DECLARE
+  raw_nonce text := gen_random_uuid()::text;
+  worker_row otlet.portable_workers%ROWTYPE;
+BEGIN
+  worker_row := otlet.registered_portable_worker(
+    portable_start_worker.requested_worker_id,
+    portable_start_worker.requested_protocol_version,
+    portable_start_worker.requested_runtime_identity_hash
+  );
+
+  UPDATE otlet.portable_claims c
+  SET status = 'replaced',
+      finished_at = COALESCE(c.finished_at, now())
+  WHERE c.worker_id = worker_row.worker_id
+    AND c.status IN ('claimed', 'renewed');
+
+  UPDATE otlet.portable_workers w
+  SET incarnation_nonce_hash = otlet.portable_text_hash(raw_nonce),
+      reported_state = 'starting',
+      model_status = 'unverified',
+      last_error_code = NULL,
+      last_seen_at = now(),
+      last_heartbeat_at = NULL,
+      current_rss_bytes = NULL,
+      process_started_at = clock_timestamp(),
+      updated_at = now()
+  WHERE w.worker_id = worker_row.worker_id
+  RETURNING * INTO worker_row;
+
+  incarnation_nonce := raw_nonce;
+  desired_state := worker_row.desired_state;
+  registered_model_name := worker_row.model_name;
+  registered_model_artifact_hash := worker_row.model_artifact_hash;
+  registered_model_artifact_bytes := worker_row.model_artifact_bytes;
+  RETURN NEXT;
+END;
+$$;
+
+CREATE FUNCTION otlet.authorized_portable_worker(
+  worker_id text,
+  protocol_version integer,
+  runtime_identity_hash text,
+  incarnation_nonce text
+) RETURNS otlet.portable_workers
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  worker_row otlet.portable_workers%ROWTYPE;
+BEGIN
+  IF authorized_portable_worker.incarnation_nonce IS NULL
+     OR authorized_portable_worker.incarnation_nonce !~
+       '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' THEN
+    RAISE EXCEPTION 'otlet portable worker incarnation is not authorized';
+  END IF;
+
+  worker_row := otlet.registered_portable_worker(
+    authorized_portable_worker.worker_id,
+    authorized_portable_worker.protocol_version,
+    authorized_portable_worker.runtime_identity_hash
+  );
+  IF worker_row.incarnation_nonce_hash IS DISTINCT FROM
+       otlet.portable_text_hash(authorized_portable_worker.incarnation_nonce) THEN
+    RAISE EXCEPTION 'otlet portable worker incarnation is not authorized';
   END IF;
 
   UPDATE otlet.portable_workers w
@@ -314,6 +409,7 @@ $$;
 
 CREATE FUNCTION otlet.authorized_portable_claim(
   worker_id text,
+  incarnation_nonce_hash text,
   job_id bigint,
   claim_token text
 ) RETURNS otlet.portable_claims
@@ -326,6 +422,7 @@ BEGIN
   INTO claim_row
   FROM otlet.portable_claims c
   WHERE c.worker_id = authorized_portable_claim.worker_id
+    AND c.incarnation_nonce_hash = authorized_portable_claim.incarnation_nonce_hash
     AND c.job_id = authorized_portable_claim.job_id
     AND c.claim_token_hash = otlet.portable_text_hash(authorized_portable_claim.claim_token)
     AND c.status <> 'replaced'
@@ -348,6 +445,7 @@ LANGUAGE plpgsql
 AS $$
 DECLARE
   existing_claim_id bigint;
+  stored_incarnation_nonce_hash text;
   stored_runtime_options_status jsonb;
 BEGIN
   IF link_portable_receipt.receipt_id IS NULL THEN
@@ -366,8 +464,8 @@ BEGIN
     VALUES (link_portable_receipt.receipt_id, link_portable_receipt.claim_id);
   END IF;
 
-  SELECT c.runtime_options_status
-  INTO stored_runtime_options_status
+  SELECT c.incarnation_nonce_hash, c.runtime_options_status
+  INTO stored_incarnation_nonce_hash, stored_runtime_options_status
   FROM otlet.portable_claims c
   WHERE c.id = link_portable_receipt.claim_id;
   IF NOT FOUND THEN
@@ -375,6 +473,7 @@ BEGIN
   END IF;
   UPDATE otlet.inference_receipts r
   SET trace_summary = r.trace_summary || jsonb_build_object(
+    'worker_incarnation_nonce_hash', stored_incarnation_nonce_hash,
     'runtime_options_status',
     stored_runtime_options_status
   )
@@ -389,6 +488,7 @@ CREATE FUNCTION otlet.portable_worker_heartbeat(
   requested_worker_id text,
   requested_protocol_version integer,
   requested_runtime_identity_hash text,
+  requested_incarnation_nonce text,
   reported_state text,
   model_status text DEFAULT NULL,
   error_code text DEFAULT NULL
@@ -420,10 +520,26 @@ BEGIN
      AND portable_worker_heartbeat.error_code !~ '^[a-z0-9][a-z0-9_.-]{0,127}$' THEN
     RAISE EXCEPTION 'otlet portable worker error code is invalid';
   END IF;
+
+  IF portable_worker_heartbeat.requested_incarnation_nonce IS NULL THEN
+    worker_row := otlet.registered_portable_worker(
+      portable_worker_heartbeat.requested_worker_id,
+      portable_worker_heartbeat.requested_protocol_version,
+      portable_worker_heartbeat.requested_runtime_identity_hash
+    );
+    desired_state := worker_row.desired_state;
+    registered_model_name := worker_row.model_name;
+    registered_model_artifact_hash := worker_row.model_artifact_hash;
+    registered_model_artifact_bytes := worker_row.model_artifact_bytes;
+    RETURN NEXT;
+    RETURN;
+  END IF;
+
   worker_row := otlet.authorized_portable_worker(
     portable_worker_heartbeat.requested_worker_id,
     portable_worker_heartbeat.requested_protocol_version,
-    portable_worker_heartbeat.requested_runtime_identity_hash
+    portable_worker_heartbeat.requested_runtime_identity_hash,
+    portable_worker_heartbeat.requested_incarnation_nonce
   );
   UPDATE otlet.portable_workers w
   SET reported_state = portable_worker_heartbeat.reported_state,
@@ -455,6 +571,7 @@ CREATE FUNCTION otlet.portable_claim_jobs(
   requested_worker_id text,
   requested_protocol_version integer,
   requested_runtime_identity_hash text,
+  requested_incarnation_nonce text,
   requested_current_rss_bytes bigint,
   requested_default_llama_threads integer,
   requested_claim_limit integer DEFAULT NULL
@@ -510,7 +627,8 @@ BEGIN
   worker_row := otlet.authorized_portable_worker(
     portable_claim_jobs.requested_worker_id,
     portable_claim_jobs.requested_protocol_version,
-    portable_claim_jobs.requested_runtime_identity_hash
+    portable_claim_jobs.requested_runtime_identity_hash,
+    portable_claim_jobs.requested_incarnation_nonce
   );
   IF worker_row.desired_state <> 'running' THEN
     RETURN;
@@ -575,6 +693,7 @@ BEGIN
       worker_id,
       protocol_version,
       runtime_identity_hash,
+      incarnation_nonce_hash,
       attempt_index,
       selection_role,
       claim_token_hash,
@@ -587,6 +706,7 @@ BEGIN
       worker_row.worker_id,
       worker_row.protocol_version,
       worker_row.runtime_identity_hash,
+      worker_row.incarnation_nonce_hash,
       claimed_job.attempts,
       claim_selection_role,
       otlet.portable_text_hash(claimed_job.claim_token),
@@ -649,6 +769,7 @@ CREATE FUNCTION otlet.portable_renew_job(
   requested_worker_id text,
   requested_protocol_version integer,
   requested_runtime_identity_hash text,
+  requested_incarnation_nonce text,
   requested_job_id bigint,
   requested_claim_token text
 ) RETURNS TABLE (job_status text, leased_until timestamptz)
@@ -664,10 +785,12 @@ BEGIN
   worker_row := otlet.authorized_portable_worker(
     portable_renew_job.requested_worker_id,
     portable_renew_job.requested_protocol_version,
-    portable_renew_job.requested_runtime_identity_hash
+    portable_renew_job.requested_runtime_identity_hash,
+    portable_renew_job.requested_incarnation_nonce
   );
   claim_row := otlet.authorized_portable_claim(
     worker_row.worker_id,
+    worker_row.incarnation_nonce_hash,
     portable_renew_job.requested_job_id,
     portable_renew_job.requested_claim_token
   );
@@ -710,6 +833,7 @@ CREATE FUNCTION otlet.portable_record_attempt(
   requested_worker_id text,
   requested_protocol_version integer,
   requested_runtime_identity_hash text,
+  requested_incarnation_nonce text,
   requested_job_id bigint,
   requested_claim_token text,
   selection_status text,
@@ -742,10 +866,12 @@ BEGIN
   worker_row := otlet.authorized_portable_worker(
     portable_record_attempt.requested_worker_id,
     portable_record_attempt.requested_protocol_version,
-    portable_record_attempt.requested_runtime_identity_hash
+    portable_record_attempt.requested_runtime_identity_hash,
+    portable_record_attempt.requested_incarnation_nonce
   );
   claim_row := otlet.authorized_portable_claim(
     worker_row.worker_id,
+    worker_row.incarnation_nonce_hash,
     portable_record_attempt.requested_job_id,
     portable_record_attempt.requested_claim_token
   );
@@ -973,6 +1099,7 @@ CREATE FUNCTION otlet.portable_complete_job(
   requested_worker_id text,
   requested_protocol_version integer,
   requested_runtime_identity_hash text,
+  requested_incarnation_nonce text,
   requested_job_id bigint,
   requested_claim_token text,
   output jsonb,
@@ -1006,10 +1133,12 @@ BEGIN
   worker_row := otlet.authorized_portable_worker(
     portable_complete_job.requested_worker_id,
     portable_complete_job.requested_protocol_version,
-    portable_complete_job.requested_runtime_identity_hash
+    portable_complete_job.requested_runtime_identity_hash,
+    portable_complete_job.requested_incarnation_nonce
   );
   claim_row := otlet.authorized_portable_claim(
     worker_row.worker_id,
+    worker_row.incarnation_nonce_hash,
     portable_complete_job.requested_job_id,
     portable_complete_job.requested_claim_token
   );
@@ -1137,6 +1266,7 @@ CREATE FUNCTION otlet.portable_fail_job(
   requested_worker_id text,
   requested_protocol_version integer,
   requested_runtime_identity_hash text,
+  requested_incarnation_nonce text,
   requested_job_id bigint,
   requested_claim_token text,
   error text,
@@ -1165,10 +1295,12 @@ BEGIN
   worker_row := otlet.authorized_portable_worker(
     portable_fail_job.requested_worker_id,
     portable_fail_job.requested_protocol_version,
-    portable_fail_job.requested_runtime_identity_hash
+    portable_fail_job.requested_runtime_identity_hash,
+    portable_fail_job.requested_incarnation_nonce
   );
   claim_row := otlet.authorized_portable_claim(
     worker_row.worker_id,
+    worker_row.incarnation_nonce_hash,
     portable_fail_job.requested_job_id,
     portable_fail_job.requested_claim_token
   );
@@ -1264,6 +1396,7 @@ CREATE FUNCTION otlet.portable_cancel_job(
   requested_worker_id text,
   requested_protocol_version integer,
   requested_runtime_identity_hash text,
+  requested_incarnation_nonce text,
   requested_job_id bigint,
   requested_claim_token text,
   reason text DEFAULT 'canceled'
@@ -1279,10 +1412,12 @@ BEGIN
   worker_row := otlet.authorized_portable_worker(
     portable_cancel_job.requested_worker_id,
     portable_cancel_job.requested_protocol_version,
-    portable_cancel_job.requested_runtime_identity_hash
+    portable_cancel_job.requested_runtime_identity_hash,
+    portable_cancel_job.requested_incarnation_nonce
   );
   claim_row := otlet.authorized_portable_claim(
     worker_row.worker_id,
+    worker_row.incarnation_nonce_hash,
     portable_cancel_job.requested_job_id,
     portable_cancel_job.requested_claim_token
   );
@@ -1335,6 +1470,7 @@ SELECT
   w.runtime_name,
   w.runtime_version,
   w.runtime_identity_hash,
+  w.incarnation_nonce_hash,
   w.runtime_identity -> 'runtime_contract' AS runtime_contract,
   w.enabled,
   w.desired_state,
@@ -1406,6 +1542,7 @@ GROUP BY
   w.runtime_name,
   w.runtime_version,
   w.runtime_identity_hash,
+  w.incarnation_nonce_hash,
   w.runtime_identity,
   w.enabled,
   w.desired_state,
@@ -1428,6 +1565,7 @@ SELECT
   c.worker_id,
   c.protocol_version,
   c.runtime_identity_hash,
+  c.incarnation_nonce_hash,
   c.attempt_index,
   c.selection_role,
   c.runtime_options_status,
@@ -1467,6 +1605,7 @@ SELECT
   c.worker_id,
   c.protocol_version,
   c.runtime_identity_hash,
+  c.incarnation_nonce_hash,
   c.runtime_options_status,
   r.attempt_index,
   r.status AS receipt_status,
@@ -1476,6 +1615,7 @@ SELECT
   r.model_name,
   r.runtime_name,
   r.runtime_endpoint,
+  r.trace_summary ->> 'worker_incarnation_nonce_hash' AS receipt_incarnation_nonce_hash,
   r.trace_summary -> 'runtime_options_status' AS receipt_runtime_options_status,
   r.finished_at,
   l.linked_at

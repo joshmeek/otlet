@@ -99,6 +99,32 @@ SELECT pg_catalog.set_config(
   (SELECT runtime_identity_hash FROM otlet.portable_workers WHERE worker_id = 'revision-strong-worker'),
   true
 ) \g /dev/null
+SET LOCAL ROLE otlet_revision_cheap_worker;
+SELECT pg_catalog.set_config(
+  'otlet.revision_cheap_incarnation',
+  started.incarnation_nonce,
+  true
+)
+FROM otlet.portable_start_worker(
+  'revision-cheap-worker',
+  1,
+  pg_catalog.current_setting('otlet.revision_cheap_identity')
+) started
+\g /dev/null
+RESET ROLE;
+SET LOCAL ROLE otlet_revision_strong_worker;
+SELECT pg_catalog.set_config(
+  'otlet.revision_strong_incarnation',
+  started.incarnation_nonce,
+  true
+)
+FROM otlet.portable_start_worker(
+  'revision-strong-worker',
+  1,
+  pg_catalog.current_setting('otlet.revision_strong_identity')
+) started
+\g /dev/null
+RESET ROLE;
 
 SELECT otlet.register_model(
   'revision_cheap',
@@ -209,6 +235,7 @@ FROM otlet.portable_claim_jobs(
   'revision-cheap-worker',
   1,
   pg_catalog.current_setting('otlet.revision_cheap_identity'),
+  pg_catalog.current_setting('otlet.revision_cheap_incarnation'),
   1048576,
   6,
   1
@@ -219,6 +246,7 @@ FROM otlet.portable_complete_job(
   'revision-cheap-worker',
   1,
   pg_catalog.current_setting('otlet.revision_cheap_identity'),
+  pg_catalog.current_setting('otlet.revision_cheap_incarnation'),
   (SELECT job_id FROM cheap_claim),
   (SELECT claim_token FROM cheap_claim),
   '{"old":"a","confidence":"low"}'::jsonb,
@@ -234,6 +262,7 @@ FROM otlet.portable_claim_jobs(
   'revision-strong-worker',
   1,
   pg_catalog.current_setting('otlet.revision_strong_identity'),
+  pg_catalog.current_setting('otlet.revision_strong_incarnation'),
   1048576,
   6,
   1
@@ -244,6 +273,7 @@ FROM otlet.portable_complete_job(
   'revision-strong-worker',
   1,
   pg_catalog.current_setting('otlet.revision_strong_identity'),
+  pg_catalog.current_setting('otlet.revision_strong_incarnation'),
   (SELECT job_id FROM strong_claim),
   (SELECT claim_token FROM strong_claim),
   '{"old":"a","confidence":"high"}'::jsonb,
@@ -265,6 +295,7 @@ FROM otlet.portable_claim_jobs(
   'revision-cheap-worker',
   1,
   pg_catalog.current_setting('otlet.revision_cheap_identity'),
+  pg_catalog.current_setting('otlet.revision_cheap_incarnation'),
   1048576,
   6,
   1
@@ -283,6 +314,7 @@ FROM otlet.portable_complete_job(
   'revision-cheap-worker',
   1,
   pg_catalog.current_setting('otlet.revision_cheap_identity'),
+  pg_catalog.current_setting('otlet.revision_cheap_incarnation'),
   (SELECT job_id FROM inactive_cheap_claim),
   (SELECT claim_token FROM inactive_cheap_claim),
   '{"old":"a","confidence":"low"}'::jsonb,

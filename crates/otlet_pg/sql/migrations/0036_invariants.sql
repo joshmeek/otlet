@@ -561,16 +561,20 @@ BEGIN
     jsonb_build_object(
       'job_id', c.job_id,
       'worker_id', c.worker_id,
+      'claim_incarnation_nonce_hash', c.incarnation_nonce_hash,
+      'worker_incarnation_nonce_hash', w.incarnation_nonce_hash,
       'claim_status', c.status,
       'job_status', j.status
     )
   FROM otlet.portable_claims c
   JOIN otlet.jobs j ON j.id = c.job_id
+  JOIN otlet.portable_workers w ON w.worker_id = c.worker_id
   WHERE c.status IN ('claimed', 'renewed')
     AND (
       j.status NOT IN ('running', 'cancel_requested')
       OR j.claim_token IS NULL
       OR c.claim_token_hash IS DISTINCT FROM otlet.portable_text_hash(j.claim_token)
+      OR c.incarnation_nonce_hash IS DISTINCT FROM w.incarnation_nonce_hash
     );
 
   RETURN QUERY
@@ -598,6 +602,9 @@ BEGIN
       'claim_id', c.id,
       'claim_job_id', c.job_id,
       'receipt_job_id', r.job_id,
+      'claim_incarnation_nonce_hash', c.incarnation_nonce_hash,
+      'receipt_incarnation_nonce_hash',
+        r.trace_summary ->> 'worker_incarnation_nonce_hash',
       'runtime_name', r.runtime_name,
       'runtime_endpoint', r.runtime_endpoint
     )
@@ -606,6 +613,8 @@ BEGIN
   JOIN otlet.inference_receipts r ON r.id = l.receipt_id
   WHERE r.job_id IS DISTINCT FROM c.job_id
      OR r.workload_revision_hash IS DISTINCT FROM c.workload_revision_hash
+     OR r.trace_summary ->> 'worker_incarnation_nonce_hash'
+       IS DISTINCT FROM c.incarnation_nonce_hash
      OR r.runtime_name NOT LIKE 'portable:%'
      OR r.runtime_endpoint IS DISTINCT FROM 'postgres_rpc';
 

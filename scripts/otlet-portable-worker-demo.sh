@@ -61,6 +61,7 @@ start_recovery_worker() {
     --user 10001:10001 \
     --entrypoint /target/release/otlet_worker \
     -e "OTLET_DATABASE_URL=$external_database_url" \
+    -e "PGPASSWORD=$worker_password" \
     -e "OTLET_PORTABLE_WORKER_ID=$worker_id" \
     -e OTLET_PORTABLE_PROTOCOL_VERSION=1 \
     -e "OTLET_PORTABLE_RUNTIME_IDENTITY_HASH=$runtime_identity_hash" \
@@ -145,15 +146,17 @@ SQL
 run_worker_once_for() {
   local active_worker_id="$1"
   local active_database_url="$2"
-  local active_model_name="$3"
-  local active_model_artifact="$4"
-  local active_model_sha256="$5"
-  local expected_event="$6"
-  local renew_ms="${7:-1000}"
+  local active_database_password="$3"
+  local active_model_name="$4"
+  local active_model_artifact="$5"
+  local active_model_sha256="$6"
+  local expected_event="$7"
+  local renew_ms="${8:-1000}"
 
   : >"$worker_log"
   if ! docker exec \
     -e "OTLET_DATABASE_URL=$active_database_url" \
+    -e "PGPASSWORD=$active_database_password" \
     -e "OTLET_PORTABLE_WORKER_ID=$active_worker_id" \
     -e OTLET_PORTABLE_PROTOCOL_VERSION=1 \
     -e "OTLET_PORTABLE_RUNTIME_IDENTITY_HASH=$runtime_identity_hash" \
@@ -180,6 +183,7 @@ run_worker_once() {
   run_worker_once_for \
     "$worker_id" \
     "$worker_database_url" \
+    "$worker_password" \
     "$model_name" \
     "$model_artifact" \
     "$model_sha256" \
@@ -520,8 +524,8 @@ WHERE worker_id = :'worker_id';
 SQL
 )"
 
-worker_database_url="postgresql://${worker_role}:${worker_password}@127.0.0.1:5432/${portable_database}"
-cheap_worker_database_url="postgresql://${cheap_worker_role}:${cheap_worker_password}@127.0.0.1:5432/${portable_database}"
+worker_database_url="postgresql://${worker_role}@127.0.0.1:5432/${portable_database}"
+cheap_worker_database_url="postgresql://${cheap_worker_role}@127.0.0.1:5432/${portable_database}"
 run_worker_once
 
 contract="$(
@@ -753,6 +757,7 @@ fi
 run_worker_once_for \
   "$worker_id" \
   "$worker_database_url" \
+  "$worker_password" \
   "$model_name" \
   "$model_artifact" \
   "$model_sha256" \
@@ -797,6 +802,7 @@ echo "portable_deadline_contract=$portable_deadline_contract"
 run_worker_once_for \
   "$cheap_worker_id" \
   "$cheap_worker_database_url" \
+  "$cheap_worker_password" \
   "$cheap_model_name" \
   "$cheap_model_artifact" \
   "$cheap_model_sha256" \
@@ -886,6 +892,7 @@ SQL
 run_worker_once_for \
   "$cheap_worker_id" \
   "$cheap_worker_database_url" \
+  "$cheap_worker_password" \
   "$cheap_model_name" \
   "$cheap_model_artifact" \
   "$cheap_model_sha256" \
@@ -935,6 +942,18 @@ claim_metadata_contract="$(
     "$container" \
     psql -h 127.0.0.1 -U "$cheap_worker_role" -d "$portable_database" \
     -X -qAt -v ON_ERROR_STOP=1 <<'SQL'
+BEGIN;
+SELECT pg_catalog.set_config(
+  'otlet.probe_incarnation',
+  started.incarnation_nonce,
+  true
+)
+FROM otlet.portable_start_worker(
+  current_setting('otlet.probe_worker_id'),
+  1,
+  current_setting('otlet.probe_runtime_hash')
+) started
+\g /dev/null
 DO $$
 DECLARE
   claim_row record;
@@ -946,6 +965,7 @@ BEGIN
     current_setting('otlet.probe_worker_id'),
     1,
     current_setting('otlet.probe_runtime_hash'),
+    current_setting('otlet.probe_incarnation'),
     1048576,
     6,
     1
@@ -961,6 +981,7 @@ BEGIN
     current_setting('otlet.probe_worker_id'),
     1,
     current_setting('otlet.probe_runtime_hash'),
+    current_setting('otlet.probe_incarnation'),
     claim_row.job_id,
     claim_row.claim_token,
     'claim metadata probe cleanup',
@@ -972,6 +993,7 @@ BEGIN
 END;
 $$;
 SELECT 'cheap|' || current_setting('otlet.probe_cheap_model') || '|queued';
+COMMIT;
 SQL
 )"
 claim_metadata_contract+="|$(
@@ -1031,6 +1053,18 @@ routing_failure_contract="$(
     "$container" \
     psql -h 127.0.0.1 -U "$cheap_worker_role" -d "$portable_database" \
     -X -qAt -v ON_ERROR_STOP=1 <<'SQL'
+BEGIN;
+SELECT pg_catalog.set_config(
+  'otlet.probe_incarnation',
+  started.incarnation_nonce,
+  true
+)
+FROM otlet.portable_start_worker(
+  current_setting('otlet.probe_worker_id'),
+  1,
+  current_setting('otlet.probe_runtime_hash')
+) started
+\g /dev/null
 DO $$
 DECLARE
   claim_row record;
@@ -1042,6 +1076,7 @@ BEGIN
     current_setting('otlet.probe_worker_id'),
     1,
     current_setting('otlet.probe_runtime_hash'),
+    current_setting('otlet.probe_incarnation'),
     1048576,
     6,
     1
@@ -1052,6 +1087,7 @@ BEGIN
     current_setting('otlet.probe_worker_id'),
     1,
     current_setting('otlet.probe_runtime_hash'),
+    current_setting('otlet.probe_incarnation'),
     claim_row.job_id,
     claim_row.claim_token,
     'cheap runtime failure'
@@ -1063,6 +1099,7 @@ BEGIN
 END;
 $$;
 SELECT 'runtime=failed';
+COMMIT;
 SQL
 )"
 if [ "$routing_failure_contract" != "runtime=failed" ]; then
@@ -1363,7 +1400,7 @@ SELECT concat_ws('|',
 COMMIT;
 SQL
 )"
-if [ "$pair_update_contract" != "true|content_revalidation_pending|1" ]; then
+if [ "$pair_update_contract" != "true|source_update|1" ]; then
   echo "Expected a stale portable pair replacement, got $pair_update_contract" >&2
   exit 1
 fi
@@ -1473,7 +1510,7 @@ fi
 worker_image="$(docker inspect -f '{{.Config.Image}}' "$container")"
 postgres_volume="$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/var/lib/postgresql"}}{{.Name}}{{end}}{{end}}' "$container")"
 target_volume="$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/target"}}{{.Name}}{{end}}{{end}}' "$container")"
-external_database_url="postgresql://${worker_role}:${worker_password}@host.docker.internal:${OTLET_PG_PORT:-55432}/${portable_database}"
+external_database_url="postgresql://${worker_role}@host.docker.internal:${OTLET_PG_PORT:-55432}/${portable_database}"
 
 docker exec -i "$container" psql -U postgres -d "$portable_database" -X -qAt \
   -v ON_ERROR_STOP=1 -v worker_id="$worker_id" <<'SQL' >/dev/null
@@ -1597,6 +1634,17 @@ done
 wait_for_worker_state drained
 archive_recovery_worker
 
+for secret in \
+  "$worker_password" \
+  "$cheap_worker_password" \
+  "$worker_database_url" \
+  "$cheap_worker_database_url" \
+  "$external_database_url"; do
+  if grep -Fq -- "$secret" "$worker_log" "$recovery_log"; then
+    echo "Portable worker logs exposed a database credential" >&2
+    exit 1
+  fi
+done
 if grep -Fq "$canary" "$recovery_log"; then
   echo "Portable worker logs exposed raw source evidence" >&2
   exit 1

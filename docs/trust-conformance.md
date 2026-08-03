@@ -12,7 +12,7 @@ Otlet treats source text, imported configuration, identifiers, model files, mode
 | Operations | Review, dry run, apply, cancellation, and policy status | `otlet_operator` session | Allowlisted functions and redacted views |
 | Audit | Receipts, labels, policy state, and redacted operational evidence | `otlet_auditor` session | Read-only allowlisted views |
 | Portable authoring | `otlet.watch.v1`, SQL text, JSON Schema, model policy, runtime options, and ordinary files | Pack author and importer | Untrusted bytes until database validation and import |
-| Portable protocol | Shaped snapshots and claim, attempt, completion, failure, and cancellation messages | Allowlisted external worker identity | Exact-version, role-bound, fenced RPC authority with no direct table access |
+| Portable protocol | Shaped snapshots and claim, attempt, completion, failure, and cancellation messages | Allowlisted external worker identity and current process incarnation | Exact-version, role-bound, fenced RPC authority with no direct table access |
 
 Deployers trust the native worker and PostgreSQL extension code. The local model is not a principal and receives no database authority. Its text stays untrusted until schema, decision, action, authority, identity, freshness, and evidence checks pass
 
@@ -26,7 +26,7 @@ Deployers trust the native worker and PostgreSQL extension code. The local model
 | Job snapshot to model | Prompt and row text | Revision-bound shaping, prompt, schema, model artifact, selection, runtime and action contracts, local execution, and no model database credential | Fail the attempt without output or action state |
 | Model response to evidence | Raw text, JSON, trace detail, and claimed model identity | Output envelope, JSON Schema, decision contract, evidence bounds, redaction, registered model role, and receipt hashes | Store a rejected or failed receipt, or one validated output |
 | Model action to workflow state | Action type, subject, target, identity, and changes | Task action allowlist, registered workflow authority, target binding, source identity, and recommendation-only default | Reject the action or keep it non-applyable |
-| Worker claim to terminal state | Worker identity, protocol version, job ID, attempt number, and lease | Role-bound runtime allowlist, fixed-search-path RPC, attempt fence, and live-lease check | Reject unauthorized, incompatible, reclaimed, or expired workers without partial trusted state |
+| Worker claim to terminal state | Worker identity, process incarnation nonce, protocol version, job ID, attempt number, and lease | Role-bound runtime allowlist, fixed-search-path RPC, current incarnation hash, attempt fence, and live-lease check | Reject unauthorized, incompatible, replaced, reclaimed, or expired workers without partial trusted state |
 | Evidence to reader | Receipts, events, traces, policies, and action state | Role grants and redacted status or export views | Deny raw tables and internal mutation functions |
 
 The redacted storage mode keeps source input in the job snapshot until retention cleanup but removes a canary from raw model output, structured redacted fields, action redacted fields, trace detail, and operational events. Diagnostic mode can retain raw model text for its configured interval, so do not use it when that retention conflicts with a secret-handling requirement
@@ -80,9 +80,12 @@ The portable boundary covers these threats:
 
 - stolen or replayed worker credentials
 - claim replay after lease expiry or failover
+- replacement process reuses one registered worker ID while the old process remains alive
+- stuck or oversized `psql` child, output, or result
+- credential exposure through process arguments or connection-data exposure through logs
 - intercepted database traffic or permissive egress
 
-The database enforces the runtime allowlist, exact protocol compatibility, fixed-search-path `SECURITY DEFINER` RPCs, a claim fence on every write, database-recomputed identity, idempotent terminal state, and no direct table grants. Before claims begin, the worker verifies the database session, grants, protocol, runtime identity, model registration, TLS state, local artifact digest, and writable runtime storage. Libpq enforces the configured CA and hostname checks. Infrastructure still owns credential rotation and model-provider egress denial
+The database enforces the runtime allowlist, exact protocol compatibility, fixed-search-path `SECURITY DEFINER` RPCs, a current process-incarnation fence on stale supplied nonces, a claim fence on the five claim-owned writes, database-recomputed identity, idempotent terminal state, and no direct table grants. The reference worker carries its nonce on all seven post-start calls. A heartbeat with no nonce is the read-only preflight exception. Startup returns one server-generated raw nonce while worker, claim, receipt, and status state retain only its SHA-256 hash. A replacement process fences the old process before new claims. Before claims begin, the worker verifies the database session, grants, protocol, runtime identity, model registration, TLS state, local artifact digest, and writable runtime storage. The reference worker permits one bounded `psql` child, applies fixed time and byte limits, and kills and reaps a stuck child. It rejects a connection URI containing a password, passes the passwordless URI to `psql`, and relies on libpq credential sources such as `PGPASSFILE`. No credential appears in process arguments or logs, and logs omit connection data. Libpq enforces the configured CA and hostname checks. Infrastructure still owns credential rotation and model-provider egress denial
 
 ## Stable Decisions
 

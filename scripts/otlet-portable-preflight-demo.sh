@@ -14,6 +14,9 @@ model_name="portable_preflight_model"
 worker_password="$(od -An -N24 -tx1 /dev/urandom | tr -d ' \n')"
 ungranted_password="$(od -An -N24 -tx1 /dev/urandom | tr -d ' \n')"
 cert_dir="$(mktemp -d)"
+worker_credential_env="$cert_dir/worker.env"
+wrong_credential_env="$cert_dir/wrong.env"
+ungranted_credential_env="$cert_dir/ungranted.env"
 diagnostics=""
 
 cleanup() {
@@ -34,6 +37,7 @@ probe() {
   output="$(
     docker run --rm \
       --network "$network" \
+      --env-file "${probe_credential_env:-$worker_credential_env}" \
       -v "$cert_dir:/run/certs:ro" \
       -v "$cert_dir:/models:ro" \
       -e "OTLET_DATABASE_URL=$database_url" \
@@ -50,6 +54,13 @@ probe() {
   )"
   status=$?
   set -e
+
+  for secret in "$worker_password" "$ungranted_password" "$database_url"; do
+    if [[ "$output" == *"$secret"* ]]; then
+      echo "Portable preflight log exposed connection data" >&2
+      exit 1
+    fi
+  done
 
   if [ "$expected" = "passed" ]; then
     if [ "$status" != "0" ] || ! printf '%s\n' "$output" | jq -e \
@@ -89,6 +100,10 @@ openssl x509 -req \
   -out "$cert_dir/server.crt" \
   -days 1 >/dev/null 2>&1
 openssl rand -out "$cert_dir/preflight.gguf" 128
+printf 'PGPASSWORD=%s\n' "$worker_password" >"$worker_credential_env"
+printf 'PGPASSWORD=wrong\n' >"$wrong_credential_env"
+printf 'PGPASSWORD=%s\n' "$ungranted_password" >"$ungranted_credential_env"
+chmod 600 "$worker_credential_env" "$wrong_credential_env" "$ungranted_credential_env"
 model_sha256="$(shasum -a 256 "$cert_dir/preflight.gguf" | awk '{print $1}')"
 model_bytes="$(stat -f %z "$cert_dir/preflight.gguf" 2>/dev/null || stat -c %s "$cert_dir/preflight.gguf")"
 
@@ -206,19 +221,18 @@ FROM otlet.portable_workers
 WHERE worker_id = :'worker_id';
 SQL
 )"
-database_url="postgresql://${worker_role}:${worker_password}@database:5432/${database}?connect_timeout=3&sslmode=verify-full&sslrootcert=/run/certs/ca.crt"
+database_url="postgresql://${worker_role}@database:5432/${database}?sslmode=verify-full&sslrootcert=/run/certs/ca.crt"
 
 probe valid passed
 probe dns database_unavailable \
-  -e "OTLET_DATABASE_URL=postgresql://${worker_role}:${worker_password}@missing-otlet-host:5432/${database}?connect_timeout=3&sslmode=verify-full&sslrootcert=/run/certs/ca.crt"
+  -e "OTLET_DATABASE_URL=postgresql://${worker_role}@missing-otlet-host:5432/${database}?sslmode=verify-full&sslrootcert=/run/certs/ca.crt"
 probe network database_unavailable \
-  -e "OTLET_DATABASE_URL=postgresql://${worker_role}:${worker_password}@database:6543/${database}?connect_timeout=3&sslmode=verify-full&sslrootcert=/run/certs/ca.crt"
+  -e "OTLET_DATABASE_URL=postgresql://${worker_role}@database:6543/${database}?sslmode=verify-full&sslrootcert=/run/certs/ca.crt"
 probe tls_hostname tls_verification_failed \
-  -e "OTLET_DATABASE_URL=postgresql://${worker_role}:${worker_password}@${database_container}:5432/${database}?connect_timeout=3&sslmode=verify-full&sslrootcert=/run/certs/ca.crt"
-probe credentials credentials_rejected \
-  -e "OTLET_DATABASE_URL=postgresql://${worker_role}:wrong@database:5432/${database}?connect_timeout=3&sslmode=verify-full&sslrootcert=/run/certs/ca.crt"
-probe role database_contract_denied \
-  -e "OTLET_DATABASE_URL=postgresql://${ungranted_role}:${ungranted_password}@database:5432/${database}?connect_timeout=3&sslmode=verify-full&sslrootcert=/run/certs/ca.crt" \
+  -e "OTLET_DATABASE_URL=postgresql://${worker_role}@${database_container}:5432/${database}?sslmode=verify-full&sslrootcert=/run/certs/ca.crt"
+probe_credential_env="$wrong_credential_env" probe credentials credentials_rejected
+probe_credential_env="$ungranted_credential_env" probe role database_contract_denied \
+  -e "OTLET_DATABASE_URL=postgresql://${ungranted_role}@database:5432/${database}?sslmode=verify-full&sslrootcert=/run/certs/ca.crt" \
   -e "OTLET_PORTABLE_WORKER_ID=$ungranted_worker_id" \
   -e "OTLET_PORTABLE_RUNTIME_IDENTITY_HASH=$ungranted_identity_hash"
 probe protocol protocol_incompatible -e OTLET_PORTABLE_PROTOCOL_VERSION=2
@@ -258,7 +272,7 @@ SELECT concat_ws('|',
 );
 SQL
 )"
-if [ "$preflight_state" != "0|queued|error:error" ]; then
+if [ "$preflight_state" != "0|queued|registered:unverified" ]; then
   echo "Expected preflight to leave claims untouched, got $preflight_state" >&2
   exit 1
 fi

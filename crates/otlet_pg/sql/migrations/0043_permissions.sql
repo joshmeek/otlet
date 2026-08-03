@@ -32,6 +32,7 @@ portable_status AS (
   JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
   WHERE n.nspname = 'otlet'
     AND p.proname IN (
+      'portable_start_worker',
       'portable_claim_jobs',
       'portable_renew_job',
       'portable_record_attempt',

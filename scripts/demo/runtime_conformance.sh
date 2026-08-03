@@ -173,12 +173,24 @@ SELECT pg_catalog.set_config('otlet.runtime_conformance_worker_id', :'worker_id'
 SELECT pg_catalog.set_config('otlet.runtime_conformance_identity', :'portable_identity_hash', true) \g /dev/null
 
 SET LOCAL ROLE :worker_role;
+SELECT pg_catalog.set_config(
+  'otlet.runtime_conformance_incarnation',
+  started.incarnation_nonce,
+  true
+)
+FROM otlet.portable_start_worker(
+  pg_catalog.current_setting('otlet.runtime_conformance_worker_id'),
+  1,
+  pg_catalog.current_setting('otlet.runtime_conformance_identity')
+) started
+\g /dev/null
 CREATE TEMP TABLE conformance_claims AS
 SELECT *
 FROM otlet.portable_claim_jobs(
   pg_catalog.current_setting('otlet.runtime_conformance_worker_id'),
   1,
   pg_catalog.current_setting('otlet.runtime_conformance_identity'),
+  pg_catalog.current_setting('otlet.runtime_conformance_incarnation'),
   1048576,
   6,
   3
@@ -189,6 +201,7 @@ FROM otlet.portable_complete_job(
   pg_catalog.current_setting('otlet.runtime_conformance_worker_id'),
   1,
   pg_catalog.current_setting('otlet.runtime_conformance_identity'),
+  pg_catalog.current_setting('otlet.runtime_conformance_incarnation'),
   (SELECT job_id FROM conformance_claims WHERE subject_id = 'portable-action'),
   (SELECT claim_token FROM conformance_claims WHERE subject_id = 'portable-action'),
   '{"decision":"flag","confidence":"high"}'::jsonb,
@@ -200,6 +213,7 @@ FROM otlet.portable_complete_job(
   pg_catalog.current_setting('otlet.runtime_conformance_worker_id'),
   1,
   pg_catalog.current_setting('otlet.runtime_conformance_identity'),
+  pg_catalog.current_setting('otlet.runtime_conformance_incarnation'),
   (SELECT job_id FROM conformance_claims WHERE subject_id = 'portable-abstain'),
   (SELECT claim_token FROM conformance_claims WHERE subject_id = 'portable-abstain'),
   '{"decision":"abstain","confidence":"medium"}'::jsonb,
@@ -217,6 +231,7 @@ BEGIN
       pg_catalog.current_setting('otlet.runtime_conformance_worker_id'),
       1,
       pg_catalog.current_setting('otlet.runtime_conformance_identity'),
+      pg_catalog.current_setting('otlet.runtime_conformance_incarnation'),
       selected.job_id,
       selected.claim_token,
       '{"decision":"flag","confidence":"high"}'::jsonb,
@@ -233,6 +248,7 @@ BEGIN
     pg_catalog.current_setting('otlet.runtime_conformance_worker_id'),
     1,
     pg_catalog.current_setting('otlet.runtime_conformance_identity'),
+    pg_catalog.current_setting('otlet.runtime_conformance_incarnation'),
     selected.job_id,
     selected.claim_token,
     'malformed output rejected',

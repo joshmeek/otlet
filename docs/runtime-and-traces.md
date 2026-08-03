@@ -89,6 +89,8 @@ SELECT * FROM otlet.portable_claim_status ORDER BY claim_id DESC;
 SELECT * FROM otlet.portable_receipt_status ORDER BY receipt_id DESC;
 ```
 
+`incarnation_nonce_hash` links each active worker, claim, and receipt without exposing the raw process nonce. Starting a replacement process under the same registered worker identity marks the old process claims replaced and rejects its heartbeat, claim, renewal, attempt, completion, failure, and cancellation calls
+
 PostgreSQL authors the portable option status before claim mutation and copies it from the claim into the linked receipt. `requested`, `honored`, `defaulted`, `rejected`, and `effective` distinguish task input from the settings the worker must execute. `envelope` binds the registered artifact, fixed context and batch shape, eager CPU-only load, current RSS, memory budget, and worker thread default
 
 ```sql
@@ -108,7 +110,7 @@ WHERE runtime_name LIKE 'portable:%'
 ORDER BY receipt_id DESC;
 ```
 
-The [reference external worker](../crates/otlet_worker/README.md) runs the same database-built prompt with one local GGUF when the PostgreSQL host cannot load the native extension worker. It rejects unknown options before claim, uses the database-normalized token and thread limits, keeps inference caching and generation tracing off, and enforces Linux VmRSS before and after inference. It converts the database-issued `max_attempt_ms` to one monotonic deadline before the claim RPC and shares it across prompt decode, generation, renewal, and the llama abort callback. PostgreSQL exposes the claim-time attempt deadline and rejects renewal after it. Timeout records `attempt_timeout` in the job, receipt selection reason, and trace with no accepted output. Cancellation, pre-deadline claim loss, and database disconnect still interrupt work. PostgreSQL parses every returned envelope and owns validation and trusted-state writes
+The [reference external worker](../crates/otlet_worker/README.md) runs the same database-built prompt with one local GGUF when the PostgreSQL host cannot load the native extension worker. It rejects unknown options before claim, uses the database-normalized token and thread limits, keeps inference caching and generation tracing off, and enforces Linux VmRSS before and after inference. It converts the database-issued `max_attempt_ms` to one monotonic deadline before the claim RPC and shares it across prompt decode, generation, renewal, and the llama abort callback. PostgreSQL exposes the claim-time attempt deadline and rejects renewal after it. Timeout records `attempt_timeout` in the job, receipt selection reason, and trace with no accepted output. Cancellation, pre-deadline claim loss, a fenced process incarnation, and database disconnect still interrupt work. The worker permits one `psql` child, caps request, stdout, stderr, and parsed-result bytes, and turns fixed operation deadlines into statement and lock timeouts. It kills and reaps a child that outlives its deadline. The worker rejects a connection URI containing a password, passes the passwordless URI to `psql`, and leaves credentials to libpq sources such as `PGPASSFILE`. No credential appears in process arguments or logs, and logs omit connection data. PostgreSQL parses every returned envelope and owns validation and trusted-state writes
 
 Receipt timing splits runtime preparation, model load, context creation, tokenization, prompt decode, generation, validation and post-processing, finish SQL, and semantic materialization. `otlet.runtime_stage_timing_status` aggregates every attempt for a job and leaves unmeasured worker work in `worker_overhead_ms`:
 
@@ -459,7 +461,7 @@ Failure records a raw-output hash, a non-sensitive error, and an attempt receipt
 
 Events show worker behavior. Receipts show model behavior
 
-The portable worker emits one `preflight_passed` event before model load or claims. A failed explicit `--preflight` emits `preflight_failed` with one stable dependency code and no connection string, credential, prompt, or source value
+The portable worker checks all eight RPC grants and emits one `preflight_passed` event before starting an incarnation, loading a model, or claiming work. A failed explicit `--preflight` emits `preflight_failed` with one stable dependency code and no connection string, credential, prompt, or source value
 
 ```sql
 SELECT event_type, count(*)

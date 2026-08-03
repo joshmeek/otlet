@@ -41,12 +41,13 @@ SELECT otlet.register_portable_worker(
 SQL
 ```
 
-The worker role receives schema usage, one protocol compatibility view, and seven fixed-search-path RPCs. It receives no table, source, owner, review, or action authority
+The worker role receives schema usage, one protocol compatibility view, and eight fixed-search-path RPCs. It receives no table, source, owner, review, or action authority
 
 ## Run One Worker
 
 ```sh
-export OTLET_DATABASE_URL='postgresql://otlet_worker:replace-me@database.example:5432/app?sslmode=verify-full&sslrootcert=/run/secrets/database-ca.pem'
+export OTLET_DATABASE_URL='postgresql://otlet_worker@database.example:5432/app?sslmode=verify-full&sslrootcert=/run/secrets/database-ca.pem'
+export PGPASSFILE='/run/secrets/otlet-worker.pgpass'
 export OTLET_PORTABLE_WORKER_ID='customer-vpc-worker'
 export OTLET_PORTABLE_PROTOCOL_VERSION='1'
 export OTLET_PORTABLE_RUNTIME_IDENTITY_HASH='registered-runtime-identity-sha256'
@@ -60,11 +61,15 @@ export OTLET_PORTABLE_RENEW_MS='1000'
 otlet_worker
 ```
 
+Store `database.example:5432:app:otlet_worker:replace-me` in the mounted password file and make it readable only by the worker user. `OTLET_DATABASE_URL` must be a PostgreSQL URI without a password; the worker passes that URI to `psql` while libpq reads the credential from `PGPASSFILE`. No credential enters a process argument or log, and logs omit the connection string
+
 The process runs deployment preflight before it can claim work, verifies the GGUF digest and registered byte size, then loads the model once at startup. The reference runtime uses a 4,096-token context, 512-token batches, 128-token microbatches, and zero GPU layers. It samples Linux VmRSS before claim, before inference, and after inference. A missing sample or budget overage fails the claim or attempt without trusted output
 
 Portable admission accepts `reasoning`, `max_tokens`, `max_attempt_ms`, `inference_cache`, `max_worker_rss_bytes`, `generation_trace`, `llama_threads`, and `llama_batch_threads`. Each task must set `inference_cache` to `false`. Tasks may omit `generation_trace` or set it to `false`. PostgreSQL rejects other options before it changes claim state, resolves missing or zero thread counts to the worker default, and returns the normalized settings for execution. The default production policy supplies a nonzero RSS budget
 
 PostgreSQL assembles the exact prompt from the shaped snapshot and immutable task contract, then recomputes and validates the terminal identities, schema result, output, actions, and receipt lineage. It stores the database-authored requested, honored, defaulted, rejected, effective, artifact, context, thread, and RSS evidence on the claim and linked receipt
+
+The worker permits one `psql` child at a time. It applies a 5-second connect limit, a 30-second ordinary query limit, a renewal limit of 30 seconds or the remaining attempt budget, and one 30-second deadline across all terminal retries. Requests stop at 128 MiB, stdout at 64 MiB, stderr at 64 KiB, and parsed results at 32 MiB. Each call also sets PostgreSQL statement and lock timeouts. A child that crosses its deadline is killed and reaped before the call returns
 
 ## Enqueue One-Off Inference
 
@@ -148,7 +153,7 @@ Run the same image, mounts, network, and environment with `--preflight` before s
 otlet_worker --preflight
 ```
 
-A passing preflight connects through libpq, authenticates the dedicated role, checks all seven worker RPCs and the exact protocol version, verifies the runtime and model registrations, confirms TLS is active when required, hashes the local GGUF, and probes the runtime directory. It exits before loading llama.cpp or claiming a job
+A passing preflight connects through libpq, authenticates the dedicated role, checks all eight worker RPCs and the exact protocol version, verifies the runtime and model registrations, confirms TLS is active when required, hashes the local GGUF, and probes the runtime directory. It exits before starting a process incarnation, loading llama.cpp, or claiming a job
 
 Failures are one-line JSON with a stable reason such as `database_unavailable`, `tls_verification_failed`, `credentials_rejected`, `database_contract_missing`, `protocol_incompatible`, `runtime_not_allowlisted`, `model_not_allowlisted`, `model_hash_mismatch`, or `runtime_path_unwritable`. Use `sslmode=verify-full` and a trusted CA in the libpq connection string. The deployment must block model-provider egress; the worker has no remote model client
 
@@ -162,20 +167,20 @@ SELECT otlet.set_portable_worker_control('customer-vpc-worker', 'running');
 SELECT otlet.set_portable_worker_control('customer-vpc-worker', 'draining');
 ```
 
-Pause lets the current claim finish and blocks the next claim. Drain also lets the current claim finish, records `drained`, and exits the process. A supervisor can then restart or replace the container
+Pause lets the current claim finish and blocks the next claim. Drain also lets the current claim finish, records `drained`, and exits the process. After preflight, PostgreSQL issues the process a nonce and stores only its hash. Starting a replacement under the same worker ID marks the prior process claims replaced and rejects its next heartbeat, claim, renewal, attempt, completion, failure, or cancellation RPC
 
-The worker converts the database-issued `max_attempt_ms` to one monotonic deadline before the claim RPC. Prompt decode, generation, the llama abort callback, and renewal share it. PostgreSQL refuses renewal after its claim-time deadline, and a timeout records `attempt_timeout` in the job, receipt selection reason, failed schema status, and trace. Cancellation interrupts decode and finishes through the fenced cancel RPC. A renewal rejected before the deadline or a database disconnect interrupts decode without a terminal write, leaving the lease available for safe reclaim. Exact terminal requests retry three times, and PostgreSQL returns the stored terminal result for duplicate delivery
+The worker converts the database-issued `max_attempt_ms` to one monotonic deadline before the claim RPC. Prompt decode, generation, the llama abort callback, and renewal share it. PostgreSQL refuses renewal after its claim-time deadline, and a timeout records `attempt_timeout` in the job, receipt selection reason, failed schema status, and trace. Cancellation interrupts decode and finishes through the fenced cancel RPC. A renewal rejected before the deadline, a fenced incarnation, or a database disconnect interrupts decode without a terminal write, leaving the lease available for safe reclaim. Exact terminal requests retry three times inside one bounded deadline, and PostgreSQL returns the stored terminal result for duplicate delivery
 
 The continuous process reconnects after PostgreSQL restarts. `--once` fails on a database disconnect so batch callers receive a nonzero exit instead of an indefinite wait
 
-Inspect the process, model, queue, and lease state without exposing prompt text or claim tokens:
+Inspect the process, incarnation hash, model, queue, and lease state without exposing the raw process nonce, prompt text, or claim tokens:
 
 ```sql
 SELECT * FROM otlet.portable_worker_status;
 SELECT * FROM otlet.portable_claim_status ORDER BY claim_id DESC;
 ```
 
-Worker logs contain one-line JSON events with IDs and bounded reason codes. They omit llama.cpp diagnostics, raw prompts, and source evidence
+Worker logs contain one-line JSON events with IDs and bounded reason codes. They omit database credentials and connection strings, llama.cpp diagnostics, raw prompts, and source evidence
 
 See [the customer-VPC example](../../docs/examples/customer-vpc-portable-worker/README.md) for a small container deployment and [the production contract](../../docs/production-contract.md) for the trust boundary
 
@@ -187,7 +192,7 @@ After `./scripts/otlet-setup.sh` has placed the demo GGUF in Docker, run:
 ./scripts/otlet-portable-worker-demo.sh
 ```
 
-The script creates a disposable SQL-only database, builds the worker, and runs real local inference through direct, cheap-to-strong, row-watch, and pair-watch paths. It proves pre-claim rejection without claim mutation, normalized thread settings, exact artifact and context evidence, fail-closed RSS sampling, database-authored option status, and an absolute attempt timeout after a successful renewal with one receipt and no output. It also covers receipt lineage, semantic reads, update and delete reconciliation, worker controls, restart and reclaim, duplicate delivery, source denial, and redacted structured logs before dropping the database and roles
+The script creates a disposable SQL-only database, builds the worker, and runs real local inference through direct, cheap-to-strong, row-watch, and pair-watch paths. It proves pre-claim rejection without claim mutation, normalized thread settings, exact artifact and context evidence, fail-closed RSS sampling, database-authored option status, and an absolute attempt timeout after a successful renewal with one receipt and no output. It also covers receipt lineage, semantic reads, update and delete reconciliation, worker controls, restart and reclaim, duplicate delivery, source denial, and logs without credentials, connection strings, or source evidence before dropping the database and roles
 
 Run the isolated deployment-preflight proof:
 

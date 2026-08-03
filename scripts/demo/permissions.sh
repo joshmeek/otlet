@@ -543,6 +543,7 @@ WITH table_grants AS (
           'otlet.grant_portable_worker_access(regrole)'::regprocedure
         )
         AND p.proname NOT IN (
+          'portable_start_worker',
           'portable_claim_jobs',
           'portable_renew_job',
           'portable_record_attempt',
@@ -589,16 +590,16 @@ CROSS JOIN definer_status;
 SQL
 )"
 echo "permission_catalog_contract=$permission_catalog_contract"
-[ "$permission_catalog_contract" = "false|0|0|0|15|19|15|27|0|0|0|0|19|19|0|7|7|7|true" ] || {
+[ "$permission_catalog_contract" = "false|0|0|0|15|19|15|27|0|0|0|0|20|20|0|8|8|8|true" ] || {
   echo "Expected exact public, auditor, operator, and owner ACLs, got $permission_catalog_contract" >&2
   exit 1
 }
 
 source "$demo_dir/review_provenance.sh"
 
-permission_contract="public=0/0/0|auditor=15/19|operator=15/27|definer=19/19|portable=7/7/7|positive=7|denied=$permission_denied_count"
+permission_contract="public=0/0/0|auditor=15/19|operator=15/27|definer=20/20|portable=8/8/8|positive=7|denied=$permission_denied_count"
 echo "permission_contract=$permission_contract"
-[ "$permission_contract" = "public=0/0/0|auditor=15/19|operator=15/27|definer=19/19|portable=7/7/7|positive=7|denied=61" ] || {
+[ "$permission_contract" = "public=0/0/0|auditor=15/19|operator=15/27|definer=20/20|portable=8/8/8|positive=7|denied=61" ] || {
   echo "Expected complete permission contract, got $permission_contract" >&2
   exit 1
 }
