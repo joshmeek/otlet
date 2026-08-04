@@ -79,7 +79,7 @@ contract="$(
 SELECT concat_ws('|',
   max(version),
   count(*),
-  array_agg(version ORDER BY version) = ARRAY(SELECT generate_series(1, 54)),
+  array_agg(version ORDER BY version) = ARRAY(SELECT generate_series(1, 55)),
   bool_and(file ~ ('(^|/)' || lpad(version::text, 4, '0') || '_')),
   (SELECT value FROM public.portable_upgrade_sentinel),
   (SELECT count(*) FROM otlet.verify_invariants())
@@ -87,7 +87,7 @@ SELECT concat_ws('|',
 FROM otlet.portable_schema_migrations;
 SQL
 )"
-[ "$contract" = "54|54|t|t|preserved|0" ] || {
+[ "$contract" = "55|55|t|t|preserved|0" ] || {
   echo "Portable repeat-install contract mismatch: $contract" >&2
   exit 1
 }
@@ -576,7 +576,7 @@ SELECT concat_ws('|',
   to_regprocedure('otlet.register_evaluation_case(bigint,text,text)') IS NOT NULL,
   to_regprocedure('otlet.start_replay_evaluation(text,text[],text,text)') IS NOT NULL,
   to_regprocedure('otlet.record_evaluation_result(bigint,bigint,bigint,jsonb,jsonb)') IS NOT NULL,
-  (SELECT count(*) = 14
+  (SELECT count(*) = 15
    FROM pg_catalog.pg_trigger trigger
    WHERE trigger.tgrelid IN (
      'otlet.evaluation_cases'::regclass,
@@ -701,6 +701,88 @@ SQL
 )"
 [ "$population_lineage_migration_contract" = "t|t|t|t|t" ] || {
   echo "Portable population-lineage migration contract mismatch: $population_lineage_migration_contract" >&2
+  exit 1
+}
+
+evaluation_slices_migration_contract="$(
+  docker exec -i "$container" psql -U postgres -d "$database" \
+    -X -qAt -v ON_ERROR_STOP=1 <<'SQL'
+SELECT concat_ws('|',
+  EXISTS (
+    SELECT 1
+    FROM otlet.portable_schema_migrations
+    WHERE version = 55
+      AND file ~ '0055_evaluation_slices_support.sql$'
+  ),
+  to_regclass('otlet.evaluation_slice_reports') IS NOT NULL,
+  to_regclass('otlet.evaluation_slice_status') IS NOT NULL,
+  to_regprocedure(
+    'otlet.record_evaluation_slice_report(text,jsonb,text)'
+  ) IS NOT NULL,
+  (SELECT count(*) = 3
+   FROM pg_catalog.pg_trigger trigger
+   WHERE trigger.tgrelid = 'otlet.evaluation_slice_reports'::regclass
+     AND trigger.tgname LIKE 'evaluation_slice_reports%'),
+  to_regprocedure(
+    'otlet.evaluation_slice_member_manifest_valid(jsonb)'
+  ) IS NOT NULL
+    AND to_regprocedure('otlet.stamp_job_wall_clock()') IS NOT NULL
+    AND to_regprocedure('otlet.validate_evaluation_slice_run()') IS NOT NULL
+    AND EXISTS (
+      SELECT 1 FROM pg_catalog.pg_trigger trigger
+      WHERE trigger.tgrelid = 'otlet.jobs'::regclass
+        AND trigger.tgname = 'jobs_wall_clock'
+    )
+    AND EXISTS (
+      SELECT 1 FROM pg_catalog.pg_trigger trigger
+      WHERE trigger.tgrelid = 'otlet.evaluation_runs'::regclass
+        AND trigger.tgname = 'evaluation_runs_d_slices'
+    )
+    AND (
+      SELECT column_default = 'clock_timestamp()'
+      FROM information_schema.columns
+      WHERE table_schema = 'otlet'
+        AND table_name = 'jobs'
+        AND column_name = 'created_at'
+    )
+    AND (
+      SELECT column_default = 'clock_timestamp()'
+      FROM information_schema.columns
+      WHERE table_schema = 'otlet'
+        AND table_name = 'inference_receipts'
+        AND column_name = 'finished_at'
+    ),
+  NOT pg_catalog.has_table_privilege(
+    'public',
+    'otlet.evaluation_slice_reports',
+    'SELECT,INSERT,UPDATE,DELETE,TRUNCATE'
+  )
+    AND NOT pg_catalog.has_table_privilege(
+      'public', 'otlet.evaluation_slice_status', 'SELECT'
+    )
+    AND NOT pg_catalog.has_function_privilege(
+      'public',
+      'otlet.record_evaluation_slice_report(text,jsonb,text)',
+      'EXECUTE'
+    )
+    AND NOT pg_catalog.has_function_privilege(
+      'public', 'otlet.validate_evaluation_slice_report()', 'EXECUTE'
+    )
+    AND NOT pg_catalog.has_function_privilege(
+      'public', 'otlet.evaluation_slice_member_manifest_valid(jsonb)', 'EXECUTE'
+    )
+    AND NOT pg_catalog.has_function_privilege(
+      'public', 'otlet.stamp_job_wall_clock()', 'EXECUTE'
+    )
+    AND NOT pg_catalog.has_function_privilege(
+      'public', 'otlet.validate_evaluation_slice_run()', 'EXECUTE'
+    )
+    AND NOT EXISTS (SELECT 1 FROM otlet.verify_invariants())
+);
+SQL
+)"
+[ "$evaluation_slices_migration_contract" = "t|t|t|t|t|t|t" ] || {
+  echo "Portable evaluation-slices migration contract mismatch: $evaluation_slices_migration_contract" >&2
   exit 1
 }
 
@@ -1119,6 +1201,7 @@ echo "portable_administrative_migration_contract=$administrative_migration_contr
 echo "portable_acceptance_migration_contract=$acceptance_migration_contract"
 echo "portable_evaluation_migration_contract=$evaluation_migration_contract"
 echo "portable_population_lineage_migration_contract=$population_lineage_migration_contract"
+echo "portable_evaluation_slices_migration_contract=$evaluation_slices_migration_contract"
 echo "portable_ask_administrative_contract=$portable_ask_administrative_contract"
 echo "portable_task_lifecycle_contract=$portable_task_lifecycle_contract"
 echo "portable_model_capacity_contract=$batch_claims|$batch_capacity_contract|$concurrent_capacity_contract|$cancel_blocked_claims|$replacement_claims|$lease_capacity_contract"

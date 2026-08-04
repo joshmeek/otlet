@@ -276,9 +276,14 @@ pgrx::extension_sql_file!(
     requires = ["replayable_evaluation"]
 );
 pgrx::extension_sql_file!(
+    "../sql/migrations/0055_evaluation_slices_support.sql",
+    name = "evaluation_slices_support",
+    requires = ["evaluation_population_lineage"]
+);
+pgrx::extension_sql_file!(
     "../sql/migrations/0043_permissions.sql",
     name = "permissions",
-    requires = ["evaluation_population_lineage"]
+    requires = ["evaluation_slices_support"]
 );
 
 #[allow(non_snake_case)]
