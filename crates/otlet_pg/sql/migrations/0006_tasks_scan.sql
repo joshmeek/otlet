@@ -579,7 +579,8 @@ CREATE FUNCTION otlet.validated_task_input_rows(
   max_rows integer DEFAULT NULL,
   active_task_name text DEFAULT NULL,
   active_workload_revision_hash text DEFAULT NULL,
-  workload_definition jsonb DEFAULT NULL
+  workload_definition jsonb DEFAULT NULL,
+  validate_contract boolean DEFAULT true
 ) RETURNS TABLE(subject_id text, input jsonb)
 LANGUAGE plpgsql
 VOLATILE
@@ -606,9 +607,11 @@ BEGIN
   END IF;
   IF validated_task_input_rows.workload_definition IS NOT NULL
      AND jsonb_typeof(validated_task_input_rows.workload_definition) <> 'null' THEN
-    PERFORM otlet.workload_source_contract_guard(
-      validated_task_input_rows.workload_definition
-    );
+    IF COALESCE(validated_task_input_rows.validate_contract, true) THEN
+      PERFORM otlet.workload_source_contract_guard(
+        validated_task_input_rows.workload_definition
+      );
+    END IF;
     PERFORM pg_catalog.set_config(
       'search_path',
       otlet.source_query_safe_search_path(
@@ -728,7 +731,8 @@ BEGIN
       FROM otlet.validated_task_input_rows(
         revision_definition #>> '{source,candidate_query}',
         candidate_limit + 1,
-        workload_definition => revision_definition
+        workload_definition => revision_definition,
+        validate_contract => false
       ) validated
     LOOP
       IF returned_rows >= candidate_limit THEN
@@ -1077,6 +1081,7 @@ DECLARE
   largest_input_bytes bigint;
   rejection_reason text;
   rejection_limit bigint;
+  reconciled_rows bigint;
 BEGIN
   revision_hash := otlet.ensure_active_workload_revision(run_task.task_name);
   SELECT
@@ -1188,6 +1193,29 @@ BEGIN
        WHERE d.rejection_reason IS NULL
        ORDER BY pending.subject_id COLLATE "C"
        RETURNING 1
+     ),
+     recorded_reconciliation AS MATERIALIZED (
+       SELECT otlet.record_watch_input_reconciliation(
+         %3$L,
+         %4$L,
+         pending.subject_id,
+         pending.input
+       ) AS generation
+       FROM bounded_input pending
+       CROSS JOIN decision d
+       WHERE d.rejection_reason IS NOT NULL
+         AND d.rejection_reason <> ''row_cap''
+     ),
+     resolved_reconciliation AS MATERIALIZED (
+       SELECT otlet.resolve_watch_input_reconciliation(
+         %3$L,
+         %4$L,
+         pending.subject_id,
+         pending.input
+       ) AS removed
+       FROM bounded_input pending
+       CROSS JOIN decision d
+       WHERE d.rejection_reason IS NULL
      )
      SELECT
        (SELECT count(*) FROM inserted),
@@ -1196,7 +1224,9 @@ BEGIN
        largest_input_bytes,
        queue_slots,
        rejection_reason,
-       rejection_limit
+       rejection_limit,
+       (SELECT count(*) FROM recorded_reconciliation)
+         + (SELECT count(*) FROM resolved_reconciliation)
      FROM decision',
     task_model_name,
     query,
@@ -1204,7 +1234,8 @@ BEGIN
     revision_hash,
     revision_definition
   )
-  INTO queued, candidate_rows, candidate_bytes, largest_input_bytes, queue_slots, rejection_reason, rejection_limit;
+  INTO queued, candidate_rows, candidate_bytes, largest_input_bytes, queue_slots,
+       rejection_reason, rejection_limit, reconciled_rows;
 
   IF rejection_reason IS NOT NULL THEN
     PERFORM otlet.record_queue_admission_suppressed(
@@ -1302,7 +1333,20 @@ BEGIN
     revision_hash
   );
   IF queued THEN
+    PERFORM otlet.resolve_watch_input_reconciliation(
+      run_task_subject.task_name,
+      revision_hash,
+      run_task_subject.subject_id,
+      pending_input
+    );
     PERFORM otlet.wake_worker();
+  ELSE
+    PERFORM otlet.record_watch_input_reconciliation(
+      run_task_subject.task_name,
+      revision_hash,
+      run_task_subject.subject_id,
+      pending_input
+    );
   END IF;
 
   RETURN queued::integer;

@@ -258,13 +258,13 @@ SQL
 invalid_import_exit=$?
 set -e
 invalid_import_count="$(psql_value -c "SELECT count(*) FROM otlet.watches WHERE name = 'admission_import_invalid';")"
-if [ "$invalid_import_exit" -eq 0 ] || [[ "$invalid_import_output" != *"candidate query EXPLAIN failed"* ]] || [ "$invalid_import_count" != "0" ]; then
+if [ "$invalid_import_exit" -eq 0 ] || [[ "$invalid_import_output" != *"source query binding failed"* ]] || [ "$invalid_import_count" != "0" ]; then
   echo "Invalid imported candidate query did not roll back cleanly" >&2
   printf '%s\n' "$invalid_import_output" >&2
   exit 1
 fi
 psql_exec -qAt -c "SELECT otlet.drop_watch('admission_timeout_demo');" >/dev/null
-echo "candidate_import_preflight_contract=failed|0"
+echo "candidate_import_validation_contract=failed|0"
 
 row_cap_contract="$(psql_value -v model_name="$cheap_model_name" <<'SQL'
 BEGIN;

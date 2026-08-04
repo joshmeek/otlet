@@ -674,6 +674,10 @@ BEGIN
     registered_model_name,
     registered_model_artifact_hash,
     registered_model_artifact_bytes;
+  IF desired_state = 'running'
+     AND portable_worker_heartbeat.reported_state IN ('starting', 'idle', 'running') THEN
+    PERFORM otlet.replay_watch_reconciliation(false);
+  END IF;
   RETURN NEXT;
 END;
 $$;

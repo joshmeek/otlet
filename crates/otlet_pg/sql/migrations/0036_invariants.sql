@@ -49,6 +49,39 @@ BEGIN
 
   RETURN QUERY
   SELECT
+    'watch_reconciliation_uses_row_enqueue_watch'::text,
+    'watch_reconciliation'::text,
+    reconciliation.watch_name || ':' || reconciliation.subject_id,
+    jsonb_build_object(
+      'watch_kind', watch.kind,
+      'on_change', COALESCE(watch.trigger_policy ->> 'on_change', 'mark_stale')
+    )
+  FROM otlet.watch_reconciliation reconciliation
+  LEFT JOIN otlet.watches watch ON watch.name = reconciliation.watch_name
+  WHERE watch.name IS NULL
+     OR watch.kind <> 'row'
+     OR COALESCE(watch.trigger_policy ->> 'on_change', 'mark_stale') <> 'mark_stale_and_enqueue';
+
+  RETURN QUERY
+  SELECT
+    'watch_reconciliation_revision_belongs_to_task'::text,
+    'watch_reconciliation'::text,
+    reconciliation.watch_name || ':' || reconciliation.subject_id,
+    jsonb_build_object(
+      'watch_task_name', watch.task_name,
+      'revision_task_name', revision.task_name,
+      'workload_revision_hash', reconciliation.workload_revision_hash
+    )
+  FROM otlet.watch_reconciliation reconciliation
+  LEFT JOIN otlet.watches watch ON watch.name = reconciliation.watch_name
+  LEFT JOIN otlet.workload_revisions revision
+    ON revision.workload_revision_hash = reconciliation.workload_revision_hash
+  WHERE watch.name IS NULL
+     OR revision.workload_revision_hash IS NULL
+     OR revision.task_name IS DISTINCT FROM watch.task_name;
+
+  RETURN QUERY
+  SELECT
     'workload_revisions_are_content_addressed'::text,
     'workload_revision'::text,
     revision.workload_revision_hash,

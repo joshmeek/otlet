@@ -605,12 +605,20 @@ VALUES
   ('flood-2', 'second flood row'),
   ('flood-3', 'third flood row');
 
+SELECT otlet.reconcile_watch_subject('row_queue_flood_demo', 'flood-1', true);
+SELECT otlet.reconcile_watch_subject('row_queue_flood_demo', 'flood-2', true);
+
 SELECT (
     SELECT count(*)
     FROM otlet.jobs
     WHERE task_name = 'row_queue_flood_demo_task'
       AND status = 'queued'
   )::text || '|' ||
+  (
+    SELECT count(*)::text || '|' || COALESCE(sum(attempts), 0)::text
+    FROM otlet.watch_reconciliation
+    WHERE watch_name = 'row_queue_flood_demo'
+  ) || '|' ||
   (
     SELECT count(*)::text || '|' ||
            (count(*) = 1)::text || '|' ||
@@ -629,7 +637,7 @@ SQL
 )"
 queue_suppression_contract="$(tail -n 1 <<<"$queue_suppression_output")"
 echo "queue_suppression_contract=$queue_suppression_contract"
-[ "$queue_suppression_contract" = "1|1|true|true|true" ] || {
-  echo "Expected queue suppression contract 1|1|true|true|true, got $queue_suppression_contract" >&2
+[ "$queue_suppression_contract" = "1|2|1|1|true|true|true" ] || {
+  echo "Expected durable queue suppression contract 1|2|1|1|true|true|true, got $queue_suppression_contract" >&2
   exit 1
 }

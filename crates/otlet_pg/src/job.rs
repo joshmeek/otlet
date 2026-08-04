@@ -149,6 +149,17 @@ ORDER BY claimed.claim_order
     })
 }
 
+pub(crate) fn replay_watch_reconciliation() -> pgrx::spi::Result<()> {
+    pgrx::Spi::connect_mut(|client| {
+        client.update(
+            "SELECT otlet.replay_watch_reconciliation(false)",
+            Some(1),
+            &[],
+        )?;
+        Ok(())
+    })
+}
+
 pub(crate) fn insert_infer_now_job(
     task_name: &str,
     subject_id: &str,

@@ -1,6 +1,6 @@
 # Workload Admission
 
-Otlet admits bounded source work before it creates jobs. Bulk `run_task` calls enqueue every eligible row or none, while single-subject calls return false when capacity is unavailable so row-watch triggers do not block application writes on worker availability
+Otlet admits bounded source work before it creates jobs. Bulk `run_task` calls enqueue every eligible row or none, while single-subject calls return false when capacity is unavailable. Row-watch triggers persist coalesced dirty state instead of waiting on worker or queue availability
 
 The default production policy sets these limits:
 
@@ -11,6 +11,9 @@ The default production policy sets these limits:
 | Queued jobs per model | 1,000 |
 | Queued input bytes per model | 64 MiB |
 | Total queued input bytes | 256 MiB |
+| Watch reconciliation attempts | 12 |
+| Watch reconciliation base delay | 1,000 ms |
+| Watch reconciliation maximum delay | 300,000 ms |
 | Candidate plan cost | 1,000,000 |
 | Candidate statement timeout | 2,000 ms |
 
@@ -37,4 +40,4 @@ Otlet rejects a pair refresh when the timeout is zero or exceeds `candidate_quer
 
 `input_shaping.source_fields` is the top-level source-field allowlist. A missing list becomes empty. `input_shaping.max_shaped_input_bytes` accepts integers from 1 through 1 MiB. Row and pair watches, imported `otlet.watch.v1` definitions, direct tasks, and the shared `admit_task_input` database path use the same task and admission checks. `ask` keeps its stricter 8 KiB shared-memory input cap
 
-Capacity rejection records a debounced `queue_admission_suppressed` event with a stable reason such as `row_cap`, `input_byte_cap`, `queue_depth_cap`, `model_queued_input_byte_cap`, or `total_queued_input_byte_cap`
+Capacity rejection records a debounced `queue_admission_suppressed` event with a stable reason such as `row_cap`, `input_byte_cap`, `queue_depth_cap`, `model_queued_input_byte_cap`, or `total_queued_input_byte_cap`. For `mark_stale_and_enqueue` row watches, PostgreSQL retains the newest source identity and retries through `watch_reconciliation`. `watch_status` exposes pending count, exhausted count, oldest age, and next retry; `watch_reconciliation_status` exposes each entry for owner replay or generation-fenced acknowledgement

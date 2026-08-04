@@ -1262,13 +1262,36 @@ BEGIN
   WHERE id = 'after';
   IF NOT EXISTS (
     SELECT 1
+    FROM otlet.watch_reconciliation reconciliation
+    WHERE reconciliation.watch_name = 'source_query_drift_watch'
+      AND reconciliation.subject_id = 'after'
+      AND reconciliation.workload_revision_hash = proof.revision_c
+      AND reconciliation.source_identity = (
+        SELECT otlet.semantic_source_hash(otlet.task_subject_input(
+          revision.definition #>> '{task,input_query}',
+          'after',
+          revision.definition
+        ))
+        FROM otlet.workload_revisions revision
+        WHERE revision.task_name = 'source_query_drift_watch_task'
+          AND revision.workload_revision_hash = proof.revision_c
+      )
+  ) OR otlet.reconcile_watch_subject(
+    'source_query_drift_watch',
+    'after',
+    true
+  ) <> 'queued' THEN
+    RAISE EXCEPTION 'restored row watch trigger did not persist and replay the changed source row';
+  END IF;
+  IF NOT EXISTS (
+    SELECT 1
     FROM otlet.jobs job
     WHERE job.task_name = 'source_query_drift_watch_task'
       AND job.workload_revision_hash = proof.revision_c
       AND job.subject_id = 'after'
       AND job.status = 'queued'
   ) THEN
-    RAISE EXCEPTION 'restored row watch trigger did not enqueue the changed source row';
+    RAISE EXCEPTION 'restored row watch replay did not enqueue the changed source row';
   END IF;
 END
 $body$;

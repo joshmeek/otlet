@@ -1262,6 +1262,11 @@ watch_insert_job_id="$(
 BEGIN;
 INSERT INTO public.otlet_portable_watch_source
 VALUES ('watch-live', 'retain');
+SELECT otlet.reconcile_watch_subject(
+  'portable_row_watch',
+  'watch-live',
+  true
+) AS watch_insert_replay \gset
 SELECT j.id AS watch_insert_job_id
 FROM otlet.jobs j
 JOIN otlet.watches w ON w.task_name = j.task_name
@@ -1370,6 +1375,11 @@ BEGIN;
 UPDATE public.otlet_portable_watch_source
 SET signal = 'retain updated'
 WHERE subject_id = 'watch-live';
+SELECT otlet.reconcile_watch_subject(
+  'portable_row_watch',
+  'watch-live',
+  true
+) AS watch_update_replay \gset
 SELECT j.id AS watch_update_job_id
 FROM otlet.jobs j
 JOIN otlet.watches w ON w.task_name = j.task_name
@@ -1419,6 +1429,11 @@ docker exec -i "$container" psql -U postgres -d "$portable_database" \
   -X -qAt -v ON_ERROR_STOP=1 <<'SQL' >/dev/null
 DELETE FROM public.otlet_portable_watch_source
 WHERE subject_id = 'watch-live';
+SELECT otlet.reconcile_watch_subject(
+  'portable_row_watch',
+  'watch-live',
+  true
+);
 SQL
 
 watch_delete_contract="$(
@@ -1610,6 +1625,11 @@ watch_cancel_contract="$(
     -X -qAt -v ON_ERROR_STOP=1 <<'SQL'
 INSERT INTO public.otlet_portable_watch_source
 VALUES ('watch-cancel', 'retain');
+SELECT otlet.reconcile_watch_subject(
+  'portable_row_watch',
+  'watch-cancel',
+  true
+) AS watch_cancel_replay \gset
 WITH target AS (
   SELECT j.id
   FROM otlet.jobs j
@@ -1727,6 +1747,78 @@ SQL
 start_recovery_worker
 wait_for_job_status recovery-worker-loss complete
 
+docker exec -i "$container" psql -U postgres -d "$portable_database" -X -qAt \
+  -v ON_ERROR_STOP=1 -v worker_id="$worker_id" <<'SQL' >/dev/null
+SELECT otlet.set_portable_worker_control(:'worker_id', 'paused');
+SQL
+wait_for_worker_state paused
+IFS='|' read -r watch_reconciliation_queue_cap watch_reconciliation_base_delay_ms <<<"$(
+  docker exec -i "$container" psql -U postgres -d "$portable_database" \
+    -X -qAt -v ON_ERROR_STOP=1 \
+    -c "SELECT max_queued_jobs_per_model || '|' || watch_reconciliation_base_delay_ms FROM otlet.production_policy WHERE name = 'default'"
+)"
+docker exec -i "$container" psql -U postgres -d "$portable_database" \
+  -X -qAt -v ON_ERROR_STOP=1 <<'SQL' >/dev/null
+UPDATE otlet.production_policy
+SET max_queued_jobs_per_model = 1,
+    watch_reconciliation_base_delay_ms = 5000
+WHERE name = 'default';
+INSERT INTO otlet.jobs (task_name, subject_id, input)
+VALUES ('aaa_portable_runtime_incompatible', 'watch-reconciliation-blocker', '{}'::jsonb);
+INSERT INTO public.otlet_portable_watch_source
+VALUES ('watch-restart', 'retain old');
+UPDATE public.otlet_portable_watch_source
+SET signal = 'retain newer'
+WHERE subject_id = 'watch-restart';
+UPDATE public.otlet_portable_watch_source
+SET signal = 'retain newest'
+WHERE subject_id = 'watch-restart';
+SELECT otlet.reconcile_watch_subject(
+  'portable_row_watch',
+  'watch-restart',
+  true
+);
+SQL
+watch_reconciliation_before_restart="$(
+  docker exec -i "$container" psql -U postgres -d "$portable_database" \
+    -X -qAt -v ON_ERROR_STOP=1 <<'SQL'
+SELECT concat_ws('|',
+  count(*),
+  max(reconciliation.generation),
+  max(reconciliation.state),
+  bool_and(
+    reconciliation.attempts >= 1
+    AND reconciliation.attempts < reconciliation.attempt_limit
+    AND reconciliation.last_error = 'queue admission rejected watch reconciliation'
+  ),
+  bool_and(reconciliation.source_identity = (
+    SELECT otlet.semantic_source_hash(otlet.task_subject_input(
+      revision.definition #>> '{task,input_query}',
+      reconciliation.subject_id,
+      revision.definition
+    ))
+    FROM otlet.workload_revisions revision
+    WHERE revision.task_name = 'portable_row_watch_task'
+      AND revision.workload_revision_hash = reconciliation.workload_revision_hash
+  )),
+  (SELECT count(*) FROM otlet.jobs WHERE subject_id = 'watch-restart')
+)
+FROM otlet.watch_reconciliation reconciliation
+WHERE reconciliation.watch_name = 'portable_row_watch'
+  AND reconciliation.subject_id = 'watch-restart';
+SQL
+)"
+if [[ ! "$watch_reconciliation_before_restart" =~ ^1\|[1-9][0-9]*\|pending\|t\|t\|0$ ]]; then
+  echo "Expected one coalesced watch reconciliation before restart, got $watch_reconciliation_before_restart" >&2
+  exit 1
+fi
+watch_reconciliation_generation="$(cut -d '|' -f 2 <<<"$watch_reconciliation_before_restart")"
+docker exec -i "$container" psql -U postgres -d "$portable_database" -X -qAt \
+  -v ON_ERROR_STOP=1 -v worker_id="$worker_id" <<'SQL' >/dev/null
+SELECT otlet.set_portable_worker_control(:'worker_id', 'running');
+SQL
+wait_for_worker_state idle
+
 docker stop "$container" >/dev/null
 for _ in {1..100}; do
   if docker logs "$recovery_container" 2>&1 | grep -q '"event":"database_unavailable"'; then
@@ -1743,10 +1835,53 @@ if ! docker exec "$container" pg_isready -U postgres -d "$portable_database" >/d
   echo "Portable recovery database did not restart" >&2
   exit 1
 fi
+watch_reconciliation_after_restart="$(
+  docker exec -i "$container" psql -U postgres -d "$portable_database" \
+    -X -qAt -v ON_ERROR_STOP=1 <<'SQL'
+SELECT concat_ws('|',
+  count(*),
+  max(reconciliation.generation),
+  max(reconciliation.state),
+  bool_and(
+    reconciliation.attempts >= 1
+    AND reconciliation.attempts < reconciliation.attempt_limit
+    AND reconciliation.last_error = 'queue admission rejected watch reconciliation'
+  ),
+  bool_and(reconciliation.source_identity = (
+    SELECT otlet.semantic_source_hash(otlet.task_subject_input(
+      revision.definition #>> '{task,input_query}',
+      reconciliation.subject_id,
+      revision.definition
+    ))
+    FROM otlet.workload_revisions revision
+    WHERE revision.task_name = 'portable_row_watch_task'
+      AND revision.workload_revision_hash = reconciliation.workload_revision_hash
+  )),
+  (SELECT count(*) FROM otlet.jobs WHERE subject_id = 'watch-restart')
+)
+FROM otlet.watch_reconciliation reconciliation
+WHERE reconciliation.watch_name = 'portable_row_watch'
+  AND reconciliation.subject_id = 'watch-restart';
+SQL
+)"
+if [ "$watch_reconciliation_after_restart" != "1|$watch_reconciliation_generation|pending|t|t|0" ]; then
+  echo "Watch reconciliation changed across database restart: $watch_reconciliation_after_restart" >&2
+  exit 1
+fi
 docker exec -i "$container" psql -U postgres -d "$portable_database" \
-  -X -qAt -v ON_ERROR_STOP=1 <<'SQL' >/dev/null
-INSERT INTO public.otlet_portable_watch_source
-VALUES ('watch-restart', 'retain');
+  -X -qAt -v ON_ERROR_STOP=1 \
+  -v queue_cap="$watch_reconciliation_queue_cap" \
+  -v base_delay_ms="$watch_reconciliation_base_delay_ms" <<'SQL' >/dev/null
+SELECT otlet.request_job_cancellation(id, 'portable reconciliation capacity fixture')
+FROM otlet.jobs
+WHERE task_name = 'aaa_portable_runtime_incompatible'
+  AND subject_id = 'watch-reconciliation-blocker'
+ORDER BY id DESC
+LIMIT 1;
+UPDATE otlet.production_policy
+SET max_queued_jobs_per_model = :'queue_cap'::integer,
+    watch_reconciliation_base_delay_ms = :'base_delay_ms'::integer
+WHERE name = 'default';
 SQL
 wait_for_job_status watch-restart complete
 
@@ -1759,6 +1894,12 @@ SELECT concat_ws('|',
    WHERE subject_id = 'watch-restart'
    ORDER BY id DESC
    LIMIT 1),
+  (SELECT input #>> '{row,signal}'
+   FROM otlet.jobs
+   WHERE task_name = 'portable_row_watch_task'
+     AND subject_id = 'watch-restart'
+   ORDER BY id DESC
+   LIMIT 1),
   (SELECT body ->> 'decision'
    FROM otlet.semantic_index_current_rows('portable_row_watch')
    WHERE subject_id = 'watch-restart'),
@@ -1767,12 +1908,22 @@ SELECT concat_ws('|',
    WHERE subject_id = 'watch-restart'),
   (SELECT count(*)
    FROM otlet.semantic_materializations
-   WHERE subject_id = 'watch-restart')
+   WHERE subject_id = 'watch-restart'),
+  (SELECT count(*)
+   FROM otlet.watch_reconciliation
+   WHERE watch_name = 'portable_row_watch'
+     AND subject_id = 'watch-restart'),
+  (SELECT status
+   FROM otlet.jobs
+   WHERE task_name = 'aaa_portable_runtime_incompatible'
+     AND subject_id = 'watch-reconciliation-blocker'
+   ORDER BY id DESC
+   LIMIT 1)
 );
 SQL
 )"
-if [ "$watch_restart_contract" != "complete|keep|false|1" ]; then
-  echo "Expected row-watch materialization after database restart, got $watch_restart_contract" >&2
+if [ "$watch_restart_contract" != "complete|retain newest|keep|false|1|0|canceled" ]; then
+  echo "Expected durable row-watch replay after database restart, got $watch_restart_contract" >&2
   exit 1
 fi
 

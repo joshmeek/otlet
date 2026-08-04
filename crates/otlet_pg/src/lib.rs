@@ -186,9 +186,14 @@ pgrx::extension_sql_file!(
     requires = ["semantic_predicates"]
 );
 pgrx::extension_sql_file!(
+    "../sql/migrations/0045_watch_reconciliation.sql",
+    name = "watch_reconciliation",
+    requires = ["semantic_status_plan"]
+);
+pgrx::extension_sql_file!(
     "../sql/migrations/0035_queue_policy_status.sql",
     name = "queue_policy_status",
-    requires = ["semantic_status_plan"]
+    requires = ["watch_reconciliation"]
 );
 pgrx::extension_sql_file!(
     "../sql/migrations/0036_invariants.sql",

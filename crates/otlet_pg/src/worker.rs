@@ -1,6 +1,6 @@
 use crate::job::{
     InferNowJobAdmission, Job, ModelSelectionPolicy, claim_jobs, insert_infer_now_job,
-    model_selection_policy,
+    model_selection_policy, replay_watch_reconciliation,
 };
 use crate::model::{
     ModelError, ModelMetrics, ModelPreload, ModelRun, preload_model, run_job, run_job_with_model,
@@ -127,6 +127,10 @@ pub extern "C-unwind" fn otlet_worker_main(_arg: pgrx::pg_sys::Datum) {
 
         let mut drained = 0;
         loop {
+            if let Err(err) = BackgroundWorker::transaction(replay_watch_reconciliation) {
+                pgrx::warning!("otlet watch reconciliation failed: {err}");
+                schema_probe_due = true;
+            }
             let jobs = match BackgroundWorker::transaction(claim_jobs) {
                 Ok(jobs) if jobs.is_empty() => break,
                 Ok(jobs) => jobs,
@@ -605,7 +609,7 @@ fn materialize_infer_now_subject(
 fn otlet_schema_ready() -> pgrx::spi::Result<bool> {
     pgrx::Spi::connect(|client| {
         let rows = client.select(
-            "SELECT to_regprocedure('otlet.claim_jobs(text,integer,jsonb)') IS NOT NULL AND to_regprocedure('otlet.materialize_completed_semantic_job(bigint)') IS NOT NULL AND to_regprocedure('otlet.complete_and_materialize_job(bigint,jsonb,text,jsonb,text,text,text,text,jsonb,text,text,text,text)') IS NOT NULL",
+            "SELECT to_regprocedure('otlet.claim_jobs(text,integer,jsonb)') IS NOT NULL AND to_regprocedure('otlet.replay_watch_reconciliation(boolean)') IS NOT NULL AND to_regprocedure('otlet.materialize_completed_semantic_job(bigint)') IS NOT NULL AND to_regprocedure('otlet.complete_and_materialize_job(bigint,jsonb,text,jsonb,text,text,text,text,jsonb,text,text,text,text)') IS NOT NULL",
             Some(1),
             &[],
         )?;

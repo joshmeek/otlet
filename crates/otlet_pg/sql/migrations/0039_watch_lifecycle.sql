@@ -2,14 +2,29 @@ CREATE FUNCTION otlet.watch_change_trigger() RETURNS trigger
 LANGUAGE plpgsql
 AS $$
 DECLARE
-  watch_task_name text;
   watch_on_change text;
+  watch_input_columns text[];
+  watch_revision_hash text;
+  source_table text;
   row_input jsonb;
+  reconciliation_input jsonb;
   subject_id text;
+  old_subject_id text;
+  row_ctid text;
+  row_xmin text;
 BEGIN
-  SELECT w.task_name, COALESCE(w.trigger_policy ->> 'on_change', 'mark_stale')
-  INTO watch_task_name, watch_on_change
+  SELECT
+    COALESCE(w.trigger_policy ->> 'on_change', 'mark_stale'),
+    w.input_columns,
+    head.active_workload_revision_hash,
+    w.source_table
+  INTO
+    watch_on_change,
+    watch_input_columns,
+    watch_revision_hash,
+    source_table
   FROM otlet.watches w
+  JOIN otlet.workload_revision_heads head ON head.task_name = w.task_name
   WHERE w.name = TG_ARGV[1]
     AND w.kind = 'row';
 
@@ -22,21 +37,70 @@ BEGIN
 
   IF TG_OP = 'DELETE' THEN
     row_input := to_jsonb(OLD);
+    row_ctid := OLD.ctid::text;
+    row_xmin := OLD.xmin::text;
   ELSE
     row_input := to_jsonb(NEW);
+    row_ctid := NEW.ctid::text;
+    row_xmin := NEW.xmin::text;
   END IF;
 
   subject_id := row_input ->> TG_ARGV[0];
+  IF TG_OP = 'UPDATE' THEN
+    old_subject_id := to_jsonb(OLD) ->> TG_ARGV[0];
+    IF old_subject_id IS DISTINCT FROM subject_id
+       AND old_subject_id IS NOT NULL THEN
+      PERFORM otlet.mark_semantic_stale(
+        format('%I.%I', TG_TABLE_SCHEMA, TG_TABLE_NAME),
+        old_subject_id,
+        'source_delete'
+      );
+      IF watch_on_change = 'mark_stale_and_enqueue' THEN
+        PERFORM otlet.record_watch_reconciliation(
+          TG_ARGV[1],
+          old_subject_id,
+          watch_revision_hash,
+          otlet.watch_source_delete_identity(TG_ARGV[1], old_subject_id),
+          true
+        );
+      END IF;
+    END IF;
+  END IF;
   PERFORM otlet.mark_semantic_stale(
     format('%I.%I', TG_TABLE_SCHEMA, TG_TABLE_NAME),
     subject_id,
     CASE WHEN TG_OP = 'DELETE' THEN 'source_delete' ELSE 'source_update' END
   );
 
-  IF TG_OP <> 'DELETE'
-     AND watch_on_change = 'mark_stale_and_enqueue'
+  IF watch_on_change = 'mark_stale_and_enqueue'
      AND subject_id IS NOT NULL THEN
-    PERFORM otlet.run_task_subject(watch_task_name, subject_id);
+    IF TG_OP = 'DELETE' THEN
+      PERFORM otlet.record_watch_reconciliation(
+        TG_ARGV[1],
+        subject_id,
+        watch_revision_hash,
+        otlet.watch_source_delete_identity(TG_ARGV[1], subject_id),
+        true
+      );
+    ELSE
+      reconciliation_input := jsonb_build_object(
+        '_otlet_mvcc', jsonb_build_object(
+          'table', source_table,
+          'subject_id', subject_id,
+          'ctid', row_ctid,
+          'xmin', row_xmin
+        ),
+        'table', source_table,
+        'row', otlet.semantic_project_row(row_input, watch_input_columns)
+      );
+      PERFORM otlet.record_watch_reconciliation(
+        TG_ARGV[1],
+        subject_id,
+        watch_revision_hash,
+        otlet.semantic_source_hash(reconciliation_input),
+        false
+      );
+    END IF;
   END IF;
 
   IF TG_OP = 'DELETE' THEN
@@ -135,6 +199,9 @@ BEGIN
     ), 64), 1, 16);
     EXECUTE format('DROP TRIGGER IF EXISTS %I ON %s', trigger_name, watch_row.source_table);
   END IF;
+
+  DELETE FROM otlet.watch_reconciliation reconciliation
+  WHERE reconciliation.watch_name = watch_row.name;
 
   DELETE FROM otlet.watches w
   WHERE w.name = watch_row.name;
@@ -278,6 +345,15 @@ BEGIN
     '{action_types}',
     to_jsonb(actual_action_types),
     true
+  );
+
+  task_name := create_watch.watch_name || '_task';
+  PERFORM 1
+  FROM otlet.production_policy policy
+  WHERE policy.name = 'default'
+  FOR UPDATE;
+  PERFORM pg_advisory_xact_lock(
+    hashtextextended('otlet_workload_revision:' || task_name, 0)
   );
 
   IF actual_kind = 'row' THEN
@@ -523,6 +599,12 @@ BEGIN
         COALESCE(NULLIF(pair_source ->> 'subject_column', ''), 'id')
       );
     END LOOP;
+  END IF;
+
+  IF saved.kind <> 'row'
+     OR COALESCE(saved.trigger_policy ->> 'on_change', 'mark_stale') <> 'mark_stale_and_enqueue' THEN
+    DELETE FROM otlet.watch_reconciliation reconciliation
+    WHERE reconciliation.watch_name = saved.name;
   END IF;
 
   PERFORM otlet.promote_configured_workload_revision(saved.task_name);

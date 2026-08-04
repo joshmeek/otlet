@@ -130,6 +130,9 @@ $$;
 \set portable_migration_file ../../../otlet_pg/sql/migrations/0034_semantic_status_plan.sql
 \ir migrations/apply.sql
 
+\set portable_migration_file ../../../otlet_pg/sql/migrations/0045_watch_reconciliation.sql
+\ir migrations/apply.sql
+
 \set portable_migration_file ../../../otlet_pg/sql/migrations/0035_queue_policy_status.sql
 \ir migrations/apply.sql
 

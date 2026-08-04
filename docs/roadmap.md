@@ -58,6 +58,7 @@ Every shipped track needs SQL-visible state, a closed failure path, executable D
 | Native same-model cross-task claims | The native task-cursor path can fill one bounded batch from compatible tasks while preserving FIFO order within retry class, claim fencing, and model-policy separation. The reference portable worker requests one claim at a time |
 | Optional native model preload | An owner can preload one registered model with normal artifact, memory, cgroup, fingerprint, and failure checks when predictable first-request latency justifies resident memory |
 | Semantic row watches | Row changes can mark one subject stale, enqueue refresh work, materialize trusted records, and fail closed when stored output no longer matches current source state |
+| Durable watch reconciliation | A row source change persists one coalesced entry per watch and subject with the newest workload revision, source identity, deletion state, and sequence-fenced generation. Native pre-claim and portable heartbeat paths replay one due entry per transaction with bounded backoff. Status exposes pending age and exhaustion, and owners can force replay or acknowledge an exact generation. Pair watches keep explicit atomic full refresh under the caller statement timeout |
 | Semantic pair watches | Bounded candidate SQL drives pair judgments with plan-cost preflight, caller statement timeout, candidate drift detection, source dependencies, and pair materialization |
 | Native semantic query planning | Native CustomScan serves supported fresh semantic predicates, refreshes bounded stale rows through infer-now, exposes plan evidence, and leaves unsupported correlated or row-locking shapes on a standard PostgreSQL plan |
 | Semantic SQL reads | Native and SQL-only installations expose current row and pair materializations, freshness status, dependency audit, predicate reads, and plan-status functions |
@@ -82,7 +83,6 @@ Work in this section closes demonstrated correctness and trust gaps before Otlet
 
 | Feature | Explanation |
 | --- | --- |
-| Durable watch reconciliation | Persist one coalesced dirty entry per watch and subject when enqueue admission rejects work. Retain the newest source identity, handle source deletion, retry with bounded backoff, expose exhaustion and oldest-pending age, and allow replay or acknowledgement after native or portable restart |
 | Definition complexity bounds | Bound instruction, query, schema, runtime JSON, decision contract, nesting depth, node count, identifier count, and prompt-construction work so adversarial definitions fail atomically without backend instability |
 
 ## Near-term operating hardening

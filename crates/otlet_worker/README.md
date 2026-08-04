@@ -110,7 +110,7 @@ PostgreSQL assigns the cheap claim, validates the result, and completes accepted
 
 ## Watch Source Rows
 
-Create a row watch with automatic enqueue, then commit source changes before polling results:
+Create a row watch with durable automatic catch-up, then commit source changes before polling results:
 
 ```sql
 CREATE TABLE vendor_notes (
@@ -141,7 +141,7 @@ FROM otlet.semantic_index_status
 WHERE name = 'vendor_note_summary';
 ```
 
-PostgreSQL queues inserts and updates in the source transaction, so the external worker sees them after commit. Portable completion stores the output and semantic materialization in one transaction. Deletes mark prior materializations stale and remove them from current-row reads. Canceled jobs do not materialize
+PostgreSQL marks inserts and updates stale and writes one coalesced reconciliation entry per subject in the source transaction. A running worker replays one due entry from heartbeat after commit; admission failure backs off without losing the newest source identity. Portable completion stores the output and semantic materialization in one transaction. Deletes clear the durable entry without inference and remove prior materializations from current-row reads. Canceled jobs do not materialize
 
 Pair watches use the same `create_watch(..., kind => 'pair')`, `refresh_semantic_join_index(...)`, `semantic_join_index_current_rows(...)`, and `semantic_join_index_plan(...)` functions as the native installation. Candidate preflight, bounded refresh, pair-source stale triggers, completion materialization, deletion reconciliation, watch export, and status are PostgreSQL-owned and work without the extension
 

@@ -506,6 +506,15 @@ WITH watch_sources AS (
   WHERE e.event_type = 'queue_admission_suppressed'
     AND e.detail ? 'task_name'
   GROUP BY e.detail ->> 'task_name'
+), reconciliation AS (
+  SELECT
+    pending.watch_name,
+    count(*) FILTER (WHERE pending.state = 'pending')::bigint AS pending_subjects,
+    count(*) FILTER (WHERE pending.state = 'exhausted')::bigint AS exhausted_subjects,
+    min(pending.first_dirty_at) FILTER (WHERE pending.state = 'pending') AS oldest_pending_at,
+    min(pending.next_attempt_at) FILTER (WHERE pending.state = 'pending') AS next_attempt_at
+  FROM otlet.watch_reconciliation pending
+  GROUP BY pending.watch_name
 ), materialized AS (
   SELECT
     sm.task_name,
@@ -574,6 +583,13 @@ SELECT
   COALESCE(action_counts.rejected_actions, 0)::bigint AS rejected_actions,
   COALESCE(suppression.suppressed_events, 0)::bigint AS queue_admission_suppressed_events,
   suppression.last_suppressed_at AS queue_admission_last_suppressed_at,
+  COALESCE(reconciliation.pending_subjects, 0)::bigint AS reconciliation_pending_subjects,
+  COALESCE(reconciliation.exhausted_subjects, 0)::bigint AS reconciliation_exhausted_subjects,
+  CASE
+    WHEN reconciliation.oldest_pending_at IS NULL THEN NULL
+    ELSE GREATEST(clock_timestamp() - reconciliation.oldest_pending_at, interval '0')
+  END AS reconciliation_oldest_pending_age,
+  reconciliation.next_attempt_at AS reconciliation_next_attempt_at,
   materialized.last_materialized_at,
   COALESCE(materialized.revalidated_materializations, 0)::bigint AS revalidated_materializations,
   COALESCE(plan.checked_at, now()) AS checked_at
@@ -583,5 +599,6 @@ LEFT JOIN watch_plans plan ON plan.watch_name = w.watch_name
 LEFT JOIN job_counts ON job_counts.task_name = w.task_name
 LEFT JOIN action_counts ON action_counts.task_name = w.task_name
 LEFT JOIN suppression ON suppression.task_name = w.task_name
+LEFT JOIN reconciliation ON reconciliation.watch_name = w.watch_name
 LEFT JOIN materialized ON materialized.task_name = w.task_name
   AND materialized.record_type = w.record_type;
