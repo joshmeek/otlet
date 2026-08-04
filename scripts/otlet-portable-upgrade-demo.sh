@@ -45,6 +45,14 @@ SQL
 
 cleanup
 docker exec "$container" createdb -U postgres "$database"
+docker exec -i "$container" psql -U postgres -d postgres \
+  -X -q -v ON_ERROR_STOP=1 -v database="$database" <<'SQL' >/dev/null
+SELECT format(
+  'ALTER DATABASE %I SET otlet.administrative_reason = %L',
+  :'database',
+  'portable upgrade executable proof'
+) \gexec
+SQL
 install_portable
 
 docker exec -i "$container" psql -U postgres -d "$database" \
@@ -71,7 +79,7 @@ contract="$(
 SELECT concat_ws('|',
   max(version),
   count(*),
-  array_agg(version ORDER BY version) = ARRAY(SELECT generate_series(1, 50)),
+  array_agg(version ORDER BY version) = ARRAY(SELECT generate_series(1, 51)),
   bool_and(file ~ ('(^|/)' || lpad(version::text, 4, '0') || '_')),
   (SELECT value FROM public.portable_upgrade_sentinel),
   (SELECT count(*) FROM otlet.verify_invariants())
@@ -79,7 +87,7 @@ SELECT concat_ws('|',
 FROM otlet.portable_schema_migrations;
 SQL
 )"
-[ "$contract" = "50|50|t|t|preserved|0" ] || {
+[ "$contract" = "51|51|t|t|preserved|0" ] || {
   echo "Portable repeat-install contract mismatch: $contract" >&2
   exit 1
 }
@@ -264,6 +272,122 @@ SQL
   exit 1
 }
 
+administrative_migration_contract="$(
+  docker exec -i "$container" psql -U postgres -d "$database" \
+    -X -qAt -v ON_ERROR_STOP=1 -v operator_role="$operator_role" <<'SQL' | tail -n 1
+BEGIN;
+SELECT otlet.set_administrative_change_context(
+  'portable administrative ledger proof'
+) \g /dev/null
+SELECT otlet.grant_application_access(:'operator_role'::regrole) \g /dev/null
+SELECT otlet.grant_portable_worker_access(:'operator_role'::regrole) \g /dev/null
+SELECT concat_ws('|',
+  (SELECT count(*) = 13
+   FROM information_schema.columns
+   WHERE table_schema = 'otlet'
+     AND table_name = 'administrative_change_events'),
+  (SELECT count(*) = 9
+   FROM pg_catalog.pg_trigger trigger
+   WHERE trigger.tgrelid IN (
+     'otlet.administrative_change_events'::regclass,
+     'otlet.models'::regclass,
+     'otlet.tasks'::regclass,
+     'otlet.watches'::regclass,
+     'otlet.model_selection_policies'::regclass,
+     'otlet.action_targets'::regclass,
+     'otlet.action_workflow_policies'::regclass,
+     'otlet.production_policy'::regclass
+   )
+     AND trigger.tgname IN (
+       'administrative_change_events_row_guard',
+       'administrative_change_events_truncate_guard',
+       'models_administrative_change',
+       'tasks_administrative_change',
+       'watches_administrative_change',
+       'model_selection_policies_administrative_change',
+       'action_targets_administrative_change',
+       'action_workflow_policies_administrative_change',
+       'production_policy_retention_administrative_change'
+     )),
+  to_regprocedure('otlet.set_administrative_change_context(text,text)') IS NOT NULL
+    AND to_regprocedure('otlet.append_administrative_change(text,text,text,text,text)') IS NOT NULL
+    AND to_regprocedure('otlet.record_administrative_row_change()') IS NOT NULL
+    AND to_regprocedure('otlet.access_policy_revision(regrole)') IS NOT NULL
+    AND to_regclass('otlet.audit_administrative_change_export') IS NOT NULL,
+  (SELECT count(*) = 2
+          AND count(DISTINCT object_name) = 2
+          AND bool_and(
+            operation = 'grant'
+            AND actor_name = session_user
+            AND active_role_name = session_user
+            AND reason = 'portable administrative ledger proof'
+            AND ticket IS NULL
+            AND old_revision_hash IS NOT NULL
+            AND new_revision_hash IS NOT NULL
+            AND (
+              prior_revision_hash IS NULL
+              OR old_revision_hash = prior_revision_hash
+            )
+          )
+   FROM (
+     SELECT
+       event.*,
+       lag(new_revision_hash) OVER (ORDER BY event_id) AS prior_revision_hash
+     FROM otlet.administrative_change_events event
+     WHERE object_name IN (
+       'application:' || :'operator_role',
+       'portable_worker:' || :'operator_role'
+     )
+   ) access_chain),
+  EXISTS (
+    SELECT 1
+    FROM otlet.portable_schema_migrations
+    WHERE version = 51
+      AND file ~ '0051_administrative_change_ledger.sql$'
+  ),
+  NOT pg_catalog.has_table_privilege(
+    'public',
+    'otlet.administrative_change_events',
+    'SELECT,INSERT,UPDATE,DELETE,TRUNCATE'
+  )
+    AND NOT pg_catalog.has_table_privilege(
+      'public',
+      'otlet.audit_administrative_change_export',
+      'SELECT'
+    )
+    AND NOT pg_catalog.has_sequence_privilege(
+      'public',
+      'otlet.administrative_change_events_event_id_seq',
+      'USAGE,SELECT,UPDATE'
+    )
+    AND NOT EXISTS (
+      SELECT 1
+      FROM unnest(ARRAY[
+        'otlet.guard_administrative_change_events()'::regprocedure,
+        'otlet.set_administrative_change_context(text,text)'::regprocedure,
+        'otlet.administrative_state_hash(text,jsonb)'::regprocedure,
+        'otlet.append_administrative_change(text,text,text,text,text)'::regprocedure,
+        'otlet.record_administrative_row_change()'::regprocedure,
+        'otlet.access_policy_descriptor(regrole)'::regprocedure,
+        'otlet.access_policy_revision(regrole)'::regprocedure,
+        'otlet.finish_access_policy_grant(text,regrole,text)'::regprocedure
+      ]) AS function_oid(oid)
+      WHERE pg_catalog.has_function_privilege(
+        'public',
+        function_oid.oid,
+        'EXECUTE'
+      )
+    ),
+  NOT EXISTS (SELECT 1 FROM otlet.verify_invariants())
+);
+ROLLBACK;
+SQL
+)"
+[ "$administrative_migration_contract" = "t|t|t|t|t|t|t" ] || {
+  echo "Portable administrative migration contract mismatch: $administrative_migration_contract" >&2
+  exit 1
+}
+
 identity_vector_contract="$(
   docker exec -i "$container" psql -U postgres -d "$database" \
     -X -qAt -v ON_ERROR_STOP=1 <<'SQL'
@@ -317,6 +441,36 @@ SELECT otlet.create_task(
   input_shaping => '{"source_fields":["value"]}'::jsonb
 );
 SQL
+
+portable_ask_administrative_contract="$(
+  docker exec -i "$container" psql -U postgres -d "$database" \
+    -X -qAt -v ON_ERROR_STOP=1 <<'SQL'
+BEGIN;
+SET LOCAL otlet.administrative_reason = '';
+SET LOCAL otlet.administrative_ticket = '';
+SELECT otlet.enqueue_ask(
+  'model_concurrency_probe',
+  'Return an empty object',
+  '{"value":1}'::jsonb
+) AS job_id \gset
+SELECT concat_ws('|',
+  :'job_id'::bigint > 0,
+  current_setting('otlet.administrative_suppress', true) IS DISTINCT FROM 'on',
+  NOT EXISTS (
+    SELECT 1
+    FROM otlet.administrative_change_events event
+    JOIN otlet.jobs job ON job.task_name = event.object_name
+    WHERE job.id = :'job_id'::bigint
+      AND event.object_type = 'task'
+  )
+);
+ROLLBACK;
+SQL
+)"
+[ "$portable_ask_administrative_contract" = "t|t|t" ] || {
+  echo "Portable queued ask administrative contract mismatch: $portable_ask_administrative_contract" >&2
+  exit 1
+}
 
 portable_task_lifecycle_contract="$(
   docker exec -i "$container" psql -U postgres -d "$database" \
@@ -645,6 +799,8 @@ echo "portable_upgrade_contract=$contract"
 echo "portable_identity_vector_contract=$identity_vector_contract"
 echo "portable_application_migration_contract=$application_migration_contract"
 echo "portable_lifecycle_migration_contract=$lifecycle_migration_contract"
+echo "portable_administrative_migration_contract=$administrative_migration_contract"
+echo "portable_ask_administrative_contract=$portable_ask_administrative_contract"
 echo "portable_task_lifecycle_contract=$portable_task_lifecycle_contract"
 echo "portable_model_capacity_contract=$batch_claims|$batch_capacity_contract|$concurrent_capacity_contract|$cancel_blocked_claims|$replacement_claims|$lease_capacity_contract"
 echo "portable_renewal_race_contract=$renewal_race_contract"

@@ -10,7 +10,7 @@ Otlet treats source text, imported configuration, identifiers, model files, mode
 | Native runtime | Registered GGUF files, verified artifact identity, worker process, shared memory, latches, and CustomScan state | Otlet background worker | Internal functions and tables needed to run claimed work |
 | Application | Source rows and bounded task-subject invocation | Authenticated application login through an owner-granted capability | Submit against any active task with optional owner-scoped idempotency and read or cancel owned jobs; no direct table access, administration, review/apply, retry, worker, or grant authority |
 | Operations | Review, dry run, apply, bounded application retry, cancellation, and policy status | `otlet_operator` session | Allowlisted functions and redacted views |
-| Audit | Receipts, labels, policy state, and redacted operational evidence | `otlet_auditor` session | Read-only allowlisted views |
+| Audit | Receipts, labels, policy state, administrative history, and redacted operational evidence | `otlet_auditor` session | Read-only allowlisted views |
 | Portable authoring | `otlet.watch.v1`, SQL text, JSON Schema, model policy, runtime options, and ordinary files | Pack author and importer | Untrusted bytes until database validation and import |
 | Portable protocol | Shaped snapshots and claim, attempt, completion, failure, and cancellation messages | Allowlisted external worker identity and current process incarnation | Exact-version, role-bound, fenced RPC authority with no direct table access |
 
@@ -21,6 +21,7 @@ Deployers trust the native worker and PostgreSQL extension code. The local model
 | Transition | Untrusted input | Control | Closed result |
 | --- | --- | --- | --- |
 | Configuration to registry | Task, watch, runtime, shaping, decision, and candidate SQL fields | Fixed byte, depth, node, identifier, dependency, and prompt bounds before schema traversal, query binding, or hashing; allowlists, bounded candidate `EXPLAIN`, statement timeout, and transaction rollback | Reject the definition without a task, revision, watch, policy, queue, or materialization mutation |
+| Administrative change to history | Model, task, watch, selection, action-policy, Otlet grant-helper, and retention mutations | Required reason or ticket, authenticated actor, active role, canonical prior and resulting identities, append guard, and transaction commit | Reject missing context without registry mutation; append one committed change while no-ops and rollbacks leave no event |
 | Task lifecycle to execution authority | Target state and expected revision pin | Owner-only transition, production-policy, task, and declared-source locks, exact revision comparison, live-work drain, unfinished job and reconciliation checks, and revision-head authority | Reject a stale pin or unsafe transition without mutation; pause and retirement remove execution authority without losing queued, dirty-source, or terminal evidence |
 | Artifact to native runtime | File path, bytes, digest, size, and GGUF structure | Registered identity, streamed SHA-256, byte count, parser check, and recheck before each load | Fail the job with a receipt and keep the worker available |
 | Source to job snapshot | Candidate query rows, source fields, application request key, and retry mode | Immutable workload revision, row, byte, queue, plan-cost, timeout, and source-field admission; authenticated owner and active-role provenance; owner-scoped key bound to a PostgreSQL-authored operation, task, and subject hash; original-snapshot retry limited to an active original revision | Queue every eligible row under one captured contract or none; return the prior keyed job for an exact retry; reject a changed payload or inactive original revision without mutation |
@@ -69,6 +70,21 @@ task_watch_lifecycle_contract=pin_conflict|pause_fenced|live_claim_fenced|unfini
 task_watch_lifecycle_race_contract=definition_write_fenced|action_policy_serialized|repair_serialized|retirement_serialized|backlog_preserved|resume_queued|queue_canceled|repaused|source_missing|status_closed|retired|exact_drop|archive_retained|registry_removed|index_removed|reconciliation_removed|invariants_clean
 portable_task_lifecycle_contract=t|t|t|t|t|t|t|t|t|t|t
 ```
+
+## Administrative Change Contract
+
+`./scripts/demo/administrative_change_ledger.sh` covers all seven administrative categories, direct registry renames, retention delete and recreate, target recertification across relation renames, explicit workload promotion, revision chains, delegated active-role attribution, concurrent same-role grants, reason and ticket context, missing-context rejection, no-op and rollback suppression, append guards, the audit grant, export declaration, `PUBLIC` closure, hash shape, and invariants. Direct and queued ask proofs keep deterministic task synthesis out of administrative history. The action-target drift proof does the same for automatic generation bumps. The SQL-only upgrade proof checks migration 51, the table, triggers, helpers, access events, revision chain, queued ask behavior, and closure
+
+```text
+administrative_change_ledger_contract=t|t|t|t|t|t|t|t|t|t|t|t|t|t|t|t|t|t|t
+administrative_access_race_contract=t|t
+portable_administrative_migration_contract=t|t|t|t|t|t|t
+portable_ask_administrative_contract=t|t|t
+direct_ask_administrative_contract=true
+action_target_drift_contract=true|true|true|true|true|true|true|true|true|true|true|true|true|true|true|true|true
+```
+
+Otlet records events from installation forward and leaves earlier history absent. Raw database-owner `GRANT` or `REVOKE` statements remain outside Otlet helper coverage until the access-policy lifecycle ships. A database or extension owner can replace or disable the guards; the planned signed checkpoints cover that stronger boundary
 
 ## Native Threats
 

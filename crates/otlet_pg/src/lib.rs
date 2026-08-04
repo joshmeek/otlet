@@ -256,9 +256,14 @@ pgrx::extension_sql_file!(
     requires = ["invocation_provenance"]
 );
 pgrx::extension_sql_file!(
+    "../sql/migrations/0051_administrative_change_ledger.sql",
+    name = "administrative_change_ledger",
+    requires = ["task_watch_operational_lifecycle"]
+);
+pgrx::extension_sql_file!(
     "../sql/migrations/0043_permissions.sql",
     name = "permissions",
-    requires = ["task_watch_operational_lifecycle"]
+    requires = ["administrative_change_ledger"]
 );
 
 #[allow(non_snake_case)]

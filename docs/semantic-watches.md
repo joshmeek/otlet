@@ -47,19 +47,18 @@ Representative output:
 ```text
  otlet_base_tables
 -------------------
-                26
+                30
 (1 row)
 ```
 
 Group the base tables by role:
 
 - `models` and `runtime_slots` describe the local resident model runtime
-- `tasks`, `model_selection_policies`, and `jobs` describe durable work and cheap-first escalation policy
+- `tasks`, `decision_rule_presets`, `model_selection_policies`, `workload_revisions`, `workload_revision_heads`, and `jobs` describe durable work and cheap-first escalation policy
 - `outputs`, `actions`, `records`, `inference_receipts`, `eval_labels`, `review_events`, and `worker_events` store results and execution evidence
 - `action_type_schemas`, `action_targets`, `action_workflow_policies`, and `action_execution_receipts` constrain application writes
-- `production_policy` defines queue admission, leases, invalid output handling, stale-result behavior, and cleanup windows
-- `watches`, `semantic_indexes`, and `semantic_materializations` make row-derived model state queryable
-- `watches` and `semantic_join_indexes` store pairwise candidate definitions
+- `production_policy` defines queue admission, leases, invalid output handling, stale-result behavior, and cleanup windows while `administrative_change_events` keeps configuration history
+- `watches`, `semantic_indexes`, `semantic_join_indexes`, `semantic_materializations`, and `watch_reconciliation` make row and pair state durable and queryable
 - `portable_workers`, `portable_claims`, `portable_protocol_versions`, and `portable_receipt_links` fence external workers
 
 Use `otlet.application_job_status(job_id)` for application reads. Use `otlet.runs` and the trace and status views for owner debugging, proof, and learning
@@ -94,6 +93,8 @@ A row watch wraps a source table with an Otlet task, materialized records, stale
 The creation shape is:
 
 ```sql
+SET otlet.administrative_reason = 'Semantic watches walkthrough';
+
 SELECT otlet.create_watch(
   'demo_semantic_vendor_idx',
   'row',

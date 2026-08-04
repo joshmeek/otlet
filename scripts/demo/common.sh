@@ -1,3 +1,5 @@
+demo_pgoptions="${OTLET_DEMO_PGOPTIONS:--c otlet.administrative_reason=repository-demo}"
+
 log() {
   printf '[%s] %s\n' "$(date '+%H:%M:%S')" "$*"
 }
@@ -10,7 +12,8 @@ require_container() {
 }
 
 psql_exec() {
-  docker exec -i "$container" psql -U postgres -d "$database" -v ON_ERROR_STOP=1 "$@"
+  docker exec -e PGOPTIONS="$demo_pgoptions" -i "$container" \
+    psql -U postgres -d "$database" -v ON_ERROR_STOP=1 "$@"
 }
 
 psql_value() {
@@ -18,7 +21,7 @@ psql_value() {
 }
 
 psql_candidate_exec() {
-  docker exec -e PGOPTIONS='-c statement_timeout=2000ms' -i "$container" \
+  docker exec -e PGOPTIONS="-c statement_timeout=2000ms $demo_pgoptions" -i "$container" \
     psql -U postgres -d "$database" -v ON_ERROR_STOP=1 "$@"
 }
 

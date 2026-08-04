@@ -90,6 +90,34 @@ preload_admission_contract=failed|model_load_admission_rejected|rejected|true|tr
 
 The production policy row and status views expose SQL state under `otlet`: `production_policy_status`, `production_status`, `model_queue_status`, `worker_throughput_status`, and `cleanup_policy_state(true)`. Cross-task batch entries expose every claimed task through `task_names`
 
+Model, task, watch, selection, action-policy, Otlet access-grant, and retention changes require a reason or ticket in the same transaction. The helper uses transaction-local settings, so calling it in autocommit mode does not authorize a later statement:
+
+Otlet treats deterministic task synthesis for direct and queued one-off asks, plus automatic target-generation bumps after contract drift, as runtime bookkeeping. These paths append no administrative event and restore the caller's suppression state. Explicit task changes, target recertification, and workload promotion append events
+
+```sql
+BEGIN;
+SELECT otlet.set_administrative_change_context(
+  reason => 'Raise diagnostic retention for one incident',
+  ticket => 'OPS-123'
+);
+
+-- Run the administrative statements here
+
+COMMIT;
+```
+
+PostgreSQL appends the authenticated actor, active role, operation, prior and resulting `otlet:v1:sha256` identities, reason or ticket, and time. Inserts and deletes use null for the absent side. No-ops and rolled-back work leave no event. Read the hash-only projection as the owner, auditor, or operator:
+
+```sql
+SELECT event_id, object_type, object_name, operation,
+       actor_name, active_role_name, reason, ticket,
+       old_revision_hash, new_revision_hash, changed_at
+FROM otlet.audit_administrative_change_export
+ORDER BY event_id DESC;
+```
+
+Otlet records changes from migration installation forward and leaves earlier history absent. Raw owner `GRANT` and `REVOKE` statements are outside the grant-helper ledger until the planned access-policy lifecycle. The database or extension owner can disable or replace database guards; the planned signed-checkpoint work covers that stronger boundary. Repository demo connections and disposable SQL-only databases supply a generic proof reason. Production sessions should supply a specific transaction-local context
+
 Native and portable claims share the task-cursor ring. Within each ring segment and task, expired claims rank before queued work, reclaim replaces the claim token, cancellation state survives reclaim, and model residency does not change the order
 
 `max_active_jobs` caps live claimed leases per model across native claims, portable claims, and infer-now. A `running` or `cancel_requested` job consumes one slot while `leased_until >= now()`; an expired or null lease consumes none. Claims stop at the smaller of the requested batch and the remaining slots. Claims, infer-now admission, and renewal share the queue-admission fence. Otlet locks the lease row before it checks wall time and rejects a renewal if its lease expired while waiting. `model_queue_status` and `worker_throughput_status` expose `active_claimed_jobs` and `available_active_job_slots`, and `verify_invariants()` reports `active_claimed_jobs_within_model_cap`
@@ -218,6 +246,9 @@ The extension owner can enable `diagnostic` mode for a bounded local investigati
 
 ```sql
 BEGIN;
+SELECT otlet.set_administrative_change_context(
+  'Bounded diagnostic evidence window'
+);
 UPDATE otlet.production_policy
 SET sensitive_evidence_mode = 'diagnostic'
 WHERE name = 'default';
@@ -257,6 +288,10 @@ FROM otlet.production_policy_status;
 Oversized evidence raises an error before output, action, event, or receipt storage. Use `decision_contract.redact_output_fields` and `decision_contract.redact_action_fields` for recursive structured redaction. `identity_fields` names workload-specific identifiers that redaction must preserve; Otlet also protects its built-in action and control identifiers
 
 ```sql
+BEGIN;
+SELECT otlet.set_administrative_change_context(
+  'Create the redacted review task'
+);
 SELECT otlet.create_task(
   task_name => 'redacted_review',
   input_query => NULL,
@@ -270,6 +305,7 @@ SELECT otlet.create_task(
     "identity_fields":["case_id"]
   }'
 );
+COMMIT;
 ```
 
 `otlet.operational_event_log` exposes event type, task and model identity, status, reason, counts, timing, byte limits, and redaction state without the raw event message or detail document. Auditor exports add structured and action redaction state without exposing job input, source rows, raw model text, or full traces
@@ -319,7 +355,7 @@ SELECT count(*) FROM otlet.verify_invariants();
 
 Contract: `0` (demo prints `invariant_contract=0`). The suite fails closed on expired or NULL leases for `running` and `cancel_requested` jobs, complete receipts without schema pass, sensitive evidence that violates the active storage policy, materializations missing `source_hash`, and error runtime slots. `production_status` and `verify_invariants` name the receipt invariant `complete_receipts_are_schema_validated`; throughput views use `completed_jobs` and `last_batch_completed_jobs`. Step 6 of `docs/semantic-watches.md` anchors the planner vocabulary for `selected_path` / `Planner Selected Path` and `freshness_basis`
 
-Operators query redacted, read-only projections through `otlet.audit_receipt_export`, `otlet.audit_review_export`, `otlet.audit_review_event_export`, `otlet.audit_action_execution_export`, `otlet.audit_eval_label_export`, `otlet.semantic_dependency_audit`, `otlet.operational_event_log`, and `otlet.worker_batch_timing_status`. `otlet.redaction_policy_status` lists withheld fields
+Operators query redacted, read-only projections through `otlet.audit_receipt_export`, `otlet.audit_review_export`, `otlet.audit_review_event_export`, `otlet.audit_action_execution_export`, `otlet.audit_eval_label_export`, `otlet.audit_administrative_change_export`, `otlet.semantic_dependency_audit`, `otlet.operational_event_log`, and `otlet.worker_batch_timing_status`. `otlet.redaction_policy_status` lists withheld fields
 
 ## Step 4 - Grant Role-Scoped Access
 
@@ -328,6 +364,11 @@ Otlet revokes schema, table, sequence, and function access from `PUBLIC`. The ex
 Create roles through your normal provisioning path. These `NOLOGIN` roles show the grant contract:
 
 ```sql
+BEGIN;
+SELECT otlet.set_administrative_change_context(
+  'Grant the application and review capabilities',
+  'ACCESS-42'
+);
 CREATE ROLE app_otlet_auditor NOLOGIN;
 CREATE ROLE app_otlet_operator NOLOGIN;
 CREATE ROLE app_otlet_application NOLOGIN;
@@ -335,6 +376,7 @@ CREATE ROLE app_otlet_application NOLOGIN;
 SELECT otlet.grant_auditor_access('app_otlet_auditor'::regrole);
 SELECT otlet.grant_operator_access('app_otlet_operator'::regrole);
 SELECT otlet.grant_application_access('app_otlet_application'::regrole);
+COMMIT;
 ```
 
 The application capability grants three functions: `application_submit_task_subject(...)`, `application_job_status(...)`, and `application_cancel_job(...)`. Login roles may inherit one shared capability role, but job ownership remains the authenticated `session_user`; PostgreSQL records the active `SET ROLE` value as invocation provenance and leaves ownership unchanged. The grant can invoke every active task in the database, so grant it to logins allowed to use that full task set. The capability grants no direct source or Otlet table access, task, model, or watch administration, review or apply authority, worker RPCs, receipt, trace, or cleanup views, retry authority, or further grant authority
@@ -348,6 +390,7 @@ The auditor capability grants these redacted policy and audit views:
 - `otlet.audit_review_event_export`
 - `otlet.audit_action_execution_export`
 - `otlet.audit_eval_label_export`
+- `otlet.audit_administrative_change_export`
 - `otlet.action_workflow_policy_status`
 - `otlet.semantic_dependency_audit`
 - `otlet.operational_event_log`
@@ -397,11 +440,11 @@ SELECT * FROM otlet.access_policy_status;
 SELECT * FROM otlet.application_access_policy_status;
 ```
 
-The demo proves the catalog ACLs, 16 auditor views and 20 function grants, 16 operator views and 29 function grants, seven operator paths, 26 exact security-definer functions, three application RPCs, eight portable RPCs, 13 denied application paths, and 64 denied auditor or operator paths. The delegated operator role proves all five review outcomes:
+The demo proves the catalog ACLs, 17 auditor views and 20 function grants, 17 operator views and 29 function grants, seven operator paths, 26 exact security-definer functions, three application RPCs, eight portable RPCs, 15 denied application paths, and 72 denied auditor or operator paths. The delegated operator role proves all five review outcomes:
 
 ```text
 review_provenance_contract=true|true|true|true|true|true|true|true|true|true|true
-permission_contract=public=0/0/0|auditor=16/20|operator=16/29|definer=26/26|application=3/3/3|portable=8/8/8|positive=7|denied=64
+permission_contract=public=0/0/0|auditor=17/20|operator=17/29|definer=26/26|application=3/3/3|portable=8/8/8|positive=7|denied=72
 ```
 
 Your application still owns these deployment boundaries:

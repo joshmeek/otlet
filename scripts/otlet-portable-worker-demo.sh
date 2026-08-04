@@ -225,6 +225,14 @@ docker exec -e CARGO_TARGET_DIR=/target -w /work "$container" \
 runtime_identity="$(docker exec "$container" /target/release/otlet_worker --print-runtime-identity)"
 
 docker exec "$container" createdb -U postgres "$portable_database"
+docker exec -i "$container" psql -U postgres -d postgres \
+  -X -q -v ON_ERROR_STOP=1 -v database="$portable_database" <<'SQL' >/dev/null
+SELECT format(
+  'ALTER DATABASE %I SET otlet.administrative_reason = %L',
+  :'database',
+  'portable worker executable proof'
+) \gexec
+SQL
 docker exec -w /work "$container" psql -U postgres -d "$portable_database" \
   -X -q -v ON_ERROR_STOP=1 -f crates/otlet_worker/sql/install.sql
 
@@ -480,10 +488,12 @@ if [ "$admission_contract" != "true" ]; then
   exit 1
 fi
 
-async_job_id="$(
+async_ask_result="$(
   docker exec -i "$container" psql -U postgres -d "$portable_database" \
     -X -qAt -v ON_ERROR_STOP=1 -v model_name="$model_name" <<'SQL'
 BEGIN;
+SET LOCAL otlet.administrative_reason = '';
+SET LOCAL otlet.administrative_ticket = '';
 SELECT otlet.enqueue_ask(
   :'model_name',
   'Return decision keep',
@@ -491,12 +501,37 @@ SELECT otlet.enqueue_ask(
   '{"type":"object","required":["decision"],"additionalProperties":false,"properties":{"decision":{"const":"keep"}}}'::jsonb,
   '{"reasoning":"off","max_tokens":48,"inference_cache":false,"llama_threads":2,"llama_batch_threads":3}'::jsonb
 ) AS async_job_id \gset
+SELECT concat_ws('|',
+  :'async_job_id',
+  (current_setting('otlet.administrative_suppress', true) IS DISTINCT FROM 'on')::text
+);
 COMMIT;
-SELECT :'async_job_id';
 SQL
 )"
+async_job_id="${async_ask_result%%|*}"
 if [[ ! "$async_job_id" =~ ^[1-9][0-9]*$ ]]; then
   echo "Expected enqueue_ask to return a positive job ID, got $async_job_id" >&2
+  exit 1
+fi
+if [ "$async_ask_result" != "$async_job_id|true" ]; then
+  echo "Expected enqueue_ask to restore administrative suppression, got $async_ask_result" >&2
+  exit 1
+fi
+
+async_administrative_contract="$(
+  docker exec -i "$container" psql -U postgres -d "$portable_database" \
+    -X -qAt -v ON_ERROR_STOP=1 -v async_job_id="$async_job_id" <<'SQL'
+SELECT NOT EXISTS (
+  SELECT 1
+  FROM otlet.administrative_change_events event
+  JOIN otlet.jobs job ON job.task_name = event.object_name
+  WHERE job.id = :'async_job_id'::bigint
+    AND event.object_type = 'task'
+)::text;
+SQL
+)"
+if [ "$async_administrative_contract" != "true" ]; then
+  echo "Expected queued ask task synthesis to stay outside administrative history" >&2
   exit 1
 fi
 
@@ -2044,7 +2079,7 @@ if [ "$portable_parity_contract" != "0|4|5|t" ]; then
   exit 1
 fi
 
-echo "portable_async_inference_contract=$async_queued_contract|$async_result_contract|admission=closed|input=validated|scalar_non_watch=accepted"
+echo "portable_async_inference_contract=$async_queued_contract|$async_result_contract|admission=closed|input=validated|scalar_non_watch=accepted|administrative=$async_administrative_contract"
 echo "portable_model_routing_contract=$routing_handoff_contract|$routing_complete_contract|$routing_accept_contract"
 echo "portable_claim_metadata_contract=$claim_metadata_contract"
 echo "portable_selection_failure_contract=$routing_failure_contract"

@@ -982,7 +982,7 @@ fi
 
 if revision_claim_promotion_output="$(
   docker exec \
-    -e PGOPTIONS='-c lock_timeout=250ms' \
+    -e PGOPTIONS="-c lock_timeout=250ms $demo_pgoptions" \
     -i "$container" \
     psql -U postgres -d "$database" -v ON_ERROR_STOP=1 -qAt 2>&1 <<'SQL'
 SELECT otlet.promote_workload_revision(

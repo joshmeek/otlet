@@ -799,6 +799,7 @@ AS $$
 DECLARE
   authority_error text;
   approved_generation bigint;
+  previous_administrative_suppress text;
 BEGIN
   authority_error := otlet.action_workflow_policy_error(
     action_workflow_policy_guard.task_name,
@@ -821,11 +822,21 @@ BEGIN
     INTO approved_generation
     FROM otlet.active_workload_revision(action_workflow_policy_guard.task_name) active;
 
+    previous_administrative_suppress := current_setting(
+      'otlet.administrative_suppress',
+      true
+    );
+    PERFORM set_config('otlet.administrative_suppress', 'on', true);
     UPDATE otlet.action_targets target
     SET contract_generation = target.contract_generation + 1,
         updated_at = now()
     WHERE target.name = action_workflow_policy_guard.target_name
       AND target.contract_generation = approved_generation;
+    PERFORM set_config(
+      'otlet.administrative_suppress',
+      COALESCE(previous_administrative_suppress, ''),
+      true
+    );
   END IF;
   RETURN authority_error;
 END;
@@ -1570,6 +1581,13 @@ BEGIN
   WHERE materialization.task_name = promote_workload_revision.task_name
     AND materialization.contract_hash IS DISTINCT FROM promote_workload_revision.target_workload_revision_hash;
 
+  PERFORM otlet.append_administrative_change(
+    'task',
+    promote_workload_revision.task_name,
+    'promote',
+    active_hash,
+    promote_workload_revision.target_workload_revision_hash
+  );
   RETURN promote_workload_revision.target_workload_revision_hash;
 END;
 $$;

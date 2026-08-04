@@ -16,9 +16,13 @@ Run the installer as the database owner from the repository checkout:
 psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f crates/otlet_worker/sql/install.sql
 ```
 
-The install transaction runs the current SQL contract as migrations `0001` through `0050`. Re-running it skips recorded migrations and preserves existing data. This greenfield path rejects older unversioned `otlet` schemas instead of converting them
+The install transaction runs the current SQL contract as migrations `0001` through `0051`. Re-running it skips recorded migrations and preserves existing data. This greenfield path rejects older unversioned `otlet` schemas instead of converting them
 
 The database keeps zero `otlet` extension objects and zero C-language Otlet functions
+
+Model, task, watch, selection, action-policy, Otlet access-grant, and retention changes require a reason or ticket in the same transaction. Both native and SQL-only installs append those changes to `otlet.audit_administrative_change_export`
+
+Deterministic task synthesis inside `otlet.enqueue_ask` is runtime bookkeeping. It appends no administrative event and restores the caller's suppression state
 
 ## Register The Worker
 
@@ -28,6 +32,8 @@ Create one dedicated login with `NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATI
 runtime_identity="$(otlet_worker --print-runtime-identity)"
 
 psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -v runtime_identity="$runtime_identity" <<'SQL'
+BEGIN;
+SELECT otlet.set_administrative_change_context('Grant and register the portable worker');
 SELECT otlet.grant_portable_worker_access('otlet_worker'::regrole);
 SELECT otlet.register_portable_worker(
   'customer-vpc-worker',
@@ -38,6 +44,7 @@ SELECT otlet.register_portable_worker(
   '0.1.0',
   :'runtime_identity'::jsonb
 );
+COMMIT;
 SQL
 ```
 
@@ -76,7 +83,10 @@ The worker permits one `psql` child at a time. It applies a 5-second connect lim
 The database owner configures and activates the task, then grants the application capability to a login or inherited group role:
 
 ```sql
+BEGIN;
+SELECT otlet.set_administrative_change_context('Grant the application capability');
 SELECT otlet.grant_application_access('app_otlet_application'::regrole);
+COMMIT;
 ```
 
 From an authenticated application connection, queue one known subject, commit it so the portable worker can see it, then read only owned status and accepted output:
@@ -114,12 +124,15 @@ The operator can retry a terminal application job with `application_retry_job(jo
 Register cheap and strong model workers, then use the normal selection policy:
 
 ```sql
+BEGIN;
+SELECT otlet.set_administrative_change_context('Route the vendor summary task');
 SELECT otlet.set_model_selection_policy(
   'vendor_summary_task',
   'qwen3_1_7b',
   'qwen35_4b',
   '{"confidence_field":"confidence","accepted_confidence":["high"]}'::jsonb
 );
+COMMIT;
 ```
 
 PostgreSQL assigns the cheap claim, validates the result, and completes accepted output. It records rejected output in a receipt and requeues the same job for the strong worker. PostgreSQL preserves the job ID, lease fence, retry budget, receipt history, queue accounting, and status reads
@@ -129,6 +142,8 @@ PostgreSQL assigns the cheap claim, validates the result, and completes accepted
 Create a row watch with durable automatic catch-up, then commit source changes before polling results:
 
 ```sql
+BEGIN;
+SELECT otlet.set_administrative_change_context('Create the vendor note watch');
 CREATE TABLE vendor_notes (
   vendor_id text PRIMARY KEY,
   note text NOT NULL
@@ -148,6 +163,7 @@ SELECT otlet.create_watch(
 );
 
 INSERT INTO vendor_notes VALUES ('vendor-1', 'Customer requested a procurement summary');
+COMMIT;
 
 SELECT *
 FROM otlet.semantic_index_current_rows('vendor_note_summary');
@@ -224,4 +240,4 @@ Run the repeat-install proof:
 ./scripts/otlet-portable-upgrade-demo.sh
 ```
 
-It installs the full SQL contract twice and checks that all 50 migrations, existing data, lifecycle fences, `PUBLIC` closure, and invariants stay intact
+It installs the full SQL contract twice and checks that all 51 migrations, existing data, lifecycle and administrative-ledger fences, queued ask behavior, `PUBLIC` closure, and invariants stay intact

@@ -24,6 +24,8 @@ SELECT otlet.register_action_target(
 
 CREATE TEMP TABLE action_target_drift_proof (
   baseline_hash text NOT NULL,
+  target_generation bigint NOT NULL,
+  target_event_count bigint NOT NULL,
   descriptor_bound boolean NOT NULL DEFAULT false,
   type_bound boolean NOT NULL DEFAULT false,
   constraint_bound boolean NOT NULL DEFAULT false,
@@ -37,6 +39,7 @@ CREATE TEMP TABLE action_target_drift_proof (
   revision_b text,
   old_action_id bigint,
   target_suspended boolean NOT NULL DEFAULT false,
+  operational_generation_unlogged boolean NOT NULL DEFAULT false,
   dry_run_closed boolean NOT NULL DEFAULT false,
   apply_closed boolean NOT NULL DEFAULT false,
   suspension_persisted boolean NOT NULL DEFAULT false,
@@ -45,8 +48,22 @@ CREATE TEMP TABLE action_target_drift_proof (
   new_action_applied boolean NOT NULL DEFAULT false
 ) ON COMMIT DROP;
 
-INSERT INTO action_target_drift_proof (baseline_hash)
-SELECT otlet.action_target_contract_hash('action_target_drift_demo');
+INSERT INTO action_target_drift_proof (
+  baseline_hash,
+  target_generation,
+  target_event_count
+)
+SELECT
+  otlet.action_target_contract_hash('action_target_drift_demo'),
+  target.contract_generation,
+  (
+    SELECT count(*)
+    FROM otlet.administrative_change_events event
+    WHERE event.object_type = 'action_policy'
+      AND event.object_name = 'target:' || target.name
+  )
+FROM otlet.action_targets target
+WHERE target.name = 'action_target_drift_demo';
 
 DO $body$
 DECLARE
@@ -289,6 +306,21 @@ SET dry_run_closed = EXISTS (
     AND action.error = 'action workflow target contract changed'
 );
 
+UPDATE action_target_drift_proof proof
+SET operational_generation_unlogged =
+  (
+    SELECT target.contract_generation = proof.target_generation + 1
+    FROM otlet.action_targets target
+    WHERE target.name = 'action_target_drift_demo'
+  )
+  AND (
+    SELECT count(*) = proof.target_event_count
+    FROM otlet.administrative_change_events event
+    WHERE event.object_type = 'action_policy'
+      AND event.object_name = 'target:action_target_drift_demo'
+  )
+  AND current_setting('otlet.administrative_suppress', true) IS DISTINCT FROM 'on';
+
 SELECT otlet.apply_action(old_action_id)
 FROM action_target_drift_proof \g /dev/null
 UPDATE action_target_drift_proof proof
@@ -401,6 +433,7 @@ SELECT
   rls_bound::text || '|' ||
   unrelated_stable::text || '|' ||
   target_suspended::text || '|' ||
+  operational_generation_unlogged::text || '|' ||
   dry_run_closed::text || '|' ||
   apply_closed::text || '|' ||
   suspension_persisted::text || '|' ||
@@ -414,7 +447,7 @@ SQL
 )"
 
 echo "action_target_drift_contract=$action_target_drift_contract"
-[ "$action_target_drift_contract" = "true|true|true|true|true|true|true|true|true|true|true|true|true|true|true|true" ] || {
+[ "$action_target_drift_contract" = "true|true|true|true|true|true|true|true|true|true|true|true|true|true|true|true|true" ] || {
   echo "Expected action-target drift contract to pass, got $action_target_drift_contract" >&2
   exit 1
 }

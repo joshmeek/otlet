@@ -98,7 +98,17 @@ SET search_path = pg_catalog, otlet, pg_temp
 AS $$
 DECLARE
   role_name text;
+  old_revision_hash text;
 BEGIN
+  PERFORM pg_catalog.pg_advisory_xact_lock(
+    pg_catalog.hashtextextended(
+      'otlet_access_policy:' || grant_auditor_access.target_role::oid::text,
+      0
+    )
+  );
+  old_revision_hash := otlet.access_policy_revision(
+    grant_auditor_access.target_role
+  );
   SELECT rolname
   INTO role_name
   FROM pg_catalog.pg_roles
@@ -153,6 +163,11 @@ BEGIN
     'otlet.source_query_contract_error(jsonb, boolean) TO %I',
     role_name
   );
+  PERFORM otlet.finish_access_policy_grant(
+    'auditor',
+    grant_auditor_access.target_role,
+    old_revision_hash
+  );
 END;
 $$;
 
@@ -163,7 +178,14 @@ SET search_path = pg_catalog, otlet, pg_temp
 AS $$
 DECLARE
   role_name text;
+  old_revision_hash text;
 BEGIN
+  PERFORM pg_catalog.pg_advisory_xact_lock(
+    pg_catalog.hashtextextended(
+      'otlet_access_policy:' || grant_operator_access.target_role::oid::text,
+      0
+    )
+  );
   SELECT rolname
   INTO role_name
   FROM pg_catalog.pg_roles
@@ -174,6 +196,9 @@ BEGIN
   END IF;
 
   PERFORM otlet.grant_auditor_access(grant_operator_access.target_role);
+  old_revision_hash := otlet.access_policy_revision(
+    grant_operator_access.target_role
+  );
   EXECUTE pg_catalog.format(
     'GRANT USAGE ON TYPE otlet.actions, otlet.eval_labels, otlet.review_events TO %I',
     role_name
@@ -190,6 +215,11 @@ BEGIN
     'otlet.apply_action(bigint), '
     'otlet.application_retry_job(bigint, text) TO %I',
     role_name
+  );
+  PERFORM otlet.finish_access_policy_grant(
+    'operator',
+    grant_operator_access.target_role,
+    old_revision_hash
   );
 END;
 $$;

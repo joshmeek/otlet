@@ -89,6 +89,7 @@ SELECT
     'otlet.audit_review_event_export',
     'otlet.audit_action_execution_export',
     'otlet.audit_eval_label_export',
+    'otlet.audit_administrative_change_export',
     'otlet.action_workflow_policy_status',
     'otlet.semantic_dependency_audit',
     'otlet.operational_event_log',

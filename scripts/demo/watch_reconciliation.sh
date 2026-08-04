@@ -445,7 +445,8 @@ SELECT otlet.create_watch(
 ) \g /dev/null
 SQL
 
-docker exec -i "$container" psql -U postgres -d "$database" -X -qAt -v ON_ERROR_STOP=1 <<'SQL' >/dev/null &
+docker exec -e PGOPTIONS="$demo_pgoptions" -i "$container" \
+  psql -U postgres -d "$database" -X -qAt -v ON_ERROR_STOP=1 <<'SQL' >/dev/null &
 BEGIN;
 SELECT pg_advisory_xact_lock(
   hashtextextended('otlet_workload_revision:watch_reconciliation_drop_race_task', 0)
@@ -456,7 +457,8 @@ COMMIT;
 SQL
 watch_runtime_pid=$!
 sleep 0.2
-docker exec -e PGAPPNAME=otlet-watch-reconciliation-create -i "$container" \
+docker exec -e PGAPPNAME=otlet-watch-reconciliation-create \
+  -e PGOPTIONS="$demo_pgoptions" -i "$container" \
   psql -U postgres -d "$database" -X -qAt -v ON_ERROR_STOP=1 \
   -v model_name="$cheap_model_name" <<'SQL' >/dev/null &
 SELECT otlet.create_watch(
@@ -500,7 +502,8 @@ if [ "$watch_runtime_status|$watch_create_status" != "0|0" ]; then
   exit 1
 fi
 
-docker exec -i "$container" psql -U postgres -d "$database" -X -qAt -v ON_ERROR_STOP=1 <<'SQL' >/dev/null &
+docker exec -e PGOPTIONS="$demo_pgoptions" -i "$container" \
+  psql -U postgres -d "$database" -X -qAt -v ON_ERROR_STOP=1 <<'SQL' >/dev/null &
 BEGIN;
 LOCK TABLE public.otlet_watch_reconciliation_drop_race IN ROW EXCLUSIVE MODE;
 SELECT pg_sleep(3);
@@ -509,7 +512,8 @@ COMMIT;
 SQL
 watch_source_pid=$!
 sleep 0.2
-docker exec -e PGAPPNAME=otlet-watch-reconciliation-drop -i "$container" \
+docker exec -e PGAPPNAME=otlet-watch-reconciliation-drop \
+  -e PGOPTIONS="$demo_pgoptions" -i "$container" \
   psql -U postgres -d "$database" -X -qAt -v ON_ERROR_STOP=1 \
   -c "SET statement_timeout = '8s'; SELECT otlet.drop_watch_registry('watch_reconciliation_drop_race')" \
   >/dev/null &

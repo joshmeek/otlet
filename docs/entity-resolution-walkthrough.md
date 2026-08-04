@@ -20,7 +20,7 @@ docker exec -it otlet-postgres sh -lc '
 
 Run the sections in order before adapting them. Each section names the state it creates and the output to inspect. Follow-up checks live in [runtime-and-traces.md](runtime-and-traces.md), [semantic-watches.md](semantic-watches.md), and [production-contract.md](production-contract.md)
 
-The setup and inspection sections run as the extension owner. A delegated reviewer reads `otlet.audit_review_export` and `otlet.audit_review_event_export`, then receives `otlet.grant_operator_access(...)` before using the action review functions. Raw `otlet.review_queue`, task configuration, receipts, and trace state remain owner-only
+The setup and inspection sections run as the extension owner. The first SQL block sets one administrative reason for this interactive `psql` session. A delegated reviewer reads `otlet.audit_review_export` and `otlet.audit_review_event_export`, then receives `otlet.grant_operator_access(...)` before using the action review functions. Raw `otlet.review_queue`, task configuration, receipts, and trace state remain owner-only
 
 Receipts keep prompt and raw-output hashes under the default storage policy. Accepted output and rejected structured candidates remain available without persisting the assembled prompt or raw model text
 
@@ -30,6 +30,7 @@ The output blocks are representative. IDs, hashes, timestamps, token counts, tim
 
 ```sql
 CREATE EXTENSION IF NOT EXISTS otlet;
+SET otlet.administrative_reason = 'Entity resolution walkthrough';
 
 SELECT otlet.register_model(
   'qwen3_1_7b',

@@ -322,7 +322,11 @@ The task schema and action rules decide whether model output can become database
 
 Reuse this task for terminal failure evidence and safe requeueing
 
+Set one reason for the remaining owner changes in this interactive session
+
 ```sql
+SET otlet.administrative_reason = 'Runtime and trace walkthrough';
+
 DROP TABLE IF EXISTS public.learning_retry_source;
 
 CREATE TABLE public.learning_retry_source (

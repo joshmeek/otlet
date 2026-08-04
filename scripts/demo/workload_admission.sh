@@ -226,7 +226,7 @@ if [ "$missing_timeout_exit" -eq 0 ] || [[ "$missing_timeout_output" != *"requir
 fi
 
 set +e
-timed_candidate_output="$(docker exec -e PGOPTIONS='-c statement_timeout=100ms' -i "$container" \
+timed_candidate_output="$(docker exec -e PGOPTIONS="-c statement_timeout=100ms $demo_pgoptions" -i "$container" \
   psql -U postgres -d "$database" -qAt -v ON_ERROR_STOP=1 2>&1 <<'SQL'
 SELECT otlet.refresh_semantic_join_index('admission_timeout_demo');
 SQL

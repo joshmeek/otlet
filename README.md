@@ -44,12 +44,17 @@ Entity resolution uses a cheap local model for the first pass and a stronger loc
 
 Rerunning setup reuses the PostgreSQL volume and model artifacts while rebuilding Otlet extension state; user tables stay in place. When the container or image changes, setup clears persisted preload state before reinstalling the extension
 
+Administrative changes require a reason or ticket in the same transaction so PostgreSQL can append their actor, active role, and before-and-after identities
+
 ```sql
+BEGIN;
+SELECT otlet.set_administrative_change_context('Register the example models');
 SELECT name
 FROM otlet.register_model('qwen3_1_7b', '/var/lib/postgresql/otlet-models/Qwen3-1.7B-Q8_0.gguf')
 UNION ALL
 SELECT name
 FROM otlet.register_model('qwen35_4b', '/var/lib/postgresql/otlet-models/Qwen3.5-4B-Q4_K_M.gguf');
+COMMIT;
 ```
 
 ```text
@@ -63,6 +68,8 @@ FROM otlet.register_model('qwen35_4b', '/var/lib/postgresql/otlet-models/Qwen3.5
 An Otlet task reads any SQL query that returns `subject_id` and row-shaped `input`. The [entity-resolution walkthrough](docs/entity-resolution-walkthrough.md) builds `public.otlet_demo_vendor_pair_input` from two application tables. The shortened task call includes the SQL API, output contract, trace settings, input shaping, and decision preset:
 
 ```sql
+BEGIN;
+SELECT otlet.set_administrative_change_context('Create the entity-resolution example');
 SELECT name, model_name
 FROM otlet.create_task(
   task_name => 'entity_resolution_demo',
@@ -94,6 +101,7 @@ FROM otlet.set_model_selection_policy(
 );
 
 SELECT otlet.run_task('entity_resolution_demo') AS queued_jobs;
+COMMIT;
 ```
 
 ```text

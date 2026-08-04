@@ -304,7 +304,17 @@ SET search_path = pg_catalog, otlet, pg_temp
 AS $$
 DECLARE
   role_name text;
+  old_revision_hash text;
 BEGIN
+  PERFORM pg_catalog.pg_advisory_xact_lock(
+    pg_catalog.hashtextextended(
+      'otlet_access_policy:' || grant_application_access.target_role::oid::text,
+      0
+    )
+  );
+  old_revision_hash := otlet.access_policy_revision(
+    grant_application_access.target_role
+  );
   SELECT rolname
   INTO role_name
   FROM pg_catalog.pg_roles
@@ -321,6 +331,11 @@ BEGIN
     'otlet.application_job_status(bigint), '
     'otlet.application_cancel_job(bigint) TO %I',
     role_name
+  );
+  PERFORM otlet.finish_access_policy_grant(
+    'application',
+    grant_application_access.target_role,
+    old_revision_hash
   );
 END;
 $$;

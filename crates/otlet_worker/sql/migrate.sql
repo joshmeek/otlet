@@ -174,3 +174,6 @@ $$;
 
 \set portable_migration_file 0043_permissions.sql
 \ir migrations/apply.sql
+
+\set portable_migration_file ../../../otlet_pg/sql/migrations/0051_administrative_change_ledger.sql
+\ir migrations/apply.sql

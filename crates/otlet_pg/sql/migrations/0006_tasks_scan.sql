@@ -1039,6 +1039,10 @@ DECLARE
   input_fields jsonb;
   direct_task_name text;
   direct_subject_id text;
+  previous_administrative_suppress text := current_setting(
+    'otlet.administrative_suppress',
+    true
+  );
   queued_job_id bigint;
 BEGIN
   IF jsonb_typeof(actual_input) IS DISTINCT FROM 'object' THEN
@@ -1069,6 +1073,7 @@ BEGIN
   ), 64), 1, 24);
   direct_subject_id := 'ask_' || gen_random_uuid()::text;
 
+  PERFORM set_config('otlet.administrative_suppress', 'on', true);
   PERFORM otlet.create_task(
     direct_task_name,
     NULL,
@@ -1077,6 +1082,11 @@ BEGIN
     enqueue_ask.model_name,
     actual_options,
     jsonb_build_object('source_fields', input_fields)
+  );
+  PERFORM set_config(
+    'otlet.administrative_suppress',
+    COALESCE(previous_administrative_suppress, ''),
+    true
   );
 
   IF NOT otlet.admit_task_input(direct_task_name, direct_subject_id, actual_input) THEN

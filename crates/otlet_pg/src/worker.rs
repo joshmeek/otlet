@@ -500,7 +500,10 @@ fn ensure_inline_task(request: &crate::infer_now::InferNowRequest) -> Result<(),
             // Keeps slot text as `$2::jsonb` — no Rust Value→JsonB round-trip.
             let args = [request.task_name.as_str().into(), inline_task_json.into()];
             let rows = client.select(
-                "WITH src AS ( \
+                "WITH administrative_context AS ( \
+                   SELECT set_config('otlet.administrative_suppress', 'on', true) AS value \
+                 ), \
+                 src AS ( \
                    SELECT COALESCE($2::jsonb, '{}'::jsonb) AS t \
                  ), \
                  model_ok AS ( \
@@ -510,7 +513,8 @@ fn ensure_inline_task(request: &crate::infer_now::InferNowRequest) -> Result<(),
                  ) \
                  SELECT \
                    CASE \
-                     WHEN (SELECT ok FROM model_ok) THEN ( \
+                     WHEN (SELECT ok FROM model_ok) \
+                          AND (SELECT value = 'on' FROM administrative_context) THEN ( \
                        SELECT otlet.create_task( \
                          $1, \
                          NULL::text, \

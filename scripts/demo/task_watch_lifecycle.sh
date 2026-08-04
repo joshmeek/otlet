@@ -618,7 +618,7 @@ authority_holder_app="otlet-task-watch-authority-holder-${race_suffix}"
 authority_register_app="otlet-task-watch-authority-register-${race_suffix}"
 authority_disable_app="otlet-task-watch-authority-disable-${race_suffix}"
 
-docker exec -e PGAPPNAME="$repair_holder_app" -i "$container" \
+docker exec -e PGAPPNAME="$repair_holder_app" -e PGOPTIONS="$demo_pgoptions" -i "$container" \
   psql -U postgres -d "$database" -X -qAt -v ON_ERROR_STOP=1 \
   -v task_name="$race_task" <<'SQL' >/dev/null &
 BEGIN;
@@ -650,7 +650,7 @@ if [ "$repair_holder_sleeping" != "true" ]; then
   exit 1
 fi
 
-docker exec -e PGAPPNAME="$repair_lifecycle_app" -i "$container" \
+docker exec -e PGAPPNAME="$repair_lifecycle_app" -e PGOPTIONS="$demo_pgoptions" -i "$container" \
   psql -U postgres -d "$database" -X -qAt -v ON_ERROR_STOP=1 \
   -v task_name="$race_task" -v revision_hash="$race_revision" <<'SQL' >/dev/null &
 SET statement_timeout = '10000ms';
@@ -679,7 +679,7 @@ if [ "$repair_lifecycle_waiting" != "true" ]; then
   exit 1
 fi
 
-docker exec -e PGAPPNAME="$definition_writer_app" -i "$container" \
+docker exec -e PGAPPNAME="$definition_writer_app" -e PGOPTIONS="$demo_pgoptions" -i "$container" \
   psql -U postgres -d "$database" -X -qAt -v ON_ERROR_STOP=1 \
   -v task_name="$race_task" <<'SQL' >/dev/null &
 SET statement_timeout = '10000ms';
@@ -704,7 +704,7 @@ $proof$;
 SQL
 definition_writer_pid=$!
 
-docker exec -e PGAPPNAME="$action_policy_writer_app" -i "$container" \
+docker exec -e PGAPPNAME="$action_policy_writer_app" -e PGOPTIONS="$demo_pgoptions" -i "$container" \
   psql -U postgres -d "$database" -X -qAt -v ON_ERROR_STOP=1 \
   -v source_table="public.$race_source" \
   -v task_name="$race_task" \
@@ -743,7 +743,7 @@ SQL
   sleep 0.05
 done
 
-docker exec -e PGAPPNAME="$repair_worker_app" -i "$container" \
+docker exec -e PGAPPNAME="$repair_worker_app" -e PGOPTIONS="$demo_pgoptions" -i "$container" \
   psql -U postgres -d "$database" -X -qAt -v ON_ERROR_STOP=1 \
   -v task_name="$race_task" -v revision_hash="$race_revision" <<'SQL' >/dev/null &
 SET statement_timeout = '10000ms';
@@ -809,7 +809,7 @@ definition_write_contract="t"
 action_policy_serialization_contract="t"
 repair_serialization_contract="t"
 
-docker exec -e PGAPPNAME="$authority_holder_app" -i "$container" \
+docker exec -e PGAPPNAME="$authority_holder_app" -e PGOPTIONS="$demo_pgoptions" -i "$container" \
   psql -U postgres -d "$database" -X -qAt -v ON_ERROR_STOP=1 \
   -v task_name="$race_task" <<'SQL' >/dev/null &
 BEGIN;
@@ -841,7 +841,7 @@ if [ "$authority_holder_sleeping" != "true" ]; then
   exit 1
 fi
 
-docker exec -e PGAPPNAME="$authority_register_app" -i "$container" \
+docker exec -e PGAPPNAME="$authority_register_app" -e PGOPTIONS="$demo_pgoptions" -i "$container" \
   psql -U postgres -d "$database" -X -qAt -v ON_ERROR_STOP=1 \
   -v task_name="$race_task" -v target_name="$race_target" <<'SQL' >/dev/null &
 SET statement_timeout = '10000ms';
@@ -876,7 +876,7 @@ if [ "$authority_register_waiting" != "true" ]; then
   exit 1
 fi
 
-docker exec -e PGAPPNAME="$authority_disable_app" -i "$container" \
+docker exec -e PGAPPNAME="$authority_disable_app" -e PGOPTIONS="$demo_pgoptions" -i "$container" \
   psql -U postgres -d "$database" -X -qAt -v ON_ERROR_STOP=1 \
   -v task_name="$race_task" <<'SQL' >/dev/null &
 SET statement_timeout = '10000ms';
@@ -925,7 +925,7 @@ SELECT otlet.register_action_workflow_policy(
 );
 SQL
 
-docker exec -e PGAPPNAME=otlet-task-watch-source-race -i "$container" \
+docker exec -e PGAPPNAME=otlet-task-watch-source-race -e PGOPTIONS="$demo_pgoptions" -i "$container" \
   psql -U postgres -d "$database" -X -qAt -v ON_ERROR_STOP=1 \
   -v source_table="public.$race_source" <<'SQL' >/dev/null &
 BEGIN;
@@ -962,7 +962,8 @@ fi
 
 set +e
 race_retirement_output="$(
-  docker exec -i "$container" psql -U postgres -d "$database" \
+  docker exec -e PGOPTIONS="$demo_pgoptions" -i "$container" \
+    psql -U postgres -d "$database" \
     -X -qAt -v ON_ERROR_STOP=1 \
     -v task_name="$race_task" \
     -v revision_hash="$race_revision" <<'SQL' 2>&1
