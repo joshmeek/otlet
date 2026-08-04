@@ -3,9 +3,12 @@ set -euo pipefail
 
 container="${OTLET_PG_CONTAINER:-otlet-postgres}"
 database="otlet_portable_upgrade_demo_$$"
+operator_role="otlet_portable_upgrade_operator_$$"
 
 cleanup() {
   docker exec "$container" dropdb -U postgres --if-exists "$database" >/dev/null 2>&1 || true
+  docker exec "$container" psql -U postgres -d postgres -X -q \
+    -c "DROP ROLE IF EXISTS $operator_role" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
 
@@ -55,13 +58,20 @@ SQL
 
 install_portable
 
+docker exec -i "$container" psql -U postgres -d "$database" \
+  -X -q -v ON_ERROR_STOP=1 -v operator_role="$operator_role" <<'SQL' >/dev/null
+CREATE ROLE :"operator_role" NOLOGIN;
+GRANT USAGE ON SCHEMA otlet TO :"operator_role";
+GRANT EXECUTE ON FUNCTION otlet.application_retry_job(bigint, text) TO :"operator_role";
+SQL
+
 contract="$(
   docker exec -i "$container" psql -U postgres -d "$database" \
     -X -qAt -v ON_ERROR_STOP=1 <<'SQL'
 SELECT concat_ws('|',
   max(version),
   count(*),
-  array_agg(version ORDER BY version) = ARRAY(SELECT generate_series(1, 48)),
+  array_agg(version ORDER BY version) = ARRAY(SELECT generate_series(1, 49)),
   bool_and(file ~ ('(^|/)' || lpad(version::text, 4, '0') || '_')),
   (SELECT value FROM public.portable_upgrade_sentinel),
   (SELECT count(*) FROM otlet.verify_invariants())
@@ -69,31 +79,71 @@ SELECT concat_ws('|',
 FROM otlet.portable_schema_migrations;
 SQL
 )"
-[ "$contract" = "48|48|t|t|preserved|0" ] || {
+[ "$contract" = "49|49|t|t|preserved|0" ] || {
   echo "Portable repeat-install contract mismatch: $contract" >&2
   exit 1
 }
 
 application_migration_contract="$(
   docker exec -i "$container" psql -U postgres -d "$database" \
-    -X -qAt -v ON_ERROR_STOP=1 <<'SQL'
+    -X -qAt -v ON_ERROR_STOP=1 -v operator_role="$operator_role" <<'SQL'
 SELECT concat_ws('|',
-  EXISTS (
-    SELECT 1
+  (
+    SELECT count(*) = 7
     FROM information_schema.columns
     WHERE table_schema = 'otlet'
       AND table_name = 'jobs'
-      AND column_name = 'application_owner_role_oid'
+      AND column_name IN (
+        'application_owner_role_oid',
+        'application_authenticated_role_oid',
+        'application_invocation_role_oid',
+        'application_request_key',
+        'application_request_payload_hash',
+        'retry_of_job_id',
+        'retry_mode'
+      )
   ),
-  to_regprocedure('otlet.application_submit_task_subject(text,text)') IS NOT NULL,
+  to_regprocedure('otlet.application_submit_task_subject(text,text,text)') IS NOT NULL,
   to_regprocedure('otlet.application_job_status(bigint)') IS NOT NULL,
   to_regprocedure('otlet.application_cancel_job(bigint)') IS NOT NULL,
+  to_regprocedure('otlet.application_retry_job(bigint,text)') IS NOT NULL,
   to_regprocedure('otlet.grant_application_access(regrole)') IS NOT NULL,
   to_regclass('otlet.application_access_policy_status') IS NOT NULL,
   (SELECT application_functions = 3
           AND application_security_definer_functions = 3
           AND application_fixed_search_path_functions = 3
    FROM otlet.application_access_policy_status),
+  (SELECT function.prosecdef
+          AND function.proconfig @> ARRAY['search_path=pg_catalog, otlet, pg_temp']
+   FROM pg_catalog.pg_proc function
+   WHERE function.oid = 'otlet.application_retry_job(bigint,text)'::regprocedure),
+  pg_catalog.has_schema_privilege(:'operator_role', 'otlet', 'USAGE')
+  AND pg_catalog.has_function_privilege(
+    :'operator_role',
+    'otlet.application_retry_job(bigint,text)',
+    'EXECUTE'
+  )
+  AND NOT pg_catalog.has_function_privilege(
+    :'operator_role',
+    'otlet.application_submit_task_subject(text,text,text)',
+    'EXECUTE'
+  )
+  AND NOT pg_catalog.has_table_privilege(:'operator_role', 'otlet.jobs', 'SELECT'),
+  (SELECT count(*) = 3
+   FROM pg_catalog.pg_constraint constraint_row
+   WHERE constraint_row.conrelid = 'otlet.jobs'::regclass
+     AND constraint_row.conname IN (
+       'jobs_application_provenance_check',
+       'jobs_retry_mode_check',
+       'jobs_retry_parent_check'
+     )),
+  (SELECT count(*) = 2
+   FROM pg_catalog.pg_indexes index_row
+   WHERE index_row.schemaname = 'otlet'
+     AND index_row.indexname IN (
+       'jobs_application_request_key_idx',
+       'jobs_retry_of_job_id_idx'
+     )),
   (SELECT count(*) = 0
    FROM pg_catalog.pg_proc function
    JOIN pg_catalog.pg_namespace namespace ON namespace.oid = function.pronamespace
@@ -102,6 +152,7 @@ SELECT concat_ws('|',
        'application_submit_task_subject',
        'application_job_status',
        'application_cancel_job',
+       'application_retry_job',
        'grant_application_access'
      )
      AND pg_catalog.has_function_privilege('public', function.oid, 'EXECUTE')),
@@ -113,7 +164,7 @@ SELECT concat_ws('|',
 );
 SQL
 )"
-[ "$application_migration_contract" = "t|t|t|t|t|t|t|t|t" ] || {
+[ "$application_migration_contract" = "t|t|t|t|t|t|t|t|t|t|t|t|t|t" ] || {
   echo "Portable application migration contract mismatch: $application_migration_contract" >&2
   exit 1
 }

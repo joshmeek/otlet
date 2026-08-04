@@ -166,5 +166,8 @@ $$;
 \set portable_migration_file ../../../otlet_pg/sql/migrations/0048_application_invocation.sql
 \ir migrations/apply.sql
 
+\set portable_migration_file ../../../otlet_pg/sql/migrations/0049_invocation_provenance.sql
+\ir migrations/apply.sql
+
 \set portable_migration_file 0043_permissions.sql
 \ir migrations/apply.sql

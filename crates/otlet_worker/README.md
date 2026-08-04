@@ -16,7 +16,7 @@ Run the installer as the database owner from the repository checkout:
 psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f crates/otlet_worker/sql/install.sql
 ```
 
-The install transaction runs the current SQL contract as migrations `0001` through `0048`. Re-running it skips recorded migrations and preserves existing data. This greenfield path rejects older unversioned `otlet` schemas instead of converting them
+The install transaction runs the current SQL contract as migrations `0001` through `0049`. Re-running it skips recorded migrations and preserves existing data. This greenfield path rejects older unversioned `otlet` schemas instead of converting them
 
 The database keeps zero `otlet` extension objects and zero C-language Otlet functions
 
@@ -85,7 +85,8 @@ From an authenticated application connection, queue one known subject, commit it
 BEGIN;
 SELECT otlet.application_submit_task_subject(
   'procurement_summary',
-  'note-1'
+  'note-1',
+  'request-2026-08-02-001'
 ) AS job_id \gset
 COMMIT;
 
@@ -95,7 +96,18 @@ FROM otlet.application_job_status(:'job_id');
 SELECT otlet.application_cancel_job(:'job_id');
 ```
 
-Submission returns `0` when the subject is missing, queue admission rejects the input, or the same input already has live work under the active revision. The application functions expose no source rows or raw Otlet data and grant no administrative, review/apply, worker, or further-grant authority. Ownership follows the authenticated `session_user`, not an active `SET ROLE`
+The optional request key must contain 1 to 256 bytes and is unique for the authenticated owner. PostgreSQL hashes the submit operation, task, and subject. Repeating the same owner, key, and payload returns the prior job even after source or revision drift; reusing that key for another task or subject fails before mutation. Different authenticated owners may reuse the same key
+
+Submission without a matching keyed job returns `0` when the subject is missing, queue admission rejects the input, or the same input has live work under the active revision. The application functions expose no source rows or raw Otlet data and grant no administrative, review/apply, worker, or further-grant authority. Job ownership follows the authenticated `session_user`; PostgreSQL stores that login and the active `SET ROLE` role in distinct provenance fields
+
+The SQL-only owner grants the retry path with PostgreSQL privileges:
+
+```sql
+GRANT USAGE ON SCHEMA otlet TO app_otlet_operator;
+GRANT EXECUTE ON FUNCTION otlet.application_retry_job(bigint, text) TO app_otlet_operator;
+```
+
+The operator can retry a terminal application job with `application_retry_job(job_id, 'original_snapshot')` or `application_retry_job(job_id, 'latest_source')`. Original-snapshot mode reuses the stored input and requires the original revision to remain active. Latest-source mode reads current source under the current revision. Both modes preserve the application's job owner, record the operator login and active role, and link the new job to the original
 
 ## Route Across Models
 

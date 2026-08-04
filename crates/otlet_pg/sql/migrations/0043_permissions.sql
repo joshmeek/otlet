@@ -8,7 +8,8 @@ WITH operator_functions(oid) AS (
     'otlet.defer_action(bigint,text)'::regprocedure::oid,
     'otlet.abstain_review(bigint,text)'::regprocedure::oid,
     'otlet.dry_run_action(bigint)'::regprocedure::oid,
-    'otlet.apply_action(bigint)'::regprocedure::oid
+    'otlet.apply_action(bigint)'::regprocedure::oid,
+    'otlet.application_retry_job(bigint,text)'::regprocedure::oid
   ])
 ),
 operator_status AS (
@@ -186,7 +187,8 @@ BEGIN
     'otlet.defer_action(bigint, text), '
     'otlet.abstain_review(bigint, text), '
     'otlet.dry_run_action(bigint), '
-    'otlet.apply_action(bigint) TO %I',
+    'otlet.apply_action(bigint), '
+    'otlet.application_retry_job(bigint, text) TO %I',
     role_name
   );
 END;

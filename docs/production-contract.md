@@ -129,9 +129,15 @@ Completion parses the raw envelope and requires it to match the submitted output
 
 Portable protocol `otlet.portable.worker.v1` uses exact-version compatibility and an owner-registered runtime identity bound to one database role. `grant_portable_worker_access(...)` grants that dedicated role one compatibility view and eight fixed-search-path `SECURITY DEFINER` RPCs for startup, heartbeat, claim, renewal, attempt, completion, failure, and cancellation. It grants no source or Otlet table access
 
-Application callers use `application_submit_task_subject(...)` to queue one subject from an already-active configured task. The fixed-path function reuses the task's bound source query, immutable revision, input-relation checks, plan preflight, and queue limits, then records the authenticated `session_user` role OID on the new job. It returns `0` when the source has no matching subject, admission rejects the input, or the same input already has live work under that revision
+Application callers use `application_submit_task_subject(...)` to queue one subject from a configured task with an active revision. The fixed-path function reuses the task's bound source query, immutable revision, input-relation checks, plan preflight, and queue limits. PostgreSQL stores the authenticated `session_user` role as owner and authenticated actor, plus the active `SET ROLE` role in a distinct provenance field
+
+Callers may supply a nonblank request key of at most 256 bytes. The key is scoped to the authenticated owner and binds a PostgreSQL-authored hash of the submit operation, task, and subject. Repeating the same owner, key, and payload returns the prior job even after source or revision drift. Reusing the key for another task or subject fails before mutation. Without a matching keyed job, submission returns `0` when the source has no matching subject, admission rejects the input, or the same input already has live work under that revision
+
+`application_retry_job(...)` lets an owner-granted operator retry a terminal application job. `original_snapshot` reuses the stored input and original revision but fails after that revision stops being active. `latest_source` reads current source under the current revision. Both modes preserve the application's owner, record the operator's authenticated login and active role, and link the new job to its original
 
 `application_job_status(...)` returns only lifecycle timestamps, status, and accepted structured output for a job owned by that authenticated login. It never returns input, errors, candidate or raw output, receipts, traces, actions, model details, or claim state. `application_cancel_job(...)` applies the existing queued and live cancellation contract after the same ownership check. Commit queued native or portable work before expecting a worker to see it
+
+Existing cleanup can remove unreferenced failed or canceled jobs and sets a surviving retry's parent link to null when it removes that parent. Request-key idempotency and retry lineage last as long as those job rows. The current cleanup base retains complete jobs
 
 Portable row watches use `create_watch(..., kind => 'row')` with `mark_stale_and_enqueue`. A source change marks prior state stale and persists the newest source identity in `watch_reconciliation`; a running worker heartbeat replays one due entry after commit. Source deletion resolves without inference. Pair watches keep bounded candidate preflight and explicit atomic `refresh_semantic_join_index(...)` under the caller statement timeout. `portable_complete_job(...)` stores the trusted output and semantic materialization in one transaction. SQL-only installations expose row and pair reads, predicates, plans, status, watch reconciliation, export, cleanup, and audit functions. Canceled work does not materialize
 
@@ -327,7 +333,7 @@ SELECT otlet.grant_operator_access('app_otlet_operator'::regrole);
 SELECT otlet.grant_application_access('app_otlet_application'::regrole);
 ```
 
-The application capability grants only `application_submit_task_subject(...)`, `application_job_status(...)`, and `application_cancel_job(...)`. Login roles may inherit one shared capability role, but job ownership remains the authenticated `session_user`; changing only `SET ROLE` does not create a separate owner. The grant can invoke every active task in the database, so grant it only to logins allowed to use that full task set. The capability grants no direct source or Otlet table access, task, model, or watch administration, review or apply authority, worker RPCs, receipt, trace, or cleanup views, or further grant authority
+The application capability grants three functions: `application_submit_task_subject(...)`, `application_job_status(...)`, and `application_cancel_job(...)`. Login roles may inherit one shared capability role, but job ownership remains the authenticated `session_user`; PostgreSQL records the active `SET ROLE` value as invocation provenance and leaves ownership unchanged. The grant can invoke every active task in the database, so grant it to logins allowed to use that full task set. The capability grants no direct source or Otlet table access, task, model, or watch administration, review or apply authority, worker RPCs, receipt, trace, or cleanup views, retry authority, or further grant authority
 
 The auditor capability grants these redacted policy and audit views:
 
@@ -358,8 +364,11 @@ The grant also includes the pure JSON hashing helpers required by `audit_review_
 - `otlet.abstain_review`
 - `otlet.dry_run_action`
 - `otlet.apply_action`
+- `otlet.application_retry_job`
 
-The eight operator functions run as the extension owner with `search_path` fixed to `pg_catalog, otlet, pg_temp`. Operators receive no direct table writes. The owner alone registers targets and workflow policies, disables them, and imports or exports watches. Watch exports contain instructions, policies, schemas, source identifiers, and owner-authored candidate SQL, so auditor and operator roles cannot read or import them
+The nine operator functions run as the extension owner with `search_path` fixed to `pg_catalog, otlet, pg_temp`. The retry RPC preserves the original application's job owner while recording the operator login and active role. Operators receive no direct table writes. The owner alone registers targets and workflow policies, disables them, and imports or exports watches. Watch exports contain instructions, policies, schemas, source identifiers, and owner-authored candidate SQL, so auditor and operator roles cannot read or import them
+
+SQL-only owners grant an operator `USAGE` on schema `otlet` and `EXECUTE` on `application_retry_job(bigint, text)` through PostgreSQL. The portable permission sweep leaves all other Otlet functions and tables closed unless the owner grants them
 
 Approval, rejection, correction, deferral, and abstention append immutable rows to `otlet.review_events`. Otlet derives `reviewer_identity` from `session_user` and `reviewer_role` from the active `SET ROLE` state; none of the review functions accepts either value from the caller. Each event snapshots its reason, timestamp, source freshness, and links to the job, action or output, receipt, model artifact, prompt, schema, runtime, and output identities
 
@@ -384,11 +393,11 @@ SELECT * FROM otlet.access_policy_status;
 SELECT * FROM otlet.application_access_policy_status;
 ```
 
-The demo proves the catalog ACLs, 16 auditor views and 20 function grants, 16 operator views and 28 function grants, seven operator paths, 25 exact security-definer functions, three application RPCs, eight portable RPCs, 12 denied application paths, and 63 denied auditor or operator paths. The delegated operator role proves all five review outcomes:
+The demo proves the catalog ACLs, 16 auditor views and 20 function grants, 16 operator views and 29 function grants, seven operator paths, 26 exact security-definer functions, three application RPCs, eight portable RPCs, 13 denied application paths, and 64 denied auditor or operator paths. The delegated operator role proves all five review outcomes:
 
 ```text
 review_provenance_contract=true|true|true|true|true|true|true|true|true|true|true
-permission_contract=public=0/0/0|auditor=16/20|operator=16/28|definer=25/25|application=3/3/3|portable=8/8/8|positive=7|denied=63
+permission_contract=public=0/0/0|auditor=16/20|operator=16/29|definer=26/26|application=3/3/3|portable=8/8/8|positive=7|denied=64
 ```
 
 Your application still owns these deployment boundaries:
