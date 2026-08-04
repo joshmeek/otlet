@@ -108,10 +108,20 @@ SQL selects candidate pairs first, then Otlet judges those pairs. Merge vendors 
 ## Step 3 - Clear Old Demo State
 
 ```sql
+BEGIN;
+
 DELETE FROM otlet.worker_events e
 USING otlet.jobs j
 WHERE e.job_id = j.id
   AND j.task_name = 'entity_resolution_demo';
+
+SELECT otlet.lock_eval_label_series(array_agg(l.id))
+FROM otlet.eval_labels l
+JOIN otlet.actions a ON a.id = l.action_id
+JOIN otlet.jobs j ON j.id = a.job_id
+WHERE j.task_name = 'entity_resolution_demo';
+
+SELECT set_config('otlet.eval_label_cleanup', 'on', true);
 
 DELETE FROM otlet.eval_labels l
 USING otlet.actions a, otlet.jobs j
@@ -149,6 +159,8 @@ WHERE r.job_id = j.id
 
 DELETE FROM otlet.jobs
 WHERE task_name = 'entity_resolution_demo';
+
+COMMIT;
 ```
 
 Delete prior demo evidence to make the active example rerunnable. `create_task` updates the active definition and captures a new revision when work is admitted. A retired task remains a durable archive, so use a new task name after retirement

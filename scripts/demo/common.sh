@@ -56,10 +56,17 @@ cleanup_task() {
   local task="$1"
 
   psql_exec -v task_name="$task" >/dev/null <<'SQL'
+BEGIN;
 DELETE FROM otlet.worker_events e
 USING otlet.jobs j
 WHERE e.job_id = j.id
   AND j.task_name = :'task_name';
+SELECT otlet.lock_eval_label_series(array_agg(label.id ORDER BY label.id))
+FROM otlet.eval_labels label
+JOIN otlet.actions action ON action.id = label.action_id
+JOIN otlet.jobs job ON job.id = action.job_id
+WHERE job.task_name = :'task_name';
+SELECT set_config('otlet.eval_label_cleanup', 'on', true);
 DELETE FROM otlet.eval_labels l
 USING otlet.actions a, otlet.jobs j
 WHERE l.action_id = a.id
@@ -89,6 +96,7 @@ USING otlet.jobs j
 WHERE r.job_id = j.id
   AND j.task_name = :'task_name';
 DELETE FROM otlet.jobs WHERE task_name = :'task_name';
+COMMIT;
 SQL
 }
 

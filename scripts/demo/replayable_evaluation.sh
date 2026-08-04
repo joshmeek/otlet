@@ -197,6 +197,13 @@ BEGIN
     label_source => 'manual_correction'
   );
 
+  PERFORM otlet.adjudicate_eval_label(
+    selected_label_id,
+    'accepted',
+    1.0,
+    'Accepted baseline replay label'
+  );
+
   selected_case_hash := otlet.register_evaluation_case(
     selected_label_id,
     'qualification',

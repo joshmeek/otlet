@@ -250,6 +250,19 @@ cleanup_sql_state() {
   local prefix
   prefix="$(task_prefix_like)"
   psql_exec -v prefix="$prefix" >/dev/null <<'SQL' || true
+BEGIN;
+SELECT otlet.lock_eval_label_series(array_agg(label.id ORDER BY label.id))
+FROM otlet.eval_labels label
+LEFT JOIN otlet.actions action ON action.id = label.action_id
+LEFT JOIN otlet.outputs output ON output.id = label.output_id
+LEFT JOIN otlet.inference_receipts receipt ON receipt.id = label.receipt_id
+LEFT JOIN otlet.jobs job ON job.id = COALESCE(
+  action.job_id,
+  output.job_id,
+  receipt.job_id
+)
+WHERE job.task_name LIKE :'prefix' ESCAPE '\';
+SELECT set_config('otlet.eval_label_cleanup', 'on', true);
 WITH bench_jobs AS (
   SELECT id
   FROM otlet.jobs
@@ -363,6 +376,7 @@ DELETE FROM otlet.tasks t
 WHERE t.name LIKE :'prefix' ESCAPE '\';
 
 DROP SCHEMA IF EXISTS otlet_bench_source CASCADE;
+COMMIT;
 SQL
 }
 

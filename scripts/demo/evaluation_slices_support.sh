@@ -242,6 +242,12 @@ BEGIN
         reason => 'Approved evaluation slice fixture',
         label_source => 'manual_correction'
       ) label;
+      PERFORM otlet.adjudicate_eval_label(
+        saved_label_id,
+        'accepted',
+        1.0,
+        'Accepted evaluation slice label'
+      );
       saved_case_hash := otlet.register_evaluation_case(
         saved_label_id,
         'qualification',

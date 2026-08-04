@@ -281,9 +281,14 @@ pgrx::extension_sql_file!(
     requires = ["evaluation_population_lineage"]
 );
 pgrx::extension_sql_file!(
+    "../sql/migrations/0056_label_provenance_quality.sql",
+    name = "label_provenance_quality",
+    requires = ["evaluation_slices_support"]
+);
+pgrx::extension_sql_file!(
     "../sql/migrations/0043_permissions.sql",
     name = "permissions",
-    requires = ["evaluation_slices_support"]
+    requires = ["label_provenance_quality"]
 );
 
 #[allow(non_snake_case)]

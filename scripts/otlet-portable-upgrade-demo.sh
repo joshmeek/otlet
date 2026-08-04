@@ -79,7 +79,7 @@ contract="$(
 SELECT concat_ws('|',
   max(version),
   count(*),
-  array_agg(version ORDER BY version) = ARRAY(SELECT generate_series(1, 55)),
+  array_agg(version ORDER BY version) = ARRAY(SELECT generate_series(1, 56)),
   bool_and(file ~ ('(^|/)' || lpad(version::text, 4, '0') || '_')),
   (SELECT value FROM public.portable_upgrade_sentinel),
   (SELECT count(*) FROM otlet.verify_invariants())
@@ -87,7 +87,7 @@ SELECT concat_ws('|',
 FROM otlet.portable_schema_migrations;
 SQL
 )"
-[ "$contract" = "55|55|t|t|preserved|0" ] || {
+[ "$contract" = "56|56|t|t|preserved|0" ] || {
   echo "Portable repeat-install contract mismatch: $contract" >&2
   exit 1
 }
@@ -576,7 +576,7 @@ SELECT concat_ws('|',
   to_regprocedure('otlet.register_evaluation_case(bigint,text,text)') IS NOT NULL,
   to_regprocedure('otlet.start_replay_evaluation(text,text[],text,text)') IS NOT NULL,
   to_regprocedure('otlet.record_evaluation_result(bigint,bigint,bigint,jsonb,jsonb)') IS NOT NULL,
-  (SELECT count(*) = 15
+  (SELECT count(*) = 17
    FROM pg_catalog.pg_trigger trigger
    WHERE trigger.tgrelid IN (
      'otlet.evaluation_cases'::regclass,
@@ -627,15 +627,12 @@ SELECT concat_ws('|',
     AND EXISTS (
       SELECT 1
       FROM pg_catalog.pg_index index_row
+      JOIN pg_catalog.pg_class index_relation
+        ON index_relation.oid = index_row.indexrelid
       WHERE index_row.indrelid = 'otlet.evaluation_cases'::regclass
-        AND index_row.indisunique
-        AND index_row.indnkeyatts = 1
-        AND index_row.indkey::text = (
-          SELECT attribute.attnum::text
-          FROM pg_catalog.pg_attribute attribute
-          WHERE attribute.attrelid = 'otlet.evaluation_cases'::regclass
-            AND attribute.attname = 'lineage_hash'
-        )
+        AND index_relation.relname = 'evaluation_cases_lineage_idx'
+        AND NOT index_row.indisunique
+        AND index_row.indnkeyatts = 3
     ),
   to_regprocedure('otlet.validate_evaluation_run_population()') IS NOT NULL
     AND EXISTS (
@@ -783,6 +780,197 @@ SQL
 )"
 [ "$evaluation_slices_migration_contract" = "t|t|t|t|t|t|t" ] || {
   echo "Portable evaluation-slices migration contract mismatch: $evaluation_slices_migration_contract" >&2
+  exit 1
+}
+
+label_provenance_migration_contract="$(
+  docker exec -i "$container" psql -U postgres -d "$database" \
+    -X -qAt -v ON_ERROR_STOP=1 <<'SQL'
+SELECT concat_ws('|',
+  EXISTS (
+    SELECT 1
+    FROM otlet.portable_schema_migrations
+    WHERE version = 56
+      AND file ~ '0056_label_provenance_quality.sql$'
+  ),
+  (SELECT count(*) = 17
+   FROM information_schema.columns
+   WHERE table_schema = 'otlet'
+     AND table_name = 'eval_labels'
+     AND column_name IN (
+       'task_name',
+       'workload_revision_hash',
+       'content_hash',
+       'label_revision',
+       'authenticated_role_oid',
+       'authenticated_role_name',
+       'active_role_oid',
+       'active_role_name',
+       'adjudication_state',
+       'label_confidence',
+       'supersedes_label_id',
+       'adjudication_reason',
+       'adjudicated_authenticated_role_oid',
+       'adjudicated_authenticated_role_name',
+       'adjudicated_active_role_oid',
+       'adjudicated_active_role_name',
+       'adjudicated_at'
+     ))
+    AND (SELECT count(*) = 10
+      FROM information_schema.columns
+      WHERE table_schema = 'otlet'
+        AND table_name = 'eval_labels'
+        AND is_nullable = 'NO'
+        AND column_name IN (
+          'source_hash',
+          'task_name',
+          'workload_revision_hash',
+          'content_hash',
+          'label_revision',
+          'authenticated_role_oid',
+          'authenticated_role_name',
+          'active_role_oid',
+          'active_role_name',
+          'adjudication_state'
+        ))
+    AND (SELECT count(*) = 12
+      FROM pg_catalog.pg_constraint constraint_row
+      WHERE constraint_row.conrelid = 'otlet.eval_labels'::regclass
+        AND constraint_row.conname IN (
+          'eval_labels_content_hash_check',
+          'eval_labels_label_revision_check',
+          'eval_labels_authenticated_role_name_check',
+          'eval_labels_active_role_name_check',
+          'eval_labels_adjudication_state_check',
+          'eval_labels_supersedes_label_check',
+          'eval_labels_adjudication_reason_check',
+          'eval_labels_workload_revision_fkey',
+          'eval_labels_adjudication_fields_check',
+          'eval_labels_rejected_supersession_check',
+          'eval_labels_supersedes_self_check',
+          'eval_labels_supersedes_label_fkey'
+        )),
+  to_regclass('otlet.eval_label_quality_status') IS NOT NULL
+    AND to_regclass('otlet.eval_label_series_revisions') IS NOT NULL
+    AND to_regprocedure(
+      'otlet.adjudicate_eval_label(bigint,text,numeric,text,bigint)'
+    ) IS NOT NULL
+    AND to_regprocedure(
+      'otlet.current_task_subject_source_hash(text,text,text)'
+    ) IS NOT NULL
+    AND to_regprocedure(
+      'otlet.eval_label_current_source_hash(bigint)'
+    ) IS NOT NULL
+    AND to_regprocedure(
+      'otlet.cleanup_eval_label_series(timestamptz,boolean)'
+    ) IS NOT NULL
+    AND (SELECT count(*) = 1 AND bool_and(dry_run)
+      FROM otlet.cleanup_policy_state(true)),
+  (SELECT count(*) = 4
+   FROM pg_catalog.pg_trigger trigger
+   WHERE trigger.tgrelid = 'otlet.eval_labels'::regclass
+     AND trigger.tgname IN (
+       'eval_labels_b_provenance',
+       'eval_labels_c_adjudication',
+       'eval_labels_d_delete_guard',
+       'eval_labels_truncate_guard'
+     ))
+    AND EXISTS (
+      SELECT 1
+      FROM pg_catalog.pg_trigger trigger
+      WHERE trigger.tgrelid = 'otlet.evaluation_cases'::regclass
+        AND trigger.tgname = 'evaluation_cases_c_label_quality'
+    )
+    AND EXISTS (
+      SELECT 1
+      FROM pg_catalog.pg_trigger trigger
+      WHERE trigger.tgrelid = 'otlet.evaluation_runs'::regclass
+        AND trigger.tgname = 'evaluation_runs_e_label_quality'
+    )
+    AND EXISTS (
+      SELECT 1
+      FROM pg_catalog.pg_trigger trigger
+      WHERE trigger.tgrelid = 'otlet.workload_acceptance_events'::regclass
+        AND trigger.tgname = 'workload_acceptance_events_c_label_quality'
+    ),
+  EXISTS (
+    SELECT 1
+    FROM pg_catalog.pg_indexes index
+    WHERE index.schemaname = 'otlet'
+      AND index.indexname = 'evaluation_cases_lineage_idx'
+      AND index.indexdef NOT LIKE 'CREATE UNIQUE INDEX%'
+  )
+    AND EXISTS (
+      SELECT 1
+      FROM pg_catalog.pg_index index_row
+      WHERE index_row.indexrelid = 'otlet.eval_labels_series_revision_idx'::regclass
+        AND index_row.indisunique
+        AND index_row.indnullsnotdistinct
+    )
+    AND EXISTS (
+      SELECT 1
+      FROM pg_catalog.pg_index index_row
+      WHERE index_row.indexrelid = 'otlet.eval_labels_supersedes_idx'::regclass
+        AND index_row.indisunique
+    )
+    AND EXISTS (
+      SELECT 1
+      FROM pg_catalog.pg_index index_row
+      WHERE index_row.indexrelid = 'otlet.eval_label_series_revisions_key'::regclass
+        AND index_row.indisunique
+        AND index_row.indnullsnotdistinct
+    ),
+  NOT EXISTS (
+    SELECT 1
+    FROM pg_catalog.pg_proc function_row
+    JOIN pg_catalog.pg_namespace namespace
+      ON namespace.oid = function_row.pronamespace
+    WHERE namespace.nspname = 'otlet'
+      AND function_row.proname IN (
+        'current_task_subject_input_snapshot',
+        'current_task_subject_content_hash',
+        'current_task_subject_source_hash',
+        'eval_label_current_source_hash',
+        'populate_eval_label_provenance',
+        'guard_eval_label_adjudication',
+        'lock_eval_label_series',
+        'guard_eval_label_delete',
+        'cleanup_eval_label_series',
+        'cleanup_policy_state_without_label_quality',
+        'cleanup_policy_state',
+        'adjudicate_eval_label',
+        'validate_evaluation_case_label_quality',
+        'validate_evaluation_run_label_quality',
+        'validate_promotion_label_quality'
+      )
+      AND pg_catalog.has_function_privilege(
+        'public', function_row.oid, 'EXECUTE'
+      )
+  )
+    AND NOT EXISTS (
+      SELECT 1
+      FROM pg_catalog.pg_class relation
+      JOIN pg_catalog.pg_namespace namespace
+        ON namespace.oid = relation.relnamespace
+      WHERE namespace.nspname = 'otlet'
+        AND relation.relname IN (
+          'eval_label_series_revisions',
+          'eval_label_quality_status',
+          'eval_label_status',
+          'audit_eval_label_export',
+          'evaluation_case_status'
+        )
+        AND pg_catalog.has_table_privilege(
+          'public', relation.oid,
+          'SELECT,INSERT,UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER'
+        )
+    ),
+  NOT EXISTS (SELECT 1 FROM otlet.verify_invariants())
+);
+SQL
+)"
+[ "$label_provenance_migration_contract" = "t|t|t|t|t|t|t" ] || {
+  echo "Portable label-provenance migration contract mismatch: $label_provenance_migration_contract" >&2
   exit 1
 }
 
@@ -1202,6 +1390,7 @@ echo "portable_acceptance_migration_contract=$acceptance_migration_contract"
 echo "portable_evaluation_migration_contract=$evaluation_migration_contract"
 echo "portable_population_lineage_migration_contract=$population_lineage_migration_contract"
 echo "portable_evaluation_slices_migration_contract=$evaluation_slices_migration_contract"
+echo "portable_label_provenance_migration_contract=$label_provenance_migration_contract"
 echo "portable_ask_administrative_contract=$portable_ask_administrative_contract"
 echo "portable_task_lifecycle_contract=$portable_task_lifecycle_contract"
 echo "portable_model_capacity_contract=$batch_claims|$batch_capacity_contract|$concurrent_capacity_contract|$cancel_blocked_claims|$replacement_claims|$lease_capacity_contract"

@@ -223,6 +223,12 @@ BEGIN
       reason => 'Approved evaluation population fixture',
       label_source => 'manual_correction'
     ) label;
+    PERFORM otlet.adjudicate_eval_label(
+      label_id,
+      'accepted',
+      1.0,
+      'Accepted evaluation population label'
+    );
     case_hash := otlet.register_evaluation_case(
       label_id,
       fixture.population_kind,
@@ -262,6 +268,12 @@ BEGIN
     reason => 'Duplicate logical snapshot probe',
     label_source => 'manual_correction'
   ) label;
+  PERFORM otlet.adjudicate_eval_label(
+    duplicate_label_id,
+    'accepted',
+    1.0,
+    'Accepted duplicate lineage probe label'
+  );
 
   BEGIN
     PERFORM otlet.register_evaluation_case(
@@ -1165,5 +1177,31 @@ FROM evaluation_population_lineage_contract;
 SELECT 'evaluation_population_lineage_contract=' || contract
 FROM evaluation_population_lineage_contract;
 
+\ir /work/scripts/demo/label_provenance_quality.sql
+
 ROLLBACK;
 SQL
+
+label_cleanup_isolation_contract="$(psql_exec -qAt <<'SQL'
+BEGIN ISOLATION LEVEL REPEATABLE READ;
+DO $body$
+BEGIN
+  BEGIN
+    PERFORM otlet.cleanup_eval_label_series(clock_timestamp(), false);
+    RAISE EXCEPTION 'negative probe unexpectedly succeeded';
+  EXCEPTION WHEN OTHERS THEN
+    IF SQLERRM <> 'otlet evaluation label cleanup requires read committed isolation' THEN
+      RAISE;
+    END IF;
+  END;
+END
+$body$;
+SELECT true;
+ROLLBACK;
+SQL
+)"
+echo "label_cleanup_isolation_contract=$label_cleanup_isolation_contract"
+[ "$label_cleanup_isolation_contract" = "t" ] || {
+  echo "Expected live label cleanup to reject repeatable-read isolation" >&2
+  exit 1
+}
