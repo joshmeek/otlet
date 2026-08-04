@@ -10,11 +10,18 @@ pub(crate) fn preload_model(
         artifact_identity: &model.artifact_identity,
     };
     let model_fingerprint_hash = model_fingerprint_hash(model);
+    let verified_artifact = verify_model_artifact(model)?;
     let cache = LINKED_CACHE.get_or_init(|| Mutex::new(None));
     let mut cache = cache
         .lock()
         .map_err(|_| ModelError::new("linked llama.cpp cache lock poisoned"))?;
-    let load = ensure_linked_model(&mut cache, model, &options, &model_fingerprint_hash)?;
+    let load = ensure_linked_model(
+        &mut cache,
+        model,
+        verified_artifact,
+        &options,
+        &model_fingerprint_hash,
+    )?;
     let loaded = cache
         .as_ref()
         .ok_or_else(|| ModelError::new("linked llama.cpp cache did not initialize"))?;
@@ -44,6 +51,7 @@ pub(crate) fn preload_model(
 fn ensure_linked_model(
     cache: &mut Option<LinkedCache>,
     job_model: JobModelRef<'_>,
+    mut verified_artifact: VerifiedArtifact,
     options: &crate::runtime::RuntimeOptions,
     model_fingerprint_hash: &str,
 ) -> Result<LinkedLoadEvidence, ModelError> {
@@ -52,7 +60,6 @@ fn ensure_linked_model(
     if job_model.artifact_path.starts_with("hf:") {
         return Err(ModelError::new("linked llama.cpp runtime requires a local GGUF artifact path"));
     }
-    verify_model_artifact(job_model)?;
     LINKED_BACKEND.get_or_init(|| unsafe {
         llama_cpp_sys_4::llama_backend_init();
     });
@@ -65,7 +72,16 @@ fn ensure_linked_model(
     let cache_hit = cache.as_ref().is_some_and(|cached| {
         cached.artifact_path == job_model.artifact_path
             && cached.model_fingerprint_hash.as_ref() == model_fingerprint_hash
+            && cached.verified_artifact.stamp == verified_artifact.stamp
     });
+    if !cache_hit && verified_artifact.digest_cached {
+        verified_artifact.verify_digest()?;
+    }
+    let model_load_path = if cache_hit {
+        None
+    } else {
+        Some(verified_artifact.load_path()?)
+    };
     let memory_before = process_memory_sample();
     let resident_reclaim_bytes = if !cache_hit && model_params.use_mmap && !model_params.use_mlock {
         cache
@@ -88,12 +104,14 @@ fn ensure_linked_model(
         )
     } else {
         linked_model_load_admission(
-            job_model.artifact_path,
+            model_load_path.as_deref().expect("cache miss has a load path"),
+            u64_to_i64_saturating(verified_artifact.bytes()),
             options,
             &memory_before,
             resident_reclaim_bytes,
         )
     };
+    verified_artifact.ensure_unchanged()?;
     if memory_admission.rejected() {
         let memory_after = process_memory_sample();
         let memory_trace = build_memory_trace(
@@ -117,7 +135,12 @@ fn ensure_linked_model(
     }
 
     if !cache_hit {
-        let model_path = CString::new(job_model.artifact_path.as_bytes())
+        let model_path = CString::new(
+            model_load_path
+                .as_deref()
+                .expect("cache miss has a load path")
+                .as_bytes(),
+        )
             .map_err(|_| ModelError::new("linked llama.cpp model path is invalid"))?;
         let prompt_batch_tokens = linked_prompt_batch_tokens();
         let prompt_micro_batch_tokens = linked_prompt_ubatch_tokens(prompt_batch_tokens);
@@ -130,9 +153,11 @@ fn ensure_linked_model(
         };
         let load_ms = elapsed_ms(load_start);
         if model_ptr.is_null() {
+            verified_artifact.ensure_unchanged()?;
             return Err(ModelError::new("linked llama.cpp model load failed"));
         }
         let model = LinkedModel { ptr: model_ptr };
+        verified_artifact.ensure_unchanged()?;
 
         let mut ctx_params = unsafe { llama_cpp_sys_4::llama_context_default_params() };
         ctx_params.n_ctx = LINKED_CONTEXT_WINDOW_TOKENS;
@@ -167,6 +192,7 @@ fn ensure_linked_model(
         *cache = Some(LinkedCache {
             artifact_path: job_model.artifact_path.to_owned(),
             model_fingerprint_hash: Arc::<str>::from(model_fingerprint_hash),
+            verified_artifact,
             _model: model,
             context,
             vocab,
@@ -193,15 +219,12 @@ fn ensure_linked_model(
 }
 
 fn linked_model_load_admission(
-    artifact_path: &str,
+    artifact_load_path: &str,
+    artifact_bytes: i64,
     options: &crate::runtime::RuntimeOptions,
     sample: &ProcessMemorySample,
     resident_reclaim_bytes: i64,
 ) -> ModelLoadAdmission {
-    let artifact_bytes = fs::metadata(artifact_path)
-        .ok()
-        .map(|metadata| u64_to_i64_saturating(metadata.len()))
-        .unwrap_or(0);
     let worker_budget_bytes = u64_to_i64_saturating(options.max_worker_rss_bytes);
     let worker_budget_headroom_bytes = worker_budget_bytes
         .saturating_sub(sample.rss_bytes)
@@ -267,7 +290,7 @@ fn linked_model_load_admission(
         return admission;
     }
 
-    let projection = linked_model_load_projection(artifact_path, artifact_bytes);
+    let projection = linked_model_load_projection(artifact_load_path, artifact_bytes);
     let Ok(projection) = projection else {
         admission.reason = "llama_projection_error";
         return admission;

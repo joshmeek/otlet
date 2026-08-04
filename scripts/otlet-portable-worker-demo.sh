@@ -27,6 +27,8 @@ worker_log="$(mktemp)"
 recovery_log="$(mktemp)"
 recovery_container="otlet-portable-recovery-worker"
 canary="RECOVERY_RAW_EVIDENCE_CANARY"
+swap_artifact_dir="/var/lib/postgresql/otlet-portable-artifact-swap-$$"
+swap_artifact="$swap_artifact_dir/model.gguf"
 
 cleanup() {
   if docker container inspect "$recovery_container" >/dev/null 2>&1; then
@@ -36,6 +38,7 @@ cleanup() {
     docker start "$container" >/dev/null 2>&1 || true
   fi
   rm -f "$worker_log" "$recovery_log"
+  docker exec "$container" rm -rf "$swap_artifact_dir" >/dev/null 2>&1 || true
   docker exec "$container" dropdb -U postgres --if-exists "$portable_database" >/dev/null 2>&1 || true
   docker exec -i "$container" psql -U postgres -d postgres -X -qAt -v ON_ERROR_STOP=1 \
     -v worker_role="$worker_role" \
@@ -526,6 +529,96 @@ SQL
 
 worker_database_url="postgresql://${worker_role}@127.0.0.1:5432/${portable_database}"
 cheap_worker_database_url="postgresql://${cheap_worker_role}@127.0.0.1:5432/${portable_database}"
+
+docker exec "$container" mkdir -p "$swap_artifact_dir"
+docker exec "$container" ln "$model_artifact" "$swap_artifact"
+docker exec -i "$container" psql -U postgres -d "$portable_database" \
+  -X -qAt -v ON_ERROR_STOP=1 <<'SQL' >/dev/null
+CREATE FUNCTION public.portable_artifact_swap_delay() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+  PERFORM pg_sleep(5);
+  RETURN NEW;
+END;
+$$;
+CREATE TRIGGER portable_artifact_swap_delay
+BEFORE UPDATE ON otlet.portable_workers
+FOR EACH ROW
+WHEN (OLD.incarnation_nonce_hash IS DISTINCT FROM NEW.incarnation_nonce_hash)
+EXECUTE FUNCTION public.portable_artifact_swap_delay();
+SQL
+
+: >"$worker_log"
+docker exec \
+  -e "OTLET_DATABASE_URL=$worker_database_url" \
+  -e "PGPASSWORD=$worker_password" \
+  -e "OTLET_PORTABLE_WORKER_ID=$worker_id" \
+  -e OTLET_PORTABLE_PROTOCOL_VERSION=1 \
+  -e "OTLET_PORTABLE_RUNTIME_IDENTITY_HASH=$runtime_identity_hash" \
+  -e "OTLET_MODEL_NAME=$model_name" \
+  -e "OTLET_MODEL_PATH=$swap_artifact" \
+  -e "OTLET_MODEL_SHA256=$model_sha256" \
+  -e OTLET_PORTABLE_REQUIRE_TLS=0 \
+  -e OTLET_PORTABLE_ONCE=1 \
+  "$container" /target/release/otlet_worker --once >"$worker_log" 2>&1 &
+swap_worker_pid=$!
+
+swap_waiting="false"
+for _ in {1..100}; do
+  swap_waiting="$(
+    docker exec "$container" psql -U postgres -d "$portable_database" -X -qAt \
+      -c "SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE datname = '$portable_database' AND wait_event = 'PgSleep' AND query LIKE '%portable_start_worker%')"
+  )"
+  [ "$swap_waiting" = "t" ] && break
+  sleep 0.05
+done
+if [ "$swap_waiting" != "t" ]; then
+  wait "$swap_worker_pid" || true
+  tail -n 120 "$worker_log" >&2
+  echo "Portable artifact swap did not reach the load window" >&2
+  exit 1
+fi
+docker exec "$container" sh -c 'rm -f "$1" && ln -s "$2" "$1"' sh "$swap_artifact" "$model_artifact"
+set +e
+wait "$swap_worker_pid"
+swap_worker_status=$?
+set -e
+if [ "$swap_worker_status" = "0" ] || ! grep -q '"reason":"model_artifact_path_replaced"' "$worker_log"; then
+  tail -n 120 "$worker_log" >&2
+  echo "Expected portable load-window replacement to fail closed" >&2
+  exit 1
+fi
+
+portable_artifact_swap_contract="$(
+  docker exec -i "$container" psql -U postgres -d "$portable_database" \
+    -X -qAt -v ON_ERROR_STOP=1 -v worker_id="$worker_id" -v async_job_id="$async_job_id" <<'SQL'
+SELECT concat_ws('|',
+  worker.reported_state,
+  worker.model_status,
+  worker.last_error_code,
+  job.status,
+  (SELECT count(*) FROM otlet.portable_claims claim WHERE claim.job_id = job.id),
+  (SELECT count(*) FROM otlet.inference_receipts receipt WHERE receipt.job_id = job.id),
+  (SELECT count(*) FROM otlet.outputs output_row WHERE output_row.job_id = job.id)
+)
+FROM otlet.portable_workers worker
+CROSS JOIN otlet.jobs job
+WHERE worker.worker_id = :'worker_id'
+  AND job.id = :'async_job_id'::bigint;
+SQL
+)"
+if [ "$portable_artifact_swap_contract" != "error|error|model_artifact_path_replaced|queued|0|0|0" ]; then
+  echo "Expected SQL-visible portable artifact replacement failure, got $portable_artifact_swap_contract" >&2
+  exit 1
+fi
+echo "portable_artifact_swap_contract=$portable_artifact_swap_contract"
+docker exec -i "$container" psql -U postgres -d "$portable_database" \
+  -X -qAt -v ON_ERROR_STOP=1 <<'SQL' >/dev/null
+DROP TRIGGER portable_artifact_swap_delay ON otlet.portable_workers;
+DROP FUNCTION public.portable_artifact_swap_delay();
+SQL
+docker exec "$container" rm -rf "$swap_artifact_dir"
+
 run_worker_once
 
 contract="$(
@@ -654,6 +747,7 @@ SELECT concat_ws('|',
   (
     contract.trace_summary #>> '{runtime_fingerprint,artifact,sha256}' = :'model_sha256'
     AND (contract.trace_summary #>> '{runtime_fingerprint,artifact,bytes}')::bigint = :'model_bytes'::bigint
+    AND contract.trace_summary #>> '{runtime_fingerprint,artifact,verification}' = 'sha256_verified_file_descriptor_load'
     AND (contract.trace_summary #>> '{runtime_fingerprint,context,tokens}')::integer = 4096
     AND (contract.trace_summary #>> '{runtime_fingerprint,context,batch_tokens}')::integer = 512
     AND (contract.trace_summary #>> '{runtime_fingerprint,context,ubatch_tokens}')::integer = 128

@@ -3,7 +3,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::ffi::CString;
 use std::fs::{File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{
@@ -831,12 +831,221 @@ fn validate_registered_model(
     Ok(())
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ArtifactStamp {
+    bytes: u64,
+    modified_ms: u128,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+    #[cfg(unix)]
+    changed_seconds: i64,
+    #[cfg(unix)]
+    changed_nanoseconds: i64,
+}
+
+impl ArtifactStamp {
+    #[cfg(unix)]
+    fn same_file(self, other: Self) -> bool {
+        self.device == other.device && self.inode == other.inode
+    }
+
+    #[cfg(not(unix))]
+    fn same_file(self, other: Self) -> bool {
+        self == other
+    }
+}
+
+#[derive(Debug)]
+struct VerifiedArtifact {
+    path: PathBuf,
+    file: File,
+    sha256: String,
+    stamp: ArtifactStamp,
+}
+
+impl VerifiedArtifact {
+    fn open(path: &Path) -> Result<Self, String> {
+        let path_stamp = regular_artifact_stamp(path)?;
+        let mut file = open_artifact(path).map_err(|_| {
+            coded(
+                "model_artifact_unreadable",
+                "local GGUF could not be opened",
+            )
+        })?;
+        let stamp = file
+            .metadata()
+            .map(|metadata| artifact_stamp(&metadata))
+            .map_err(|_| {
+                coded(
+                    "model_artifact_unreadable",
+                    "local GGUF metadata is unavailable",
+                )
+            })?;
+        if stamp != path_stamp || regular_artifact_stamp(path)? != stamp {
+            return Err(coded(
+                "model_artifact_path_replaced",
+                "local GGUF path changed while opening",
+            ));
+        }
+        let sha256 = sha256_open_file(&mut file)?;
+        file.rewind().map_err(|_| {
+            coded(
+                "model_artifact_unreadable",
+                "local GGUF could not be rewound",
+            )
+        })?;
+        let artifact = Self {
+            path: path.to_path_buf(),
+            file,
+            sha256,
+            stamp,
+        };
+        artifact.ensure_unchanged()?;
+        Ok(artifact)
+    }
+
+    fn bytes(&self) -> u64 {
+        self.stamp.bytes
+    }
+
+    #[cfg(target_os = "linux")]
+    fn load_path(&self) -> Result<String, String> {
+        use std::os::fd::AsRawFd;
+
+        Ok(format!("/proc/self/fd/{}", self.file.as_raw_fd()))
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn load_path(&self) -> Result<String, String> {
+        Err(coded(
+            "model_artifact_descriptor_unavailable",
+            "verified model loading requires Linux /proc",
+        ))
+    }
+
+    fn ensure_unchanged(&self) -> Result<(), String> {
+        let metadata = std::fs::symlink_metadata(&self.path).map_err(|_| {
+            coded(
+                "model_artifact_path_replaced",
+                "local GGUF path disappeared after verification",
+            )
+        })?;
+        if !metadata.file_type().is_file() {
+            return Err(coded(
+                "model_artifact_path_replaced",
+                "local GGUF path was replaced after verification",
+            ));
+        }
+        let path_stamp = artifact_stamp(&metadata);
+        if !self.stamp.same_file(path_stamp) {
+            return Err(coded(
+                "model_artifact_path_replaced",
+                "local GGUF path was replaced after verification",
+            ));
+        }
+        let file_stamp = self
+            .file
+            .metadata()
+            .map(|metadata| artifact_stamp(&metadata))
+            .map_err(|_| {
+                coded(
+                    "model_artifact_changed_after_verification",
+                    "verified local GGUF metadata is unavailable",
+                )
+            })?;
+        if file_stamp != self.stamp || path_stamp != self.stamp {
+            return Err(coded(
+                "model_artifact_changed_after_verification",
+                "local GGUF changed after verification",
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn open_artifact(path: &Path) -> std::io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(0o400000);
+    }
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(0x100);
+    }
+    options.open(path)
+}
+
+fn regular_artifact_stamp(path: &Path) -> Result<ArtifactStamp, String> {
+    let metadata = std::fs::symlink_metadata(path).map_err(|_| {
+        coded(
+            "model_artifact_unreadable",
+            "local GGUF metadata is unavailable",
+        )
+    })?;
+    if metadata.file_type().is_symlink() {
+        return Err(coded(
+            "model_artifact_symlink_rejected",
+            "local GGUF path must not be a symlink",
+        ));
+    }
+    if !metadata.file_type().is_file() {
+        return Err(coded(
+            "model_artifact_not_regular",
+            "local GGUF path is not a regular file",
+        ));
+    }
+    Ok(artifact_stamp(&metadata))
+}
+
+fn artifact_stamp(metadata: &std::fs::Metadata) -> ArtifactStamp {
+    #[cfg(unix)]
+    use std::os::unix::fs::MetadataExt;
+
+    ArtifactStamp {
+        bytes: metadata.len(),
+        modified_ms: metadata
+            .modified()
+            .ok()
+            .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+            .map_or(0, |duration| duration.as_millis()),
+        #[cfg(unix)]
+        device: metadata.dev(),
+        #[cfg(unix)]
+        inode: metadata.ino(),
+        #[cfg(unix)]
+        changed_seconds: metadata.ctime(),
+        #[cfg(unix)]
+        changed_nanoseconds: metadata.ctime_nsec(),
+    }
+}
+
+fn sha256_open_file(file: &mut File) -> Result<String, String> {
+    let mut digest = Sha256::new();
+    let mut buffer = vec![0_u8; 1024 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .map_err(|_| coded("model_artifact_unreadable", "local GGUF could not be read"))?;
+        if read == 0 {
+            break;
+        }
+        digest.update(&buffer[..read]);
+    }
+    Ok(format!("{:x}", digest.finalize()))
+}
+
 struct LocalModel {
     model: *mut llama_cpp_sys_4::llama_model,
     context: *mut llama_cpp_sys_4::llama_context,
     vocab: *const llama_cpp_sys_4::llama_vocab,
     default_threads: i32,
-    artifact_bytes: u64,
+    artifact: VerifiedArtifact,
     model_memory_bytes: u64,
     model_parameters: u64,
     context_window_tokens: u32,
@@ -845,12 +1054,10 @@ struct LocalModel {
 }
 
 impl LocalModel {
-    fn load(path: &Path, threads: i32) -> Result<Self, String> {
-        let artifact_bytes = std::fs::metadata(path)
-            .map_err(|err| format!("could not read local GGUF metadata: {err}"))?
-            .len();
-        let path = CString::new(path.as_os_str().as_encoded_bytes())
+    fn load(artifact: VerifiedArtifact, threads: i32) -> Result<Self, String> {
+        let path = CString::new(artifact.load_path()?)
             .map_err(|_| "model path contains a null byte".to_owned())?;
+        artifact.ensure_unchanged()?;
         unsafe {
             llama_cpp_sys_4::llama_log_set(Some(discard_llama_log), std::ptr::null_mut());
             llama_cpp_sys_4::llama_backend_init();
@@ -862,7 +1069,12 @@ impl LocalModel {
             unsafe { llama_cpp_sys_4::llama_model_load_from_file(path.as_ptr(), model_params) };
         let load_ms = u64::try_from(load_start.elapsed().as_millis()).unwrap_or(u64::MAX);
         if model.is_null() {
+            artifact.ensure_unchanged()?;
             return Err("local GGUF model load failed".to_owned());
+        }
+        if let Err(error) = artifact.ensure_unchanged() {
+            unsafe { llama_cpp_sys_4::llama_model_free(model) };
+            return Err(error);
         }
 
         let mut context_params = unsafe { llama_cpp_sys_4::llama_context_default_params() };
@@ -902,7 +1114,7 @@ impl LocalModel {
             context,
             vocab,
             default_threads: threads,
-            artifact_bytes,
+            artifact,
             model_memory_bytes: unsafe { llama_cpp_sys_4::llama_model_size(model) },
             model_parameters: unsafe { llama_cpp_sys_4::llama_model_n_params(model) },
             context_window_tokens,
@@ -920,6 +1132,7 @@ impl LocalModel {
         batch_threads: i32,
         signal: &ClaimSignal,
     ) -> Result<Inference, String> {
+        self.artifact.ensure_unchanged()?;
         let _abort = AbortGuard::new(self.context, signal);
         unsafe {
             llama_cpp_sys_4::llama_set_n_threads(self.context, threads, batch_threads);
@@ -1457,7 +1670,6 @@ fn token_to_piece(
 }
 
 fn runtime_trace(
-    config: &Config,
     claim: &Claim,
     model: &LocalModel,
     options: Option<&RuntimeOptions>,
@@ -1496,9 +1708,9 @@ fn runtime_trace(
         "runtime_fingerprint_version": "otlet_portable_runtime_contract_v1",
         "runtime_fingerprint": {
             "artifact": {
-                "sha256": config.model_sha256,
-                "bytes": model.artifact_bytes,
-                "verification": "sha256_verified_before_eager_load"
+                "sha256": model.artifact.sha256.as_str(),
+                "bytes": model.artifact.bytes(),
+                "verification": "sha256_verified_file_descriptor_load"
             },
             "context": {
                 "tokens": model.context_window_tokens,
@@ -1565,7 +1777,7 @@ fn process_claim(
         return Err("portable claim selection role is invalid".to_owned());
     }
     let Some(selected_model) = claim.model.as_object() else {
-        let trace = runtime_trace(config, claim, model, None, None, None, None);
+        let trace = runtime_trace(claim, model, None, None, None, None);
         let state = database.fail(
             config,
             claim,
@@ -1590,9 +1802,9 @@ fn process_claim(
         || artifact_identity
             .and_then(|identity| identity.get("bytes"))
             .and_then(Value::as_u64)
-            != Some(model.artifact_bytes)
+            != Some(model.artifact.bytes())
     {
-        let trace = runtime_trace(config, claim, model, None, None, None, None);
+        let trace = runtime_trace(claim, model, None, None, None, None);
         let state = database.fail(
             config,
             claim,
@@ -1607,7 +1819,7 @@ fn process_claim(
     let options = match RuntimeOptions::parse(&claim.runtime_options) {
         Ok(options) => options,
         Err(_) => {
-            let trace = runtime_trace(config, claim, model, None, None, None, None);
+            let trace = runtime_trace(claim, model, None, None, None, None);
             let state = database.fail(
                 config,
                 claim,
@@ -1630,7 +1842,7 @@ fn process_claim(
     let rss_before = match process_rss_bytes() {
         Ok(rss) => rss,
         Err(_) => {
-            let trace = runtime_trace(config, claim, model, Some(&options), None, None, None);
+            let trace = runtime_trace(claim, model, Some(&options), None, None, None);
             let state = database.fail(
                 config,
                 claim,
@@ -1644,15 +1856,7 @@ fn process_claim(
         }
     };
     if enforce_worker_rss_budget(rss_before, options.max_worker_rss_bytes).is_err() {
-        let trace = runtime_trace(
-            config,
-            claim,
-            model,
-            Some(&options),
-            Some(rss_before),
-            None,
-            None,
-        );
+        let trace = runtime_trace(claim, model, Some(&options), Some(rss_before), None, None);
         let state = database.fail(
             config,
             claim,
@@ -1676,6 +1880,7 @@ fn process_claim(
     );
     let inference_state = signal.state();
     drop(lease);
+    let artifact_state = model.artifact.ensure_unchanged();
     match signal.state() {
         CLAIM_CANCELED => {
             database.cancel(config, claim)?;
@@ -1687,26 +1892,21 @@ fn process_claim(
             return Ok(());
         }
         CLAIM_TIMED_OUT if inference_state == CLAIM_TIMED_OUT => {
-            let trace = runtime_trace(
-                config,
-                claim,
-                model,
-                Some(&options),
-                Some(rss_before),
-                None,
-                None,
-            );
+            let trace = runtime_trace(claim, model, Some(&options), Some(rss_before), None, None);
             let state = database.fail(config, claim, "attempt_timeout", None, None, &trace)?;
             log_failure_state(&state, claim, "attempt_timeout");
             return Ok(());
         }
         _ => {}
     }
+    let inference = match artifact_state {
+        Ok(()) => inference,
+        Err(error) => Err(error),
+    };
     let rss_after = match process_rss_bytes() {
         Ok(rss) => rss,
         Err(_) => {
             let trace = runtime_trace(
-                config,
                 claim,
                 model,
                 Some(&options),
@@ -1727,7 +1927,6 @@ fn process_claim(
         }
     };
     let trace = runtime_trace(
-        config,
         claim,
         model,
         Some(&options),
@@ -1850,7 +2049,10 @@ fn runtime_identity() -> Value {
     })
 }
 
-fn deployment_preflight(database: &Database, config: &Config) -> Result<String, String> {
+fn deployment_preflight(
+    database: &Database,
+    config: &Config,
+) -> Result<(String, VerifiedArtifact), String> {
     check_runtime_dir(&config.runtime_dir)?;
 
     let desired = database.heartbeat(config, "starting", Some("verifying"), None)?;
@@ -1862,15 +2064,14 @@ fn deployment_preflight(database: &Database, config: &Config) -> Result<String, 
         ));
     }
 
-    let actual_hash = sha256_file(&config.model_path)
-        .map_err(|_| coded("model_artifact_unreadable", "local GGUF is not readable"))?;
-    if actual_hash != config.model_sha256 {
+    let artifact = VerifiedArtifact::open(&config.model_path)?;
+    if artifact.sha256 != config.model_sha256 {
         return Err(coded(
             "model_hash_mismatch",
             "local GGUF SHA-256 does not match OTLET_MODEL_SHA256",
         ));
     }
-    Ok(desired)
+    Ok((desired, artifact))
 }
 
 fn check_runtime_dir(runtime_dir: &Path) -> Result<(), String> {
@@ -1927,7 +2128,8 @@ fn run() -> Result<(), String> {
         child: Arc::new(Mutex::new(())),
     };
     let mut database_unavailable = false;
-    deployment_preflight_until_available(&database, &config, &mut database_unavailable)?;
+    let (_, verified_artifact) =
+        deployment_preflight_until_available(&database, &config, &mut database_unavailable)?;
     log_preflight(&config);
     if config.preflight_only {
         database.heartbeat(&config, "stopped", Some("verified"), None)?;
@@ -1960,10 +2162,10 @@ fn run() -> Result<(), String> {
             )
             .unwrap_or(4)
         });
-    let mut model = match LocalModel::load(&config.model_path, threads) {
+    let mut model = match LocalModel::load(verified_artifact, threads) {
         Ok(model) => model,
         Err(error) => {
-            let _ = database.heartbeat(&config, "error", Some("error"), Some("model_load_failed"));
+            let _ = database.heartbeat(&config, "error", Some("error"), Some(error_code(&error)));
             return Err(error);
         }
     };
@@ -2022,15 +2224,15 @@ fn deployment_preflight_until_available(
     database: &Database,
     config: &Config,
     unavailable: &mut bool,
-) -> Result<String, String> {
+) -> Result<(String, VerifiedArtifact), String> {
     loop {
         match deployment_preflight(database, config) {
-            Ok(desired) => {
+            Ok(preflight) => {
                 if *unavailable {
                     log_worker("database_recovered", config, None);
                     *unavailable = false;
                 }
-                return Ok(desired);
+                return Ok(preflight);
             }
             Err(error) if !config.once && !config.preflight_only && is_connection_error(&error) => {
                 if !*unavailable {
@@ -2139,22 +2341,6 @@ fn timestamp_ms() -> u128 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis()
-}
-
-fn sha256_file(path: &Path) -> Result<String, String> {
-    let mut file = File::open(path).map_err(|err| format!("could not open local GGUF: {err}"))?;
-    let mut digest = Sha256::new();
-    let mut buffer = vec![0_u8; 1024 * 1024];
-    loop {
-        let read = file
-            .read(&mut buffer)
-            .map_err(|err| format!("could not read local GGUF: {err}"))?;
-        if read == 0 {
-            break;
-        }
-        digest.update(&buffer[..read]);
-    }
-    Ok(format!("{:x}", digest.finalize()))
 }
 
 fn process_rss_bytes() -> Result<u64, String> {
@@ -2727,6 +2913,38 @@ esac
         assert_eq!(
             error_code("psql: SSL error: certificate verify failed"),
             "tls_verification_failed"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn verified_artifact_rejects_symlinks_and_path_replacement() {
+        use std::os::unix::fs::symlink;
+
+        let directory = TestDirectory::new();
+        let path = directory.path("model.gguf");
+        let replacement = directory.path("replacement.gguf");
+        let symlink_path = directory.path("symlink.gguf");
+        let original = b"verified artifact";
+        std::fs::write(&path, original).expect("model should be written");
+        std::fs::write(&replacement, b"replacement bytes").expect("replacement should be written");
+        symlink(&path, &symlink_path).expect("symlink should be created");
+
+        let artifact = VerifiedArtifact::open(&path).expect("regular artifact should verify");
+        let error =
+            VerifiedArtifact::open(&symlink_path).expect_err("symlink artifact should be rejected");
+        assert_eq!(error_code(&error), "model_artifact_symlink_rejected");
+
+        std::fs::rename(replacement, &path).expect("artifact path should be replaced");
+        let error = artifact
+            .ensure_unchanged()
+            .expect_err("path replacement should be rejected");
+        assert_eq!(error_code(&error), "model_artifact_path_replaced");
+        #[cfg(target_os = "linux")]
+        assert_eq!(
+            std::fs::read(artifact.load_path().expect("descriptor path should exist"))
+                .expect("descriptor should remain readable"),
+            original
         );
     }
 

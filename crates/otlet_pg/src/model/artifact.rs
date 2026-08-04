@@ -1,7 +1,7 @@
 use sha2::{Digest, Sha256};
-use std::io::{BufReader, Read};
+use std::io::{Read, Seek};
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ArtifactStamp {
     bytes: u64,
     modified_ms: u128,
@@ -15,12 +15,110 @@ struct ArtifactStamp {
     changed_nanoseconds: i64,
 }
 
-struct VerifiedArtifact {
+impl ArtifactStamp {
+    #[cfg(unix)]
+    fn same_file(self, other: Self) -> bool {
+        self.device == other.device && self.inode == other.inode
+    }
+
+    #[cfg(not(unix))]
+    fn same_file(self, other: Self) -> bool {
+        self == other
+    }
+}
+
+#[derive(Debug)]
+struct VerifiedArtifactCacheEntry {
     expected_sha256: String,
     stamp: ArtifactStamp,
 }
 
-fn verify_model_artifact(model: JobModelRef<'_>) -> Result<(), ModelError> {
+#[derive(Debug)]
+struct VerifiedArtifact {
+    path: String,
+    file: fs::File,
+    sha256: String,
+    stamp: ArtifactStamp,
+    digest_cached: bool,
+}
+
+impl VerifiedArtifact {
+    fn bytes(&self) -> u64 {
+        self.stamp.bytes
+    }
+
+    fn sha256(&self) -> &str {
+        &self.sha256
+    }
+
+    fn verify_digest(&mut self) -> Result<(), ModelError> {
+        let actual_sha256 = sha256_gguf(&mut self.file)?;
+        self.file.rewind().map_err(|error| {
+            artifact_failure(
+                format!("model artifact rewind failed: {error}"),
+                "model_artifact_unreadable",
+            )
+        })?;
+        if actual_sha256 != self.sha256 {
+            return Err(artifact_failure(
+                format!(
+                    "model artifact SHA-256 mismatch: expected {}, found {actual_sha256}",
+                    self.sha256
+                ),
+                "model_artifact_digest_mismatch",
+            ));
+        }
+        self.digest_cached = false;
+        self.ensure_unchanged()
+    }
+
+    #[cfg(target_os = "linux")]
+    fn load_path(&self) -> Result<String, ModelError> {
+        use std::os::fd::AsRawFd;
+
+        Ok(format!("/proc/self/fd/{}", self.file.as_raw_fd()))
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn load_path(&self) -> Result<String, ModelError> {
+        Err(artifact_failure(
+            "verified model loading requires Linux /proc",
+            "model_artifact_descriptor_unavailable",
+        ))
+    }
+
+    fn ensure_unchanged(&self) -> Result<(), ModelError> {
+        let path_stamp = regular_artifact_stamp(&self.path).map_err(|_| {
+            artifact_failure(
+                "model artifact path was replaced after verification",
+                "model_artifact_path_replaced",
+            )
+        })?;
+        if !self.stamp.same_file(path_stamp) {
+            return Err(artifact_failure(
+                "model artifact path was replaced after verification",
+                "model_artifact_path_replaced",
+            ));
+        }
+        let file_stamp = self.file.metadata().map(|metadata| artifact_stamp(&metadata)).map_err(
+            |error| {
+                artifact_failure(
+                    format!("verified model artifact metadata failed: {error}"),
+                    "model_artifact_changed_after_verification",
+                )
+            },
+        )?;
+        if file_stamp != self.stamp || path_stamp != self.stamp {
+            return Err(artifact_failure(
+                "model artifact changed after verification",
+                "model_artifact_changed_after_verification",
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn verify_model_artifact(model: JobModelRef<'_>) -> Result<VerifiedArtifact, ModelError> {
     let expected_sha256 = model.artifact_hash.trim();
     if expected_sha256.len() != 64
         || !expected_sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
@@ -45,13 +143,25 @@ fn verify_model_artifact(model: JobModelRef<'_>) -> Result<(), ModelError> {
         .and_then(Value::as_u64)
         .filter(|bytes| *bytes >= 24)
         .ok_or_else(|| artifact_failure("model artifact byte size is invalid", "model_artifact_size_invalid"))?;
-    let metadata = fs::metadata(model.artifact_path).map_err(|error| {
+    let path_stamp = regular_artifact_stamp(model.artifact_path)?;
+    let file = open_artifact(model.artifact_path).map_err(|error| {
         artifact_failure(
             format!("model artifact is unreadable: {error}"),
             "model_artifact_unreadable",
         )
     })?;
-    let stamp = artifact_stamp(&metadata);
+    let stamp = file.metadata().map(|metadata| artifact_stamp(&metadata)).map_err(|error| {
+        artifact_failure(
+            format!("model artifact metadata failed: {error}"),
+            "model_artifact_unreadable",
+        )
+    })?;
+    if stamp != path_stamp || regular_artifact_stamp(model.artifact_path)? != stamp {
+        return Err(artifact_failure(
+            "model artifact path changed while opening",
+            "model_artifact_path_replaced",
+        ));
+    }
     if stamp.bytes != expected_bytes {
         return Err(artifact_failure(
             format!(
@@ -62,24 +172,24 @@ fn verify_model_artifact(model: JobModelRef<'_>) -> Result<(), ModelError> {
         ));
     }
 
-    static VERIFIED: OnceLock<Mutex<HashMap<String, VerifiedArtifact>>> = OnceLock::new();
+    static VERIFIED: OnceLock<Mutex<HashMap<String, VerifiedArtifactCacheEntry>>> = OnceLock::new();
     let cache = VERIFIED.get_or_init(|| Mutex::new(HashMap::with_capacity(4)));
-    if cache.lock().ok().is_some_and(|cache| {
+    let cache_hit = cache.lock().ok().is_some_and(|cache| {
         cache.get(model.artifact_path).is_some_and(|verified| {
             verified.expected_sha256 == expected_sha256 && verified.stamp == stamp
         })
-    }) {
-        return Ok(());
-    }
-
-    let actual_sha256 = sha256_gguf(model.artifact_path)?;
-    if actual_sha256 != expected_sha256 {
-        return Err(artifact_failure(
-            format!(
-                "model artifact SHA-256 mismatch: expected {expected_sha256}, found {actual_sha256}"
-            ),
-            "model_artifact_digest_mismatch",
-        ));
+    });
+    let mut verified = VerifiedArtifact {
+        path: model.artifact_path.to_owned(),
+        file,
+        sha256: expected_sha256.clone(),
+        stamp,
+        digest_cached: cache_hit,
+    };
+    if cache_hit {
+        verified.ensure_unchanged()?;
+    } else {
+        verified.verify_digest()?;
     }
     if let Ok(mut cache) = cache.lock() {
         if cache.len() >= 32 {
@@ -87,28 +197,59 @@ fn verify_model_artifact(model: JobModelRef<'_>) -> Result<(), ModelError> {
         }
         cache.insert(
             model.artifact_path.to_owned(),
-            VerifiedArtifact {
+            VerifiedArtifactCacheEntry {
                 expected_sha256,
                 stamp,
             },
         );
     }
-    Ok(())
+    Ok(verified)
 }
 
-fn sha256_gguf(path: &str) -> Result<String, ModelError> {
-    let file = fs::File::open(path).map_err(|error| {
+fn regular_artifact_stamp(path: &str) -> Result<ArtifactStamp, ModelError> {
+    let metadata = fs::symlink_metadata(path).map_err(|error| {
         artifact_failure(
             format!("model artifact is unreadable: {error}"),
             "model_artifact_unreadable",
         )
     })?;
-    let mut reader = BufReader::with_capacity(1024 * 1024, file);
+    if metadata.file_type().is_symlink() {
+        return Err(artifact_failure(
+            "model artifact path must not be a symlink",
+            "model_artifact_symlink_rejected",
+        ));
+    }
+    if !metadata.file_type().is_file() {
+        return Err(artifact_failure(
+            "model artifact path is not a regular file",
+            "model_artifact_not_regular",
+        ));
+    }
+    Ok(artifact_stamp(&metadata))
+}
+
+fn open_artifact(path: &str) -> std::io::Result<fs::File> {
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(0o400000);
+    }
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(0x100);
+    }
+    options.open(path)
+}
+
+fn sha256_gguf(file: &mut fs::File) -> Result<String, ModelError> {
     let mut buffer = vec![0_u8; 1024 * 1024];
     let mut hasher = Sha256::new();
     let mut first = true;
     loop {
-        let read = reader.read(&mut buffer).map_err(|error| {
+        let read = file.read(&mut buffer).map_err(|error| {
             artifact_failure(
                 format!("model artifact read failed: {error}"),
                 "model_artifact_unreadable",
@@ -198,5 +339,62 @@ mod artifact_tests {
 
         fs::remove_file(valid_path).unwrap();
         fs::remove_file(malformed_path).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_symlinks_and_replacement_after_verification() {
+        use std::os::unix::fs::symlink;
+
+        let directory = std::env::temp_dir().join(format!(
+            "otlet-artifact-fence-{}-{}",
+            std::process::id(),
+            UNIX_EPOCH.elapsed().unwrap().as_nanos()
+        ));
+        fs::create_dir(&directory).unwrap();
+        let path = directory.join("model.gguf");
+        let replacement = directory.join("replacement.gguf");
+        let symlink_path = directory.join("symlink.gguf");
+        let original = b"GGUF0123456789abcdefghij";
+        fs::write(&path, original).unwrap();
+        fs::write(&replacement, b"GGUF0123456789abcdefghik").unwrap();
+        symlink(&path, &symlink_path).unwrap();
+        let identity = json!({
+            "sha256": "e5bb1fee570b0488d28b735081054087bc81fcdc02795e6feeec0eaefc403994",
+            "bytes": 24,
+            "source": "test",
+            "revision": "test",
+            "quantization": "test",
+            "license": "test"
+        });
+        let model = JobModelRef {
+            name: "test",
+            artifact_path: path.to_str().unwrap(),
+            artifact_hash: identity.get("sha256").and_then(Value::as_str).unwrap(),
+            artifact_identity: &identity,
+        };
+        let verified = verify_model_artifact(model)
+            .ok()
+            .expect("regular artifact should verify");
+        let symlink_model = JobModelRef {
+            artifact_path: symlink_path.to_str().unwrap(),
+            ..model
+        };
+        let error = verify_model_artifact(symlink_model).unwrap_err();
+        assert_eq!(
+            error.trace_summary.unwrap()["stop_reason"],
+            "model_artifact_symlink_rejected"
+        );
+
+        fs::rename(replacement, &path).unwrap();
+        let error = verified.ensure_unchanged().unwrap_err();
+        assert_eq!(
+            error.trace_summary.unwrap()["stop_reason"],
+            "model_artifact_path_replaced"
+        );
+        #[cfg(target_os = "linux")]
+        assert_eq!(fs::read(verified.load_path().unwrap()).unwrap(), original);
+
+        fs::remove_dir_all(directory).unwrap();
     }
 }

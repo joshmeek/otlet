@@ -100,6 +100,7 @@ openssl x509 -req \
   -out "$cert_dir/server.crt" \
   -days 1 >/dev/null 2>&1
 openssl rand -out "$cert_dir/preflight.gguf" 128
+ln -s preflight.gguf "$cert_dir/preflight-symlink.gguf"
 printf 'PGPASSWORD=%s\n' "$worker_password" >"$worker_credential_env"
 printf 'PGPASSWORD=wrong\n' >"$wrong_credential_env"
 printf 'PGPASSWORD=%s\n' "$ungranted_password" >"$ungranted_credential_env"
@@ -239,6 +240,7 @@ probe protocol protocol_incompatible -e OTLET_PORTABLE_PROTOCOL_VERSION=2
 probe runtime runtime_not_allowlisted -e "OTLET_PORTABLE_RUNTIME_IDENTITY_HASH=$(printf '0%.0s' {1..64})"
 probe model_allowlist model_not_allowlisted -e OTLET_MODEL_NAME=unregistered_model
 probe model_path model_artifact_unreadable -e OTLET_MODEL_PATH=/models/missing.gguf
+probe model_symlink model_artifact_symlink_rejected -e OTLET_MODEL_PATH=/models/preflight-symlink.gguf
 probe model_hash model_hash_mismatch -e "OTLET_MODEL_SHA256=$(printf '0%.0s' {1..64})"
 probe runtime_path runtime_path_unwritable -e OTLET_PORTABLE_RUNTIME_DIR=/proc
 probe psql psql_unavailable -e OTLET_PSQL=/missing/psql

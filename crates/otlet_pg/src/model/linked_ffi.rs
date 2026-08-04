@@ -14,6 +14,7 @@ struct LinkedCache {
     model_fingerprint_hash: Arc<str>,
     context: LinkedContext,
     _model: LinkedModel,
+    verified_artifact: VerifiedArtifact,
     vocab: *const llama_cpp_sys_4::llama_vocab,
     /// Tokens known to occupy positions `0..len` of the context memory; used
     /// to reuse the KV cache for shared prompt prefixes across jobs.

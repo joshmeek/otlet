@@ -5,6 +5,7 @@ tampered_artifact="$artifact_test_dir/tampered.gguf"
 truncated_artifact="$artifact_test_dir/truncated.gguf"
 parser_malformed_artifact="$artifact_test_dir/parser-malformed.gguf"
 unreadable_artifact="$artifact_test_dir/unreadable.gguf"
+symlink_artifact="$artifact_test_dir/symlink.gguf"
 docker exec "$container" sh -c '
   set -eu
   mkdir -p "$1"
@@ -12,7 +13,8 @@ docker exec "$container" sh -c '
   printf %s GGUF0123456789abcdefghij > "$3"
   printf %s GGUF0123 > "$4"
   printf %s GGUF0123456789abcdefghij > "$5"
-' sh "$artifact_test_dir" "$malformed_artifact" "$tampered_artifact" "$truncated_artifact" "$parser_malformed_artifact"
+  ln -sf "$5" "$6"
+' sh "$artifact_test_dir" "$malformed_artifact" "$tampered_artifact" "$truncated_artifact" "$parser_malformed_artifact" "$symlink_artifact"
 malformed_sha256="$(docker exec "$container" sha256sum "$malformed_artifact" | awk '{print $1}')"
 tampered_sha256="$(docker exec "$container" sha256sum "$tampered_artifact" | awk '{print $1}')"
 truncated_sha256="$(docker exec "$container" sha256sum "$truncated_artifact" | awk '{print $1}')"
@@ -28,6 +30,7 @@ psql_exec \
   -v truncated_sha256="$truncated_sha256" \
   -v parser_malformed_artifact="$parser_malformed_artifact" \
   -v parser_malformed_sha256="$parser_malformed_sha256" \
+  -v symlink_artifact="$symlink_artifact" \
   -v unreadable_artifact="$unreadable_artifact" >/dev/null <<'SQL'
 SELECT otlet.register_model(
   'artifact_parser_malformed_smoke',
@@ -52,6 +55,12 @@ SELECT otlet.register_model(
   :'tampered_artifact',
   :'tampered_sha256',
   jsonb_build_object('sha256', :'tampered_sha256', 'bytes', 24, 'source', 'smoke', 'revision', 'v1', 'quantization', 'test', 'license', 'test')
+);
+SELECT otlet.register_model(
+  'artifact_symlink_smoke',
+  :'symlink_artifact',
+  :'parser_malformed_sha256',
+  jsonb_build_object('sha256', :'parser_malformed_sha256', 'bytes', 24, 'source', 'smoke', 'revision', 'v1', 'quantization', 'test', 'license', 'test')
 );
 SELECT otlet.register_model(
   'artifact_unreadable_smoke',
@@ -89,6 +98,13 @@ SELECT otlet.create_task(
   'artifact_tampered_smoke'
 );
 SELECT otlet.create_task(
+  'artifact_symlink_smoke_task',
+  'SELECT ''symlink''::text AS subject_id, ''{}''::jsonb AS input',
+  'Return JSON only',
+  '{"type":"object"}'::jsonb,
+  'artifact_symlink_smoke'
+);
+SELECT otlet.create_task(
   'artifact_unreadable_smoke_task',
   'SELECT ''unreadable''::text AS subject_id, ''{}''::jsonb AS input',
   'Return JSON only',
@@ -99,6 +115,7 @@ SELECT otlet.run_task('artifact_malformed_smoke_task');
 SELECT otlet.run_task('artifact_tampered_smoke_task');
 SELECT otlet.run_task('artifact_truncated_smoke_task');
 SELECT otlet.run_task('artifact_parser_malformed_smoke_task');
+SELECT otlet.run_task('artifact_symlink_smoke_task');
 SELECT otlet.run_task('artifact_unreadable_smoke_task');
 SQL
 
@@ -106,7 +123,23 @@ wait_task_failed artifact_malformed_smoke_task 1 60 1
 wait_task_failed artifact_tampered_smoke_task 1 60 1
 wait_task_failed artifact_truncated_smoke_task 1 60 1
 wait_task_failed artifact_parser_malformed_smoke_task 1 60 1
+wait_task_failed artifact_symlink_smoke_task 1 60 1
 wait_task_failed artifact_unreadable_smoke_task 1 60 1
+
+artifact_symlink_contract="$(psql_value <<'SQL'
+SELECT j.status || '|' || (r.trace_summary ->> 'stop_reason') || '|' ||
+       (SELECT count(*) FROM otlet.outputs o WHERE o.job_id = j.id)::text || '|' ||
+       ((SELECT count(*) FROM pg_stat_activity WHERE backend_type = 'otlet worker') > 0)::text
+FROM otlet.jobs j
+JOIN otlet.inference_receipts r ON r.job_id = j.id
+WHERE j.task_name = 'artifact_symlink_smoke_task';
+SQL
+)"
+echo "artifact_symlink_contract=$artifact_symlink_contract"
+[ "$artifact_symlink_contract" = "failed|model_artifact_symlink_rejected|0|true" ] || {
+  echo "Expected a symlink artifact to fail before load, got $artifact_symlink_contract" >&2
+  exit 1
+}
 
 artifact_parser_safety_contract="$(psql_value <<'SQL'
 SELECT j.status || '|' || r.status || '|' ||
@@ -183,11 +216,11 @@ echo "artifact_identity_contract=$artifact_identity_contract"
   exit 1
 }
 
-for task in artifact_malformed_smoke_task artifact_tampered_smoke_task artifact_truncated_smoke_task artifact_parser_malformed_smoke_task artifact_changed_after_verify_smoke_task artifact_unreadable_smoke_task; do
+for task in artifact_malformed_smoke_task artifact_tampered_smoke_task artifact_truncated_smoke_task artifact_parser_malformed_smoke_task artifact_changed_after_verify_smoke_task artifact_symlink_smoke_task artifact_unreadable_smoke_task; do
   cleanup_task "$task"
 done
 psql_exec >/dev/null <<'SQL'
 DELETE FROM otlet.runtime_slots
-WHERE model_name IN ('artifact_malformed_smoke', 'artifact_tampered_smoke', 'artifact_truncated_smoke', 'artifact_parser_malformed_smoke', 'artifact_unreadable_smoke');
+WHERE model_name IN ('artifact_malformed_smoke', 'artifact_tampered_smoke', 'artifact_truncated_smoke', 'artifact_parser_malformed_smoke', 'artifact_symlink_smoke', 'artifact_unreadable_smoke');
 SQL
 docker exec "$container" rm -rf "$artifact_test_dir"

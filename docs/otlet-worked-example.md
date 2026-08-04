@@ -230,7 +230,7 @@ candidate_changed_contract=1|true|candidate_changed|0
 semantic_join_stale_contract=4|0|fresh_after_lookup=0|receipts=8|8
 receipt_trace_contract=8|8|8|8
 inference_visibility_status=true|true|true|true|true
-direct_ask_runtime_fingerprint_contract=otlet_runtime_fingerprint_v1|true|true|true|true|true|true|sha256_verified_before_model_load|Q4_K_M|otlet_raw_json_worker_v1|94a220cd6|512|8217751552
+direct_ask_runtime_fingerprint_contract=otlet_runtime_fingerprint_v1|true|true|true|true|true|true|sha256_verified_file_descriptor_load|Q4_K_M|otlet_raw_json_worker_v1|94a220cd6|512|8217751552
 preload_admission_contract=failed|model_load_admission_rejected|rejected|true|true|true|true|0|true|true|true|true
 requester_timeout_contract=canceled|true|canceled|canceled|0|0|true|true|true|1|ready|ready
 redaction_status_contract=redacted|0|0|0|0|0|true

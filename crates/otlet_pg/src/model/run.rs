@@ -55,14 +55,22 @@ pub(crate) fn run_job_with_model(job: &Job, model: &JobModel) -> Result<ModelRun
 
 fn run_job_with_model_ref(job: &Job, model: JobModelRef<'_>) -> Result<ModelRun, ModelError> {
     let prepare_started = Instant::now();
-    verify_model_artifact(model)?;
+    let verified_artifact = verify_model_artifact(model)?;
     let digests = task_contract_digests(job);
     let options = digests
         .runtime_options
         .as_ref()
         .map_err(|err| ModelError::new(err.clone()))?;
     let model_fingerprint_hash = model_fingerprint_hash(model);
-    let runtime_fingerprint = runtime_fingerprint(model, &model_fingerprint_hash, options);
+    let verified_artifact_sha256 = Arc::<str>::from(verified_artifact.sha256());
+    let verified_artifact_bytes = verified_artifact.bytes();
+    let runtime_fingerprint = runtime_fingerprint(
+        model,
+        &model_fingerprint_hash,
+        &verified_artifact_sha256,
+        verified_artifact_bytes,
+        options,
+    );
     // Cache keys use content/contract/model digests only — look up before
     // allocating shaped JSON or prompt strings. Hits stream the same hashes.
     let cache_probe = RunContext {
@@ -111,6 +119,8 @@ fn run_job_with_model_ref(job: &Job, model: JobModelRef<'_>) -> Result<ModelRun,
             content_cache_key,
             contract_cache_key,
             model_cache_key,
+            &verified_artifact_sha256,
+            verified_artifact_bytes,
         )
     } else if options.generation_trace {
         CacheLookup::disabled_for("disabled_for_generation_trace")
@@ -280,6 +290,7 @@ fn run_job_with_model_ref(job: &Job, model: JobModelRef<'_>) -> Result<ModelRun,
         let linked = run_linked(
             job,
             model,
+            verified_artifact,
             &prompt.full,
             &prompt.prefix,
             options,
@@ -352,6 +363,8 @@ fn run_job_with_model_ref(job: &Job, model: JobModelRef<'_>) -> Result<ModelRun,
             context.content_cache_key,
             context.contract_cache_key,
             context.model_cache_key,
+            &verified_artifact_sha256,
+            verified_artifact_bytes,
             raw_output.into_owned(),
         );
         metrics.inference_cache_entries = stats.entries;

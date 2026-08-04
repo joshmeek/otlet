@@ -1,6 +1,7 @@
 fn run_linked(
     job: &Job,
     job_model: JobModelRef<'_>,
+    verified_artifact: VerifiedArtifact,
     prompt: &str,
     prompt_prefix: &str,
     options: &crate::runtime::RuntimeOptions,
@@ -12,7 +13,13 @@ fn run_linked(
     let mut cache = cache
         .lock()
         .map_err(|_| ModelError::new("linked llama.cpp cache lock poisoned"))?;
-    let load = ensure_linked_model(&mut cache, job_model, options, model_fingerprint_hash)?;
+    let load = ensure_linked_model(
+        &mut cache,
+        job_model,
+        verified_artifact,
+        options,
+        model_fingerprint_hash,
+    )?;
     let cache = cache
         .as_mut()
         .ok_or_else(|| ModelError::new("linked llama.cpp cache did not initialize"))?;
@@ -25,6 +32,7 @@ fn run_linked(
         attempt_deadline,
         &load,
     );
+    cache.verified_artifact.ensure_unchanged()?;
     match result {
         Err(err) if !load.cache_hit => {
             let worker_memory = process_memory_sample();

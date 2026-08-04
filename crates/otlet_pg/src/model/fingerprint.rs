@@ -12,6 +12,8 @@ struct RuntimeFingerprint {
 fn runtime_fingerprint(
     model: JobModelRef<'_>,
     model_fingerprint_hash: &str,
+    verified_artifact_sha256: &str,
+    verified_artifact_bytes: u64,
     options: &crate::runtime::RuntimeOptions,
 ) -> RuntimeFingerprint {
     let batch_tokens = linked_prompt_batch_tokens();
@@ -65,10 +67,10 @@ fn runtime_fingerprint(
         "output_contract": output_contract,
         "artifact": {
             "name": artifact_name,
-            "bytes": fs::metadata(model.artifact_path).map(|meta| meta.len()).unwrap_or(0),
-            "sha256": model.artifact_hash,
+            "bytes": verified_artifact_bytes,
+            "sha256": verified_artifact_sha256,
             "identity": model.artifact_identity,
-            "verification": "sha256_verified_before_model_load",
+            "verification": "sha256_verified_file_descriptor_load",
             "fingerprint_hash": model_fingerprint_hash,
             "quantization": model.artifact_identity
                 .get("quantization")
@@ -217,14 +219,26 @@ mod runtime_fingerprint_tests {
             artifact_identity: &identity,
         };
         let options = crate::runtime::RuntimeOptions::default();
-        let first = runtime_fingerprint(model, "model-hash", &options);
-        let second = runtime_fingerprint(model, "model-hash", &options);
+        let first = runtime_fingerprint(model, "model-hash", model.artifact_hash, 24, &options);
+        let second = runtime_fingerprint(model, "model-hash", model.artifact_hash, 24, &options);
         let mut changed_options = crate::runtime::RuntimeOptions::default();
         changed_options.llama_threads = 2;
-        let changed = runtime_fingerprint(model, "model-hash", &changed_options);
+        let changed = runtime_fingerprint(
+            model,
+            "model-hash",
+            model.artifact_hash,
+            24,
+            &changed_options,
+        );
         let mut reasoning_on = crate::runtime::RuntimeOptions::default();
         reasoning_on.reasoning = "on";
-        let reasoning_on = runtime_fingerprint(model, "model-hash", &reasoning_on);
+        let reasoning_on = runtime_fingerprint(
+            model,
+            "model-hash",
+            model.artifact_hash,
+            24,
+            &reasoning_on,
+        );
         let mut changed_host = first.document.clone();
         changed_host["host"]["memory_bytes"] = json!(1);
         let changed_identity = json!({
@@ -242,6 +256,8 @@ mod runtime_fingerprint_tests {
                 ..model
             },
             "changed-model-hash",
+            changed_identity.get("sha256").and_then(Value::as_str).unwrap(),
+            24,
             &options,
         );
 

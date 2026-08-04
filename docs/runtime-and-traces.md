@@ -461,7 +461,7 @@ Failure records a raw-output hash, a non-sensitive error, and an attempt receipt
 
 Events show worker behavior. Receipts show model behavior
 
-The portable worker checks all eight RPC grants and emits one `preflight_passed` event before starting an incarnation, loading a model, or claiming work. A failed explicit `--preflight` emits `preflight_failed` with one stable dependency code and no connection string, credential, prompt, or source value
+The portable worker checks all eight RPC grants, rejects symlink artifacts, and binds the verified open file through llama.cpp load. It emits one `preflight_passed` event before starting an incarnation, loading a model, or claiming work. A failed explicit `--preflight` emits `preflight_failed` with one stable dependency code and no connection string, credential, prompt, or source value
 
 ```sql
 SELECT event_type, count(*)
