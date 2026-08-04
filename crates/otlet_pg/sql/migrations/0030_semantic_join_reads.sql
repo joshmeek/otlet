@@ -12,6 +12,7 @@ CREATE FUNCTION otlet.semantic_join_index_current_rows(
 )
 LANGUAGE plpgsql
 STABLE
+SET search_path = pg_catalog, pg_temp
 AS $$
 DECLARE
   index_row otlet.semantic_join_indexes%ROWTYPE;
@@ -51,7 +52,7 @@ BEGIN
     $sql$
       WITH raw_inputs AS (
         SELECT subject_id, input
-        FROM otlet.semantic_join_candidate_rows(%1$L, %4$L)
+        FROM otlet.semantic_join_candidate_rows(%1$L, %4$L, false)
       ),
       current_inputs AS (
         SELECT
@@ -135,6 +136,7 @@ LANGUAGE plpgsql
 STABLE
 STRICT
 COST 1000
+SET search_path = pg_catalog, pg_temp
 AS $$
 DECLARE
   index_row otlet.semantic_join_indexes%ROWTYPE;
@@ -169,7 +171,7 @@ BEGIN
 
   current_input := otlet.task_subject_input(
     format(
-      'SELECT subject_id, input FROM otlet.semantic_join_candidate_rows(%L, %L)',
+      'SELECT subject_id, input FROM otlet.semantic_join_candidate_rows(%L, %L, false)',
       index_row.name,
       current_contract_hash
     ),

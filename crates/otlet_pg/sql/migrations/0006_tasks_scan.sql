@@ -436,7 +436,8 @@ $$;
 CREATE FUNCTION otlet.preflight_candidate_query(
   candidate_query text,
   enforce_policy boolean DEFAULT true,
-  validate_contract boolean DEFAULT true
+  validate_contract boolean DEFAULT true,
+  source_query_contract jsonb DEFAULT NULL
 )
 RETURNS TABLE (
   candidate_plan jsonb,
@@ -447,11 +448,13 @@ RETURNS TABLE (
   candidate_preflight_error text
 )
 LANGUAGE plpgsql
+SET search_path = pg_catalog, pg_temp
 AS $$
 DECLARE
   policy otlet.production_policy%ROWTYPE;
-  query_contract jsonb;
+  effective_contract jsonb := preflight_candidate_query.source_query_contract;
   explained_query text;
+  original_search_path text := pg_catalog.current_setting('search_path');
 BEGIN
   candidate_preflight_at := clock_timestamp();
   IF NULLIF(btrim(preflight_candidate_query.candidate_query), '') IS NULL THEN
@@ -472,18 +475,28 @@ BEGIN
   BEGIN
     IF COALESCE(preflight_candidate_query.enforce_policy, true)
        AND COALESCE(preflight_candidate_query.validate_contract, true) THEN
-      query_contract := otlet.build_source_query_contract(
+      effective_contract := otlet.build_source_query_contract(
         preflight_candidate_query.candidate_query
       );
-      explained_query := query_contract #>> '{query,resolved}';
+      explained_query := effective_contract #>> '{query,resolved}';
     ELSE
       explained_query := preflight_candidate_query.candidate_query;
+    END IF;
+    IF effective_contract IS NOT NULL
+       AND jsonb_typeof(effective_contract) <> 'null' THEN
+      PERFORM pg_catalog.set_config(
+        'search_path',
+        otlet.source_query_safe_search_path(effective_contract),
+        true
+      );
     END IF;
     EXECUTE format(
       'EXPLAIN (FORMAT JSON) SELECT subject_id::text, input::jsonb FROM (%s) otlet_candidate',
       explained_query
     ) INTO candidate_plan;
+    PERFORM pg_catalog.set_config('search_path', original_search_path, true);
   EXCEPTION WHEN OTHERS THEN
+    PERFORM pg_catalog.set_config('search_path', original_search_path, true);
     candidate_preflight_status := 'failed';
     candidate_preflight_error := 'otlet candidate query EXPLAIN failed: ' || SQLERRM;
     IF COALESCE(preflight_candidate_query.enforce_policy, true) THEN
@@ -537,7 +550,7 @@ BEGIN
     RETURN 0;
   END IF;
 
-  timeout_ms := round(EXTRACT(epoch FROM current_setting('statement_timeout')::interval) * 1000)::integer;
+  timeout_ms := round(EXTRACT(epoch FROM pg_catalog.current_setting('statement_timeout')::interval) * 1000)::integer;
   IF timeout_ms <= 0 OR timeout_ms > timeout_limit THEN
     RAISE EXCEPTION 'otlet candidate query requires statement_timeout between 1 ms and % ms', timeout_limit
       USING HINT = format(
@@ -565,10 +578,12 @@ CREATE FUNCTION otlet.validated_task_input_rows(
   input_query text,
   max_rows integer DEFAULT NULL,
   active_task_name text DEFAULT NULL,
-  active_workload_revision_hash text DEFAULT NULL
+  active_workload_revision_hash text DEFAULT NULL,
+  workload_definition jsonb DEFAULT NULL
 ) RETURNS TABLE(subject_id text, input jsonb)
 LANGUAGE plpgsql
 VOLATILE
+SET search_path = pg_catalog, pg_temp
 AS $$
 DECLARE
   candidate record;
@@ -576,6 +591,7 @@ DECLARE
   previous_input jsonb;
   seen_subject boolean := false;
   returned_rows integer := 0;
+  original_search_path text := pg_catalog.current_setting('search_path');
 BEGIN
   IF NULLIF(btrim(validated_task_input_rows.input_query), '') IS NULL THEN
     RAISE EXCEPTION 'otlet input relation query is required';
@@ -587,6 +603,19 @@ BEGIN
   IF (validated_task_input_rows.active_task_name IS NULL)
      <> (validated_task_input_rows.active_workload_revision_hash IS NULL) THEN
     RAISE EXCEPTION 'otlet active input filter requires task and workload revision';
+  END IF;
+  IF validated_task_input_rows.workload_definition IS NOT NULL
+     AND jsonb_typeof(validated_task_input_rows.workload_definition) <> 'null' THEN
+    PERFORM otlet.workload_source_contract_guard(
+      validated_task_input_rows.workload_definition
+    );
+    PERFORM pg_catalog.set_config(
+      'search_path',
+      otlet.source_query_safe_search_path(
+        validated_task_input_rows.workload_definition #> '{source,query_contract}'
+      ),
+      true
+    );
   END IF;
 
   FOR candidate IN EXECUTE format(
@@ -641,21 +670,29 @@ BEGIN
       returned_rows := returned_rows + 1;
     END IF;
   END LOOP;
+  PERFORM pg_catalog.set_config('search_path', original_search_path, true);
+EXCEPTION WHEN OTHERS THEN
+  PERFORM pg_catalog.set_config('search_path', original_search_path, true);
+  RAISE;
 END;
 $$;
 
 CREATE FUNCTION otlet.semantic_join_candidate_rows(
   index_name text,
-  workload_revision_hash text
+  workload_revision_hash text,
+  rebind_source_query boolean DEFAULT true
 ) RETURNS TABLE(subject_id text, input jsonb)
 LANGUAGE plpgsql
 VOLATILE
+SET search_path = pg_catalog, pg_temp
 AS $$
 DECLARE
   revision_definition jsonb;
   candidate record;
   candidate_limit integer;
   returned_rows integer := 0;
+  original_search_path text := pg_catalog.current_setting('search_path');
+  changed_search_path boolean := false;
 BEGIN
   SELECT revision.definition
   INTO revision_definition
@@ -672,36 +709,58 @@ BEGIN
 
   PERFORM otlet.require_workload_source_contract(
     revision_definition #>> '{task,name}',
-    semantic_join_candidate_rows.workload_revision_hash
+    semantic_join_candidate_rows.workload_revision_hash,
+    semantic_join_candidate_rows.rebind_source_query
   );
+  PERFORM pg_catalog.set_config(
+    'search_path',
+    otlet.source_query_safe_search_path(
+      revision_definition #> '{source,query_contract}'
+    ),
+    true
+  );
+  changed_search_path := true;
   candidate_limit := (revision_definition #>> '{source,max_candidate_rows}')::integer;
 
-  FOR candidate IN
-    SELECT validated.subject_id, validated.input
-    FROM otlet.validated_task_input_rows(
-      revision_definition #>> '{source,candidate_query}',
-      candidate_limit + 1
-    ) validated
-  LOOP
-    IF returned_rows >= candidate_limit THEN
-      RAISE EXCEPTION 'otlet candidate query for semantic join index % exceeds max_candidate_rows %',
-        semantic_join_candidate_rows.index_name,
-        candidate_limit;
+  BEGIN
+    FOR candidate IN
+      SELECT validated.subject_id, validated.input
+      FROM otlet.validated_task_input_rows(
+        revision_definition #>> '{source,candidate_query}',
+        candidate_limit + 1,
+        workload_definition => revision_definition
+      ) validated
+    LOOP
+      IF returned_rows >= candidate_limit THEN
+        RAISE EXCEPTION 'otlet candidate query for semantic join index % exceeds max_candidate_rows %',
+          semantic_join_candidate_rows.index_name,
+          candidate_limit;
+      END IF;
+      subject_id := candidate.subject_id;
+      input := candidate.input;
+      RETURN NEXT;
+      returned_rows := returned_rows + 1;
+    END LOOP;
+  EXCEPTION WHEN OTHERS THEN
+    IF changed_search_path THEN
+      PERFORM pg_catalog.set_config('search_path', original_search_path, true);
     END IF;
-    subject_id := candidate.subject_id;
-    input := candidate.input;
-    RETURN NEXT;
-    returned_rows := returned_rows + 1;
-  END LOOP;
+    RAISE;
+  END;
+  IF changed_search_path THEN
+    PERFORM pg_catalog.set_config('search_path', original_search_path, true);
+  END IF;
 END;
 $$;
 
 CREATE FUNCTION otlet.task_subject_input(
   input_query text,
-  subject_id text
+  subject_id text,
+  workload_definition jsonb DEFAULT NULL
 ) RETURNS jsonb
 LANGUAGE plpgsql
 VOLATILE
+SET search_path = pg_catalog, pg_temp
 AS $$
 DECLARE
   selected_input jsonb;
@@ -712,7 +771,10 @@ BEGIN
 
   SELECT candidate.input
   INTO selected_input
-  FROM otlet.validated_task_input_rows(task_subject_input.input_query) candidate
+  FROM otlet.validated_task_input_rows(
+    task_subject_input.input_query,
+    workload_definition => task_subject_input.workload_definition
+  ) candidate
   WHERE candidate.subject_id = task_subject_input.subject_id;
 
   RETURN selected_input;
@@ -1005,6 +1067,7 @@ DECLARE
   query text;
   task_model_name text;
   revision_hash text;
+  revision_definition jsonb;
   source_kind text;
   semantic_join_index_name text;
   queue_slots integer;
@@ -1017,11 +1080,12 @@ DECLARE
 BEGIN
   revision_hash := otlet.ensure_active_workload_revision(run_task.task_name);
   SELECT
+    revision.definition,
     revision.definition #>> '{task,input_query}',
     revision.definition #>> '{models,direct,name}',
     revision.definition #>> '{source,kind}',
     revision.definition #>> '{source,semantic_join_index_name}'
-  INTO query, task_model_name, source_kind, semantic_join_index_name
+  INTO revision_definition, query, task_model_name, source_kind, semantic_join_index_name
   FROM otlet.workload_revisions revision
   WHERE revision.task_name = run_task.task_name
     AND revision.workload_revision_hash = revision_hash;
@@ -1083,7 +1147,8 @@ BEGIN
          %2$L,
          (SELECT max_admission_rows + 1 FROM policy),
          %3$L,
-         %4$L
+         %4$L,
+         %5$L::jsonb
        ) otlet_input
      ),
      candidate_state AS (
@@ -1136,7 +1201,8 @@ BEGIN
     task_model_name,
     query,
     task_name,
-    revision_hash
+    revision_hash,
+    revision_definition
   )
   INTO queued, candidate_rows, candidate_bytes, largest_input_bytes, queue_slots, rejection_reason, rejection_limit;
 
@@ -1182,6 +1248,7 @@ AS $$
 DECLARE
   query text;
   revision_hash text;
+  revision_definition jsonb;
   source_kind text;
   semantic_join_index_name text;
   pending_input jsonb;
@@ -1193,10 +1260,11 @@ BEGIN
     RAISE EXCEPTION 'otlet workload revision changed during subject admission for task %', run_task_subject.task_name;
   END IF;
   SELECT
+    revision.definition,
     revision.definition #>> '{task,input_query}',
     revision.definition #>> '{source,kind}',
     revision.definition #>> '{source,semantic_join_index_name}'
-  INTO query, source_kind, semantic_join_index_name
+  INTO revision_definition, query, source_kind, semantic_join_index_name
   FROM otlet.workload_revisions revision
   WHERE revision.task_name = run_task_subject.task_name
     AND revision.workload_revision_hash = revision_hash;
@@ -1219,7 +1287,8 @@ BEGIN
   PERFORM otlet.require_candidate_query_timeout(run_task_subject.task_name);
   pending_input := otlet.task_subject_input(
     query,
-    run_task_subject.subject_id
+    run_task_subject.subject_id,
+    revision_definition
   );
 
   IF pending_input IS NULL THEN

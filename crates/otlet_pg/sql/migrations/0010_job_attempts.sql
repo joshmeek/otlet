@@ -160,10 +160,7 @@ BEGIN
     RAISE EXCEPTION 'otlet job workload revision is missing';
   END IF;
   IF COALESCE(record_model_attempt.selection_status, 'accepted') <> 'failed' THEN
-    PERFORM otlet.source_query_contract_guard(
-      revision_definition #> '{source,query_contract}',
-      true
-    );
+    PERFORM otlet.workload_source_contract_guard(revision_definition);
   END IF;
   task_row.name := job_row.task_name;
   task_row.input_query := revision_definition #>> '{task,input_query}';

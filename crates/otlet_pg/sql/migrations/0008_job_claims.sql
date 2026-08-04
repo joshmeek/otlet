@@ -611,10 +611,7 @@ BEGIN
   guarded_tasks AS MATERIALIZED (
     SELECT task.*
     FROM locked_tasks task
-    WHERE otlet.source_query_contract_guard(
-      task.definition #> '{source,query_contract}',
-      true
-    )::text = ''
+    WHERE otlet.workload_source_contract_guard(task.definition)::text = ''
   ),
   ranked_candidates AS (
     SELECT
@@ -810,10 +807,7 @@ BEGIN
   ), guarded_claims AS MATERIALIZED (
     SELECT live_claims.id
     FROM live_claims
-    WHERE otlet.source_query_contract_guard(
-      live_claims.definition #> '{source,query_contract}',
-      true
-    )::text = ''
+    WHERE otlet.workload_source_contract_guard(live_claims.definition)::text = ''
   )
   SELECT count(*) INTO valid_count
   FROM guarded_claims;

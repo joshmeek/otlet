@@ -1109,6 +1109,13 @@ BEGIN
         'source_table', w.source_table,
         'subject_column', w.subject_column,
         'input_columns', to_jsonb(w.input_columns),
+        'semantic_column_contract', CASE WHEN w.kind = 'row' THEN
+          otlet.semantic_source_column_contract(
+            w.source_table,
+            w.subject_column,
+            w.input_columns
+          )
+        END,
         'candidate_query', CASE
           WHEN w.kind = 'pair' THEN COALESCE(
             t.source_query_contract #>> '{query,resolved}',
@@ -1130,6 +1137,11 @@ BEGIN
         'source_table', si.source_table,
         'subject_column', si.subject_column,
         'input_columns', to_jsonb(si.input_columns),
+        'semantic_column_contract', otlet.semantic_source_column_contract(
+          si.source_table,
+          si.subject_column,
+          si.input_columns
+        ),
         'record_type', si.record_type
       )
       FROM otlet.semantic_indexes si
@@ -1367,7 +1379,8 @@ BEGIN
     FROM otlet.preflight_candidate_query(
       revision_definition #>> '{source,candidate_query}',
       true,
-      false
+      false,
+      revision_definition #> '{source,query_contract}'
     ) preflight;
   END IF;
 
@@ -1438,10 +1451,7 @@ BEGIN
    AND revision.workload_revision_hash = head.active_workload_revision_hash
   WHERE head.task_name = ensure_active_workload_revision.task_name;
   IF FOUND THEN
-    PERFORM otlet.source_query_contract_guard(
-      active_definition #> '{source,query_contract}',
-      true
-    );
+    PERFORM otlet.workload_source_contract_guard(active_definition);
     RETURN active_hash;
   END IF;
 
@@ -1454,6 +1464,12 @@ BEGIN
     ensure_active_workload_revision.task_name,
     active_hash
   );
+  SELECT revision.definition
+  INTO active_definition
+  FROM otlet.workload_revisions revision
+  WHERE revision.task_name = ensure_active_workload_revision.task_name
+    AND revision.workload_revision_hash = active_hash;
+  PERFORM otlet.workload_source_contract_guard(active_definition);
   RETURN active_hash;
 END;
 $$;
@@ -1562,13 +1578,14 @@ CREATE FUNCTION otlet.repair_source_query_contract(
   expected_active_workload_revision_hash text
 ) RETURNS text
 LANGUAGE plpgsql
+SET search_path = pg_catalog, pg_temp
 AS $$
 DECLARE
   active_definition jsonb;
   active_contract jsonb;
   repaired_contract jsonb;
   repaired_definition jsonb;
-  raw_search_path text := current_setting('search_path');
+  raw_search_path text := pg_catalog.current_setting('search_path');
   repaired_hash text;
   candidate_plan jsonb;
   candidate_plan_cost numeric;
@@ -1616,7 +1633,7 @@ BEGIN
     RAISE EXCEPTION 'otlet source query repair requires the bound execution identity';
   END IF;
 
-  PERFORM set_config(
+  PERFORM pg_catalog.set_config(
     'search_path',
     active_contract #>> '{search_path,raw}',
     true
@@ -1649,6 +1666,23 @@ BEGIN
     '{source,declared_relations}',
     COALESCE(repaired_contract -> 'declared_sources', 'null'::jsonb)
   );
+  IF repaired_definition #>> '{source,kind}' = 'row' THEN
+    repaired_definition := jsonb_set(
+      repaired_definition,
+      '{source,semantic_column_contract}',
+      otlet.semantic_source_column_contract(
+        repaired_definition #>> '{source,source_table}',
+        repaired_definition #>> '{source,subject_column}',
+        ARRAY(
+          SELECT value
+          FROM jsonb_array_elements_text(COALESCE(
+            repaired_definition #> '{source,input_columns}',
+            '[]'::jsonb
+          )) value
+        )
+      )
+    );
+  END IF;
   IF repaired_definition #>> '{source,kind}' = 'pair' THEN
     repaired_definition := jsonb_set(
       repaired_definition,
@@ -1656,7 +1690,7 @@ BEGIN
       to_jsonb(repaired_contract #>> '{query,resolved}')
     );
   END IF;
-  PERFORM set_config('search_path', raw_search_path, true);
+  PERFORM pg_catalog.set_config('search_path', raw_search_path, true);
 
   IF repaired_definition #>> '{source,kind}' = 'pair' THEN
     SELECT
@@ -1667,7 +1701,8 @@ BEGIN
     FROM otlet.preflight_candidate_query(
       repaired_definition #>> '{source,candidate_query}',
       true,
-      false
+      false,
+      repaired_contract
     ) preflight;
   END IF;
 
@@ -1735,7 +1770,7 @@ BEGIN
   END IF;
   RETURN repaired_hash;
 EXCEPTION WHEN OTHERS THEN
-  PERFORM set_config('search_path', raw_search_path, true);
+  PERFORM pg_catalog.set_config('search_path', raw_search_path, true);
   RAISE;
 END;
 $$;

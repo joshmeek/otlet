@@ -275,21 +275,19 @@ LANGUAGE plpgsql
 VOLATILE
 AS $$
 DECLARE
-  index_row otlet.semantic_indexes%ROWTYPE;
+  revision_definition jsonb;
+  current_task_name text;
+  current_record_type text;
   current_contract_hash text;
+  drift_error text;
   updated_count bigint := 0;
 BEGIN
   SELECT
-    revision.definition #>> '{source,subject_column}',
-    revision.definition #>> '{source,source_table}',
-    ARRAY(
-      SELECT value
-      FROM jsonb_array_elements_text(COALESCE(revision.definition #> '{source,input_columns}', '[]'::jsonb)) value
-    ),
+    revision.definition,
     revision.definition #>> '{task,name}',
     revision.definition #>> '{source,record_type}',
     revision.workload_revision_hash
-  INTO index_row.subject_column, index_row.source_table, index_row.input_columns, index_row.task_name, index_row.record_type, current_contract_hash
+  INTO revision_definition, current_task_name, current_record_type, current_contract_hash
   FROM otlet.workload_revision_heads head
   JOIN otlet.workload_revisions revision
     ON revision.task_name = head.task_name
@@ -297,49 +295,27 @@ BEGIN
   WHERE revision.definition #>> '{source,semantic_index_name}' = mark_semantic_schema_drift.index_name
     AND revision.definition #>> '{source,kind}' = 'row';
 
-  IF NOT FOUND OR index_row.input_columns IS NULL THEN
+  IF NOT FOUND THEN
     RETURN 0;
   END IF;
 
-  EXECUTE format(
-    $sql$
-      WITH missing_columns AS (
-        SELECT 1
-        FROM unnest(%3$L::text[]) AS expected(column_name)
-        WHERE NOT EXISTS (
-          SELECT 1
-          FROM pg_attribute a
-          WHERE a.attrelid = %2$L::regclass
-            AND a.attname = expected.column_name
-            AND a.attnum > 0
-            AND NOT a.attisdropped
-        )
-        LIMIT 1
-      ),
-      drift_subjects AS (
-        SELECT (src.%1$I)::text AS subject_id
-        FROM %2$s AS src
-        WHERE EXISTS (SELECT 1 FROM missing_columns)
-      )
-      UPDATE otlet.semantic_materializations sm
-      SET stale = true,
-          stale_reason = 'schema_drift',
-          updated_at = now()
-      FROM drift_subjects ds
-      WHERE sm.task_name = %4$L
-        AND sm.record_type = %5$L
-        AND sm.subject_id = ds.subject_id
-        AND sm.contract_hash = %6$L
-        AND sm.stale_reason IS DISTINCT FROM 'contract_changed'
-        AND sm.stale_reason IS DISTINCT FROM 'schema_drift'
-    $sql$,
-    index_row.subject_column,
-    index_row.source_table,
-    index_row.input_columns,
-    index_row.task_name,
-    index_row.record_type,
-    current_contract_hash
+  drift_error := COALESCE(
+    otlet.source_query_contract_error(revision_definition #> '{source,query_contract}'),
+    otlet.semantic_schema_drift_error(revision_definition)
   );
+  IF drift_error IS NULL THEN
+    RETURN 0;
+  END IF;
+
+  UPDATE otlet.semantic_materializations materialization
+  SET stale = true,
+      stale_reason = 'schema_drift',
+      updated_at = now()
+  WHERE materialization.task_name = current_task_name
+    AND materialization.record_type = current_record_type
+    AND materialization.contract_hash = current_contract_hash
+    AND materialization.stale_reason IS DISTINCT FROM 'contract_changed'
+    AND materialization.stale_reason IS DISTINCT FROM 'schema_drift';
 
   GET DIAGNOSTICS updated_count = ROW_COUNT;
   RETURN updated_count;

@@ -12,14 +12,15 @@ unsafe extern "C-unwind" fn create_semantic_custom_scan_state(
     }
 }
 
-fn require_custom_scan_source_contract(workload_revision_hash: &str) -> Result<(), String> {
+fn require_custom_scan_source_contract(workload_revision_hash: &str) -> Result<bool, String> {
     pgrx::Spi::connect(|client| {
         let args = [workload_revision_hash.into()];
         let table = client
             .select(
                 "SELECT otlet.require_workload_source_contract(\
-                   revision.task_name, revision.workload_revision_hash\
-                 ) \
+                   revision.task_name, revision.workload_revision_hash, false\
+                 ), \
+                 otlet.semantic_schema_drift_error(revision.definition) IS NOT NULL AS schema_drift \
                  FROM otlet.workload_revisions revision \
                  WHERE revision.workload_revision_hash = $1",
                 Some(1),
@@ -29,7 +30,11 @@ fn require_custom_scan_source_contract(workload_revision_hash: &str) -> Result<(
         if table.is_empty() {
             return Err("otlet semantic CustomScan workload revision is missing".to_owned());
         }
-        Ok(())
+        table
+            .first()
+            .get_by_name::<bool, _>("schema_drift")
+            .map_err(to_string)?
+            .ok_or_else(|| "otlet semantic CustomScan drift status is missing".to_owned())
     })
 }
 
@@ -44,8 +49,16 @@ unsafe extern "C-unwind" fn begin_semantic_custom_scan(
         let Some(mut private) = custom_private_from_plan(node) else {
             return;
         };
-        require_custom_scan_source_contract(&private.workload_revision_hash)
-            .unwrap_or_else(|err| pgrx::error!("{err}"));
+        if pg_sys::XactReadOnly || pg_sys::RecoveryInProgress() {
+            private.allow_refresh = false;
+            private.wait_ms = 0;
+            private.infer_ms = 0;
+            private.infer_max_rows = 0;
+            private.planner_stats = None;
+        }
+        let executor_schema_drift =
+            require_custom_scan_source_contract(&private.workload_revision_hash)
+                .unwrap_or_else(|err| pgrx::error!("{err}"));
         let relation = (*node).ss.ss_currentRelation;
         if relation.is_null() && private.index_kind == SemanticIndexKind::Row {
             pgrx::error!("otlet semantic CustomScan could not open source relation");
@@ -79,16 +92,55 @@ unsafe extern "C-unwind" fn begin_semantic_custom_scan(
             &private.workload_revision_hash,
         )
         .unwrap_or_else(|err| pgrx::error!("{err}"));
+        if executor_schema_drift {
+            let source_rows = loaded_state.subjects.len() as u64;
+            for subject_state in loaded_state.subjects.values_mut() {
+                *subject_state = SubjectSemanticState::Stale;
+            }
+            loaded_state.subject_counts = PreloadedSubjectCounts {
+                fresh_matches: 0,
+                fresh_non_matches: 0,
+                stale: source_rows,
+                inflight: 0,
+                missing: 0,
+            };
+            loaded_state.freshness_basis_counts = "{}".to_owned();
+            loaded_state.freshness_basis_by_subject.clear();
+            loaded_state.stale_reasons = format!("{{\"schema_drift\":{source_rows}}}");
+        }
         // Prefer plan-time vocabulary from custom_private; overlay exact preload
         // counts. Keep executor knobs from plan-time private data.
-        let (planner_stats, preloaded_counts) =
+        let (mut planner_stats, preloaded_counts) =
             planner_stats_from_loaded_state(&private, stashed_stats, &mut loaded_state);
+        if executor_schema_drift {
+            planner_stats.selected_path = "lookup_fail_closed".to_owned();
+            planner_stats.reason = format!(
+                "fail closed for {} unresolved rows; fresh=0",
+                planner_stats.source_rows
+            );
+            planner_stats.fresh_matches = 0;
+            planner_stats.fresh_non_matches = 0;
+            planner_stats.stale_rows = planner_stats.source_rows;
+            planner_stats.missing_rows = 0;
+            planner_stats.inflight_rows = 0;
+            planner_stats.infer_decision_rows = 0;
+            planner_stats.fail_closed_decision_rows = planner_stats.source_rows;
+            planner_stats.stale_reasons =
+                format!("{{\"schema_drift\":{}}}", planner_stats.source_rows);
+            planner_stats.count_basis = "exact".to_owned();
+        }
+        let schema_drift = executor_schema_drift
+            || planner_stats.stale_reasons.contains("\"schema_drift\"");
         let policy = SemanticAutoPolicy {
             auto_policy: private.auto_policy,
-            allow_refresh: private.allow_refresh,
-            wait_ms: private.wait_ms,
-            infer_ms: private.infer_ms,
-            infer_max_rows: private.infer_max_rows,
+            allow_refresh: private.allow_refresh && !schema_drift,
+            wait_ms: if schema_drift { 0 } else { private.wait_ms },
+            infer_ms: if schema_drift { 0 } else { private.infer_ms },
+            infer_max_rows: if schema_drift {
+                0
+            } else {
+                private.infer_max_rows
+            },
         };
         snapshot_planner_state(state, &planner_stats, &policy);
         (*state).index_kind = private.index_kind;

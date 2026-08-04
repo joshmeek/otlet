@@ -8,6 +8,7 @@ LANGUAGE plpgsql
 STABLE
 STRICT
 COST 1000
+SET search_path = pg_catalog, pg_temp
 AS $$
 DECLARE
   index_row record;
@@ -23,7 +24,8 @@ BEGIN
     revision.definition #>> '{task,name}' AS task_name,
     revision.definition #>> '{source,record_type}' AS record_type,
     revision.definition #> '{task,input_shaping}' AS input_shaping,
-    head.active_workload_revision_hash AS contract_hash
+    head.active_workload_revision_hash AS contract_hash,
+    revision.definition AS workload_definition
   INTO index_row
   FROM otlet.workload_revision_heads head
   JOIN otlet.workload_revisions revision
@@ -36,7 +38,14 @@ BEGIN
     RAISE EXCEPTION 'otlet semantic index % does not exist', semantic_matches.index_name;
   END IF;
 
-  PERFORM otlet.require_workload_source_contract(index_row.task_name, index_row.contract_hash);
+  PERFORM otlet.require_workload_source_contract(
+    index_row.task_name,
+    index_row.contract_hash,
+    false
+  );
+  IF otlet.semantic_schema_drift_error(index_row.workload_definition) IS NOT NULL THEN
+    RETURN false;
+  END IF;
 
   EXECUTE format(
     $sql$

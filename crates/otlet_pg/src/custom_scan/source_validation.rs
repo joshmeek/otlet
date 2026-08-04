@@ -153,7 +153,7 @@ fn validate_semantic_index_source(
                     AND revision.workload_revision_hash = head.active_workload_revision_hash \
                    WHERE revision.definition #>> '{source,semantic_index_name}' = $1 \
                      AND revision.definition #>> '{source,kind}' = 'row' \
-                     AND (revision.definition #>> '{source,source_table}')::regclass = $2::oid \
+                     AND (revision.definition #>> '{source,source_table}')::pg_catalog.regclass = $2::pg_catalog.oid \
                    LIMIT 1 \
                  ), \
                  plan AS ( \
@@ -166,8 +166,10 @@ fn validate_semantic_index_source(
                      model_cost_source, \
                      count_basis, \
                      stale_reasons \
-                   FROM otlet.semantic_index_plan($1, true) \
-                   WHERE EXISTS (SELECT 1 FROM meta) \
+                   FROM meta m \
+                   CROSS JOIN LATERAL otlet.semantic_index_plan( \
+                     $1, true, m.workload_revision_hash \
+                   ) \
                  ), \
                  current_rows AS ( \
                    SELECT subject_id, body, stale \
@@ -180,17 +182,17 @@ fn validate_semantic_index_source(
                    (SELECT source_table FROM meta) AS source_table, \
                    (SELECT subject_column FROM meta) AS subject_column, \
                    (SELECT workload_revision_hash FROM meta) AS workload_revision_hash, \
-                   COALESCE((SELECT total_subjects FROM plan), 0)::bigint AS source_rows, \
-                   (SELECT count(*) FROM current_rows WHERE stale = false AND body @> $3::jsonb)::bigint AS fresh_matches, \
-                   (SELECT count(*) FROM current_rows WHERE stale = false AND NOT (body @> $3::jsonb))::bigint AS fresh_non_matches, \
-                   COALESCE((SELECT stale_subjects FROM plan), 0)::bigint AS stale_rows, \
-                   COALESCE((SELECT missing_subjects FROM plan), 0)::bigint AS missing_rows, \
-                   COALESCE((SELECT inflight_subjects FROM plan), 0)::bigint AS inflight_rows, \
-                   0::bigint AS cache_reusable_rows, \
-                   COALESCE((SELECT model_ms FROM plan), 2500)::float8 AS model_ms, \
-                   COALESCE((SELECT model_cost_source FROM plan), 'static_fallback')::text AS model_cost_source, \
-                   COALESCE((SELECT count_basis FROM plan), 'exact')::text AS count_basis, \
-                   COALESCE((SELECT stale_reasons::text FROM plan), '{}'::text) AS stale_reasons",
+                   COALESCE((SELECT total_subjects FROM plan), 0)::pg_catalog.int8 AS source_rows, \
+                   (SELECT count(*) FROM current_rows WHERE stale = false AND body @> $3::pg_catalog.jsonb)::pg_catalog.int8 AS fresh_matches, \
+                   (SELECT count(*) FROM current_rows WHERE stale = false AND NOT (body @> $3::pg_catalog.jsonb))::pg_catalog.int8 AS fresh_non_matches, \
+                   COALESCE((SELECT stale_subjects FROM plan), 0)::pg_catalog.int8 AS stale_rows, \
+                   COALESCE((SELECT missing_subjects FROM plan), 0)::pg_catalog.int8 AS missing_rows, \
+                   COALESCE((SELECT inflight_subjects FROM plan), 0)::pg_catalog.int8 AS inflight_rows, \
+                   0::pg_catalog.int8 AS cache_reusable_rows, \
+                   COALESCE((SELECT model_ms FROM plan), 2500)::pg_catalog.float8 AS model_ms, \
+                   COALESCE((SELECT model_cost_source FROM plan), 'static_fallback')::pg_catalog.text AS model_cost_source, \
+                   COALESCE((SELECT count_basis FROM plan), 'exact')::pg_catalog.text AS count_basis, \
+                   COALESCE((SELECT stale_reasons::pg_catalog.text FROM plan), '{}'::pg_catalog.text) AS stale_reasons",
                 Some(1),
                 &args,
             )
@@ -334,8 +336,10 @@ fn validate_semantic_join_index_source(
                      model_cost_source, \
                      count_basis, \
                      stale_reasons \
-                   FROM otlet.semantic_join_index_plan($1) \
-                   WHERE EXISTS (SELECT 1 FROM meta) \
+                   FROM meta m \
+                   CROSS JOIN LATERAL otlet.semantic_join_index_plan( \
+                     $1, false, m.workload_revision_hash \
+                   ) \
                  ), \
                  current_rows AS ( \
                    SELECT subject_id, body, stale \
@@ -347,17 +351,17 @@ fn validate_semantic_join_index_source(
                  SELECT \
                    (SELECT ok FROM meta) AS meta_ok, \
                    (SELECT workload_revision_hash FROM meta) AS workload_revision_hash, \
-                   COALESCE((SELECT total_subjects FROM plan), 0)::bigint AS source_rows, \
-                   (SELECT count(*) FROM current_rows WHERE stale = false AND body @> $2::jsonb)::bigint AS fresh_matches, \
-                   (SELECT count(*) FROM current_rows WHERE stale = false AND NOT (body @> $2::jsonb))::bigint AS fresh_non_matches, \
-                   COALESCE((SELECT stale_subjects FROM plan), 0)::bigint AS stale_rows, \
-                   COALESCE((SELECT missing_subjects FROM plan), 0)::bigint AS missing_rows, \
-                   COALESCE((SELECT inflight_subjects FROM plan), 0)::bigint AS inflight_rows, \
-                   0::bigint AS cache_reusable_rows, \
-                   COALESCE((SELECT model_ms FROM plan), 2500)::float8 AS model_ms, \
-                   COALESCE((SELECT model_cost_source FROM plan), 'static_fallback')::text AS model_cost_source, \
-                   COALESCE((SELECT count_basis FROM plan), 'estimated')::text AS count_basis, \
-                   COALESCE((SELECT stale_reasons::text FROM plan), '{}'::text) AS stale_reasons",
+                   COALESCE((SELECT total_subjects FROM plan), 0)::pg_catalog.int8 AS source_rows, \
+                   (SELECT count(*) FROM current_rows WHERE stale = false AND body @> $2::pg_catalog.jsonb)::pg_catalog.int8 AS fresh_matches, \
+                   (SELECT count(*) FROM current_rows WHERE stale = false AND NOT (body @> $2::pg_catalog.jsonb))::pg_catalog.int8 AS fresh_non_matches, \
+                   COALESCE((SELECT stale_subjects FROM plan), 0)::pg_catalog.int8 AS stale_rows, \
+                   COALESCE((SELECT missing_subjects FROM plan), 0)::pg_catalog.int8 AS missing_rows, \
+                   COALESCE((SELECT inflight_subjects FROM plan), 0)::pg_catalog.int8 AS inflight_rows, \
+                   0::pg_catalog.int8 AS cache_reusable_rows, \
+                   COALESCE((SELECT model_ms FROM plan), 2500)::pg_catalog.float8 AS model_ms, \
+                   COALESCE((SELECT model_cost_source FROM plan), 'static_fallback')::pg_catalog.text AS model_cost_source, \
+                   COALESCE((SELECT count_basis FROM plan), 'estimated')::pg_catalog.text AS count_basis, \
+                   COALESCE((SELECT stale_reasons::pg_catalog.text FROM plan), '{}'::pg_catalog.text) AS stale_reasons",
                 Some(1),
                 &stats_args,
             )

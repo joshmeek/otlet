@@ -14,20 +14,20 @@ fn load_semantic_states(
                 "SELECT \
                    revision.definition #>> '{source,source_table}' AS source_table, \
                    revision.definition #>> '{source,subject_column}' AS subject_column, \
-                   (revision.definition #> '{source,input_columns}')::text AS input_columns_json, \
+                   (revision.definition #> '{source,input_columns}')::pg_catalog.text AS input_columns_json, \
                    CASE \
                      WHEN revision.definition #> '{source,input_columns}' IS NULL THEN 'NULL' \
                      ELSE quote_nullable(ARRAY( \
                        SELECT jsonb_array_elements_text( \
                          revision.definition #> '{source,input_columns}' \
                        ) \
-                     ))::text \
+                     ))::pg_catalog.text \
                    END AS input_columns_sql, \
-                   quote_nullable((revision.definition #> '{task,input_shaping}')::text)::text AS input_shaping_sql, \
+                   quote_nullable((revision.definition #> '{task,input_shaping}')::pg_catalog.text)::pg_catalog.text AS input_shaping_sql, \
                    revision.task_name, \
                    revision.definition #>> '{source,record_type}' AS record_type, \
                    revision.workload_revision_hash AS contract_hash, \
-                   COALESCE(NULLIF(rs.last_generate_ms, 0), 2500)::float8 AS model_ms, \
+                   COALESCE(NULLIF(rs.last_generate_ms, 0), 2500)::pg_catalog.float8 AS model_ms, \
                    CASE \
                      WHEN COALESCE(rs.last_generate_ms, 0) > 0 THEN 'runtime_slot' \
                      ELSE 'static_fallback' \
@@ -100,7 +100,7 @@ fn load_semantic_states(
         let freshness_status_sql = semantic_freshness_status_sql(
             "l",
             "src.content_hash",
-            "$3::text",
+            "$3::pg_catalog.text",
             "src.source_hash",
         );
         let query_args = [
@@ -122,7 +122,7 @@ fn load_semantic_states(
              sm.contract_hash, \
              sm.stale_reason, \
              sm.freshness_basis, \
-             (sm.body @> $4::jsonb) AS matches_expected, \
+             (sm.body @> $4::pg_catalog.jsonb) AS matches_expected, \
              sm.updated_at, \
              sm.id \
            FROM source_rows src \
@@ -132,7 +132,7 @@ fn load_semantic_states(
              AND sm.record_type = $2 \
              AND sm.contract_hash = $3 \
            ORDER BY sm.subject_id, \
-             (sm.content_hash IS NOT DISTINCT FROM src.content_hash AND sm.contract_hash IS NOT DISTINCT FROM $3::text) DESC, \
+             (sm.content_hash IS NOT DISTINCT FROM src.content_hash AND sm.contract_hash IS NOT DISTINCT FROM $3::pg_catalog.text) DESC, \
              sm.updated_at DESC, sm.id DESC \
          ), \
          active_jobs AS ( \
@@ -255,14 +255,14 @@ fn load_semantic_join_states(
                      revision.task_name, \
                      revision.definition #>> '{source,record_type}' AS record_type, \
                      revision.workload_revision_hash, \
-                     COALESCE(NULLIF(rs.last_generate_ms, 0), 2500)::float8 AS model_ms, \
+                     COALESCE(NULLIF(rs.last_generate_ms, 0), 2500)::pg_catalog.float8 AS model_ms, \
                      CASE \
                        WHEN COALESCE(rs.last_generate_ms, 0) > 0 THEN 'runtime_slot' \
                        ELSE 'static_fallback' \
                      END AS model_cost_source, \
                      COALESCE( \
-                       (SELECT plan.stale_reasons::text \
-                        FROM otlet.semantic_join_index_plan($1, false) plan \
+                       (SELECT plan.stale_reasons::pg_catalog.text \
+                        FROM otlet.semantic_join_index_plan($1, false, $3) plan \
                         LIMIT 1), \
                        '{}' \
                      ) AS stale_reasons \
@@ -296,7 +296,7 @@ fn load_semantic_join_states(
                        WHEN a.subject_id IS NOT NULL AND (c.subject_id IS NULL OR c.stale) THEN 'in_flight' \
                        WHEN c.subject_id IS NULL THEN 'missing' \
                        WHEN c.stale THEN 'stale' \
-                       WHEN c.body @> $2::jsonb THEN 'fresh_match' \
+                       WHEN c.body @> $2::pg_catalog.jsonb THEN 'fresh_match' \
                        ELSE 'fresh_non_match' \
                      END AS semantic_state, \
                      c.freshness_basis \

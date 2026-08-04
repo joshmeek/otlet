@@ -176,6 +176,7 @@ DECLARE
   candidate_plan jsonb;
   candidate_plan_cost numeric;
   candidate_preflight_at timestamptz;
+  candidate_contract jsonb;
 BEGIN
   IF index_name !~ '^[a-z0-9][a-z0-9_-]*$' THEN
     RAISE EXCEPTION 'otlet semantic join index name % must be a simple identifier', index_name;
@@ -184,13 +185,6 @@ BEGIN
   IF semantic_task_name !~ '^[a-z0-9][a-z0-9_-]*$' THEN
     RAISE EXCEPTION 'otlet semantic join index name % creates invalid task name %', index_name, semantic_task_name;
   END IF;
-
-  SELECT
-    preflight.candidate_plan,
-    preflight.candidate_plan_cost,
-    preflight.candidate_preflight_at
-  INTO candidate_plan, candidate_plan_cost, candidate_preflight_at
-  FROM otlet.preflight_candidate_query(candidate_query) preflight;
 
   PERFORM otlet.create_task(
     semantic_task_name,
@@ -203,6 +197,21 @@ BEGIN
     decision_contract,
     pair_sources
   );
+  SELECT task.source_query_contract
+  INTO candidate_contract
+  FROM otlet.tasks task
+  WHERE task.name = semantic_task_name;
+  SELECT
+    preflight.candidate_plan,
+    preflight.candidate_plan_cost,
+    preflight.candidate_preflight_at
+  INTO candidate_plan, candidate_plan_cost, candidate_preflight_at
+  FROM otlet.preflight_candidate_query(
+    candidate_contract #>> '{query,resolved}',
+    true,
+    false,
+    candidate_contract
+  ) preflight;
 
   INSERT INTO otlet.semantic_join_indexes (
     name,

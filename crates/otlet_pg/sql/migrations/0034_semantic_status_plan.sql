@@ -1,6 +1,7 @@
 CREATE FUNCTION otlet.semantic_index_plan(
   index_name text,
-  exact boolean DEFAULT false
+  exact boolean DEFAULT false,
+  expected_workload_revision_hash text DEFAULT NULL
 ) RETURNS TABLE (
   selected_path text,
   reason text,
@@ -38,6 +39,7 @@ CREATE FUNCTION otlet.semantic_index_plan(
 LANGUAGE plpgsql
 VOLATILE
 ROWS 1
+SET search_path = pg_catalog, pg_temp
 AS $$
 DECLARE
   index_row otlet.semantic_indexes%ROWTYPE;
@@ -49,6 +51,8 @@ DECLARE
   v_count_basis text := CASE WHEN exact THEN 'exact' ELSE 'estimated' END;
   current_contract_hash text;
   current_input_shaping jsonb := '{}'::jsonb;
+  current_definition jsonb;
+  schema_drift_error text;
 BEGIN
   SELECT
     revision.definition #>> '{source,semantic_index_name}',
@@ -62,7 +66,8 @@ BEGIN
     revision.definition #>> '{source,record_type}',
     revision.definition #>> '{models,direct,name}',
     head.active_workload_revision_hash,
-    revision.definition #> '{task,input_shaping}'
+    revision.definition #> '{task,input_shaping}',
+    revision.definition
   INTO
     index_row.name,
     index_row.task_name,
@@ -72,7 +77,8 @@ BEGIN
     index_row.record_type,
     index_row.model_name,
     current_contract_hash,
-    current_input_shaping
+    current_input_shaping,
+    current_definition
   FROM otlet.workload_revision_heads head
   JOIN otlet.workload_revisions revision
     ON revision.task_name = head.task_name
@@ -84,13 +90,22 @@ BEGIN
     RAISE EXCEPTION 'otlet semantic index % does not exist', semantic_index_plan.index_name;
   END IF;
 
-  PERFORM otlet.require_workload_source_contract(index_row.task_name, current_contract_hash);
-
-  IF exact THEN
-    PERFORM otlet.mark_semantic_schema_drift(index_row.name);
+  IF semantic_index_plan.expected_workload_revision_hash IS NOT NULL
+     AND semantic_index_plan.expected_workload_revision_hash IS DISTINCT FROM current_contract_hash THEN
+    RAISE EXCEPTION 'otlet workload revision changed during semantic plan for index %', index_row.name;
   END IF;
 
-  IF exact THEN
+  PERFORM otlet.require_workload_source_contract(
+    index_row.task_name,
+    current_contract_hash,
+    false
+  );
+  schema_drift_error := otlet.semantic_schema_drift_error(current_definition);
+
+  IF exact AND schema_drift_error IS NOT NULL THEN
+    EXECUTE format('SELECT count(*)::bigint FROM %s', index_row.source_table)
+    INTO v_total_subjects;
+  ELSIF exact THEN
     EXECUTE format(
       $sql$
         WITH raw_inputs AS (
@@ -267,6 +282,13 @@ BEGIN
     LEFT JOIN source_estimate se ON true;
   END IF;
 
+  IF schema_drift_error IS NOT NULL THEN
+    v_fresh_subjects := 0;
+    v_stale_subjects := v_total_subjects;
+    v_missing_subjects := 0;
+    v_stale_reasons := jsonb_build_object('schema_drift', v_total_subjects);
+  END IF;
+
   RETURN QUERY
   SELECT *
   FROM otlet.semantic_plan_from_counts(
@@ -278,7 +300,10 @@ BEGIN
     'semantic_lookup',
     'empty source',
     'semantic index fully fresh',
-    'policy returns fresh lookup rows only',
+    CASE
+      WHEN schema_drift_error IS NULL THEN 'policy returns fresh lookup rows only'
+      ELSE 'fail closed: ' || schema_drift_error
+    END,
     'partial refresh queued before lookup',
     'fresh_inference_scan',
     'fresh inference has no reusable semantic coverage',
@@ -287,7 +312,8 @@ BEGIN
     v_stale_subjects,
     v_missing_subjects,
     v_stale_reasons,
-    v_count_basis
+    v_count_basis,
+    schema_drift_error IS NOT NULL
   );
 END;
 $$;
@@ -335,6 +361,8 @@ JOIN otlet.workload_revisions revision
   ON revision.task_name = head.task_name
  AND revision.workload_revision_hash = head.active_workload_revision_hash
 JOIN LATERAL otlet.semantic_index_plan(
-  revision.definition #>> '{source,semantic_index_name}'
+  revision.definition #>> '{source,semantic_index_name}',
+  false,
+  head.active_workload_revision_hash
 ) plan ON true
 WHERE revision.definition #>> '{source,kind}' = 'row';

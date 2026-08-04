@@ -12,17 +12,37 @@ CREATE FUNCTION otlet.semantic_index_current_rows(
 )
 LANGUAGE plpgsql
 VOLATILE
+SET search_path = pg_catalog, pg_temp
 AS $$
 DECLARE
   index_row otlet.semantic_indexes%ROWTYPE;
   current_contract_hash text;
   current_input_shaping jsonb := '{}'::jsonb;
+  current_definition jsonb;
 BEGIN
   SELECT
     revision.definition #>> '{source,semantic_index_name}',
     revision.definition #>> '{task,name}',
-    head.active_workload_revision_hash
-  INTO index_row.name, index_row.task_name, current_contract_hash
+    head.active_workload_revision_hash,
+    revision.definition #> '{task,input_shaping}',
+    revision.definition #>> '{source,subject_column}',
+    revision.definition #>> '{source,source_table}',
+    revision.definition #>> '{source,record_type}',
+    ARRAY(
+      SELECT value
+      FROM jsonb_array_elements_text(COALESCE(revision.definition #> '{source,input_columns}', '[]'::jsonb)) value
+    ),
+    revision.definition
+  INTO
+    index_row.name,
+    index_row.task_name,
+    current_contract_hash,
+    current_input_shaping,
+    index_row.subject_column,
+    index_row.source_table,
+    index_row.record_type,
+    index_row.input_columns,
+    current_definition
   FROM otlet.workload_revision_heads head
   JOIN otlet.workload_revisions revision
     ON revision.task_name = head.task_name
@@ -34,31 +54,19 @@ BEGIN
     RAISE EXCEPTION 'otlet semantic index % does not exist', semantic_index_current_rows.index_name;
   END IF;
 
-  PERFORM otlet.require_workload_source_contract(index_row.task_name, current_contract_hash);
-  PERFORM otlet.mark_semantic_schema_drift(index_row.name);
-
-  SELECT
-    active.workload_revision_hash,
-    active.definition #> '{task,input_shaping}',
-    active.definition #>> '{source,subject_column}',
-    active.definition #>> '{source,source_table}',
-    active.definition #>> '{source,record_type}',
-    ARRAY(
-      SELECT value
-      FROM jsonb_array_elements_text(COALESCE(active.definition #> '{source,input_columns}', '[]'::jsonb)) value
-    )
-  INTO
-    current_contract_hash,
-    current_input_shaping,
-    index_row.subject_column,
-    index_row.source_table,
-    index_row.record_type,
-    index_row.input_columns
-  FROM otlet.active_workload_revision(index_row.task_name) active;
-
   IF semantic_index_current_rows.expected_workload_revision_hash IS NOT NULL
      AND semantic_index_current_rows.expected_workload_revision_hash IS DISTINCT FROM current_contract_hash THEN
     RAISE EXCEPTION 'otlet workload revision changed during semantic read for index %', index_row.name;
+  END IF;
+
+  PERFORM otlet.require_workload_source_contract(
+    index_row.task_name,
+    current_contract_hash,
+    false
+  );
+
+  IF otlet.semantic_schema_drift_error(current_definition) IS NOT NULL THEN
+    RETURN;
   END IF;
 
   RETURN QUERY EXECUTE format(

@@ -30,6 +30,29 @@ BEGIN ATOMIC
   SELECT lower(value);
 END;
 
+CREATE FUNCTION source_query_drift.current_schema_wrapper() RETURNS text
+LANGUAGE sql
+STABLE
+BEGIN ATOMIC
+  SELECT CURRENT_SCHEMA;
+END;
+
+CREATE FUNCTION source_query_drift.current_schema_default(
+  value text DEFAULT CURRENT_SCHEMA
+) RETURNS text
+LANGUAGE sql
+STABLE
+BEGIN ATOMIC
+  SELECT value;
+END;
+
+CREATE VIEW source_query_drift.current_schema_view
+WITH (security_invoker = true)
+AS
+SELECT
+  CURRENT_SCHEMA::text AS subject_id,
+  '{}'::jsonb AS input;
+
 CREATE ROLE source_query_drift_reader;
 CREATE ROLE source_query_drift_unrelated;
 GRANT USAGE ON SCHEMA source_query_drift TO source_query_drift_reader;
@@ -50,6 +73,24 @@ IMMUTABLE
 RETURNS NULL ON NULL INPUT
 BEGIN ATOMIC
   SELECT NULL::text;
+END;
+
+CREATE FUNCTION source_query_shadow.current_setting(name text) RETURNS text
+LANGUAGE sql
+IMMUTABLE
+BEGIN ATOMIC
+  SELECT 'shadowed';
+END;
+
+CREATE FUNCTION source_query_shadow.set_config(
+  name text,
+  value text,
+  is_local boolean
+) RETURNS text
+LANGUAGE sql
+VOLATILE
+BEGIN ATOMIC
+  SELECT 'shadowed';
 END;
 
 CREATE TABLE source_query_drift.writer_log (value text NOT NULL);
@@ -201,6 +242,119 @@ SELECT pg_temp.expect_error(
 SELECT pg_temp.expect_error(
   $statement$
     SELECT otlet.build_source_query_contract(
+      $query$
+        SELECT 'path-observer'::text AS subject_id, '{}'::jsonb AS input
+        WHERE current_setting('search_path') IS NOT NULL
+      $query$,
+      '[]'::jsonb
+    )
+  $statement$,
+  'source query cannot observe or change session name resolution'
+);
+
+DO $body$
+DECLARE
+  original_search_path text := pg_catalog.current_setting('search_path');
+  expected_search_path text := 'source_query_shadow, pg_catalog, public';
+  contract jsonb;
+  input_rows integer;
+BEGIN
+  PERFORM pg_catalog.set_config('search_path', expected_search_path, true);
+  contract := otlet.build_source_query_contract(
+    'SELECT ''path-safe''::text AS subject_id, ''{}''::jsonb AS input',
+    '[]'::jsonb
+  );
+  PERFORM otlet.source_query_contract_guard(contract, true);
+  PERFORM candidate_plan
+  FROM otlet.preflight_candidate_query(
+    contract #>> '{query,resolved}',
+    true,
+    false,
+    contract
+  );
+  SELECT count(*)::integer
+  INTO input_rows
+  FROM otlet.validated_task_input_rows(
+    contract #>> '{query,resolved}',
+    workload_definition => jsonb_build_object(
+      'source',
+      jsonb_build_object('query_contract', contract)
+    )
+  );
+  IF input_rows <> 1
+     OR pg_catalog.current_setting('search_path') IS DISTINCT FROM expected_search_path THEN
+    RAISE EXCEPTION 'source contract helpers did not resist path-control function shadowing';
+  END IF;
+  PERFORM pg_catalog.set_config('search_path', original_search_path, true);
+EXCEPTION WHEN OTHERS THEN
+  PERFORM pg_catalog.set_config('search_path', original_search_path, true);
+  RAISE;
+END
+$body$;
+
+SELECT pg_temp.expect_error(
+  $statement$
+    SELECT otlet.build_source_query_contract(
+      $query$
+        SELECT 'pg_database'::regclass::text AS subject_id, '{}'::jsonb AS input
+      $query$,
+      '[]'::jsonb
+    )
+  $statement$,
+  'source query cannot observe or change session name resolution'
+);
+
+SELECT pg_temp.expect_error(
+  $statement$
+    SELECT otlet.build_source_query_contract(
+      $query$
+        SELECT source_query_drift.current_schema_default() AS subject_id, '{}'::jsonb AS input
+      $query$,
+      '[]'::jsonb
+    )
+  $statement$,
+  'source query cannot observe or change session name resolution'
+);
+
+SELECT pg_temp.expect_error(
+  $statement$
+    SELECT otlet.build_source_query_contract(
+      $query$
+        SELECT subject_id, input FROM source_query_drift.current_schema_view
+      $query$,
+      '[]'::jsonb
+    )
+  $statement$,
+  'source query cannot observe or change session name resolution'
+);
+
+SELECT pg_temp.expect_error(
+  $statement$
+    SELECT otlet.build_source_query_contract(
+      $query$
+        SELECT CURRENT_SCHEMA::text AS subject_id, '{}'::jsonb AS input
+      $query$,
+      '[]'::jsonb
+    )
+  $statement$,
+  'source query cannot observe or change session name resolution'
+);
+
+SELECT pg_temp.expect_error(
+  $statement$
+    SELECT otlet.build_source_query_contract(
+      $query$
+        SELECT source_query_drift.current_schema_wrapper() AS subject_id, '{}'::jsonb AS input
+      $query$,
+      '[]'::jsonb
+    )
+  $statement$,
+  'source query cannot observe or change session name resolution'
+);
+
+SELECT pg_temp.expect_error(
+  $statement$
+    SELECT otlet.build_source_query_contract(
       'SELECT id AS subject_id, to_jsonb(ROW(payload)::source_query_drift.source_payload) AS input FROM source_query_drift.source',
       '[{"table":"source_query_drift.source"}]'::jsonb
     )
@@ -209,7 +363,13 @@ SELECT pg_temp.expect_error(
 );
 
 DO $body$
+DECLARE
+  original_search_path text := pg_catalog.current_setting('search_path');
+  contract_search_path text;
+  contract jsonb;
 BEGIN
+  PERFORM pg_catalog.set_config('search_path', 'public', true);
+  contract_search_path := pg_catalog.current_setting('search_path');
   PERFORM otlet.create_task(
     'source_query_constant',
     'SELECT ''constant''::text AS subject_id, ''{}''::jsonb AS input',
@@ -227,12 +387,13 @@ BEGIN
   END IF;
   DELETE FROM otlet.jobs WHERE task_name = 'source_query_constant';
 
+  SELECT source_query_contract
+  INTO contract
+  FROM otlet.tasks
+  WHERE name = 'source_query_constant';
   EXECUTE 'CREATE DOMAIN pg_temp.text AS pg_catalog.text';
   BEGIN
-    PERFORM otlet.source_query_contract_guard(
-      (SELECT source_query_contract FROM otlet.tasks WHERE name = 'source_query_constant'),
-      true
-    );
+    PERFORM otlet.source_query_contract_guard(contract, true);
     RAISE EXCEPTION 'temporary type shadowing was accepted';
   EXCEPTION WHEN OTHERS THEN
     IF position('source query binding drifted' IN SQLERRM) = 0 THEN
@@ -240,6 +401,11 @@ BEGIN
     END IF;
   END;
   EXECUTE 'DROP DOMAIN pg_temp.text';
+  PERFORM otlet.source_query_contract_guard(contract, true);
+  IF pg_catalog.current_setting('search_path') IS DISTINCT FROM contract_search_path THEN
+    RAISE EXCEPTION 'source guard changed the caller search_path';
+  END IF;
+  PERFORM pg_catalog.set_config('search_path', original_search_path, true);
 END
 $body$;
 
@@ -266,10 +432,10 @@ $body$;
 
 DO $body$
 DECLARE
-  original_search_path text := current_setting('search_path');
+  original_search_path text := pg_catalog.current_setting('search_path');
   contract jsonb;
 BEGIN
-  PERFORM set_config('search_path', 'source_query_shadow, pg_catalog, public', true);
+  PERFORM pg_catalog.set_config('search_path', 'source_query_shadow, pg_catalog, public', true);
   contract := otlet.build_source_query_contract(
     'SELECT ''one''::text AS subject_id, ''{}''::jsonb AS input',
     '[]'::jsonb
@@ -283,7 +449,7 @@ BEGIN
       RAISE;
     END IF;
   END;
-  PERFORM set_config('search_path', original_search_path, true);
+  PERFORM pg_catalog.set_config('search_path', original_search_path, true);
 END
 $body$;
 
@@ -472,7 +638,6 @@ SET input_query = $query$
     ) AS input
   FROM source AS src
   WHERE decorate(src.payload) IS NOT NULL
-    AND current_setting('search_path') = 'source_query_empty, source_query_drift, public'
 $query$
 WHERE name = 'source_query_drift_watch_task';
 
@@ -913,6 +1078,27 @@ BEGIN
      OR (SELECT status FROM otlet.jobs WHERE id = proof.running_job_id) <> 'running'
      OR (SELECT status FROM otlet.jobs WHERE id = proof.queued_job_id) <> 'queued' THEN
     RAISE EXCEPTION 'drift rejection mutated historical or pending evidence';
+  END IF;
+END
+$body$;
+
+DO $body$
+DECLARE
+  proof source_query_drift_proof%ROWTYPE;
+  marked bigint;
+  recorded_reason text;
+BEGIN
+  SELECT * INTO proof FROM source_query_drift_proof;
+  marked := otlet.mark_semantic_schema_drift('source_query_drift_watch');
+  SELECT materialization.stale_reason
+  INTO recorded_reason
+  FROM otlet.semantic_materializations materialization
+  WHERE materialization.id = proof.materialization_id
+    AND materialization.stale;
+  IF marked <> 1 OR recorded_reason IS DISTINCT FROM 'schema_drift' THEN
+    RAISE EXCEPTION 'explicit source drift maintenance recorded % rows with reason %',
+      marked,
+      recorded_reason;
   END IF;
 END
 $body$;

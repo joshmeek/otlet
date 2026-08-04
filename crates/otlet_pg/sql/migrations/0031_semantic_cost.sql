@@ -16,7 +16,8 @@ CREATE FUNCTION otlet.semantic_plan_from_counts(
   p_stale_subjects bigint,
   p_missing_subjects bigint,
   p_stale_reasons jsonb DEFAULT '{}'::jsonb,
-  p_count_basis text DEFAULT 'exact'
+  p_count_basis text DEFAULT 'exact',
+  p_force_fail_closed boolean DEFAULT false
 ) RETURNS TABLE (
   selected_path text,
   reason text,
@@ -163,19 +164,22 @@ BEGIN
   FROM otlet.production_policy policy
   WHERE policy.name = 'default';
 
-  IF NOT v_portable
+  IF NOT COALESCE(p_force_fail_closed, false)
+     AND NOT v_portable
      AND COALESCE(v_auto_infer_ms, 0) > 0
      AND COALESCE(v_auto_max_rows, 0) > 0 THEN
     v_infer_now_subjects := LEAST(v_refresh_subjects, v_auto_max_rows::bigint);
   END IF;
 
-  IF COALESCE(v_auto_wait_ms, 0) > 0 THEN
+  IF NOT COALESCE(p_force_fail_closed, false)
+     AND COALESCE(v_auto_wait_ms, 0) > 0 THEN
     v_wait_subjects := COALESCE(v_inflight_subjects, 0);
   END IF;
 
   v_remaining_refresh_subjects := GREATEST(v_refresh_subjects - v_infer_now_subjects, 0);
 
-  IF v_stale_policy = 'refresh_then_fail_closed' THEN
+  IF NOT COALESCE(p_force_fail_closed, false)
+     AND v_stale_policy = 'refresh_then_fail_closed' THEN
     v_queue_subjects := LEAST(v_remaining_refresh_subjects, COALESCE(v_available_queue_slots, 0));
   END IF;
 
@@ -184,7 +188,10 @@ BEGIN
     0
   );
 
-  IF v_total_subjects = 0 THEN
+  IF COALESCE(p_force_fail_closed, false) THEN
+    v_selected_path := 'lookup_fail_closed';
+    v_reason := p_fail_closed_reason;
+  ELSIF v_total_subjects = 0 THEN
     v_selected_path := p_lookup_path;
     v_reason := p_empty_reason;
   ELSIF v_infer_now_subjects > 0 THEN

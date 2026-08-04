@@ -123,10 +123,7 @@ BEGIN
   IF NOT FOUND THEN
     RAISE EXCEPTION 'otlet job workload revision is missing';
   END IF;
-  PERFORM otlet.source_query_contract_guard(
-    revision_definition #> '{source,query_contract}',
-    true
-  );
+  PERFORM otlet.workload_source_contract_guard(revision_definition);
   task_row.model_name := revision_definition #>> '{models,direct,name}';
   task_row.input_shaping := revision_definition #> '{task,input_shaping}';
   task_row.decision_contract := revision_definition #> '{task,decision_contract}';
@@ -504,7 +501,7 @@ AS $$
 DECLARE
   actual_outcome text := lower(COALESCE(record_review_event.outcome, ''));
   actual_reason text := COALESCE(NULLIF(btrim(record_review_event.reason), ''), actual_outcome);
-  role_setting text := current_setting('role', true);
+  role_setting text := pg_catalog.current_setting('role', true);
   reviewer_role_name text;
   target record;
   current_hash text;
@@ -761,10 +758,7 @@ BEGIN
     AND locked_action.authority_origin = 'workflow';
 
   IF target_authority_error IS DISTINCT FROM 'action workflow target contract changed' THEN
-    PERFORM otlet.source_query_contract_guard(
-      revision.definition #> '{source,query_contract}',
-      true
-    )
+    PERFORM otlet.workload_source_contract_guard(revision.definition)
     FROM otlet.actions locked_action
     JOIN otlet.jobs job ON job.id = locked_action.job_id
     JOIN otlet.workload_revisions revision

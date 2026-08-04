@@ -112,22 +112,22 @@ fn reload_private_planner_stats_plan_only(private: &CustomScanPrivate) -> Semant
         let query = match private.index_kind {
             SemanticIndexKind::Row => {
                 "SELECT \
-                   COALESCE(selected_path, 'semantic_lookup')::text AS selected_path, \
-                   COALESCE(reason, 'reloaded_from_sql_plan')::text AS reason, \
-                   COALESCE(total_subjects, 0)::bigint AS total_subjects, \
-                   0::bigint AS fresh_matches, \
-                   0::bigint AS fresh_non_matches, \
-                   COALESCE(stale_subjects, 0)::bigint AS stale_subjects, \
-                   COALESCE(missing_subjects, 0)::bigint AS missing_subjects, \
-                   COALESCE(inflight_subjects, 0)::bigint AS inflight_subjects, \
-                   COALESCE(infer_now_subjects, 0)::bigint AS infer_now_subjects, \
-                   COALESCE(fail_closed_subjects, 0)::bigint AS fail_closed_subjects, \
-                   COALESCE(model_ms, 2500)::float8 AS model_ms, \
-                   COALESCE(model_cost_source, 'static_fallback')::text AS model_cost_source, \
-                   COALESCE(path_cost, 1)::float8 AS path_cost, \
-                   COALESCE(stale_reasons::text, '{}')::text AS stale_reasons, \
-                   COALESCE(count_basis, 'exact')::text AS count_basis \
-                 FROM otlet.semantic_index_plan($1, true) \
+                   COALESCE(selected_path, 'semantic_lookup')::pg_catalog.text AS selected_path, \
+                   COALESCE(reason, 'reloaded_from_sql_plan')::pg_catalog.text AS reason, \
+                   COALESCE(total_subjects, 0)::pg_catalog.int8 AS total_subjects, \
+                   0::pg_catalog.int8 AS fresh_matches, \
+                   0::pg_catalog.int8 AS fresh_non_matches, \
+                   COALESCE(stale_subjects, 0)::pg_catalog.int8 AS stale_subjects, \
+                   COALESCE(missing_subjects, 0)::pg_catalog.int8 AS missing_subjects, \
+                   COALESCE(inflight_subjects, 0)::pg_catalog.int8 AS inflight_subjects, \
+                   COALESCE(infer_now_subjects, 0)::pg_catalog.int8 AS infer_now_subjects, \
+                   COALESCE(fail_closed_subjects, 0)::pg_catalog.int8 AS fail_closed_subjects, \
+                   COALESCE(model_ms, 2500)::pg_catalog.float8 AS model_ms, \
+                   COALESCE(model_cost_source, 'static_fallback')::pg_catalog.text AS model_cost_source, \
+                   COALESCE(path_cost, 1)::pg_catalog.float8 AS path_cost, \
+                   COALESCE(stale_reasons::pg_catalog.text, '{}')::pg_catalog.text AS stale_reasons, \
+                   COALESCE(count_basis, 'exact')::pg_catalog.text AS count_basis \
+                 FROM otlet.semantic_index_plan($1, true, $2) \
                  WHERE EXISTS ( \
                    SELECT 1 \
                    FROM otlet.workload_revision_heads head \
@@ -140,22 +140,22 @@ fn reload_private_planner_stats_plan_only(private: &CustomScanPrivate) -> Semant
             }
             SemanticIndexKind::Join => {
                 "SELECT \
-                   COALESCE(selected_path, 'semantic_lookup')::text AS selected_path, \
-                   COALESCE(reason, 'reloaded_from_sql_plan')::text AS reason, \
-                   COALESCE(total_subjects, 0)::bigint AS total_subjects, \
-                   0::bigint AS fresh_matches, \
-                   0::bigint AS fresh_non_matches, \
-                   COALESCE(stale_subjects, 0)::bigint AS stale_subjects, \
-                   COALESCE(missing_subjects, 0)::bigint AS missing_subjects, \
-                   COALESCE(inflight_subjects, 0)::bigint AS inflight_subjects, \
-                   COALESCE(infer_now_subjects, 0)::bigint AS infer_now_subjects, \
-                   COALESCE(fail_closed_subjects, 0)::bigint AS fail_closed_subjects, \
-                   COALESCE(model_ms, 2500)::float8 AS model_ms, \
-                   COALESCE(model_cost_source, 'static_fallback')::text AS model_cost_source, \
-                   COALESCE(path_cost, 1)::float8 AS path_cost, \
-                   COALESCE(stale_reasons::text, '{}')::text AS stale_reasons, \
-                   COALESCE(count_basis, 'exact')::text AS count_basis \
-                 FROM otlet.semantic_join_index_plan($1) \
+                   COALESCE(selected_path, 'semantic_lookup')::pg_catalog.text AS selected_path, \
+                   COALESCE(reason, 'reloaded_from_sql_plan')::pg_catalog.text AS reason, \
+                   COALESCE(total_subjects, 0)::pg_catalog.int8 AS total_subjects, \
+                   0::pg_catalog.int8 AS fresh_matches, \
+                   0::pg_catalog.int8 AS fresh_non_matches, \
+                   COALESCE(stale_subjects, 0)::pg_catalog.int8 AS stale_subjects, \
+                   COALESCE(missing_subjects, 0)::pg_catalog.int8 AS missing_subjects, \
+                   COALESCE(inflight_subjects, 0)::pg_catalog.int8 AS inflight_subjects, \
+                   COALESCE(infer_now_subjects, 0)::pg_catalog.int8 AS infer_now_subjects, \
+                   COALESCE(fail_closed_subjects, 0)::pg_catalog.int8 AS fail_closed_subjects, \
+                   COALESCE(model_ms, 2500)::pg_catalog.float8 AS model_ms, \
+                   COALESCE(model_cost_source, 'static_fallback')::pg_catalog.text AS model_cost_source, \
+                   COALESCE(path_cost, 1)::pg_catalog.float8 AS path_cost, \
+                   COALESCE(stale_reasons::pg_catalog.text, '{}')::pg_catalog.text AS stale_reasons, \
+                   COALESCE(count_basis, 'exact')::pg_catalog.text AS count_basis \
+                 FROM otlet.semantic_join_index_plan($1, false, $2) \
                  WHERE EXISTS ( \
                    SELECT 1 \
                    FROM otlet.workload_revision_heads head \

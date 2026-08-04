@@ -1334,6 +1334,35 @@ if [ "$watch_insert_contract" != "$expected_watch_insert" ]; then
   exit 1
 fi
 
+portable_row_read_only_contract="$(
+  docker exec -i "$container" psql -U postgres -d "$portable_database" \
+    -X -qAt -v ON_ERROR_STOP=1 <<'SQL'
+BEGIN READ ONLY;
+SELECT concat_ws('|',
+  current_setting('transaction_read_only'),
+  pg_my_temp_schema() = 0,
+  (SELECT count(*) = 1 FROM otlet.semantic_index_current_rows('portable_row_watch', true)),
+  (SELECT count_basis = 'estimated' FROM otlet.semantic_index_plan('portable_row_watch')),
+  (SELECT count_basis = 'exact' FROM otlet.semantic_index_plan('portable_row_watch', true)),
+  EXISTS (SELECT 1 FROM otlet.semantic_index_status WHERE name = 'portable_row_watch'),
+  otlet.semantic_matches('portable_row_watch', 'watch-live', '{"decision":"keep"}'::jsonb),
+  EXISTS (
+    SELECT 1
+    FROM otlet.watch_status
+    WHERE watch_name = 'portable_row_watch'
+      AND source_dependency_status = 'ready'
+  ),
+  pg_my_temp_schema() = 0
+);
+COMMIT;
+SQL
+)"
+if [ "$portable_row_read_only_contract" != "on|t|t|t|t|t|t|t|t" ]; then
+  echo "Expected portable row status, plan, current-row, and predicate reads to remain read-only, got $portable_row_read_only_contract" >&2
+  exit 1
+fi
+echo "portable_row_read_only_contract=$portable_row_read_only_contract"
+
 watch_update_job_id="$(
   docker exec -i "$container" psql -U postgres -d "$portable_database" \
     -X -qAt -v ON_ERROR_STOP=1 <<'SQL'
@@ -1472,6 +1501,36 @@ if [ "$pair_insert_contract" != "complete|keep|false|1|1" ]; then
   echo "Expected portable pair materialization and audit visibility, got $pair_insert_contract" >&2
   exit 1
 fi
+
+portable_pair_read_only_contract="$(
+  docker exec -i "$container" psql -U postgres -d "$portable_database" \
+    -X -qAt -v ON_ERROR_STOP=1 <<'SQL'
+BEGIN READ ONLY;
+SELECT concat_ws('|',
+  current_setting('transaction_read_only'),
+  pg_my_temp_schema() = 0,
+  (SELECT count(*) = 1 FROM otlet.semantic_join_index_current_rows('portable_pair_watch', true)),
+  (SELECT count_basis = 'estimated' FROM otlet.semantic_join_index_plan('portable_pair_watch')),
+  (SELECT count_basis = 'exact' FROM otlet.semantic_join_index_plan('portable_pair_watch', true)),
+  otlet.semantic_join_matches('portable_pair_watch', 'pair-left:pair-right', '{"decision":"keep"}'::jsonb),
+  EXISTS (
+    SELECT 1
+    FROM otlet.watch_status
+    WHERE watch_name = 'portable_pair_watch'
+      AND source_dependency_status = 'ready'
+      AND candidate_preflight_status = 'ready'
+  ),
+  (SELECT count(*) >= 0 FROM otlet.verify_invariants()),
+  pg_my_temp_schema() = 0
+);
+COMMIT;
+SQL
+)"
+if [ "$portable_pair_read_only_contract" != "on|t|t|t|t|t|t|t|t" ]; then
+  echo "Expected portable pair status, plan, current-row, predicate, and invariant reads to remain read-only, got $portable_pair_read_only_contract" >&2
+  exit 1
+fi
+echo "portable_pair_read_only_contract=$portable_pair_read_only_contract"
 
 pair_update_contract="$(
   docker exec -i "$container" psql -U postgres -d "$portable_database" \

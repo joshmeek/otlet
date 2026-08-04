@@ -31,15 +31,14 @@ BEGIN
   IF NOT FOUND THEN
     RAISE EXCEPTION 'otlet task % does not exist', materialize_semantic_records.task_name;
   END IF;
-  PERFORM otlet.source_query_contract_guard(
-    revision_definition #> '{source,query_contract}',
-    true
-  );
   EXECUTE format(
     $sql$
       WITH current_inputs AS (
         SELECT subject_id, input
-        FROM otlet.validated_task_input_rows(%1$L)
+        FROM otlet.validated_task_input_rows(
+          %1$L,
+          workload_definition => %8$L::jsonb
+        )
       ),
       latest_jobs AS (
         SELECT DISTINCT ON (j.subject_id)
@@ -117,7 +116,8 @@ BEGIN
     materialize_semantic_records.record_type,
     current_input_shaping,
     current_contract_hash,
-    current_contract_hash
+    current_contract_hash,
+    revision_definition
   );
 
   GET DIAGNOSTICS refreshed = ROW_COUNT;

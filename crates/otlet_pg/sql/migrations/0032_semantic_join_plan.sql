@@ -1,6 +1,7 @@
 CREATE FUNCTION otlet.semantic_join_index_plan(
   index_name text,
-  exact boolean DEFAULT false
+  exact boolean DEFAULT false,
+  expected_workload_revision_hash text DEFAULT NULL
 ) RETURNS TABLE (
   selected_path text,
   reason text,
@@ -37,6 +38,7 @@ CREATE FUNCTION otlet.semantic_join_index_plan(
 )
 LANGUAGE plpgsql
 ROWS 1
+SET search_path = pg_catalog, pg_temp
 AS $$
 DECLARE
   index_row otlet.semantic_join_indexes%ROWTYPE;
@@ -76,8 +78,17 @@ BEGIN
     RAISE EXCEPTION 'otlet semantic join index % does not exist', semantic_join_index_plan.index_name;
   END IF;
 
+  IF semantic_join_index_plan.expected_workload_revision_hash IS NOT NULL
+     AND semantic_join_index_plan.expected_workload_revision_hash IS DISTINCT FROM current_contract_hash THEN
+    RAISE EXCEPTION 'otlet workload revision changed during semantic join plan for index %', index_row.name;
+  END IF;
+
   IF NOT exact THEN
-    PERFORM otlet.require_workload_source_contract(index_row.task_name, current_contract_hash);
+    PERFORM otlet.require_workload_source_contract(
+      index_row.task_name,
+      current_contract_hash,
+      false
+    );
   END IF;
 
   IF exact THEN
@@ -85,7 +96,7 @@ BEGIN
       $sql$
         WITH raw_inputs AS (
           SELECT subject_id, input
-          FROM otlet.semantic_join_candidate_rows(%1$L, %4$L)
+          FROM otlet.semantic_join_candidate_rows(%1$L, %4$L, false)
         ),
         current_inputs AS (
           SELECT

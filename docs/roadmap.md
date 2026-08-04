@@ -61,6 +61,7 @@ Every shipped track needs SQL-visible state, a closed failure path, executable D
 | Semantic pair watches | Bounded candidate SQL drives pair judgments with plan-cost preflight, caller statement timeout, candidate drift detection, source dependencies, and pair materialization |
 | Native semantic query planning | Native CustomScan serves supported fresh semantic predicates, refreshes bounded stale rows through infer-now, exposes plan evidence, and leaves unsupported correlated or row-locking shapes on a standard PostgreSQL plan |
 | Semantic SQL reads | Native and SQL-only installations expose current row and pair materializations, freshness status, dependency audit, predicate reads, and plan-status functions |
+| Read-only semantic status | Row and pair status, plans, current rows, predicates, and invariant scans pin one checked workload revision and use read-only contract checks plus one canonical source-query path with no temp DDL or durable drift writes. Detected row-source column-contract drift returns no current matches, selects `lookup_fail_closed` with zero wait, infer, or queue work, and suspends task execution. Explicit owner maintenance records drift and revision repair restores execution |
 | Typed actions and review | Models propose allowlisted typed actions. Reviewers can approve, reject, correct, defer, or abstain, and one bounded `update_row` path requires target registration, dry run, freshness, approval, idempotency, and an execution receipt |
 | Evaluation labels | Operators can label approved, rejected, or corrected actions and export cases linked to source, output, receipt, model, and action identity |
 | Workload admission | PostgreSQL caps bulk rows, input bytes, queue depth, queued bytes, pair candidate cost, and pair statement time before work enters the queue |
@@ -82,7 +83,6 @@ Work in this section closes demonstrated correctness and trust gaps before Otlet
 | Feature | Explanation |
 | --- | --- |
 | Durable watch reconciliation | Persist one coalesced dirty entry per watch and subject when enqueue admission rejects work. Retain the newest source identity, handle source deletion, retry with bounded backoff, expose exhaustion and oldest-pending age, and allow replay or acknowledgement after native or portable restart |
-| Read-only semantic status | Keep status, plan, and current-row reads free of hidden writes. A read-only transaction or standby must fail closed on detected schema drift while a separate maintenance path records and repairs the drift |
 | Definition complexity bounds | Bound instruction, query, schema, runtime JSON, decision contract, nesting depth, node count, identifier count, and prompt-construction work so adversarial definitions fail atomically without backend instability |
 
 ## Near-term operating hardening

@@ -20,6 +20,9 @@ BEGIN
     INTO task_row.name, task_row.input_shaping, task_row.input_query, task_row.source_query_contract
     FROM otlet.tasks t
     WHERE t.name = current_task_subject_content_hash.task_name;
+    revision_definition := otlet.current_workload_revision_definition(
+      current_task_subject_content_hash.task_name
+    );
   ELSE
     SELECT revision.definition
     INTO revision_definition
@@ -31,12 +34,6 @@ BEGIN
     task_row.input_shaping := revision_definition #> '{task,input_shaping}';
     task_row.input_query := revision_definition #>> '{task,input_query}';
     source_kind := revision_definition #>> '{source,kind}';
-    IF source_kind IS DISTINCT FROM 'pair' THEN
-      PERFORM otlet.source_query_contract_guard(
-        revision_definition #> '{source,query_contract}',
-        true
-      );
-    END IF;
     IF source_kind = 'row' THEN
       index_row.subject_column := (revision_definition #>> '{source,subject_column}')::name;
       index_row.source_table := revision_definition #>> '{source,source_table}';
@@ -71,8 +68,6 @@ BEGIN
         index_row.name,
         active_revision_hash
       );
-    ELSE
-      PERFORM otlet.source_query_contract_guard(task_row.source_query_contract, true);
     END IF;
   END IF;
 
@@ -108,7 +103,8 @@ BEGIN
     );
     current_input := otlet.task_subject_input(
       current_input_query,
-      current_task_subject_content_hash.subject_id
+      current_task_subject_content_hash.subject_id,
+      revision_definition
     );
 
     IF current_input IS NULL THEN
@@ -124,7 +120,8 @@ BEGIN
 
   current_input := otlet.task_subject_input(
     task_row.input_query,
-    current_task_subject_content_hash.subject_id
+    current_task_subject_content_hash.subject_id,
+    revision_definition
   );
 
   IF current_input IS NULL THEN

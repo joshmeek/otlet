@@ -539,10 +539,10 @@ LANGUAGE plpgsql
 VOLATILE
 AS $$
 DECLARE
-  raw_search_path text := current_setting('search_path');
-  execution_role_oid oid := current_user::regrole::oid;
-  probe_name text := 'otlet_source_probe_' || pg_backend_pid()::text || '_' ||
-    substr(md5(clock_timestamp()::text || random()::text), 1, 12);
+  raw_search_path text := pg_catalog.current_setting('search_path');
+  raw_namespaces name[];
+  execution_role_oid oid;
+  probe_name text;
   probe_oid oid;
   resolved_query text;
   path_identity jsonb;
@@ -560,31 +560,32 @@ DECLARE
   actual_leaf_oids oid[] := ARRAY[]::oid[];
   unsafe_name text;
   bindable_query text;
+  built_contract jsonb;
 BEGIN
-  IF NULLIF(btrim(build_source_query_contract.query), '') IS NULL THEN
+  PERFORM pg_catalog.set_config('search_path', 'pg_catalog, pg_temp', true);
+  execution_role_oid := current_user::pg_catalog.regrole::pg_catalog.oid;
+  probe_name := 'otlet_source_probe_' || pg_catalog.pg_backend_pid()::pg_catalog.text || '_' ||
+    pg_catalog.substr(pg_catalog.md5(
+      pg_catalog.clock_timestamp()::pg_catalog.text ||
+      pg_catalog.random()::pg_catalog.text
+    ), 1, 12);
+  IF NULLIF(pg_catalog.btrim(build_source_query_contract.query), '') IS NULL THEN
     RAISE EXCEPTION 'otlet source query is required';
   END IF;
   IF build_source_query_contract.declared_sources IS NOT NULL
-     AND jsonb_typeof(build_source_query_contract.declared_sources) IS DISTINCT FROM 'array' THEN
+     AND pg_catalog.jsonb_typeof(build_source_query_contract.declared_sources) IS DISTINCT FROM 'array' THEN
     RAISE EXCEPTION 'otlet declared source relations must be a JSON array';
   END IF;
-  bindable_query := regexp_replace(
-    btrim(build_source_query_contract.query),
+  bindable_query := pg_catalog.regexp_replace(
+    pg_catalog.btrim(build_source_query_contract.query),
     ';[[:space:]]*$',
     ''
   );
-
-  SELECT COALESCE(jsonb_agg(jsonb_build_object(
-    'oid', namespace.oid::text,
-    'name', namespace.nspname
-  ) ORDER BY path.ordinality), '[]'::jsonb)
-  INTO path_identity
-  FROM unnest(current_schemas(true)) WITH ORDINALITY path(name, ordinality)
-  JOIN pg_namespace namespace ON namespace.nspname = path.name
-  WHERE namespace.nspname !~ '^pg_(toast_)?temp_';
+  PERFORM pg_catalog.set_config('search_path', raw_search_path, true);
+  raw_namespaces := pg_catalog.current_schemas(true);
 
   BEGIN
-    EXECUTE format(
+    EXECUTE pg_catalog.format(
       E'CREATE TEMP VIEW %I AS SELECT source.subject_id::text AS subject_id, source.input::jsonb AS input FROM (\n%s\n) source',
       probe_name,
       bindable_query
@@ -593,15 +594,116 @@ BEGIN
     RAISE EXCEPTION 'otlet source query binding failed: %', SQLERRM;
   END;
 
-  SELECT to_regclass(format('pg_temp.%I', probe_name))::oid INTO probe_oid;
-  PERFORM set_config('search_path', 'pg_catalog, pg_temp', true);
+  SELECT pg_catalog.to_regclass(pg_catalog.format('pg_temp.%I', probe_name))::pg_catalog.oid
+  INTO probe_oid;
+  PERFORM pg_catalog.set_config('search_path', 'pg_catalog, pg_temp', true);
+  SELECT COALESCE(pg_catalog.jsonb_agg(pg_catalog.jsonb_build_object(
+    'oid', namespace.oid::pg_catalog.text,
+    'name', namespace.nspname
+  ) ORDER BY path.ordinality), '[]'::pg_catalog.jsonb)
+  INTO path_identity
+  FROM pg_catalog.unnest(raw_namespaces) WITH ORDINALITY path(name, ordinality)
+  JOIN pg_catalog.pg_namespace namespace ON namespace.nspname = path.name
+  WHERE namespace.nspname !~ '^pg_(toast_)?temp_';
+  IF EXISTS (
+    SELECT 1
+    FROM otlet.source_query_dependencies(probe_oid) dependency
+    JOIN pg_proc function_row
+      ON dependency.refclassid = 'pg_proc'::regclass
+     AND function_row.oid = dependency.refobjid
+    JOIN pg_namespace namespace ON namespace.oid = function_row.pronamespace
+    WHERE namespace.nspname = 'pg_catalog'
+      AND (
+        function_row.proname IN (
+          'current_setting',
+          'set_config',
+          'current_schema',
+          'current_schemas'
+        )
+        OR function_row.proname LIKE 'pg\_%\_is_visible' ESCAPE '\'
+        OR function_row.proname LIKE 'to_reg%'
+      )
+  ) OR EXISTS (
+    WITH node_trees(value) AS (
+      SELECT rewrite.ev_action::text
+      FROM pg_rewrite rewrite
+      WHERE rewrite.ev_class = probe_oid
+      UNION ALL
+      SELECT rewrite.ev_action::text
+      FROM otlet.source_query_dependencies(probe_oid) dependency
+      JOIN pg_class relation
+        ON dependency.refclassid = 'pg_class'::regclass
+       AND relation.oid = dependency.refobjid
+       AND relation.relkind = 'v'
+      JOIN pg_rewrite rewrite ON rewrite.ev_class = relation.oid
+      UNION ALL
+      SELECT function_row.prosqlbody::text
+      FROM otlet.source_query_dependencies(probe_oid) dependency
+      JOIN pg_proc function_row
+        ON dependency.refclassid = 'pg_proc'::regclass
+       AND function_row.oid = dependency.refobjid
+      UNION ALL
+      SELECT function_row.proargdefaults::text
+      FROM otlet.source_query_dependencies(probe_oid) dependency
+      JOIN pg_proc function_row
+        ON dependency.refclassid = 'pg_proc'::regclass
+       AND function_row.oid = dependency.refobjid
+      UNION ALL
+      SELECT policy.polqual::text
+      FROM otlet.source_query_dependencies(probe_oid) dependency
+      JOIN pg_policy policy
+        ON dependency.refclassid = 'pg_class'::regclass
+       AND policy.polrelid = dependency.refobjid
+      JOIN pg_class policy_relation ON policy_relation.oid = policy.polrelid
+      JOIN pg_roles execution_role ON execution_role.oid = execution_role_oid
+      WHERE policy.polcmd IN ('r', '*')
+        AND policy_relation.relrowsecurity
+        AND NOT execution_role.rolsuper
+        AND NOT execution_role.rolbypassrls
+        AND (
+          policy_relation.relowner <> execution_role.oid
+          OR policy_relation.relforcerowsecurity
+        )
+        AND EXISTS (
+          SELECT 1
+          FROM unnest(policy.polroles) policy_role
+          WHERE policy_role = 0
+             OR pg_has_role(execution_role.oid, policy_role, 'MEMBER')
+        )
+    )
+    SELECT 1
+    FROM node_trees
+    WHERE value ~ 'SQLVALUEFUNCTION[[:space:]]+:op[[:space:]]+14[[:space:]]+:type[[:space:]]+19'
+       OR EXISTS (
+         SELECT 1
+         FROM regexp_matches(
+           node_trees.value,
+           ':[[:alnum:]_]*(?:type|typeid|typid)[[:space:]]+([0-9]+)',
+           'g'
+         ) parsed(match)
+         JOIN pg_type type_row ON type_row.oid = (parsed.match)[1]::oid
+         JOIN pg_namespace namespace ON namespace.oid = type_row.typnamespace
+         WHERE namespace.nspname = 'pg_catalog'
+           AND type_row.typname IN (
+             'regclass',
+             'regcollation',
+             'regconfig',
+             'regdictionary',
+             'regoper',
+             'regoperator',
+             'regproc',
+             'regprocedure',
+             'regtype'
+           )
+       )
+  ) THEN
+    RAISE EXCEPTION 'otlet source query cannot observe or change session name resolution';
+  END IF;
   SELECT regexp_replace(
     btrim(pg_get_viewdef(probe_oid, false)),
     ';[[:space:]]*$',
     ''
   ) INTO resolved_query;
-  PERFORM set_config('search_path', raw_search_path, true);
-
   SELECT format('%I.%I', namespace.nspname, relation.relname)
   INTO unsafe_name
   FROM otlet.source_query_dependencies(probe_oid) dependency
@@ -921,7 +1023,7 @@ BEGIN
 
   EXECUTE format('DROP VIEW pg_temp.%I', probe_name);
 
-  RETURN jsonb_build_object(
+  built_contract := jsonb_build_object(
     'format', 'otlet.source_query.v1',
     'query', jsonb_build_object(
       'raw', build_source_query_contract.query,
@@ -939,10 +1041,12 @@ BEGIN
     'relations', relation_contracts,
     'functions', function_contracts
   );
+  PERFORM pg_catalog.set_config('search_path', raw_search_path, true);
+  RETURN built_contract;
 EXCEPTION WHEN OTHERS THEN
-  PERFORM set_config('search_path', raw_search_path, true);
-  IF to_regclass(format('pg_temp.%I', probe_name)) IS NOT NULL THEN
-    EXECUTE format('DROP VIEW pg_temp.%I', probe_name);
+  PERFORM pg_catalog.set_config('search_path', raw_search_path, true);
+  IF pg_catalog.to_regclass(pg_catalog.format('pg_temp.%I', probe_name)) IS NOT NULL THEN
+    EXECUTE pg_catalog.format('DROP VIEW pg_temp.%I', probe_name);
   END IF;
   RAISE;
 END;
@@ -954,6 +1058,7 @@ CREATE FUNCTION otlet.source_query_contract_error(
 ) RETURNS text
 LANGUAGE plpgsql
 STABLE
+SET search_path = pg_catalog, pg_temp
 AS $$
 DECLARE
   stored_role_oid oid;
@@ -1065,53 +1170,48 @@ EXCEPTION WHEN OTHERS THEN
 END;
 $$;
 
-CREATE FUNCTION otlet.source_query_contract_guard(
-  contract jsonb,
-  require_identity boolean DEFAULT true
+CREATE FUNCTION otlet.source_query_safe_search_path(
+  contract jsonb
+) RETURNS text
+LANGUAGE sql
+STABLE
+SET search_path = pg_catalog, pg_temp
+AS $$
+  SELECT concat_ws(
+    ', ',
+    'pg_catalog',
+    'pg_temp',
+    (
+      SELECT string_agg(quote_ident(namespace.value ->> 'name'), ', ' ORDER BY namespace.ordinality)
+      FROM jsonb_array_elements(COALESCE(
+        source_query_safe_search_path.contract #> '{search_path,namespaces}',
+        '[]'::jsonb
+      )) WITH ORDINALITY namespace(value, ordinality)
+      WHERE namespace.value ->> 'name' NOT IN ('pg_catalog', 'pg_temp')
+    )
+  );
+$$;
+
+CREATE FUNCTION otlet.lock_source_query_contract_relations(
+  contract jsonb
 ) RETURNS void
 LANGUAGE plpgsql
 VOLATILE
+SET search_path = pg_catalog, pg_temp
 AS $$
 DECLARE
   dependency jsonb;
   relation_name text;
-  contract_error text;
-  effective_namespaces jsonb;
-  stored_search_path text;
-  probe_name text := 'otlet_source_guard_' || pg_backend_pid()::text || '_' ||
-    substr(md5(clock_timestamp()::text || random()::text), 1, 12);
-  probe_oid oid;
-  rebound_query text;
-  unsafe_name text;
 BEGIN
-  IF source_query_contract_guard.contract IS NULL
-     OR jsonb_typeof(source_query_contract_guard.contract) = 'null' THEN
+  IF lock_source_query_contract_relations.contract IS NULL
+     OR jsonb_typeof(lock_source_query_contract_relations.contract) = 'null' THEN
     RETURN;
-  END IF;
-
-  stored_search_path := source_query_contract_guard.contract #>> '{search_path,raw}';
-  IF stored_search_path IS NULL THEN
-    RAISE EXCEPTION 'otlet workload is suspended: source search_path is missing';
-  END IF;
-  PERFORM set_config('search_path', stored_search_path, true);
-
-  SELECT COALESCE(jsonb_agg(jsonb_build_object(
-    'oid', namespace.oid::text,
-    'name', namespace.nspname
-  ) ORDER BY path.ordinality), '[]'::jsonb)
-  INTO effective_namespaces
-  FROM unnest(current_schemas(true)) WITH ORDINALITY path(name, ordinality)
-  JOIN pg_namespace namespace ON namespace.nspname = path.name
-  WHERE namespace.nspname !~ '^pg_(toast_)?temp_';
-  IF effective_namespaces IS DISTINCT FROM
-     source_query_contract_guard.contract #> '{search_path,namespaces}' THEN
-    RAISE EXCEPTION 'otlet workload is suspended: source search_path drifted';
   END IF;
 
   FOR dependency IN
     SELECT value
     FROM jsonb_array_elements(COALESCE(
-      source_query_contract_guard.contract -> 'relations',
+      lock_source_query_contract_relations.contract -> 'relations',
       '[]'::jsonb
     )) relation(value)
     ORDER BY (value ->> 'oid')::oid
@@ -1127,6 +1227,66 @@ BEGIN
     END IF;
     EXECUTE format('LOCK TABLE %s IN ACCESS SHARE MODE', relation_name);
   END LOOP;
+END;
+$$;
+
+CREATE FUNCTION otlet.source_query_contract_guard(
+  contract jsonb,
+  require_identity boolean DEFAULT true
+) RETURNS void
+LANGUAGE plpgsql
+VOLATILE
+AS $$
+DECLARE
+  contract_error text;
+  effective_namespaces jsonb;
+  raw_namespaces name[];
+  stored_search_path text;
+  probe_name text;
+  probe_oid oid;
+  rebound_query text;
+  unsafe_name text;
+  original_search_path text := pg_catalog.current_setting('search_path');
+BEGIN
+  PERFORM pg_catalog.set_config('search_path', 'pg_catalog, pg_temp', true);
+  probe_name := 'otlet_source_guard_' || pg_catalog.pg_backend_pid()::pg_catalog.text || '_' ||
+    pg_catalog.substr(pg_catalog.md5(
+      pg_catalog.clock_timestamp()::pg_catalog.text ||
+      pg_catalog.random()::pg_catalog.text
+    ), 1, 12);
+  IF source_query_contract_guard.contract IS NULL
+     OR pg_catalog.jsonb_typeof(source_query_contract_guard.contract) = 'null' THEN
+    PERFORM pg_catalog.set_config('search_path', original_search_path, true);
+    RETURN;
+  END IF;
+
+  stored_search_path := source_query_contract_guard.contract #>> '{search_path,raw}';
+  IF stored_search_path IS NULL THEN
+    RAISE EXCEPTION 'otlet workload is suspended: source search_path is missing';
+  END IF;
+  PERFORM pg_catalog.set_config('search_path', stored_search_path, true);
+  raw_namespaces := pg_catalog.current_schemas(true);
+  PERFORM pg_catalog.set_config('search_path', 'pg_catalog, pg_temp', true);
+  SELECT COALESCE(pg_catalog.jsonb_agg(pg_catalog.jsonb_build_object(
+    'oid', namespace.oid::pg_catalog.text,
+    'name', namespace.nspname
+  ) ORDER BY path.ordinality), '[]'::pg_catalog.jsonb)
+  INTO effective_namespaces
+  FROM pg_catalog.unnest(raw_namespaces) WITH ORDINALITY path(name, ordinality)
+  JOIN pg_catalog.pg_namespace namespace ON namespace.nspname = path.name
+  WHERE namespace.nspname !~ '^pg_(toast_)?temp_';
+  IF effective_namespaces IS DISTINCT FROM
+     pg_catalog.jsonb_extract_path(
+       source_query_contract_guard.contract,
+       'search_path',
+       'namespaces'
+     ) THEN
+    RAISE EXCEPTION 'otlet workload is suspended: source search_path drifted';
+  END IF;
+
+  PERFORM otlet.lock_source_query_contract_relations(
+    source_query_contract_guard.contract
+  );
 
   contract_error := otlet.source_query_contract_error(
     source_query_contract_guard.contract,
@@ -1136,17 +1296,20 @@ BEGIN
     RAISE EXCEPTION 'otlet workload is suspended: %', contract_error;
   END IF;
 
+  PERFORM pg_catalog.set_config('search_path', stored_search_path, true);
   BEGIN
-    EXECUTE format(
+    EXECUTE pg_catalog.format(
       E'CREATE TEMP VIEW %I AS SELECT source.subject_id::text AS subject_id, source.input::jsonb AS input FROM (\n%s\n) source',
       probe_name,
-      regexp_replace(
-        btrim(source_query_contract_guard.contract #>> '{query,raw}'),
+      pg_catalog.regexp_replace(
+        pg_catalog.btrim(source_query_contract_guard.contract #>> '{query,raw}'),
         ';[[:space:]]*$',
         ''
       )
     );
-    SELECT to_regclass(format('pg_temp.%I', probe_name))::oid INTO probe_oid;
+    SELECT pg_catalog.to_regclass(pg_catalog.format('pg_temp.%I', probe_name))::pg_catalog.oid
+    INTO probe_oid;
+    PERFORM pg_catalog.set_config('search_path', 'pg_catalog, pg_temp', true);
     SELECT format('%I.%I', namespace.nspname, type_row.typname)
     INTO unsafe_name
     FROM pg_rewrite rewrite
@@ -1165,18 +1328,16 @@ BEGIN
       RAISE EXCEPTION 'source query binding drifted through unsupported PostgreSQL type %',
         unsafe_name;
     END IF;
-    PERFORM set_config('search_path', 'pg_catalog, pg_temp', true);
     SELECT regexp_replace(
       btrim(pg_get_viewdef(probe_oid, false)),
       ';[[:space:]]*$',
       ''
     ) INTO rebound_query;
-    PERFORM set_config('search_path', stored_search_path, true);
     EXECUTE format('DROP VIEW pg_temp.%I', probe_name);
   EXCEPTION WHEN OTHERS THEN
-    PERFORM set_config('search_path', stored_search_path, true);
-    IF to_regclass(format('pg_temp.%I', probe_name)) IS NOT NULL THEN
-      EXECUTE format('DROP VIEW pg_temp.%I', probe_name);
+    PERFORM pg_catalog.set_config('search_path', stored_search_path, true);
+    IF pg_catalog.to_regclass(pg_catalog.format('pg_temp.%I', probe_name)) IS NOT NULL THEN
+      EXECUTE pg_catalog.format('DROP VIEW pg_temp.%I', probe_name);
     END IF;
     RAISE EXCEPTION 'otlet workload is suspended: source query rebinding failed: %', SQLERRM;
   END;
@@ -1184,6 +1345,143 @@ BEGIN
      source_query_contract_guard.contract #>> '{query,resolved}' THEN
     RAISE EXCEPTION 'otlet workload is suspended: source query binding drifted';
   END IF;
+  PERFORM pg_catalog.set_config('search_path', original_search_path, true);
+EXCEPTION WHEN OTHERS THEN
+  PERFORM pg_catalog.set_config('search_path', original_search_path, true);
+  RAISE;
+END;
+$$;
+
+CREATE FUNCTION otlet.semantic_source_column_contract(
+  source_table text,
+  subject_column text,
+  input_columns text[]
+) RETURNS jsonb
+LANGUAGE plpgsql
+STABLE
+SET search_path = pg_catalog, pg_temp
+AS $$
+DECLARE
+  source_relation regclass;
+  expected_columns text[];
+  actual_count integer;
+  columns jsonb;
+BEGIN
+  source_relation := to_regclass(semantic_source_column_contract.source_table);
+  IF source_relation IS NULL THEN
+    RAISE EXCEPTION 'semantic source relation is missing';
+  END IF;
+
+  SELECT array_agg(expected.column_name ORDER BY expected.column_name COLLATE "C")
+  INTO expected_columns
+  FROM (
+    SELECT semantic_source_column_contract.subject_column AS column_name
+    UNION
+    SELECT value
+    FROM unnest(COALESCE(semantic_source_column_contract.input_columns, ARRAY[]::text[])) value
+  ) expected
+  WHERE NULLIF(expected.column_name, '') IS NOT NULL;
+
+  IF expected_columns IS NULL THEN
+    RAISE EXCEPTION 'semantic source column contract is empty';
+  END IF;
+
+  SELECT
+    jsonb_agg(jsonb_build_object(
+      'number', attribute.attnum,
+      'name', attribute.attname,
+      'type_oid', attribute.atttypid::text,
+      'type_modifier', attribute.atttypmod,
+      'not_null', attribute.attnotnull,
+      'collation_oid', attribute.attcollation::text,
+      'generated', attribute.attgenerated,
+      'identity', attribute.attidentity
+    ) ORDER BY attribute.attname COLLATE "C"),
+    count(*)::integer
+  INTO columns, actual_count
+  FROM pg_attribute attribute
+  WHERE attribute.attrelid = source_relation
+    AND attribute.attnum > 0
+    AND NOT attribute.attisdropped
+    AND attribute.attname = ANY(expected_columns);
+
+  IF actual_count IS DISTINCT FROM cardinality(expected_columns) THEN
+    RAISE EXCEPTION 'semantic source column is missing';
+  END IF;
+
+  RETURN jsonb_build_object(
+    'relation_oid', source_relation::oid::text,
+    'columns', columns
+  );
+END;
+$$;
+
+CREATE FUNCTION otlet.semantic_schema_drift_error(
+  workload_definition jsonb
+) RETURNS text
+LANGUAGE plpgsql
+STABLE
+SET search_path = pg_catalog, pg_temp
+AS $$
+DECLARE
+  stored_contract jsonb;
+  current_contract jsonb;
+BEGIN
+  IF semantic_schema_drift_error.workload_definition #>> '{source,kind}' IS DISTINCT FROM 'row' THEN
+    RETURN NULL;
+  END IF;
+
+  stored_contract := semantic_schema_drift_error.workload_definition
+    #> '{source,semantic_column_contract}';
+  IF stored_contract IS NULL THEN
+    RETURN 'semantic source column contract is missing from the workload revision';
+  END IF;
+
+  current_contract := otlet.semantic_source_column_contract(
+    semantic_schema_drift_error.workload_definition #>> '{source,source_table}',
+    semantic_schema_drift_error.workload_definition #>> '{source,subject_column}',
+    ARRAY(
+      SELECT value
+      FROM jsonb_array_elements_text(COALESCE(
+        semantic_schema_drift_error.workload_definition #> '{source,input_columns}',
+        '[]'::jsonb
+      )) value
+    )
+  );
+  IF current_contract IS DISTINCT FROM stored_contract THEN
+    RETURN 'semantic source column contract drifted';
+  END IF;
+  RETURN NULL;
+EXCEPTION WHEN OTHERS THEN
+  RETURN 'semantic source schema revalidation failed: ' || SQLERRM;
+END;
+$$;
+
+CREATE FUNCTION otlet.workload_source_contract_guard(
+  workload_definition jsonb
+) RETURNS void
+LANGUAGE plpgsql
+VOLATILE
+SET search_path = pg_catalog, pg_temp
+AS $$
+DECLARE
+  contract_error text;
+  original_search_path text := pg_catalog.current_setting('search_path');
+BEGIN
+  PERFORM otlet.source_query_contract_guard(
+    workload_source_contract_guard.workload_definition #> '{source,query_contract}',
+    true
+  );
+  contract_error := otlet.semantic_schema_drift_error(
+    workload_source_contract_guard.workload_definition
+  );
+  IF contract_error IS NOT NULL THEN
+    RAISE EXCEPTION 'otlet workload is suspended: %', contract_error;
+  END IF;
+  PERFORM pg_catalog.set_config('search_path', original_search_path, true);
+EXCEPTION WHEN OTHERS THEN
+  PERFORM pg_catalog.set_config('search_path', original_search_path, true);
+  RAISE;
 END;
 $$;
 
@@ -1222,13 +1520,17 @@ FOR EACH ROW EXECUTE FUNCTION otlet.bind_task_source_query_contract();
 
 CREATE FUNCTION otlet.require_workload_source_contract(
   task_name text,
-  workload_revision_hash text
+  workload_revision_hash text,
+  rebind_source_query boolean DEFAULT true
 ) RETURNS void
 LANGUAGE plpgsql
 VOLATILE
+SET search_path = pg_catalog, pg_temp
 AS $$
 DECLARE
   revision_definition jsonb;
+  contract_error text;
+  original_search_path text := pg_catalog.current_setting('search_path');
 BEGIN
   SELECT revision.definition
   INTO revision_definition
@@ -1239,17 +1541,32 @@ BEGIN
     RAISE EXCEPTION 'otlet workload revision is missing for task %',
       require_workload_source_contract.task_name;
   END IF;
-  PERFORM otlet.source_query_contract_guard(
-    revision_definition #> '{source,query_contract}',
-    true
-  );
+  IF COALESCE(require_workload_source_contract.rebind_source_query, true) THEN
+    PERFORM otlet.workload_source_contract_guard(revision_definition);
+  ELSE
+    PERFORM otlet.lock_source_query_contract_relations(
+      revision_definition #> '{source,query_contract}'
+    );
+    contract_error := otlet.source_query_contract_error(
+      revision_definition #> '{source,query_contract}',
+      true
+    );
+    IF contract_error IS NOT NULL THEN
+      RAISE EXCEPTION 'otlet workload is suspended: %', contract_error;
+    END IF;
+  END IF;
   IF revision_definition #>> '{source,kind}' = 'pair' THEN
     PERFORM preflight.candidate_plan
     FROM otlet.preflight_candidate_query(
       revision_definition #>> '{source,candidate_query}',
       true,
-      false
+      false,
+      revision_definition #> '{source,query_contract}'
     ) preflight;
   END IF;
+  PERFORM pg_catalog.set_config('search_path', original_search_path, true);
+EXCEPTION WHEN OTHERS THEN
+  PERFORM pg_catalog.set_config('search_path', original_search_path, true);
+  RAISE;
 END;
 $$;

@@ -40,18 +40,18 @@ fn source_rows_sql(
     format!(
         "SELECT projected.subject_id, \
                 otlet.semantic_source_hash(projected.input_obj) AS source_hash, \
-                otlet.semantic_content_hash(projected.input_obj, {input_shaping_sql}::jsonb) AS content_hash \
+                otlet.semantic_content_hash(projected.input_obj, {input_shaping_sql}::pg_catalog.jsonb) AS content_hash \
          FROM ( \
-           SELECT (src.{subject_identifier})::text AS subject_id, \
-                  jsonb_build_object( \
-                    '_otlet_mvcc', jsonb_build_object( \
+           SELECT (src.{subject_identifier})::pg_catalog.text AS subject_id, \
+                  pg_catalog.jsonb_build_object( \
+                    '_otlet_mvcc', pg_catalog.jsonb_build_object( \
                       'table', {source_table_literal}, \
-                      'subject_id', (src.{subject_identifier})::text, \
-                      'ctid', src.ctid::text, \
-                      'xmin', src.xmin::text \
+                      'subject_id', (src.{subject_identifier})::pg_catalog.text, \
+                      'ctid', src.ctid::pg_catalog.text, \
+                      'xmin', src.xmin::pg_catalog.text \
                     ), \
                     'table', {source_table_literal}, \
-                    'row', otlet.semantic_project_row(to_jsonb(src), {input_columns_sql}::text[]) \
+                    'row', otlet.semantic_project_row(pg_catalog.to_jsonb(src), {input_columns_sql}::pg_catalog.text[]) \
                   ) AS input_obj \
            FROM {source_table} AS src \
          ) projected"

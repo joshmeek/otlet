@@ -388,6 +388,7 @@ WITH watch_sources AS (
         FROM jsonb_array_elements_text(revision.definition #> '{source,input_columns}') value
       )
     END AS input_columns,
+    head.active_workload_revision_hash AS workload_revision_hash,
     COALESCE(revision.definition #> '{source,pair_sources}', '[]'::jsonb) AS pair_sources,
     revision.definition #>> '{source,record_type}' AS record_type,
     revision.definition #>> '{models,direct,name}' AS model_name,
@@ -428,7 +429,9 @@ WITH watch_sources AS (
   ) dependency ON true
   LEFT JOIN LATERAL otlet.preflight_candidate_query(
     revision.definition #>> '{source,candidate_query}',
-    false
+    false,
+    false,
+    revision.definition #> '{source,query_contract}'
   ) current_preflight
     ON revision.definition #>> '{source,kind}' = 'pair'
   WHERE revision.definition #>> '{source,kind}' IN ('row', 'pair')
@@ -440,7 +443,11 @@ WITH watch_sources AS (
     WHERE kind = 'row'
       AND source_dependency_error IS NULL
   ) w
-  JOIN LATERAL otlet.semantic_index_plan(w.semantic_index_name) p ON true
+  JOIN LATERAL otlet.semantic_index_plan(
+    w.semantic_index_name,
+    false,
+    w.workload_revision_hash
+  ) p ON true
   UNION ALL
   SELECT w.watch_name, p.*
   FROM (
@@ -450,7 +457,11 @@ WITH watch_sources AS (
       AND source_dependency_error IS NULL
       AND candidate_preflight_status = 'ready'
   ) w
-  JOIN LATERAL otlet.semantic_join_index_plan(w.semantic_join_index_name) p ON true
+  JOIN LATERAL otlet.semantic_join_index_plan(
+    w.semantic_join_index_name,
+    false,
+    w.workload_revision_hash
+  ) p ON true
 ), watch_revisions AS (
   SELECT
     head.task_name,

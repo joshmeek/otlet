@@ -7,6 +7,7 @@ RETURNS TABLE (
 )
 LANGUAGE plpgsql
 VOLATILE
+SET search_path = pg_catalog, pg_temp
 AS $$
 DECLARE
   index_row record;
@@ -830,7 +831,7 @@ BEGIN
         $sql$
           WITH source_inputs AS (
             SELECT subject_id, input
-            FROM otlet.semantic_join_candidate_rows(%6$L, %5$L)
+            FROM otlet.semantic_join_candidate_rows(%6$L, %5$L, false)
           ),
           current_inputs AS (
             SELECT *

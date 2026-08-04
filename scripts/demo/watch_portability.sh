@@ -1,4 +1,87 @@
 log "Checking watch definition portability"
+read_only_semantic_contract="$(psql_exec -qAt \
+  -v row_watch="$numeric_triage_watch" \
+  -v pair_watch="$join_index_name" <<'SQL'
+BEGIN READ ONLY;
+WITH row_estimated AS MATERIALIZED (
+  SELECT * FROM otlet.semantic_index_plan(:'row_watch')
+), row_exact AS MATERIALIZED (
+  SELECT * FROM otlet.semantic_index_plan(:'row_watch', true)
+), pair_estimated AS MATERIALIZED (
+  SELECT * FROM otlet.semantic_join_index_plan(:'pair_watch')
+), pair_exact AS MATERIALIZED (
+  SELECT * FROM otlet.semantic_join_index_plan(:'pair_watch', true)
+)
+SELECT concat_ws('|',
+  current_setting('transaction_read_only'),
+  pg_my_temp_schema() = 0,
+  (SELECT count(*) > 0 FROM otlet.semantic_index_current_rows(:'row_watch', true)),
+  (SELECT count_basis = 'estimated' FROM row_estimated),
+  (SELECT count_basis = 'exact' FROM row_exact),
+  EXISTS (
+    SELECT 1
+    FROM otlet.semantic_index_status
+    WHERE name = :'row_watch'
+  ),
+  EXISTS (
+    SELECT 1
+    FROM public.otlet_demo_numeric_triage source
+    WHERE source.id = 'numeric-1'
+      AND otlet.semantic_matches_auto(:'row_watch', source.id, '{"decision":"flag"}'::jsonb)
+  ),
+  (SELECT count(*) > 0 FROM otlet.semantic_join_index_current_rows(:'pair_watch', true)),
+  (SELECT count_basis = 'estimated' FROM pair_estimated),
+  (SELECT count_basis = 'exact' FROM pair_exact),
+  otlet.semantic_join_matches(:'pair_watch', 'vendor-1001:vendor-42', '{"match":"same_entity"}'::jsonb),
+  NOT otlet.semantic_join_matches(:'pair_watch', 'vendor-1001:vendor-77', '{"match":"same_entity"}'::jsonb),
+  (
+    SELECT count(*) = 2 AND bool_and(source_dependency_status = 'ready')
+    FROM otlet.watch_status
+    WHERE watch_name IN (:'row_watch', :'pair_watch')
+  ),
+  (SELECT count(*) >= 0 FROM otlet.verify_invariants()),
+  pg_my_temp_schema() = 0
+);
+COMMIT;
+SQL
+)"
+echo "read_only_semantic_contract=$read_only_semantic_contract"
+[ "$read_only_semantic_contract" = "on|t|t|t|t|t|t|t|t|t|t|t|t|t|t" ] || {
+  echo "Expected healthy row and pair semantic reads to remain pure in a read-only transaction, got $read_only_semantic_contract" >&2
+  exit 1
+}
+read_only_shadow_contract="$(psql_exec -qAt \
+  -v row_watch="$numeric_triage_watch" \
+  -v pair_watch="$join_index_name" <<'SQL'
+CREATE DOMAIN pg_temp.text AS pg_catalog.text CHECK (false);
+BEGIN READ ONLY;
+SELECT concat_ws('|',
+  current_setting('transaction_read_only'),
+  pg_my_temp_schema() <> 0,
+  (SELECT count(*) > 0 FROM otlet.semantic_index_current_rows(:'row_watch', true)),
+  (SELECT selected_path = 'semantic_lookup' FROM otlet.semantic_index_plan(:'row_watch', true)),
+  otlet.semantic_matches(:'row_watch', 'numeric-1', '{"decision":"flag"}'::jsonb),
+  EXISTS (
+    SELECT 1
+    FROM public.otlet_demo_numeric_triage source
+    WHERE source.id = 'numeric-1'
+      AND otlet.semantic_matches_auto(:'row_watch', source.id, '{"decision":"flag"}'::jsonb)
+  ),
+  (SELECT count(*) > 0 FROM otlet.semantic_join_index_current_rows(:'pair_watch', true)),
+  (SELECT selected_path = 'semantic_join_lookup' FROM otlet.semantic_join_index_plan(:'pair_watch', true)),
+  otlet.semantic_join_matches(:'pair_watch', 'vendor-1001:vendor-42', '{"match":"same_entity"}'::jsonb),
+  (SELECT count(*) >= 0 FROM otlet.verify_invariants()),
+  pg_my_temp_schema() <> 0
+);
+COMMIT;
+DROP DOMAIN pg_temp.text;
+SQL
+)"
+echo "read_only_shadow_contract=$read_only_shadow_contract"
+[ "$read_only_shadow_contract" = "on|t|t|t|t|t|t|t|t|t|t" ] || {
+  echo "Expected read-only row and pair reads to ignore a pre-existing temporary type shadow, got $read_only_shadow_contract" >&2
+  exit 1
+}
 watch_replace_contract="$(psql_exec -qAt \
   -v row_watch="$numeric_triage_watch" \
   -v pair_watch="$join_index_name" <<'SQL'
