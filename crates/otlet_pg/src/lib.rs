@@ -271,9 +271,14 @@ pgrx::extension_sql_file!(
     requires = ["workload_acceptance_contract"]
 );
 pgrx::extension_sql_file!(
+    "../sql/migrations/0054_evaluation_population_lineage.sql",
+    name = "evaluation_population_lineage",
+    requires = ["replayable_evaluation"]
+);
+pgrx::extension_sql_file!(
     "../sql/migrations/0043_permissions.sql",
     name = "permissions",
-    requires = ["replayable_evaluation"]
+    requires = ["evaluation_population_lineage"]
 );
 
 #[allow(non_snake_case)]

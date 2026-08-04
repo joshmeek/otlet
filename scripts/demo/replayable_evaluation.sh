@@ -199,10 +199,12 @@ BEGIN
 
   selected_case_hash := otlet.register_evaluation_case(
     selected_label_id,
+    'qualification',
     'Approved immutable shaped snapshot for replay'
   );
   repeated_case_hash := otlet.register_evaluation_case(
     selected_label_id,
+    'qualification',
     'Approved immutable shaped snapshot for replay'
   );
 
@@ -553,7 +555,7 @@ SELECT concat_ws('|',
      AND production_isolation_verified
      AND (SELECT count(*) FROM otlet.evaluation_runs) = 1
    FROM proof),
-  (SELECT same_population
+  (SELECT same_input_snapshot
      AND baseline_job_id <> candidate_job_id
      AND (SELECT baseline.input = candidate.input
           FROM otlet.jobs baseline, otlet.jobs candidate

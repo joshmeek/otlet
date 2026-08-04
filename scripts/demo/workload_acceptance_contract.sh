@@ -288,16 +288,16 @@ SET exception_hash = otlet.record_workload_acceptance_exception(
 
 UPDATE workload_acceptance_proof
 SET decision_hash = otlet.record_workload_promotion_decision(
-  current_contract_hash,
-  'defer',
-  otlet.identity_hash(
+  contract_hash => current_contract_hash,
+  outcome => 'defer',
+  evidence_hash => otlet.identity_hash(
     'workload_acceptance_evidence',
     jsonb_build_object('candidate_workload_revision_hash', candidate_revision_hash)
   ),
-  '{"status":"declared_not_evaluated","authoritative":false}'::jsonb,
-  'Replayable evaluation has not run',
-  ARRAY[exception_hash],
-  'OTLET-52'
+  evidence_summary => '{"status":"declared_not_evaluated","authoritative":false}'::jsonb,
+  reason => 'Replayable evaluation has not run',
+  exception_hashes => ARRAY[exception_hash],
+  ticket => 'OTLET-52'
 );
 
 SELECT format('CREATE ROLE %I NOLOGIN', :'delegate_role') \gexec
@@ -356,12 +356,12 @@ BEGIN
 
   BEGIN
     PERFORM otlet.record_workload_promotion_decision(
-      proof.current_contract_hash,
-      'promote',
-      otlet.identity_hash('invalid_acceptance_evidence', '{}'::jsonb),
-      '{"status":"invalid"}'::jsonb,
-      'invalid exception probe',
-      ARRAY[otlet.identity_hash('missing_exception', '{}'::jsonb)]
+      contract_hash => proof.current_contract_hash,
+      outcome => 'defer',
+      evidence_hash => otlet.identity_hash('invalid_acceptance_evidence', '{}'::jsonb),
+      evidence_summary => '{"status":"invalid"}'::jsonb,
+      reason => 'invalid exception probe',
+      exception_hashes => ARRAY[otlet.identity_hash('missing_exception', '{}'::jsonb)]
     );
     RAISE EXCEPTION 'invalid exception reference unexpectedly recorded';
   EXCEPTION WHEN OTHERS THEN

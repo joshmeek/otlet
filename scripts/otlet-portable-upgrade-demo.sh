@@ -79,7 +79,7 @@ contract="$(
 SELECT concat_ws('|',
   max(version),
   count(*),
-  array_agg(version ORDER BY version) = ARRAY(SELECT generate_series(1, 53)),
+  array_agg(version ORDER BY version) = ARRAY(SELECT generate_series(1, 54)),
   bool_and(file ~ ('(^|/)' || lpad(version::text, 4, '0') || '_')),
   (SELECT value FROM public.portable_upgrade_sentinel),
   (SELECT count(*) FROM otlet.verify_invariants())
@@ -87,7 +87,7 @@ SELECT concat_ws('|',
 FROM otlet.portable_schema_migrations;
 SQL
 )"
-[ "$contract" = "53|53|t|t|preserved|0" ] || {
+[ "$contract" = "54|54|t|t|preserved|0" ] || {
   echo "Portable repeat-install contract mismatch: $contract" >&2
   exit 1
 }
@@ -466,7 +466,7 @@ SELECT otlet.record_workload_promotion_decision(
   otlet.identity_hash('acceptance_upgrade_evidence', '{}'::jsonb),
   '{"status":"declared_not_evaluated"}'::jsonb,
   'Portable acceptance proof decision',
-  ARRAY[:'acceptance_exception_hash']
+  exception_hashes => ARRAY[:'acceptance_exception_hash']
 ) AS decision_hash
 \gset acceptance_
 SELECT concat_ws('|',
@@ -573,10 +573,10 @@ SELECT concat_ws('|',
   to_regclass('otlet.evaluation_case_status') IS NOT NULL,
   to_regclass('otlet.evaluation_replay_status') IS NOT NULL,
   to_regclass('otlet.audit_evaluation_replay_export') IS NOT NULL,
-  to_regprocedure('otlet.register_evaluation_case(bigint,text)') IS NOT NULL,
+  to_regprocedure('otlet.register_evaluation_case(bigint,text,text)') IS NOT NULL,
   to_regprocedure('otlet.start_replay_evaluation(text,text[],text,text)') IS NOT NULL,
   to_regprocedure('otlet.record_evaluation_result(bigint,bigint,bigint,jsonb,jsonb)') IS NOT NULL,
-  (SELECT count(*) = 13
+  (SELECT count(*) = 14
    FROM pg_catalog.pg_trigger trigger
    WHERE trigger.tgrelid IN (
      'otlet.evaluation_cases'::regclass,
@@ -612,6 +612,95 @@ SQL
 )"
 [ "$evaluation_migration_contract" = "t|t|t|t|t|t|t|t|t|t|t|t|t|t|t" ] || {
   echo "Portable evaluation migration contract mismatch: $evaluation_migration_contract" >&2
+  exit 1
+}
+
+population_lineage_migration_contract="$(
+  docker exec -i "$container" psql -U postgres -d "$database" \
+    -X -qAt -v ON_ERROR_STOP=1 <<'SQL'
+SELECT concat_ws('|',
+  (SELECT count(*) = 2 AND bool_and(is_nullable = 'NO')
+   FROM information_schema.columns
+   WHERE table_schema = 'otlet'
+     AND table_name = 'evaluation_cases'
+     AND column_name IN ('population_kind', 'lineage_hash'))
+    AND EXISTS (
+      SELECT 1
+      FROM pg_catalog.pg_index index_row
+      WHERE index_row.indrelid = 'otlet.evaluation_cases'::regclass
+        AND index_row.indisunique
+        AND index_row.indnkeyatts = 1
+        AND index_row.indkey::text = (
+          SELECT attribute.attnum::text
+          FROM pg_catalog.pg_attribute attribute
+          WHERE attribute.attrelid = 'otlet.evaluation_cases'::regclass
+            AND attribute.attname = 'lineage_hash'
+        )
+    ),
+  to_regprocedure('otlet.validate_evaluation_run_population()') IS NOT NULL
+    AND EXISTS (
+      SELECT 1
+      FROM pg_catalog.pg_trigger trigger
+      WHERE trigger.tgrelid = 'otlet.evaluation_runs'::regclass
+        AND trigger.tgname = 'evaluation_runs_c_population'
+    ),
+  to_regclass('otlet.evaluation_exposure_status') IS NOT NULL
+    AND (SELECT count(*) = 21
+         FROM information_schema.columns
+         WHERE table_schema = 'otlet'
+           AND table_name = 'evaluation_exposure_status')
+    AND to_regprocedure('otlet.register_evaluation_case(bigint,text,text)') IS NOT NULL
+    AND to_regprocedure('otlet.register_evaluation_case(bigint,text)') IS NULL
+    AND to_regprocedure(
+      'otlet.record_workload_promotion_decision(text,text,text,jsonb,text,text[],text[],text)'
+    ) IS NOT NULL
+    AND to_regprocedure(
+      'otlet.record_workload_promotion_decision(text,text,text,jsonb,text,text[],text)'
+    ) IS NULL,
+  (SELECT count(*) = 2
+   FROM information_schema.columns
+   WHERE table_schema = 'otlet'
+     AND table_name IN (
+       'evaluation_replay_status',
+       'audit_evaluation_replay_export'
+     )
+     AND column_name = 'same_input_snapshot')
+    AND NOT EXISTS (
+      SELECT 1
+      FROM information_schema.columns
+      WHERE table_schema = 'otlet'
+        AND table_name IN (
+          'evaluation_replay_status',
+          'audit_evaluation_replay_export'
+        )
+        AND column_name = 'same_population'
+    ),
+  NOT pg_catalog.has_function_privilege(
+    'public',
+    'otlet.register_evaluation_case(bigint,text,text)',
+    'EXECUTE'
+  )
+    AND NOT pg_catalog.has_function_privilege(
+      'public',
+      'otlet.validate_evaluation_run_population()',
+      'EXECUTE'
+    )
+    AND NOT pg_catalog.has_function_privilege(
+      'public',
+      'otlet.record_workload_promotion_decision(text,text,text,jsonb,text,text[],text[],text)',
+      'EXECUTE'
+    )
+    AND NOT pg_catalog.has_table_privilege(
+      'public',
+      'otlet.evaluation_exposure_status',
+      'SELECT'
+    )
+    AND NOT EXISTS (SELECT 1 FROM otlet.verify_invariants())
+);
+SQL
+)"
+[ "$population_lineage_migration_contract" = "t|t|t|t|t" ] || {
+  echo "Portable population-lineage migration contract mismatch: $population_lineage_migration_contract" >&2
   exit 1
 }
 
@@ -1029,6 +1118,7 @@ echo "portable_lifecycle_migration_contract=$lifecycle_migration_contract"
 echo "portable_administrative_migration_contract=$administrative_migration_contract"
 echo "portable_acceptance_migration_contract=$acceptance_migration_contract"
 echo "portable_evaluation_migration_contract=$evaluation_migration_contract"
+echo "portable_population_lineage_migration_contract=$population_lineage_migration_contract"
 echo "portable_ask_administrative_contract=$portable_ask_administrative_contract"
 echo "portable_task_lifecycle_contract=$portable_task_lifecycle_contract"
 echo "portable_model_capacity_contract=$batch_claims|$batch_capacity_contract|$concurrent_capacity_contract|$cancel_blocked_claims|$replacement_claims|$lease_capacity_contract"

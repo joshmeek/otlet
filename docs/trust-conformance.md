@@ -106,6 +106,17 @@ replayable_evaluation_contract=t|t|t|t|t|t|t|t|t|t|t|t|t|t|t
 portable_evaluation_migration_contract=t|t|t|t|t|t|t|t|t|t|t|t|t|t|t
 ```
 
+## Evaluation Population and Exposure Lineage Contract
+
+`./scripts/demo/evaluation_population_lineage.sh` registers tuning, calibration, shadow, and qualification cases from four labeled receipts. Otlet rejects attempts to change a snapshot population, mix populations in one run, or support a `promote` decision with tuning, calibration, or shadow runs. Two portable workers route one candidate job through cheap rejection and strong cancellation. The strong claim reports attempt 1 while its linked receipt records attempt 2, and the exposure view must retain the receipt attempt
+
+The proof rebuilds each expected source, scheduled, portable-claim, attempt, and result exposure and compares the full multiset with the owner view. Model and prompt identities must match across scheduled and executed stages. Otlet accepts the promotion decision after the qualification run has both baseline and candidate results. The SQL-only proof checks migration 54, population and lineage columns, the exposure view, the promotion signature, and `PUBLIC` closure
+
+```text
+evaluation_population_lineage_contract=t|t|t|t|t|t|t|t|t
+portable_population_lineage_migration_contract=t|t|t|t|t
+```
+
 Otlet records events from installation forward and leaves earlier history absent. Raw database-owner `GRANT` or `REVOKE` statements remain outside Otlet helper coverage until the access-policy lifecycle ships. A database or extension owner can replace or disable the guards; the planned signed checkpoints cover that stronger boundary
 
 ## Native Threats

@@ -181,5 +181,8 @@ $$;
 \set portable_migration_file ../../../otlet_pg/sql/migrations/0053_replayable_evaluation.sql
 \ir migrations/apply.sql
 
+\set portable_migration_file ../../../otlet_pg/sql/migrations/0054_evaluation_population_lineage.sql
+\ir migrations/apply.sql
+
 \set portable_migration_file 0043_permissions.sql
 \ir migrations/apply.sql
