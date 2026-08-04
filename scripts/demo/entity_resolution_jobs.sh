@@ -1,6 +1,6 @@
 log "Running entity-resolution demo"
 psql_exec -v join_index_name="$join_index_name" >/dev/null <<'SQL'
-SELECT otlet.drop_watch(:'join_index_name');
+SELECT otlet.drop_watch_registry(:'join_index_name');
 SQL
 cleanup_task "$entity_task"
 cleanup_task "$join_task"

@@ -186,14 +186,14 @@ psql_exec \
   -v numeric_triage_watch="$numeric_triage_watch" \
   -v pair_strip_watch="$pair_strip_watch" \
   -v action_allowlist_watch="$action_allowlist_watch" >/dev/null <<'SQL'
-SELECT otlet.drop_watch(:'row_triage_watch');
-SELECT otlet.drop_watch(:'row_scoped_watch');
-SELECT otlet.drop_watch(:'row_customscan_watch');
-SELECT otlet.drop_watch(:'row_triage_policy_watch');
-SELECT otlet.drop_watch(:'numeric_triage_watch');
-SELECT otlet.drop_watch(:'pair_strip_watch');
-SELECT otlet.drop_watch(:'action_allowlist_watch');
-SELECT otlet.drop_watch(:'join_index_name');
+SELECT otlet.drop_watch_registry(:'row_triage_watch');
+SELECT otlet.drop_watch_registry(:'row_scoped_watch');
+SELECT otlet.drop_watch_registry(:'row_customscan_watch');
+SELECT otlet.drop_watch_registry(:'row_triage_policy_watch');
+SELECT otlet.drop_watch_registry(:'numeric_triage_watch');
+SELECT otlet.drop_watch_registry(:'pair_strip_watch');
+SELECT otlet.drop_watch_registry(:'action_allowlist_watch');
+SELECT otlet.drop_watch_registry(:'join_index_name');
 SQL
 cleanup_task "row_review_demo"
 cleanup_task "entity_hypothesis_demo"

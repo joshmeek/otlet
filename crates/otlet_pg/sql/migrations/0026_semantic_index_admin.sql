@@ -231,7 +231,7 @@ BEGIN
   ) THEN
     stale_trigger_name := 'otlet_stale_v1_' || substr(right(otlet.identity_text_hash(
       'semantic_stale_trigger',
-      index_row.source_table::regclass::text || ':' || index_row.subject_column
+      index_row.subject_column
     ), 64), 1, 16);
     EXECUTE format('DROP TRIGGER IF EXISTS %I ON %s', stale_trigger_name, index_row.source_table);
   END IF;

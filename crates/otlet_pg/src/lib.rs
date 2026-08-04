@@ -251,9 +251,14 @@ pgrx::extension_sql_file!(
     requires = ["application_invocation"]
 );
 pgrx::extension_sql_file!(
+    "../sql/migrations/0050_task_watch_operational_lifecycle.sql",
+    name = "task_watch_operational_lifecycle",
+    requires = ["invocation_provenance"]
+);
+pgrx::extension_sql_file!(
     "../sql/migrations/0043_permissions.sql",
     name = "permissions",
-    requires = ["invocation_provenance"]
+    requires = ["task_watch_operational_lifecycle"]
 );
 
 #[allow(non_snake_case)]

@@ -120,7 +120,7 @@ AS $$
 DECLARE
   trigger_name text := 'otlet_watch_v1_' || substr(right(otlet.identity_text_hash(
     'watch_trigger',
-    table_name::text || ':' || subject_column || ':' || COALESCE(watch_name, '')
+    subject_column || ':' || COALESCE(watch_name, '')
   ), 64), 1, 16);
 BEGIN
   IF watch_name IS NULL OR watch_name = '' THEN
@@ -195,7 +195,7 @@ BEGIN
      AND to_regclass(watch_row.source_table) IS NOT NULL THEN
     trigger_name := 'otlet_watch_v1_' || substr(right(otlet.identity_text_hash(
       'watch_trigger',
-      to_regclass(watch_row.source_table)::text || ':' || watch_row.subject_column || ':' || watch_row.name
+      watch_row.subject_column || ':' || watch_row.name
     ), 64), 1, 16);
     EXECUTE format('DROP TRIGGER IF EXISTS %I ON %s', trigger_name, watch_row.source_table);
   END IF;
@@ -237,7 +237,7 @@ BEGIN
          ) THEN
         trigger_name := 'otlet_stale_v1_' || substr(right(otlet.identity_text_hash(
           'semantic_stale_trigger',
-          pair_source_table::regclass::text || ':' || pair_source_subject_column
+          pair_source_subject_column
         ), 64), 1, 16);
         EXECUTE format('DROP TRIGGER IF EXISTS %I ON %s', trigger_name, pair_source_table);
       END IF;
@@ -609,7 +609,7 @@ BEGIN
     ELSIF saved.source_table IS NOT NULL AND to_regclass(saved.source_table) IS NOT NULL THEN
       watch_trigger_name := 'otlet_watch_v1_' || substr(right(otlet.identity_text_hash(
         'watch_trigger',
-        to_regclass(saved.source_table)::text || ':' || saved.subject_column || ':' || saved.name
+        saved.subject_column || ':' || saved.name
       ), 64), 1, 16);
       EXECUTE format('DROP TRIGGER IF EXISTS %I ON %s', watch_trigger_name, saved.source_table);
     END IF;

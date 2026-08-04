@@ -127,7 +127,9 @@ expect_permission_denied "$permission_auditor_role" "SELECT * FROM otlet.abstain
 expect_permission_denied "$permission_auditor_role" "SELECT * FROM otlet.dry_run_action(0)" "auditor action dry run"
 expect_permission_denied "$permission_auditor_role" "SELECT * FROM otlet.apply_action(0)" "auditor action apply"
 expect_permission_denied "$permission_auditor_role" "SELECT otlet.register_model('denied', '/tmp/denied', repeat('0', 64), jsonb_build_object('sha256', repeat('0', 64), 'bytes', 24, 'source', 'denied', 'revision', 'denied', 'quantization', 'denied', 'license', 'denied'))" "auditor model registration"
-expect_permission_denied "$permission_auditor_role" "SELECT otlet.drop_watch('denied')" "auditor watch administration"
+expect_permission_denied "$permission_auditor_role" "SELECT otlet.drop_watch('denied', 'denied')" "auditor watch administration"
+expect_permission_denied "$permission_auditor_role" "SELECT otlet.set_task_lifecycle('denied', 'paused', 'denied')" "auditor task lifecycle administration"
+expect_permission_denied "$permission_auditor_role" "SELECT count(*) FROM otlet.task_lifecycle_status" "auditor task lifecycle status"
 expect_permission_denied "$permission_auditor_role" "SELECT otlet.register_action_target('denied', 'public.otlet_demo_bounded_actions'::regclass, 'id', ARRAY['review_state']::name[])" "auditor action target registration"
 expect_permission_denied "$permission_auditor_role" "SELECT otlet.disable_action_target('$bounded_action_target')" "auditor action target disable"
 expect_permission_denied "$permission_auditor_role" "SELECT otlet.register_action_workflow_policy('$bounded_action_task', 'update_row', '$bounded_action_target')" "auditor action workflow policy registration"
@@ -414,7 +416,9 @@ expect_permission_denied "$permission_operator_role" "SELECT count(*) FROM otlet
 expect_permission_denied "$permission_operator_role" "SELECT count(*) FROM otlet.inference_receipt_token_alternative_trace" "operator token alternative read"
 expect_permission_denied "$permission_operator_role" "SELECT otlet.register_model('denied', '/tmp/denied', repeat('0', 64), jsonb_build_object('sha256', repeat('0', 64), 'bytes', 24, 'source', 'denied', 'revision', 'denied', 'quantization', 'denied', 'license', 'denied'))" "operator model registration"
 expect_permission_denied "$permission_operator_role" "SELECT otlet.create_task('denied', 'SELECT 1', 'denied', '{}'::jsonb, 'denied')" "operator task administration"
-expect_permission_denied "$permission_operator_role" "SELECT otlet.drop_watch('denied')" "operator watch administration"
+expect_permission_denied "$permission_operator_role" "SELECT otlet.drop_watch('denied', 'denied')" "operator watch administration"
+expect_permission_denied "$permission_operator_role" "SELECT otlet.set_task_lifecycle('denied', 'paused', 'denied')" "operator task lifecycle administration"
+expect_permission_denied "$permission_operator_role" "SELECT count(*) FROM otlet.task_lifecycle_status" "operator task lifecycle status"
 expect_permission_denied "$permission_operator_role" "SELECT otlet.register_action_target('denied', 'public.otlet_demo_bounded_actions'::regclass, 'id', ARRAY['review_state']::name[])" "operator action target registration"
 expect_permission_denied "$permission_operator_role" "SELECT otlet.disable_action_target('$bounded_action_target')" "operator action target disable"
 expect_permission_denied "$permission_operator_role" "SELECT otlet.register_action_workflow_policy('$bounded_action_task', 'update_row', '$bounded_action_target')" "operator action workflow policy registration"
@@ -617,7 +621,7 @@ source "$demo_dir/review_provenance.sh"
 
 permission_contract="public=0/0/0|auditor=16/20|operator=16/29|definer=26/26|application=3/3/3|portable=8/8/8|positive=7|denied=$permission_denied_count"
 echo "permission_contract=$permission_contract"
-[ "$permission_contract" = "public=0/0/0|auditor=16/20|operator=16/29|definer=26/26|application=3/3/3|portable=8/8/8|positive=7|denied=64" ] || {
+[ "$permission_contract" = "public=0/0/0|auditor=16/20|operator=16/29|definer=26/26|application=3/3/3|portable=8/8/8|positive=7|denied=68" ] || {
   echo "Expected complete permission contract, got $permission_contract" >&2
   exit 1
 }

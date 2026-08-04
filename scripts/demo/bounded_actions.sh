@@ -1,6 +1,6 @@
 log "Proving bounded row updates"
 psql_exec -v watch_name="$bounded_action_watch" >/dev/null <<'SQL'
-SELECT otlet.drop_watch(:'watch_name');
+SELECT otlet.drop_watch_registry(:'watch_name');
 SQL
 cleanup_task "$bounded_action_task"
 

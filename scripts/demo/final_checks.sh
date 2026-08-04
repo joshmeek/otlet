@@ -97,14 +97,14 @@ echo "planner_1m_contract=$planner_1m_contract"
 }
 
 psql_exec >/dev/null <<'SQL'
-SELECT otlet.drop_watch('plan_1m_demo');
+SELECT otlet.drop_watch_registry('plan_1m_demo');
 DROP TABLE IF EXISTS public.otlet_plan_1m;
 SQL
 
 colon_subject_watch="colon_subject_demo"
 colon_subject_task="${colon_subject_watch}_task"
 psql_exec -v watch_name="$colon_subject_watch" >/dev/null <<'SQL'
-SELECT otlet.drop_watch(:'watch_name');
+SELECT otlet.drop_watch_registry(:'watch_name');
 DROP TABLE IF EXISTS public.otlet_demo_colon_subject;
 SQL
 psql_exec \
@@ -317,7 +317,7 @@ echo "colon_subject_safety_contract=$colon_subject_contract"
   exit 1
 }
 psql_exec -v watch_name="$colon_subject_watch" >/dev/null <<'SQL'
-SELECT otlet.drop_watch(:'watch_name');
+SELECT otlet.drop_watch_registry(:'watch_name');
 DROP TABLE IF EXISTS public.otlet_demo_colon_subject;
 SQL
 

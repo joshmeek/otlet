@@ -141,7 +141,7 @@ LANGUAGE plpgsql
 AS $$
 DECLARE
   trigger_name text := 'otlet_stale_v1_' || substr(right(otlet.identity_text_hash(
-    'semantic_stale_trigger', table_name::text || ':' || subject_column
+    'semantic_stale_trigger', subject_column
   ), 64), 1, 16);
 BEGIN
   IF NOT EXISTS (

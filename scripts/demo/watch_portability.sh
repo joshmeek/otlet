@@ -151,7 +151,7 @@ DO $body$
 DECLARE item record;
 BEGIN
   FOR item IN SELECT * FROM watch_round_trip_definitions ORDER BY name LOOP
-    PERFORM otlet.drop_watch(item.name);
+    PERFORM otlet.drop_watch_registry(item.name);
     PERFORM otlet.import_watch(item.definition);
   END LOOP;
 END

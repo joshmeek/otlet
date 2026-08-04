@@ -21,6 +21,7 @@ Deployers trust the native worker and PostgreSQL extension code. The local model
 | Transition | Untrusted input | Control | Closed result |
 | --- | --- | --- | --- |
 | Configuration to registry | Task, watch, runtime, shaping, decision, and candidate SQL fields | Fixed byte, depth, node, identifier, dependency, and prompt bounds before schema traversal, query binding, or hashing; allowlists, bounded candidate `EXPLAIN`, statement timeout, and transaction rollback | Reject the definition without a task, revision, watch, policy, queue, or materialization mutation |
+| Task lifecycle to execution authority | Target state and expected revision pin | Owner-only transition, production-policy, task, and declared-source locks, exact revision comparison, live-work drain, unfinished job and reconciliation checks, and revision-head authority | Reject a stale pin or unsafe transition without mutation; pause and retirement remove execution authority without losing queued, dirty-source, or terminal evidence |
 | Artifact to native runtime | File path, bytes, digest, size, and GGUF structure | Registered identity, streamed SHA-256, byte count, parser check, and recheck before each load | Fail the job with a receipt and keep the worker available |
 | Source to job snapshot | Candidate query rows, source fields, application request key, and retry mode | Immutable workload revision, row, byte, queue, plan-cost, timeout, and source-field admission; authenticated owner and active-role provenance; owner-scoped key bound to a PostgreSQL-authored operation, task, and subject hash; original-snapshot retry limited to an active original revision | Queue every eligible row under one captured contract or none; return the prior keyed job for an exact retry; reject a changed payload or inactive original revision without mutation |
 | Job snapshot to model | Prompt and row text | Revision-bound shaping, prompt, schema, model artifact, selection, runtime and action contracts, local execution, and no model database credential | Fail the attempt without output or action state |
@@ -59,6 +60,14 @@ workload_revision_status_contract=ok
 ```text
 revision_invalidation_contract=ok
 revision_claim_serialization_contract=true|true
+```
+
+`./scripts/demo/task_watch_lifecycle.sh` removes execution authority at pause, keeps queued work dormant until exact-pin resume, leaves paused task edits as unpromoted drafts, rejects concurrent definition writes for retry, rejects watch reconfiguration and retirement with unfinished work, and coalesces source changes without retrying them. It fences renamed or replaced source identities, preserves cleanup after a source deletion, and serializes pause with action-target registration, workflow-policy changes, and source-query repair. Its source race proves concurrent work blocks retirement without losing the backlog, then resumes, drains, retires, and removes the watch-owned registry state, indexes, reconciliation, and triggers. The task, revision, canceled job, and other evidence remain. `./scripts/otlet-portable-upgrade-demo.sh` repeats the task-state contract through the SQL-only install and checks the migration-local `PUBLIC` fence
+
+```text
+task_watch_lifecycle_contract=pin_conflict|pause_fenced|live_claim_fenced|unfinished_fenced|draft_unpromoted|watch_reconfig_fenced|resume_pinned|retire_fenced|watch_backlog|backlog_retire_fenced|watch_resume|rename_retire_fenced|name_reuse_fenced|rename_drop_fenced|drop_pin_fenced|archive_retained|exact_drop|path_independent_cleanup|shared_trigger_preserved|shared_trigger_released|invariants_clean
+task_watch_lifecycle_race_contract=definition_write_fenced|action_policy_serialized|repair_serialized|retirement_serialized|backlog_preserved|resume_queued|queue_canceled|repaused|source_missing|status_closed|retired|exact_drop|archive_retained|registry_removed|index_removed|reconciliation_removed|invariants_clean
+portable_task_lifecycle_contract=t|t|t|t|t|t|t|t|t|t|t
 ```
 
 ## Native Threats

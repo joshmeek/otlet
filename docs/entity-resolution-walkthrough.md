@@ -148,12 +148,9 @@ WHERE r.job_id = j.id
 
 DELETE FROM otlet.jobs
 WHERE task_name = 'entity_resolution_demo';
-
-DELETE FROM otlet.tasks
-WHERE name = 'entity_resolution_demo';
 ```
 
-Delete prior demo state to make the example rerunnable. Production flows retain their history
+Delete prior demo evidence to make the active example rerunnable. `create_task` updates the active definition and captures a new revision when work is admitted. A retired task remains a durable archive, so use a new task name after retirement
 
 ## Step 4 - Create The Task
 

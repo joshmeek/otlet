@@ -435,6 +435,11 @@ DECLARE
   validation_error text;
   normalized_columns name[];
 BEGIN
+  PERFORM 1
+  FROM otlet.production_policy policy
+  WHERE policy.name = 'default'
+  FOR UPDATE;
+
   IF target_name IS NULL OR target_name !~ '^[a-z0-9][a-z0-9_-]*$' THEN
     RAISE EXCEPTION 'otlet action target name is invalid';
   END IF;
@@ -562,6 +567,17 @@ DECLARE
   policy_hash text;
   target_error text;
 BEGIN
+  PERFORM 1
+  FROM otlet.production_policy policy
+  WHERE policy.name = 'default'
+  FOR UPDATE;
+  PERFORM pg_advisory_xact_lock(
+    hashtextextended(
+      'otlet_workload_revision:' || register_action_workflow_policy.task_name,
+      0
+    )
+  );
+
   SELECT * INTO task_row
   FROM otlet.tasks t
   WHERE t.name = register_action_workflow_policy.task_name;
@@ -677,6 +693,17 @@ AS $$
 DECLARE
   saved otlet.action_workflow_policies%ROWTYPE;
 BEGIN
+  PERFORM 1
+  FROM otlet.production_policy policy
+  WHERE policy.name = 'default'
+  FOR UPDATE;
+  PERFORM pg_advisory_xact_lock(
+    hashtextextended(
+      'otlet_workload_revision:' || disable_action_workflow_policy.task_name,
+      0
+    )
+  );
+
   UPDATE otlet.action_workflow_policies p
   SET enabled = false,
       updated_at = now()
@@ -1575,210 +1602,6 @@ BEGIN
     target_hash,
     active_hash
   );
-END;
-$$;
-
-CREATE FUNCTION otlet.repair_source_query_contract(
-  task_name text,
-  expected_active_workload_revision_hash text
-) RETURNS text
-LANGUAGE plpgsql
-SET search_path = pg_catalog, pg_temp
-AS $$
-DECLARE
-  active_definition jsonb;
-  active_contract jsonb;
-  repaired_contract jsonb;
-  repaired_definition jsonb;
-  raw_search_path text := pg_catalog.current_setting('search_path');
-  repaired_hash text;
-  candidate_plan jsonb;
-  candidate_plan_cost numeric;
-  candidate_preflight_at timestamptz;
-  repaired_relation regclass;
-  pair_source jsonb;
-  watch_row otlet.watches%ROWTYPE;
-BEGIN
-  PERFORM 1
-  FROM otlet.tasks task
-  WHERE task.name = repair_source_query_contract.task_name
-  FOR UPDATE;
-  IF NOT FOUND THEN
-    RAISE EXCEPTION 'otlet task % does not exist', repair_source_query_contract.task_name;
-  END IF;
-  PERFORM 1
-  FROM otlet.production_policy policy
-  WHERE policy.name = 'default'
-  FOR UPDATE;
-  PERFORM pg_advisory_xact_lock(
-    hashtextextended('otlet_workload_revision:' || repair_source_query_contract.task_name, 0)
-  );
-
-  SELECT revision.definition
-  INTO active_definition
-  FROM otlet.workload_revision_heads head
-  JOIN otlet.workload_revisions revision
-    ON revision.task_name = head.task_name
-   AND revision.workload_revision_hash = head.active_workload_revision_hash
-  WHERE head.task_name = repair_source_query_contract.task_name
-    AND head.active_workload_revision_hash =
-      repair_source_query_contract.expected_active_workload_revision_hash
-  FOR UPDATE OF head;
-  IF NOT FOUND THEN
-    RAISE EXCEPTION 'otlet source query repair conflict for task %',
-      repair_source_query_contract.task_name;
-  END IF;
-  active_contract := active_definition #> '{source,query_contract}';
-  IF active_contract IS NULL OR jsonb_typeof(active_contract) = 'null' THEN
-    RAISE EXCEPTION 'otlet task % has no source query contract',
-      repair_source_query_contract.task_name;
-  END IF;
-  IF current_user::regrole::oid IS DISTINCT FROM
-     (active_contract #>> '{identity,oid}')::oid THEN
-    RAISE EXCEPTION 'otlet source query repair requires the bound execution identity';
-  END IF;
-
-  PERFORM pg_catalog.set_config(
-    'search_path',
-    active_contract #>> '{search_path,raw}',
-    true
-  );
-  repaired_contract := otlet.build_source_query_contract(
-    active_contract #>> '{query,raw}',
-    NULLIF(active_contract -> 'declared_sources', 'null'::jsonb)
-  );
-
-  UPDATE otlet.tasks task
-  SET source_relations = NULLIF(repaired_contract -> 'declared_sources', 'null'::jsonb),
-      source_query_contract = repaired_contract
-  WHERE task.name = repair_source_query_contract.task_name
-    AND task.input_query IS NOT DISTINCT FROM active_contract #>> '{query,raw}'
-    AND task.source_relations IS NOT DISTINCT FROM
-      NULLIF(active_contract -> 'declared_sources', 'null'::jsonb);
-
-  repaired_definition := jsonb_set(
-    active_definition,
-    '{task,input_query}',
-    to_jsonb(repaired_contract #>> '{query,resolved}')
-  );
-  repaired_definition := jsonb_set(
-    repaired_definition,
-    '{source,query_contract}',
-    repaired_contract
-  );
-  repaired_definition := jsonb_set(
-    repaired_definition,
-    '{source,declared_relations}',
-    COALESCE(repaired_contract -> 'declared_sources', 'null'::jsonb)
-  );
-  IF repaired_definition #>> '{source,kind}' = 'pair' THEN
-    repaired_definition := jsonb_set(
-      repaired_definition,
-      '{source,candidate_query}',
-      to_jsonb(repaired_contract #>> '{query,resolved}')
-    );
-  END IF;
-  PERFORM otlet.workload_definition_complexity_guard(repaired_definition);
-  IF repaired_definition #>> '{source,kind}' = 'row' THEN
-    repaired_definition := jsonb_set(
-      repaired_definition,
-      '{source,semantic_column_contract}',
-      otlet.semantic_source_column_contract(
-        repaired_definition #>> '{source,source_table}',
-        repaired_definition #>> '{source,subject_column}',
-        ARRAY(
-          SELECT value
-          FROM jsonb_array_elements_text(COALESCE(
-            repaired_definition #> '{source,input_columns}',
-            '[]'::jsonb
-          )) value
-        )
-      )
-    );
-    PERFORM otlet.workload_definition_complexity_guard(repaired_definition);
-  END IF;
-  PERFORM pg_catalog.set_config('search_path', raw_search_path, true);
-
-  IF repaired_definition #>> '{source,kind}' = 'pair' THEN
-    SELECT
-      preflight.candidate_plan,
-      preflight.candidate_plan_cost,
-      preflight.candidate_preflight_at
-    INTO candidate_plan, candidate_plan_cost, candidate_preflight_at
-    FROM otlet.preflight_candidate_query(
-      repaired_definition #>> '{source,candidate_query}',
-      true,
-      false,
-      repaired_contract
-    ) preflight;
-  END IF;
-
-  repaired_hash := otlet.identity_hash('workload_revision', repaired_definition);
-  INSERT INTO otlet.workload_revisions (
-    workload_revision_hash,
-    task_name,
-    definition,
-    candidate_plan,
-    candidate_plan_cost,
-    candidate_preflight_at
-  ) VALUES (
-    repaired_hash,
-    repair_source_query_contract.task_name,
-    repaired_definition,
-    candidate_plan,
-    candidate_plan_cost,
-    candidate_preflight_at
-  )
-  ON CONFLICT (workload_revision_hash) DO NOTHING;
-
-  repaired_hash := otlet.promote_workload_revision(
-    repair_source_query_contract.task_name,
-    repaired_hash,
-    repair_source_query_contract.expected_active_workload_revision_hash
-  );
-
-  SELECT watch.*
-  INTO watch_row
-  FROM otlet.watches watch
-  WHERE watch.task_name = repair_source_query_contract.task_name;
-
-  IF repaired_definition #>> '{source,kind}' = 'row' THEN
-    repaired_relation := to_regclass(repaired_definition #>> '{source,source_table}');
-    IF repaired_relation IS NULL THEN
-      RAISE EXCEPTION 'otlet repaired row source relation is missing for task %',
-        repair_source_query_contract.task_name;
-    END IF;
-    PERFORM otlet.watch_semantic_stale(
-      repaired_relation,
-      repaired_definition #>> '{source,subject_column}'
-    );
-    IF watch_row.name IS NOT NULL
-       AND COALESCE(watch_row.trigger_policy ->> 'on_change', 'mark_stale') =
-         'mark_stale_and_enqueue' THEN
-      PERFORM otlet.watch_semantic_change(
-        repaired_relation,
-        repaired_definition #>> '{source,subject_column}',
-        watch_row.name
-      );
-    END IF;
-  ELSIF repaired_definition #>> '{source,kind}' = 'pair'
-        AND watch_row.name IS NOT NULL THEN
-    FOR pair_source IN
-      SELECT value
-      FROM jsonb_array_elements(
-        COALESCE(repaired_definition #> '{source,pair_sources}', '[]'::jsonb)
-      ) source(value)
-    LOOP
-      PERFORM otlet.watch_semantic_stale(
-        (pair_source ->> 'table')::regclass,
-        COALESCE(NULLIF(pair_source ->> 'subject_column', ''), 'id')
-      );
-    END LOOP;
-  END IF;
-  RETURN repaired_hash;
-EXCEPTION WHEN OTHERS THEN
-  PERFORM pg_catalog.set_config('search_path', raw_search_path, true);
-  RAISE;
 END;
 $$;
 

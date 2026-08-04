@@ -69,7 +69,6 @@ Use `otlet.application_job_status(job_id)` for application reads. Use `otlet.run
 Create three ordinary source rows for the watch:
 
 ```sql
-SELECT otlet.drop_watch('demo_semantic_vendor_idx');
 DROP TABLE IF EXISTS public.otlet_demo_semantic_vendor;
 
 CREATE TABLE public.otlet_demo_semantic_vendor (
@@ -419,8 +418,6 @@ Row watches follow source tables. Pair watches follow candidate queries
 The candidate query supplies `subject_id` and `input` for candidate pairs:
 
 ```sql
-SELECT otlet.drop_watch('learning_entity_pair_idx');
-
 DROP TABLE IF EXISTS public.learning_entity;
 
 CREATE TABLE public.learning_entity (
@@ -494,7 +491,7 @@ semantic_join_refresh_queued=1
 semantic_join_auto_materialized=1
 ```
 
-`pair_sources` installs the row-index stale trigger. Updates to declared source rows mark matching pair materializations through `_otlet_mvcc` dependencies, and `drop_watch` removes the trigger when no row index or pair watch still needs it
+`pair_sources` installs the row-index stale trigger. Updates to declared source rows mark matching pair materializations through `_otlet_mvcc` dependencies, and pinned deletion of a retired watch removes the trigger when no row index or pair watch still needs it
 
 Pair refresh reads one row past the candidate cap and rejects the whole operation on overflow. Only a complete candidate set reaches reconciliation, so unseen overflow rows never become `candidate_removed`. Within a complete set, a removed subject gets `candidate_removed` and a subject with changed shaped content gets `candidate_changed`. Removed candidates queue no work. New and changed candidates continue through the existing queue. If the same candidate content returns, Otlet clears the candidate-drift state and reuses its materialization
 
@@ -587,15 +584,10 @@ SELECT jsonb_pretty(otlet.export_watch('learning_entity_pair_idx'));
 
 The document contains watch configuration and owner-authored candidate SQL. It excludes model paths, source rows, jobs, outputs, actions, receipts, labels, traces, materializations, trigger names, timestamps, and counters
 
-Import requires the referenced model, tables, and columns to exist. The function rejects an existing watch unless the owner requests replacement:
+Import requires the referenced model, tables, and columns to exist. Use the exported definition in another database, or request same-identity replacement while this watch remains active:
 
 ```sql
 SELECT otlet.export_watch('learning_entity_pair_idx') AS watch_definition \gset
-
-SELECT otlet.drop_watch('learning_entity_pair_idx');
-
-SELECT name, kind
-FROM otlet.import_watch(:'watch_definition'::jsonb);
 
 SELECT name, kind
 FROM otlet.import_watch(
@@ -604,9 +596,75 @@ FROM otlet.import_watch(
 );
 ```
 
-Import validates `otlet.watch.v1`, resolves database dependencies, and calls `otlet.create_watch(...)`. A failed import rolls back its statement and leaves an existing watch unchanged
+Import validates `otlet.watch.v1`, resolves database dependencies, and calls `otlet.create_watch(...)`. A failed import rolls back its statement and leaves an existing watch unchanged. Identity changes require a new watch name
 
-The Docker demo proves replacement, drop/import round trip, lookup preservation, trigger preservation, and ten rejected documents:
+## Pause Or Retire A Watch
+
+The backing task owns watch state. Inspect its exact pin and blockers before changing it:
+
+```sql
+SELECT task_name,
+       lifecycle_state,
+       pinned_workload_revision_hash,
+       queued_jobs,
+       running_jobs,
+       cancel_requested_jobs,
+       configured_revision_error,
+       source_relation_drift,
+       can_pause,
+       can_retire,
+       can_drop_watch,
+       watch_deletion_blocker
+FROM otlet.task_lifecycle_status
+WHERE watch_name = 'learning_entity_pair_idx';
+```
+
+Drain leased work with the existing worker controls, then pause at the reported pin. Queued work stays dormant until resume:
+
+```sql
+SELECT pinned_workload_revision_hash AS revision_hash
+FROM otlet.task_lifecycle_status
+WHERE watch_name = 'learning_entity_pair_idx'
+\gset
+
+SELECT lifecycle_state
+FROM otlet.set_task_lifecycle(
+  'learning_entity_pair_idx_task',
+  'paused',
+  :'revision_hash'
+);
+
+SELECT lifecycle_state
+FROM otlet.set_task_lifecycle(
+  'learning_entity_pair_idx_task',
+  'active',
+  :'revision_hash'
+);
+```
+
+Task-definition changes captured while paused are drafts. A definition write that meets a concurrent lifecycle operation fails for retry before it can wait across the task-row lock. Otlet rejects watch-registry reconfiguration while inactive so triggers and source identity cannot drift from the pin. Resume restores the pinned revision; promote a captured task draft after inspection
+
+Retirement is terminal and requires no unfinished jobs or reconciliation subjects. Resume to reconcile the backlog, or acknowledge its exact generations, before retiring. If `source_relation_drift` is true, restore the pinned relation name and identity before retirement or deletion; a dropped source does not block cleanup. Exact-pin deletion removes the watch registry and Otlet-owned triggers while preserving its task, revisions, evidence, any surviving source table, and name as an archive:
+
+```sql
+SELECT lifecycle_state
+FROM otlet.set_task_lifecycle(
+  'learning_entity_pair_idx_task',
+  'paused',
+  :'revision_hash'
+);
+
+SELECT lifecycle_state
+FROM otlet.set_task_lifecycle(
+  'learning_entity_pair_idx_task',
+  'retired',
+  :'revision_hash'
+);
+
+SELECT otlet.drop_watch('learning_entity_pair_idx', :'revision_hash');
+```
+
+The Docker demo proves same-identity replacement, fixture round trip, lookup preservation, trigger preservation, and ten rejected documents. The lifecycle proof covers the production exact-pin deletion path:
 
 ```text
 watch_replace_contract=true|true|true|true|true|true|true|true|true|true

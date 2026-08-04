@@ -511,7 +511,7 @@ watch_source_pid=$!
 sleep 0.2
 docker exec -e PGAPPNAME=otlet-watch-reconciliation-drop -i "$container" \
   psql -U postgres -d "$database" -X -qAt -v ON_ERROR_STOP=1 \
-  -c "SET statement_timeout = '8s'; SELECT otlet.drop_watch('watch_reconciliation_drop_race')" \
+  -c "SET statement_timeout = '8s'; SELECT otlet.drop_watch_registry('watch_reconciliation_drop_race')" \
   >/dev/null &
 watch_drop_pid=$!
 

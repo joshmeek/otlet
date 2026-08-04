@@ -832,7 +832,7 @@ BEGIN
     RAISE EXCEPTION 'revision B re-promotion did not restore invalidation';
   END IF;
 
-  PERFORM otlet.drop_watch('revision_invalidation_probe');
+  PERFORM otlet.drop_watch_registry('revision_invalidation_probe');
   IF EXISTS (
     SELECT 1
     FROM otlet.workload_revision_heads head

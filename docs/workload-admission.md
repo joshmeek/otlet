@@ -40,6 +40,8 @@ Each model registration sets `max_active_jobs`, with a default of one. The limit
 
 `otlet.model_queue_status`, `otlet.production_policy_status`, and `otlet.production_status` expose current limits and queue bytes. Model and worker status also expose `active_claimed_jobs` and `available_active_job_slots`. `otlet.verify_invariants()` checks live claims, queue depth, per-job bytes, per-model bytes, and total bytes
 
+Admission also requires an active task revision. Pausing a task removes its revision head after leased work drains, so direct, application, native, portable, and watch admission reject new work and claims leave existing queued jobs untouched. Exact-pin resume restores that queue under the same revision. Retirement requires an empty queue and watch-reconciliation backlog, locks the pinned source identities, and is terminal. `task_lifecycle_status` exposes the state, pin, queue and reconciliation counts, source identity drift, and transition blockers
+
 Pair-watch creation runs `EXPLAIN (FORMAT JSON)` without executing candidate rows. Otlet stores the accepted plan, total cost, and preflight timestamp on the immutable workload revision and rejects invalid or over-cost plans before watch mutation
 
 Every pair execution revalidates source dependencies and reruns plan-cost preflight. `otlet.watch_status` keeps the accepted revision evidence separate from the current read-only plan, reports drift and current preflight status, and suspends the watch when the live plan exceeds policy. Source-query repair must capture fresh accepted evidence before it can promote a revision

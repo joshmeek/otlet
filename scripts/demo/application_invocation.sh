@@ -598,7 +598,9 @@ expect_application_denied "$application_login_a" "SELECT count(*) FROM otlet.inf
 expect_application_denied "$application_login_a" "SELECT count(*) FROM public.otlet_demo_application_input" "application source read"
 expect_application_denied "$application_login_a" "SELECT otlet.create_task('denied', NULL, 'denied', '{}'::jsonb, 'denied')" "application task administration"
 expect_application_denied "$application_login_a" "SELECT otlet.register_model('denied', '/tmp/denied', repeat('0', 64), jsonb_build_object('sha256', repeat('0', 64), 'bytes', 1, 'source', 'denied', 'revision', 'denied', 'quantization', 'denied', 'license', 'denied'))" "application model administration"
-expect_application_denied "$application_login_a" "SELECT otlet.drop_watch('denied')" "application watch administration"
+expect_application_denied "$application_login_a" "SELECT otlet.drop_watch('denied', 'denied')" "application watch administration"
+expect_application_denied "$application_login_a" "SELECT otlet.set_task_lifecycle('denied', 'paused', 'denied')" "application task lifecycle administration"
+expect_application_denied "$application_login_a" "SELECT count(*) FROM otlet.task_lifecycle_status" "application task lifecycle status"
 expect_application_denied "$application_login_a" "SELECT * FROM otlet.approve_action(0)" "application review authority"
 expect_application_denied "$application_login_a" "SELECT otlet.application_retry_job(0, 'latest_source')" "application operator retry"
 expect_application_denied "$application_login_a" "SELECT * FROM otlet.request_job_cancellation(0)" "application raw cancellation"
@@ -632,8 +634,8 @@ echo "application_invocation_contract=$application_complete_contract|conflict=$a
   echo "Expected exact application capability ACLs, got $application_acl_contract" >&2
   exit 1
 }
-[ "$application_denied_count" = "13" ] || {
-  echo "Expected 13 denied application paths, got $application_denied_count" >&2
+[ "$application_denied_count" = "15" ] || {
+  echo "Expected 15 denied application paths, got $application_denied_count" >&2
   exit 1
 }
 

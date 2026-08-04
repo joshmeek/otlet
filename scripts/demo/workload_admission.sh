@@ -195,7 +195,7 @@ fi
 echo "candidate_cost_preflight_contract=failed|no_execution"
 
 psql_exec -qAt -v model_name="$cheap_model_name" >/dev/null <<'SQL'
-SELECT otlet.drop_watch('admission_timeout_demo');
+SELECT otlet.drop_watch_registry('admission_timeout_demo');
 SELECT otlet.create_watch(
   watch_name => 'admission_timeout_demo',
   kind => 'pair',
@@ -263,7 +263,7 @@ if [ "$invalid_import_exit" -eq 0 ] || [[ "$invalid_import_output" != *"source q
   printf '%s\n' "$invalid_import_output" >&2
   exit 1
 fi
-psql_exec -qAt -c "SELECT otlet.drop_watch('admission_timeout_demo');" >/dev/null
+psql_exec -qAt -c "SELECT otlet.drop_watch_registry('admission_timeout_demo');" >/dev/null
 echo "candidate_import_validation_contract=failed|0"
 
 row_cap_contract="$(psql_value -v model_name="$cheap_model_name" <<'SQL'
