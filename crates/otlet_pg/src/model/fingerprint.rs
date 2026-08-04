@@ -1,7 +1,106 @@
+use pgrx::{IntoDatum, JsonB, pg_guard, pg_sys};
+
 const RUNTIME_FINGERPRINT_VERSION: &str = "otlet_runtime_fingerprint_v1";
 const PROMPT_TEMPLATE_NAME: &str = "otlet_raw_json_worker_v1";
 const LLAMA_CPP_SYS_VERSION: &str = "0.3.1";
 const LLAMA_CPP_REVISION: &str = "94a220cd6";
+
+static OTLET_LINKED_RUNTIME_CAPABILITIES_FINFO: pg_sys::Pg_finfo_record =
+    pg_sys::Pg_finfo_record { api_version: 1 };
+
+fn linked_runtime_capabilities() -> Value {
+    let batch_tokens = linked_prompt_batch_tokens();
+    json!({
+        "version": "otlet_runtime_capabilities_v1",
+        "supported_runtime_options": crate::runtime::SUPPORTED_RUNTIME_OPTIONS,
+        "schema_behavior": {
+            "input": "postgres_jsonb_shaped_snapshot",
+            "response": "json_object_output_actions_envelope",
+            "decode_constraint": LINKED_DECODE_CONSTRAINT,
+            "validation": "runtime_then_postgres_authoritative_json_schema_subset",
+            "unsupported_schema": "rejected_at_task_registration",
+            "supported_types": [
+                "object", "array", "string", "number", "integer", "boolean", "null"
+            ],
+            "supported_keywords": [
+                "$schema", "$id", "title", "description", "default", "examples",
+                "type", "enum", "const", "required", "properties",
+                "additionalProperties", "items", "minLength", "maxLength", "minimum",
+                "maximum", "exclusiveMinimum", "exclusiveMaximum", "minItems",
+                "maxItems", "minProperties", "maxProperties"
+            ],
+            "additional_properties": "boolean_only",
+            "items": "one_schema"
+        },
+        "context_limits": {
+            "context_window_tokens": LINKED_CONTEXT_WINDOW_TOKENS,
+            "batch_tokens": batch_tokens,
+            "ubatch_tokens": linked_prompt_ubatch_tokens(batch_tokens),
+            "max_generation_tokens": 4096
+        },
+        "cancellation": {
+            "policy": LINKED_CANCELLATION_POLICY,
+            "prompt_decode_boundary": LINKED_PROMPT_DECODE_CANCELLATION_BOUNDARY,
+            "observation_slice_ms": LINKED_CANCELLATION_SLICE_MS
+        },
+        "tracing": {
+            "summary": "otlet_generation_trace_v1",
+            "detailed": DETAILED_TRACE_CONTRACT,
+            "generation_trace": "optional",
+            "max_tokens": 256,
+            "max_top_k": 16,
+            "storage": DETAILED_TRACE_STORAGE_POLICY
+        },
+        "artifact_formats": {
+            "accepted": ["gguf"],
+            "verification": "sha256_verified_open_regular_file_descriptor",
+            "symlinks": "rejected"
+        },
+        "runtime_build": {
+            "engine": "llama.cpp",
+            "crate": "llama-cpp-sys-4",
+            "crate_version": LLAMA_CPP_SYS_VERSION,
+            "revision": LLAMA_CPP_REVISION,
+            "features": {
+                "native": cfg!(feature = "native"),
+                "openmp": cfg!(feature = "openmp")
+            }
+        },
+        "device_settings": {
+            "policy": LINKED_MODEL_DEVICE_POLICY,
+            "gpu_layers": 0,
+            "mmap": linked_env_bool("OTLET_LLAMA_MMAP", true),
+            "mlock": linked_env_bool("OTLET_LLAMA_MLOCK", false),
+            "flash_attention": fingerprint_flash_attention()
+        },
+        "resource_admission": {
+            "budget_option": "max_worker_rss_bytes",
+            "default_max_worker_rss_bytes": crate::runtime::DEFAULT_MAX_WORKER_RSS_BYTES,
+            "memory_accounting": LINKED_MEMORY_ACCOUNTING_POLICY,
+            "load_policy": "one_resident_model_preflight_before_tensor_allocation",
+            "required_evidence": [
+                "artifact_bytes",
+                "worker_rss",
+                "system_available_memory",
+                "cgroup_memory"
+            ]
+        }
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C-unwind" fn pg_finfo_otlet_linked_runtime_capabilities()
+-> *const pg_sys::Pg_finfo_record {
+    &raw const OTLET_LINKED_RUNTIME_CAPABILITIES_FINFO
+}
+
+#[pg_guard]
+#[unsafe(no_mangle)]
+pub extern "C-unwind" fn otlet_linked_runtime_capabilities(
+    _fcinfo: pg_sys::FunctionCallInfo,
+) -> pg_sys::Datum {
+    JsonB(linked_runtime_capabilities()).into_datum().unwrap()
+}
 
 struct RuntimeFingerprint {
     document: Value,

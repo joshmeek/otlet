@@ -48,6 +48,7 @@ source "$demo_dir/model_setup.sh"
 require_container
 register_models
 
+source "$demo_dir/runtime_capabilities.sh"
 source "$demo_dir/definition_complexity.sh"
 source "$demo_dir/model_artifact_trust.sh"
 source "$demo_dir/production_policy.sh"

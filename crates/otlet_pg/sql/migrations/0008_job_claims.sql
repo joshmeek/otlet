@@ -107,12 +107,7 @@ IMMUTABLE
 PARALLEL SAFE
 AS $$
   SELECT jsonb_build_object(
-    'context_window_tokens', 4096,
-    'batch_tokens', 512,
-    'ubatch_tokens', 128,
-    'load_policy', 'eager_single_resident_model',
-    'device_policy', 'cpu_only_n_gpu_layers_0',
-    'rss_policy', 'linux_proc_status_vmrss_fail_closed',
+    'version', 'otlet_runtime_capabilities_v1',
     'supported_runtime_options', jsonb_build_array(
       'reasoning',
       'max_tokens',
@@ -122,6 +117,64 @@ AS $$
       'generation_trace',
       'llama_threads',
       'llama_batch_threads'
+    ),
+    'schema_behavior', jsonb_build_object(
+      'input', 'postgres_jsonb_shaped_snapshot',
+      'response', 'json_object_output_actions_envelope',
+      'decode_constraint', 'greedy_balanced_json_object_then_database_validation',
+      'validation', 'postgres_authoritative_json_schema_subset',
+      'unsupported_schema', 'rejected_at_task_registration',
+      'supported_types', jsonb_build_array(
+        'object', 'array', 'string', 'number', 'integer', 'boolean', 'null'
+      ),
+      'supported_keywords', jsonb_build_array(
+        '$schema', '$id', 'title', 'description', 'default', 'examples',
+        'type', 'enum', 'const', 'required', 'properties', 'additionalProperties',
+        'items', 'minLength', 'maxLength', 'minimum', 'maximum',
+        'exclusiveMinimum', 'exclusiveMaximum', 'minItems', 'maxItems',
+        'minProperties', 'maxProperties'
+      ),
+      'additional_properties', 'boolean_only',
+      'items', 'one_schema'
+    ),
+    'context_limits', jsonb_build_object(
+      'context_window_tokens', 4096,
+      'batch_tokens', 512,
+      'ubatch_tokens', 128,
+      'max_generation_tokens', 4096
+    ),
+    'cancellation', jsonb_build_object(
+      'policy', 'claim_signal_before_inference_and_llama_abort_during_decode_generation',
+      'claim_loss', 'authoritative',
+      'attempt_deadline', 'monotonic_worker_and_database_deadline'
+    ),
+    'tracing', jsonb_build_object(
+      'summary', 'otlet_portable_worker_trace_v1',
+      'generation_trace', 'unsupported_must_be_false',
+      'raw_prompt_storage', 'none'
+    ),
+    'artifact_formats', jsonb_build_object(
+      'accepted', jsonb_build_array('gguf'),
+      'verification', 'sha256_verified_open_regular_file_descriptor',
+      'symlinks', 'rejected'
+    ),
+    'runtime_build', jsonb_build_object(
+      'engine', 'llama.cpp',
+      'crate', 'llama-cpp-sys-4',
+      'crate_version', '0.3.1',
+      'revision', '94a220cd6',
+      'features', jsonb_build_object('native', true, 'openmp', true)
+    ),
+    'device_settings', jsonb_build_object(
+      'policy', 'cpu_only_n_gpu_layers_0',
+      'gpu_layers', 0,
+      'load_policy', 'eager_single_resident_model'
+    ),
+    'resource_admission', jsonb_build_object(
+      'budget_option', 'max_worker_rss_bytes',
+      'rss_policy', 'linux_proc_status_vmrss_fail_closed',
+      'required_evidence', jsonb_build_array('current_rss_bytes', 'artifact_bytes'),
+      'process_slots', 1
     )
   )
 $$;
@@ -368,12 +421,12 @@ BEGIN
         WHEN artifact_bytes_valid THEN to_jsonb(artifact_bytes_text::bigint)
         ELSE 'null'::jsonb
       END,
-      'context_window_tokens', reference_contract -> 'context_window_tokens',
-      'batch_tokens', reference_contract -> 'batch_tokens',
-      'ubatch_tokens', reference_contract -> 'ubatch_tokens',
-      'load_policy', reference_contract -> 'load_policy',
-      'device_policy', reference_contract -> 'device_policy',
-      'rss_policy', reference_contract -> 'rss_policy',
+      'context_window_tokens', reference_contract #> '{context_limits,context_window_tokens}',
+      'batch_tokens', reference_contract #> '{context_limits,batch_tokens}',
+      'ubatch_tokens', reference_contract #> '{context_limits,ubatch_tokens}',
+      'load_policy', reference_contract #> '{device_settings,load_policy}',
+      'device_policy', reference_contract #> '{device_settings,policy}',
+      'rss_policy', reference_contract #> '{resource_admission,rss_policy}',
       'default_llama_threads', CASE
         WHEN default_llama_threads_valid THEN to_jsonb(default_llama_threads_text::integer)
         ELSE 'null'::jsonb

@@ -28,6 +28,8 @@ const PSQL_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const LOAD_POLICY: &str = "eager_single_resident_model";
 const DEVICE_POLICY: &str = "cpu_only_n_gpu_layers_0";
 const RSS_POLICY: &str = "linux_proc_status_vmrss_fail_closed";
+const LLAMA_CPP_SYS_VERSION: &str = "0.3.1";
+const LLAMA_CPP_REVISION: &str = "94a220cd6";
 const SUPPORTED_RUNTIME_OPTIONS: &[&str] = &[
     "reasoning",
     "max_tokens",
@@ -2035,13 +2037,69 @@ fn runtime_identity() -> Value {
         "engine": "llama.cpp",
         "protocol_version": 1,
         "runtime_contract": {
-            "context_window_tokens": CONTEXT_TOKENS,
-            "batch_tokens": BATCH_TOKENS,
-            "ubatch_tokens": UBATCH_TOKENS,
-            "load_policy": LOAD_POLICY,
-            "device_policy": DEVICE_POLICY,
-            "rss_policy": RSS_POLICY,
-            "supported_runtime_options": SUPPORTED_RUNTIME_OPTIONS
+            "version": "otlet_runtime_capabilities_v1",
+            "supported_runtime_options": SUPPORTED_RUNTIME_OPTIONS,
+            "schema_behavior": {
+                "input": "postgres_jsonb_shaped_snapshot",
+                "response": "json_object_output_actions_envelope",
+                "decode_constraint": "greedy_balanced_json_object_then_database_validation",
+                "validation": "postgres_authoritative_json_schema_subset",
+                "unsupported_schema": "rejected_at_task_registration",
+                "supported_types": [
+                    "object", "array", "string", "number", "integer", "boolean", "null"
+                ],
+                "supported_keywords": [
+                    "$schema", "$id", "title", "description", "default", "examples",
+                    "type", "enum", "const", "required", "properties",
+                    "additionalProperties", "items", "minLength", "maxLength", "minimum",
+                    "maximum", "exclusiveMinimum", "exclusiveMaximum", "minItems",
+                    "maxItems", "minProperties", "maxProperties"
+                ],
+                "additional_properties": "boolean_only",
+                "items": "one_schema"
+            },
+            "context_limits": {
+                "context_window_tokens": CONTEXT_TOKENS,
+                "batch_tokens": BATCH_TOKENS,
+                "ubatch_tokens": UBATCH_TOKENS,
+                "max_generation_tokens": 4096
+            },
+            "cancellation": {
+                "policy": "claim_signal_before_inference_and_llama_abort_during_decode_generation",
+                "claim_loss": "authoritative",
+                "attempt_deadline": "monotonic_worker_and_database_deadline"
+            },
+            "tracing": {
+                "summary": "otlet_portable_worker_trace_v1",
+                "generation_trace": "unsupported_must_be_false",
+                "raw_prompt_storage": "none"
+            },
+            "artifact_formats": {
+                "accepted": ["gguf"],
+                "verification": "sha256_verified_open_regular_file_descriptor",
+                "symlinks": "rejected"
+            },
+            "runtime_build": {
+                "engine": "llama.cpp",
+                "crate": "llama-cpp-sys-4",
+                "crate_version": LLAMA_CPP_SYS_VERSION,
+                "revision": LLAMA_CPP_REVISION,
+                "features": {
+                    "native": cfg!(feature = "native"),
+                    "openmp": cfg!(feature = "openmp")
+                }
+            },
+            "device_settings": {
+                "policy": DEVICE_POLICY,
+                "gpu_layers": 0,
+                "load_policy": LOAD_POLICY
+            },
+            "resource_admission": {
+                "budget_option": "max_worker_rss_bytes",
+                "rss_policy": RSS_POLICY,
+                "required_evidence": ["current_rss_bytes", "artifact_bytes"],
+                "process_slots": 1
+            }
         },
         "transport": "postgres_psql",
         "worker": "otlet-portable-worker",
@@ -3059,27 +3117,27 @@ esac
 
     #[test]
     fn portable_runtime_identity_has_the_fixed_contract() {
+        let identity = runtime_identity();
+        let contract = &identity["runtime_contract"];
+        assert_eq!(contract["version"], "otlet_runtime_capabilities_v1");
         assert_eq!(
-            runtime_identity()["runtime_contract"],
-            json!({
-                "context_window_tokens": 4096,
-                "batch_tokens": 512,
-                "ubatch_tokens": 128,
-                "load_policy": "eager_single_resident_model",
-                "device_policy": "cpu_only_n_gpu_layers_0",
-                "rss_policy": "linux_proc_status_vmrss_fail_closed",
-                "supported_runtime_options": [
-                    "reasoning",
-                    "max_tokens",
-                    "max_attempt_ms",
-                    "inference_cache",
-                    "max_worker_rss_bytes",
-                    "generation_trace",
-                    "llama_threads",
-                    "llama_batch_threads"
-                ]
-            })
+            contract["supported_runtime_options"],
+            json!(SUPPORTED_RUNTIME_OPTIONS)
         );
+        assert_eq!(contract["context_limits"]["context_window_tokens"], 4096);
+        assert_eq!(contract["runtime_build"]["revision"], LLAMA_CPP_REVISION);
+        for name in [
+            "schema_behavior",
+            "context_limits",
+            "cancellation",
+            "tracing",
+            "artifact_formats",
+            "runtime_build",
+            "device_settings",
+            "resource_admission",
+        ] {
+            assert!(contract[name].is_object(), "missing {name}");
+        }
     }
 
     #[test]

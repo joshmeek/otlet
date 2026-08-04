@@ -4,6 +4,30 @@ Use this after the entity-resolution walkthrough queues work. It inspects model 
 
 These diagnostic queries run as the extension owner because they expose receipt, structured output, error, and numeric token state. Raw model output and token text appear when the owner enables bounded diagnostic storage. Auditors use `otlet.audit_receipt_export` and the other redacted exports granted by `otlet.grant_auditor_access(...)`
 
+## Discover Runtime Capabilities
+
+`otlet.runtime_capability_status` declares what each installed runtime can do before a model runs. The native row comes from the loaded extension build. Each portable row comes from the exact registered worker identity, so a changed declaration produces a different identity and an incompatible contract is rejected at registration
+
+```sql
+SELECT runtime_id,
+       runtime_kind,
+       runtime_name,
+       runtime_version,
+       supported_runtime_options,
+       schema_behavior,
+       context_limits,
+       cancellation,
+       tracing,
+       artifact_formats,
+       runtime_build,
+       device_settings,
+       resource_admission
+FROM otlet.runtime_capability_status
+ORDER BY runtime_id;
+```
+
+Use this view to choose a compatible runtime. Use `otlet.runtime_status` and the portable status views for observed residency, health, memory, claims, and receipts
+
 ## Step 1 - Inspect Model Selection Attempts
 
 ```sql

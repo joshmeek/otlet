@@ -2009,7 +2009,7 @@ fi
 
 portable_parity_contract="$(
   docker exec -i "$container" psql -U postgres -d "$portable_database" \
-    -X -qAt -v ON_ERROR_STOP=1 <<'SQL'
+    -X -qAt -v ON_ERROR_STOP=1 -v runtime_identity="$runtime_identity" <<'SQL'
 SELECT concat_ws('|',
   (SELECT count(*) FROM otlet.verify_invariants()),
   (SELECT count(*)
@@ -2023,15 +2023,23 @@ SELECT concat_ws('|',
   (SELECT count(*)
    FROM unnest(ARRAY[
      'otlet.runtime_status',
+     'otlet.runtime_capability_status',
      'otlet.production_status',
      'otlet.watch_status',
      'otlet.audit_receipt_export'
    ]) relation_name
-   WHERE to_regclass(relation_name) IS NOT NULL)
+   WHERE to_regclass(relation_name) IS NOT NULL),
+  (SELECT count(*) = 2
+      AND bool_and(
+        runtime_identity_hash = otlet.portable_json_hash(:'runtime_identity'::jsonb)
+        AND capability_version = 'otlet_runtime_capabilities_v1'
+        AND runtime_build = :'runtime_identity'::jsonb #> '{runtime_contract,runtime_build}'
+      )
+    FROM otlet.runtime_capability_status)
 );
 SQL
 )"
-if [ "$portable_parity_contract" != "0|4|4" ]; then
+if [ "$portable_parity_contract" != "0|4|5|t" ]; then
   echo "Expected complete portable SQL parity surfaces and zero invariant violations, got $portable_parity_contract" >&2
   exit 1
 fi

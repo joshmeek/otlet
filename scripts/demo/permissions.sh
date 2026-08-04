@@ -93,6 +93,7 @@ SELECT (SELECT count(*) = 1 FROM otlet.redaction_policy_status)::text || '|' ||
        (SELECT count(*) > 0 FROM otlet.operational_event_log)::text || '|' ||
        (SELECT count(*) > 0 FROM otlet.worker_batch_timing_status)::text || '|' ||
        (SELECT count(*) = 1 FROM otlet.portable_protocol_status)::text || '|' ||
+       (SELECT count(*) >= 1 FROM otlet.runtime_capability_status)::text || '|' ||
        (SELECT count(*) >= 0 FROM otlet.portable_worker_status)::text || '|' ||
        (SELECT count(*) >= 0 FROM otlet.portable_claim_status)::text || '|' ||
        (SELECT count(*) >= 0 FROM otlet.portable_receipt_status)::text || '|' ||
@@ -101,7 +102,7 @@ ROLLBACK;
 SQL
 )"
 echo "auditor_read_contract=$auditor_read_contract"
-[ "$auditor_read_contract" = "true|true|true|true|true|true|true|true|true|true|true|true|true|true|true|true" ] || {
+[ "$auditor_read_contract" = "true|true|true|true|true|true|true|true|true|true|true|true|true|true|true|true|true" ] || {
   echo "Expected auditor access to all redacted exports, got $auditor_read_contract" >&2
   exit 1
 }
@@ -449,6 +450,7 @@ WITH table_grants AS (
             'operational_event_log',
             'worker_batch_timing_status',
             'portable_protocol_status',
+            'runtime_capability_status',
             'portable_worker_status',
             'portable_claim_status',
             'portable_receipt_status'
@@ -468,6 +470,7 @@ WITH table_grants AS (
           'portable_canonical_json_text',
           'portable_text_hash',
           'portable_json_hash',
+          'linked_runtime_capabilities',
           'identity_hash',
           'identity_text_hash',
           'semantic_source_hash',
@@ -492,6 +495,7 @@ WITH table_grants AS (
           'portable_canonical_json_text',
           'portable_text_hash',
           'portable_json_hash',
+          'linked_runtime_capabilities',
           'identity_hash',
           'identity_text_hash',
           'semantic_source_hash',
@@ -591,16 +595,16 @@ CROSS JOIN definer_status;
 SQL
 )"
 echo "permission_catalog_contract=$permission_catalog_contract"
-[ "$permission_catalog_contract" = "false|0|0|0|15|19|15|27|0|0|0|0|21|21|0|8|8|8|true" ] || {
+[ "$permission_catalog_contract" = "false|0|0|0|16|20|16|28|0|0|0|0|21|21|0|8|8|8|true" ] || {
   echo "Expected exact public, auditor, operator, and owner ACLs, got $permission_catalog_contract" >&2
   exit 1
 }
 
 source "$demo_dir/review_provenance.sh"
 
-permission_contract="public=0/0/0|auditor=15/19|operator=15/27|definer=21/21|portable=8/8/8|positive=7|denied=$permission_denied_count"
+permission_contract="public=0/0/0|auditor=16/20|operator=16/28|definer=21/21|portable=8/8/8|positive=7|denied=$permission_denied_count"
 echo "permission_contract=$permission_contract"
-[ "$permission_contract" = "public=0/0/0|auditor=15/19|operator=15/27|definer=21/21|portable=8/8/8|positive=7|denied=61" ] || {
+[ "$permission_contract" = "public=0/0/0|auditor=16/20|operator=16/28|definer=21/21|portable=8/8/8|positive=7|denied=61" ] || {
   echo "Expected complete permission contract, got $permission_contract" >&2
   exit 1
 }

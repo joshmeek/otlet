@@ -236,9 +236,14 @@ pgrx::extension_sql_file!(
     requires = ["portable_permissions"]
 );
 pgrx::extension_sql_file!(
+    "../sql/migrations/0047_runtime_capabilities.sql",
+    name = "runtime_capabilities",
+    requires = ["definition_complexity"]
+);
+pgrx::extension_sql_file!(
     "../sql/migrations/0043_permissions.sql",
     name = "permissions",
-    requires = ["definition_complexity"]
+    requires = ["runtime_capabilities"]
 );
 
 #[allow(non_snake_case)]

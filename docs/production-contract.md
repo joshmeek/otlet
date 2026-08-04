@@ -28,6 +28,8 @@ The five booleans confirm receipts, numeric token steps, numeric top-k alternati
 
 Runtime status shows the resident model slot, cache bounds, memory samples, pressure, and last run metrics
 
+`otlet.runtime_capability_status` is the cold declaration for native and registered portable runtimes. It exposes supported options, schema behavior, context limits, cancellation, tracing, GGUF handling, llama.cpp revision and build features, device settings, and admission policy without requiring a receipt. `otlet.runtime_status` remains the observed native state after work runs
+
 ```sql
 SELECT 'runtime_status_contract=' ||
        runtime_status || '|' ||
@@ -334,8 +336,13 @@ The auditor capability grants these redacted policy and audit views:
 - `otlet.semantic_dependency_audit`
 - `otlet.operational_event_log`
 - `otlet.worker_batch_timing_status`
+- `otlet.runtime_capability_status`
+- `otlet.portable_protocol_status`
+- `otlet.portable_worker_status`
+- `otlet.portable_claim_status`
+- `otlet.portable_receipt_status`
 
-The grant also includes three pure JSON hashing helpers required by `audit_review_export`; those helpers read no database rows. The operator capability includes auditor access plus these functions:
+The grant also includes the pure JSON hashing helpers required by `audit_review_export` and the native capability reader used by `runtime_capability_status`; they read no database rows. The operator capability includes auditor access plus these functions:
 
 - `otlet.approve_action`
 - `otlet.reject_action`

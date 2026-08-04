@@ -57,3 +57,7 @@ LANGUAGE C;
 CREATE FUNCTION otlet.worker_infer_now_state() RETURNS jsonb
 AS 'MODULE_PATHNAME', 'otlet_worker_infer_now_state'
 LANGUAGE C STRICT;
+
+CREATE FUNCTION otlet.linked_runtime_capabilities() RETURNS jsonb
+AS 'MODULE_PATHNAME', 'otlet_linked_runtime_capabilities'
+LANGUAGE C STABLE PARALLEL SAFE STRICT;

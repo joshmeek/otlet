@@ -72,3 +72,11 @@ AS $$
     'reason', 'portable_sql_installation_uses_queued_rpc_claims'
   )
 $$;
+
+CREATE FUNCTION otlet.linked_runtime_capabilities() RETURNS jsonb
+LANGUAGE sql
+STABLE
+PARALLEL SAFE
+AS $$
+  SELECT NULL::jsonb
+$$;

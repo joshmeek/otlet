@@ -122,6 +122,7 @@ BEGIN
     'otlet.operational_event_log, '
     'otlet.worker_batch_timing_status, '
     'otlet.portable_protocol_status, '
+    'otlet.runtime_capability_status, '
     'otlet.portable_worker_status, '
     'otlet.portable_claim_status, '
     'otlet.portable_receipt_status TO %I',
@@ -133,6 +134,7 @@ BEGIN
     'otlet.portable_canonical_json_text(jsonb), '
     'otlet.portable_text_hash(text), '
     'otlet.portable_json_hash(jsonb), '
+    'otlet.linked_runtime_capabilities(), '
     'otlet.identity_hash(text, jsonb), '
     'otlet.identity_text_hash(text, text), '
     'otlet.semantic_source_hash(jsonb), '

@@ -1,11 +1,11 @@
 use serde_json::{Value, json};
 
 #[cfg(target_os = "linux")]
-const DEFAULT_MAX_WORKER_RSS_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+pub(crate) const DEFAULT_MAX_WORKER_RSS_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 #[cfg(not(target_os = "linux"))]
-const DEFAULT_MAX_WORKER_RSS_BYTES: u64 = 0;
+pub(crate) const DEFAULT_MAX_WORKER_RSS_BYTES: u64 = 0;
 
-const SUPPORTED_RUNTIME_OPTIONS: &[&str] = &[
+pub(crate) const SUPPORTED_RUNTIME_OPTIONS: &[&str] = &[
     "reasoning",
     "max_tokens",
     "max_attempt_ms",
