@@ -241,9 +241,14 @@ pgrx::extension_sql_file!(
     requires = ["definition_complexity"]
 );
 pgrx::extension_sql_file!(
+    "../sql/migrations/0048_application_invocation.sql",
+    name = "application_invocation",
+    requires = ["runtime_capabilities"]
+);
+pgrx::extension_sql_file!(
     "../sql/migrations/0043_permissions.sql",
     name = "permissions",
-    requires = ["runtime_capabilities"]
+    requires = ["application_invocation"]
 );
 
 #[allow(non_snake_case)]

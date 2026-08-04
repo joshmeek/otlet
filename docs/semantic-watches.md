@@ -62,7 +62,7 @@ Group the base tables by role:
 - `watches` and `semantic_join_indexes` store pairwise candidate definitions
 - `portable_workers`, `portable_claims`, `portable_protocol_versions`, and `portable_receipt_links` fence external workers
 
-Use `otlet.runs` for application reads. Use trace and status views for debugging, proof, and learning
+Use `otlet.application_job_status(job_id)` for application reads. Use `otlet.runs` and the trace and status views for owner debugging, proof, and learning
 
 ## Step 3 - Create The Row Source
 

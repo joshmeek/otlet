@@ -129,7 +129,9 @@ Completion parses the raw envelope and requires it to match the submitted output
 
 Portable protocol `otlet.portable.worker.v1` uses exact-version compatibility and an owner-registered runtime identity bound to one database role. `grant_portable_worker_access(...)` grants that dedicated role one compatibility view and eight fixed-search-path `SECURITY DEFINER` RPCs for startup, heartbeat, claim, renewal, attempt, completion, failure, and cancellation. It grants no source or Otlet table access
 
-Portable callers use `enqueue_ask(...)` for one-off inference. Commit the transaction, then read status or trusted output from `otlet.runs` with the returned job ID. Queue rejection returns `0`; synchronous `otlet.ask(...)` remains native-only because an external worker cannot see uncommitted work
+Application callers use `application_submit_task_subject(...)` to queue one subject from an already-active configured task. The fixed-path function reuses the task's bound source query, immutable revision, input-relation checks, plan preflight, and queue limits, then records the authenticated `session_user` role OID on the new job. It returns `0` when the source has no matching subject, admission rejects the input, or the same input already has live work under that revision
+
+`application_job_status(...)` returns only lifecycle timestamps, status, and accepted structured output for a job owned by that authenticated login. It never returns input, errors, candidate or raw output, receipts, traces, actions, model details, or claim state. `application_cancel_job(...)` applies the existing queued and live cancellation contract after the same ownership check. Commit queued native or portable work before expecting a worker to see it
 
 Portable row watches use `create_watch(..., kind => 'row')` with `mark_stale_and_enqueue`. A source change marks prior state stale and persists the newest source identity in `watch_reconciliation`; a running worker heartbeat replays one due entry after commit. Source deletion resolves without inference. Pair watches keep bounded candidate preflight and explicit atomic `refresh_semantic_join_index(...)` under the caller statement timeout. `portable_complete_job(...)` stores the trusted output and semantic materialization in one transaction. SQL-only installations expose row and pair reads, predicates, plans, status, watch reconciliation, export, cleanup, and audit functions. Canceled work does not materialize
 
@@ -311,17 +313,21 @@ Operators query redacted, read-only projections through `otlet.audit_receipt_exp
 
 ## Step 4 - Grant Role-Scoped Access
 
-Otlet revokes schema, table, sequence, and function access from `PUBLIC`. The extension owner keeps raw and administrative access. Applications create their own login or group roles, then the extension owner grants one of two bounded capabilities
+Otlet revokes schema, table, sequence, and function access from `PUBLIC`. The extension owner keeps raw and administrative access. Applications create their own login or group roles, then the extension owner grants one of three bounded capabilities
 
 Create roles through your normal provisioning path. These `NOLOGIN` roles show the grant contract:
 
 ```sql
 CREATE ROLE app_otlet_auditor NOLOGIN;
 CREATE ROLE app_otlet_operator NOLOGIN;
+CREATE ROLE app_otlet_application NOLOGIN;
 
 SELECT otlet.grant_auditor_access('app_otlet_auditor'::regrole);
 SELECT otlet.grant_operator_access('app_otlet_operator'::regrole);
+SELECT otlet.grant_application_access('app_otlet_application'::regrole);
 ```
+
+The application capability grants only `application_submit_task_subject(...)`, `application_job_status(...)`, and `application_cancel_job(...)`. Login roles may inherit one shared capability role, but job ownership remains the authenticated `session_user`; changing only `SET ROLE` does not create a separate owner. The grant can invoke every active task in the database, so grant it only to logins allowed to use that full task set. The capability grants no direct source or Otlet table access, task, model, or watch administration, review or apply authority, worker RPCs, receipt, trace, or cleanup views, or further grant authority
 
 The auditor capability grants these redacted policy and audit views:
 
@@ -375,13 +381,14 @@ Check the installed policy:
 
 ```sql
 SELECT * FROM otlet.access_policy_status;
+SELECT * FROM otlet.application_access_policy_status;
 ```
 
-The demo proves the catalog ACLs, 15 auditor views and 19 function grants, 15 operator views and 27 function grants, seven existing operator paths, 20 exact security-definer functions, eight portable RPCs, and 61 denied paths. The delegated operator role proves all five review outcomes:
+The demo proves the catalog ACLs, 16 auditor views and 20 function grants, 16 operator views and 28 function grants, seven operator paths, 25 exact security-definer functions, three application RPCs, eight portable RPCs, 12 denied application paths, and 63 denied auditor or operator paths. The delegated operator role proves all five review outcomes:
 
 ```text
 review_provenance_contract=true|true|true|true|true|true|true|true|true|true|true
-permission_contract=public=0/0/0|auditor=15/19|operator=15/27|definer=20/20|portable=8/8/8|positive=7|denied=61
+permission_contract=public=0/0/0|auditor=16/20|operator=16/28|definer=25/25|application=3/3/3|portable=8/8/8|positive=7|denied=63
 ```
 
 Your application still owns these deployment boundaries:

@@ -8,7 +8,7 @@ Otlet treats source text, imported configuration, identifiers, model files, mode
 | --- | --- | --- | --- |
 | PostgreSQL | Source rows, tasks, watches, policies, jobs, receipts, outputs, reviews, actions, and execution receipts | Installer or extension owner | Full database authority and outside this threat boundary |
 | Native runtime | Registered GGUF files, verified artifact identity, worker process, shared memory, latches, and CustomScan state | Otlet background worker | Internal functions and tables needed to run claimed work |
-| Application | Source rows and task invocation | Application role | Rights granted by the application owner; no Otlet operator authority by default |
+| Application | Source rows and bounded task-subject invocation | Authenticated application login through an owner-granted capability | Submit against any active task and read or cancel owned jobs; no direct table access, administration, review/apply, worker, or grant authority |
 | Operations | Review, dry run, apply, cancellation, and policy status | `otlet_operator` session | Allowlisted functions and redacted views |
 | Audit | Receipts, labels, policy state, and redacted operational evidence | `otlet_auditor` session | Read-only allowlisted views |
 | Portable authoring | `otlet.watch.v1`, SQL text, JSON Schema, model policy, runtime options, and ordinary files | Pack author and importer | Untrusted bytes until database validation and import |

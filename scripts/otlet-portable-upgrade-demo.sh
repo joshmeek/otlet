@@ -61,7 +61,7 @@ contract="$(
 SELECT concat_ws('|',
   max(version),
   count(*),
-  array_agg(version ORDER BY version) = ARRAY(SELECT generate_series(1, 47)),
+  array_agg(version ORDER BY version) = ARRAY(SELECT generate_series(1, 48)),
   bool_and(file ~ ('(^|/)' || lpad(version::text, 4, '0') || '_')),
   (SELECT value FROM public.portable_upgrade_sentinel),
   (SELECT count(*) FROM otlet.verify_invariants())
@@ -69,8 +69,52 @@ SELECT concat_ws('|',
 FROM otlet.portable_schema_migrations;
 SQL
 )"
-[ "$contract" = "47|47|t|t|preserved|0" ] || {
+[ "$contract" = "48|48|t|t|preserved|0" ] || {
   echo "Portable repeat-install contract mismatch: $contract" >&2
+  exit 1
+}
+
+application_migration_contract="$(
+  docker exec -i "$container" psql -U postgres -d "$database" \
+    -X -qAt -v ON_ERROR_STOP=1 <<'SQL'
+SELECT concat_ws('|',
+  EXISTS (
+    SELECT 1
+    FROM information_schema.columns
+    WHERE table_schema = 'otlet'
+      AND table_name = 'jobs'
+      AND column_name = 'application_owner_role_oid'
+  ),
+  to_regprocedure('otlet.application_submit_task_subject(text,text)') IS NOT NULL,
+  to_regprocedure('otlet.application_job_status(bigint)') IS NOT NULL,
+  to_regprocedure('otlet.application_cancel_job(bigint)') IS NOT NULL,
+  to_regprocedure('otlet.grant_application_access(regrole)') IS NOT NULL,
+  to_regclass('otlet.application_access_policy_status') IS NOT NULL,
+  (SELECT application_functions = 3
+          AND application_security_definer_functions = 3
+          AND application_fixed_search_path_functions = 3
+   FROM otlet.application_access_policy_status),
+  (SELECT count(*) = 0
+   FROM pg_catalog.pg_proc function
+   JOIN pg_catalog.pg_namespace namespace ON namespace.oid = function.pronamespace
+   WHERE namespace.nspname = 'otlet'
+     AND function.proname IN (
+       'application_submit_task_subject',
+       'application_job_status',
+       'application_cancel_job',
+       'grant_application_access'
+     )
+     AND pg_catalog.has_function_privilege('public', function.oid, 'EXECUTE')),
+  NOT pg_catalog.has_table_privilege(
+    'public',
+    'otlet.application_access_policy_status',
+    'SELECT'
+  )
+);
+SQL
+)"
+[ "$application_migration_contract" = "t|t|t|t|t|t|t|t|t" ] || {
+  echo "Portable application migration contract mismatch: $application_migration_contract" >&2
   exit 1
 }
 
@@ -294,5 +338,6 @@ renewal_race_contract="$renewal_race_claims|$(model_capacity_contract)"
 
 echo "portable_upgrade_contract=$contract"
 echo "portable_identity_vector_contract=$identity_vector_contract"
+echo "portable_application_migration_contract=$application_migration_contract"
 echo "portable_model_capacity_contract=$batch_claims|$batch_capacity_contract|$concurrent_capacity_contract|$cancel_blocked_claims|$replacement_claims|$lease_capacity_contract"
 echo "portable_renewal_race_contract=$renewal_race_contract"

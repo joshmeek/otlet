@@ -16,7 +16,7 @@ Run the installer as the database owner from the repository checkout:
 psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f crates/otlet_worker/sql/install.sql
 ```
 
-The install transaction runs the current SQL contract as migrations `0001` through `0043`. Re-running it skips recorded migrations and preserves existing data. This greenfield path rejects older unversioned `otlet` schemas instead of converting them
+The install transaction runs the current SQL contract as migrations `0001` through `0048`. Re-running it skips recorded migrations and preserves existing data. This greenfield path rejects older unversioned `otlet` schemas instead of converting them
 
 The database keeps zero `otlet` extension objects and zero C-language Otlet functions
 
@@ -71,27 +71,31 @@ PostgreSQL assembles the exact prompt from the shaped snapshot and immutable tas
 
 The worker permits one `psql` child at a time. It applies a 5-second connect limit, a 30-second ordinary query limit, a renewal limit of 30 seconds or the remaining attempt budget, and one 30-second deadline across all terminal retries. Requests stop at 128 MiB, stdout at 64 MiB, stderr at 64 KiB, and parsed results at 32 MiB. Each call also sets PostgreSQL statement and lock timeouts. A child that crosses its deadline is killed and reaped before the call returns
 
-## Enqueue One-Off Inference
+## Invoke a Configured Task
 
-Portable workers cannot see work created inside the open transaction used by synchronous `otlet.ask(...)`. Queue the request, commit it, then read status and trusted output from `otlet.runs`:
+The database owner configures and activates the task, then grants the application capability to a login or inherited group role:
+
+```sql
+SELECT otlet.grant_application_access('app_otlet_application'::regrole);
+```
+
+From an authenticated application connection, queue one known subject, commit it so the portable worker can see it, then read only owned status and accepted output:
 
 ```sql
 BEGIN;
-SELECT otlet.enqueue_ask(
-  'qwen35_4b',
-  'Summarize the note',
-  '{"note":"Customer requested a procurement summary"}',
-  '{"type":"object","required":["summary"],"additionalProperties":false,"properties":{"summary":{"type":"string"}}}',
-  '{"reasoning":"off","max_tokens":256,"inference_cache":false}'
+SELECT otlet.application_submit_task_subject(
+  'procurement_summary',
+  'note-1'
 ) AS job_id \gset
 COMMIT;
 
-SELECT status, output, receipt_id, error
-FROM otlet.runs
-WHERE job_id = :'job_id';
+SELECT status, trusted_output, started_at, finished_at
+FROM otlet.application_job_status(:'job_id');
+
+SELECT otlet.application_cancel_job(:'job_id');
 ```
 
-`enqueue_ask(...)` returns `0` when queue admission rejects the request. It uses the same task, input shaping, queue limits, PostgreSQL validation, receipt, and cancellation state as other jobs
+Submission returns `0` when the subject is missing, queue admission rejects the input, or the same input already has live work under the active revision. The application functions expose no source rows or raw Otlet data and grant no administrative, review/apply, worker, or further-grant authority. Ownership follows the authenticated `session_user`, not an active `SET ROLE`
 
 ## Route Across Models
 
