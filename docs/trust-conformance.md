@@ -84,6 +84,15 @@ direct_ask_administrative_contract=true
 action_target_drift_contract=true|true|true|true|true|true|true|true|true|true|true|true|true|true|true|true|true
 ```
 
+## Workload Acceptance Contract
+
+`./scripts/demo/workload_acceptance_contract.sh` registers exact full-population and sampled declarations before their observation window against one baseline and candidate revision without creating jobs or promoting the candidate. It checks all 11 threshold categories, content identity, exact-repeat idempotency, compare-and-swap versioning, stale exact retries, invalid and rolled-back declarations, append-only exception and promotion-decision events, distinct authenticated and active roles, exact exception linkage, owner status, and `PUBLIC` closure. The SQL-only repeat-install proof checks migration 52, repeat installation, the core contract surfaces, and `PUBLIC` closure
+
+```text
+workload_acceptance_contract=t|t|t|t|t|t|t|t|t|t|t|t|t|t|t|t
+portable_acceptance_migration_contract=t|t|t|t|t|t|t|t|t|t|t|t|t|t
+```
+
 Otlet records events from installation forward and leaves earlier history absent. Raw database-owner `GRANT` or `REVOKE` statements remain outside Otlet helper coverage until the access-policy lifecycle ships. A database or extension owner can replace or disable the guards; the planned signed checkpoints cover that stronger boundary
 
 ## Native Threats

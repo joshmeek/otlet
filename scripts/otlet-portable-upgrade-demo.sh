@@ -79,7 +79,7 @@ contract="$(
 SELECT concat_ws('|',
   max(version),
   count(*),
-  array_agg(version ORDER BY version) = ARRAY(SELECT generate_series(1, 51)),
+  array_agg(version ORDER BY version) = ARRAY(SELECT generate_series(1, 52)),
   bool_and(file ~ ('(^|/)' || lpad(version::text, 4, '0') || '_')),
   (SELECT value FROM public.portable_upgrade_sentinel),
   (SELECT count(*) FROM otlet.verify_invariants())
@@ -87,7 +87,7 @@ SELECT concat_ws('|',
 FROM otlet.portable_schema_migrations;
 SQL
 )"
-[ "$contract" = "51|51|t|t|preserved|0" ] || {
+[ "$contract" = "52|52|t|t|preserved|0" ] || {
   echo "Portable repeat-install contract mismatch: $contract" >&2
   exit 1
 }
@@ -385,6 +385,167 @@ SQL
 )"
 [ "$administrative_migration_contract" = "t|t|t|t|t|t|t" ] || {
   echo "Portable administrative migration contract mismatch: $administrative_migration_contract" >&2
+  exit 1
+}
+
+acceptance_migration_contract="$(
+  docker exec -i "$container" psql -U postgres -d "$database" \
+    -X -qAt -v ON_ERROR_STOP=1 <<'SQL' | tail -n 1
+BEGIN;
+SELECT otlet.register_model(
+  'acceptance_upgrade_probe',
+  '/tmp/acceptance-upgrade.gguf',
+  repeat('a', 64),
+  jsonb_build_object(
+    'sha256', repeat('a', 64),
+    'bytes', 1,
+    'source', 'portable-upgrade-demo',
+    'revision', 'acceptance-v1',
+    'quantization', 'test',
+    'license', 'test'
+  )
+) \g /dev/null
+SELECT otlet.create_task(
+  'acceptance_upgrade_probe',
+  NULL,
+  'Return JSON',
+  '{"type":"object"}'::jsonb,
+  'acceptance_upgrade_probe'
+) \g /dev/null
+SELECT otlet.ensure_active_workload_revision('acceptance_upgrade_probe')
+  AS revision_hash
+\gset acceptance_
+WITH thresholds AS (
+  SELECT jsonb_object_agg(
+    category,
+    jsonb_build_object(
+      'metric', category,
+      'statistic', 'rate',
+      'operator', CASE
+        WHEN category IN ('candidate_recall', 'downstream_outcome') THEN 'gte'
+        ELSE 'lte'
+      END,
+      'value', CASE
+        WHEN category IN ('candidate_recall', 'downstream_outcome') THEN 0.9
+        ELSE 0.1
+      END,
+      'unit', 'ratio',
+      'minimum_support', 1,
+      'required', true
+    )
+  ) AS definition
+  FROM unnest(ARRAY[
+    'candidate_recall', 'false_trust', 'abstention', 'review_age',
+    'review_minutes', 'freshness', 'latency', 'database_impact',
+    'unit_cost', 'recovery', 'downstream_outcome'
+  ]) category
+)
+SELECT otlet.register_workload_acceptance_contract(
+  'acceptance_upgrade_probe',
+  :'acceptance_revision_hash',
+  :'acceptance_revision_hash',
+  '{"mode":"full","rule":{"kind":"all_declared_subjects"}}'::jsonb,
+  date_trunc('day', statement_timestamp()) + interval '1 day',
+  date_trunc('day', statement_timestamp()) + interval '32 days',
+  '{"name":"active_revision","definition":{"kind":"workload_revision"}}'::jsonb,
+  thresholds.definition
+) AS contract_hash
+FROM thresholds
+\gset acceptance_
+SELECT otlet.record_workload_acceptance_exception(
+  :'acceptance_contract_hash',
+  'unit_cost',
+  '{"required":false}'::jsonb,
+  '{}'::jsonb,
+  'Portable acceptance proof exception'
+) AS exception_hash
+\gset acceptance_
+SELECT otlet.record_workload_promotion_decision(
+  :'acceptance_contract_hash',
+  'defer',
+  otlet.identity_hash('acceptance_upgrade_evidence', '{}'::jsonb),
+  '{"status":"declared_not_evaluated"}'::jsonb,
+  'Portable acceptance proof decision',
+  ARRAY[:'acceptance_exception_hash']
+) AS decision_hash
+\gset acceptance_
+SELECT concat_ws('|',
+  EXISTS (
+    SELECT 1
+    FROM otlet.portable_schema_migrations
+    WHERE version = 52
+      AND file ~ '0052_workload_acceptance_contract.sql$'
+  ),
+  to_regclass('otlet.workload_acceptance_contracts') IS NOT NULL,
+  to_regclass('otlet.workload_acceptance_events') IS NOT NULL,
+  to_regclass('otlet.workload_acceptance_status') IS NOT NULL,
+  to_regprocedure(
+    'otlet.register_workload_acceptance_contract(text,text,text,jsonb,timestamptz,timestamptz,jsonb,jsonb,text)'
+  ) IS NOT NULL,
+  (SELECT count(*) = 1 FROM otlet.workload_acceptance_contracts),
+  (SELECT count(*) = 2 FROM otlet.workload_acceptance_events),
+  (SELECT count(*) = 1
+   FROM otlet.workload_acceptance_status
+   WHERE current
+     AND threshold_categories = 11
+     AND exceptions = 1
+     AND promotion_decisions = 1
+     AND latest_promotion_outcome = 'defer'),
+  NOT pg_catalog.has_table_privilege(
+    'public', 'otlet.workload_acceptance_contracts', 'SELECT,INSERT,UPDATE,DELETE,TRUNCATE'
+  ),
+  NOT pg_catalog.has_table_privilege(
+    'public', 'otlet.workload_acceptance_events', 'SELECT,INSERT,UPDATE,DELETE,TRUNCATE'
+  ),
+  NOT EXISTS (
+    SELECT 1
+    FROM pg_catalog.pg_proc function
+    JOIN pg_catalog.pg_namespace namespace ON namespace.oid = function.pronamespace
+    WHERE namespace.nspname = 'otlet'
+      AND function.proname IN (
+        'register_workload_acceptance_contract',
+        'record_workload_acceptance_exception',
+        'record_workload_promotion_decision'
+      )
+      AND pg_catalog.has_function_privilege('public', function.oid, 'EXECUTE')
+  ),
+  NOT EXISTS (
+    SELECT 1
+    FROM pg_catalog.pg_proc function
+    JOIN pg_catalog.pg_namespace namespace ON namespace.oid = function.pronamespace
+    WHERE namespace.nspname = 'otlet'
+      AND pg_catalog.has_function_privilege('public', function.oid, 'EXECUTE')
+  ),
+  NOT EXISTS (
+    SELECT 1
+    FROM pg_catalog.pg_class relation
+    JOIN pg_catalog.pg_namespace namespace ON namespace.oid = relation.relnamespace
+    WHERE namespace.nspname = 'otlet'
+      AND relation.relkind IN ('r', 'p', 'v', 'm', 'f')
+      AND EXISTS (
+        SELECT 1
+        FROM pg_catalog.aclexplode(relation.relacl) privilege
+        WHERE privilege.grantee = 0
+      )
+  ),
+  NOT EXISTS (
+    SELECT 1
+    FROM pg_catalog.pg_class relation
+    JOIN pg_catalog.pg_namespace namespace ON namespace.oid = relation.relnamespace
+    WHERE namespace.nspname = 'otlet'
+      AND relation.relkind = 'S'
+      AND EXISTS (
+        SELECT 1
+        FROM pg_catalog.aclexplode(relation.relacl) privilege
+        WHERE privilege.grantee = 0
+      )
+  )
+);
+ROLLBACK;
+SQL
+)"
+[ "$acceptance_migration_contract" = "t|t|t|t|t|t|t|t|t|t|t|t|t|t" ] || {
+  echo "Portable acceptance migration contract mismatch: $acceptance_migration_contract" >&2
   exit 1
 }
 
@@ -800,6 +961,7 @@ echo "portable_identity_vector_contract=$identity_vector_contract"
 echo "portable_application_migration_contract=$application_migration_contract"
 echo "portable_lifecycle_migration_contract=$lifecycle_migration_contract"
 echo "portable_administrative_migration_contract=$administrative_migration_contract"
+echo "portable_acceptance_migration_contract=$acceptance_migration_contract"
 echo "portable_ask_administrative_contract=$portable_ask_administrative_contract"
 echo "portable_task_lifecycle_contract=$portable_task_lifecycle_contract"
 echo "portable_model_capacity_contract=$batch_claims|$batch_capacity_contract|$concurrent_capacity_contract|$cancel_blocked_claims|$replacement_claims|$lease_capacity_contract"

@@ -261,9 +261,14 @@ pgrx::extension_sql_file!(
     requires = ["task_watch_operational_lifecycle"]
 );
 pgrx::extension_sql_file!(
+    "../sql/migrations/0052_workload_acceptance_contract.sql",
+    name = "workload_acceptance_contract",
+    requires = ["administrative_change_ledger"]
+);
+pgrx::extension_sql_file!(
     "../sql/migrations/0043_permissions.sql",
     name = "permissions",
-    requires = ["administrative_change_ledger"]
+    requires = ["workload_acceptance_contract"]
 );
 
 #[allow(non_snake_case)]
