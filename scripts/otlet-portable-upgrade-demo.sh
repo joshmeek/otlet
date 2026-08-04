@@ -79,7 +79,7 @@ contract="$(
 SELECT concat_ws('|',
   max(version),
   count(*),
-  array_agg(version ORDER BY version) = ARRAY(SELECT generate_series(1, 56)),
+  array_agg(version ORDER BY version) = ARRAY(SELECT generate_series(1, 57)),
   bool_and(file ~ ('(^|/)' || lpad(version::text, 4, '0') || '_')),
   (SELECT value FROM public.portable_upgrade_sentinel),
   (SELECT count(*) FROM otlet.verify_invariants())
@@ -87,7 +87,7 @@ SELECT concat_ws('|',
 FROM otlet.portable_schema_migrations;
 SQL
 )"
-[ "$contract" = "56|56|t|t|preserved|0" ] || {
+[ "$contract" = "57|57|t|t|preserved|0" ] || {
   echo "Portable repeat-install contract mismatch: $contract" >&2
   exit 1
 }
@@ -974,6 +974,88 @@ SQL
   exit 1
 }
 
+production_model_qualification_migration_contract="$(
+  docker exec -i "$container" psql -U postgres -d "$database" \
+    -X -qAt -v ON_ERROR_STOP=1 <<'SQL'
+SELECT concat_ws('|',
+  EXISTS (
+    SELECT 1
+    FROM otlet.portable_schema_migrations
+    WHERE version = 57
+      AND file ~ '0057_production_model_qualification.sql$'
+  ),
+  to_regclass('otlet.production_model_database_samples') IS NOT NULL
+    AND to_regclass('otlet.production_model_cancellation_probes') IS NOT NULL
+    AND to_regclass('otlet.production_model_qualification_status') IS NOT NULL,
+  to_regprocedure(
+    'otlet.production_model_qualification_rule_valid(jsonb)'
+  ) IS NOT NULL
+    AND to_regprocedure(
+      'otlet.record_production_model_database_sample(text,text)'
+    ) IS NOT NULL
+    AND to_regprocedure(
+      'otlet.start_production_model_cancellation_probes(text,text)'
+    ) IS NOT NULL
+    AND to_regprocedure(
+      'otlet.record_production_model_qualification(text,text,text)'
+    ) IS NOT NULL,
+  EXISTS (
+    SELECT 1
+    FROM pg_catalog.pg_constraint constraint_row
+    WHERE constraint_row.conrelid = 'otlet.workload_acceptance_events'::regclass
+      AND constraint_row.contype = 'c'
+      AND pg_catalog.pg_get_constraintdef(constraint_row.oid)
+        LIKE '%model_qualification%'
+  )
+    AND EXISTS (
+      SELECT 1
+      FROM pg_catalog.pg_indexes index_row
+      WHERE index_row.schemaname = 'otlet'
+        AND index_row.indexname =
+          'workload_acceptance_events_one_model_qualification_idx'
+    ),
+  (SELECT count(*) = 6
+   FROM pg_catalog.pg_trigger trigger
+   WHERE trigger.tgrelid IN (
+       'otlet.production_model_database_samples'::regclass,
+       'otlet.production_model_cancellation_probes'::regclass
+     )
+     AND NOT trigger.tgisinternal)
+    AND pg_get_functiondef('otlet.stamp_job_wall_clock()'::regprocedure)
+      LIKE '%cancel_requested_at := clock_timestamp()%',
+  NOT EXISTS (
+    SELECT 1
+    FROM unnest(ARRAY[
+      'otlet.production_model_qualification_rule_valid(jsonb)'::regprocedure,
+      'otlet.validate_production_model_database_sample()'::regprocedure,
+      'otlet.record_production_model_database_sample(text,text)'::regprocedure,
+      'otlet.validate_production_model_cancellation_probe()'::regprocedure,
+      'otlet.start_production_model_cancellation_probes(text,text)'::regprocedure,
+      'otlet.record_production_model_qualification(text,text,text)'::regprocedure
+    ]) function_row(oid)
+    WHERE pg_catalog.has_function_privilege('public', function_row.oid, 'EXECUTE')
+  )
+    AND NOT EXISTS (
+      SELECT 1
+      FROM unnest(ARRAY[
+        'otlet.production_model_database_samples'::regclass,
+        'otlet.production_model_cancellation_probes'::regclass,
+        'otlet.production_model_qualification_status'::regclass
+      ]) relation(oid)
+      WHERE pg_catalog.has_table_privilege(
+        'public', relation.oid,
+        'SELECT,INSERT,UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER'
+      )
+    ),
+  NOT EXISTS (SELECT 1 FROM otlet.verify_invariants())
+);
+SQL
+)"
+[ "$production_model_qualification_migration_contract" = "t|t|t|t|t|t|t" ] || {
+  echo "Portable production-model-qualification migration contract mismatch: $production_model_qualification_migration_contract" >&2
+  exit 1
+}
+
 identity_vector_contract="$(
   docker exec -i "$container" psql -U postgres -d "$database" \
     -X -qAt -v ON_ERROR_STOP=1 <<'SQL'
@@ -1391,6 +1473,7 @@ echo "portable_evaluation_migration_contract=$evaluation_migration_contract"
 echo "portable_population_lineage_migration_contract=$population_lineage_migration_contract"
 echo "portable_evaluation_slices_migration_contract=$evaluation_slices_migration_contract"
 echo "portable_label_provenance_migration_contract=$label_provenance_migration_contract"
+echo "portable_production_model_qualification_migration_contract=$production_model_qualification_migration_contract"
 echo "portable_ask_administrative_contract=$portable_ask_administrative_contract"
 echo "portable_task_lifecycle_contract=$portable_task_lifecycle_contract"
 echo "portable_model_capacity_contract=$batch_claims|$batch_capacity_contract|$concurrent_capacity_contract|$cancel_blocked_claims|$replacement_claims|$lease_capacity_contract"

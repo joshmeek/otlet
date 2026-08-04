@@ -190,5 +190,8 @@ $$;
 \set portable_migration_file ../../../otlet_pg/sql/migrations/0056_label_provenance_quality.sql
 \ir migrations/apply.sql
 
+\set portable_migration_file ../../../otlet_pg/sql/migrations/0057_production_model_qualification.sql
+\ir migrations/apply.sql
+
 \set portable_migration_file 0043_permissions.sql
 \ir migrations/apply.sql

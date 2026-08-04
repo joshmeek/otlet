@@ -286,9 +286,14 @@ pgrx::extension_sql_file!(
     requires = ["evaluation_slices_support"]
 );
 pgrx::extension_sql_file!(
+    "../sql/migrations/0057_production_model_qualification.sql",
+    name = "production_model_qualification",
+    requires = ["label_provenance_quality"]
+);
+pgrx::extension_sql_file!(
     "../sql/migrations/0043_permissions.sql",
     name = "permissions",
-    requires = ["label_provenance_quality"]
+    requires = ["production_model_qualification"]
 );
 
 #[allow(non_snake_case)]

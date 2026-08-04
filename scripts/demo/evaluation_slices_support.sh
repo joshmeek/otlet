@@ -1178,5 +1178,7 @@ FROM evaluation_slice_contract;
 SELECT 'evaluation_slices_support_contract=' || contract
 FROM evaluation_slice_contract;
 
+\ir /work/scripts/demo/production_model_qualification.sql
+
 ROLLBACK;
 SQL
