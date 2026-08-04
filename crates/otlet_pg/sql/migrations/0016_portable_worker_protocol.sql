@@ -857,10 +857,13 @@ BEGIN
     output_schema := revision_definition #> '{task,output_schema}';
     runtime_options := revision_definition #> '{runtime,effective_options}';
     decision_contract := revision_definition #> '{task,decision_contract}';
-    input_snapshot := otlet.semantic_shaped_input(
-      claimed_job.input,
-      revision_definition #> '{task,input_shaping}'
-    );
+    input_snapshot := CASE claimed_job.execution_mode
+      WHEN 'evaluation' THEN claimed_job.input
+      ELSE otlet.semantic_shaped_input(
+        claimed_job.input,
+        revision_definition #> '{task,input_shaping}'
+      )
+    END;
     prompt := otlet.portable_prompt_text(
       instruction,
       output_schema,
@@ -1125,12 +1128,13 @@ BEGIN
   );
   SELECT
     revision.definition #>> '{selection,strong_model_name}',
-    EXISTS (
-      SELECT 1
-      FROM otlet.workload_revision_heads head
-      WHERE head.task_name = j.task_name
-        AND head.active_workload_revision_hash = j.workload_revision_hash
-    )
+    j.execution_mode = 'evaluation'
+      OR EXISTS (
+        SELECT 1
+        FROM otlet.workload_revision_heads head
+        WHERE head.task_name = j.task_name
+          AND head.active_workload_revision_hash = j.workload_revision_hash
+      )
   INTO strong_model_name, revision_active
   FROM otlet.jobs j
   JOIN otlet.workload_revisions revision
@@ -1638,10 +1642,12 @@ FROM otlet.portable_workers w
 LEFT JOIN LATERAL (
   SELECT
     count(*) FILTER (
-      WHERE queued_job.workload_revision_hash = queued_head.active_workload_revision_hash
+      WHERE queued_job.execution_mode = 'evaluation'
+         OR queued_job.workload_revision_hash = queued_head.active_workload_revision_hash
     )::bigint AS queued_jobs,
     count(*) FILTER (
-      WHERE queued_job.workload_revision_hash IS DISTINCT FROM queued_head.active_workload_revision_hash
+      WHERE queued_job.execution_mode = 'production'
+        AND queued_job.workload_revision_hash IS DISTINCT FROM queued_head.active_workload_revision_hash
     )::bigint AS suspended_revision_queued_jobs
   FROM otlet.jobs queued_job
   JOIN otlet.workload_revisions queued_revision

@@ -208,6 +208,13 @@ struct InferenceCache {
     access_clock: u64,
 }
 
+fn inference_cache_for(execution_mode: &str) -> &'static Mutex<InferenceCache> {
+    match execution_mode {
+        "production" => INFERENCE_CACHE.get_or_init(|| Mutex::new(InferenceCache::default())),
+        _ => EVALUATION_INFERENCE_CACHE.get_or_init(|| Mutex::new(InferenceCache::default())),
+    }
+}
+
 impl Default for InferenceCache {
     fn default() -> Self {
         Self {
@@ -301,6 +308,7 @@ impl InferenceCache {
 }
 
 fn inference_cache_get(
+    execution_mode: &str,
     key: u64,
     row_key: u64,
     content_key: u64,
@@ -309,7 +317,7 @@ fn inference_cache_get(
     artifact_sha256: &str,
     artifact_bytes: u64,
 ) -> CacheLookup {
-    let cache = INFERENCE_CACHE.get_or_init(|| Mutex::new(InferenceCache::default()));
+    let cache = inference_cache_for(execution_mode);
     let Ok(mut cache) = cache.lock() else {
         return CacheLookup {
             raw_output: None,
@@ -357,6 +365,7 @@ fn inference_cache_get(
 }
 
 fn inference_cache_put(
+    execution_mode: &str,
     key: u64,
     row_key: u64,
     content_key: u64,
@@ -366,7 +375,7 @@ fn inference_cache_put(
     artifact_bytes: u64,
     raw_output: String,
 ) -> InferenceCacheStats {
-    let cache = INFERENCE_CACHE.get_or_init(|| Mutex::new(InferenceCache::default()));
+    let cache = inference_cache_for(execution_mode);
     let Ok(mut cache) = cache.lock() else {
         return InferenceCacheStats::default();
     };

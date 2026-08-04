@@ -26,7 +26,9 @@ SELECT
   o.id AS output_id,
   r.finished_at
 FROM otlet.inference_receipts r
-LEFT JOIN otlet.outputs o ON o.receipt_id = r.id;
+JOIN otlet.jobs j ON j.id = r.job_id
+LEFT JOIN otlet.outputs o ON o.receipt_id = r.id
+WHERE j.execution_mode = 'production';
 
 CREATE VIEW otlet.runs AS
 WITH receipt_attempts AS (
@@ -87,7 +89,8 @@ LEFT JOIN LATERAL (
   WHERE r.job_id = j.id
   ORDER BY r.attempt_index DESC, r.id DESC
   LIMIT 1
-) latest ON true;
+) latest ON true
+WHERE j.execution_mode = 'production';
 
 CREATE VIEW otlet.action_status AS
 SELECT
@@ -388,7 +391,8 @@ WITH action_items AS (
     ORDER BY sm.updated_at DESC, sm.id DESC
     LIMIT 1
   ) materialization ON true
-  WHERE (
+  WHERE j.execution_mode = 'production'
+    AND (
       (
         a.approval_status = 'required'
         AND a.status = 'proposed'
@@ -477,7 +481,8 @@ abstention_items AS (
     ORDER BY sm.updated_at DESC, sm.id DESC
     LIMIT 1
   ) materialization ON true
-  WHERE COALESCE(
+  WHERE j.execution_mode = 'production'
+    AND COALESCE(
       revision.definition #> '{task,decision_contract,abstain_values}',
       '["unclear"]'::jsonb
     ) ? (o.output ->> COALESCE(
@@ -563,7 +568,8 @@ direct_rejected_items AS (
     ORDER BY sm.updated_at DESC, sm.id DESC
     LIMIT 1
   ) materialization ON true
-  WHERE r.selection_role = 'direct'
+  WHERE j.execution_mode = 'production'
+    AND r.selection_role = 'direct'
     AND r.selection_status = 'rejected'
     AND r.selection_reason = 'direct_rejected_by_decision_contract'
     AND r.schema_validation_status = 'passed'

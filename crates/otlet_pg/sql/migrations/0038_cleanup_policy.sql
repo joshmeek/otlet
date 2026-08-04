@@ -59,6 +59,7 @@ BEGIN
     SELECT j.id
     FROM otlet.jobs j
     WHERE j.status IN ('failed', 'canceled')
+      AND j.execution_mode = 'production'
       AND (
         j.finished_at < now() - failed_job_retention_interval
         OR (
@@ -138,7 +139,12 @@ BEGIN
   SELECT count(*)
   INTO eval_count
   FROM otlet.eval_labels l
-  WHERE l.created_at < now() - eval_retention;
+  WHERE l.created_at < now() - eval_retention
+    AND NOT EXISTS (
+      SELECT 1
+      FROM otlet.evaluation_cases evaluation_case
+      WHERE evaluation_case.label_id = l.id
+    );
 
   SELECT count(*)
   INTO delete_stale_count
@@ -248,7 +254,12 @@ BEGIN
       AND jsonb_array_length(r.trace_summary #> '{detailed_trace,steps}') > 0;
 
     DELETE FROM otlet.eval_labels l
-    WHERE l.created_at < now() - eval_retention;
+    WHERE l.created_at < now() - eval_retention
+      AND NOT EXISTS (
+        SELECT 1
+        FROM otlet.evaluation_cases evaluation_case
+        WHERE evaluation_case.label_id = l.id
+      );
 
     DELETE FROM otlet.semantic_materializations sm
     WHERE sm.stale

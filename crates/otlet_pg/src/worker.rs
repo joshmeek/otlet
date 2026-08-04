@@ -141,20 +141,25 @@ pub extern "C-unwind" fn otlet_worker_main(_arg: pgrx::pg_sys::Datum) {
                 }
             };
 
-            let batch_owned = jobs.first().filter(|_| jobs.len() > 1).map(|job| {
-                let mut task_names = jobs
-                    .iter()
-                    .map(|job| job.task_name.clone())
-                    .collect::<Vec<_>>();
-                task_names.sort_unstable();
-                task_names.dedup();
-                (
-                    job.task_name.clone(),
-                    task_names,
-                    job.model_name.clone(),
-                    i64::try_from(jobs.len()).unwrap_or(i64::MAX),
-                )
-            });
+            let batch_owned = jobs
+                .first()
+                .filter(|_| {
+                    jobs.len() > 1 && jobs.iter().all(|job| job.execution_mode == "production")
+                })
+                .map(|job| {
+                    let mut task_names = jobs
+                        .iter()
+                        .map(|job| job.task_name.clone())
+                        .collect::<Vec<_>>();
+                    task_names.sort_unstable();
+                    task_names.dedup();
+                    (
+                        job.task_name.clone(),
+                        task_names,
+                        job.model_name.clone(),
+                        i64::try_from(jobs.len()).unwrap_or(i64::MAX),
+                    )
+                });
 
             let batch_start = Instant::now();
             let batch_result = process_job_batch(jobs);

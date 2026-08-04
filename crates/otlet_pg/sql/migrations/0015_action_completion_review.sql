@@ -123,7 +123,9 @@ BEGIN
   IF NOT FOUND THEN
     RAISE EXCEPTION 'otlet job workload revision is missing';
   END IF;
-  PERFORM otlet.workload_source_contract_guard(revision_definition);
+  IF job_row.execution_mode = 'production' THEN
+    PERFORM otlet.workload_source_contract_guard(revision_definition);
+  END IF;
   task_row.model_name := revision_definition #>> '{models,direct,name}';
   task_row.input_shaping := revision_definition #> '{task,input_shaping}';
   task_row.decision_contract := revision_definition #> '{task,decision_contract}';
@@ -275,6 +277,36 @@ BEGIN
       'selection_reason', complete_job.selection_reason
     )
   );
+
+  IF job_row.execution_mode = 'evaluation' THEN
+    PERFORM otlet.record_evaluation_result(
+      job_row.id,
+      saved_output.id,
+      saved_receipt.id,
+      complete_job.output,
+      complete_job.actions
+    );
+    UPDATE otlet.inference_receipts r
+    SET trace_summary = r.trace_summary
+      || jsonb_build_object(
+        'finish_sql_ms',
+        GREATEST(
+          0,
+          CEIL(EXTRACT(epoch FROM (clock_timestamp() - finish_started)) * 1000)
+        )::bigint
+      )
+      || jsonb_build_object(
+        'evidence_redaction',
+        COALESCE(r.trace_summary -> 'evidence_redaction', '{}'::jsonb)
+        || jsonb_build_object(
+          'actions', cardinality(action_redacted_fields) > 0,
+          'action_field_count', cardinality(action_redacted_fields)
+        )
+      )
+    WHERE r.id = saved_receipt.id;
+    RETURN NEXT saved_output;
+    RETURN;
+  END IF;
 
   FOR action IN SELECT value FROM jsonb_array_elements(COALESCE(complete_job.actions, '[]'::jsonb)) LOOP
     action_payload := CASE

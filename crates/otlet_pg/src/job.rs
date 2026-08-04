@@ -5,6 +5,7 @@ pub(crate) struct Job {
     pub(crate) id: i64,
     pub(crate) task_name: String,
     pub(crate) workload_revision_hash: String,
+    pub(crate) execution_mode: String,
     pub(crate) subject_id: String,
     pub(crate) instruction: String,
     pub(crate) output_schema: Value,
@@ -79,6 +80,7 @@ macro_rules! job_from_row {
             max_attempt_ms: i64::from(required_col!($row, i32, 16)),
             claim_token: required_col!($row, String, 17),
             workload_revision_hash: required_col!($row, String, 18),
+            execution_mode: required_col!($row, String, 19),
         }
     };
 }
@@ -118,7 +120,8 @@ SELECT
   definition #> '{task,decision_contract}',
   (definition #>> '{runtime,effective_max_attempt_ms}')::integer,
   j.claim_token,
-  j.workload_revision_hash
+  j.workload_revision_hash,
+  j.execution_mode
 FROM claimed
 JOIN otlet.jobs j ON j.id = claimed.id
 JOIN otlet.workload_revisions revision
@@ -130,10 +133,13 @@ CROSS JOIN LATERAL (
       WHEN j.routed_model_name IS NOT NULL THEN definition #> '{models,strong}'
       ELSE definition #> '{models,direct}'
     END AS selected_model,
-    otlet.semantic_shaped_input(
-      j.input,
-      definition #> '{task,input_shaping}'
-    ) AS shaped_input
+    CASE j.execution_mode
+      WHEN 'evaluation' THEN j.input
+      ELSE otlet.semantic_shaped_input(
+        j.input,
+        definition #> '{task,input_shaping}'
+      )
+    END AS shaped_input
 ) selected
 ORDER BY claimed.claim_order
 ",
@@ -204,6 +210,7 @@ LEFT JOIN otlet.jobs j
   ON j.task_name = revision.task_name
  AND j.workload_revision_hash = revision.workload_revision_hash
  AND j.subject_id = $2
+ AND j.execution_mode = 'production'
  AND j.status IN ('queued', 'running', 'cancel_requested')
 WHERE revision.task_name = $1
   AND revision.workload_revision_hash = $4
@@ -277,13 +284,15 @@ SELECT
   definition #> '{task,decision_contract}',
   (definition #>> '{runtime,effective_max_attempt_ms}')::integer,
   claim_token,
-  workload_revision_hash
+  workload_revision_hash,
+  execution_mode
 FROM (
   SELECT
     j.id,
     j.task_name,
     j.subject_id,
     j.workload_revision_hash,
+    j.execution_mode,
     revision.definition,
     revision.definition #> '{models,direct}' AS selected_model,
     'direct'::text AS selection_role,

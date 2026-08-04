@@ -266,9 +266,14 @@ pgrx::extension_sql_file!(
     requires = ["administrative_change_ledger"]
 );
 pgrx::extension_sql_file!(
+    "../sql/migrations/0053_replayable_evaluation.sql",
+    name = "replayable_evaluation",
+    requires = ["workload_acceptance_contract"]
+);
+pgrx::extension_sql_file!(
     "../sql/migrations/0043_permissions.sql",
     name = "permissions",
-    requires = ["workload_acceptance_contract"]
+    requires = ["replayable_evaluation"]
 );
 
 #[allow(non_snake_case)]

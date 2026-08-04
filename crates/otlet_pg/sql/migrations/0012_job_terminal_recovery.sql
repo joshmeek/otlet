@@ -361,22 +361,27 @@ BEGIN
       AND (j.leased_until IS NULL OR j.leased_until < now())
       AND (
         j.attempts >= policy_max_attempts
-        OR NOT EXISTS (
-          SELECT 1
-          FROM otlet.workload_revision_heads head
-          WHERE head.task_name = j.task_name
-            AND head.active_workload_revision_hash = j.workload_revision_hash
+        OR (
+          j.execution_mode = 'production'
+          AND NOT EXISTS (
+            SELECT 1
+            FROM otlet.workload_revision_heads head
+            WHERE head.task_name = j.task_name
+              AND head.active_workload_revision_hash = j.workload_revision_hash
+          )
         )
       )
     ORDER BY j.id
     FOR UPDATE OF j
   LOOP
-    SELECT NOT EXISTS (
-      SELECT 1
-      FROM otlet.workload_revision_heads head
-      WHERE head.task_name = job_row.task_name
-        AND head.active_workload_revision_hash = job_row.workload_revision_hash
-    ) INTO inactive_revision;
+    SELECT job_row.execution_mode = 'production'
+      AND NOT EXISTS (
+        SELECT 1
+        FROM otlet.workload_revision_heads head
+        WHERE head.task_name = job_row.task_name
+          AND head.active_workload_revision_hash = job_row.workload_revision_hash
+      )
+    INTO inactive_revision;
     IF NOT inactive_revision AND job_row.attempts < policy_max_attempts THEN
       CONTINUE;
     END IF;
@@ -458,22 +463,27 @@ BEGIN
       AND (j.leased_until IS NULL OR j.leased_until < now())
       AND (
         j.attempts >= policy_max_attempts
-        OR NOT EXISTS (
-          SELECT 1
-          FROM otlet.workload_revision_heads head
-          WHERE head.task_name = j.task_name
-            AND head.active_workload_revision_hash = j.workload_revision_hash
+        OR (
+          j.execution_mode = 'production'
+          AND NOT EXISTS (
+            SELECT 1
+            FROM otlet.workload_revision_heads head
+            WHERE head.task_name = j.task_name
+              AND head.active_workload_revision_hash = j.workload_revision_hash
+          )
         )
       )
     ORDER BY j.id
     FOR UPDATE OF j
   LOOP
-    SELECT NOT EXISTS (
-      SELECT 1
-      FROM otlet.workload_revision_heads head
-      WHERE head.task_name = job_row.task_name
-        AND head.active_workload_revision_hash = job_row.workload_revision_hash
-    ) INTO inactive_revision;
+    SELECT job_row.execution_mode = 'production'
+      AND NOT EXISTS (
+        SELECT 1
+        FROM otlet.workload_revision_heads head
+        WHERE head.task_name = job_row.task_name
+          AND head.active_workload_revision_hash = job_row.workload_revision_hash
+      )
+    INTO inactive_revision;
     IF NOT inactive_revision AND job_row.attempts < policy_max_attempts THEN
       CONTINUE;
     END IF;

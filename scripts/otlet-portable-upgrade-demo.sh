@@ -79,7 +79,7 @@ contract="$(
 SELECT concat_ws('|',
   max(version),
   count(*),
-  array_agg(version ORDER BY version) = ARRAY(SELECT generate_series(1, 52)),
+  array_agg(version ORDER BY version) = ARRAY(SELECT generate_series(1, 53)),
   bool_and(file ~ ('(^|/)' || lpad(version::text, 4, '0') || '_')),
   (SELECT value FROM public.portable_upgrade_sentinel),
   (SELECT count(*) FROM otlet.verify_invariants())
@@ -87,7 +87,7 @@ SELECT concat_ws('|',
 FROM otlet.portable_schema_migrations;
 SQL
 )"
-[ "$contract" = "52|52|t|t|preserved|0" ] || {
+[ "$contract" = "53|53|t|t|preserved|0" ] || {
   echo "Portable repeat-install contract mismatch: $contract" >&2
   exit 1
 }
@@ -549,6 +549,72 @@ SQL
   exit 1
 }
 
+evaluation_migration_contract="$(
+  docker exec -i "$container" psql -U postgres -d "$database" \
+    -X -qAt -v ON_ERROR_STOP=1 <<'SQL'
+SELECT concat_ws('|',
+  EXISTS (
+    SELECT 1
+    FROM otlet.portable_schema_migrations
+    WHERE version = 53
+      AND file ~ '0053_replayable_evaluation.sql$'
+  ),
+  EXISTS (
+    SELECT 1
+    FROM information_schema.columns
+    WHERE table_schema = 'otlet'
+      AND table_name = 'jobs'
+      AND column_name = 'execution_mode'
+  ),
+  to_regclass('otlet.evaluation_cases') IS NOT NULL,
+  to_regclass('otlet.evaluation_runs') IS NOT NULL,
+  to_regclass('otlet.evaluation_executions') IS NOT NULL,
+  to_regclass('otlet.evaluation_results') IS NOT NULL,
+  to_regclass('otlet.evaluation_case_status') IS NOT NULL,
+  to_regclass('otlet.evaluation_replay_status') IS NOT NULL,
+  to_regclass('otlet.audit_evaluation_replay_export') IS NOT NULL,
+  to_regprocedure('otlet.register_evaluation_case(bigint,text)') IS NOT NULL,
+  to_regprocedure('otlet.start_replay_evaluation(text,text[],text,text)') IS NOT NULL,
+  to_regprocedure('otlet.record_evaluation_result(bigint,bigint,bigint,jsonb,jsonb)') IS NOT NULL,
+  (SELECT count(*) = 13
+   FROM pg_catalog.pg_trigger trigger
+   WHERE trigger.tgrelid IN (
+     'otlet.evaluation_cases'::regclass,
+     'otlet.evaluation_runs'::regclass,
+     'otlet.evaluation_executions'::regclass,
+     'otlet.evaluation_results'::regclass,
+     'otlet.jobs'::regclass
+   )
+     AND trigger.tgname LIKE '%evaluation%'),
+  NOT EXISTS (
+    SELECT 1
+    FROM pg_catalog.pg_proc function
+    JOIN pg_catalog.pg_namespace namespace ON namespace.oid = function.pronamespace
+    WHERE namespace.nspname = 'otlet'
+      AND function.proname LIKE '%evaluation%'
+      AND pg_catalog.has_function_privilege('public', function.oid, 'EXECUTE')
+  ),
+  NOT EXISTS (
+    SELECT 1
+    FROM pg_catalog.pg_class relation
+    JOIN pg_catalog.pg_namespace namespace ON namespace.oid = relation.relnamespace
+    WHERE namespace.nspname = 'otlet'
+      AND relation.relname LIKE '%evaluation%'
+      AND relation.relkind IN ('r', 'p', 'v', 'm', 'f')
+      AND EXISTS (
+        SELECT 1
+        FROM pg_catalog.aclexplode(relation.relacl) privilege
+        WHERE privilege.grantee = 0
+      )
+  )
+);
+SQL
+)"
+[ "$evaluation_migration_contract" = "t|t|t|t|t|t|t|t|t|t|t|t|t|t|t" ] || {
+  echo "Portable evaluation migration contract mismatch: $evaluation_migration_contract" >&2
+  exit 1
+}
+
 identity_vector_contract="$(
   docker exec -i "$container" psql -U postgres -d "$database" \
     -X -qAt -v ON_ERROR_STOP=1 <<'SQL'
@@ -962,6 +1028,7 @@ echo "portable_application_migration_contract=$application_migration_contract"
 echo "portable_lifecycle_migration_contract=$lifecycle_migration_contract"
 echo "portable_administrative_migration_contract=$administrative_migration_contract"
 echo "portable_acceptance_migration_contract=$acceptance_migration_contract"
+echo "portable_evaluation_migration_contract=$evaluation_migration_contract"
 echo "portable_ask_administrative_contract=$portable_ask_administrative_contract"
 echo "portable_task_lifecycle_contract=$portable_task_lifecycle_contract"
 echo "portable_model_capacity_contract=$batch_claims|$batch_capacity_contract|$concurrent_capacity_contract|$cancel_blocked_claims|$replacement_claims|$lease_capacity_contract"

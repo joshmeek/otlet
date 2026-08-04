@@ -114,6 +114,7 @@ fn run_job_with_model_ref(job: &Job, model: JobModelRef<'_>) -> Result<ModelRun,
 
     let cache_lookup = if options.inference_cache && !options.generation_trace {
         inference_cache_get(
+            &job.execution_mode,
             cache_key,
             row_cache_key,
             content_cache_key,
@@ -358,6 +359,7 @@ fn run_job_with_model_ref(job: &Job, model: JobModelRef<'_>) -> Result<ModelRun,
     }
     if cache_enabled && !metrics.inference_cache_hit {
         let stats = inference_cache_put(
+            &job.execution_mode,
             context.cache_key,
             context.row_cache_key,
             context.content_cache_key,

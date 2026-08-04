@@ -1783,6 +1783,26 @@ AS $$
 DECLARE
   active_hash text;
 BEGIN
+  IF NEW.execution_mode = 'evaluation' THEN
+    IF current_setting('otlet.evaluation_append', true) IS DISTINCT FROM 'on' THEN
+      RAISE EXCEPTION 'otlet evaluation jobs must be created through the evaluation API';
+    END IF;
+    IF NEW.workload_revision_hash IS NULL THEN
+      RAISE EXCEPTION 'otlet evaluation jobs require an explicit workload revision';
+    END IF;
+    PERFORM 1
+    FROM otlet.workload_revisions revision
+    JOIN otlet.workload_revision_heads head ON head.task_name = revision.task_name
+    JOIN otlet.tasks task ON task.name = revision.task_name
+    WHERE revision.task_name = NEW.task_name
+      AND revision.workload_revision_hash = NEW.workload_revision_hash
+      AND task.lifecycle_state = 'active';
+    IF NOT FOUND THEN
+      RAISE EXCEPTION 'otlet evaluation workload revision does not belong to an active task %', NEW.task_name;
+    END IF;
+    RETURN NEW;
+  END IF;
+
   active_hash := otlet.ensure_active_workload_revision(NEW.task_name);
   IF NEW.workload_revision_hash IS NULL THEN
     NEW.workload_revision_hash := active_hash;
@@ -1802,7 +1822,8 @@ LANGUAGE plpgsql
 AS $$
 BEGIN
   IF NEW.task_name IS DISTINCT FROM OLD.task_name
-     OR NEW.workload_revision_hash IS DISTINCT FROM OLD.workload_revision_hash THEN
+     OR NEW.workload_revision_hash IS DISTINCT FROM OLD.workload_revision_hash
+     OR NEW.execution_mode IS DISTINCT FROM OLD.execution_mode THEN
     RAISE EXCEPTION 'otlet job workload revision is immutable';
   END IF;
   RETURN NEW;
@@ -1810,5 +1831,5 @@ END;
 $$;
 
 CREATE TRIGGER jobs_workload_revision_immutable
-BEFORE UPDATE OF task_name, workload_revision_hash ON otlet.jobs
+BEFORE UPDATE OF task_name, workload_revision_hash, execution_mode ON otlet.jobs
 FOR EACH ROW EXECUTE FUNCTION otlet.reject_job_workload_revision_change();

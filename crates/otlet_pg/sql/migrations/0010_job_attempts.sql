@@ -159,7 +159,8 @@ BEGIN
   IF NOT FOUND THEN
     RAISE EXCEPTION 'otlet job workload revision is missing';
   END IF;
-  IF COALESCE(record_model_attempt.selection_status, 'accepted') <> 'failed' THEN
+  IF job_row.execution_mode = 'production'
+     AND COALESCE(record_model_attempt.selection_status, 'accepted') <> 'failed' THEN
     PERFORM otlet.workload_source_contract_guard(revision_definition);
   END IF;
   task_row.name := job_row.task_name;

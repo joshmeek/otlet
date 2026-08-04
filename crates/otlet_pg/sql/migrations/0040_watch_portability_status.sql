@@ -351,6 +351,7 @@ LEFT JOIN LATERAL (
   FROM otlet.jobs job
   WHERE job.task_name = task.name
     AND job.status = 'queued'
+    AND job.execution_mode = 'production'
     AND (
       job.workload_revision_hash IS DISTINCT FROM head.active_workload_revision_hash
       OR dependency.error IS NOT NULL
@@ -361,6 +362,7 @@ LEFT JOIN LATERAL (
   FROM otlet.actions action_row
   JOIN otlet.jobs job ON job.id = action_row.job_id
   WHERE job.task_name = task.name
+    AND job.execution_mode = 'production'
     AND (
       job.workload_revision_hash IS DISTINCT FROM head.active_workload_revision_hash
       OR dependency.error IS NOT NULL
@@ -482,6 +484,7 @@ WITH watch_sources AS (
   JOIN watch_revisions revision
     ON revision.task_name = j.task_name
    AND revision.workload_revision_hash = j.workload_revision_hash
+  WHERE j.execution_mode = 'production'
   GROUP BY j.task_name
 ), action_counts AS (
   SELECT
@@ -494,6 +497,7 @@ WITH watch_sources AS (
   JOIN watch_revisions revision
     ON revision.task_name = j.task_name
    AND revision.workload_revision_hash = j.workload_revision_hash
+  WHERE j.execution_mode = 'production'
   GROUP BY j.task_name
 ), suppression AS (
   SELECT

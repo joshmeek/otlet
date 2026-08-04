@@ -172,11 +172,14 @@ $$;
 \set portable_migration_file ../../../otlet_pg/sql/migrations/0050_task_watch_operational_lifecycle.sql
 \ir migrations/apply.sql
 
-\set portable_migration_file 0043_permissions.sql
-\ir migrations/apply.sql
-
 \set portable_migration_file ../../../otlet_pg/sql/migrations/0051_administrative_change_ledger.sql
 \ir migrations/apply.sql
 
 \set portable_migration_file ../../../otlet_pg/sql/migrations/0052_workload_acceptance_contract.sql
+\ir migrations/apply.sql
+
+\set portable_migration_file ../../../otlet_pg/sql/migrations/0053_replayable_evaluation.sql
+\ir migrations/apply.sql
+
+\set portable_migration_file 0043_permissions.sql
 \ir migrations/apply.sql

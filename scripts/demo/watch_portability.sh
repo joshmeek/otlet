@@ -207,8 +207,10 @@ WITH definitions AS (
   UNION ALL SELECT pg_temp.expect_watch_import_error(row_definition || '{"model_name":"missing_model"}', false, 'model missing_model does not exist') FROM definitions
   UNION ALL SELECT pg_temp.expect_watch_import_error(jsonb_set(row_definition, '{model_artifact_identity,sha256}', to_jsonb(repeat('0', 64))), true, 'model artifact identity does not match') FROM definitions
   UNION ALL SELECT pg_temp.expect_watch_import_error(row_definition || '{"table_name":"public.missing_table"}', true, 'table public.missing_table does not exist') FROM definitions
-  UNION ALL SELECT pg_temp.expect_watch_import_error(row_definition || '{"subject_column":"missing_column"}', true, 'subject column missing_column does not exist') FROM definitions
-  UNION ALL SELECT pg_temp.expect_watch_import_error(pair_definition || jsonb_build_object('candidate_query', 'SELECT broken'), true, 'column "broken" does not exist') FROM definitions
+  UNION ALL SELECT pg_temp.expect_watch_import_error(row_definition || '{"subject_column":"missing_column"}', true, 'identity change requires retirement and pinned deletion') FROM definitions
+  UNION ALL SELECT pg_temp.expect_watch_import_error(row_definition || '{"name":"watch_import_missing_column_probe","subject_column":"missing_column"}', false, 'subject column missing_column does not exist') FROM definitions
+  UNION ALL SELECT pg_temp.expect_watch_import_error(pair_definition || jsonb_build_object('candidate_query', 'SELECT broken'), true, 'identity change requires retirement and pinned deletion') FROM definitions
+  UNION ALL SELECT pg_temp.expect_watch_import_error(pair_definition || jsonb_build_object('name', 'watch_import_broken_query_probe', 'candidate_query', 'SELECT broken'), false, 'column "broken" does not exist') FROM definitions
   UNION ALL SELECT pg_temp.expect_watch_import_error(row_definition, false, 'already exists') FROM definitions
 )
 SELECT count(*)::text || '|' || bool_and(ok)::text FROM checks;
@@ -216,8 +218,8 @@ ROLLBACK;
 SQL
 )"
 echo "watch_import_failure_contract=$watch_import_failure_contract"
-[ "$watch_import_failure_contract" = "10|true" ] || {
-  echo "Expected ten watch import failures to roll back cleanly, got $watch_import_failure_contract" >&2
+[ "$watch_import_failure_contract" = "12|true" ] || {
+  echo "Expected twelve watch import failures to roll back cleanly, got $watch_import_failure_contract" >&2
   exit 1
 }
 

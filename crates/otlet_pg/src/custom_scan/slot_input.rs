@@ -374,6 +374,7 @@ const SEMANTIC_ROW_WAIT_MATERIALIZE_STATE_SQL: &str = "WITH active AS ( \
                      WHERE j.task_name = $4 \
                        AND j.subject_id = $2 \
                        AND j.workload_revision_hash = $6 \
+                       AND j.execution_mode = 'production' \
                        AND j.status IN ('queued', 'running', 'cancel_requested') \
                      LIMIT 1 \
                    ) AS is_active \
@@ -420,6 +421,7 @@ const SEMANTIC_JOIN_WAIT_MATERIALIZE_STATE_SQL: &str = "WITH active AS ( \
                      WHERE j.task_name = $4 \
                        AND j.subject_id = $2 \
                        AND j.workload_revision_hash = $5 \
+                       AND j.execution_mode = 'production' \
                        AND j.status IN ('queued', 'running', 'cancel_requested') \
                      LIMIT 1 \
                    ) AS is_active \

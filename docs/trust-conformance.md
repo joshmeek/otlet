@@ -7,6 +7,7 @@ Otlet treats source text, imported configuration, identifiers, model files, mode
 | Surface | Assets | Principal | Authority |
 | --- | --- | --- | --- |
 | PostgreSQL | Source rows, tasks, watches, policies, jobs, receipts, outputs, reviews, actions, and execution receipts | Installer or extension owner | Full database authority and outside this threat boundary |
+| Replay evaluation | Approved post-shaping snapshots, exact revision pairs, receipts, and non-authoritative diffs | Installer or extension owner | Owner-only case and run creation; the replay path creates no action, review, materialization, or target write |
 | Native runtime | Registered GGUF files, verified artifact identity, worker process, shared memory, latches, and CustomScan state | Otlet background worker | Internal functions and tables needed to run claimed work |
 | Application | Source rows and bounded task-subject invocation | Authenticated application login through an owner-granted capability | Submit against any active task with optional owner-scoped idempotency and read or cancel owned jobs; no direct table access, administration, review/apply, retry, worker, or grant authority |
 | Operations | Review, dry run, apply, bounded application retry, cancellation, and policy status | `otlet_operator` session | Allowlisted functions and redacted views |
@@ -25,8 +26,9 @@ Deployers trust the native worker and PostgreSQL extension code. The local model
 | Task lifecycle to execution authority | Target state and expected revision pin | Owner-only transition, production-policy, task, and declared-source locks, exact revision comparison, live-work drain, unfinished job and reconciliation checks, and revision-head authority | Reject a stale pin or unsafe transition without mutation; pause and retirement remove execution authority without losing queued, dirty-source, or terminal evidence |
 | Artifact to native runtime | File path, bytes, digest, size, and GGUF structure | Registered identity, streamed SHA-256, byte count, parser check, and recheck before each load | Fail the job with a receipt and keep the worker available |
 | Source to job snapshot | Candidate query rows, source fields, application request key, and retry mode | Immutable workload revision, row, byte, queue, plan-cost, timeout, and source-field admission; authenticated owner and active-role provenance; owner-scoped key bound to a PostgreSQL-authored operation, task, and subject hash; original-snapshot retry limited to an active original revision | Queue every eligible row under one captured contract or none; return the prior keyed job for an exact retry; reject a changed payload or inactive original revision without mutation |
-| Job snapshot to model | Prompt and row text | Revision-bound shaping, prompt, schema, model artifact, selection, runtime and action contracts, local execution, and no model database credential | Fail the attempt without output or action state |
+| Job snapshot to model | Prompt and row text | Revision-bound shaping for production or one immutable approved post-shaping evaluation snapshot; revision-bound prompt, schema, model artifact, selection, runtime and action contracts; local execution; no model database credential | Fail the attempt without output or action state |
 | Model response to evidence | Raw text, JSON, trace detail, and claimed model identity | Output envelope, JSON Schema, decision contract, evidence bounds, redaction, registered model role, and receipt hashes | Store a rejected or failed receipt, or one validated output |
+| Approved label to replay result | Label, post-shaping snapshot, run key, case set, revision pair, model response, and proposed actions | Owner-only entry points, exact label-job-receipt linkage, content identities, append guards, equal case population, evaluation job mode, ordinary claim fencing, production-status isolation, accepted-receipt hashes, and read-only target preview | Reject a mismatched or stale write in one transaction, or append non-authoritative diffs without actions, reviews, records, materializations, target writes, or production status evidence |
 | Model action to workflow state | Action type, subject, target, identity, and changes | Task action allowlist, registered workflow authority, target binding, source identity, and recommendation-only default | Reject the action or keep it non-applyable |
 | Worker claim to terminal state | Worker identity, process incarnation nonce, protocol version, job ID, attempt number, and lease | Role-bound runtime allowlist, fixed-search-path RPC, current incarnation hash, attempt fence, and live-lease check | Reject unauthorized, incompatible, replaced, reclaimed, or expired workers without partial trusted state |
 | Evidence to reader | Receipts, events, traces, policies, and action state | Role grants and redacted status or export views | Deny raw tables and internal mutation functions |
@@ -91,6 +93,17 @@ action_target_drift_contract=true|true|true|true|true|true|true|true|true|true|t
 ```text
 workload_acceptance_contract=t|t|t|t|t|t|t|t|t|t|t|t|t|t|t|t
 portable_acceptance_migration_contract=t|t|t|t|t|t|t|t|t|t|t|t|t|t
+```
+
+## Replayable Evaluation Contract
+
+`./scripts/demo/replayable_evaluation.sh` creates one approved case from a labeled production receipt, changes the task contract, restores the baseline revision, and runs both exact revisions over the same post-shaping snapshot. Evaluation mode keeps the inactive candidate revision claimable and carries no authority. Both variants pass through normal claim and receipt fences and use a separate native inference cache. Production semantic in-flight, runtime aggregate, run, receipt, timing, cache, cost, review, trust, action, record, and materialization state stays unchanged
+
+The proof redacts the stored decision field and still requires the receipt-verified transient decision diff to match. It also requires read-only current-target mutation hashes, exact retry idempotency, conflicting-key rejection, rollback, append-only case, run, and result evidence, and an untouched target row. The SQL-only repeat-install proof checks migration 53, the replay surfaces, and `PUBLIC` closure
+
+```text
+replayable_evaluation_contract=t|t|t|t|t|t|t|t|t|t|t|t|t|t|t
+portable_evaluation_migration_contract=t|t|t|t|t|t|t|t|t|t|t|t|t|t|t
 ```
 
 Otlet records events from installation forward and leaves earlier history absent. Raw database-owner `GRANT` or `REVOKE` statements remain outside Otlet helper coverage until the access-policy lifecycle ships. A database or extension owner can replace or disable the guards; the planned signed checkpoints cover that stronger boundary

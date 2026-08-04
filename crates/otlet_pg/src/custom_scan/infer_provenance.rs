@@ -119,6 +119,7 @@ const INFER_NOW_PROVENANCE_AND_ROW_STATE_SQL: &str = "WITH receipt AS ( \
                        WHERE j.id = $1 \
                          AND j.task_name = $4 \
                          AND j.workload_revision_hash = $6 \
+                         AND j.execution_mode = 'production' \
                          AND head.active_workload_revision_hash = $6 \
                      ) THEN 'missing' \
                      WHEN EXISTS ( \
@@ -126,6 +127,7 @@ const INFER_NOW_PROVENANCE_AND_ROW_STATE_SQL: &str = "WITH receipt AS ( \
                        WHERE j.task_name = $4 \
                          AND j.subject_id = $2 \
                          AND j.workload_revision_hash = $6 \
+                         AND j.execution_mode = 'production' \
                          AND j.status IN ('queued', 'running', 'cancel_requested') \
                        LIMIT 1 \
                      ) AND (l.subject_id IS NULL OR l.stale) THEN 'in_flight' \
@@ -199,6 +201,7 @@ const INFER_NOW_PROVENANCE_AND_JOIN_STATE_SQL: &str = "WITH receipt AS ( \
                        WHERE j.id = $1 \
                          AND j.task_name = $5 \
                          AND j.workload_revision_hash = $6 \
+                         AND j.execution_mode = 'production' \
                          AND head.active_workload_revision_hash = $6 \
                      ) THEN 'missing' \
                      WHEN EXISTS ( \
@@ -206,6 +209,7 @@ const INFER_NOW_PROVENANCE_AND_JOIN_STATE_SQL: &str = "WITH receipt AS ( \
                        WHERE j.task_name = $5 \
                          AND j.subject_id = $3 \
                          AND j.workload_revision_hash = $6 \
+                         AND j.execution_mode = 'production' \
                          AND j.status IN ('queued', 'running', 'cancel_requested') \
                        LIMIT 1 \
                      ) AND (c.subject_id IS NULL OR c.stale) THEN 'in_flight' \

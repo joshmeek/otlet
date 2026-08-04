@@ -52,6 +52,7 @@ BEGIN
          AND ci.input IS NOT DISTINCT FROM j.input
         WHERE j.task_name = %2$L
           AND j.workload_revision_hash = %7$L
+          AND j.execution_mode = 'production'
           AND j.status = 'complete'
         ORDER BY j.subject_id, j.finished_at DESC NULLS LAST, j.id DESC
       )
@@ -251,6 +252,10 @@ BEGIN
     AND j.status = 'complete';
 
   IF NOT FOUND THEN
+    RETURN 0;
+  END IF;
+
+  IF job_row.execution_mode = 'evaluation' THEN
     RETURN 0;
   END IF;
 

@@ -244,6 +244,7 @@ CREATE TABLE otlet.jobs (
   workload_revision_hash text NOT NULL,
   subject_id text NOT NULL,
   input jsonb NOT NULL,
+  execution_mode text NOT NULL DEFAULT 'production',
   routed_model_name text REFERENCES otlet.models(name),
   status text NOT NULL DEFAULT 'queued',
   attempts int NOT NULL DEFAULT 0,
@@ -256,6 +257,7 @@ CREATE TABLE otlet.jobs (
   started_at timestamptz,
   finished_at timestamptz,
   cancel_requested_at timestamptz,
+  CHECK (execution_mode IN ('production', 'evaluation')),
   CHECK (status IN ('queued', 'running', 'complete', 'failed', 'canceled', 'cancel_requested')),
   CHECK ((status IN ('running', 'cancel_requested')) = (claim_token IS NOT NULL)),
   CHECK ((terminal_claim_token IS NULL) = (terminal_request_hash IS NULL)),
@@ -268,7 +270,8 @@ CREATE TABLE otlet.jobs (
 
 CREATE UNIQUE INDEX jobs_active_subject_idx
 ON otlet.jobs (task_name, workload_revision_hash, subject_id)
-WHERE status IN ('queued', 'running', 'cancel_requested');
+WHERE execution_mode = 'production'
+  AND status IN ('queued', 'running', 'cancel_requested');
 
 CREATE INDEX jobs_task_status_idx
 ON otlet.jobs (task_name, status);

@@ -126,7 +126,8 @@ BEGIN
     )
   FROM otlet.jobs job
   JOIN otlet.workload_revision_heads head ON head.task_name = job.task_name
-  WHERE job.created_at >= head.promoted_at
+  WHERE job.execution_mode = 'production'
+    AND job.created_at >= head.promoted_at
     AND job.workload_revision_hash IS DISTINCT FROM head.active_workload_revision_hash;
 
   RETURN QUERY
@@ -264,15 +265,16 @@ BEGIN
     JOIN otlet.jobs j ON j.status = 'queued'
     JOIN otlet.workload_revisions revision
       ON revision.workload_revision_hash = j.workload_revision_hash
-    JOIN otlet.workload_revision_heads head
+    LEFT JOIN otlet.workload_revision_heads head
       ON head.task_name = j.task_name
-     AND head.active_workload_revision_hash = j.workload_revision_hash
     CROSS JOIN LATERAL (
       SELECT COALESCE(
         j.routed_model_name,
         revision.definition #>> '{models,direct,name}'
       ) AS name
     ) m
+    WHERE j.execution_mode = 'evaluation'
+       OR head.active_workload_revision_hash = j.workload_revision_hash
     GROUP BY m.name, p.max_queued_jobs_per_model
   ) q
   WHERE q.queued_jobs > q.max_queued_jobs_per_model;
@@ -309,15 +311,16 @@ BEGIN
     JOIN otlet.jobs j ON j.status = 'queued'
     JOIN otlet.workload_revisions revision
       ON revision.workload_revision_hash = j.workload_revision_hash
-    JOIN otlet.workload_revision_heads head
+    LEFT JOIN otlet.workload_revision_heads head
       ON head.task_name = j.task_name
-     AND head.active_workload_revision_hash = j.workload_revision_hash
     CROSS JOIN LATERAL (
       SELECT COALESCE(
         j.routed_model_name,
         revision.definition #>> '{models,direct,name}'
       ) AS name
     ) m
+    WHERE j.execution_mode = 'evaluation'
+       OR head.active_workload_revision_hash = j.workload_revision_hash
     GROUP BY m.name, p.max_queued_input_bytes_per_model
   ) q
   WHERE q.queued_input_bytes > q.max_queued_input_bytes_per_model;
@@ -335,10 +338,13 @@ BEGIN
   CROSS JOIN LATERAL (
     SELECT COALESCE(sum(octet_length(j.input::text)), 0)::bigint AS queued_input_bytes
     FROM otlet.jobs j
-    JOIN otlet.workload_revision_heads head
+    LEFT JOIN otlet.workload_revision_heads head
       ON head.task_name = j.task_name
-     AND head.active_workload_revision_hash = j.workload_revision_hash
     WHERE j.status = 'queued'
+      AND (
+        j.execution_mode = 'evaluation'
+        OR head.active_workload_revision_hash = j.workload_revision_hash
+      )
   ) q
   WHERE q.queued_input_bytes > p.max_queued_input_bytes_total;
 
@@ -352,11 +358,14 @@ BEGIN
       'max_input_bytes_per_job', p.max_input_bytes_per_job
     )
   FROM otlet.jobs j
-  JOIN otlet.workload_revision_heads head
+  LEFT JOIN otlet.workload_revision_heads head
     ON head.task_name = j.task_name
-   AND head.active_workload_revision_hash = j.workload_revision_hash
   CROSS JOIN otlet.production_policy p
   WHERE j.status = 'queued'
+    AND (
+      j.execution_mode = 'evaluation'
+      OR head.active_workload_revision_hash = j.workload_revision_hash
+    )
     AND octet_length(j.input::text) > p.max_input_bytes_per_job;
 
   RETURN QUERY

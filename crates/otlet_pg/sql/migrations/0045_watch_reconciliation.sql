@@ -511,6 +511,7 @@ BEGIN
   WHERE job.task_name = watch_row.task_name
     AND job.workload_revision_hash = active_revision_hash
     AND job.subject_id = pending.subject_id
+    AND job.execution_mode = 'production'
     AND job.status IN ('queued', 'running', 'cancel_requested');
   active_other := active_other AND NOT active_current;
 
@@ -586,6 +587,7 @@ BEGIN
   WHERE job.task_name = watch_row.task_name
     AND job.workload_revision_hash = active_revision_hash
     AND job.subject_id = pending.subject_id
+    AND job.execution_mode = 'production'
     AND job.status IN ('queued', 'running', 'cancel_requested');
   IF active_current THEN
     DELETE FROM otlet.watch_reconciliation reconciliation

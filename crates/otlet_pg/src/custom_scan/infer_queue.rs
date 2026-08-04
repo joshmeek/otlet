@@ -205,6 +205,7 @@ fn wait_poll_active_or_materialize(
                      WHERE task_name = $1 \
                        AND subject_id = $2 \
                        AND workload_revision_hash = $3 \
+                       AND execution_mode = 'production' \
                        AND status IN ('queued', 'running', 'cancel_requested') \
                      LIMIT 1",
                     Some(1),

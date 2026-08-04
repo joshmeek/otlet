@@ -141,6 +141,7 @@ fn load_semantic_states(
            JOIN source_rows src ON src.subject_id = j.subject_id \
            WHERE j.task_name = $1 \
              AND j.workload_revision_hash = $3 \
+             AND j.execution_mode = 'production' \
              AND j.status IN ('queued', 'running', 'cancel_requested') \
          ), \
          semantic_state AS ( \
@@ -287,6 +288,7 @@ fn load_semantic_join_states(
                    FROM otlet.jobs j \
                    JOIN meta m ON m.task_name = j.task_name \
                    WHERE j.workload_revision_hash = $3 \
+                     AND j.execution_mode = 'production' \
                      AND j.status IN ('queued', 'running', 'cancel_requested') \
                  ), \
                  subjects AS ( \

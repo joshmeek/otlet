@@ -445,6 +445,9 @@ fn fail_attempt_with_model(
 }
 
 fn record_metrics(job: &Job, model_name: &str, metrics: &ModelMetrics) {
+    if job.execution_mode != "production" {
+        return;
+    }
     let result: pgrx::spi::Result<()> = BackgroundWorker::transaction(|| {
         pgrx::Spi::connect_mut(|client| {
             let args = [

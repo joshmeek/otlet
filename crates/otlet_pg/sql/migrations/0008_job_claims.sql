@@ -19,7 +19,10 @@ WITH policy AS (
     j.status,
     j.attempts,
     j.leased_until,
-    j.workload_revision_hash = head.active_workload_revision_hash AS active_revision
+    (
+      j.execution_mode = 'evaluation'
+      OR j.workload_revision_hash = head.active_workload_revision_hash
+    ) AS active_revision
   FROM otlet.jobs j
   JOIN otlet.workload_revisions revision
     ON revision.workload_revision_hash = j.workload_revision_hash
@@ -480,6 +483,7 @@ BEGIN
         ON revision.workload_revision_hash = j.workload_revision_hash
       WHERE j.task_name = head.task_name
         AND j.workload_revision_hash = head.active_workload_revision_hash
+        AND j.execution_mode = 'production'
         AND j.status IN ('queued', 'running', 'cancel_requested')
         AND (
           claim_jobs.requested_model_name IS NULL
@@ -504,7 +508,8 @@ BEGIN
     JOIN invalid_heads head
       ON head.task_name = j.task_name
      AND head.active_workload_revision_hash = j.workload_revision_hash
-    WHERE j.status IN ('queued', 'running', 'cancel_requested')
+    WHERE j.execution_mode = 'production'
+      AND j.status IN ('queued', 'running', 'cancel_requested')
       AND (
         claim_jobs.requested_model_name IS NULL
         OR COALESCE(
@@ -546,12 +551,14 @@ BEGIN
     FROM otlet.jobs j
     JOIN otlet.workload_revisions revision
       ON revision.workload_revision_hash = j.workload_revision_hash
-    JOIN otlet.workload_revision_heads head ON head.task_name = j.task_name
+     AND revision.task_name = j.task_name
+    LEFT JOIN otlet.workload_revision_heads head ON head.task_name = j.task_name
   ),
   eligible_tasks AS (
     SELECT
       job.task_name,
-      job.active_workload_revision_hash AS workload_revision_hash,
+      job.workload_revision_hash,
+      job.execution_mode,
       job.selected_model ->> 'name' AS model_name,
       job.selected_model ->> 'artifact_path' AS artifact_path,
       job.definition #>> '{selection,cheap_model_name}' AS policy_cheap_model_name,
@@ -583,14 +590,20 @@ BEGIN
         claim_jobs.requested_model_name IS NULL
         OR job.selected_model ->> 'name' = claim_jobs.requested_model_name
       )
-      AND otlet.source_fields_are_allowed(
-        job.input,
-        job.definition #> '{task,input_shaping}'
-      )
-      AND otlet.source_query_contract_error(
-        job.definition #> '{source,query_contract}',
-        true
-      ) IS NULL
+      AND CASE job.execution_mode
+        WHEN 'evaluation' THEN true
+        ELSE otlet.source_fields_are_allowed(
+          job.input,
+          job.definition #> '{task,input_shaping}'
+        )
+      END
+      AND CASE job.execution_mode
+        WHEN 'evaluation' THEN true
+        ELSE otlet.source_query_contract_error(
+          job.definition #> '{source,query_contract}',
+          true
+        ) IS NULL
+      END
       AND (
         claim_jobs.requested_portable_claim_contract IS NULL
         OR COALESCE((otlet.portable_runtime_option_status(
@@ -599,10 +612,14 @@ BEGIN
           claim_jobs.requested_portable_claim_contract
         ) ->> 'compatible')::boolean, false)
       )
-      AND job.workload_revision_hash = job.active_workload_revision_hash
+      AND (
+        job.execution_mode = 'evaluation'
+        OR job.workload_revision_hash = job.active_workload_revision_hash
+      )
     GROUP BY
       job.task_name,
-      job.active_workload_revision_hash,
+      job.workload_revision_hash,
+      job.execution_mode,
       job.selected_model,
       job.definition #>> '{selection,cheap_model_name}',
       job.definition #>> '{selection,strong_model_name}',
@@ -649,7 +666,7 @@ BEGIN
      AND f.lease_ms = e.lease_ms
     CROSS JOIN policy p
   ),
-  locked_tasks AS MATERIALIZED (
+  locked_production_tasks AS MATERIALIZED (
     SELECT task.*, revision.definition
     FROM same_model_tasks task
     JOIN otlet.workload_revision_heads head
@@ -658,13 +675,37 @@ BEGIN
     JOIN otlet.workload_revisions revision
       ON revision.task_name = task.task_name
      AND revision.workload_revision_hash = task.workload_revision_hash
+    WHERE task.execution_mode = 'production'
     ORDER BY task.task_rank
     FOR UPDATE OF head
+  ),
+  evaluation_tasks AS MATERIALIZED (
+    SELECT task.*, revision.definition
+    FROM same_model_tasks task
+    JOIN otlet.workload_revision_heads head
+      ON head.task_name = task.task_name
+    JOIN otlet.tasks task_state
+      ON task_state.name = task.task_name
+     AND task_state.lifecycle_state = 'active'
+    JOIN otlet.workload_revisions revision
+      ON revision.task_name = task.task_name
+     AND revision.workload_revision_hash = task.workload_revision_hash
+    WHERE task.execution_mode = 'evaluation'
+    ORDER BY task.task_rank
+    FOR UPDATE OF head
+  ),
+  locked_tasks AS MATERIALIZED (
+    SELECT * FROM locked_production_tasks
+    UNION ALL
+    SELECT * FROM evaluation_tasks
   ),
   guarded_tasks AS MATERIALIZED (
     SELECT task.*
     FROM locked_tasks task
-    WHERE otlet.workload_source_contract_guard(task.definition)::text = ''
+    WHERE CASE task.execution_mode
+      WHEN 'evaluation' THEN true
+      ELSE otlet.workload_source_contract_guard(task.definition)::text = ''
+    END
   ),
   ranked_candidates AS (
     SELECT
@@ -684,6 +725,8 @@ BEGIN
     FROM job_contracts job
     JOIN guarded_tasks f
       ON f.task_name = job.task_name
+     AND f.workload_revision_hash = job.workload_revision_hash
+     AND f.execution_mode = job.execution_mode
      AND f.model_name = job.selected_model ->> 'name'
      AND f.artifact_path IS NOT DISTINCT FROM job.selected_model ->> 'artifact_path'
     CROSS JOIN policy p
@@ -700,11 +743,17 @@ BEGIN
           AND job.attempts < p.max_attempts
         )
       )
-      AND otlet.source_fields_are_allowed(
-        job.input,
-        job.definition #> '{task,input_shaping}'
+      AND CASE job.execution_mode
+        WHEN 'evaluation' THEN true
+        ELSE otlet.source_fields_are_allowed(
+          job.input,
+          job.definition #> '{task,input_shaping}'
+        )
+      END
+      AND (
+        job.execution_mode = 'evaluation'
+        OR job.workload_revision_hash = job.active_workload_revision_hash
       )
-      AND job.workload_revision_hash = job.active_workload_revision_hash
   ),
   claimable AS (
     SELECT
@@ -738,12 +787,16 @@ BEGIN
           ON job.id = j.id
          AND job.task_name = task.task_name
          AND job.workload_revision_hash = task.workload_revision_hash
+         AND job.execution_mode = task.execution_mode
         WHERE task.task_name = candidate.task_name
           AND task.workload_revision_hash = candidate.workload_revision_hash
-          AND otlet.source_fields_are_allowed(
-            j.input,
-            job.definition #> '{task,input_shaping}'
-          )
+          AND CASE job.execution_mode
+            WHEN 'evaluation' THEN true
+            ELSE otlet.source_fields_are_allowed(
+              j.input,
+              job.definition #> '{task,input_shaping}'
+            )
+          END
       )
     ORDER BY
       candidate.task_job_rank,
@@ -839,7 +892,7 @@ BEGIN
   END IF;
 
   WITH live_claims AS MATERIALIZED (
-    SELECT j.id, revision.definition
+    SELECT j.id, j.execution_mode, revision.definition
     FROM unnest(
       renew_job_leases.job_ids,
       renew_job_leases.expected_claim_tokens
@@ -853,14 +906,20 @@ BEGIN
      AND revision.task_name = j.task_name
     WHERE j.leased_until IS NOT NULL
       AND j.leased_until >= clock_timestamp()
-      AND otlet.source_query_contract_error(
-        revision.definition #> '{source,query_contract}',
-        true
-      ) IS NULL
+      AND CASE j.execution_mode
+        WHEN 'evaluation' THEN true
+        ELSE otlet.source_query_contract_error(
+          revision.definition #> '{source,query_contract}',
+          true
+        ) IS NULL
+      END
   ), guarded_claims AS MATERIALIZED (
     SELECT live_claims.id
     FROM live_claims
-    WHERE otlet.workload_source_contract_guard(live_claims.definition)::text = ''
+    WHERE CASE live_claims.execution_mode
+      WHEN 'evaluation' THEN true
+      ELSE otlet.workload_source_contract_guard(live_claims.definition)::text = ''
+    END
   )
   SELECT count(*) INTO valid_count
   FROM guarded_claims;

@@ -664,6 +664,7 @@ BEGIN
        AND active.task_name = %2$L
        AND active.workload_revision_hash = %3$L
        AND active.subject_id = source.subject_id::text
+       AND active.execution_mode = 'production'
        AND active.status IN ('queued', 'running', 'cancel_requested')
       ORDER BY source.subject_id::text COLLATE "C" NULLS FIRST
     $sql$,
@@ -825,13 +826,16 @@ AS $$
       - (
         SELECT count(*)
         FROM otlet.jobs j
-        JOIN otlet.workload_revision_heads head
+        LEFT JOIN otlet.workload_revision_heads head
           ON head.task_name = j.task_name
-         AND head.active_workload_revision_hash = j.workload_revision_hash
         JOIN otlet.workload_revisions revision
           ON revision.task_name = j.task_name
          AND revision.workload_revision_hash = j.workload_revision_hash
         WHERE j.status = 'queued'
+          AND CASE j.execution_mode
+            WHEN 'evaluation' THEN true
+            ELSE head.active_workload_revision_hash = j.workload_revision_hash
+          END
           AND COALESCE(
             j.routed_model_name,
             revision.definition #>> '{models,direct,name}'
@@ -945,6 +949,7 @@ BEGIN
   WHERE active.task_name = admit_task_input.task_name
     AND active.workload_revision_hash = revision_hash
     AND active.subject_id = admit_task_input.subject_id
+    AND active.execution_mode = 'production'
     AND active.status IN ('queued', 'running', 'cancel_requested')
   FOR UPDATE;
   IF FOUND THEN
@@ -974,13 +979,16 @@ BEGIN
     COALESCE(sum(octet_length(j.input::text)), 0)
   INTO queued_jobs, model_queued_bytes, total_queued_bytes
   FROM otlet.jobs j
-  JOIN otlet.workload_revision_heads head
+  LEFT JOIN otlet.workload_revision_heads head
     ON head.task_name = j.task_name
-   AND head.active_workload_revision_hash = j.workload_revision_hash
   JOIN otlet.workload_revisions revision
     ON revision.task_name = j.task_name
    AND revision.workload_revision_hash = j.workload_revision_hash
-  WHERE j.status = 'queued';
+  WHERE j.status = 'queued'
+    AND CASE j.execution_mode
+      WHEN 'evaluation' THEN true
+      ELSE head.active_workload_revision_hash = j.workload_revision_hash
+    END;
 
   IF input_bytes > policy.max_input_bytes_per_job THEN
     rejection_reason := 'input_byte_cap';
@@ -1098,6 +1106,7 @@ BEGIN
   FROM otlet.jobs
   WHERE task_name = direct_task_name
     AND subject_id = direct_subject_id
+    AND execution_mode = 'production'
     AND status = 'queued';
 
   IF queued_job_id IS NULL THEN
@@ -1183,13 +1192,16 @@ BEGIN
          ), 0)::bigint AS model_queued_bytes,
          COALESCE(sum(octet_length(j.input::text)), 0)::bigint AS total_queued_bytes
        FROM otlet.jobs j
-       JOIN otlet.workload_revision_heads queued_heads
+       LEFT JOIN otlet.workload_revision_heads queued_heads
          ON queued_heads.task_name = j.task_name
-        AND queued_heads.active_workload_revision_hash = j.workload_revision_hash
        JOIN otlet.workload_revisions queued_revisions
          ON queued_revisions.task_name = j.task_name
         AND queued_revisions.workload_revision_hash = j.workload_revision_hash
        WHERE j.status = ''queued''
+         AND CASE j.execution_mode
+           WHEN ''evaluation'' THEN true
+           ELSE queued_heads.active_workload_revision_hash = j.workload_revision_hash
+         END
      ),
      bounded_input AS MATERIALIZED (
        SELECT

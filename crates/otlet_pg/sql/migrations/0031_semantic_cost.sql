@@ -96,10 +96,12 @@ BEGIN
   SELECT
     count(DISTINCT j.subject_id) FILTER (
       WHERE j.task_name = p_task_name
+        AND j.execution_mode = 'production'
         AND j.workload_revision_hash = head.active_workload_revision_hash
     )::bigint,
     count(j.id) FILTER (
       WHERE j.status IN ('running', 'cancel_requested')
+         OR j.execution_mode = 'evaluation'
          OR j.workload_revision_hash = head.active_workload_revision_hash
     )::bigint,
     COALESCE(otlet.available_model_queue_slots(p_model_name), 0)::bigint
@@ -125,6 +127,9 @@ BEGIN
   LEFT JOIN LATERAL (
     SELECT r.generate_ms::numeric AS generate_ms
     FROM otlet.inference_receipts r
+    JOIN otlet.jobs job
+      ON job.id = r.job_id
+     AND job.execution_mode = 'production'
     WHERE r.task_name = p_task_name
       AND r.model_name = p_model_name
       AND r.status = 'complete'
@@ -145,6 +150,9 @@ BEGIN
   LEFT JOIN LATERAL (
     SELECT r.generate_ms::numeric AS generate_ms
     FROM otlet.inference_receipts r
+    JOIN otlet.jobs job
+      ON job.id = r.job_id
+     AND job.execution_mode = 'production'
     WHERE task_cost.generate_ms IS NULL
       AND slot_cost.last_generate_ms IS NULL
       AND r.model_name = p_model_name

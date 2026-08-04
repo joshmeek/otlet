@@ -245,7 +245,10 @@ BEGIN
     RAISE EXCEPTION 'otlet portable result schema validation failed: %', schema_error;
   END IF;
 
-  shaped_input := otlet.semantic_shaped_input(job_row.input, task_row.input_shaping);
+  shaped_input := CASE job_row.execution_mode
+    WHEN 'evaluation' THEN job_row.input
+    ELSE otlet.semantic_shaped_input(job_row.input, task_row.input_shaping)
+  END;
   expected_input_hash := otlet.portable_json_hash(shaped_input);
   expected_schema_hash := otlet.portable_json_hash(task_row.output_schema);
   expected_runtime_hash := otlet.portable_json_hash(effective_runtime_options);
@@ -309,7 +312,10 @@ BEGIN
     RAISE EXCEPTION 'otlet portable result trace raw output hash is forged';
   END IF;
 
-  snapshot_content_hash := otlet.semantic_content_hash(job_row.input, task_row.input_shaping);
+  snapshot_content_hash := CASE job_row.execution_mode
+    WHEN 'evaluation' THEN otlet.identity_hash('semantic_content', job_row.input)
+    ELSE otlet.semantic_content_hash(job_row.input, task_row.input_shaping)
+  END;
   IF jsonb_typeof(COALESCE(job_row.input -> '_otlet_mvcc', job_row.input -> 'otlet_mvcc')) = 'object' THEN
     current_content_hash := otlet.current_task_subject_content_hash(
       task_row.name,

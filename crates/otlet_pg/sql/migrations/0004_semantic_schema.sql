@@ -234,7 +234,7 @@ BEGIN
       validate_source_input := NEW.task_name IS DISTINCT FROM OLD.task_name
         OR NEW.input IS DISTINCT FROM OLD.input;
     END IF;
-    IF validate_source_input THEN
+    IF validate_source_input AND NEW.execution_mode = 'production' THEN
       SELECT revision.definition #> '{task,input_shaping}'
       INTO task_input_shaping
       FROM otlet.workload_revisions revision

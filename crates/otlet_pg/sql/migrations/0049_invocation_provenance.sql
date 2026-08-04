@@ -169,6 +169,7 @@ BEGIN
   WHERE job.task_name = application_submit_task_subject.task_name
     AND job.workload_revision_hash = revision_hash
     AND job.subject_id = application_submit_task_subject.subject_id
+    AND job.execution_mode = 'production'
     AND job.status = 'queued'
     AND job.application_owner_role_oid IS NULL
   RETURNING job.id INTO queued_job_id;
@@ -285,6 +286,7 @@ BEGIN
   WHERE job.task_name = original_job.task_name
     AND job.workload_revision_hash = revision_hash
     AND job.subject_id = original_job.subject_id
+    AND job.execution_mode = 'production'
     AND job.status = 'queued'
     AND job.application_owner_role_oid IS NULL
   RETURNING job.id INTO queued_job_id;

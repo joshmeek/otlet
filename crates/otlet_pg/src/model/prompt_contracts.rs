@@ -57,6 +57,7 @@ static LINKED_BACKEND: OnceLock<()> = OnceLock::new();
 static LINKED_CACHE: OnceLock<Mutex<Option<LinkedCache>>> = OnceLock::new();
 
 static INFERENCE_CACHE: OnceLock<Mutex<InferenceCache>> = OnceLock::new();
+static EVALUATION_INFERENCE_CACHE: OnceLock<Mutex<InferenceCache>> = OnceLock::new();
 
 const INFERENCE_CACHE_MAX_ENTRIES: usize = 512;
 const INFERENCE_CACHE_MAX_BYTES: usize = 8 * 1024 * 1024;
