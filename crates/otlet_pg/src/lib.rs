@@ -231,9 +231,14 @@ pgrx::extension_sql_file!(
     requires = ["audit_export"]
 );
 pgrx::extension_sql_file!(
+    "../sql/migrations/0046_definition_complexity.sql",
+    name = "definition_complexity",
+    requires = ["portable_permissions"]
+);
+pgrx::extension_sql_file!(
     "../sql/migrations/0043_permissions.sql",
     name = "permissions",
-    requires = ["portable_permissions"]
+    requires = ["definition_complexity"]
 );
 
 #[allow(non_snake_case)]

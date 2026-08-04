@@ -97,6 +97,7 @@ DECLARE
   input_columns text[];
   saved otlet.watches%ROWTYPE;
 BEGIN
+  PERFORM otlet.workload_definition_complexity_guard(import_watch.definition);
   IF jsonb_typeof(import_watch.definition) IS DISTINCT FROM 'object' THEN
     RAISE EXCEPTION 'otlet watch definition must be a JSON object';
   END IF;

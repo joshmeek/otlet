@@ -192,9 +192,12 @@ SELECT
   p.policy_hash IS NOT DISTINCT FROM active.definition #>> ARRAY[
     'action_policies', p.action_type, 'authority', 'policy_hash'
   ] AS task_contract_current,
-  active.definition #> ARRAY[
-    'action_policies', p.action_type, 'authority', 'target_contract'
-  ] IS NOT DISTINCT FROM otlet.action_target_contract_descriptor(
+  otlet.identity_hash(
+    'action_target_contract',
+    active.definition #> ARRAY[
+      'action_policies', p.action_type, 'authority', 'target_contract'
+    ]
+  ) IS NOT DISTINCT FROM otlet.action_target_contract_hash(
     active.definition #>> ARRAY['action_policies', p.action_type, 'authority', 'target_name']
   )
     AND active.definition #>> ARRAY[
@@ -215,9 +218,12 @@ SELECT
     AND active.definition #>> ARRAY[
       'action_policies', p.action_type, 'authority', 'evaluation_status'
     ] = 'evaluated'
-    AND active.definition #> ARRAY[
-      'action_policies', p.action_type, 'authority', 'target_contract'
-    ] IS NOT DISTINCT FROM otlet.action_target_contract_descriptor(
+    AND otlet.identity_hash(
+      'action_target_contract',
+      active.definition #> ARRAY[
+        'action_policies', p.action_type, 'authority', 'target_contract'
+      ]
+    ) IS NOT DISTINCT FROM otlet.action_target_contract_hash(
       active.definition #>> ARRAY['action_policies', p.action_type, 'authority', 'target_name']
     )
     AND active.definition #>> ARRAY[

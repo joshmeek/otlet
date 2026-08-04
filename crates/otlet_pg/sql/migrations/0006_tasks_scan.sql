@@ -62,6 +62,15 @@ DECLARE
   schema_error text;
   saved_task otlet.tasks%ROWTYPE;
 BEGIN
+  PERFORM otlet.task_definition_complexity_guard(
+    create_task.input_query,
+    create_task.instruction,
+    create_task.output_schema,
+    actual_runtime_options,
+    actual_input_shaping,
+    actual_decision_contract,
+    actual_source_relations
+  );
   SELECT report.error
   INTO schema_error
   FROM otlet.json_schema_support_report(create_task.output_schema) report
@@ -181,6 +190,16 @@ BEGIN
       );
   END IF;
 
+  PERFORM otlet.task_definition_complexity_guard(
+    create_task.input_query,
+    create_task.instruction,
+    create_task.output_schema,
+    actual_runtime_options,
+    actual_input_shaping,
+    actual_decision_contract,
+    actual_source_relations
+  );
+
   IF NOT actual_decision_contract ? 'action_types' THEN
     actual_decision_contract := jsonb_set(actual_decision_contract, '{action_types}', '[]'::jsonb, true);
   END IF;
@@ -279,10 +298,21 @@ DECLARE
   direct_task_name text;
   direct_subject_id text;
   completed_job_id bigint;
+  input_fields jsonb;
 BEGIN
   IF jsonb_typeof(actual_input) IS DISTINCT FROM 'object' THEN
     RAISE EXCEPTION 'otlet ask input must be a JSON object';
   END IF;
+  SELECT COALESCE(jsonb_agg(input_field ORDER BY input_field), '[]'::jsonb)
+  INTO input_fields
+  FROM jsonb_object_keys(actual_input) input_field;
+  PERFORM otlet.task_definition_complexity_guard(
+    NULL,
+    ask.instruction,
+    actual_schema,
+    actual_options,
+    jsonb_build_object('source_fields', input_fields)
+  );
   direct_task_name := 'ask_v1_' || substr(right(otlet.identity_hash(
     'direct_task',
     jsonb_build_object(
@@ -290,10 +320,7 @@ BEGIN
       'instruction', ask.instruction,
       'output_schema', actual_schema,
       'runtime_options', actual_options,
-      'input_fields', (
-        SELECT COALESCE(jsonb_agg(input_field ORDER BY input_field), '[]'::jsonb)
-        FROM jsonb_object_keys(actual_input) input_field
-      )
+      'input_fields', input_fields
     )
   ), 64), 1, 24);
   direct_subject_id := 'ask_' || gen_random_uuid()::text;
@@ -361,6 +388,9 @@ BEGIN
   IF jsonb_typeof(actual_accept_field_checks) IS DISTINCT FROM 'object' THEN
     RAISE EXCEPTION 'otlet accept_field_checks must be a JSON object';
   END IF;
+  PERFORM otlet.workload_definition_complexity_guard(jsonb_build_object(
+    'selection', actual_accept_field_checks
+  ));
   IF actual_accept_field_checks ? 'answer_field'
      AND (
        jsonb_typeof(actual_accept_field_checks -> 'answer_field') IS DISTINCT FROM 'string'
@@ -1018,6 +1048,14 @@ BEGIN
   SELECT COALESCE(jsonb_agg(input_field ORDER BY input_field), '[]'::jsonb)
   INTO input_fields
   FROM jsonb_object_keys(actual_input) input_field;
+
+  PERFORM otlet.task_definition_complexity_guard(
+    NULL,
+    enqueue_ask.instruction,
+    actual_schema,
+    actual_options,
+    jsonb_build_object('source_fields', input_fields)
+  );
 
   direct_task_name := 'ask_v1_' || substr(right(otlet.identity_hash(
     'direct_task',

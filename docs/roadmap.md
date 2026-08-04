@@ -4,7 +4,7 @@ Otlet keeps model work beside PostgreSQL data and keeps PostgreSQL in charge of 
 
 The roadmap follows entity resolution and private data stewardship as the first reference workflow, from bounded candidate selection through local judgment, reviewed or corrected recommendations, labels, replay, and audit. Canonical merge and split execution remains application-owned unless its conditional gate opens
 
-This roadmap classifies shipped, release-blocking, planned, conditional, and measured work
+This roadmap classifies shipped, planned, conditional, and measured work
 
 Every shipped track needs SQL-visible state, a closed failure path, executable Docker proof with real PostgreSQL data, upgrade and rollback coverage once supported releases exist, and an explicit native or portable support statement
 
@@ -13,8 +13,7 @@ Every shipped track needs SQL-visible state, a closed failure path, executable D
 | Stage | Meaning |
 | --- | --- |
 | Current foundation | Behavior that exists in the repository and has executable proof |
-| Release-blocking contract work | A current correctness, authority, security, or operability gap that should be closed before expanding the surface |
-| Planned work | The next complete vertical slices after release-blocking contracts hold |
+| Planned work | The next complete vertical slices after the contract-safe alpha gate |
 | Conditional research | Work that remains out of scope until a named workload, deployment, or measurement justifies it |
 | Measured decision | A tested avenue that stays closed until the recorded reopen gate changes |
 
@@ -66,6 +65,7 @@ Every shipped track needs SQL-visible state, a closed failure path, executable D
 | Typed actions and review | Models propose allowlisted typed actions. Reviewers can approve, reject, correct, defer, or abstain, and one bounded `update_row` path requires target registration, dry run, freshness, approval, idempotency, and an execution receipt |
 | Evaluation labels | Operators can label approved, rejected, or corrected actions and export cases linked to source, output, receipt, model, and action identity |
 | Workload admission | PostgreSQL caps bulk rows, input bytes, queue depth, queued bytes, pair candidate cost, and pair statement time before work enters the queue |
+| Definition complexity bounds | Fixed SQL-visible limits cover instruction, query, schema, runtime, shaping, decision, complete-definition, nesting, node, identifier, source-dependency, and prompt-template work. Shared guards reject task, ask, watch, import, policy, preset, query-binding, and workload-revision mutations before expensive traversal or identity construction, and one atomic Docker fixture covers every public authoring path |
 | Evidence bounds and redaction | Source-field allowlists, payload limits, bounded trace detail, redacted operational views, and cleanup policy constrain what becomes durable evidence |
 | Native runtime containment | Model-load admission, worker RSS and cgroup checks, cancellation, lease expiry, crash recovery, and invariant checks keep native failures out of trusted state |
 | Runtime and audit status | Owner-visible SQL views expose queue, worker, cache, memory, model, receipt, review, cleanup, permission, and dependency state. Delegated auditor and operator roles receive a narrower redacted allowlist |
@@ -77,21 +77,13 @@ Every shipped track needs SQL-visible state, a closed failure path, executable D
 | Adversarial conformance | Executable cases cover prompt injection, secret canaries, Unicode identity, malicious identifiers, oversized evidence, malformed configuration, forged identity, stale claims, malformed artifacts, and oversized prompts |
 | Evidence cleanup base | Existing policy prunes old events, trace detail, labels, delete-stale materializations, sensitive evidence, and unreferenced failed or canceled jobs |
 
-## Release-blocking contract work
-
-Work in this section closes demonstrated correctness and trust gaps before Otlet expands authority or claims a supported release
-
-| Feature | Explanation |
-| --- | --- |
-| Definition complexity bounds | Bound instruction, query, schema, runtime JSON, decision contract, nesting depth, node count, identifier count, and prompt-construction work so adversarial definitions fail atomically without backend instability |
-
 ## Near-term operating hardening
 
-These tracks make the corrected core usable by applications and operators without blocking the narrower release-safety work above
+These tracks make the contract-safe core usable by applications and operators
 
 | Feature | Explanation |
 | --- | --- |
-| Runtime capability discovery | Expose supported options, schema behavior, context limits, cancellation, tracing, artifact formats, runtime revision and build features, device settings, and resource admission for each runtime after the release-blocking portable enforcement contract exists |
+| Runtime capability discovery | Expose supported options, schema behavior, context limits, cancellation, tracing, artifact formats, runtime revision and build features, device settings, and resource admission for each runtime |
 | Application invocation contract | Add a least-privilege application capability for bounded submission, own-job status and trusted-result reads, and own-job cancellation without task, model, watch, review, action, or raw-table administration |
 | Invocation provenance and caller idempotency | Persist authenticated `session_user` and the invocation role captured before privileged execution as separate fields, with `session_user` owning read and cancel authority until verified pooled identity exists. Add an optional request key, payload hash, retry lineage, and operator retry mode for original snapshot versus latest source; return the prior job for an exact retry and reject a changed payload under the same key |
 | Task and watch operational lifecycle | Add `active`, `paused`, and `retired` states with dependency inspection and safe deletion at a pinned revision. Use unpromoted revisions for drafts, worker controls for drain, and retention policy for archives |
@@ -101,7 +93,7 @@ These tracks make the corrected core usable by applications and operators withou
 
 ## Planned entity-resolution and stewardship work
 
-These tracks complete the first product loop after the release-blocking contracts hold
+These tracks complete the first product loop after the contract-safe alpha gate
 
 | Feature | Explanation |
 | --- | --- |
@@ -228,7 +220,7 @@ Start these tracks only after the named trigger exists
 | Supported worker-pool scale-out | Start after one worker misses a declared throughput SLO and an A/B run proves `OTLET_WORKER_COUNT > 1` wins under aggregate RSS and database-load gates. Add per-process identity, model-filtered placement, fairness, and drain; claim availability only with separate failure-domain placement and host-loss recovery proof |
 | Poison-job and artifact quarantine | Start when the same job revision or artifact crashes or wedges two distinct worker incarnations. Quarantine only that identity, preserve retry evidence, require explicit release or replacement, and keep transient host failure out of the count |
 | Portable transport efficiency | Start when measured `psql` startup, polling, or row encoding consumes a declared share of portable latency or connection load. First reuse a bounded process or standard PostgreSQL client; add a long-lived protocol only with cancellation, fencing, credential, backpressure, and recovery proof |
-| External runtime and model conformance kit | Start when an external maintainer adds a runtime or certifies a model family. Package the release-blocking fixture for prompt identity, claim fencing, cancellation, schema output, cheap-to-strong accounting, artifact and runtime identity, redaction, receipt parity, and recovery and reuse the portable protocol rather than creating a plugin SDK |
+| External runtime and model conformance kit | Start when an external maintainer adds a runtime or certifies a model family. Package the contract fixture for prompt identity, claim fencing, cancellation, schema output, cheap-to-strong accounting, artifact and runtime identity, redaction, receipt parity, and recovery and reuse the portable protocol rather than creating a plugin SDK |
 | Native process isolation | Start when measured llama.cpp crash or corruption risk violates the database SLO. Use a supervised helper and fenced IPC only if PostgreSQL worker restart cannot meet the contract |
 | Multi-database cluster topology | Start when one PostgreSQL cluster must host Otlet in multiple databases. Prefer one portable registration per database until native shared-memory, latch, budget, and shutdown ownership have focused proof |
 | Read-replica semantics | Start when an application needs Otlet reads from a standby. Permit redacted status and fresh-materialization reads with replay-LSN evidence and block claims, actions, cleanup, and administration |

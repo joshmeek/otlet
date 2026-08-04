@@ -515,13 +515,15 @@ AS $$
 $$;
 
 CREATE FUNCTION otlet.action_target_contract_hash(target_name text) RETURNS text
-LANGUAGE sql
+LANGUAGE plpgsql
 STABLE
 AS $$
-  SELECT otlet.identity_hash(
+BEGIN
+  RETURN otlet.identity_hash(
     'action_target_contract',
-    otlet.action_target_contract_descriptor($1)
+    otlet.bounded_action_target_contract(action_target_contract_hash.target_name)
   );
+END;
 $$;
 
 CREATE FUNCTION otlet.default_action_authority_hash(
@@ -607,7 +609,7 @@ BEGIN
   END IF;
 
   task_hash := otlet.current_task_contract_hash(register_action_workflow_policy.task_name);
-  target_contract := otlet.action_target_contract_descriptor(
+  target_contract := otlet.bounded_action_target_contract(
     register_action_workflow_policy.target_name
   );
   target_hash := otlet.identity_hash('action_target_contract', target_contract);
@@ -727,9 +729,10 @@ BEGIN
     RETURN 'action has no registered workflow authority';
   ELSIF COALESCE((policy ->> 'enabled')::boolean, false) IS NOT TRUE THEN
     RETURN 'action workflow authority is disabled';
-  ELSIF policy -> 'target_contract' IS DISTINCT FROM otlet.action_target_contract_descriptor(
-    policy ->> 'target_name'
-  ) THEN
+  ELSIF otlet.identity_hash(
+    'action_target_contract',
+    policy -> 'target_contract'
+  ) IS DISTINCT FROM otlet.action_target_contract_hash(policy ->> 'target_name') THEN
     RETURN 'action workflow target contract changed';
   ELSIF policy ->> 'target_contract_hash' IS DISTINCT FROM otlet.action_target_contract_hash(policy ->> 'target_name') THEN
     RETURN 'action workflow target contract changed';
@@ -1280,6 +1283,7 @@ CREATE FUNCTION otlet.validate_workload_revision() RETURNS trigger
 LANGUAGE plpgsql
 AS $$
 BEGIN
+  PERFORM otlet.workload_definition_complexity_guard(NEW.definition);
   IF NEW.definition ->> 'format' IS DISTINCT FROM 'otlet.workload.v1'
      OR NEW.definition #>> '{task,name}' IS DISTINCT FROM NEW.task_name THEN
     RAISE EXCEPTION 'otlet workload revision definition is invalid';
@@ -1370,6 +1374,7 @@ BEGIN
     RAISE EXCEPTION 'otlet task % does not exist', capture_workload_revision.task_name;
   END IF;
 
+  PERFORM otlet.workload_definition_complexity_guard(revision_definition);
   IF revision_definition #>> '{source,kind}' = 'pair' THEN
     SELECT
       preflight.candidate_plan,
@@ -1666,6 +1671,14 @@ BEGIN
     '{source,declared_relations}',
     COALESCE(repaired_contract -> 'declared_sources', 'null'::jsonb)
   );
+  IF repaired_definition #>> '{source,kind}' = 'pair' THEN
+    repaired_definition := jsonb_set(
+      repaired_definition,
+      '{source,candidate_query}',
+      to_jsonb(repaired_contract #>> '{query,resolved}')
+    );
+  END IF;
+  PERFORM otlet.workload_definition_complexity_guard(repaired_definition);
   IF repaired_definition #>> '{source,kind}' = 'row' THEN
     repaired_definition := jsonb_set(
       repaired_definition,
@@ -1682,13 +1695,7 @@ BEGIN
         )
       )
     );
-  END IF;
-  IF repaired_definition #>> '{source,kind}' = 'pair' THEN
-    repaired_definition := jsonb_set(
-      repaired_definition,
-      '{source,candidate_query}',
-      to_jsonb(repaired_contract #>> '{query,resolved}')
-    );
+    PERFORM otlet.workload_definition_complexity_guard(repaired_definition);
   END IF;
   PERFORM pg_catalog.set_config('search_path', raw_search_path, true);
 

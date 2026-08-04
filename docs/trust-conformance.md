@@ -20,7 +20,7 @@ Deployers trust the native worker and PostgreSQL extension code. The local model
 
 | Transition | Untrusted input | Control | Closed result |
 | --- | --- | --- | --- |
-| Configuration to registry | Task, watch, runtime, shaping, decision, and candidate SQL fields | JSON type checks, identifier constraints, allowlists, bounded candidate `EXPLAIN`, statement timeout, and transaction rollback | Reject the definition without a task, watch, or queue mutation |
+| Configuration to registry | Task, watch, runtime, shaping, decision, and candidate SQL fields | Fixed byte, depth, node, identifier, dependency, and prompt bounds before schema traversal, query binding, or hashing; allowlists, bounded candidate `EXPLAIN`, statement timeout, and transaction rollback | Reject the definition without a task, revision, watch, policy, queue, or materialization mutation |
 | Artifact to native runtime | File path, bytes, digest, size, and GGUF structure | Registered identity, streamed SHA-256, byte count, parser check, and recheck before each load | Fail the job with a receipt and keep the worker available |
 | Source to job snapshot | Candidate query rows and source fields | Immutable workload revision, row, byte, queue, plan-cost, timeout, and source-field admission | Queue every eligible row under one captured contract or none |
 | Job snapshot to model | Prompt and row text | Revision-bound shaping, prompt, schema, model artifact, selection, runtime and action contracts, local execution, and no model database credential | Fail the attempt without output or action state |

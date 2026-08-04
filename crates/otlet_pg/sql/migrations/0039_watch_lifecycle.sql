@@ -301,6 +301,30 @@ DECLARE
   cheap_model_name text;
   strong_model_name text;
 BEGIN
+  IF COALESCE(cardinality(actual_action_types), 0) > (
+       SELECT max_identifiers FROM otlet.definition_complexity_limits
+     )
+     OR COALESCE(cardinality(create_watch.input_columns), 0) > (
+       SELECT max_identifiers FROM otlet.definition_complexity_limits
+     ) THEN
+    RAISE EXCEPTION 'otlet definition complexity rejected: identifier count exceeds %',
+      (SELECT max_identifiers FROM otlet.definition_complexity_limits);
+  END IF;
+  PERFORM otlet.task_definition_complexity_guard(
+    create_watch.candidate_query,
+    create_watch.instruction,
+    create_watch.output_schema,
+    actual_runtime_options,
+    actual_input_shaping,
+    actual_decision_contract,
+    jsonb_build_object(
+      'selection_policy', actual_selection_policy,
+      'trigger_policy', actual_trigger_policy,
+      'action_types', to_jsonb(actual_action_types),
+      'input_columns', to_jsonb(create_watch.input_columns),
+      'pair_sources', actual_pair_sources
+    )
+  );
   IF create_watch.watch_name !~ '^[a-z0-9][a-z0-9_-]*$' THEN
     RAISE EXCEPTION 'otlet watch name % must be a simple identifier', create_watch.watch_name;
   END IF;

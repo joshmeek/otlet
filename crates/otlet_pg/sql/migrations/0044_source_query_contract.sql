@@ -1,3 +1,22 @@
+CREATE FUNCTION otlet.bounded_source_dependency_text(input text) RETURNS text
+LANGUAGE plpgsql
+IMMUTABLE
+STRICT
+PARALLEL SAFE
+AS $$
+BEGIN
+  IF octet_length(bounded_source_dependency_text.input) > 1048576 THEN
+    RAISE EXCEPTION 'otlet definition complexity rejected: source dependency text exceeds 1048576 bytes';
+  ELSIF regexp_count(
+    bounded_source_dependency_text.input,
+    ':(funcid|opfuncid|aggfnoid|winfnoid|opno) ([0-9]+)'
+  ) > 4096 THEN
+    RAISE EXCEPTION 'otlet definition complexity rejected: source dependency reference count exceeds 4096';
+  END IF;
+  RETURN bounded_source_dependency_text.input;
+END;
+$$;
+
 CREATE FUNCTION otlet.source_role_descriptor(role_oid oid) RETURNS jsonb
 LANGUAGE sql
 STABLE
@@ -209,10 +228,10 @@ AS $$
     'schema_usage', has_schema_privilege(execution_role_oid, namespace.oid, 'USAGE'),
     'execute_allowed', has_function_privilege(execution_role_oid, function_row.oid, 'EXECUTE'),
     'parsed_sql_body', function_row.prosqlbody IS NOT NULL,
-    'definition', CASE
+    'definition', otlet.bounded_source_dependency_text(CASE
       WHEN function_row.prokind = 'f' THEN pg_get_functiondef(function_row.oid)
       ELSE function_row.prosrc
-    END
+    END)
   )
   FROM pg_proc function_row
   JOIN pg_namespace namespace ON namespace.oid = function_row.pronamespace
@@ -320,41 +339,48 @@ AS $$
   );
 $$;
 
-CREATE FUNCTION otlet.source_query_dependencies(root_relation_oid oid)
+CREATE FUNCTION otlet.source_query_dependencies(
+  root_relation_oid oid,
+  max_rows bigint DEFAULT NULL,
+  include_internal boolean DEFAULT false
+)
 RETURNS TABLE(refclassid oid, refobjid oid, refobjsubid integer)
 LANGUAGE sql
 STABLE
 SET search_path = pg_catalog, pg_temp
 AS $$
   WITH RECURSIVE dependencies(refclassid, refobjid, refobjsubid) AS (
-    SELECT dependency.refclassid, dependency.refobjid, dependency.refobjsubid
-    FROM pg_rewrite rewrite
-    JOIN pg_depend dependency
-      ON dependency.classid = 'pg_rewrite'::regclass
-     AND dependency.objid = rewrite.oid
-    WHERE rewrite.ev_class = source_query_dependencies.root_relation_oid
-      AND dependency.deptype IN ('n', 'a')
-    UNION
-    SELECT 'pg_proc'::regclass::oid, (parsed.match)[2]::oid, 0
-    FROM pg_rewrite rewrite
-    CROSS JOIN LATERAL regexp_matches(
-      rewrite.ev_action::text,
-      ':(funcid|opfuncid|aggfnoid|winfnoid) ([0-9]+)',
-      'g'
-    ) parsed(match)
-    WHERE rewrite.ev_class = source_query_dependencies.root_relation_oid
-      AND (parsed.match)[2]::oid <> 0
-    UNION
-    SELECT 'pg_operator'::regclass::oid, (parsed.match)[1]::oid, 0
-    FROM pg_rewrite rewrite
-    CROSS JOIN LATERAL regexp_matches(
-      rewrite.ev_action::text,
-      ':opno ([0-9]+)',
-      'g'
-    ) parsed(match)
-    WHERE rewrite.ev_class = source_query_dependencies.root_relation_oid
-      AND (parsed.match)[1]::oid <> 0
-    UNION
+    SELECT root.refclassid, root.refobjid, root.refobjsubid
+    FROM (
+      SELECT dependency.refclassid, dependency.refobjid, dependency.refobjsubid
+      FROM pg_rewrite rewrite
+      JOIN pg_depend dependency
+        ON dependency.classid = 'pg_rewrite'::regclass
+       AND dependency.objid = rewrite.oid
+      WHERE rewrite.ev_class = source_query_dependencies.root_relation_oid
+        AND dependency.deptype IN ('n', 'a')
+      UNION ALL
+      SELECT 'pg_proc'::regclass::oid, (parsed.match)[2]::oid, 0
+      FROM pg_rewrite rewrite
+      CROSS JOIN LATERAL regexp_matches(
+        otlet.bounded_source_dependency_text(rewrite.ev_action::text),
+        ':(funcid|opfuncid|aggfnoid|winfnoid) ([0-9]+)',
+        'g'
+      ) parsed(match)
+      WHERE rewrite.ev_class = source_query_dependencies.root_relation_oid
+        AND (parsed.match)[2]::oid <> 0
+      UNION ALL
+      SELECT 'pg_operator'::regclass::oid, (parsed.match)[1]::oid, 0
+      FROM pg_rewrite rewrite
+      CROSS JOIN LATERAL regexp_matches(
+        otlet.bounded_source_dependency_text(rewrite.ev_action::text),
+        ':opno ([0-9]+)',
+        'g'
+      ) parsed(match)
+      WHERE rewrite.ev_class = source_query_dependencies.root_relation_oid
+        AND (parsed.match)[1]::oid <> 0
+    ) root
+    UNION ALL
     SELECT child.refclassid, child.refobjid, child.refobjsubid
     FROM dependencies parent
     CROSS JOIN LATERAL (
@@ -368,12 +394,12 @@ AS $$
         AND relation.oid = parent.refobjid
         AND relation.relkind = 'v'
         AND dependency.deptype IN ('n', 'a')
-      UNION
+      UNION ALL
       SELECT 'pg_proc'::regclass::oid, (parsed.match)[2]::oid, 0
       FROM pg_class relation
       JOIN pg_rewrite rewrite ON rewrite.ev_class = relation.oid
       CROSS JOIN LATERAL regexp_matches(
-        rewrite.ev_action::text,
+        otlet.bounded_source_dependency_text(rewrite.ev_action::text),
         ':(funcid|opfuncid|aggfnoid|winfnoid) ([0-9]+)',
         'g'
       ) parsed(match)
@@ -381,12 +407,12 @@ AS $$
         AND relation.oid = parent.refobjid
         AND relation.relkind = 'v'
         AND (parsed.match)[2]::oid <> 0
-      UNION
+      UNION ALL
       SELECT 'pg_operator'::regclass::oid, (parsed.match)[1]::oid, 0
       FROM pg_class relation
       JOIN pg_rewrite rewrite ON rewrite.ev_class = relation.oid
       CROSS JOIN LATERAL regexp_matches(
-        rewrite.ev_action::text,
+        otlet.bounded_source_dependency_text(rewrite.ev_action::text),
         ':opno ([0-9]+)',
         'g'
       ) parsed(match)
@@ -394,14 +420,14 @@ AS $$
         AND relation.oid = parent.refobjid
         AND relation.relkind = 'v'
         AND (parsed.match)[1]::oid <> 0
-      UNION
+      UNION ALL
       SELECT dependency.refclassid, dependency.refobjid, dependency.refobjsubid
       FROM pg_depend dependency
       WHERE parent.refclassid = 'pg_proc'::regclass
         AND dependency.classid = 'pg_proc'::regclass
         AND dependency.objid = parent.refobjid
         AND dependency.deptype IN ('n', 'a')
-      UNION
+      UNION ALL
       SELECT 'pg_proc'::regclass::oid, trusted_dependency.function_oid, 0
       FROM unnest(CASE parent.refobjid
         WHEN 'otlet.identity_hash(text,jsonb)'::regprocedure::oid THEN ARRAY[
@@ -418,11 +444,11 @@ AS $$
         ELSE ARRAY[]::oid[]
       END) trusted_dependency(function_oid)
       WHERE parent.refclassid = 'pg_proc'::regclass
-      UNION
+      UNION ALL
       SELECT 'pg_proc'::regclass::oid, (parsed.match)[2]::oid, 0
       FROM pg_proc function_row
       CROSS JOIN LATERAL regexp_matches(
-        function_row.prosqlbody::text,
+        otlet.bounded_source_dependency_text(function_row.prosqlbody::text),
         ':(funcid|opfuncid|aggfnoid|winfnoid) ([0-9]+)',
         'g'
       ) parsed(match)
@@ -430,11 +456,11 @@ AS $$
         AND function_row.oid = parent.refobjid
         AND function_row.prosqlbody IS NOT NULL
         AND (parsed.match)[2]::oid <> 0
-      UNION
+      UNION ALL
       SELECT 'pg_operator'::regclass::oid, (parsed.match)[1]::oid, 0
       FROM pg_proc function_row
       CROSS JOIN LATERAL regexp_matches(
-        function_row.prosqlbody::text,
+        otlet.bounded_source_dependency_text(function_row.prosqlbody::text),
         ':opno ([0-9]+)',
         'g'
       ) parsed(match)
@@ -442,7 +468,7 @@ AS $$
         AND function_row.oid = parent.refobjid
         AND function_row.prosqlbody IS NOT NULL
         AND (parsed.match)[1]::oid <> 0
-      UNION
+      UNION ALL
       SELECT dependency.refclassid, dependency.refobjid, dependency.refobjsubid
       FROM pg_policy policy
       JOIN pg_class policy_relation ON policy_relation.oid = policy.polrelid
@@ -467,13 +493,13 @@ AS $$
              OR pg_has_role(execution_role.oid, policy_role, 'MEMBER')
         )
         AND dependency.deptype IN ('n', 'a')
-      UNION
+      UNION ALL
       SELECT 'pg_proc'::regclass::oid, (parsed.match)[2]::oid, 0
       FROM pg_policy policy
       JOIN pg_class policy_relation ON policy_relation.oid = policy.polrelid
       JOIN pg_roles execution_role ON execution_role.oid = current_user::regrole::oid
       CROSS JOIN LATERAL regexp_matches(
-        COALESCE(policy.polqual::text, ''),
+        otlet.bounded_source_dependency_text(COALESCE(policy.polqual::text, '')),
         ':(funcid|opfuncid|aggfnoid|winfnoid) ([0-9]+)',
         'g'
       ) parsed(match)
@@ -494,13 +520,13 @@ AS $$
              OR pg_has_role(execution_role.oid, policy_role, 'MEMBER')
         )
         AND (parsed.match)[2]::oid <> 0
-      UNION
+      UNION ALL
       SELECT 'pg_operator'::regclass::oid, (parsed.match)[1]::oid, 0
       FROM pg_policy policy
       JOIN pg_class policy_relation ON policy_relation.oid = policy.polrelid
       JOIN pg_roles execution_role ON execution_role.oid = current_user::regrole::oid
       CROSS JOIN LATERAL regexp_matches(
-        COALESCE(policy.polqual::text, ''),
+        otlet.bounded_source_dependency_text(COALESCE(policy.polqual::text, '')),
         ':opno ([0-9]+)',
         'g'
       ) parsed(match)
@@ -522,13 +548,26 @@ AS $$
         )
         AND (parsed.match)[1]::oid <> 0
     ) child
+  ) CYCLE refclassid, refobjid, refobjsubid SET is_cycle USING dependency_path,
+  bounded AS MATERIALIZED (
+    SELECT
+      dependencies.refclassid,
+      dependencies.refobjid,
+      dependencies.refobjsubid,
+      dependencies.is_cycle
+    FROM dependencies
+    LIMIT source_query_dependencies.max_rows
   )
-  SELECT DISTINCT dependencies.refclassid, dependencies.refobjid, dependencies.refobjsubid
-  FROM dependencies
-  WHERE NOT (
-    dependencies.refclassid = 'pg_class'::regclass
-    AND dependencies.refobjid = source_query_dependencies.root_relation_oid
-  );
+  SELECT bounded.refclassid, bounded.refobjid, bounded.refobjsubid
+  FROM bounded
+  WHERE source_query_dependencies.include_internal
+     OR (
+       NOT bounded.is_cycle
+       AND NOT (
+         bounded.refclassid = 'pg_class'::regclass
+         AND bounded.refobjid = source_query_dependencies.root_relation_oid
+       )
+     );
 $$;
 
 CREATE FUNCTION otlet.build_source_query_contract(
@@ -562,6 +601,7 @@ DECLARE
   bindable_query text;
   built_contract jsonb;
 BEGIN
+  PERFORM otlet.source_query_complexity_guard(build_source_query_contract.query);
   PERFORM pg_catalog.set_config('search_path', 'pg_catalog, pg_temp', true);
   execution_role_oid := current_user::pg_catalog.regrole::pg_catalog.oid;
   probe_name := 'otlet_source_probe_' || pg_catalog.pg_backend_pid()::pg_catalog.text || '_' ||
@@ -597,6 +637,7 @@ BEGIN
   SELECT pg_catalog.to_regclass(pg_catalog.format('pg_temp.%I', probe_name))::pg_catalog.oid
   INTO probe_oid;
   PERFORM pg_catalog.set_config('search_path', 'pg_catalog, pg_temp', true);
+  PERFORM otlet.source_query_dependency_complexity_guard(probe_oid);
   SELECT COALESCE(pg_catalog.jsonb_agg(pg_catalog.jsonb_build_object(
     'oid', namespace.oid::pg_catalog.text,
     'name', namespace.nspname
@@ -643,7 +684,7 @@ BEGIN
         ON dependency.refclassid = 'pg_proc'::regclass
        AND function_row.oid = dependency.refobjid
       UNION ALL
-      SELECT function_row.proargdefaults::text
+      SELECT otlet.bounded_source_dependency_text(function_row.proargdefaults::text)
       FROM otlet.source_query_dependencies(probe_oid) dependency
       JOIN pg_proc function_row
         ON dependency.refclassid = 'pg_proc'::regclass
@@ -704,6 +745,7 @@ BEGIN
     ';[[:space:]]*$',
     ''
   ) INTO resolved_query;
+  PERFORM otlet.source_query_complexity_guard(resolved_query);
   SELECT format('%I.%I', namespace.nspname, relation.relname)
   INTO unsafe_name
   FROM otlet.source_query_dependencies(probe_oid) dependency
@@ -1489,6 +1531,15 @@ CREATE FUNCTION otlet.bind_task_source_query_contract() RETURNS trigger
 LANGUAGE plpgsql
 AS $$
 BEGIN
+  PERFORM otlet.task_definition_complexity_guard(
+    NEW.input_query,
+    NEW.instruction,
+    NEW.output_schema,
+    NEW.runtime_options,
+    NEW.input_shaping,
+    NEW.decision_contract,
+    NEW.source_relations
+  );
   IF NEW.input_query IS NULL THEN
     IF NEW.source_relations IS NOT NULL THEN
       RAISE EXCEPTION 'otlet task without input_query cannot declare source relations';
@@ -1510,12 +1561,21 @@ BEGIN
       'null'::jsonb
     );
   END IF;
+  PERFORM otlet.task_definition_complexity_guard(
+    NEW.input_query,
+    NEW.instruction,
+    NEW.output_schema,
+    NEW.runtime_options,
+    NEW.input_shaping,
+    NEW.decision_contract,
+    NEW.source_query_contract
+  );
   RETURN NEW;
 END;
 $$;
 
 CREATE TRIGGER tasks_bind_source_query_contract
-BEFORE INSERT OR UPDATE OF input_query, source_relations, source_query_contract ON otlet.tasks
+BEFORE INSERT OR UPDATE ON otlet.tasks
 FOR EACH ROW EXECUTE FUNCTION otlet.bind_task_source_query_contract();
 
 CREATE FUNCTION otlet.require_workload_source_contract(

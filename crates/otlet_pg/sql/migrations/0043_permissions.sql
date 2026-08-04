@@ -139,7 +139,7 @@ BEGIN
     'otlet.semantic_shaped_input(jsonb, jsonb), '
     'otlet.semantic_content_hash(jsonb, jsonb), '
     'otlet.action_execution_role_oid(), '
-    'otlet.action_target_contract_descriptor(text), '
+    'otlet.bounded_action_target_contract(text), '
     'otlet.action_target_contract_hash(text), '
     'otlet.action_target_validation_error(text), '
     'otlet.action_workflow_policy_error(text, text, text, text, text, boolean), '

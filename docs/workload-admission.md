@@ -17,6 +17,25 @@ The default production policy sets these limits:
 | Candidate plan cost | 1,000,000 |
 | Candidate statement timeout | 2,000 ms |
 
+Definition authoring uses fixed platform limits rather than production-policy settings:
+
+| Definition limit | Maximum |
+| --- | ---: |
+| Instruction | 64 KiB |
+| Query | 256 KiB |
+| Output schema | 256 KiB |
+| Runtime JSON | 64 KiB |
+| Input shaping | 64 KiB |
+| Decision contract | 256 KiB |
+| Complete definition | 1 MiB |
+| JSON depth | 32 |
+| JSON nodes | 8,192 |
+| Definition identifiers | 4,096 |
+| Query identifiers | 4,096 |
+| Empty-input prompt template | 256 KiB |
+
+`otlet.definition_complexity_limits` exposes the limits. `otlet.definition_complexity_status` reports the measured instruction, query, schema, runtime, shaping, decision, complete-definition, JSON, identifier, and prompt sizes for every active workload revision. Query binding also caps resolved query text and source dependencies. Task, ask, watch, import, policy, preset, query-binding, and revision writes reject excess work before schema traversal, hashing, or prompt construction, and the surrounding transaction leaves no partial registry state
+
 Each model registration sets `max_active_jobs`, with a default of one. The limit counts live claimed leases. A `running` or `cancel_requested` job consumes a slot while its lease is live. Queued, terminal, null-lease, and expired-lease jobs consume none
 
 `otlet.model_queue_status`, `otlet.production_policy_status`, and `otlet.production_status` expose current limits and queue bytes. Model and worker status also expose `active_claimed_jobs` and `available_active_job_slots`. `otlet.verify_invariants()` checks live claims, queue depth, per-job bytes, per-model bytes, and total bytes
