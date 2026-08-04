@@ -79,7 +79,7 @@ contract="$(
 SELECT concat_ws('|',
   max(version),
   count(*),
-  array_agg(version ORDER BY version) = ARRAY(SELECT generate_series(1, 57)),
+  array_agg(version ORDER BY version) = ARRAY(SELECT generate_series(1, 58)),
   bool_and(file ~ ('(^|/)' || lpad(version::text, 4, '0') || '_')),
   (SELECT value FROM public.portable_upgrade_sentinel),
   (SELECT count(*) FROM otlet.verify_invariants())
@@ -87,7 +87,7 @@ SELECT concat_ws('|',
 FROM otlet.portable_schema_migrations;
 SQL
 )"
-[ "$contract" = "57|57|t|t|preserved|0" ] || {
+[ "$contract" = "58|58|t|t|preserved|0" ] || {
   echo "Portable repeat-install contract mismatch: $contract" >&2
   exit 1
 }
@@ -576,7 +576,7 @@ SELECT concat_ws('|',
   to_regprocedure('otlet.register_evaluation_case(bigint,text,text)') IS NOT NULL,
   to_regprocedure('otlet.start_replay_evaluation(text,text[],text,text)') IS NOT NULL,
   to_regprocedure('otlet.record_evaluation_result(bigint,bigint,bigint,jsonb,jsonb)') IS NOT NULL,
-  (SELECT count(*) = 17
+  (SELECT count(*) = 18
    FROM pg_catalog.pg_trigger trigger
    WHERE trigger.tgrelid IN (
      'otlet.evaluation_cases'::regclass,
@@ -1056,6 +1056,96 @@ SQL
   exit 1
 }
 
+promotion_shadow_rollback_migration_contract="$(
+  docker exec -i "$container" psql -U postgres -d "$database" \
+    -X -qAt -v ON_ERROR_STOP=1 <<'SQL'
+SELECT concat_ws('|',
+  EXISTS (
+    SELECT 1
+    FROM otlet.portable_schema_migrations
+    WHERE version = 58
+      AND file ~ '0058_promotion_shadow_rollback.sql$'
+  ),
+  to_regclass('otlet.workload_shadow_comparison_status') IS NOT NULL
+    AND to_regclass('otlet.workload_promotion_status') IS NOT NULL,
+  to_regprocedure('otlet.validate_promotion_shadow_run()') IS NOT NULL
+    AND to_regprocedure('otlet.guard_governed_workload_promotion()') IS NOT NULL
+    AND to_regprocedure(
+      'otlet.activate_workload_promotion(text,text)'
+    ) IS NOT NULL
+    AND to_regprocedure(
+      'otlet.rollback_workload_promotion(text,text,text,text)'
+    ) IS NOT NULL,
+  EXISTS (
+    SELECT 1
+    FROM pg_catalog.pg_constraint constraint_row
+    WHERE constraint_row.conrelid = 'otlet.workload_acceptance_events'::regclass
+      AND constraint_row.contype = 'c'
+      AND pg_catalog.pg_get_constraintdef(constraint_row.oid)
+        LIKE '%promotion_activation%'
+      AND pg_catalog.pg_get_constraintdef(constraint_row.oid)
+        LIKE '%promotion_rollback%'
+  )
+    AND to_regclass(
+      'otlet.workload_acceptance_events_one_promotion_activation_idx'
+    ) IS NOT NULL
+    AND to_regclass(
+      'otlet.workload_acceptance_events_one_promotion_rollback_idx'
+    ) IS NOT NULL,
+  EXISTS (
+    SELECT 1
+    FROM pg_catalog.pg_trigger trigger
+    WHERE trigger.tgrelid = 'otlet.evaluation_runs'::regclass
+      AND trigger.tgname = 'evaluation_runs_e_promotion_shadow'
+      AND NOT trigger.tgisinternal
+  )
+    AND EXISTS (
+      SELECT 1
+      FROM pg_catalog.pg_trigger trigger
+      WHERE trigger.tgrelid = 'otlet.workload_revision_heads'::regclass
+        AND trigger.tgname = 'workload_revision_heads_governed_promotion'
+        AND NOT trigger.tgisinternal
+    )
+    AND pg_get_functiondef(
+      'otlet.promote_workload_revision(text,text,text)'::regprocedure
+    ) LIKE '%otlet.workload_revision_operation%'
+    AND pg_get_functiondef(
+      'otlet.guard_governed_workload_promotion()'::regprocedure
+    ) LIKE '%promotion_shadow%'
+    AND pg_get_functiondef(
+      'otlet.guard_governed_workload_promotion()'::regprocedure
+    ) NOT LIKE '%successor%'
+    AND pg_get_functiondef(
+      'otlet.guard_governed_workload_promotion()'::regprocedure
+    ) LIKE '%lifecycle_revision_hash%'
+    AND pg_get_functiondef(
+      'otlet.activate_workload_promotion(text,text)'::regprocedure
+    ) LIKE '%requires distinct revisions%',
+  NOT EXISTS (
+    SELECT 1
+    FROM unnest(ARRAY[
+      'otlet.validate_promotion_shadow_run()'::regprocedure,
+      'otlet.guard_governed_workload_promotion()'::regprocedure,
+      'otlet.activate_workload_promotion(text,text)'::regprocedure,
+      'otlet.rollback_workload_promotion(text,text,text,text)'::regprocedure
+    ]) function_row(oid)
+    WHERE pg_catalog.has_function_privilege('public', function_row.oid, 'EXECUTE')
+  )
+    AND NOT pg_catalog.has_table_privilege(
+      'public', 'otlet.workload_shadow_comparison_status', 'SELECT'
+    )
+    AND NOT pg_catalog.has_table_privilege(
+      'public', 'otlet.workload_promotion_status', 'SELECT'
+    ),
+  NOT EXISTS (SELECT 1 FROM otlet.verify_invariants())
+);
+SQL
+)"
+[ "$promotion_shadow_rollback_migration_contract" = "t|t|t|t|t|t|t" ] || {
+  echo "Portable promotion-shadow-rollback migration contract mismatch: $promotion_shadow_rollback_migration_contract" >&2
+  exit 1
+}
+
 identity_vector_contract="$(
   docker exec -i "$container" psql -U postgres -d "$database" \
     -X -qAt -v ON_ERROR_STOP=1 <<'SQL'
@@ -1474,6 +1564,7 @@ echo "portable_population_lineage_migration_contract=$population_lineage_migrati
 echo "portable_evaluation_slices_migration_contract=$evaluation_slices_migration_contract"
 echo "portable_label_provenance_migration_contract=$label_provenance_migration_contract"
 echo "portable_production_model_qualification_migration_contract=$production_model_qualification_migration_contract"
+echo "portable_promotion_shadow_rollback_migration_contract=$promotion_shadow_rollback_migration_contract"
 echo "portable_ask_administrative_contract=$portable_ask_administrative_contract"
 echo "portable_task_lifecycle_contract=$portable_task_lifecycle_contract"
 echo "portable_model_capacity_contract=$batch_claims|$batch_capacity_contract|$concurrent_capacity_contract|$cancel_blocked_claims|$replacement_claims|$lease_capacity_contract"

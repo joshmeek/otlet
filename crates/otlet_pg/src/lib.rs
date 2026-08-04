@@ -291,9 +291,14 @@ pgrx::extension_sql_file!(
     requires = ["label_provenance_quality"]
 );
 pgrx::extension_sql_file!(
+    "../sql/migrations/0058_promotion_shadow_rollback.sql",
+    name = "promotion_shadow_rollback",
+    requires = ["production_model_qualification"]
+);
+pgrx::extension_sql_file!(
     "../sql/migrations/0043_permissions.sql",
     name = "permissions",
-    requires = ["production_model_qualification"]
+    requires = ["promotion_shadow_rollback"]
 );
 
 #[allow(non_snake_case)]
