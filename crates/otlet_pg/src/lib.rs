@@ -355,6 +355,11 @@ pgrx::extension_sql_file!(
     name = "evidence_linked_decisions",
     requires = ["authoritative_semantic_correction"]
 );
+pgrx::extension_sql_file!(
+    "../sql/migrations/0070_review_sampling.sql",
+    name = "review_sampling",
+    requires = ["evidence_linked_decisions"]
+);
 
 #[allow(non_snake_case)]
 #[pgrx::pg_guard]

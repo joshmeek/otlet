@@ -475,6 +475,7 @@ WITH table_grants AS (
             'access_policy_status',
             'audit_receipt_export',
             'audit_decision_evidence_export',
+            'audit_review_sample_export',
             'audit_review_export',
             'audit_review_event_export',
             'audit_action_execution_export',
@@ -525,7 +526,8 @@ WITH table_grants AS (
           'source_query_binding_descriptor',
           'source_query_contract_error',
           'entity_graph_conflict_status_for_task',
-          'semantic_correction_status_for_task'
+          'semantic_correction_status_for_task',
+          'pair_constraint_contract_hash'
         )
     )::bigint AS unexpected_auditor_grants,
     count(*) FILTER (
@@ -553,6 +555,7 @@ WITH table_grants AS (
           'source_query_contract_error',
           'entity_graph_conflict_status_for_task',
           'semantic_correction_status_for_task',
+          'pair_constraint_contract_hash',
           'approve_action',
           'reject_action',
           'label_action',
@@ -562,7 +565,8 @@ WITH table_grants AS (
           'dry_run_action',
           'apply_action',
           'application_retry_job',
-          'approve_semantic_correction'
+          'approve_semantic_correction',
+          'label_review_sample'
         )
     )::bigint AS unexpected_operator_grants
   FROM information_schema.routine_privileges
@@ -594,6 +598,7 @@ WITH table_grants AS (
           'otlet.entity_graph_conflict_status_for_task(text)'::regprocedure,
           'otlet.semantic_correction_status_for_task(text)'::regprocedure,
           'otlet.approve_semantic_correction(bigint,bigint,jsonb,timestamptz,numeric,text,text)'::regprocedure,
+          'otlet.label_review_sample(bigint,text,text,text,text,text)'::regprocedure,
           'otlet.export_eval_cases(integer)'::regprocedure,
           'otlet.grant_auditor_access(regrole)'::regprocedure,
           'otlet.grant_operator_access(regrole)'::regprocedure,
@@ -652,16 +657,16 @@ CROSS JOIN definer_status;
 SQL
 )"
 echo "permission_catalog_contract=$permission_catalog_contract"
-[ "$permission_catalog_contract" = "false|0|0|0|21|22|21|32|0|0|0|0|30|30|0|3|3|3|8|8|8|true" ] || {
+[ "$permission_catalog_contract" = "false|0|0|0|22|23|22|34|0|0|0|0|31|31|0|3|3|3|8|8|8|true" ] || {
   echo "Expected exact public, auditor, operator, and owner ACLs, got $permission_catalog_contract" >&2
   exit 1
 }
 
 source "$demo_dir/review_provenance.sh"
 
-permission_contract="public=0/0/0|auditor=21/22|operator=21/32|definer=30/30|application=3/3/3|portable=8/8/8|positive=8|denied=$permission_denied_count"
+permission_contract="public=0/0/0|auditor=22/23|operator=22/34|definer=31/31|application=3/3/3|portable=8/8/8|positive=8|denied=$permission_denied_count"
 echo "permission_contract=$permission_contract"
-[ "$permission_contract" = "public=0/0/0|auditor=21/22|operator=21/32|definer=30/30|application=3/3/3|portable=8/8/8|positive=8|denied=75" ] || {
+[ "$permission_contract" = "public=0/0/0|auditor=22/23|operator=22/34|definer=31/31|application=3/3/3|portable=8/8/8|positive=8|denied=75" ] || {
   echo "Expected complete permission contract, got $permission_contract" >&2
   exit 1
 }

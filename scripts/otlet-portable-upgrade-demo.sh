@@ -20,9 +20,9 @@ install_portable() {
     -f crates/otlet_worker/sql/install.sql
 }
 
-install_portable_through_68() {
+install_portable_through_69() {
   docker exec -w /work/crates/otlet_worker/sql "$container" \
-    sed '/0069_evidence_linked_decisions.sql/,$d' migrate.sql |
+    sed '/0070_review_sampling.sql/,$d' migrate.sql |
     docker exec -i -w /work/crates/otlet_worker/sql "$container" \
       psql -U postgres -d "$database" -X -q -v ON_ERROR_STOP=1 --single-transaction
 }
@@ -62,7 +62,7 @@ SELECT format(
   'portable upgrade executable proof'
 ) \gexec
 SQL
-install_portable_through_68
+install_portable_through_69
 
 docker exec -i "$container" psql -U postgres -d "$database" \
   -X -q -v ON_ERROR_STOP=1 <<'SQL' >/dev/null
@@ -181,7 +181,7 @@ INSERT INTO otlet.jobs (
   claim_token
 ) VALUES (
   'decision_evidence_legacy',
-  'pre-0069',
+  'pre-0070',
   '{"value":"legacy"}'::jsonb,
   'running',
   1,
@@ -200,7 +200,7 @@ contract="$(
 SELECT concat_ws('|',
   max(version),
   count(*),
-  array_agg(version ORDER BY version) = ARRAY(SELECT generate_series(1, 69)),
+  array_agg(version ORDER BY version) = ARRAY(SELECT generate_series(1, 70)),
   bool_and(file ~ ('(^|/)' || lpad(version::text, 4, '0') || '_')),
   (SELECT value FROM public.portable_upgrade_sentinel),
   (SELECT count(*) FROM otlet.verify_invariants())
@@ -208,7 +208,7 @@ SELECT concat_ws('|',
 FROM otlet.portable_schema_migrations;
 SQL
 )"
-[ "$contract" = "69|69|t|t|preserved|0" ] || {
+[ "$contract" = "70|70|t|t|preserved|0" ] || {
   echo "Portable repeat-install contract mismatch: $contract" >&2
   exit 1
 }
@@ -2124,7 +2124,7 @@ SELECT concat_ws('|',
       ) = failure_reason_code
     )
     FROM otlet.failure_taxonomy),
-  (SELECT policy_version = 4
+  (SELECT policy_version = 5
           AND withheld_fields @> ARRAY['job_error', 'receipt_error']::text[]
           AND export_views @> ARRAY['otlet.failure_retry_status']::text[]
    FROM otlet.redaction_policy_status),
@@ -2732,7 +2732,8 @@ SELECT concat_ws('|',
     JOIN pg_catalog.pg_depend dependency
       ON dependency.classid = 'pg_rewrite'::regclass
      AND dependency.objid = rewrite.oid
-    WHERE rewrite.ev_class = 'otlet.review_queue'::regclass
+    WHERE rewrite.ev_class =
+        'otlet.review_queue_without_review_samples'::regclass
       AND dependency.refobjid =
         'otlet.semantic_correction_status'::regclass
   ) AND (
@@ -2824,9 +2825,9 @@ SELECT concat_ws('|',
         )
     ),
   (
-    SELECT operator_functions = 10
-      AND operator_security_definer_functions = 10
-      AND operator_fixed_search_path_functions = 10
+    SELECT operator_functions = 11
+      AND operator_security_definer_functions = 11
+      AND operator_fixed_search_path_functions = 11
     FROM otlet.access_policy_status
   ),
   (SELECT count(*) = 0 FROM otlet.semantic_correction_overrides)
@@ -2865,7 +2866,7 @@ SELECT concat_ws('|',
     ) IS NOT NULL,
   to_regclass('otlet.audit_decision_evidence_export') IS NOT NULL
     AND (
-      SELECT policy_version = 4
+      SELECT policy_version = 5
         AND export_views @>
           ARRAY['otlet.audit_decision_evidence_export']::text[]
       FROM otlet.redaction_policy_status
@@ -2911,6 +2912,599 @@ SQL
   exit 1
 }
 
+review_sampling_migration_contract="$(
+  docker exec -i "$container" psql -U postgres -d "$database" \
+    -X -qAt -v ON_ERROR_STOP=1 \
+    -v operator_role="$operator_role" \
+    -v partial_auditor_role="$partial_auditor_role" <<'SQL'
+SELECT concat_ws('|',
+  EXISTS (
+    SELECT 1
+    FROM otlet.portable_schema_migrations
+    WHERE version = 70
+      AND file LIKE '%0070_review_sampling.sql'
+  ),
+  to_regclass('otlet.review_samples') IS NOT NULL
+    AND to_regclass('otlet.audit_review_sample_export') IS NOT NULL
+    AND to_regprocedure(
+      'otlet.review_sampling_rule_error(jsonb,jsonb,jsonb)'
+    ) IS NOT NULL
+    AND to_regprocedure(
+      'otlet.record_review_sample(bigint,jsonb)'
+    ) IS NOT NULL
+    AND to_regprocedure(
+      'otlet.label_review_sample(bigint,text,text,text,text,text)'
+    ) IS NOT NULL,
+  (
+    SELECT policy_version = 5
+      AND export_views @> ARRAY['otlet.audit_review_sample_export']::text[]
+    FROM otlet.redaction_policy_status
+  ),
+  (
+    SELECT operator_functions = 11
+      AND operator_security_definer_functions = 11
+      AND operator_fixed_search_path_functions = 11
+    FROM otlet.access_policy_status
+  ),
+  pg_catalog.has_table_privilege(
+    :'operator_role',
+    'otlet.audit_review_sample_export',
+    'SELECT'
+  )
+    AND pg_catalog.has_function_privilege(
+      :'operator_role',
+      'otlet.label_review_sample(bigint,text,text,text,text,text)',
+      'EXECUTE'
+    )
+    AND pg_catalog.has_function_privilege(
+      :'operator_role',
+      'otlet.pair_constraint_contract_hash(jsonb)',
+      'EXECUTE'
+    )
+    AND NOT pg_catalog.has_table_privilege(
+      :'operator_role',
+      'otlet.review_samples',
+      'SELECT'
+    ),
+  NOT pg_catalog.has_table_privilege(
+      :'partial_auditor_role',
+      'otlet.audit_review_sample_export',
+      'SELECT'
+    )
+    AND NOT pg_catalog.has_function_privilege(
+      :'partial_auditor_role',
+      'otlet.label_review_sample(bigint,text,text,text,text,text)',
+      'EXECUTE'
+    ),
+  NOT pg_catalog.has_table_privilege(
+      'public',
+      'otlet.review_samples',
+      'SELECT'
+    )
+    AND NOT pg_catalog.has_table_privilege(
+      'public',
+      'otlet.audit_review_sample_export',
+      'SELECT'
+    )
+    AND NOT EXISTS (
+      SELECT 1
+      FROM pg_catalog.pg_proc function
+      JOIN pg_catalog.pg_namespace namespace
+        ON namespace.oid = function.pronamespace
+      WHERE namespace.nspname = 'otlet'
+        AND function.proname LIKE '%review_sampl%'
+        AND pg_catalog.has_function_privilege(
+          'public', function.oid, 'EXECUTE'
+        )
+    ),
+  NOT EXISTS (SELECT 1 FROM otlet.verify_invariants())
+);
+SQL
+)"
+[ "$review_sampling_migration_contract" = \
+  "t|t|t|t|t|t|t|t" ] || {
+  echo "Portable review-sampling migration contract mismatch: $review_sampling_migration_contract" >&2
+  exit 1
+}
+
+portable_review_sampling_contract="$(
+  docker exec -i "$container" psql -U postgres -d "$database" \
+    -X -qAt -v ON_ERROR_STOP=1 \
+    -v operator_role="$operator_role" <<'SQL'
+CREATE TEMP TABLE review_sampling_upgrade_proof (
+  case_hash text,
+  run_hash text,
+  invalid_rule_blocked boolean NOT NULL DEFAULT false,
+  redacted_class_blocked boolean NOT NULL DEFAULT false,
+  append_blocked boolean NOT NULL DEFAULT false,
+  cleanup_preserved boolean NOT NULL DEFAULT false
+);
+INSERT INTO review_sampling_upgrade_proof DEFAULT VALUES;
+
+UPDATE review_sampling_upgrade_proof
+SET redacted_class_blocked = otlet.review_sampling_rule_error(
+      '{
+        "format":"otlet.review_sampling.v1",
+        "decision_class_rates":{"same_entity":1}
+      }'::jsonb,
+      '{
+        "type":"object",
+        "properties":{"decision":{"enum":["same_entity"]}}
+      }'::jsonb,
+      '{
+        "answer_field":"decision",
+        "redact_output_fields":["decision"]
+      }'::jsonb
+    ) = 'review_sampling decision classes cannot use a redacted answer field';
+
+SELECT otlet.create_task(
+  task_name => 'review_sampling_upgrade',
+  input_query => NULL,
+  instruction => 'Return one review decision',
+  output_schema => '{
+    "type":"object",
+    "required":["decision","confidence"],
+    "additionalProperties":false,
+    "properties":{
+      "decision":{
+        "type":"string",
+        "enum":["same_entity","different_entity","other"]
+      },
+      "confidence":{
+        "type":"string",
+        "enum":["high","medium","low"]
+      }
+    }
+  }'::jsonb,
+  model_name => 'model_concurrency_probe',
+  input_shaping => '{"source_fields":["value"]}'::jsonb,
+  decision_contract => '{
+    "answer_field":"decision",
+    "confidence_field":"confidence",
+    "abstain_values":[],
+    "action_types":["note"]
+  }'::jsonb
+) \g /dev/null
+
+SELECT otlet.ensure_active_workload_revision('review_sampling_upgrade')
+  AS review_sampling_revision_hash \gset
+
+WITH thresholds AS (
+  SELECT jsonb_object_agg(
+    category,
+    jsonb_build_object(
+      'metric', category,
+      'statistic', 'rate',
+      'operator', 'lte',
+      'value', 1,
+      'unit', 'ratio',
+      'minimum_support', 1,
+      'required', true
+    )
+  ) AS definition
+  FROM unnest(ARRAY[
+    'candidate_recall',
+    'false_trust',
+    'abstention',
+    'review_age',
+    'review_minutes',
+    'freshness',
+    'latency',
+    'database_impact',
+    'unit_cost',
+    'recovery',
+    'downstream_outcome'
+  ]) category
+)
+SELECT otlet.register_workload_acceptance_contract(
+  'review_sampling_upgrade',
+  :'review_sampling_revision_hash',
+  :'review_sampling_revision_hash',
+  '{
+    "mode":"sample",
+    "rule":{
+      "kind":"stable_hash",
+      "basis":"subject_id",
+      "rate":1,
+      "review_sampling":{
+        "format":"otlet.review_sampling.v1",
+        "task_rate":1,
+        "decision_class_rates":{
+          "same_entity":1,
+          "different_entity":0
+        },
+        "action_free_rate":1
+      }
+    }
+  }'::jsonb,
+  clock_timestamp() + interval '100 milliseconds',
+  clock_timestamp() + interval '1 day',
+  '{"name":"active_revision","definition":{"kind":"workload_revision"}}',
+  thresholds.definition
+) AS review_sampling_contract_hash
+FROM thresholds
+\gset
+
+DO $body$
+DECLARE
+  thresholds jsonb;
+  revision_hash text;
+  contract_hash text;
+BEGIN
+  SELECT
+    contract.definition -> 'thresholds',
+    contract.candidate_workload_revision_hash,
+    contract.contract_hash
+  INTO thresholds, revision_hash, contract_hash
+  FROM otlet.workload_acceptance_contracts contract
+  WHERE contract.task_name = 'review_sampling_upgrade'
+    AND NOT EXISTS (
+      SELECT 1
+      FROM otlet.workload_acceptance_contracts successor
+      WHERE successor.task_name = contract.task_name
+        AND successor.supersedes_contract_hash = contract.contract_hash
+    );
+  BEGIN
+    PERFORM otlet.register_workload_acceptance_contract(
+      'review_sampling_upgrade',
+      revision_hash,
+      revision_hash,
+      '{
+        "mode":"sample",
+        "rule":{
+          "kind":"stable_hash",
+          "basis":"subject_id",
+          "rate":1,
+          "review_sampling":{
+            "format":"otlet.review_sampling.v1",
+            "task_rate":2
+          }
+        }
+      }'::jsonb,
+      clock_timestamp() + interval '1 hour',
+      clock_timestamp() + interval '1 day',
+      '{"name":"active_revision","definition":{"kind":"workload_revision"}}',
+      thresholds,
+      contract_hash
+    );
+  EXCEPTION WHEN OTHERS THEN
+    UPDATE review_sampling_upgrade_proof
+    SET invalid_rule_blocked = SQLERRM LIKE '%task_rate must be between 0 and 1%';
+  END;
+END
+$body$;
+
+SELECT pg_sleep(0.12) \g /dev/null
+
+DO $body$
+DECLARE
+  revision_hash text := (
+    SELECT active_workload_revision_hash
+    FROM otlet.workload_revision_heads
+    WHERE task_name = 'review_sampling_upgrade'
+  );
+  fixture record;
+  output jsonb;
+  raw_output text;
+  job_id bigint;
+BEGIN
+  FOR fixture IN
+    SELECT *
+    FROM (VALUES
+      ('action-free', 'different_entity', '[]'::jsonb),
+      (
+        'class',
+        'same_entity',
+        '[{"type":"note","body":{"subject_id":"class","text":"review"}}]'::jsonb
+      ),
+      (
+        'task',
+        'other',
+        '[{"type":"note","body":{"subject_id":"task","text":"review"}}]'::jsonb
+      ),
+      (
+        'excluded',
+        'different_entity',
+        '[{"type":"note","body":{"subject_id":"excluded","text":"review"}}]'::jsonb
+      )
+    ) item(subject_id, decision_class, actions)
+  LOOP
+    INSERT INTO otlet.jobs (
+      task_name,
+      workload_revision_hash,
+      subject_id,
+      input,
+      status,
+      attempts,
+      started_at,
+      leased_until,
+      claim_token
+    ) VALUES (
+      'review_sampling_upgrade',
+      revision_hash,
+      fixture.subject_id,
+      jsonb_build_object('value', fixture.subject_id),
+      'running',
+      1,
+      clock_timestamp(),
+      clock_timestamp() + interval '5 minutes',
+      'review-sampling-upgrade-' || fixture.subject_id
+    ) RETURNING id INTO job_id;
+    output := jsonb_build_object(
+      'decision', fixture.decision_class,
+      'confidence', 'high'
+    );
+    raw_output := jsonb_build_object(
+      'output', output,
+      'actions', fixture.actions
+    )::text;
+    PERFORM *
+    FROM otlet.complete_job(
+      job_id => job_id,
+      output => output,
+      raw_output => raw_output,
+      actions => fixture.actions,
+      raw_output_hash => otlet.portable_text_hash(raw_output),
+      trace_summary => '{"schema_validation_status":"passed"}',
+      model_name => 'model_concurrency_probe',
+      expected_claim_token =>
+        'review-sampling-upgrade-' || fixture.subject_id
+    );
+  END LOOP;
+END
+$body$;
+
+SELECT count(*)
+FROM otlet.complete_job(
+  job_id => (
+    SELECT id
+    FROM otlet.jobs
+    WHERE task_name = 'review_sampling_upgrade'
+      AND subject_id = 'action-free'
+  ),
+  output => '{"decision":"different_entity","confidence":"high"}',
+  raw_output => jsonb_build_object(
+    'output',
+    '{"decision":"different_entity","confidence":"high"}'::jsonb,
+    'actions',
+    '[]'::jsonb
+  )::text,
+  actions => '[]',
+  raw_output_hash => otlet.portable_text_hash(
+    jsonb_build_object(
+      'output',
+      '{"decision":"different_entity","confidence":"high"}'::jsonb,
+      'actions',
+      '[]'::jsonb
+    )::text
+  ),
+  trace_summary => '{"schema_validation_status":"passed"}',
+  model_name => 'model_concurrency_probe',
+  expected_claim_token => 'review-sampling-upgrade-action-free'
+) \g /dev/null
+
+SET ROLE :"operator_role";
+SELECT count(*)
+FROM otlet.label_review_sample(
+  (
+    SELECT receipt_id
+    FROM otlet.audit_review_sample_export
+    WHERE task_name = 'review_sampling_upgrade'
+      AND action_free
+  ),
+  'different_entity',
+  'high',
+  'none',
+  'approve',
+  'Confirmed action-free sample'
+) \g /dev/null
+RESET ROLE;
+
+SELECT otlet.cleanup_eval_label_series(
+  clock_timestamp() + interval '1 second',
+  false
+) \g /dev/null
+
+UPDATE review_sampling_upgrade_proof
+SET cleanup_preserved = (
+      SELECT count(*) = 1
+      FROM otlet.eval_labels label
+      JOIN otlet.review_samples sample ON sample.receipt_id = label.receipt_id
+      WHERE sample.task_name = 'review_sampling_upgrade'
+        AND sample.action_free
+    )
+    AND NOT EXISTS (
+      SELECT 1
+      FROM otlet.review_queue queue
+      JOIN otlet.review_samples sample
+        ON sample.receipt_id = queue.receipt_id
+      WHERE sample.task_name = 'review_sampling_upgrade'
+        AND sample.action_free
+    );
+
+UPDATE review_sampling_upgrade_proof
+SET case_hash = otlet.register_evaluation_case(
+  (
+    SELECT label.id
+    FROM otlet.eval_labels label
+    JOIN otlet.review_samples sample ON sample.receipt_id = label.receipt_id
+    WHERE sample.task_name = 'review_sampling_upgrade'
+      AND sample.action_free
+  ),
+  'tuning',
+  'Explicit sampled outcome case'
+);
+
+UPDATE review_sampling_upgrade_proof
+SET run_hash = otlet.start_replay_evaluation(
+  :'review_sampling_contract_hash',
+  ARRAY[case_hash],
+  'review-sampling-upgrade-action-free-v1',
+  'Replay the explicit action-free sample'
+);
+
+UPDATE otlet.jobs job
+SET status = 'running',
+    attempts = 1,
+    started_at = clock_timestamp(),
+    leased_until = clock_timestamp() + interval '5 minutes',
+    claim_token = gen_random_uuid()::text
+FROM otlet.evaluation_executions execution
+JOIN review_sampling_upgrade_proof proof
+  ON proof.run_hash = execution.run_hash
+WHERE execution.job_id = job.id;
+
+DO $body$
+DECLARE
+  execution record;
+  output jsonb := '{"decision":"different_entity","confidence":"high"}'::jsonb;
+  raw_output text;
+BEGIN
+  raw_output := jsonb_build_object('output', output, 'actions', '[]'::jsonb)::text;
+  FOR execution IN
+    SELECT job.id, job.started_at, job.claim_token
+    FROM otlet.evaluation_executions evaluated
+    JOIN otlet.jobs job ON job.id = evaluated.job_id
+    JOIN review_sampling_upgrade_proof proof
+      ON proof.run_hash = evaluated.run_hash
+    ORDER BY evaluated.variant
+  LOOP
+    PERFORM otlet.complete_job(
+      job_id => execution.id,
+      output => output,
+      raw_output => raw_output,
+      actions => '[]'::jsonb,
+      raw_output_hash => otlet.portable_text_hash(raw_output),
+      started_at => execution.started_at,
+      trace_summary => '{"schema_validation_status":"passed","generate_ms":1}',
+      model_name => 'model_concurrency_probe',
+      expected_claim_token => execution.claim_token
+    );
+  END LOOP;
+END
+$body$;
+
+DO $body$
+BEGIN
+  BEGIN
+    UPDATE otlet.review_samples
+    SET sample_rate = sample_rate
+    WHERE task_name = 'review_sampling_upgrade';
+  EXCEPTION WHEN OTHERS THEN
+    UPDATE review_sampling_upgrade_proof
+    SET append_blocked = SQLERRM = 'otlet review samples are append only';
+  END;
+END
+$body$;
+
+SELECT concat_ws('|',
+  (
+    SELECT count(*) = 3
+      AND count(*) FILTER (WHERE sampling_scope = 'task') = 1
+      AND count(*) FILTER (WHERE sampling_scope = 'decision_class') = 1
+      AND count(*) FILTER (WHERE sampling_scope = 'action_free') = 1
+      AND count(*) FILTER (
+        WHERE job.subject_id = 'excluded'
+      ) = 0
+    FROM otlet.review_samples sample
+    JOIN otlet.jobs job ON job.id = sample.job_id
+    WHERE sample.task_name = 'review_sampling_upgrade'
+  ),
+  (
+    SELECT count(*) = 2
+      AND bool_and(queue_kind = 'sampled_output')
+    FROM otlet.review_queue
+    WHERE task_name = 'review_sampling_upgrade'
+  ),
+  (
+    SELECT count(*) = 3
+      AND count(*) FILTER (WHERE label_id IS NOT NULL) = 1
+      AND count(*) FILTER (
+        WHERE evaluation_population = 'tuning'
+      ) = 1
+    FROM otlet.audit_review_sample_export
+    WHERE task_name = 'review_sampling_upgrade'
+  ),
+  (
+    SELECT count(*) = 1
+      AND bool_and(label.action_id IS NULL)
+      AND bool_and(label.expected_action_type = 'none')
+      AND bool_and(label.adjudication_state = 'pending')
+    FROM otlet.eval_labels label
+    JOIN otlet.review_samples sample ON sample.receipt_id = label.receipt_id
+    WHERE sample.task_name = 'review_sampling_upgrade'
+  ),
+  (
+    SELECT count(*) = 1
+      AND bool_and(outcome = 'approve')
+      AND bool_and(action_id IS NULL)
+    FROM otlet.review_events event
+    WHERE event.task_name = 'review_sampling_upgrade'
+  ),
+  (
+    SELECT count(*) = 1
+      AND bool_and(population_kind = 'tuning')
+    FROM otlet.evaluation_cases evaluation_case
+    WHERE evaluation_case.task_name = 'review_sampling_upgrade'
+  )
+    AND (SELECT count(*) = 1
+         FROM otlet.evaluation_runs run
+         JOIN review_sampling_upgrade_proof proof
+           ON proof.run_hash = run.run_hash)
+    AND (SELECT count(*) = 2
+         FROM otlet.evaluation_results result
+         JOIN review_sampling_upgrade_proof proof
+           ON proof.run_hash = result.run_hash
+         WHERE (result.approval_diff ->> 'expected_action_present')::boolean
+           AND (result.approval_diff ->> 'matches_expected')::boolean
+           AND result.approval_diff -> 'proposed_action_types' = '[]'::jsonb
+           AND result.approval_diff -> 'valid_action_types' = '[]'::jsonb)
+    AND NOT EXISTS (
+      SELECT 1
+      FROM otlet.workload_acceptance_events event
+      WHERE event.contract_hash = :'review_sampling_contract_hash'
+        AND event.event_kind = 'promotion_decision'
+  ),
+  (
+    SELECT count(*) = 1
+    FROM otlet.jobs job
+    WHERE job.task_name = 'review_sampling_upgrade'
+      AND job.subject_id = 'action-free'
+      AND (SELECT count(*) FROM otlet.inference_receipts receipt
+           WHERE receipt.job_id = job.id) = 1
+      AND (SELECT count(*) FROM otlet.outputs output
+           WHERE output.job_id = job.id) = 1
+      AND (SELECT count(*) FROM otlet.review_samples sample
+           WHERE sample.job_id = job.id) = 1
+  ),
+  (
+    SELECT invalid_rule_blocked
+      AND redacted_class_blocked
+      AND append_blocked
+      AND cleanup_preserved
+    FROM review_sampling_upgrade_proof
+  ),
+  (
+    SELECT count(*) = 1
+      AND bool_and(contract_hash = :'review_sampling_contract_hash')
+    FROM otlet.workload_acceptance_contracts
+    WHERE task_name = 'review_sampling_upgrade'
+  ),
+  (
+    SELECT active_workload_revision_hash = :'review_sampling_revision_hash'
+    FROM otlet.workload_revision_heads
+    WHERE task_name = 'review_sampling_upgrade'
+  ),
+  NOT EXISTS (SELECT 1 FROM otlet.verify_invariants())
+);
+SQL
+)"
+[ "$portable_review_sampling_contract" = \
+  "t|t|t|t|t|t|t|t|t|t|t" ] || {
+  echo "Portable review-sampling contract mismatch: $portable_review_sampling_contract" >&2
+  exit 1
+}
+
 identity_vector_contract="$(
   docker exec -i "$container" psql -U postgres -d "$database" \
     -X -qAt -v ON_ERROR_STOP=1 <<'SQL'
@@ -2948,8 +3542,8 @@ FROM otlet.complete_job(
     FROM otlet.jobs
     WHERE task_name = 'decision_evidence_legacy'
   ),
-  '{"evidence":"legacy-business-field"}'::jsonb,
-  '{"output":{"evidence":"legacy-business-field"},"actions":[]}',
+  '{"business_evidence":"legacy-business-field"}'::jsonb,
+  '{"output":{"business_evidence":"legacy-business-field"},"actions":[]}',
   '[]'::jsonb,
   expected_claim_token => 'decision-evidence-legacy-token'
 );
@@ -3051,16 +3645,18 @@ portable_decision_evidence_contract="$(
     -X -qAt -v ON_ERROR_STOP=1 <<'SQL'
 SELECT concat_ws('|',
   (SELECT job.status = 'complete'
-          AND output.output ->> 'evidence' = 'legacy-business-field'
-          AND NOT ((
+          AND output.output ->> 'business_evidence' = 'legacy-business-field'
+          AND (
             receipt.trace_summary #> '{portable_validation}'
-          ) ? 'decision_evidence')
-          AND NOT ((
+          ) ? 'decision_evidence'
+          AND receipt.trace_summary #>
+            '{portable_validation,decision_evidence}' = '[]'::jsonb
+          AND (
             receipt.trace_summary #> '{portable_validation}'
-          ) ? 'decision_evidence_version')
-          AND NOT ((
+          ) ? 'decision_evidence_version'
+          AND (
             revision.definition #> '{validator}'
-          ) ? 'decision_evidence_version')
+          ) ? 'decision_evidence_version'
    FROM otlet.jobs job
    JOIN otlet.inference_receipts receipt ON receipt.job_id = job.id
    JOIN otlet.outputs output ON output.job_id = job.id
@@ -3489,6 +4085,8 @@ echo "portable_pair_constraint_migration_contract=$pair_constraint_migration_con
 echo "portable_entity_graph_conflict_migration_contract=$entity_graph_conflict_migration_contract"
 echo "portable_semantic_correction_migration_contract=$semantic_correction_migration_contract"
 echo "portable_decision_evidence_migration_contract=$decision_evidence_migration_contract"
+echo "portable_review_sampling_migration_contract=$review_sampling_migration_contract"
+echo "portable_review_sampling_contract=$portable_review_sampling_contract"
 echo "portable_decision_evidence_contract=$portable_decision_evidence_contract"
 echo "portable_ask_administrative_contract=$portable_ask_administrative_contract"
 echo "portable_task_lifecycle_contract=$portable_task_lifecycle_contract"
