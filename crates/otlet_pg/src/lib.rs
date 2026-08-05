@@ -350,6 +350,11 @@ pgrx::extension_sql_file!(
     name = "authoritative_semantic_correction",
     requires = ["entity_graph_conflict_status"]
 );
+pgrx::extension_sql_file!(
+    "../sql/migrations/0069_evidence_linked_decisions.sql",
+    name = "evidence_linked_decisions",
+    requires = ["authoritative_semantic_correction"]
+);
 
 #[allow(non_snake_case)]
 #[pgrx::pg_guard]

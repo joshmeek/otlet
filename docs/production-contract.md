@@ -337,6 +337,28 @@ FROM otlet.tasks
 ORDER BY name;
 ```
 
+Tasks can opt into evidence-linked decisions by declaring an `evidence` array in the output schema and asking actions to return `body.evidence`. Each entry is a JSON path written as an array of text segments. A one-segment path cites a top-level field
+
+```json
+{
+  "output": {
+    "decision": "review",
+    "evidence": [["row", "email"]]
+  },
+  "actions": [{
+    "type": "review_flag",
+    "body": {
+      "reason": "email needs review",
+      "evidence": [["row", "email"]]
+    }
+  }]
+}
+```
+
+PostgreSQL resolves every path against the pinned shaped job input before the receipt, output, or action can commit. The first segment must appear in the revision's `input_shaping.source_fields`, including when shaping adds another derived top-level field. The pinned workload revision must declare `otlet_decision_evidence_v1`, so an upgrade cannot change citation acceptance under an old revision hash. Each output or action may cite at most 32 paths, each path may contain at most 16 nonempty segments of 128 bytes each, and one result may store at most 128 links. Array offsets use canonical nonnegative decimal text such as `0` or `12`. Repeated links collapse to one receipt entry
+
+`otlet.audit_decision_evidence_export` exposes the output or action target, canonical path, and PostgreSQL-derived `otlet:v1:sha256` value hash. It does not expose the referenced value or copy the shaped snapshot
+
 The production policy bounds each stored evidence family before a write can commit:
 
 ```sql
@@ -422,7 +444,7 @@ SELECT count(*) FROM otlet.verify_invariants();
 
 Contract: `0` (demo prints `invariant_contract=0`). The suite fails closed on expired or NULL leases for `running` and `cancel_requested` jobs, complete receipts without schema pass, sensitive evidence that violates the active storage policy, materializations missing `source_hash`, and error runtime slots. `production_status` and `verify_invariants` name the receipt invariant `complete_receipts_are_schema_validated`; throughput views use `completed_jobs` and `last_batch_completed_jobs`. Step 6 of `docs/semantic-watches.md` anchors the planner vocabulary for `selected_path` / `Planner Selected Path` and `freshness_basis`
 
-Operators query redacted, read-only projections through `otlet.audit_receipt_export`, `otlet.audit_review_export`, `otlet.audit_review_event_export`, `otlet.audit_action_execution_export`, `otlet.audit_eval_label_export`, `otlet.audit_administrative_change_export`, `otlet.semantic_dependency_audit`, `otlet.operational_event_log`, `otlet.worker_batch_timing_status`, and `otlet.failure_retry_status`. `otlet.redaction_policy_status` lists withheld evidence for the audit exports. `otlet.failure_retry_status` exposes whether raw error detail exists without exposing the detail
+Operators query redacted, read-only projections through `otlet.audit_receipt_export`, `otlet.audit_review_export`, `otlet.audit_review_event_export`, `otlet.audit_action_execution_export`, `otlet.audit_eval_label_export`, `otlet.audit_administrative_change_export`, `otlet.audit_decision_evidence_export`, `otlet.semantic_dependency_audit`, `otlet.operational_event_log`, `otlet.worker_batch_timing_status`, and `otlet.failure_retry_status`. `otlet.redaction_policy_status` lists withheld evidence for the audit exports. `otlet.failure_retry_status` exposes whether raw error detail exists without exposing the detail
 
 ## Step 4 - Grant Role-Scoped Access
 
@@ -458,6 +480,8 @@ The auditor capability grants read-only access to these redacted policy and audi
 - `otlet.audit_action_execution_export`
 - `otlet.audit_eval_label_export`
 - `otlet.audit_administrative_change_export`
+- `otlet.audit_semantic_correction_export`
+- `otlet.audit_decision_evidence_export`
 - `otlet.action_workflow_policy_status`
 - `otlet.semantic_dependency_audit`
 - `otlet.operational_event_log`
@@ -470,7 +494,7 @@ The auditor capability grants read-only access to these redacted policy and audi
 - `otlet.failure_taxonomy`
 - `otlet.failure_retry_status`
 
-The grant also includes the pure JSON hashing helpers required by `audit_review_export` and the native capability reader used by `runtime_capability_status`; they read no database rows. The operator capability includes auditor access plus these functions:
+The grant also includes the pure JSON hashing helpers required by `audit_review_export`, the native capability reader used by `runtime_capability_status`, and the task-scoped entity-graph and semantic-correction status readers. The operator capability includes auditor access plus these functions:
 
 - `otlet.approve_action`
 - `otlet.reject_action`
@@ -481,8 +505,9 @@ The grant also includes the pure JSON hashing helpers required by `audit_review_
 - `otlet.dry_run_action`
 - `otlet.apply_action`
 - `otlet.application_retry_job`
+- `otlet.approve_semantic_correction`
 
-The nine operator functions run as the extension owner with `search_path` fixed to `pg_catalog, otlet, pg_temp`. The retry RPC preserves the original application's job owner while recording the operator login and active role. Operators receive no direct table writes. The owner alone registers targets and workflow policies, disables them, and imports or exports watches. Watch exports contain instructions, policies, schemas, source identifiers, and owner-authored candidate SQL, so auditor and operator roles cannot read or import them
+The ten operator functions run as the extension owner with `search_path` fixed to `pg_catalog, otlet, pg_temp`. The retry RPC preserves the original application's job owner while recording the operator login and active role. Operators receive no direct table writes. The owner alone registers targets and workflow policies, disables them, and imports or exports watches. Watch exports contain instructions, policies, schemas, source identifiers, and owner-authored candidate SQL, so auditor and operator roles cannot read or import them
 
 SQL-only owners grant an operator `USAGE` on schema `otlet` and `EXECUTE` on `application_retry_job(bigint, text)` through PostgreSQL. The portable permission sweep leaves all other Otlet functions and tables closed unless the owner grants them
 
@@ -509,11 +534,11 @@ SELECT * FROM otlet.access_policy_status;
 SELECT * FROM otlet.application_access_policy_status;
 ```
 
-The demo proves the catalog ACLs, 19 auditor relations and 20 function grants, 19 operator relations and 29 function grants, seven operator paths, 26 exact security-definer functions, three application RPCs, eight portable RPCs, 15 denied application paths, and 72 denied auditor or operator paths. The delegated operator role proves all five review outcomes:
+The demo proves the catalog ACLs, 21 auditor relations and 22 function grants, 21 operator relations and 32 function grants, eight operator paths, 30 exact security-definer functions, three application RPCs, eight portable RPCs, 15 denied application paths, and 75 denied auditor or operator paths. The delegated operator role proves all five review outcomes:
 
 ```text
 review_provenance_contract=true|true|true|true|true|true|true|true|true|true|true
-permission_contract=public=0/0/0|auditor=19/20|operator=19/29|definer=26/26|application=3/3/3|portable=8/8/8|positive=7|denied=72
+permission_contract=public=0/0/0|auditor=21/22|operator=21/32|definer=30/30|application=3/3/3|portable=8/8/8|positive=8|denied=75
 ```
 
 Your application still owns these deployment boundaries:

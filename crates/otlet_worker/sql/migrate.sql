@@ -228,3 +228,6 @@ $$;
 
 \set portable_migration_file ../../../otlet_pg/sql/migrations/0068_authoritative_semantic_correction.sql
 \ir migrations/apply.sql
+
+\set portable_migration_file ../../../otlet_pg/sql/migrations/0069_evidence_linked_decisions.sql
+\ir migrations/apply.sql

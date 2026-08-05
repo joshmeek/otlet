@@ -20,9 +20,9 @@ install_portable() {
     -f crates/otlet_worker/sql/install.sql
 }
 
-install_portable_through_67() {
+install_portable_through_68() {
   docker exec -w /work/crates/otlet_worker/sql "$container" \
-    sed '/0068_authoritative_semantic_correction.sql/,$d' migrate.sql |
+    sed '/0069_evidence_linked_decisions.sql/,$d' migrate.sql |
     docker exec -i -w /work/crates/otlet_worker/sql "$container" \
       psql -U postgres -d "$database" -X -q -v ON_ERROR_STOP=1 --single-transaction
 }
@@ -62,7 +62,7 @@ SELECT format(
   'portable upgrade executable proof'
 ) \gexec
 SQL
-install_portable_through_67
+install_portable_through_68
 
 docker exec -i "$container" psql -U postgres -d "$database" \
   -X -q -v ON_ERROR_STOP=1 <<'SQL' >/dev/null
@@ -86,6 +86,8 @@ CREATE ROLE :"operator_role" NOLOGIN;
 CREATE ROLE :"application_role" NOLOGIN;
 CREATE ROLE :"partial_auditor_role" NOLOGIN;
 SELECT otlet.grant_application_access(:'application_role'::regrole);
+SELECT otlet.access_policy_revision(:'operator_role'::regrole)
+  AS operator_old_revision \gset
 GRANT USAGE ON SCHEMA otlet TO :"operator_role";
 GRANT SELECT ON TABLE
   otlet.redaction_policy_status,
@@ -105,13 +107,26 @@ GRANT SELECT ON TABLE
   otlet.portable_claim_status,
   otlet.portable_receipt_status,
   otlet.failure_taxonomy,
-  otlet.failure_retry_status
+  otlet.failure_retry_status,
+  otlet.audit_semantic_correction_export
 TO :"operator_role";
-GRANT EXECUTE ON FUNCTION otlet.application_retry_job(bigint, text) TO :"operator_role";
-GRANT EXECUTE ON FUNCTION otlet.export_eval_cases(integer) TO :"operator_role";
-GRANT EXECUTE ON FUNCTION otlet.correct_action(bigint, jsonb, text) TO :"operator_role";
+GRANT EXECUTE ON FUNCTION
+  otlet.application_retry_job(bigint, text),
+  otlet.export_eval_cases(integer),
+  otlet.correct_action(bigint, jsonb, text),
+  otlet.entity_graph_conflict_status_for_task(text),
+  otlet.semantic_correction_status_for_task(text),
+  otlet.approve_semantic_correction(
+    bigint, bigint, jsonb, timestamptz, numeric, text, text
+  )
+TO :"operator_role";
+SELECT otlet.finish_access_policy_grant(
+  'operator',
+  :'operator_role'::regrole,
+  :'operator_old_revision'
+);
 GRANT USAGE ON SCHEMA otlet TO :"partial_auditor_role";
-GRANT SELECT ON TABLE otlet.audit_receipt_export TO :"partial_auditor_role";
+GRANT SELECT ON TABLE otlet.audit_review_export TO :"partial_auditor_role";
 UPDATE public.portable_upgrade_sentinel sentinel
 SET export_function_oid = function.oid,
     export_function_acl = function.proacl::text
@@ -124,6 +139,56 @@ SET audit_review_oid = relation.oid,
 FROM pg_catalog.pg_class relation
 WHERE sentinel.id = 1
   AND relation.oid = 'otlet.audit_review_export'::regclass;
+
+SELECT otlet.register_model(
+  'model_concurrency_probe',
+  '/tmp/model_concurrency_probe.gguf',
+  repeat('1', 64),
+  jsonb_build_object(
+    'sha256', repeat('1', 64),
+    'bytes', 1,
+    'source', 'portable-upgrade-demo',
+    'revision', 'model-concurrency-v1',
+    'quantization', 'test',
+    'license', 'test'
+  ),
+  3
+);
+SELECT otlet.create_task(
+  task_name => 'model_concurrency_probe',
+  input_query => NULL,
+  instruction => 'Return an empty object',
+  output_schema => '{"type":"object"}'::jsonb,
+  model_name => 'model_concurrency_probe',
+  input_shaping => '{"source_fields":["value"]}'::jsonb
+);
+SELECT otlet.create_task(
+  task_name => 'decision_evidence_legacy',
+  input_query => NULL,
+  instruction => 'Return a legacy business evidence field',
+  output_schema => '{"type":"object"}'::jsonb,
+  model_name => 'model_concurrency_probe',
+  input_shaping => '{"source_fields":["value"]}'::jsonb
+);
+INSERT INTO otlet.jobs (
+  task_name,
+  subject_id,
+  input,
+  status,
+  attempts,
+  started_at,
+  leased_until,
+  claim_token
+) VALUES (
+  'decision_evidence_legacy',
+  'pre-0069',
+  '{"value":"legacy"}'::jsonb,
+  'running',
+  1,
+  now(),
+  now() + interval '5 minutes',
+  'decision-evidence-legacy-token'
+);
 SQL
 
 install_portable
@@ -135,7 +200,7 @@ contract="$(
 SELECT concat_ws('|',
   max(version),
   count(*),
-  array_agg(version ORDER BY version) = ARRAY(SELECT generate_series(1, 68)),
+  array_agg(version ORDER BY version) = ARRAY(SELECT generate_series(1, 69)),
   bool_and(file ~ ('(^|/)' || lpad(version::text, 4, '0') || '_')),
   (SELECT value FROM public.portable_upgrade_sentinel),
   (SELECT count(*) FROM otlet.verify_invariants())
@@ -143,7 +208,7 @@ SELECT concat_ws('|',
 FROM otlet.portable_schema_migrations;
 SQL
 )"
-[ "$contract" = "68|68|t|t|preserved|0" ] || {
+[ "$contract" = "69|69|t|t|preserved|0" ] || {
   echo "Portable repeat-install contract mismatch: $contract" >&2
   exit 1
 }
@@ -248,7 +313,7 @@ SELECT concat_ws('|',
   )
   AND pg_catalog.has_schema_privilege(:'partial_auditor_role', 'otlet', 'USAGE')
   AND pg_catalog.has_table_privilege(
-    :'partial_auditor_role', 'otlet.audit_receipt_export', 'SELECT'
+    :'partial_auditor_role', 'otlet.audit_review_export', 'SELECT'
   )
   AND (SELECT count(*) = 1
        FROM pg_catalog.pg_class relation
@@ -2059,7 +2124,7 @@ SELECT concat_ws('|',
       ) = failure_reason_code
     )
     FROM otlet.failure_taxonomy),
-  (SELECT policy_version = 3
+  (SELECT policy_version = 4
           AND withheld_fields @> ARRAY['job_error', 'receipt_error']::text[]
           AND export_views @> ARRAY['otlet.failure_retry_status']::text[]
    FROM otlet.redaction_policy_status),
@@ -2558,10 +2623,10 @@ SELECT concat_ws('|',
       'SELECT'
     ),
   pg_catalog.has_table_privilege(
-    :'partial_auditor_role', 'otlet.audit_receipt_export', 'SELECT'
+    :'partial_auditor_role', 'otlet.audit_review_export', 'SELECT'
   )
     AND NOT pg_catalog.has_table_privilege(
-      :'partial_auditor_role', 'otlet.audit_review_export', 'SELECT'
+      :'partial_auditor_role', 'otlet.audit_receipt_export', 'SELECT'
     )
     AND NOT pg_catalog.has_function_privilege(
       :'partial_auditor_role',
@@ -2780,6 +2845,72 @@ SQL
   exit 1
 }
 
+decision_evidence_migration_contract="$(
+  docker exec -i "$container" psql -U postgres -d "$database" \
+    -X -qAt -v ON_ERROR_STOP=1 \
+    -v operator_role="$operator_role" \
+    -v partial_auditor_role="$partial_auditor_role" <<'SQL'
+SELECT concat_ws('|',
+  EXISTS (
+    SELECT 1
+    FROM otlet.portable_schema_migrations
+    WHERE version = 69
+      AND file LIKE '%0069_evidence_linked_decisions.sql'
+  ),
+  to_regprocedure(
+    'otlet.decision_evidence_path_links(jsonb,jsonb,jsonb,text,integer)'
+  ) IS NOT NULL
+    AND to_regprocedure(
+      'otlet.validated_decision_evidence(jsonb,jsonb,jsonb,jsonb,text)'
+    ) IS NOT NULL,
+  to_regclass('otlet.audit_decision_evidence_export') IS NOT NULL
+    AND (
+      SELECT policy_version = 4
+        AND export_views @>
+          ARRAY['otlet.audit_decision_evidence_export']::text[]
+      FROM otlet.redaction_policy_status
+    ),
+  pg_catalog.has_table_privilege(
+    :'operator_role',
+    'otlet.audit_decision_evidence_export',
+    'SELECT'
+  )
+    AND NOT pg_catalog.has_function_privilege(
+      :'operator_role',
+      'otlet.validated_decision_evidence(jsonb,jsonb,jsonb,jsonb,text)',
+      'EXECUTE'
+    ),
+  NOT pg_catalog.has_table_privilege(
+    :'partial_auditor_role',
+    'otlet.audit_decision_evidence_export',
+    'SELECT'
+  ),
+  NOT pg_catalog.has_table_privilege(
+      'public',
+      'otlet.audit_decision_evidence_export',
+      'SELECT'
+    )
+    AND NOT EXISTS (
+      SELECT 1
+      FROM pg_catalog.pg_proc function
+      JOIN pg_catalog.pg_namespace namespace
+        ON namespace.oid = function.pronamespace
+      WHERE namespace.nspname = 'otlet'
+        AND function.proname LIKE '%decision_evidence%'
+        AND pg_catalog.has_function_privilege(
+          'public', function.oid, 'EXECUTE'
+        )
+    ),
+  NOT EXISTS (SELECT 1 FROM otlet.verify_invariants())
+);
+SQL
+)"
+[ "$decision_evidence_migration_contract" = \
+  "t|t|t|t|t|t|t" ] || {
+  echo "Portable decision-evidence migration contract mismatch: $decision_evidence_migration_contract" >&2
+  exit 1
+}
+
 identity_vector_contract="$(
   docker exec -i "$container" psql -U postgres -d "$database" \
     -X -qAt -v ON_ERROR_STOP=1 <<'SQL'
@@ -2810,29 +2941,177 @@ SQL
 
 docker exec -i "$container" psql -U postgres -d "$database" \
   -X -q -v ON_ERROR_STOP=1 <<'SQL' >/dev/null
+SELECT count(*)
+FROM otlet.complete_job(
+  (
+    SELECT id
+    FROM otlet.jobs
+    WHERE task_name = 'decision_evidence_legacy'
+  ),
+  '{"evidence":"legacy-business-field"}'::jsonb,
+  '{"output":{"evidence":"legacy-business-field"},"actions":[]}',
+  '[]'::jsonb,
+  expected_claim_token => 'decision-evidence-legacy-token'
+);
+
 SELECT otlet.register_model(
-  'model_concurrency_probe',
-  '/tmp/model_concurrency_probe.gguf',
-  repeat('1', 64),
+  'decision_evidence_upgrade_model',
+  '/tmp/decision_evidence_upgrade_model.gguf',
+  repeat('2', 64),
   jsonb_build_object(
-    'sha256', repeat('1', 64),
+    'sha256', repeat('2', 64),
     'bytes', 1,
     'source', 'portable-upgrade-demo',
-    'revision', 'model-concurrency-v1',
+    'revision', 'decision-evidence-v1',
     'quantization', 'test',
     'license', 'test'
-  ),
-  3
+  )
 );
 SELECT otlet.create_task(
-  task_name => 'model_concurrency_probe',
+  task_name => 'decision_evidence_upgrade',
   input_query => NULL,
-  instruction => 'Return an empty object',
-  output_schema => '{"type":"object"}'::jsonb,
-  model_name => 'model_concurrency_probe',
-  input_shaping => '{"source_fields":["value"]}'::jsonb
+  instruction => 'Return a decision with source paths',
+  output_schema => '{
+    "type":"object",
+    "required":["decision","evidence"],
+    "additionalProperties":false,
+    "properties":{
+      "decision":{"type":"string"},
+      "evidence":{
+        "type":"array",
+        "items":{
+          "type":"array",
+          "minItems":1,
+          "maxItems":16,
+          "items":{"type":"string"}
+        }
+      }
+    }
+  }'::jsonb,
+  model_name => 'decision_evidence_upgrade_model',
+  input_shaping => '{"source_fields":["approved"]}'::jsonb,
+  decision_contract => '{"action_types":["review_flag"]}'::jsonb
+);
+INSERT INTO otlet.jobs (
+  task_name,
+  subject_id,
+  input,
+  status,
+  attempts,
+  started_at,
+  leased_until,
+  claim_token
+) VALUES (
+  'decision_evidence_upgrade',
+  'portable-upgrade',
+  '{
+    "approved":{
+      "aliases":[{"value":"PORTABLE-CANARY-A"},{"value":"PORTABLE-CANARY-B"}]
+    }
+  }'::jsonb,
+  'running',
+  1,
+  now(),
+  now() + interval '5 minutes',
+  'decision-evidence-upgrade-token'
+) RETURNING id \gset decision_evidence_upgrade_
+SELECT count(*)
+FROM otlet.complete_job(
+  :decision_evidence_upgrade_id,
+  '{
+    "decision":"review",
+    "evidence":[["approved","aliases","0","value"]]
+  }'::jsonb,
+  '{
+    "output":{
+      "decision":"review",
+      "evidence":[["approved","aliases","0","value"]]
+    },
+    "actions":[{
+      "type":"review_flag",
+      "body":{
+        "reason":"review aliases",
+        "evidence":[["approved","aliases","1","value"]]
+      }
+    }]
+  }',
+  '[{
+    "type":"review_flag",
+    "body":{
+      "reason":"review aliases",
+      "evidence":[["approved","aliases","1","value"]]
+    }
+  }]'::jsonb,
+  expected_claim_token => 'decision-evidence-upgrade-token'
 );
 SQL
+
+portable_decision_evidence_contract="$(
+  docker exec -i "$container" psql -U postgres -d "$database" \
+    -X -qAt -v ON_ERROR_STOP=1 <<'SQL'
+SELECT concat_ws('|',
+  (SELECT job.status = 'complete'
+          AND output.output ->> 'evidence' = 'legacy-business-field'
+          AND NOT ((
+            receipt.trace_summary #> '{portable_validation}'
+          ) ? 'decision_evidence')
+          AND NOT ((
+            receipt.trace_summary #> '{portable_validation}'
+          ) ? 'decision_evidence_version')
+          AND NOT ((
+            revision.definition #> '{validator}'
+          ) ? 'decision_evidence_version')
+   FROM otlet.jobs job
+   JOIN otlet.inference_receipts receipt ON receipt.job_id = job.id
+   JOIN otlet.outputs output ON output.job_id = job.id
+   JOIN otlet.workload_revisions revision
+     ON revision.task_name = job.task_name
+    AND revision.workload_revision_hash = job.workload_revision_hash
+   WHERE job.task_name = 'decision_evidence_legacy'),
+  (SELECT status = 'complete'
+          AND (SELECT count(*) FROM otlet.inference_receipts receipt
+               WHERE receipt.job_id = job.id) = 1
+          AND (SELECT count(*) FROM otlet.outputs output
+               WHERE output.job_id = job.id) = 1
+          AND (SELECT count(*) FROM otlet.actions action
+               WHERE action.job_id = job.id) = 1
+   FROM otlet.jobs job
+   WHERE task_name = 'decision_evidence_upgrade'),
+  (SELECT count(*) = 2
+          AND count(*) FILTER (WHERE target_kind = 'output') = 1
+          AND count(*) FILTER (WHERE target_kind = 'action') = 1
+          AND bool_and(action_id IS NOT NULL OR target_kind = 'output')
+   FROM otlet.audit_decision_evidence_export
+   WHERE task_name = 'decision_evidence_upgrade'),
+  (SELECT receipt.trace_summary #>>
+            '{portable_validation,decision_evidence_version}' =
+          revision.definition #>> '{validator,decision_evidence_version}'
+          AND revision.definition #>>
+            '{validator,decision_evidence_version}' =
+            'otlet_decision_evidence_v1'
+   FROM otlet.inference_receipts receipt
+   JOIN otlet.workload_revisions revision
+     ON revision.task_name = receipt.task_name
+    AND revision.workload_revision_hash = receipt.workload_revision_hash
+   WHERE receipt.task_name = 'decision_evidence_upgrade'),
+  (SELECT receipt.trace_summary::text NOT LIKE '%PORTABLE-CANARY%'
+          AND NOT EXISTS (
+            SELECT 1
+            FROM otlet.audit_decision_evidence_export export
+            WHERE export.task_name = receipt.task_name
+              AND to_jsonb(export)::text LIKE '%PORTABLE-CANARY%'
+          )
+   FROM otlet.inference_receipts receipt
+   WHERE receipt.task_name = 'decision_evidence_upgrade'),
+  NOT EXISTS (SELECT 1 FROM otlet.verify_invariants())
+);
+SQL
+)"
+[ "$portable_decision_evidence_contract" = \
+  "t|t|t|t|t|t" ] || {
+  echo "Portable decision-evidence contract mismatch: $portable_decision_evidence_contract" >&2
+  exit 1
+}
 
 portable_ask_administrative_contract="$(
   docker exec -i "$container" psql -U postgres -d "$database" \
@@ -3209,6 +3488,8 @@ echo "portable_entity_resolution_quality_migration_contract=$entity_resolution_q
 echo "portable_pair_constraint_migration_contract=$pair_constraint_migration_contract"
 echo "portable_entity_graph_conflict_migration_contract=$entity_graph_conflict_migration_contract"
 echo "portable_semantic_correction_migration_contract=$semantic_correction_migration_contract"
+echo "portable_decision_evidence_migration_contract=$decision_evidence_migration_contract"
+echo "portable_decision_evidence_contract=$portable_decision_evidence_contract"
 echo "portable_ask_administrative_contract=$portable_ask_administrative_contract"
 echo "portable_task_lifecycle_contract=$portable_task_lifecycle_contract"
 echo "portable_model_capacity_contract=$batch_claims|$batch_capacity_contract|$concurrent_capacity_contract|$cancel_blocked_claims|$replacement_claims|$lease_capacity_contract"
