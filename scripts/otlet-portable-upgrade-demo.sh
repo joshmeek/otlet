@@ -79,7 +79,7 @@ contract="$(
 SELECT concat_ws('|',
   max(version),
   count(*),
-  array_agg(version ORDER BY version) = ARRAY(SELECT generate_series(1, 58)),
+  array_agg(version ORDER BY version) = ARRAY(SELECT generate_series(1, 59)),
   bool_and(file ~ ('(^|/)' || lpad(version::text, 4, '0') || '_')),
   (SELECT value FROM public.portable_upgrade_sentinel),
   (SELECT count(*) FROM otlet.verify_invariants())
@@ -87,7 +87,7 @@ SELECT concat_ws('|',
 FROM otlet.portable_schema_migrations;
 SQL
 )"
-[ "$contract" = "58|58|t|t|preserved|0" ] || {
+[ "$contract" = "59|59|t|t|preserved|0" ] || {
   echo "Portable repeat-install contract mismatch: $contract" >&2
   exit 1
 }
@@ -1146,6 +1146,178 @@ SQL
   exit 1
 }
 
+quality_data_drift_migration_contract="$(
+  docker exec -i "$container" psql -U postgres -d "$database" \
+    -X -qAt -v ON_ERROR_STOP=1 <<'SQL'
+SELECT concat_ws('|',
+  EXISTS (
+    SELECT 1
+    FROM otlet.portable_schema_migrations
+    WHERE version = 59
+      AND file ~ '0059_quality_data_drift.sql$'
+  ),
+  to_regclass('otlet.task_candidate_observations') IS NOT NULL
+    AND to_regclass('otlet.quality_data_drift_reports') IS NOT NULL
+    AND to_regclass('otlet.quality_data_drift_status') IS NOT NULL
+    AND (SELECT count(*) = 7
+      FROM information_schema.columns
+      WHERE table_schema = 'otlet'
+        AND table_name = 'task_candidate_observations'
+        AND column_name IN (
+          'observation_hash',
+          'task_name',
+          'workload_revision_hash',
+          'candidate_rows',
+          'candidate_bytes',
+          'largest_input_bytes',
+          'admitted'
+        )),
+  NOT EXISTS (
+    SELECT 1
+    FROM unnest(ARRAY[
+      'otlet.guard_quality_data_drift_append()'::regprocedure,
+      'otlet.validate_task_candidate_observation()'::regprocedure,
+      'otlet.record_task_candidate_observation(text,text,bigint,bigint,bigint,boolean,text)'::regprocedure,
+      'otlet.quality_data_input_shape(jsonb)'::regprocedure,
+      'otlet.quality_data_distribution_drift(jsonb,jsonb)'::regprocedure,
+      'otlet.quality_data_reviewer_overturn(text)'::regprocedure,
+      'otlet.quality_data_report_metrics(text,text)'::regprocedure,
+      'otlet.quality_data_drift_declaration_valid(jsonb)'::regprocedure,
+      'otlet.validate_quality_data_drift_contract()'::regprocedure,
+      'otlet.validate_quality_data_drift_report()'::regprocedure,
+      'otlet.record_quality_data_drift_report(text,text,text,text)'::regprocedure
+    ]) function_row(oid)
+    WHERE function_row.oid IS NULL
+  )
+    AND position(
+      'record_task_candidate_observation' IN
+      pg_get_functiondef('otlet.run_task(text)'::regprocedure)
+    ) > 0,
+  (SELECT count(*) = 7
+   FROM pg_catalog.pg_trigger trigger
+   WHERE NOT trigger.tgisinternal
+     AND trigger.tgname IN (
+       'task_candidate_observations_a_guard',
+       'task_candidate_observations_b_validate',
+       'task_candidate_observations_truncate_guard',
+       'workload_acceptance_contracts_c_quality_data_drift',
+       'quality_data_drift_reports_a_guard',
+       'quality_data_drift_reports_b_validate',
+       'quality_data_drift_reports_truncate_guard'
+     )),
+  otlet.quality_data_drift_declaration_valid('{
+    "format":"otlet.quality_data_drift.v1",
+    "report_hash":"otlet:v1:sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "variant":"candidate",
+    "candidate_observation_hash":"otlet:v1:sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "reviewer_overturn":{
+      "value":0,
+      "support":2,
+      "overturns":0,
+      "evidence_hash":"otlet:v1:sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+    },
+    "minimum_support":2,
+    "maximum_drift":{
+      "input_shape":0,
+      "candidate_volume":0.2,
+      "class":0.1,
+      "abstention":0.2,
+      "escalation":0.5,
+      "reviewer_overturn":0.2,
+      "false_trust":0.1
+    }
+  }'::jsonb)
+    AND NOT otlet.quality_data_drift_declaration_valid('{
+      "format":"otlet.quality_data_drift.v1",
+      "report_hash":"otlet:v1:sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "variant":"candidate",
+      "candidate_observation_hash":"otlet:v1:sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "reviewer_overturn":{
+        "value":0,
+        "support":2,
+        "overturns":0,
+        "evidence_hash":"otlet:v1:sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+      },
+      "minimum_support":2,
+      "maximum_drift":{
+        "input_shape":0.1,
+        "candidate_volume":0.2,
+        "class":0.1,
+        "abstention":0.2,
+        "escalation":0.5,
+        "reviewer_overturn":0.2,
+        "false_trust":0.1
+      },
+      "confidence":"high"
+    }'::jsonb)
+    AND otlet.quality_data_input_shape('{"field":1}'::jsonb) =
+      otlet.quality_data_input_shape('{"field":2}'::jsonb)
+    AND otlet.quality_data_input_shape('{"field":1}'::jsonb) <>
+      otlet.quality_data_input_shape('{"field":"1"}'::jsonb)
+    AND otlet.quality_data_distribution_drift(
+      '{"a":0.5,"b":0.5}'::jsonb,
+      '{"a":0.25,"c":0.75}'::jsonb
+    ) = 0.75
+    AND otlet.quality_data_input_shape(jsonb_build_object(
+      'items',
+      (SELECT jsonb_agg(value) FROM generate_series(1, 4097) value)
+    )) IS NULL,
+  position(
+    'confidence' IN lower(pg_get_viewdef('otlet.quality_data_drift_status'::regclass, true))
+  ) = 0
+    AND pg_get_viewdef('otlet.quality_data_drift_status'::regclass, true)
+      LIKE '%insufficient_evidence%'
+    AND position(
+      'confidence' IN lower(pg_get_functiondef(
+        'otlet.quality_data_report_metrics(text,text)'::regprocedure
+      ))
+    ) = 0,
+  NOT pg_catalog.has_table_privilege(
+    'public', 'otlet.task_candidate_observations',
+    'SELECT,INSERT,UPDATE,DELETE,TRUNCATE'
+  )
+    AND NOT pg_catalog.has_table_privilege(
+      'public', 'otlet.quality_data_drift_reports',
+      'SELECT,INSERT,UPDATE,DELETE,TRUNCATE'
+    )
+    AND NOT pg_catalog.has_table_privilege(
+      'public', 'otlet.quality_data_drift_status', 'SELECT'
+    )
+    AND NOT EXISTS (
+      SELECT 1
+      FROM pg_catalog.pg_proc function
+      JOIN pg_catalog.pg_namespace namespace ON namespace.oid = function.pronamespace
+      WHERE namespace.nspname = 'otlet'
+        AND function.proname IN (
+          'guard_quality_data_drift_append',
+          'validate_task_candidate_observation',
+          'record_task_candidate_observation',
+          'quality_data_input_shape',
+          'quality_data_distribution_drift',
+          'quality_data_reviewer_overturn',
+          'quality_data_report_metrics',
+          'quality_data_drift_declaration_valid',
+          'validate_quality_data_drift_contract',
+          'validate_quality_data_drift_report',
+          'record_quality_data_drift_report'
+        )
+        AND pg_catalog.has_function_privilege('public', function.oid, 'EXECUTE')
+    ),
+  (SELECT count(*) = 2
+   FROM pg_catalog.pg_constraint constraint_row
+   WHERE constraint_row.conrelid = 'otlet.quality_data_drift_reports'::regclass
+     AND constraint_row.contype = 'u')
+    AND (SELECT count(*) = 0 FROM otlet.quality_data_drift_reports)
+    AND (SELECT count(*) = 0 FROM otlet.task_candidate_observations),
+  NOT EXISTS (SELECT 1 FROM otlet.verify_invariants())
+);
+SQL
+)"
+[ "$quality_data_drift_migration_contract" = "t|t|t|t|t|t|t|t|t" ] || {
+  echo "Portable quality-data-drift migration contract mismatch: $quality_data_drift_migration_contract" >&2
+  exit 1
+}
+
 identity_vector_contract="$(
   docker exec -i "$container" psql -U postgres -d "$database" \
     -X -qAt -v ON_ERROR_STOP=1 <<'SQL'
@@ -1565,6 +1737,7 @@ echo "portable_evaluation_slices_migration_contract=$evaluation_slices_migration
 echo "portable_label_provenance_migration_contract=$label_provenance_migration_contract"
 echo "portable_production_model_qualification_migration_contract=$production_model_qualification_migration_contract"
 echo "portable_promotion_shadow_rollback_migration_contract=$promotion_shadow_rollback_migration_contract"
+echo "portable_quality_data_drift_migration_contract=$quality_data_drift_migration_contract"
 echo "portable_ask_administrative_contract=$portable_ask_administrative_contract"
 echo "portable_task_lifecycle_contract=$portable_task_lifecycle_contract"
 echo "portable_model_capacity_contract=$batch_claims|$batch_capacity_contract|$concurrent_capacity_contract|$cancel_blocked_claims|$replacement_claims|$lease_capacity_contract"

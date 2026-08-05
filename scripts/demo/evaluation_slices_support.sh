@@ -84,20 +84,22 @@ FROM (VALUES
 CREATE TABLE public.otlet_demo_evaluation_slice_primary (
   id text PRIMARY KEY,
   review_state text NOT NULL,
+  shape_probe jsonb NOT NULL,
   protected_note text NOT NULL
 );
 INSERT INTO public.otlet_demo_evaluation_slice_primary
-SELECT fixture_id, 'pending', 'DO_NOT_TOUCH'
+SELECT fixture_id, 'pending', '{"kind":"stable"}'::jsonb, 'DO_NOT_TOUCH'
 FROM evaluation_slice_cases
 WHERE source_table = 'public.otlet_demo_evaluation_slice_primary';
 
 CREATE TABLE public.otlet_demo_evaluation_slice_secondary (
   id text PRIMARY KEY,
   review_state text NOT NULL,
+  shape_probe jsonb NOT NULL,
   protected_note text NOT NULL
 );
 INSERT INTO public.otlet_demo_evaluation_slice_secondary
-SELECT fixture_id, 'pending', 'DO_NOT_TOUCH'
+SELECT fixture_id, 'pending', '{"kind":"stable"}'::jsonb, 'DO_NOT_TOUCH'
 FROM evaluation_slice_cases
 WHERE source_table = 'public.otlet_demo_evaluation_slice_secondary';
 
@@ -233,6 +235,12 @@ BEGIN
       FROM otlet.actions action
       WHERE action.job_id = job.id
         AND action.action_type = 'review_flag';
+      PERFORM otlet.record_review_event(
+        'approve',
+        action_id,
+        NULL,
+        'Accepted evaluation slice fixture'
+      );
       SELECT label.id INTO saved_label_id
       FROM otlet.label_action(
         action_id,

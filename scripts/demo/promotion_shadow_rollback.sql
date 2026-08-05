@@ -684,3 +684,5 @@ FROM promotion_shadow_rollback_contract;
 
 SELECT 'promotion_shadow_rollback_contract=' || contract
 FROM promotion_shadow_rollback_contract;
+
+\ir /work/scripts/demo/quality_data_drift.sql

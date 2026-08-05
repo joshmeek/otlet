@@ -296,9 +296,14 @@ pgrx::extension_sql_file!(
     requires = ["production_model_qualification"]
 );
 pgrx::extension_sql_file!(
+    "../sql/migrations/0059_quality_data_drift.sql",
+    name = "quality_data_drift",
+    requires = ["promotion_shadow_rollback"]
+);
+pgrx::extension_sql_file!(
     "../sql/migrations/0043_permissions.sql",
     name = "permissions",
-    requires = ["promotion_shadow_rollback"]
+    requires = ["quality_data_drift"]
 );
 
 #[allow(non_snake_case)]

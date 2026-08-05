@@ -1298,6 +1298,15 @@ BEGIN
        rejection_reason, rejection_limit, reconciled_rows;
 
   IF rejection_reason IS NOT NULL THEN
+    PERFORM otlet.record_task_candidate_observation(
+      run_task.task_name,
+      revision_hash,
+      candidate_rows,
+      candidate_bytes,
+      largest_input_bytes,
+      false,
+      rejection_reason
+    );
     PERFORM otlet.record_queue_admission_suppressed(
       run_task.task_name,
       task_model_name,
@@ -1317,6 +1326,16 @@ BEGIN
   IF queued <> candidate_rows THEN
     RAISE EXCEPTION 'otlet queue admission changed concurrently; no jobs were committed';
   END IF;
+
+  PERFORM otlet.record_task_candidate_observation(
+    run_task.task_name,
+    revision_hash,
+    candidate_rows,
+    candidate_bytes,
+    largest_input_bytes,
+    true,
+    NULL
+  );
 
   IF queued > 0 THEN
     PERFORM otlet.wake_worker();
