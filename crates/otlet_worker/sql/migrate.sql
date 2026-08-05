@@ -234,3 +234,6 @@ $$;
 
 \set portable_migration_file ../../../otlet_pg/sql/migrations/0070_review_sampling.sql
 \ir migrations/apply.sql
+
+\set portable_migration_file ../../../otlet_pg/sql/migrations/0071_reviewer_rubric_calibration.sql
+\ir migrations/apply.sql

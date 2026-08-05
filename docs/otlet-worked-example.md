@@ -6,7 +6,7 @@ Follow one Docker-backed Otlet entity-resolution loop: leave vendor rows in Post
 
 The output blocks are validated with `./scripts/otlet-setup.sh` and `./scripts/otlet-demo.sh`. Job IDs, receipt IDs, hashes, timestamps, token counts, timings, and token rates are representative and vary by machine and cache state
 
-This walkthrough runs as the extension owner because it registers models and tasks, reads raw attempt state, and administers watches. Production auditors use the redacted `otlet.audit_*` views. Reviewers receive `otlet.grant_operator_access(...)` before calling approval, correction, dry-run, or apply functions. See [production-contract.md](production-contract.md) for the exact grants
+This walkthrough runs as the extension owner because it registers models and tasks, reads raw attempt state, and administers watches. Production auditors use the redacted `otlet.audit_*` views. The owner calls `otlet.grant_reviewer_access(...)` for reviewers and registers a successful calibration before they approve or correct work. A separate operator receives `otlet.grant_operator_access(...)` for dry run and apply. See [production-contract.md](production-contract.md) for the exact grants
 
 The default storage policy keeps assembled prompts in worker memory and removes raw model text and token text before receipt insertion. The examples inspect hashes, structured output, and numeric trace state
 

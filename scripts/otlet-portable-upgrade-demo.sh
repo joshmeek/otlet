@@ -4,13 +4,15 @@ set -euo pipefail
 container="${OTLET_PG_CONTAINER:-otlet-postgres}"
 database="otlet_portable_upgrade_demo_$$"
 operator_role="otlet_portable_upgrade_operator_$$"
+reviewer_role="otlet_portable_upgrade_reviewer_$$"
+reviewer_login="otlet_portable_upgrade_reviewer_login_$$"
 application_role="otlet_portable_upgrade_application_$$"
 partial_auditor_role="otlet_portable_upgrade_partial_auditor_$$"
 
 cleanup() {
   docker exec "$container" dropdb -U postgres --if-exists "$database" >/dev/null 2>&1 || true
   docker exec "$container" psql -U postgres -d postgres -X -q \
-    -c "DROP ROLE IF EXISTS $operator_role, $application_role, $partial_auditor_role" >/dev/null 2>&1 || true
+    -c "DROP ROLE IF EXISTS $reviewer_login, $reviewer_role, $operator_role, $application_role, $partial_auditor_role" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
 
@@ -20,9 +22,9 @@ install_portable() {
     -f crates/otlet_worker/sql/install.sql
 }
 
-install_portable_through_69() {
+install_portable_through_70() {
   docker exec -w /work/crates/otlet_worker/sql "$container" \
-    sed '/0070_review_sampling.sql/,$d' migrate.sql |
+    sed '/0071_reviewer_rubric_calibration.sql/,$d' migrate.sql |
     docker exec -i -w /work/crates/otlet_worker/sql "$container" \
       psql -U postgres -d "$database" -X -q -v ON_ERROR_STOP=1 --single-transaction
 }
@@ -62,7 +64,7 @@ SELECT format(
   'portable upgrade executable proof'
 ) \gexec
 SQL
-install_portable_through_69
+install_portable_through_70
 
 docker exec -i "$container" psql -U postgres -d "$database" \
   -X -q -v ON_ERROR_STOP=1 <<'SQL' >/dev/null
@@ -89,6 +91,11 @@ SELECT otlet.grant_application_access(:'application_role'::regrole);
 SELECT otlet.access_policy_revision(:'operator_role'::regrole)
   AS operator_old_revision \gset
 GRANT USAGE ON SCHEMA otlet TO :"operator_role";
+GRANT USAGE ON TYPE
+  otlet.actions,
+  otlet.eval_labels,
+  otlet.review_events
+TO :"operator_role";
 GRANT SELECT ON TABLE
   otlet.redaction_policy_status,
   otlet.audit_receipt_export,
@@ -111,9 +118,16 @@ GRANT SELECT ON TABLE
   otlet.audit_semantic_correction_export
 TO :"operator_role";
 GRANT EXECUTE ON FUNCTION
+  otlet.approve_action(bigint, text),
+  otlet.reject_action(bigint, text, text),
+  otlet.label_action(bigint, text, text, text, text, text),
+  otlet.correct_action(bigint, jsonb, text),
+  otlet.defer_action(bigint, text),
+  otlet.abstain_review(bigint, text),
+  otlet.dry_run_action(bigint),
+  otlet.apply_action(bigint),
   otlet.application_retry_job(bigint, text),
   otlet.export_eval_cases(integer),
-  otlet.correct_action(bigint, jsonb, text),
   otlet.entity_graph_conflict_status_for_task(text),
   otlet.semantic_correction_status_for_task(text),
   otlet.approve_semantic_correction(
@@ -181,7 +195,7 @@ INSERT INTO otlet.jobs (
   claim_token
 ) VALUES (
   'decision_evidence_legacy',
-  'pre-0070',
+  'pre-0071',
   '{"value":"legacy"}'::jsonb,
   'running',
   1,
@@ -200,7 +214,7 @@ contract="$(
 SELECT concat_ws('|',
   max(version),
   count(*),
-  array_agg(version ORDER BY version) = ARRAY(SELECT generate_series(1, 70)),
+  array_agg(version ORDER BY version) = ARRAY(SELECT generate_series(1, 71)),
   bool_and(file ~ ('(^|/)' || lpad(version::text, 4, '0') || '_')),
   (SELECT value FROM public.portable_upgrade_sentinel),
   (SELECT count(*) FROM otlet.verify_invariants())
@@ -208,7 +222,7 @@ SELECT concat_ws('|',
 FROM otlet.portable_schema_migrations;
 SQL
 )"
-[ "$contract" = "70|70|t|t|preserved|0" ] || {
+[ "$contract" = "71|71|t|t|preserved|0" ] || {
   echo "Portable repeat-install contract mismatch: $contract" >&2
   exit 1
 }
@@ -2124,7 +2138,7 @@ SELECT concat_ws('|',
       ) = failure_reason_code
     )
     FROM otlet.failure_taxonomy),
-  (SELECT policy_version = 5
+  (SELECT policy_version = 6
           AND withheld_fields @> ARRAY['job_error', 'receipt_error']::text[]
           AND export_views @> ARRAY['otlet.failure_retry_status']::text[]
    FROM otlet.redaction_policy_status),
@@ -2783,7 +2797,7 @@ SELECT concat_ws('|',
       'otlet.semantic_correction_status_for_task(text)',
       'EXECUTE'
     )
-    AND pg_catalog.has_function_privilege(
+    AND NOT pg_catalog.has_function_privilege(
       :'operator_role',
       'otlet.approve_semantic_correction(bigint,bigint,jsonb,timestamptz,numeric,text,text)',
       'EXECUTE'
@@ -2825,9 +2839,12 @@ SELECT concat_ws('|',
         )
     ),
   (
-    SELECT operator_functions = 11
-      AND operator_security_definer_functions = 11
-      AND operator_fixed_search_path_functions = 11
+    SELECT operator_functions = 3
+      AND operator_security_definer_functions = 3
+      AND operator_fixed_search_path_functions = 3
+      AND reviewer_functions = 8
+      AND reviewer_security_definer_functions = 8
+      AND reviewer_fixed_search_path_functions = 8
     FROM otlet.access_policy_status
   ),
   (SELECT count(*) = 0 FROM otlet.semantic_correction_overrides)
@@ -2866,7 +2883,7 @@ SELECT concat_ws('|',
     ) IS NOT NULL,
   to_regclass('otlet.audit_decision_evidence_export') IS NOT NULL
     AND (
-      SELECT policy_version = 5
+      SELECT policy_version = 6
         AND export_views @>
           ARRAY['otlet.audit_decision_evidence_export']::text[]
       FROM otlet.redaction_policy_status
@@ -2936,14 +2953,17 @@ SELECT concat_ws('|',
       'otlet.label_review_sample(bigint,text,text,text,text,text)'
     ) IS NOT NULL,
   (
-    SELECT policy_version = 5
+    SELECT policy_version = 6
       AND export_views @> ARRAY['otlet.audit_review_sample_export']::text[]
     FROM otlet.redaction_policy_status
   ),
   (
-    SELECT operator_functions = 11
-      AND operator_security_definer_functions = 11
-      AND operator_fixed_search_path_functions = 11
+    SELECT operator_functions = 3
+      AND operator_security_definer_functions = 3
+      AND operator_fixed_search_path_functions = 3
+      AND reviewer_functions = 8
+      AND reviewer_security_definer_functions = 8
+      AND reviewer_fixed_search_path_functions = 8
     FROM otlet.access_policy_status
   ),
   pg_catalog.has_table_privilege(
@@ -2951,7 +2971,7 @@ SELECT concat_ws('|',
     'otlet.audit_review_sample_export',
     'SELECT'
   )
-    AND pg_catalog.has_function_privilege(
+    AND NOT pg_catalog.has_function_privilege(
       :'operator_role',
       'otlet.label_review_sample(bigint,text,text,text,text,text)',
       'EXECUTE'
@@ -3004,6 +3024,255 @@ SQL
 [ "$review_sampling_migration_contract" = \
   "t|t|t|t|t|t|t|t" ] || {
   echo "Portable review-sampling migration contract mismatch: $review_sampling_migration_contract" >&2
+  exit 1
+}
+
+docker exec -i "$container" psql -U postgres -d "$database" \
+  -X -q -v ON_ERROR_STOP=1 \
+  -v reviewer_role="$reviewer_role" \
+  -v reviewer_login="$reviewer_login" <<'SQL' >/dev/null
+CREATE ROLE :"reviewer_role" NOLOGIN;
+CREATE ROLE :"reviewer_login" LOGIN INHERIT;
+GRANT :"reviewer_role" TO :"reviewer_login";
+SELECT otlet.grant_reviewer_access(:'reviewer_role'::regrole);
+SQL
+
+reviewer_calibration_migration_contract="$(
+  docker exec -i "$container" psql -U postgres -d "$database" \
+    -X -qAt -v ON_ERROR_STOP=1 \
+    -v operator_role="$operator_role" \
+    -v reviewer_role="$reviewer_role" \
+    -v reviewer_login="$reviewer_login" \
+    -v partial_auditor_role="$partial_auditor_role" <<'SQL'
+SELECT concat_ws('|',
+  EXISTS (
+    SELECT 1
+    FROM otlet.portable_schema_migrations
+    WHERE version = 71
+      AND file LIKE '%0071_reviewer_rubric_calibration.sql'
+  ),
+  to_regclass('otlet.reviewer_calibrations') IS NOT NULL
+    AND to_regclass('otlet.reviewer_calibration_responses') IS NOT NULL
+    AND to_regclass('otlet.reviewer_review_errors') IS NOT NULL
+    AND to_regclass('otlet.reviewer_review_queue') IS NOT NULL
+    AND to_regclass('otlet.reviewer_calibration_queue') IS NOT NULL
+    AND to_regclass('otlet.reviewer_calibration_status') IS NOT NULL
+    AND to_regclass('otlet.audit_reviewer_calibration_export') IS NOT NULL,
+  to_regprocedure('otlet.reviewer_rubric_error(jsonb)') IS NOT NULL
+    AND to_regprocedure('otlet.reviewer_rubric_hash(jsonb)') IS NOT NULL
+    AND to_regprocedure(
+      'otlet.register_reviewer_calibration(text,regrole,text,text[],text)'
+    ) IS NOT NULL
+    AND to_regprocedure(
+      'otlet.submit_reviewer_calibration(text,text,text,text,text)'
+    ) IS NOT NULL
+    AND to_regprocedure(
+      'otlet.reviewer_authority(text,text,oid)'
+    ) IS NOT NULL
+    AND to_regprocedure(
+      'otlet.reviewer_review_queue_rows()'
+    ) IS NOT NULL
+    AND to_regprocedure(
+      'otlet.record_reviewer_error(bigint,text)'
+    ) IS NOT NULL
+    AND to_regprocedure(
+      'otlet.validate_review_event_reviewer_calibration()'
+    ) IS NOT NULL
+    AND to_regprocedure(
+      'otlet.lock_review_action_task(bigint)'
+    ) IS NOT NULL
+    AND to_regprocedure(
+      'otlet.reviewer_correct_action(bigint,jsonb,text)'
+    ) IS NOT NULL
+    AND to_regprocedure('otlet.grant_reviewer_access(regrole)') IS NOT NULL,
+  (
+    SELECT count(*) = 2
+    FROM information_schema.columns
+    WHERE table_schema = 'otlet'
+      AND table_name = 'review_events'
+      AND column_name IN (
+        'reviewer_rubric_hash',
+        'reviewer_calibration_hash'
+      )
+  ),
+  (
+    SELECT policy_version = 6
+      AND export_views @>
+        ARRAY['otlet.audit_reviewer_calibration_export']::text[]
+    FROM otlet.redaction_policy_status
+  ) AND (
+    SELECT operator_functions = 3
+      AND operator_security_definer_functions = 3
+      AND operator_fixed_search_path_functions = 3
+      AND reviewer_functions = 8
+      AND reviewer_security_definer_functions = 8
+      AND reviewer_fixed_search_path_functions = 8
+    FROM otlet.access_policy_status
+  ),
+  pg_catalog.has_table_privilege(
+      :'operator_role',
+      'otlet.audit_reviewer_calibration_export',
+      'SELECT'
+    )
+    AND pg_catalog.has_function_privilege(
+      :'operator_role',
+      'otlet.reviewer_calibration_state(text)',
+      'EXECUTE'
+    )
+    AND (
+      SELECT bool_and(pg_catalog.has_function_privilege(
+        :'operator_role', function_oid, 'EXECUTE'
+      ))
+      FROM unnest(ARRAY[
+        'otlet.dry_run_action(bigint)'::regprocedure::oid,
+        'otlet.apply_action(bigint)'::regprocedure::oid,
+        'otlet.application_retry_job(bigint,text)'::regprocedure::oid
+      ]) function_oid
+    )
+    AND (
+      SELECT bool_and(NOT pg_catalog.has_function_privilege(
+        :'operator_role', function_oid, 'EXECUTE'
+      ))
+      FROM unnest(ARRAY[
+        'otlet.approve_action(bigint,text)'::regprocedure::oid,
+        'otlet.reject_action(bigint,text,text)'::regprocedure::oid,
+        'otlet.label_action(bigint,text,text,text,text,text)'::regprocedure::oid,
+        'otlet.correct_action(bigint,jsonb,text)'::regprocedure::oid,
+        'otlet.reviewer_correct_action(bigint,jsonb,text)'::regprocedure::oid,
+        'otlet.defer_action(bigint,text)'::regprocedure::oid,
+        'otlet.abstain_review(bigint,text)'::regprocedure::oid,
+        'otlet.approve_semantic_correction(bigint,bigint,jsonb,timestamptz,numeric,text,text)'::regprocedure::oid,
+        'otlet.label_review_sample(bigint,text,text,text,text,text)'::regprocedure::oid,
+        'otlet.submit_reviewer_calibration(text,text,text,text,text)'::regprocedure::oid,
+        'otlet.record_reviewer_error(bigint,text)'::regprocedure::oid
+      ]) function_oid
+    ),
+  pg_catalog.pg_has_role(:'reviewer_login', :'reviewer_role', 'MEMBER')
+    AND (
+      SELECT bool_and(pg_catalog.has_table_privilege(
+        :'reviewer_role', relation_name, 'SELECT'
+      ))
+      FROM unnest(ARRAY[
+        'otlet.reviewer_review_queue',
+        'otlet.reviewer_calibration_queue',
+        'otlet.reviewer_calibration_status'
+      ]) relation_name
+    )
+    AND (
+      SELECT bool_and(pg_catalog.has_function_privilege(
+        :'reviewer_role', function_oid, 'EXECUTE'
+      ))
+      FROM unnest(ARRAY[
+        'otlet.approve_action(bigint,text)'::regprocedure::oid,
+        'otlet.reject_action(bigint,text,text)'::regprocedure::oid,
+        'otlet.reviewer_correct_action(bigint,jsonb,text)'::regprocedure::oid,
+        'otlet.defer_action(bigint,text)'::regprocedure::oid,
+        'otlet.abstain_review(bigint,text)'::regprocedure::oid,
+        'otlet.approve_semantic_correction(bigint,bigint,jsonb,timestamptz,numeric,text,text)'::regprocedure::oid,
+        'otlet.label_review_sample(bigint,text,text,text,text,text)'::regprocedure::oid,
+        'otlet.submit_reviewer_calibration(text,text,text,text,text)'::regprocedure::oid,
+        'otlet.reviewer_calibration_state(text)'::regprocedure::oid,
+        'otlet.reviewer_calibration_member_token(text,text)'::regprocedure::oid,
+        'otlet.reviewer_review_queue_rows()'::regprocedure::oid
+      ]) function_oid
+    ),
+  (
+    SELECT bool_and(NOT pg_catalog.has_table_privilege(
+      :'reviewer_role', relation_name, 'SELECT'
+    ))
+    FROM unnest(ARRAY[
+      'otlet.evaluation_cases',
+      'otlet.eval_labels',
+      'otlet.review_samples',
+      'otlet.reviewer_calibrations',
+      'otlet.reviewer_calibration_responses',
+      'otlet.reviewer_review_errors',
+      'otlet.audit_review_export',
+      'otlet.audit_reviewer_calibration_export'
+    ]) relation_name
+  ) AND (
+    SELECT bool_and(NOT pg_catalog.has_function_privilege(
+      :'reviewer_role', function_oid, 'EXECUTE'
+    ))
+    FROM unnest(ARRAY[
+      'otlet.label_action(bigint,text,text,text,text,text)'::regprocedure::oid,
+      'otlet.dry_run_action(bigint)'::regprocedure::oid,
+      'otlet.apply_action(bigint)'::regprocedure::oid,
+      'otlet.application_retry_job(bigint,text)'::regprocedure::oid,
+      'otlet.record_reviewer_error(bigint,text)'::regprocedure::oid,
+      'otlet.lock_review_action_task(bigint)'::regprocedure::oid,
+      'otlet.correct_action(bigint,jsonb,text)'::regprocedure::oid
+    ]) function_oid
+  ),
+  NOT pg_catalog.has_table_privilege(
+      :'partial_auditor_role',
+      'otlet.audit_reviewer_calibration_export',
+      'SELECT'
+    )
+    AND NOT pg_catalog.has_function_privilege(
+      :'partial_auditor_role',
+      'otlet.reviewer_calibration_state(text)',
+      'EXECUTE'
+    ),
+  (
+    SELECT bool_and(NOT pg_catalog.has_table_privilege(
+      'public', relation_name, 'SELECT,INSERT,UPDATE,DELETE,TRUNCATE'
+    ))
+    FROM unnest(ARRAY[
+      'otlet.reviewer_calibrations',
+      'otlet.reviewer_calibration_responses',
+      'otlet.reviewer_review_errors',
+      'otlet.reviewer_review_queue',
+      'otlet.reviewer_calibration_queue',
+      'otlet.reviewer_calibration_status',
+      'otlet.audit_reviewer_calibration_export'
+    ]) relation_name
+  ) AND NOT EXISTS (
+    SELECT 1
+    FROM pg_catalog.pg_proc function
+    JOIN pg_catalog.pg_namespace namespace
+      ON namespace.oid = function.pronamespace
+    WHERE namespace.nspname = 'otlet'
+      AND (
+        function.proname LIKE '%reviewer_calibration%'
+        OR function.proname LIKE 'reviewer_rubric%'
+        OR function.proname = 'reviewer_authority'
+        OR function.proname = 'reviewer_review_queue_rows'
+        OR function.proname IN (
+          'record_reviewer_error',
+          'validate_reviewer_review_error',
+          'validate_review_event_reviewer_calibration',
+          'lock_review_action_task',
+          'reviewer_correct_action'
+        )
+      )
+      AND pg_catalog.has_function_privilege(
+        'public', function.oid, 'EXECUTE'
+      )
+  ),
+  NOT EXISTS (SELECT 1 FROM otlet.verify_invariants())
+);
+SQL
+)"
+[ "$reviewer_calibration_migration_contract" = \
+  "t|t|t|t|t|t|t|t|t|t|t" ] || {
+  echo "Portable reviewer-calibration migration contract mismatch: $reviewer_calibration_migration_contract" >&2
+  exit 1
+}
+
+portable_reviewer_calibration_contract="$(
+  (
+    log() { :; }
+    psql_exec() {
+      docker exec -i "$container" psql -U postgres -d "$database" \
+        -X -v ON_ERROR_STOP=1 "$@"
+    }
+    source "$(dirname "$0")/demo/reviewer_rubric_calibration.sh"
+  ) | awk 'NF { line = $0 } END { print line }'
+)"
+[ "$portable_reviewer_calibration_contract" = \
+  "t|rubric_changed|rubric_changed|rubric_changed|calibrated|4|8" ] || {
+  echo "Portable reviewer-calibration contract mismatch: $portable_reviewer_calibration_contract" >&2
   exit 1
 }
 
@@ -3283,7 +3552,6 @@ FROM otlet.complete_job(
   expected_claim_token => 'review-sampling-upgrade-action-free'
 ) \g /dev/null
 
-SET ROLE :"operator_role";
 SELECT count(*)
 FROM otlet.label_review_sample(
   (
@@ -3298,7 +3566,6 @@ FROM otlet.label_review_sample(
   'approve',
   'Confirmed action-free sample'
 ) \g /dev/null
-RESET ROLE;
 
 SELECT otlet.cleanup_eval_label_series(
   clock_timestamp() + interval '1 second',
@@ -4086,6 +4353,8 @@ echo "portable_entity_graph_conflict_migration_contract=$entity_graph_conflict_m
 echo "portable_semantic_correction_migration_contract=$semantic_correction_migration_contract"
 echo "portable_decision_evidence_migration_contract=$decision_evidence_migration_contract"
 echo "portable_review_sampling_migration_contract=$review_sampling_migration_contract"
+echo "portable_reviewer_calibration_migration_contract=$reviewer_calibration_migration_contract"
+echo "portable_reviewer_calibration_contract=$portable_reviewer_calibration_contract"
 echo "portable_review_sampling_contract=$portable_review_sampling_contract"
 echo "portable_decision_evidence_contract=$portable_decision_evidence_contract"
 echo "portable_ask_administrative_contract=$portable_ask_administrative_contract"

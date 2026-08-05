@@ -14,7 +14,7 @@ SQL
 review_provenance_contract="$(psql_value \
   -v action_id="$merge_action_id" \
   -v receipt_id="$abstention_review_receipt_id" \
-  -v operator_role="$permission_operator_role" <<'SQL'
+  -v reviewer_role="$permission_reviewer_role" <<'SQL'
 BEGIN;
 CREATE TEMP TABLE review_event_baseline AS
 SELECT COALESCE(max(id), 0) AS max_id
@@ -23,7 +23,7 @@ FROM otlet.review_events;
 UPDATE otlet.actions
 SET status = 'proposed', approval_status = 'required', approved_at = NULL, error = NULL
 WHERE id = :'action_id'::bigint;
-SET LOCAL ROLE :operator_role;
+SET LOCAL ROLE :reviewer_role;
 SELECT count(*) AS calls
 FROM otlet.approve_action(:'action_id'::bigint, 'provenance approve') \gset review_approve_
 RESET ROLE;
@@ -31,7 +31,7 @@ RESET ROLE;
 UPDATE otlet.actions
 SET status = 'proposed', approval_status = 'required', approved_at = NULL, error = NULL
 WHERE id = :'action_id'::bigint;
-SET LOCAL ROLE :operator_role;
+SET LOCAL ROLE :reviewer_role;
 SELECT count(*) AS calls
 FROM otlet.reject_action(:'action_id'::bigint, 'rejected', 'provenance reject') \gset review_reject_
 RESET ROLE;
@@ -39,7 +39,7 @@ RESET ROLE;
 UPDATE otlet.actions
 SET status = 'proposed', approval_status = 'required', approved_at = NULL, error = NULL
 WHERE id = :'action_id'::bigint;
-SET LOCAL ROLE :operator_role;
+SET LOCAL ROLE :reviewer_role;
 SELECT count(*) AS calls
 FROM otlet.defer_action(:'action_id'::bigint, 'provenance defer') \gset review_defer_
 RESET ROLE;
@@ -48,16 +48,16 @@ SELECT EXISTS (
   SELECT 1 FROM otlet.review_queue WHERE action_id = :'action_id'::bigint
 ) AS still_queued;
 
-SET LOCAL ROLE :operator_role;
+SET LOCAL ROLE :reviewer_role;
 SELECT count(*) AS calls
-FROM otlet.correct_action(
+FROM otlet.reviewer_correct_action(
   :'action_id'::bigint,
   '{"match":"same_entity","confidence":"high","action_type":"merge_candidate"}'::jsonb,
   'provenance correct'
 ) \gset review_correct_
 RESET ROLE;
 
-SET LOCAL ROLE :operator_role;
+SET LOCAL ROLE :reviewer_role;
 SELECT count(*) AS calls
 FROM otlet.abstain_review(:'receipt_id'::bigint, 'provenance abstain') \gset review_abstain_
 RESET ROLE;
@@ -81,7 +81,7 @@ BEGIN
       DELETE FROM otlet.review_events
       WHERE id = (SELECT min(id) FROM review_test_events);
     ELSE
-      TRUNCATE otlet.review_events;
+      TRUNCATE otlet.review_events CASCADE;
     END IF;
   EXCEPTION WHEN OTHERS THEN
     RETURN SQLERRM = 'otlet review event history is immutable';
@@ -102,7 +102,7 @@ SELECT
     'abstain,approve,correct,defer,reject')::text || '|' ||
   (SELECT bool_and(
     reviewer_identity = session_user::text
-    AND reviewer_role = :'operator_role'
+    AND reviewer_role = :'reviewer_role'
   ) FROM review_test_events)::text || '|' ||
   (SELECT bool_and(
     receipt_id IS NOT NULL
@@ -126,7 +126,7 @@ SELECT
    FROM unnest(ARRAY[
      'otlet.approve_action(bigint,text)'::regprocedure::oid,
      'otlet.reject_action(bigint,text,text)'::regprocedure::oid,
-     'otlet.correct_action(bigint,jsonb,text)'::regprocedure::oid,
+     'otlet.reviewer_correct_action(bigint,jsonb,text)'::regprocedure::oid,
      'otlet.defer_action(bigint,text)'::regprocedure::oid,
      'otlet.abstain_review(bigint,text)'::regprocedure::oid
    ]) function_oid)::text;
@@ -140,6 +140,6 @@ echo "review_provenance_contract=$review_provenance_contract"
 }
 
 expect_permission_denied \
-  "$permission_operator_role" \
+  "$permission_reviewer_role" \
   "INSERT INTO otlet.review_events DEFAULT VALUES" \
-  "operator caller-supplied review provenance"
+  "reviewer caller-supplied review provenance"

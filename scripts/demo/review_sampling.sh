@@ -1,10 +1,10 @@
 log "Proving review sampling"
 
-review_sampling_operator_role="otlet_review_sampling_operator_$$"
+review_sampling_reviewer_role="otlet_review_sampling_reviewer_$$"
 review_sampling_contract="$(
   psql_exec -qAt \
     -v model_name="$strong_model_name" \
-    -v operator_role="$review_sampling_operator_role" <<'SQL'
+    -v reviewer_role="$review_sampling_reviewer_role" <<'SQL'
 BEGIN;
 SET LOCAL client_min_messages TO warning;
 
@@ -556,8 +556,8 @@ SELECT
    JOIN review_sampling_proof proof ON event.contract_hash = proof.contract_hash)
     AS automatic_promotion_events;
 
-SELECT format('CREATE ROLE %I NOLOGIN', :'operator_role') \gexec
-SELECT otlet.grant_operator_access(:'operator_role'::regrole) \g /dev/null
+SELECT format('CREATE ROLE %I NOLOGIN', :'reviewer_role') \gexec
+SELECT otlet.grant_reviewer_access(:'reviewer_role'::regrole) \g /dev/null
 
 SELECT
   task_receipt_id AS task_receipt_id,
@@ -565,7 +565,7 @@ SELECT
   action_free_receipt_id AS action_free_receipt_id
 FROM review_sampling_proof \gset review_sampling_
 
-SELECT format('SET LOCAL ROLE %I', :'operator_role') \gexec
+SELECT format('SET LOCAL ROLE %I', :'reviewer_role') \gexec
 SELECT label.id AS label_id
 FROM otlet.label_review_sample(
   :'review_sampling_task_receipt_id'::bigint,
@@ -1013,33 +1013,41 @@ SELECT concat_ws('|',
     AND immutability.delete_guarded
     AND immutability.truncate_guarded,
   pg_catalog.has_table_privilege(
-    :'operator_role',
-    'otlet.audit_review_sample_export',
+    :'reviewer_role',
+    'otlet.reviewer_review_queue',
     'SELECT'
   )
     AND NOT pg_catalog.has_table_privilege(
-      :'operator_role',
+      :'reviewer_role',
+      'otlet.audit_review_sample_export',
+      'SELECT'
+    )
+    AND NOT pg_catalog.has_table_privilege(
+      :'reviewer_role',
       'otlet.review_samples',
       'SELECT,INSERT,UPDATE,DELETE,TRUNCATE'
     )
     AND pg_catalog.has_function_privilege(
-      :'operator_role',
+      :'reviewer_role',
       'otlet.label_review_sample(bigint,text,text,text,text,text)',
       'EXECUTE'
     )
     AND NOT pg_catalog.has_function_privilege(
-      :'operator_role',
+      :'reviewer_role',
       'otlet.register_evaluation_case(bigint,text,text)',
       'EXECUTE'
     )
     AND NOT pg_catalog.has_function_privilege(
-      :'operator_role',
+      :'reviewer_role',
       'otlet.adjudicate_eval_label(bigint,text,numeric,text,bigint)',
       'EXECUTE'
     ),
-  (SELECT operator_functions = 11
-     AND operator_security_definer_functions = 11
-     AND operator_fixed_search_path_functions = 11
+  (SELECT operator_functions = 3
+     AND operator_security_definer_functions = 3
+     AND operator_fixed_search_path_functions = 3
+     AND reviewer_functions = 8
+     AND reviewer_security_definer_functions = 8
+     AND reviewer_fixed_search_path_functions = 8
      AND NOT public_schema_usage
      AND public_executable_functions = 0
      AND public_table_privileges = 0

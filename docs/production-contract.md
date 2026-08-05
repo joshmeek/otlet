@@ -124,7 +124,15 @@ Workload acceptance policy lives outside executable workload revisions. `registe
 
 These functions declare governance evidence. They do not run an evaluation, infer that a threshold passed, promote a workload revision, or create a job. Otlet accepts a `promote` decision after the caller cites at least one complete qualification run for the same contract, task, baseline, and candidate revisions. Read the owner-only declaration and history through `otlet.workload_acceptance_status` and `otlet.audit_workload_acceptance_event_export`. Metric calculation, shadow execution, and authoritative promotion remain separate contracts
 
-An acceptance contract can opt production outcomes into review with `population.rule.review_sampling`. The declaration sets task, decision-class, and action-free rates from 0 through 1; action-free, decision-class, then task rates take precedence, so a specific zero excludes that stratum. Completion uses a portable SHA-derived bucket and persists selected receipt and output identity before commit. A redacted answer cannot define a class stratum, and task or action-free sampling stores no redacted or unbounded answer. `otlet.review_queue` suppresses the sampled row when a mandatory review path already owns the receipt. Delegated operators read redacted state through `otlet.audit_review_sample_export` and call `label_review_sample(...)` with an explicit `approve` or `correct` outcome. Approval requires visible answer and confidence plus no actions for `none` or exactly one valid matching action; redacted evidence and multi-action outputs require correction. The call atomically creates one pending receipt label and one immutable review event; correction can set `none`, exact retries add nothing, and retention cleanup cannot reopen the sample. Label adjudication, `register_evaluation_case(...)`, qualification, training, and promotion remain separate owner actions
+An acceptance contract can opt production outcomes into review with `population.rule.review_sampling`. The declaration sets task, decision-class, and action-free rates from 0 through 1; action-free, decision-class, then task rates take precedence, so a specific zero excludes that stratum. Completion uses a portable SHA-derived bucket and persists selected receipt and output identity before commit. A redacted answer cannot define a class stratum, and task or action-free sampling stores no redacted or unbounded answer. `otlet.review_queue` suppresses the sampled row when a mandatory review path already owns the receipt. Auditors and operators read redacted sampling evidence through `otlet.audit_review_sample_export`. A calibrated reviewer reads sampled work through `otlet.reviewer_review_queue` and calls `label_review_sample(...)` with an explicit `approve` or `correct` outcome. Approval requires visible answer and confidence plus no actions for `none` or exactly one valid matching action; redacted evidence and multi-action outputs require correction. The call atomically creates one pending receipt label and one immutable review event; correction can set `none`, exact retries add nothing, and retention cleanup cannot reopen the sample. Label adjudication, `register_evaluation_case(...)`, qualification, training, and promotion remain separate owner actions
+
+A workload revision opts into delegated review with the exact `task.decision_contract.review_rubric` keys `format`, `instructions`, `minimum_gold_cases`, `maximum_calibration_errors`, and `maximum_review_errors`. The format is `otlet.review_rubric.v1`; instructions are nonblank and at most 32 KiB; minimum gold is 1 through 64; calibration errors are 0 through 63 and must leave at least one correct case; review errors are 0 through 999999. Without this object, review remains owner-only
+
+The owner calls `register_reviewer_calibration(...)` for a login role that already has reviewer access. Cases must be current, qualification-eligible manual corrections from the calibration population, meet the rubric count, use distinct source lineage, and never have been authored, adjudicated, or previously exposed to that reviewer. Otlet also rejects reviewers that can read label, evaluation, sampling, correction, acceptance-population, or derived report surfaces or call the owner-only label, correction, or gold-export RPCs, including access reachable through inherited or `SET ROLE` membership
+
+`otlet.reviewer_calibration_queue` exposes opaque member tokens, the rubric, shaped input, and allowed answer, confidence, and action values. It never exposes case identities, expected answers, correctness, or the running error count. `submit_reviewer_calibration(...)` accepts exact retries, rejects changed answers, and reveals the result only after every member is answered. `otlet.reviewer_calibration_status` reports `pending`, `calibration_threshold_breached`, `calibrated`, `gold_invalid`, `gold_visible`, `rubric_changed`, `review_error_threshold_breached`, or `reviewer_identity_invalid`
+
+Only `calibrated` opens `otlet.reviewer_review_queue`. That queue contains shaped input, storage-redacted output, bounded proposed actions, the rubric, and the response contract, but no raw job, audit, or gold tables. Review events bind the calibration and rubric hashes. The owner may call `record_reviewer_error(review_event_id, reason)` against one immutable calibrated event; once errors exceed the rubric maximum, a later calibration is required. A workload revision with the same rubric preserves authority, while rubric, identity, gold, or visible-gold drift closes it. Calibration creates no jobs, labels, actions, materializations, training, promotion, review-work assignments, or leases
 
 Replay uses a separate owner-only path. `register_evaluation_case(label_id, population_kind, reason)` binds an approved label to its source job, receipt, exact workload revision, expected decision, immutable post-shaping snapshot, and one of `tuning`, `calibration`, `shadow`, or `qualification`. Otlet derives logical source and shaped-snapshot lineage without label or population inputs. Otlet accepts one registration per snapshot, so evidence used for selection cannot enter the qualification population. Cases reject updates and deletes and remain owner-only
 
@@ -446,11 +454,11 @@ SELECT count(*) FROM otlet.verify_invariants();
 
 Contract: `0` (demo prints `invariant_contract=0`). The suite fails closed on expired or NULL leases for `running` and `cancel_requested` jobs, complete receipts without schema pass, sensitive evidence that violates the active storage policy, materializations missing `source_hash`, and error runtime slots. `production_status` and `verify_invariants` name the receipt invariant `complete_receipts_are_schema_validated`; throughput views use `completed_jobs` and `last_batch_completed_jobs`. Step 6 of `docs/semantic-watches.md` anchors the planner vocabulary for `selected_path` / `Planner Selected Path` and `freshness_basis`
 
-Operators query redacted, read-only projections through `otlet.audit_receipt_export`, `otlet.audit_review_export`, `otlet.audit_review_event_export`, `otlet.audit_action_execution_export`, `otlet.audit_eval_label_export`, `otlet.audit_administrative_change_export`, `otlet.audit_decision_evidence_export`, `otlet.semantic_dependency_audit`, `otlet.operational_event_log`, `otlet.worker_batch_timing_status`, and `otlet.failure_retry_status`. `otlet.redaction_policy_status` lists withheld evidence for the audit exports. `otlet.failure_retry_status` exposes whether raw error detail exists without exposing the detail
+Auditors and operators query redacted, read-only projections through `otlet.audit_receipt_export`, `otlet.audit_review_sample_export`, `otlet.audit_review_export`, `otlet.audit_review_event_export`, `otlet.audit_reviewer_calibration_export`, `otlet.audit_action_execution_export`, `otlet.audit_eval_label_export`, `otlet.audit_administrative_change_export`, `otlet.audit_decision_evidence_export`, `otlet.semantic_dependency_audit`, `otlet.operational_event_log`, `otlet.worker_batch_timing_status`, and `otlet.failure_retry_status`. `otlet.redaction_policy_status` lists withheld evidence for the audit exports. `otlet.failure_retry_status` exposes whether raw error detail exists without exposing the detail
 
 ## Step 4 - Grant Role-Scoped Access
 
-Otlet revokes schema, table, sequence, and function access from `PUBLIC`. The extension owner keeps raw and administrative access. Applications create their own login or group roles, then the extension owner grants one of three bounded capabilities
+Otlet revokes schema, table, sequence, and function access from `PUBLIC`. The extension owner keeps raw and administrative access. Applications create their own login or group roles, then the extension owner grants one of four bounded capabilities
 
 Create roles through your normal provisioning path. These `NOLOGIN` roles show the grant contract:
 
@@ -462,10 +470,12 @@ SELECT otlet.set_administrative_change_context(
 );
 CREATE ROLE app_otlet_auditor NOLOGIN;
 CREATE ROLE app_otlet_operator NOLOGIN;
+CREATE ROLE app_otlet_reviewer NOLOGIN;
 CREATE ROLE app_otlet_application NOLOGIN;
 
 SELECT otlet.grant_auditor_access('app_otlet_auditor'::regrole);
 SELECT otlet.grant_operator_access('app_otlet_operator'::regrole);
+SELECT otlet.grant_reviewer_access('app_otlet_reviewer'::regrole);
 SELECT otlet.grant_application_access('app_otlet_application'::regrole);
 COMMIT;
 ```
@@ -477,8 +487,10 @@ The auditor capability grants read-only access to these redacted policy and audi
 - `otlet.redaction_policy_status`
 - `otlet.access_policy_status`
 - `otlet.audit_receipt_export`
+- `otlet.audit_review_sample_export`
 - `otlet.audit_review_export`
 - `otlet.audit_review_event_export`
+- `otlet.audit_reviewer_calibration_export`
 - `otlet.audit_action_execution_export`
 - `otlet.audit_eval_label_export`
 - `otlet.audit_administrative_change_export`
@@ -496,31 +508,36 @@ The auditor capability grants read-only access to these redacted policy and audi
 - `otlet.failure_taxonomy`
 - `otlet.failure_retry_status`
 
-The grant also includes the pure JSON hashing helpers required by `audit_review_export`, the native capability reader used by `runtime_capability_status`, and the task-scoped entity-graph and semantic-correction status readers. The operator capability includes auditor access plus these functions:
+The grant also includes the pure JSON hashing helpers required by `audit_review_export`, the native capability reader used by `runtime_capability_status`, the task-scoped entity-graph and semantic-correction status readers, and the calibration-state reader. The operator capability includes auditor access plus these functions:
 
-- `otlet.approve_action`
-- `otlet.reject_action`
-- `otlet.label_action`
-- `otlet.correct_action`
-- `otlet.defer_action`
-- `otlet.abstain_review`
 - `otlet.dry_run_action`
 - `otlet.apply_action`
 - `otlet.application_retry_job`
+
+The reviewer capability grants `SELECT` only on `otlet.reviewer_review_queue`, `otlet.reviewer_calibration_queue`, and `otlet.reviewer_calibration_status`, plus these decision RPCs:
+
+- `otlet.approve_action`
+- `otlet.reject_action`
+- `otlet.reviewer_correct_action`
+- `otlet.defer_action`
+- `otlet.abstain_review`
 - `otlet.approve_semantic_correction`
+- `otlet.label_review_sample`
+- `otlet.submit_reviewer_calibration`
 
-The ten operator functions run as the extension owner with `search_path` fixed to `pg_catalog, otlet, pg_temp`. The retry RPC preserves the original application's job owner while recording the operator login and active role. Operators receive no direct table writes. The owner alone registers targets and workflow policies, disables them, and imports or exports watches. Watch exports contain instructions, policies, schemas, source identifiers, and owner-authored candidate SQL, so auditor and operator roles cannot read or import them
+The reviewer grant also includes three fixed-path queue and state helpers. `reviewer_correct_action(...)` accepts only a declared response action type or `none`, then returns the new label and immutable review-event IDs needed for semantic-correction approval without exposing either raw table. The three operator RPCs, eight reviewer RPCs, and reviewer helpers run as the extension owner with `search_path` fixed to `pg_catalog, otlet, pg_temp`. The retry RPC preserves the original application's job owner while recording the operator login and active role. Review RPCs require a current calibration for the authenticated login, even under `SET ROLE`. Operators and reviewers receive no direct table writes. `label_action(...)` and the unbounded `correct_action(...)` stay owner-only. The owner alone registers targets and workflow policies, disables them, and imports or exports watches. Watch exports contain instructions, policies, schemas, source identifiers, and owner-authored candidate SQL, so delegated roles cannot read or import them
 
-SQL-only owners grant an operator `USAGE` on schema `otlet` and `EXECUTE` on `application_retry_job(bigint, text)` through PostgreSQL. The portable permission sweep leaves all other Otlet functions and tables closed unless the owner grants them
+The SQL-only install exposes the same operator and reviewer grants through PostgreSQL. The portable worker permission sweep leaves all other Otlet functions and tables closed unless the owner grants them
 
-Approval, rejection, correction, deferral, and abstention append immutable rows to `otlet.review_events`. Otlet derives `reviewer_identity` from `session_user` and `reviewer_role` from the active `SET ROLE` state; none of the review functions accepts either value from the caller. Each event snapshots its reason, timestamp, source freshness, and links to the job, action or output, receipt, model artifact, prompt, schema, runtime, and output identities
+Approval, rejection, correction, deferral, abstention, and semantic-correction approval append immutable rows to `otlet.review_events`. Otlet derives `reviewer_identity` from `session_user` and `reviewer_role` from the active `SET ROLE` state; none of the review functions accepts either value from the caller. Each event snapshots its reason, timestamp, source freshness, reviewer rubric and calibration hashes, and links to the job, action or output, receipt, model artifact, prompt, schema, runtime, and output identities
 
 `otlet.defer_action(...)` leaves the action in the review queue. `otlet.abstain_review(...)` records the final review of an abstention or an output rejected without an action and removes that item from the queue. Inspect the append-only audit projection without raw source rows:
 
 ```sql
 SELECT outcome, reviewer_identity, reviewer_role, reason,
        source_freshness, action_id, output_id, receipt_id,
-       model_name, prompt_hash, output_schema_hash, reviewed_at
+       model_name, prompt_hash, output_schema_hash,
+       reviewer_rubric_hash, reviewer_calibration_hash, reviewed_at
 FROM otlet.audit_review_event_export
 ORDER BY review_event_id;
 ```
@@ -536,11 +553,11 @@ SELECT * FROM otlet.access_policy_status;
 SELECT * FROM otlet.application_access_policy_status;
 ```
 
-The demo proves the catalog ACLs, 21 auditor relations and 22 function grants, 21 operator relations and 32 function grants, eight operator paths, 30 exact security-definer functions, three application RPCs, eight portable RPCs, 15 denied application paths, and 75 denied auditor or operator paths. The delegated operator role proves all five review outcomes:
+The demo proves the catalog ACLs, 23 auditor relations and 24 function grants, 23 operator relations and 27 function grants, three reviewer relations and 11 function grants, three operator RPCs, eight reviewer RPCs, 37 exact security-definer functions, three application RPCs, eight portable RPCs, seven positive delegated paths, and 112 denied paths. The calibrated reviewer proves all five review outcomes:
 
 ```text
 review_provenance_contract=true|true|true|true|true|true|true|true|true|true|true
-permission_contract=public=0/0/0|auditor=21/22|operator=21/32|definer=30/30|application=3/3/3|portable=8/8/8|positive=8|denied=75
+permission_contract=public=0/0/0|auditor=23/24|operator=23/27|reviewer=3/11|definer=37/37|application=3/3/3|operator_rpc=3/3/3|reviewer_rpc=8/8/8|portable=8/8/8|positive=7|denied=112
 ```
 
 Your application still owns these deployment boundaries:
@@ -548,4 +565,4 @@ Your application still owns these deployment boundaries:
 - add RLS or schema isolation if multiple tenants share the database
 - schedule `otlet.cleanup_policy_state(false)` for worker-event, trace-detail, diagnostic evidence, stale materialization, and unreferenced failed/canceled job pruning
 - allow action types your application has code to interpret
-- decide which users inherit the auditor and operator roles
+- decide which users inherit the auditor, operator, and reviewer roles, keeping reviewer logins away from gold access

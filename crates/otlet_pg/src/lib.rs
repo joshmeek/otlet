@@ -360,6 +360,11 @@ pgrx::extension_sql_file!(
     name = "review_sampling",
     requires = ["evidence_linked_decisions"]
 );
+pgrx::extension_sql_file!(
+    "../sql/migrations/0071_reviewer_rubric_calibration.sql",
+    name = "reviewer_rubric_calibration",
+    requires = ["review_sampling"]
+);
 
 #[allow(non_snake_case)]
 #[pgrx::pg_guard]

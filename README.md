@@ -169,9 +169,9 @@ ORDER BY attempt_index;
 (2 rows)
 ```
 
-Otlet records both attempts and creates `merge_candidate` from the accepted output. The action requires operator approval. The source vendor rows remain unchanged
+Otlet records both attempts and creates `merge_candidate` from the accepted output. The action remains pending for review. The source vendor rows remain unchanged
 
-The full demo checks row and pair watches, candidate drift, CustomScan freshness, portable watch definitions, and bounded `update_row`. It covers receipt redaction, role grants, cancellation, model-load admission, memory pressure, cache bounds, prompt and runtime fingerprints, invariants, and Docker crash logs
+The full demo checks row and pair watches, candidate drift, CustomScan freshness, portable watch definitions, and bounded `update_row`. It covers blinded reviewer calibration, role separation, receipt redaction, cancellation, model-load admission, memory pressure, cache bounds, prompt and runtime fingerprints, invariants, and Docker crash logs
 
 ## Docs
 

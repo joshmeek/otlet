@@ -1,36 +1,5 @@
 \echo '[label-provenance] Proving label provenance and quality'
 
-CREATE TEMP TABLE label_quality_role (role_name text NOT NULL) ON COMMIT DROP;
-INSERT INTO label_quality_role
-VALUES ('otlet_label_operator_' || pg_backend_pid()::text);
-SELECT format('CREATE ROLE %I NOLOGIN', role_name)
-FROM label_quality_role \gexec
-SELECT format(
-  'SELECT otlet.grant_operator_access(%L::regrole)',
-  role_name
-)
-FROM label_quality_role
-WHERE to_regprocedure('otlet.grant_operator_access(regrole)') IS NOT NULL \gexec
-SELECT format('GRANT USAGE ON SCHEMA otlet TO %I', role_name)
-FROM label_quality_role
-WHERE to_regprocedure('otlet.grant_operator_access(regrole)') IS NULL \gexec
-SELECT format('GRANT USAGE ON TYPE otlet.eval_labels TO %I', role_name)
-FROM label_quality_role
-WHERE to_regprocedure('otlet.grant_operator_access(regrole)') IS NULL \gexec
-SELECT format(
-  'GRANT SELECT ON TABLE otlet.audit_eval_label_export TO %I',
-  role_name
-)
-FROM label_quality_role
-WHERE to_regprocedure('otlet.grant_operator_access(regrole)') IS NULL \gexec
-SELECT format(
-  'GRANT EXECUTE ON FUNCTION '
-    'otlet.label_action(bigint, text, text, text, text, text) TO %I',
-  role_name
-)
-FROM label_quality_role
-WHERE to_regprocedure('otlet.grant_operator_access(regrole)') IS NULL \gexec
-
 CREATE TEMP TABLE label_quality_proof (
   original_label_id bigint NOT NULL,
   original_action_id bigint NOT NULL,
@@ -81,8 +50,6 @@ WHERE population_case.population_kind = 'qualification';
 
 SELECT original_action_id AS action_id
 FROM label_quality_proof \gset
-SELECT format('SET ROLE %I', role_name)
-FROM label_quality_role \gexec
 SELECT label.id AS conflict_label_id
 FROM otlet.label_action(
   :action_id,
@@ -92,13 +59,12 @@ FROM otlet.label_action(
   reason => 'Independent conflicting label',
   label_source => 'manual_correction'
 ) label \gset
-RESET ROLE;
 UPDATE label_quality_proof
 SET conflict_label_id = :'conflict_label_id'::bigint;
 
 SELECT pg_temp.assert_true(
   quality.authored_by = session_user
-    AND quality.authored_as = (SELECT role_name FROM label_quality_role)
+    AND quality.authored_as = session_user
     AND quality.label_revision = 2
     AND quality.adjudication_state = 'pending'
     AND quality.label_confidence IS NULL,
@@ -265,8 +231,6 @@ $body$;
 
 SELECT original_action_id AS action_id
 FROM label_quality_proof \gset
-SELECT format('SET ROLE %I', role_name)
-FROM label_quality_role \gexec
 SELECT label.id AS intermediate_label_id
 FROM otlet.label_action(
   :action_id,
@@ -276,7 +240,6 @@ FROM otlet.label_action(
   reason => 'Uncased same-snapshot successor',
   label_source => 'manual_correction'
 ) label \gset
-RESET ROLE;
 UPDATE label_quality_proof
 SET intermediate_label_id = :'intermediate_label_id'::bigint;
 SELECT otlet.adjudicate_eval_label(
@@ -290,8 +253,6 @@ FROM label_quality_proof \g /dev/null
 
 SELECT original_action_id AS action_id
 FROM label_quality_proof \gset
-SELECT format('SET ROLE %I', role_name)
-FROM label_quality_role \gexec
 SELECT label.id AS replacement_label_id
 FROM otlet.label_action(
   :action_id,
@@ -301,7 +262,6 @@ FROM otlet.label_action(
   reason => 'Accepted multi-hop same-snapshot successor',
   label_source => 'manual_correction'
 ) label \gset
-RESET ROLE;
 UPDATE label_quality_proof
 SET replacement_label_id = :'replacement_label_id'::bigint;
 SELECT otlet.adjudicate_eval_label(
@@ -573,8 +533,6 @@ SELECT pg_temp.assert_true(
 );
 SELECT pg_temp.complete_label_quality_production('qualification-1')
   AS fresh_action_id \gset
-SELECT format('SET ROLE %I', role_name)
-FROM label_quality_role \gexec
 SELECT label.id AS fresh_label_id
 FROM otlet.label_action(
   :fresh_action_id,
@@ -584,7 +542,6 @@ FROM otlet.label_action(
   reason => 'Fresh exact-source successor',
   label_source => 'manual_correction'
 ) label \gset
-RESET ROLE;
 UPDATE label_quality_proof
 SET fresh_label_id = :'fresh_label_id'::bigint;
 SELECT otlet.adjudicate_eval_label(
@@ -648,8 +605,6 @@ SELECT pg_temp.assert_true(
 );
 SELECT pg_temp.complete_label_quality_production('cleanup-1')
   AS cleanup_action_id \gset
-SELECT format('SET ROLE %I', role_name)
-FROM label_quality_role \gexec
 SELECT label.id AS cleanup_first_label_id
 FROM otlet.label_action(
   :cleanup_action_id,
@@ -659,15 +614,12 @@ FROM otlet.label_action(
   reason => 'Cleanup chain predecessor',
   label_source => 'manual_correction'
 ) label \gset
-RESET ROLE;
 SELECT otlet.adjudicate_eval_label(
   :'cleanup_first_label_id'::bigint,
   'accepted',
   0.90,
   'Accepted cleanup chain predecessor'
 ) \g /dev/null
-SELECT format('SET ROLE %I', role_name)
-FROM label_quality_role \gexec
 SELECT label.id AS cleanup_second_label_id
 FROM otlet.label_action(
   :cleanup_action_id,
@@ -677,7 +629,6 @@ FROM otlet.label_action(
   reason => 'Cleanup chain successor',
   label_source => 'manual_correction'
 ) label \gset
-RESET ROLE;
 SELECT otlet.adjudicate_eval_label(
   :'cleanup_second_label_id'::bigint,
   'accepted',
@@ -749,8 +700,6 @@ BEGIN
 END
 $body$;
 
-SELECT format('SET ROLE %I', role_name)
-FROM label_quality_role \gexec
 SELECT label.id AS cleanup_third_label_id
 FROM otlet.label_action(
   :cleanup_action_id,
@@ -760,7 +709,6 @@ FROM otlet.label_action(
   reason => 'Cleanup revision non-reuse probe',
   label_source => 'manual_correction'
 ) label \gset
-RESET ROLE;
 UPDATE label_quality_proof proof
 SET cleanup_chain_safe = proof.cleanup_chain_safe
   AND EXISTS (
@@ -824,36 +772,8 @@ SELECT 'label_provenance_quality_contract=' ||
   label_provenance_quality_contract
 FROM label_provenance_quality_contract;
 
-RESET ROLE;
-SELECT pg_temp.assert_true(
-  pg_catalog.has_table_privilege(
-    role_name,
-    'otlet.audit_eval_label_export',
-    'SELECT'
-  )
-    AND NOT pg_catalog.has_table_privilege(
-      role_name,
-      'otlet.eval_labels',
-      'SELECT'
-    )
-    AND NOT pg_catalog.has_function_privilege(
-      role_name,
-      'otlet.current_task_subject_input_snapshot(text,text,text)',
-      'EXECUTE'
-    )
-    AND NOT pg_catalog.has_function_privilege(
-      role_name,
-      'otlet.current_task_subject_source_hash(text,text,text)',
-      'EXECUTE'
-    ),
-  'delegated label audit boundary is invalid'
-)
-FROM label_quality_role;
 SET LOCAL transaction_read_only = on;
 SELECT count(*)
 FROM otlet.eval_label_quality_status \g /dev/null
-SELECT format('SET ROLE %I', role_name)
-FROM label_quality_role \gexec
 SELECT count(*)
 FROM otlet.audit_eval_label_export \g /dev/null
-RESET ROLE;

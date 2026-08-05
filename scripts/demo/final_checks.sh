@@ -469,7 +469,7 @@ row_correction_hash="$(psql_value \
   -v event_id="$row_authoritative_review_event_id" \
   -v expires_at="$row_correction_expires_at" <<SQL
 BEGIN;
-SET LOCAL ROLE $permission_operator_role;
+SET LOCAL ROLE $permission_reviewer_role;
 SELECT otlet.approve_semantic_correction(
   :'label_id'::bigint,
   :'event_id'::bigint,
@@ -484,7 +484,7 @@ SQL
 row_correction_active_contract="$(psql_value \
   -v task_name="$row_triage_task" \
   -v watch_name="$row_triage_watch" \
-  -v operator_role="$permission_operator_role" \
+  -v reviewer_role="$permission_reviewer_role" \
   -v correction_hash="$row_correction_hash" <<'SQL'
 WITH current_row AS (
   SELECT *
@@ -529,7 +529,12 @@ SELECT concat_ws('|',
   (SELECT raw_output_hash IS NOT DISTINCT FROM original_raw_output_hash FROM original, audit),
   (SELECT correction_author_identity = session_user FROM audit),
   (SELECT approver_identity = session_user FROM audit),
-  (SELECT approver_role = :'operator_role' FROM audit),
+  (SELECT approver_role = :'reviewer_role' FROM audit),
+  (SELECT count(*) = 1
+   FROM otlet.review_events event, audit
+   WHERE event.action_id = audit.original_action_id
+     AND event.outcome = 'approve'
+     AND event.reason = 'Semantic correction approval: approved typed correction'),
   (SELECT count(*) = 0 FROM otlet.review_queue
    WHERE queue_kind = 'semantic_correction_re_review'
      AND task_name = :'task_name'
@@ -539,7 +544,7 @@ SQL
 )"
 echo "row_correction_active_contract=$row_correction_active_contract"
 [ "$row_correction_active_contract" = \
-  "active|pass|manual_correction|t|t|t|t|t|t|t|t|t|t|t" ] || {
+  "active|pass|manual_correction|t|t|t|t|t|t|t|t|t|t|t|t" ] || {
   echo "Expected active corrected state with unchanged model evidence, got $row_correction_active_contract" >&2
   exit 1
 }
@@ -650,7 +655,7 @@ row_correction_retry_hash="$(psql_value \
   -v event_id="$row_authoritative_review_event_id" \
   -v expires_at="$row_correction_expires_at" <<SQL
 BEGIN;
-SET LOCAL ROLE $permission_operator_role;
+SET LOCAL ROLE $permission_reviewer_role;
 SELECT otlet.approve_semantic_correction(
   :'label_id'::bigint,
   :'event_id'::bigint,
@@ -929,9 +934,9 @@ SQL
 pair_authoritative_label_id="$(psql_value \
   -v action_id="$pair_authoritative_action_id" <<SQL
 BEGIN;
-SET LOCAL ROLE $permission_operator_role;
-SELECT id
-FROM otlet.correct_action(
+SET LOCAL ROLE $permission_reviewer_role;
+SELECT label_id
+FROM otlet.reviewer_correct_action(
   :'action_id'::bigint,
   '{"match":"same_entity","confidence":"high","action_type":"merge_candidate"}'::jsonb,
   'reviewer linked the pair'
@@ -958,7 +963,7 @@ pair_correction_hash="$(psql_value \
   -v label_id="$pair_authoritative_label_id" \
   -v event_id="$pair_authoritative_review_event_id" <<SQL
 BEGIN;
-SET LOCAL ROLE $permission_operator_role;
+SET LOCAL ROLE $permission_reviewer_role;
 SELECT otlet.approve_semantic_correction(
   :'label_id'::bigint,
   :'event_id'::bigint,
@@ -973,7 +978,7 @@ SQL
 pair_correction_active_contract="$(psql_value \
   -v task_name="$join_task" \
   -v index_name="$join_index_name" \
-  -v operator_role="$permission_operator_role" \
+  -v reviewer_role="$permission_reviewer_role" \
   -v correction_hash="$pair_correction_hash" <<'SQL'
 WITH current_pair AS (
   SELECT *
@@ -1006,8 +1011,13 @@ SELECT concat_ws('|',
   ),
   (SELECT body ->> 'match' = 'different_entity' FROM original),
   (SELECT output ->> 'match' = 'different_entity' FROM original),
-  (SELECT correction_author_role = :'operator_role' FROM audit),
-  (SELECT approver_role = :'operator_role' FROM audit),
+  (SELECT correction_author_role = :'reviewer_role' FROM audit),
+  (SELECT approver_role = :'reviewer_role' FROM audit),
+  (SELECT count(*) = 1
+   FROM otlet.review_events event, audit
+   WHERE event.action_id = audit.original_action_id
+     AND event.outcome = 'approve'
+     AND event.reason = 'Semantic correction approval: approved pair correction'),
   (SELECT count(*) = 1
    FROM otlet.pair_constraint_status fact
    WHERE fact.task_name = :'task_name'
@@ -1019,7 +1029,7 @@ SQL
 )"
 echo "pair_correction_active_contract=$pair_correction_active_contract"
 [ "$pair_correction_active_contract" = \
-  "active|same_entity|manual_correction|t|t|t|t|t|t|t" ] || {
+  "active|same_entity|manual_correction|t|t|t|t|t|t|t|t" ] || {
   echo "Expected active effective pair correction, got $pair_correction_active_contract" >&2
   exit 1
 }
@@ -1062,9 +1072,9 @@ pair_correction_conflict_contract="$(psql_value \
   -v predecessor_hash="$pair_correction_hash" <<SQL
 BEGIN;
 CREATE TEMP TABLE pair_correction_conflict_result (message text);
-SET LOCAL ROLE $permission_operator_role;
-SELECT id AS conflict_label_id
-FROM otlet.correct_action(
+SET LOCAL ROLE $permission_reviewer_role;
+SELECT label_id AS conflict_label_id
+FROM otlet.reviewer_correct_action(
   :'action_id'::bigint,
   '{"match":"different_entity","confidence":"high","action_type":"new_entity"}'::jsonb,
   'reviewer separated the pair'
