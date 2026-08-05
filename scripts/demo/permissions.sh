@@ -503,7 +503,8 @@ WITH table_grants AS (
           'source_relation_descriptor',
           'source_function_descriptor',
           'source_query_binding_descriptor',
-          'source_query_contract_error'
+          'source_query_contract_error',
+          'entity_graph_conflict_status_for_task'
         )
     )::bigint AS unexpected_auditor_grants,
     count(*) FILTER (
@@ -529,6 +530,7 @@ WITH table_grants AS (
           'source_function_descriptor',
           'source_query_binding_descriptor',
           'source_query_contract_error',
+          'entity_graph_conflict_status_for_task',
           'approve_action',
           'reject_action',
           'label_action',
@@ -566,6 +568,8 @@ WITH table_grants AS (
           'otlet.application_job_status(bigint)'::regprocedure,
           'otlet.application_cancel_job(bigint)'::regprocedure,
           'otlet.application_retry_job(bigint,text)'::regprocedure,
+          'otlet.entity_graph_conflict_status_for_task(text)'::regprocedure,
+          'otlet.export_eval_cases(integer)'::regprocedure,
           'otlet.grant_auditor_access(regrole)'::regprocedure,
           'otlet.grant_operator_access(regrole)'::regprocedure,
           'otlet.grant_portable_worker_access(regrole)'::regprocedure,
@@ -623,16 +627,16 @@ CROSS JOIN definer_status;
 SQL
 )"
 echo "permission_catalog_contract=$permission_catalog_contract"
-[ "$permission_catalog_contract" = "false|0|0|0|19|20|19|29|0|0|0|0|26|26|0|3|3|3|8|8|8|true" ] || {
+[ "$permission_catalog_contract" = "false|0|0|0|19|21|19|30|0|0|0|0|28|28|0|3|3|3|8|8|8|true" ] || {
   echo "Expected exact public, auditor, operator, and owner ACLs, got $permission_catalog_contract" >&2
   exit 1
 }
 
 source "$demo_dir/review_provenance.sh"
 
-permission_contract="public=0/0/0|auditor=19/20|operator=19/29|definer=26/26|application=3/3/3|portable=8/8/8|positive=7|denied=$permission_denied_count"
+permission_contract="public=0/0/0|auditor=19/21|operator=19/30|definer=28/28|application=3/3/3|portable=8/8/8|positive=7|denied=$permission_denied_count"
 echo "permission_contract=$permission_contract"
-[ "$permission_contract" = "public=0/0/0|auditor=19/20|operator=19/29|definer=26/26|application=3/3/3|portable=8/8/8|positive=7|denied=72" ] || {
+[ "$permission_contract" = "public=0/0/0|auditor=19/21|operator=19/30|definer=28/28|application=3/3/3|portable=8/8/8|positive=7|denied=72" ] || {
   echo "Expected complete permission contract, got $permission_contract" >&2
   exit 1
 }

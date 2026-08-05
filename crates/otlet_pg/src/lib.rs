@@ -340,6 +340,11 @@ pgrx::extension_sql_file!(
     name = "pair_constraint_ledger",
     requires = ["entity_resolution_quality"]
 );
+pgrx::extension_sql_file!(
+    "../sql/migrations/0067_entity_graph_conflict_status.sql",
+    name = "entity_graph_conflict_status",
+    requires = ["pair_constraint_ledger"]
+);
 
 #[allow(non_snake_case)]
 #[pgrx::pg_guard]

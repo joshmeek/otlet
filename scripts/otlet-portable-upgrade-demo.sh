@@ -20,9 +20,9 @@ install_portable() {
     -f crates/otlet_worker/sql/install.sql
 }
 
-install_portable_through_65() {
+install_portable_through_66() {
   docker exec -w /work/crates/otlet_worker/sql "$container" \
-    sed '/0066_pair_constraint_ledger.sql/,$d' migrate.sql |
+    sed '/0067_entity_graph_conflict_status.sql/,$d' migrate.sql |
     docker exec -i -w /work/crates/otlet_worker/sql "$container" \
       psql -U postgres -d "$database" -X -q -v ON_ERROR_STOP=1 --single-transaction
 }
@@ -62,13 +62,15 @@ SELECT format(
   'portable upgrade executable proof'
 ) \gexec
 SQL
-install_portable_through_65
+install_portable_through_66
 
 docker exec -i "$container" psql -U postgres -d "$database" \
   -X -q -v ON_ERROR_STOP=1 <<'SQL' >/dev/null
 CREATE TABLE public.portable_upgrade_sentinel (
   id integer PRIMARY KEY,
-  value text NOT NULL
+  value text NOT NULL,
+  export_function_oid oid,
+  export_function_acl text
 );
 INSERT INTO public.portable_upgrade_sentinel VALUES (1, 'preserved');
 SQL
@@ -104,8 +106,15 @@ GRANT SELECT ON TABLE
   otlet.failure_retry_status
 TO :"operator_role";
 GRANT EXECUTE ON FUNCTION otlet.application_retry_job(bigint, text) TO :"operator_role";
+GRANT EXECUTE ON FUNCTION otlet.export_eval_cases(integer) TO :"operator_role";
 GRANT USAGE ON SCHEMA otlet TO :"partial_auditor_role";
 GRANT SELECT ON TABLE otlet.audit_receipt_export TO :"partial_auditor_role";
+UPDATE public.portable_upgrade_sentinel sentinel
+SET export_function_oid = function.oid,
+    export_function_acl = function.proacl::text
+FROM pg_catalog.pg_proc function
+WHERE sentinel.id = 1
+  AND function.oid = 'otlet.export_eval_cases(integer)'::regprocedure;
 SQL
 
 install_portable
@@ -117,7 +126,7 @@ contract="$(
 SELECT concat_ws('|',
   max(version),
   count(*),
-  array_agg(version ORDER BY version) = ARRAY(SELECT generate_series(1, 66)),
+  array_agg(version ORDER BY version) = ARRAY(SELECT generate_series(1, 67)),
   bool_and(file ~ ('(^|/)' || lpad(version::text, 4, '0') || '_')),
   (SELECT value FROM public.portable_upgrade_sentinel),
   (SELECT count(*) FROM otlet.verify_invariants())
@@ -125,7 +134,7 @@ SELECT concat_ws('|',
 FROM otlet.portable_schema_migrations;
 SQL
 )"
-[ "$contract" = "66|66|t|t|preserved|0" ] || {
+[ "$contract" = "67|67|t|t|preserved|0" ] || {
   echo "Portable repeat-install contract mismatch: $contract" >&2
   exit 1
 }
@@ -2381,6 +2390,184 @@ SQL
   exit 1
 }
 
+entity_graph_conflict_migration_contract="$(
+  docker exec -i "$container" psql -U postgres -d "$database" \
+    -X -qAt -v ON_ERROR_STOP=1 \
+    -v operator_role="$operator_role" \
+    -v partial_auditor_role="$partial_auditor_role" <<'SQL'
+SELECT concat_ws('|',
+  EXISTS (
+    SELECT 1
+    FROM otlet.portable_schema_migrations
+    WHERE version = 67
+      AND file LIKE '%0067_entity_graph_conflict_status.sql'
+  ),
+  to_regclass('otlet.entity_graph_conflict_status') IS NOT NULL
+    AND to_regclass(
+      'otlet.review_queue_without_entity_graph_conflicts'
+    ) IS NOT NULL,
+  to_regprocedure('otlet.lock_entity_graph_task(text)') IS NOT NULL
+    AND to_regprocedure(
+      'otlet.entity_graph_conflict_status_for_task(text)'
+    ) IS NOT NULL
+    AND to_regprocedure(
+      'otlet.require_entity_graph_clear(text,text)'
+    ) IS NOT NULL
+    AND to_regprocedure('otlet.export_eval_cases(integer)') IS NOT NULL
+    AND to_regprocedure(
+      'otlet.export_eval_cases_unchecked(integer)'
+    ) IS NULL,
+  (
+    SELECT function.prosecdef
+      AND function.provolatile = 'v'
+      AND function.proconfig @>
+        ARRAY['search_path=pg_catalog, otlet, pg_temp']
+    FROM pg_catalog.pg_proc function
+    WHERE function.oid =
+      'otlet.entity_graph_conflict_status_for_task(text)'::regprocedure
+  ),
+  (
+    SELECT function.oid = sentinel.export_function_oid
+      AND function.proacl::text = sentinel.export_function_acl
+      AND function.prosecdef
+      AND function.proconfig @>
+        ARRAY['search_path=pg_catalog, otlet, pg_temp']
+      AND pg_catalog.has_function_privilege(
+        :'operator_role', function.oid, 'EXECUTE'
+      )
+    FROM pg_catalog.pg_proc function
+    CROSS JOIN public.portable_upgrade_sentinel sentinel
+    WHERE function.oid = 'otlet.export_eval_cases(integer)'::regprocedure
+      AND sentinel.id = 1
+  ),
+  (
+    SELECT count(*) = 3
+    FROM (VALUES
+      (
+        'pair_constraint_facts_entity_graph_lock',
+        'otlet.pair_constraint_facts'::regclass,
+        'otlet.lock_entity_graph_fact_write()'::regprocedure::oid,
+        7::smallint
+      ),
+      (
+        'actions_entity_graph_approval',
+        'otlet.actions'::regclass,
+        'otlet.guard_entity_graph_action_approval()'::regprocedure::oid,
+        19::smallint
+      ),
+      (
+        'workload_revision_heads_entity_graph',
+        'otlet.workload_revision_heads'::regclass,
+        'otlet.guard_entity_graph_promotion()'::regprocedure::oid,
+        21::smallint
+      )
+    ) expected(trigger_name, relation_oid, function_oid, trigger_type)
+    JOIN pg_catalog.pg_trigger trigger
+      ON trigger.tgname = expected.trigger_name
+     AND trigger.tgrelid = expected.relation_oid
+     AND trigger.tgfoid = expected.function_oid
+     AND trigger.tgtype = expected.trigger_type
+     AND NOT trigger.tgisinternal
+  ),
+  (
+    SELECT count(*) = 8
+    FROM information_schema.columns column_row
+    WHERE column_row.table_schema = 'otlet'
+      AND column_row.table_name = 'audit_review_export'
+      AND column_row.column_name IN (
+        'entity_graph_conflict_hash',
+        'entity_graph_conflict_status',
+        'entity_graph_cannot_fact_hash',
+        'entity_graph_left_id',
+        'entity_graph_right_id',
+        'entity_graph_review_event_id',
+        'entity_graph_reviewer_identity',
+        'entity_graph_reviewer_role'
+      )
+  ),
+  EXISTS (
+    SELECT 1
+    FROM pg_catalog.pg_rewrite rewrite
+    JOIN pg_catalog.pg_depend dependency
+      ON dependency.classid = 'pg_rewrite'::regclass
+     AND dependency.objid = rewrite.oid
+    WHERE rewrite.ev_class = 'otlet.review_queue'::regclass
+      AND dependency.refobjid =
+        'otlet.entity_graph_conflict_status'::regclass
+  ) AND EXISTS (
+    SELECT 1
+    FROM pg_catalog.pg_rewrite rewrite
+    JOIN pg_catalog.pg_depend dependency
+      ON dependency.classid = 'pg_rewrite'::regclass
+     AND dependency.objid = rewrite.oid
+    WHERE rewrite.ev_class = 'otlet.audit_review_export'::regclass
+      AND dependency.refobjid = 'otlet.review_queue'::regclass
+  ),
+  (SELECT count(*) = 0 FROM otlet.entity_graph_conflict_status)
+    AND NOT EXISTS (
+      SELECT 1
+      FROM otlet.review_queue
+      WHERE queue_kind = 'entity_graph_conflict'
+    ),
+  NOT pg_catalog.has_table_privilege(
+      'public', 'otlet.entity_graph_conflict_status', 'SELECT'
+    )
+    AND NOT pg_catalog.has_table_privilege(
+      'public',
+      'otlet.review_queue_without_entity_graph_conflicts',
+      'SELECT'
+    )
+    AND NOT EXISTS (
+      SELECT 1
+      FROM pg_catalog.pg_proc function
+      JOIN pg_catalog.pg_namespace namespace
+        ON namespace.oid = function.pronamespace
+      WHERE namespace.nspname = 'otlet'
+        AND (
+          function.proname LIKE '%entity_graph%'
+          OR function.proname = 'export_eval_cases'
+        )
+        AND pg_catalog.has_function_privilege(
+          'public', function.oid, 'EXECUTE'
+        )
+    ),
+  pg_catalog.has_table_privilege(
+    :'operator_role', 'otlet.audit_review_export', 'SELECT'
+  )
+    AND pg_catalog.has_function_privilege(
+      :'operator_role',
+      'otlet.entity_graph_conflict_status_for_task(text)',
+      'EXECUTE'
+    )
+    AND NOT pg_catalog.has_table_privilege(
+      :'operator_role', 'otlet.entity_graph_conflict_status', 'SELECT'
+    )
+    AND NOT pg_catalog.has_table_privilege(
+      :'operator_role',
+      'otlet.review_queue_without_entity_graph_conflicts',
+      'SELECT'
+    ),
+  pg_catalog.has_table_privilege(
+    :'partial_auditor_role', 'otlet.audit_receipt_export', 'SELECT'
+  )
+    AND NOT pg_catalog.has_table_privilege(
+      :'partial_auditor_role', 'otlet.audit_review_export', 'SELECT'
+    )
+    AND NOT pg_catalog.has_function_privilege(
+      :'partial_auditor_role',
+      'otlet.entity_graph_conflict_status_for_task(text)',
+      'EXECUTE'
+    ),
+  NOT EXISTS (SELECT 1 FROM otlet.verify_invariants())
+);
+SQL
+)"
+[ "$entity_graph_conflict_migration_contract" = \
+  "t|t|t|t|t|t|t|t|t|t|t|t|t" ] || {
+  echo "Portable entity-graph-conflict migration contract mismatch: $entity_graph_conflict_migration_contract" >&2
+  exit 1
+}
+
 identity_vector_contract="$(
   docker exec -i "$container" psql -U postgres -d "$database" \
     -X -qAt -v ON_ERROR_STOP=1 <<'SQL'
@@ -2808,6 +2995,7 @@ echo "portable_failure_retry_taxonomy_migration_contract=$failure_retry_taxonomy
 echo "portable_candidate_set_coverage_migration_contract=$candidate_set_coverage_migration_contract"
 echo "portable_entity_resolution_quality_migration_contract=$entity_resolution_quality_migration_contract"
 echo "portable_pair_constraint_migration_contract=$pair_constraint_migration_contract"
+echo "portable_entity_graph_conflict_migration_contract=$entity_graph_conflict_migration_contract"
 echo "portable_ask_administrative_contract=$portable_ask_administrative_contract"
 echo "portable_task_lifecycle_contract=$portable_task_lifecycle_contract"
 echo "portable_model_capacity_contract=$batch_claims|$batch_capacity_contract|$concurrent_capacity_contract|$cancel_blocked_claims|$replacement_claims|$lease_capacity_contract"

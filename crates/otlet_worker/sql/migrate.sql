@@ -222,3 +222,6 @@ $$;
 
 \set portable_migration_file ../../../otlet_pg/sql/migrations/0066_pair_constraint_ledger.sql
 \ir migrations/apply.sql
+
+\set portable_migration_file ../../../otlet_pg/sql/migrations/0067_entity_graph_conflict_status.sql
+\ir migrations/apply.sql
