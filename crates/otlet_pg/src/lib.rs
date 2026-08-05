@@ -330,6 +330,11 @@ pgrx::extension_sql_file!(
     name = "candidate_set_coverage",
     requires = ["failure_retry_taxonomy"]
 );
+pgrx::extension_sql_file!(
+    "../sql/migrations/0065_entity_resolution_quality.sql",
+    name = "entity_resolution_quality",
+    requires = ["candidate_set_coverage"]
+);
 
 #[allow(non_snake_case)]
 #[pgrx::pg_guard]

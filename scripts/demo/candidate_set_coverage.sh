@@ -1,6 +1,8 @@
 log "Proving candidate-set coverage gates"
 psql_candidate_exec -qAt \
-  -v task_name="$join_task" <<'SQL'
+  -v task_name="$join_task" \
+  -v cheap_model_name="$cheap_model_name" \
+  -v strong_model_name="$strong_model_name" <<'SQL'
 BEGIN;
 SELECT 1
 FROM otlet.production_policy
@@ -89,7 +91,8 @@ CREATE FUNCTION pg_temp.candidate_set_coverage_revision(
   baseline_hash text,
   candidate_query text DEFAULT NULL,
   candidate_cap integer DEFAULT NULL,
-  decision_suffix text DEFAULT NULL
+  decision_suffix text DEFAULT NULL,
+  instruction_suffix text DEFAULT NULL
 ) RETURNS text
 LANGUAGE plpgsql
 AS $$
@@ -136,6 +139,16 @@ BEGIN
       to_jsonb(
         definition #>> '{task,decision_contract,prompt_prefix}' ||
         candidate_set_coverage_revision.decision_suffix
+      )
+    );
+  END IF;
+  IF candidate_set_coverage_revision.instruction_suffix IS NOT NULL THEN
+    definition := jsonb_set(
+      definition,
+      '{task,instruction}',
+      to_jsonb(
+        definition #>> '{task,instruction}' ||
+        candidate_set_coverage_revision.instruction_suffix
       )
     );
   END IF;
@@ -943,6 +956,8 @@ BEGIN
 END;
 $$;
 
+\ir /work/scripts/demo/entity_resolution_quality.sql
+
 WITH contract AS (
   SELECT concat_ws('|',
     proof.unmeasured_blocked,
@@ -981,7 +996,7 @@ WITH contract AS (
   FROM candidate_set_coverage_proof proof
 )
 SELECT CASE
-  WHEN contract.value = 't|t|t|t|t|t|t|t|t|t|5|t|t|t|t|0'
+  WHEN contract.value = 't|t|t|t|t|t|t|t|t|t|7|t|t|t|t|0'
     THEN 'candidate_set_coverage_contract=' || contract.value
   ELSE otlet.require_task_input_relation(
     'candidate-set coverage contract mismatch: ' || contract.value

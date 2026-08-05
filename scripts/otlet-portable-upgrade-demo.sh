@@ -20,9 +20,9 @@ install_portable() {
     -f crates/otlet_worker/sql/install.sql
 }
 
-install_portable_through_63() {
+install_portable_through_64() {
   docker exec -w /work/crates/otlet_worker/sql "$container" \
-    sed '/0064_candidate_set_coverage.sql/,$d' migrate.sql |
+    sed '/0065_entity_resolution_quality.sql/,$d' migrate.sql |
     docker exec -i -w /work/crates/otlet_worker/sql "$container" \
       psql -U postgres -d "$database" -X -q -v ON_ERROR_STOP=1 --single-transaction
 }
@@ -62,7 +62,7 @@ SELECT format(
   'portable upgrade executable proof'
 ) \gexec
 SQL
-install_portable_through_63
+install_portable_through_64
 
 docker exec -i "$container" psql -U postgres -d "$database" \
   -X -q -v ON_ERROR_STOP=1 <<'SQL' >/dev/null
@@ -117,7 +117,7 @@ contract="$(
 SELECT concat_ws('|',
   max(version),
   count(*),
-  array_agg(version ORDER BY version) = ARRAY(SELECT generate_series(1, 64)),
+  array_agg(version ORDER BY version) = ARRAY(SELECT generate_series(1, 65)),
   bool_and(file ~ ('(^|/)' || lpad(version::text, 4, '0') || '_')),
   (SELECT value FROM public.portable_upgrade_sentinel),
   (SELECT count(*) FROM otlet.verify_invariants())
@@ -125,7 +125,7 @@ SELECT concat_ws('|',
 FROM otlet.portable_schema_migrations;
 SQL
 )"
-[ "$contract" = "64|64|t|t|preserved|0" ] || {
+[ "$contract" = "65|65|t|t|preserved|0" ] || {
   echo "Portable repeat-install contract mismatch: $contract" >&2
   exit 1
 }
@@ -2203,6 +2203,88 @@ SQL
   exit 1
 }
 
+entity_resolution_quality_migration_contract="$(
+  docker exec -i "$container" psql -U postgres -d "$database" \
+    -X -qAt -v ON_ERROR_STOP=1 \
+    -v operator_role="$operator_role" \
+    -v partial_auditor_role="$partial_auditor_role" <<'SQL'
+SELECT concat_ws('|',
+  EXISTS (
+    SELECT 1
+    FROM otlet.portable_schema_migrations
+    WHERE version = 65
+      AND file LIKE '%0065_entity_resolution_quality.sql'
+  ),
+  to_regclass('otlet.entity_resolution_quality_status') IS NOT NULL,
+  (
+    SELECT count(*) = 23
+      AND count(*) FILTER (WHERE column_name IN (
+        'candidate_coverage_report_hash',
+        'evaluation_report_hash',
+        'review_economics_report_hash',
+        'evaluation_labels_current',
+        'metric',
+        'eligible_count',
+        'numerator',
+        'denominator',
+        'rate',
+        'denominator_definition',
+        'evidence_kind',
+        'non_authoritative'
+      )) = 12
+    FROM information_schema.columns
+    WHERE table_schema = 'otlet'
+      AND table_name = 'entity_resolution_quality_status'
+  ),
+  pg_catalog.pg_get_viewdef(
+    'otlet.entity_resolution_quality_status'::regclass,
+    true
+  ) LIKE '%decision_diff%answer_matches%'
+    AND pg_catalog.pg_get_viewdef(
+      'otlet.entity_resolution_quality_status'::regclass,
+      true
+    ) LIKE '%expected_answer%'
+    AND pg_catalog.pg_get_viewdef(
+      'otlet.entity_resolution_quality_status'::regclass,
+      true
+    ) NOT LIKE '%approval_diff%'
+    AND position('reported_downstream_success' IN pg_catalog.pg_get_viewdef(
+      'otlet.entity_resolution_quality_status'::regclass,
+      true
+    )) > 0
+    AND position('expected_action_type' IN pg_catalog.pg_get_viewdef(
+      'otlet.entity_resolution_quality_status'::regclass,
+      true
+    )) > 0
+    AND position('merge_candidate' IN pg_catalog.pg_get_viewdef(
+      'otlet.entity_resolution_quality_status'::regclass,
+      true
+    )) > 0
+    AND pg_catalog.pg_get_functiondef(
+      'otlet.validate_candidate_set_coverage_contract()'::regprocedure
+    ) LIKE '%review_economics%',
+  (SELECT count(*) = 0 FROM otlet.entity_resolution_quality_status),
+  NOT pg_catalog.has_table_privilege(
+    'public', 'otlet.entity_resolution_quality_status', 'SELECT'
+  ),
+  NOT pg_catalog.has_table_privilege(
+    :'operator_role', 'otlet.entity_resolution_quality_status', 'SELECT'
+  )
+    AND NOT pg_catalog.has_table_privilege(
+      :'partial_auditor_role',
+      'otlet.entity_resolution_quality_status',
+      'SELECT'
+    ),
+  NOT EXISTS (SELECT 1 FROM otlet.verify_invariants())
+);
+SQL
+)"
+[ "$entity_resolution_quality_migration_contract" = \
+  "t|t|t|t|t|t|t|t" ] || {
+  echo "Portable entity-resolution-quality migration contract mismatch: $entity_resolution_quality_migration_contract" >&2
+  exit 1
+}
+
 identity_vector_contract="$(
   docker exec -i "$container" psql -U postgres -d "$database" \
     -X -qAt -v ON_ERROR_STOP=1 <<'SQL'
@@ -2628,6 +2710,7 @@ echo "portable_model_license_use_migration_contract=$model_license_use_migration
 echo "portable_model_artifact_lifecycle_migration_contract=$model_artifact_lifecycle_migration_contract"
 echo "portable_failure_retry_taxonomy_migration_contract=$failure_retry_taxonomy_migration_contract"
 echo "portable_candidate_set_coverage_migration_contract=$candidate_set_coverage_migration_contract"
+echo "portable_entity_resolution_quality_migration_contract=$entity_resolution_quality_migration_contract"
 echo "portable_ask_administrative_contract=$portable_ask_administrative_contract"
 echo "portable_task_lifecycle_contract=$portable_task_lifecycle_contract"
 echo "portable_model_capacity_contract=$batch_claims|$batch_capacity_contract|$concurrent_capacity_contract|$cancel_blocked_claims|$replacement_claims|$lease_capacity_contract"

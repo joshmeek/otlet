@@ -16,7 +16,7 @@ Run the installer as the database owner from the repository checkout:
 psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f crates/otlet_worker/sql/install.sql
 ```
 
-The install transaction runs the current SQL contract as migrations `0001` through `0064`. Re-running it skips recorded migrations and preserves existing data. This greenfield path rejects older unversioned `otlet` schemas instead of converting them
+The install transaction runs the current SQL contract as migrations `0001` through `0065`. Re-running it skips recorded migrations and preserves existing data. This greenfield path rejects older unversioned `otlet` schemas instead of converting them
 
 The database keeps zero `otlet` extension objects and zero C-language Otlet functions
 
@@ -253,4 +253,4 @@ Run the repeat-install proof:
 ./scripts/otlet-portable-upgrade-demo.sh
 ```
 
-It installs through migration `0063`, grants existing auditor and application roles, applies `0064`, and repeats the current install. The proof checks all 64 migrations, existing data and grants, lifecycle, administrative-ledger, workload-acceptance and candidate-set promotion fences, bounded validators, queued ask behavior, `PUBLIC` closure, and invariants
+It installs through migration `0064`, grants existing auditor and application roles, applies `0065`, and repeats the current install. The proof checks all 65 migrations, existing data and grants, lifecycle, administrative-ledger, workload-acceptance and candidate-set promotion fences, entity-resolution quality decomposition, bounded validators, queued ask behavior, `PUBLIC` closure, and invariants

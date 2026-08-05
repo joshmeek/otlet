@@ -194,7 +194,21 @@ Otlet executes the declared full-pool query, binds it to the source-query contra
 
 Production pair execution is unchanged: `max_candidate_rows` remains an overflow-reject fence and never truncates work. `candidate_set_coverage_status` shows stored evidence and contract, baseline, and label currency without executing application SQL. Promotion reruns both queries, revalidates plan cost, and compares the live full-pool, target-prefix, input, and label manifests with the passing report. Run the promotion or activation call under the same bounded candidate-query `statement_timeout`
 
-Changing candidate SQL, `max_candidate_rows`, output schema, or the pair decision contract requires a current passing report for the exact active-to-candidate revision pair. First activation and one-step rollback remain available. Source-contract repair, model, task instruction, runtime, and unrelated revision changes do not require another candidate-set report
+Changing candidate SQL, `max_candidate_rows`, output schema, or the pair decision contract requires a current passing report for the exact active-to-candidate revision pair. First activation and one-step rollback remain available. Source-contract repair, model, task instruction, runtime, and unrelated revision changes do not require another candidate-set report. A review-economics contract may still declare and record candidate coverage for an unchanged candidate-set contract so it can measure the full entity-resolution workflow
+
+`entity_resolution_quality_status` joins candidate coverage, the exact replay evaluation report, and review-economics observations only when all three belong to the same acceptance contract and candidate revision. It emits one candidate row per stage with `eligible_count`, numerator, denominator, rate, denominator definition, evidence kind, and all three source report hashes:
+
+| Metric | Numerator | Denominator |
+| --- | --- | --- |
+| `candidate_recall` | Merge-positive labels inside the bounded candidate set | Eligible merge-positive labels recorded in the coverage report |
+| `pair_classification` | Correct decisive answers for decisive gold cases | Decisive terminal candidate results for decisive gold cases |
+| `abstention` | Terminal abstaining answers | Terminal candidate results with an observed answer |
+| `escalation` | Candidate evaluations with a strong-route receipt | Candidate evaluations with any receipt |
+| `reported_reviewer_agreement` | Reviewer-touched outcomes reported accepted | Reviewer-touched outcomes reported accepted, corrected, or rejected |
+| `reported_correction` | Reviewer-touched outcomes reported corrected | Reviewer-touched outcomes reported accepted, corrected, or rejected |
+| `reported_downstream_merge_outcome` | Successful reported merge outcomes | Reported outcomes for accepted or corrected cases whose approved label expects `merge_candidate` |
+
+Rates are null when their denominator is zero. `eligible_count` keeps missing decisions, reviews, receipts, or downstream observations visible instead of silently shrinking the workflow. `evidence_ready` also requires the current contract, active baseline, passing and current coverage, and currently qualified evaluation labels; historical or failed evidence remains visible with that flag false. Reviewer and downstream rows remain non-authoritative authenticated-role attestations because `merge_candidate` has no Otlet apply path. Otlet does not produce a combined accuracy score
 
 Semantic row and pair status, plan, current-row, predicate, and invariant reads pin one workload revision and use read-only source-contract checks. They do not create temporary views or mark materializations stale, and status views reject a concurrent revision change instead of combining revisions. Detected row-source column-contract drift returns no current matches and a `lookup_fail_closed` plan with no wait, infer, or queue work in read-only transactions; the same contract suspends writable execution checkpoints. During PostgreSQL recovery, CustomScan suppresses wait, infer, and queue work. Otlet does not yet claim physical-standby read support. Run `mark_semantic_schema_drift(...)` from a writable owner maintenance session to persist `schema_drift`; after repairing the source, run `repair_source_query_contract(...)` to promote the revised contract and restore watch triggers and execution
 
