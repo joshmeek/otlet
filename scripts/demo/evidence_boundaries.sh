@@ -343,6 +343,52 @@ BEGIN
 END;
 $$;
 
+INSERT INTO otlet.jobs (
+  task_name,
+  subject_id,
+  input,
+  status,
+  attempts,
+  started_at,
+  leased_until,
+  claim_token
+)
+VALUES (
+  'evidence_redaction_demo',
+  'failure-redaction',
+  '{}'::jsonb,
+  'running',
+  1,
+  now(),
+  now() + interval '5 minutes',
+  gen_random_uuid()::text
+)
+RETURNING id \gset failure_
+CREATE TEMP TABLE evidence_redaction_failed AS SELECT *
+FROM otlet.fail_job(
+  :failure_id,
+  'SENSITIVE-FIXTURE-ERROR',
+  model_name => :'model_name',
+  expected_claim_token => (
+    SELECT claim_token FROM otlet.jobs WHERE id = :failure_id
+  )
+);
+WITH owner_role AS (
+  SELECT oid
+  FROM pg_catalog.pg_roles
+  WHERE rolname = session_user
+)
+UPDATE otlet.jobs
+SET application_owner_role_oid = owner_role.oid,
+    application_authenticated_role_oid = owner_role.oid,
+    application_invocation_role_oid = owner_role.oid,
+    application_request_payload_hash = otlet.identity_hash(
+      'application_request',
+      '{"proof":"evidence_redaction"}'::jsonb
+    )
+FROM owner_role
+WHERE id = :failure_id;
+
 SELECT
   (SELECT output ->> 'case_id' = 'case-1'
           AND output ->> 'sensitive_note' = '[REDACTED]'
@@ -361,7 +407,7 @@ SELECT
    FROM otlet.worker_events WHERE event_type = 'evidence_redaction_probe')::text || '|' ||
   (SELECT structured_output_redacted AND actions_redacted
    FROM otlet.audit_receipt_export WHERE job_id = :redaction_id)::text || '|' ||
-  (SELECT bool_and(to_jsonb(surface)::text NOT LIKE '%SENSITIVE-FIXTURE%')
+  ((SELECT bool_and(to_jsonb(surface)::text NOT LIKE '%SENSITIVE-FIXTURE%')
    FROM (
      SELECT to_jsonb(log_row) AS surface FROM otlet.operational_event_log log_row
      UNION ALL SELECT to_jsonb(metric_row) FROM otlet.worker_batch_timing_status metric_row
@@ -370,7 +416,20 @@ SELECT
      UNION ALL SELECT to_jsonb(receipt_row) FROM otlet.audit_receipt_export receipt_row
      UNION ALL SELECT to_jsonb(review_row) FROM otlet.audit_review_export review_row
      UNION ALL SELECT to_jsonb(review_event_row) FROM otlet.audit_review_event_export review_event_row
-   ) surfaces)::text;
+     UNION ALL SELECT to_jsonb(failure_row) FROM otlet.failure_retry_status failure_row
+       WHERE failure_row.job_id = :failure_id
+     UNION ALL SELECT to_jsonb(application_row)
+       FROM otlet.application_job_status(:failure_id) application_row
+   ) surfaces)
+   AND (SELECT count(*) = 2
+        FROM otlet.failure_retry_status
+        WHERE job_id = :failure_id)
+   AND (SELECT count(*) = 1
+        FROM otlet.application_job_status(:failure_id))
+   AND (SELECT policy_version = 3
+               AND withheld_fields @> ARRAY['job_error', 'receipt_error']::text[]
+               AND export_views @> ARRAY['otlet.failure_retry_status']::text[]
+        FROM otlet.redaction_policy_status))::text;
 ROLLBACK;
 SQL
 }

@@ -1167,6 +1167,14 @@ SELECT concat_ws('|',
   receipt.selection_reason,
   receipt.trace_summary ->> 'stop_reason',
   receipt.schema_validation_status,
+  job.failure_reason_code,
+  receipt.failure_reason_code,
+  taxonomy.stage,
+  taxonomy.retryability,
+  taxonomy.owner_action,
+  taxonomy.recommended_retry_mode,
+  taxonomy.raw_detail_visibility,
+  (failure.execution_path = 'portable' AND failure.raw_detail_available)::text,
   portable_claim.status,
   (SELECT count(*) FROM otlet.inference_receipts r WHERE r.job_id = job.id),
   (SELECT count(*) FROM otlet.outputs output WHERE output.job_id = job.id),
@@ -1176,11 +1184,16 @@ FROM portable_deadline_claim claim
 JOIN otlet.jobs job ON job.id = claim.job_id
 JOIN otlet.portable_claims portable_claim ON portable_claim.job_id = job.id
 JOIN otlet.portable_claim_status status ON status.claim_id = portable_claim.id
-JOIN otlet.inference_receipts receipt ON receipt.job_id = job.id;
+JOIN otlet.inference_receipts receipt ON receipt.job_id = job.id
+JOIN otlet.failure_taxonomy taxonomy
+  ON taxonomy.failure_reason_code = job.failure_reason_code
+JOIN otlet.failure_retry_status failure
+  ON failure.failure_scope = 'job'
+ AND failure.job_id = job.id;
 ROLLBACK;
 SQL
 )"
-expected_portable_deadline_contract="1000|true|true|true|failed|attempt_timeout|attempt_timeout|attempt_timeout|failed|failed|1|0|true"
+expected_portable_deadline_contract="1000|true|true|true|failed|attempt_timeout|attempt_timeout|attempt_timeout|failed|otlet.failure.v1.attempt_timeout|otlet.failure.v1.attempt_timeout|inference|manual_retry|application_retry_job|original_snapshot|database_owner_only|true|failed|1|0|true"
 echo "portable_deadline_contract=$portable_deadline_contract"
 [ "$portable_deadline_contract" = "$expected_portable_deadline_contract" ] || {
   echo "Unexpected portable deadline contract: $portable_deadline_contract" >&2

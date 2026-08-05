@@ -175,7 +175,9 @@ Callers may supply a nonblank request key of at most 256 bytes. The key is scope
 
 `application_retry_job(...)` lets an owner-granted operator retry a terminal application job. `original_snapshot` reuses the stored input and original revision but fails after that revision stops being active. `latest_source` reads current source under the current revision. Both modes preserve the application's owner, record the operator's authenticated login and active role, and link the new job to its original
 
-`application_job_status(...)` returns only lifecycle timestamps, status, and accepted structured output for a job owned by that authenticated login. It never returns input, errors, candidate or raw output, receipts, traces, actions, model details, or claim state. `application_cancel_job(...)` applies the existing queued and live cancellation contract after the same ownership check. Commit queued native or portable work before expecting a worker to see it
+Otlet assigns each failed or canceled job and each failed, rejected, or canceled receipt one code from the immutable `otlet.failure.v1` taxonomy. `failure_retry_status` joins the code to its execution path, stage, retryability, owner action, recommended existing retry mode, raw-detail availability, and application retry lineage. Owners, auditors, and operators can read this redacted status. The database owner alone can read raw job and receipt errors. Classification does not quarantine jobs or artifacts
+
+`application_job_status(...)` returns lifecycle timestamps, status, accepted structured output, stable failure code, stage, retryability, owner action, recommended retry mode, raw-detail visibility, and retry lineage for a job owned by that authenticated login. It never returns input, raw error detail, candidate or raw output, receipts, traces, actions, model details, or claim state. `application_cancel_job(...)` applies the existing queued and live cancellation contract after the same ownership check. Commit queued native or portable work before expecting a worker to see it
 
 Existing cleanup can remove unreferenced failed or canceled jobs and sets a surviving retry's parent link to null when it removes that parent. Request-key idempotency and retry lineage last as long as those job rows. The current cleanup base retains complete jobs
 
@@ -367,7 +369,7 @@ SELECT count(*) FROM otlet.verify_invariants();
 
 Contract: `0` (demo prints `invariant_contract=0`). The suite fails closed on expired or NULL leases for `running` and `cancel_requested` jobs, complete receipts without schema pass, sensitive evidence that violates the active storage policy, materializations missing `source_hash`, and error runtime slots. `production_status` and `verify_invariants` name the receipt invariant `complete_receipts_are_schema_validated`; throughput views use `completed_jobs` and `last_batch_completed_jobs`. Step 6 of `docs/semantic-watches.md` anchors the planner vocabulary for `selected_path` / `Planner Selected Path` and `freshness_basis`
 
-Operators query redacted, read-only projections through `otlet.audit_receipt_export`, `otlet.audit_review_export`, `otlet.audit_review_event_export`, `otlet.audit_action_execution_export`, `otlet.audit_eval_label_export`, `otlet.audit_administrative_change_export`, `otlet.semantic_dependency_audit`, `otlet.operational_event_log`, and `otlet.worker_batch_timing_status`. `otlet.redaction_policy_status` lists withheld fields
+Operators query redacted, read-only projections through `otlet.audit_receipt_export`, `otlet.audit_review_export`, `otlet.audit_review_event_export`, `otlet.audit_action_execution_export`, `otlet.audit_eval_label_export`, `otlet.audit_administrative_change_export`, `otlet.semantic_dependency_audit`, `otlet.operational_event_log`, `otlet.worker_batch_timing_status`, and `otlet.failure_retry_status`. `otlet.redaction_policy_status` lists withheld evidence for the audit exports. `otlet.failure_retry_status` exposes whether raw error detail exists without exposing the detail
 
 ## Step 4 - Grant Role-Scoped Access
 
@@ -393,7 +395,7 @@ COMMIT;
 
 The application capability grants three functions: `application_submit_task_subject(...)`, `application_job_status(...)`, and `application_cancel_job(...)`. Login roles may inherit one shared capability role, but job ownership remains the authenticated `session_user`; PostgreSQL records the active `SET ROLE` value as invocation provenance and leaves ownership unchanged. The grant can invoke every active task in the database, so grant it to logins allowed to use that full task set. The capability grants no direct source or Otlet table access, task, model, or watch administration, review or apply authority, worker RPCs, receipt, trace, or cleanup views, retry authority, or further grant authority
 
-The auditor capability grants these redacted policy and audit views:
+The auditor capability grants read-only access to these redacted policy and audit surfaces:
 
 - `otlet.redaction_policy_status`
 - `otlet.access_policy_status`
@@ -412,6 +414,8 @@ The auditor capability grants these redacted policy and audit views:
 - `otlet.portable_worker_status`
 - `otlet.portable_claim_status`
 - `otlet.portable_receipt_status`
+- `otlet.failure_taxonomy`
+- `otlet.failure_retry_status`
 
 The grant also includes the pure JSON hashing helpers required by `audit_review_export` and the native capability reader used by `runtime_capability_status`; they read no database rows. The operator capability includes auditor access plus these functions:
 
@@ -452,11 +456,11 @@ SELECT * FROM otlet.access_policy_status;
 SELECT * FROM otlet.application_access_policy_status;
 ```
 
-The demo proves the catalog ACLs, 17 auditor views and 20 function grants, 17 operator views and 29 function grants, seven operator paths, 26 exact security-definer functions, three application RPCs, eight portable RPCs, 15 denied application paths, and 72 denied auditor or operator paths. The delegated operator role proves all five review outcomes:
+The demo proves the catalog ACLs, 19 auditor relations and 20 function grants, 19 operator relations and 29 function grants, seven operator paths, 26 exact security-definer functions, three application RPCs, eight portable RPCs, 15 denied application paths, and 72 denied auditor or operator paths. The delegated operator role proves all five review outcomes:
 
 ```text
 review_provenance_contract=true|true|true|true|true|true|true|true|true|true|true
-permission_contract=public=0/0/0|auditor=17/20|operator=17/29|definer=26/26|application=3/3/3|portable=8/8/8|positive=7|denied=72
+permission_contract=public=0/0/0|auditor=19/20|operator=19/29|definer=26/26|application=3/3/3|portable=8/8/8|positive=7|denied=72
 ```
 
 Your application still owns these deployment boundaries:

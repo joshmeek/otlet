@@ -272,7 +272,14 @@ FROM otlet.application_job_status(:'application_job_id'::bigint)
 SELECT otlet.application_cancel_job(:'application_job_id'::bigint) AS status
 \gset canceled_
 SELECT status AS status,
-       (trusted_output IS NULL)::text AS output_is_null
+       (trusted_output IS NULL)::text AS output_is_null,
+       failure_reason_code,
+       failure_stage,
+       failure_retryability,
+       failure_owner_action,
+       recommended_retry_mode,
+       raw_detail_visibility,
+       (retry_of_job_id IS NULL AND retry_mode IS NULL)::text AS no_retry_lineage
 FROM otlet.application_job_status(:'application_job_id'::bigint)
 \gset final_
 RESET ROLE;
@@ -284,10 +291,17 @@ SELECT (:'application_job_id'::bigint > 0)::text || '|' ||
        :'queued_output_is_null' || '|' ||
        :'canceled_status' || '|' ||
        :'final_status' || '|' ||
-       :'final_output_is_null';
+       :'final_output_is_null' || '|' ||
+       :'final_failure_reason_code' || '|' ||
+       :'final_failure_stage' || '|' ||
+       :'final_failure_retryability' || '|' ||
+       :'final_failure_owner_action' || '|' ||
+       :'final_recommended_retry_mode' || '|' ||
+       :'final_raw_detail_visibility' || '|' ||
+       :'final_no_retry_lineage';
 SQL
 )"
-[ "$application_cancel_contract" = "true|queued|true|canceled|canceled|true" ] || {
+[ "$application_cancel_contract" = "true|queued|true|canceled|canceled|true|otlet.failure.v1.canceled|cancellation|manual_retry|application_retry_job|original_snapshot|database_owner_only|true" ] || {
   echo "Expected owned queued cancellation, got $application_cancel_contract" >&2
   exit 1
 }
@@ -419,6 +433,12 @@ FROM otlet.application_job_status(:'retry_job_id'::bigint)
 \gset owner_
 SELECT otlet.application_cancel_job(:'retry_job_id'::bigint) AS status
 \gset canceled_
+SELECT
+  failure_reason_code,
+  (retry_of_job_id = :'original_job_id'::bigint)::text AS lineage_matches,
+  retry_mode
+FROM otlet.application_job_status(:'retry_job_id'::bigint)
+\gset retry_status_
 RESET SESSION AUTHORIZATION;
 COMMIT;
 
@@ -433,10 +453,13 @@ SELECT :'proof_newer_job' || '|' ||
        :'proof_request_key_is_null' || '|' ||
        :'proof_payload_hash_valid' || '|' ||
        :'owner_visible_rows' || '|' ||
-       :'canceled_status';
+       :'canceled_status' || '|' ||
+       :'retry_status_failure_reason_code' || '|' ||
+       :'retry_status_lineage_matches' || '|' ||
+       :'retry_status_retry_mode';
 SQL
 )"
-[ "$application_original_retry_contract" = "true|true|true|true|true|true|true|original_snapshot|true|true|1|canceled" ] || {
+[ "$application_original_retry_contract" = "true|true|true|true|true|true|true|original_snapshot|true|true|1|canceled|otlet.failure.v1.canceled|true|original_snapshot" ] || {
   echo "Expected original-snapshot retry provenance and ownership, got $application_original_retry_contract" >&2
   exit 1
 }

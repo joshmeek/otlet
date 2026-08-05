@@ -862,7 +862,8 @@ SELECT
       'input', job.input,
       'status', job.status,
       'attempts', job.attempts,
-      'error', job.error
+      'error', job.error,
+      'failure_reason_code', job.failure_reason_code
     ),
     'output_count', (
       SELECT count(*) FROM otlet.outputs output WHERE output.job_id = job.id
@@ -900,7 +901,8 @@ LEFT JOIN LATERAL (
       'actions_hash', receipt.actions_hash,
       'schema_validation_status', receipt.schema_validation_status,
       'status', receipt.status,
-      'error', receipt.error
+      'error', receipt.error,
+      'failure_reason_code', receipt.failure_reason_code
     )
     ORDER BY receipt.attempt_index
   ) AS value

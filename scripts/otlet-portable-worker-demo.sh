@@ -908,6 +908,15 @@ SELECT concat_ws('|',
   receipt.selection_reason,
   receipt.trace_summary ->> 'stop_reason',
   receipt.schema_validation_status,
+  job.failure_reason_code,
+  receipt.failure_reason_code,
+  taxonomy.stage,
+  taxonomy.retryability,
+  taxonomy.owner_action,
+  taxonomy.recommended_retry_mode,
+  taxonomy.raw_detail_visibility,
+  (failure.execution_path = 'portable' AND failure.raw_detail_available)::text,
+  (model.lifecycle_state = 'active' AND worker.enabled)::text,
   claim.status,
   (claim.last_renewed_at IS NOT NULL)::text,
   (claim.last_renewed_at < status.attempt_deadline_at)::text,
@@ -918,10 +927,17 @@ FROM otlet.jobs job
 JOIN otlet.portable_claims claim ON claim.job_id = job.id
 JOIN otlet.portable_claim_status status ON status.claim_id = claim.id
 JOIN otlet.inference_receipts receipt ON receipt.job_id = job.id
+JOIN otlet.failure_taxonomy taxonomy
+  ON taxonomy.failure_reason_code = job.failure_reason_code
+JOIN otlet.failure_retry_status failure
+  ON failure.failure_scope = 'job'
+ AND failure.job_id = job.id
+JOIN otlet.models model ON model.name = receipt.model_name
+JOIN otlet.portable_workers worker ON worker.worker_id = claim.worker_id
 WHERE job.id = :'job_id'::bigint;
 SQL
 )"
-expected_portable_deadline_contract="failed|attempt_timeout|attempt_timeout|attempt_timeout|failed|failed|true|true|1|0"
+expected_portable_deadline_contract="failed|attempt_timeout|attempt_timeout|attempt_timeout|failed|otlet.failure.v1.attempt_timeout|otlet.failure.v1.attempt_timeout|inference|manual_retry|application_retry_job|original_snapshot|database_owner_only|true|true|failed|true|true|1|0"
 if [ "$portable_deadline_contract" != "$expected_portable_deadline_contract" ]; then
   echo "Expected portable deadline contract $expected_portable_deadline_contract, got $portable_deadline_contract" >&2
   exit 1

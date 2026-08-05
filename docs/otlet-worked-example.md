@@ -211,7 +211,7 @@ review_provenance_contract=true|true|true|true|true|true|true|true|true|true|tru
 action_target_drift_contract=true|true|true|true|true|true|true|true|true|true|true|true|true|true|true|true|true
 administrative_change_ledger_contract=t|t|t|t|t|t|t|t|t|t|t|t|t|t|t|t|t|t|t
 administrative_access_race_contract=t|t
-permission_contract=public=0/0/0|auditor=17/20|operator=17/29|definer=26/26|application=3/3/3|portable=8/8/8|positive=7|denied=72
+permission_contract=public=0/0/0|auditor=19/20|operator=19/29|definer=26/26|application=3/3/3|portable=8/8/8|positive=7|denied=72
 ```
 
 Otlet changes `row-1` once and preserves its protected sentinel. `row-3` stays unchanged. The authority proof rejects a forged destination, recommendation-only policy, unevaluated and adversarial policies, missing approval, and stale source state before proving one bounded mutation

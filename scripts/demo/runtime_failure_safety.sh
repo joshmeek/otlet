@@ -1,4 +1,68 @@
-require_regex "$oversized_prompt_contract" '^failed\|true\|failed\|failed\|direct_attempt_failed\|failed\|prompt(_and_generation)?_exceed(s_context_window|_context_window)\|0\|ready\|ready$' "Expected oversized prompt to produce a clean failed receipt and healthy worker"
+require_regex "$oversized_prompt_contract" '^failed\|true\|failed\|failed\|direct_attempt_failed\|failed\|prompt(_and_generation)?_exceed(s_context_window|_context_window)\|otlet.failure.v1.runtime_configuration_rejected\|otlet.failure.v1.runtime_configuration_rejected\|admission\|after_owner_action\|repair_runtime_options\|database_owner_only\|true\|true\|0\|ready\|ready$' "Expected oversized prompt to produce a classified failure and healthy worker"
+
+sql_failure_taxonomy_contract="$(psql_exec -qAt -v model_name="$strong_model_name" <<'SQL'
+BEGIN;
+\o /dev/null
+SELECT otlet.register_model(
+  'failure_taxonomy_sql_model',
+  model.artifact_path,
+  model.artifact_hash,
+  model.artifact_identity
+)
+FROM otlet.models model
+WHERE model.name = :'model_name';
+SELECT otlet.create_task(
+  'failure_taxonomy_sql_task',
+  NULL,
+  'SQL failure taxonomy proof',
+  '{"type":"object"}'::jsonb,
+  'failure_taxonomy_sql_model',
+  input_shaping => '{"source_fields":["approved"]}'::jsonb
+);
+\o
+INSERT INTO otlet.jobs (task_name, subject_id, input)
+VALUES (
+  'failure_taxonomy_sql_task',
+  'sql-failure',
+  '{"approved":"ok"}'::jsonb
+);
+UPDATE otlet.jobs
+SET status = 'failed',
+    error = 'source field allowlist violation',
+    finished_at = now()
+WHERE task_name = 'failure_taxonomy_sql_task';
+UPDATE otlet.jobs
+SET failure_reason_code = 'otlet.failure.v1.decision_rejected'
+WHERE task_name = 'failure_taxonomy_sql_task';
+SELECT concat_ws('|',
+  job.status,
+  job.error,
+  job.failure_reason_code,
+  failure.execution_path,
+  failure.stage,
+  failure.retryability,
+  failure.owner_action,
+  failure.recommended_retry_mode,
+  failure.raw_detail_visibility,
+  failure.raw_detail_available,
+  model.lifecycle_state,
+  (SELECT count(*) FROM otlet.inference_receipts receipt WHERE receipt.job_id = job.id),
+  (SELECT count(*) FROM otlet.verify_invariants())
+)
+FROM otlet.jobs job
+JOIN otlet.failure_retry_status failure
+  ON failure.failure_scope = 'job'
+ AND failure.job_id = job.id
+JOIN otlet.models model ON model.name = 'failure_taxonomy_sql_model'
+WHERE job.task_name = 'failure_taxonomy_sql_task';
+ROLLBACK;
+SQL
+)"
+echo "sql_failure_taxonomy_contract=$sql_failure_taxonomy_contract"
+[ "$sql_failure_taxonomy_contract" = "failed|source field allowlist violation|otlet.failure.v1.source_contract_rejected|sql|admission|after_owner_action|repair_workload|latest_source|database_owner_only|t|active|0|0" ] || {
+  echo "Expected SQL failure classification without a receipt, got $sql_failure_taxonomy_contract" >&2
+  exit 1
+}
 
 cancel_decode_task="cancel_decode_worker_demo"
 cleanup_task "$cancel_decode_task"
@@ -128,14 +192,14 @@ FROM invalid_json_claim;
 SQL
 invalid_json_contract="$(psql_exec -qAt -v task_name="$invalid_json_task" <<'SQL'
 WITH job_row AS (
-  SELECT id, status, error
+  SELECT id, status, error, failure_reason_code
   FROM otlet.jobs
   WHERE task_name = :'task_name'
   ORDER BY id DESC
   LIMIT 1
 ),
 receipt_row AS (
-  SELECT status, selection_status, schema_validation_status
+  SELECT status, selection_status, schema_validation_status, failure_reason_code
   FROM otlet.inference_receipts
   WHERE job_id = (SELECT id FROM job_row)
   ORDER BY id DESC
@@ -153,15 +217,22 @@ SELECT j.status || '|' ||
        r.status || '|' ||
        r.selection_status || '|' ||
        r.schema_validation_status || '|' ||
+       j.failure_reason_code || '|' ||
+       r.failure_reason_code || '|' ||
+       taxonomy.stage || '|' ||
+       taxonomy.owner_action || '|' ||
+       taxonomy.raw_detail_visibility || '|' ||
        (SELECT count(*) FROM otlet.outputs WHERE job_id = j.id)::text || '|' ||
        (SELECT count(*) FROM otlet.actions WHERE job_id = j.id)::text || '|' ||
        (SELECT materialization_count FROM materialized)::text
 FROM job_row j
-CROSS JOIN receipt_row r;
+CROSS JOIN receipt_row r
+JOIN otlet.failure_taxonomy taxonomy
+  ON taxonomy.failure_reason_code = j.failure_reason_code;
 SQL
 )"
 echo "invalid_json_safety_contract=$invalid_json_contract"
-[ "$invalid_json_contract" = "failed|true|failed|failed|failed|0|0|0" ] || {
+[ "$invalid_json_contract" = "failed|true|failed|failed|failed|otlet.failure.v1.output_validation_failed|otlet.failure.v1.output_validation_failed|output_validation|inspect_model_and_contract|database_owner_only|0|0|0" ] || {
   echo "Expected invalid JSON to leave only a failed receipt, got $invalid_json_contract" >&2
   exit 1
 }

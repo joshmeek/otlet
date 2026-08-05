@@ -46,10 +46,31 @@ SELECT j.status || '|' ||
        COALESCE(j.error, '') || '|' ||
        COALESCE(s.selection_reason, '') || '|' ||
        COALESCE(s.schema_validation_status, '') || '|' ||
+       j.failure_reason_code || '|' ||
+       receipt.failure_reason_code || '|' ||
+       taxonomy.stage || '|' ||
+       taxonomy.retryability || '|' ||
+       taxonomy.owner_action || '|' ||
+       taxonomy.recommended_retry_mode || '|' ||
+       taxonomy.raw_detail_visibility || '|' ||
+       (failure.execution_path = 'native' AND failure.raw_detail_available)::text || '|' ||
+       (SELECT count(*) = 2
+               AND count(*) FILTER (WHERE failure_scope = 'job') = 1
+               AND count(*) FILTER (WHERE failure_scope = 'receipt') = 1
+        FROM otlet.failure_retry_status failure_row
+        WHERE failure_row.job_id = j.id)::text || '|' ||
+       (model.lifecycle_state = 'active')::text || '|' ||
        COALESCE(rs.runtime_status, '') || '|' ||
        COALESCE(rs.slot_state, '')
 FROM otlet.inference_receipt_trace_status s
 JOIN otlet.jobs j ON j.id = s.job_id
+JOIN otlet.inference_receipts receipt ON receipt.id = s.receipt_id
+JOIN otlet.failure_taxonomy taxonomy
+  ON taxonomy.failure_reason_code = j.failure_reason_code
+JOIN otlet.failure_retry_status failure
+  ON failure.failure_scope = 'job'
+ AND failure.job_id = j.id
+JOIN otlet.models model ON model.name = :'model_name'
 JOIN otlet.runtime_status rs
   ON rs.model_name = :'model_name'
 WHERE s.task_name = :'task_name'
@@ -58,7 +79,7 @@ LIMIT 1;
 SQL
 )"
 echo "attempt_timeout_contract=$attempt_timeout_contract"
-[ "$attempt_timeout_contract" = "failed|attempt_timeout|attempt_timeout|failed|ready|ready" ] || {
+[ "$attempt_timeout_contract" = "failed|attempt_timeout|attempt_timeout|failed|otlet.failure.v1.attempt_timeout|otlet.failure.v1.attempt_timeout|inference|manual_retry|application_retry_job|original_snapshot|database_owner_only|true|true|true|ready|ready" ] || {
   echo "Expected attempt timeout to fail cleanly with healthy worker, got $attempt_timeout_contract" >&2
   exit 1
 }

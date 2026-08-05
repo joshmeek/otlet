@@ -16,7 +16,7 @@ Run the installer as the database owner from the repository checkout:
 psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f crates/otlet_worker/sql/install.sql
 ```
 
-The install transaction runs the current SQL contract as migrations `0001` through `0052`. Re-running it skips recorded migrations and preserves existing data. This greenfield path rejects older unversioned `otlet` schemas instead of converting them
+The install transaction runs the current SQL contract as migrations `0001` through `0063`. Re-running it skips recorded migrations and preserves existing data. This greenfield path rejects older unversioned `otlet` schemas instead of converting them
 
 The database keeps zero `otlet` extension objects and zero C-language Otlet functions
 
@@ -89,7 +89,7 @@ SELECT otlet.grant_application_access('app_otlet_application'::regrole);
 COMMIT;
 ```
 
-From an authenticated application connection, queue one known subject, commit it so the portable worker can see it, then read only owned status and accepted output:
+From an authenticated application connection, queue one known subject, commit it so the portable worker can see it, then read owned status, accepted output, safe failure guidance, and retry lineage:
 
 ```sql
 BEGIN;
@@ -100,7 +100,18 @@ SELECT otlet.application_submit_task_subject(
 ) AS job_id \gset
 COMMIT;
 
-SELECT status, trusted_output, started_at, finished_at
+SELECT status,
+       trusted_output,
+       failure_reason_code,
+       failure_stage,
+       failure_retryability,
+       failure_owner_action,
+       recommended_retry_mode,
+       raw_detail_visibility,
+       retry_of_job_id,
+       retry_mode,
+       started_at,
+       finished_at
 FROM otlet.application_job_status(:'job_id');
 
 SELECT otlet.application_cancel_job(:'job_id');
@@ -109,6 +120,8 @@ SELECT otlet.application_cancel_job(:'job_id');
 The optional request key must contain 1 to 256 bytes and is unique for the authenticated owner. PostgreSQL hashes the submit operation, task, and subject. Repeating the same owner, key, and payload returns the prior job even after source or revision drift; reusing that key for another task or subject fails before mutation. Different authenticated owners may reuse the same key
 
 Submission without a matching keyed job returns `0` when the subject is missing, queue admission rejects the input, or the same input has live work under the active revision. The application functions expose no source rows or raw Otlet data and grant no administrative, review/apply, worker, or further-grant authority. Job ownership follows the authenticated `session_user`; PostgreSQL stores that login and the active `SET ROLE` role in distinct provenance fields
+
+Application status reports stable failure guidance and retry lineage without exposing raw job or receipt errors
 
 The SQL-only owner grants the retry path with PostgreSQL privileges:
 
@@ -201,7 +214,7 @@ SELECT otlet.set_portable_worker_control('customer-vpc-worker', 'draining');
 
 Pause lets the current claim finish and blocks the next claim. Drain also lets the current claim finish, records `drained`, and exits the process. After preflight, PostgreSQL issues the process a nonce and stores only its hash. Starting a replacement under the same worker ID marks the prior process claims replaced and rejects its next heartbeat, claim, renewal, attempt, completion, failure, or cancellation RPC
 
-The worker converts the database-issued `max_attempt_ms` to one monotonic deadline before the claim RPC. Prompt decode, generation, the llama abort callback, and renewal share it. PostgreSQL refuses renewal after its claim-time deadline, and a timeout records `attempt_timeout` in the job, receipt selection reason, failed schema status, and trace. Cancellation interrupts decode and finishes through the fenced cancel RPC. A renewal rejected before the deadline, a fenced incarnation, or a database disconnect interrupts decode without a terminal write, leaving the lease available for safe reclaim. Exact terminal requests retry three times inside one bounded deadline, and PostgreSQL returns the stored terminal result for duplicate delivery
+The worker converts the database-issued `max_attempt_ms` to one monotonic deadline before the claim RPC. Prompt decode, generation, the llama abort callback, and renewal share it. PostgreSQL refuses renewal after its claim-time deadline, and a timeout records `attempt_timeout` in the job, receipt selection reason, failed schema status, and trace. The redacted status reports `otlet.failure.v1.attempt_timeout` and keeps raw detail database-owner-only. Cancellation interrupts decode and finishes through the fenced cancel RPC. A renewal rejected before the deadline, a fenced incarnation, or a database disconnect interrupts decode without a terminal write, leaving the lease available for safe reclaim. Exact terminal requests retry three times inside one bounded deadline, and PostgreSQL returns the stored terminal result for duplicate delivery
 
 The continuous process reconnects after PostgreSQL restarts. `--once` fails on a database disconnect so batch callers receive a nonzero exit instead of an indefinite wait
 
@@ -224,7 +237,7 @@ After `./scripts/otlet-setup.sh` has placed the demo GGUF in Docker, run:
 ./scripts/otlet-portable-worker-demo.sh
 ```
 
-The script creates a disposable SQL-only database, builds the worker, and runs real local inference through direct, cheap-to-strong, row-watch, and pair-watch paths. It proves pre-claim rejection without claim mutation, normalized thread settings, exact artifact and context evidence, fail-closed RSS sampling, database-authored option status, and an absolute attempt timeout after a successful renewal with one receipt and no output. It also covers receipt lineage, semantic reads, update and delete reconciliation, worker controls, restart and reclaim, duplicate delivery, source denial, and logs without credentials, connection strings, or source evidence before dropping the database and roles
+The script creates a disposable SQL-only database, builds the worker, and runs real local inference through direct, cheap-to-strong, row-watch, and pair-watch paths. It proves pre-claim rejection without claim mutation, normalized thread settings, exact artifact and context evidence, fail-closed RSS sampling, database-authored option status, and an absolute attempt timeout after a successful renewal with one receipt and no output. The timeout check requires matching `otlet.failure.v1.attempt_timeout` metadata, raw-detail availability, and `database_owner_only` visibility. The script also covers receipt lineage, semantic reads, update and delete reconciliation, worker controls, restart and reclaim, duplicate delivery, source denial, and logs without credentials, connection strings, or source evidence before dropping the database and roles
 
 Run the isolated deployment-preflight proof:
 
@@ -240,4 +253,4 @@ Run the repeat-install proof:
 ./scripts/otlet-portable-upgrade-demo.sh
 ```
 
-It installs the full SQL contract twice and checks that all 52 migrations, existing data, lifecycle, administrative-ledger, and workload-acceptance fences, queued ask behavior, `PUBLIC` closure, and invariants stay intact
+It installs through migration `0062`, grants existing auditor and application roles, applies `0063`, and repeats the current install. The proof checks all 63 migrations, existing data and grants, lifecycle, administrative-ledger, and workload-acceptance fences, queued ask behavior, `PUBLIC` closure, and invariants

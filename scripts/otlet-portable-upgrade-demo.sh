@@ -4,11 +4,13 @@ set -euo pipefail
 container="${OTLET_PG_CONTAINER:-otlet-postgres}"
 database="otlet_portable_upgrade_demo_$$"
 operator_role="otlet_portable_upgrade_operator_$$"
+application_role="otlet_portable_upgrade_application_$$"
+partial_auditor_role="otlet_portable_upgrade_partial_auditor_$$"
 
 cleanup() {
   docker exec "$container" dropdb -U postgres --if-exists "$database" >/dev/null 2>&1 || true
   docker exec "$container" psql -U postgres -d postgres -X -q \
-    -c "DROP ROLE IF EXISTS $operator_role" >/dev/null 2>&1 || true
+    -c "DROP ROLE IF EXISTS $operator_role, $application_role, $partial_auditor_role" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
 
@@ -16,6 +18,13 @@ install_portable() {
   docker exec -w /work "$container" \
     psql -U postgres -d "$database" -X -q -v ON_ERROR_STOP=1 \
     -f crates/otlet_worker/sql/install.sql
+}
+
+install_portable_through_62() {
+  docker exec -w /work/crates/otlet_worker/sql "$container" \
+    sed '/0063_failure_retry_taxonomy.sql/,$d' migrate.sql |
+    docker exec -i -w /work/crates/otlet_worker/sql "$container" \
+      psql -U postgres -d "$database" -X -q -v ON_ERROR_STOP=1 --single-transaction
 }
 
 claim_probe_jobs() {
@@ -53,7 +62,7 @@ SELECT format(
   'portable upgrade executable proof'
 ) \gexec
 SQL
-install_portable
+install_portable_through_62
 
 docker exec -i "$container" psql -U postgres -d "$database" \
   -X -q -v ON_ERROR_STOP=1 <<'SQL' >/dev/null
@@ -64,14 +73,41 @@ CREATE TABLE public.portable_upgrade_sentinel (
 INSERT INTO public.portable_upgrade_sentinel VALUES (1, 'preserved');
 SQL
 
-install_portable
-
 docker exec -i "$container" psql -U postgres -d "$database" \
-  -X -q -v ON_ERROR_STOP=1 -v operator_role="$operator_role" <<'SQL' >/dev/null
+  -X -q -v ON_ERROR_STOP=1 \
+  -v operator_role="$operator_role" \
+  -v application_role="$application_role" \
+  -v partial_auditor_role="$partial_auditor_role" <<'SQL' >/dev/null
 CREATE ROLE :"operator_role" NOLOGIN;
+CREATE ROLE :"application_role" NOLOGIN;
+CREATE ROLE :"partial_auditor_role" NOLOGIN;
+SELECT otlet.grant_application_access(:'application_role'::regrole);
 GRANT USAGE ON SCHEMA otlet TO :"operator_role";
+GRANT SELECT ON TABLE
+  otlet.redaction_policy_status,
+  otlet.audit_receipt_export,
+  otlet.audit_review_export,
+  otlet.audit_review_event_export,
+  otlet.audit_action_execution_export,
+  otlet.audit_eval_label_export,
+  otlet.audit_administrative_change_export,
+  otlet.action_workflow_policy_status,
+  otlet.semantic_dependency_audit,
+  otlet.operational_event_log,
+  otlet.worker_batch_timing_status,
+  otlet.portable_protocol_status,
+  otlet.runtime_capability_status,
+  otlet.portable_worker_status,
+  otlet.portable_claim_status,
+  otlet.portable_receipt_status
+TO :"operator_role";
 GRANT EXECUTE ON FUNCTION otlet.application_retry_job(bigint, text) TO :"operator_role";
+GRANT USAGE ON SCHEMA otlet TO :"partial_auditor_role";
+GRANT SELECT ON TABLE otlet.audit_receipt_export TO :"partial_auditor_role";
 SQL
+
+install_portable
+install_portable
 
 contract="$(
   docker exec -i "$container" psql -U postgres -d "$database" \
@@ -79,7 +115,7 @@ contract="$(
 SELECT concat_ws('|',
   max(version),
   count(*),
-  array_agg(version ORDER BY version) = ARRAY(SELECT generate_series(1, 62)),
+  array_agg(version ORDER BY version) = ARRAY(SELECT generate_series(1, 63)),
   bool_and(file ~ ('(^|/)' || lpad(version::text, 4, '0') || '_')),
   (SELECT value FROM public.portable_upgrade_sentinel),
   (SELECT count(*) FROM otlet.verify_invariants())
@@ -87,14 +123,17 @@ SELECT concat_ws('|',
 FROM otlet.portable_schema_migrations;
 SQL
 )"
-[ "$contract" = "62|62|t|t|preserved|0" ] || {
+[ "$contract" = "63|63|t|t|preserved|0" ] || {
   echo "Portable repeat-install contract mismatch: $contract" >&2
   exit 1
 }
 
 application_migration_contract="$(
   docker exec -i "$container" psql -U postgres -d "$database" \
-    -X -qAt -v ON_ERROR_STOP=1 -v operator_role="$operator_role" <<'SQL'
+    -X -qAt -v ON_ERROR_STOP=1 \
+    -v operator_role="$operator_role" \
+    -v application_role="$application_role" \
+    -v partial_auditor_role="$partial_auditor_role" <<'SQL'
 SELECT concat_ws('|',
   (
     SELECT count(*) = 7
@@ -136,7 +175,70 @@ SELECT concat_ws('|',
     'otlet.application_submit_task_subject(text,text,text)',
     'EXECUTE'
   )
+  AND pg_catalog.has_table_privilege(
+    :'operator_role', 'otlet.failure_taxonomy', 'SELECT'
+  )
+  AND pg_catalog.has_table_privilege(
+    :'operator_role', 'otlet.failure_retry_status', 'SELECT'
+  )
+  AND (SELECT bool_and(pg_catalog.has_table_privilege(
+         :'operator_role', prior_surface.name, 'SELECT'
+       ))
+       FROM pg_catalog.unnest(ARRAY[
+         'otlet.redaction_policy_status',
+         'otlet.audit_receipt_export',
+         'otlet.audit_review_export',
+         'otlet.audit_review_event_export',
+         'otlet.audit_action_execution_export',
+         'otlet.audit_eval_label_export',
+         'otlet.audit_administrative_change_export',
+         'otlet.action_workflow_policy_status',
+         'otlet.semantic_dependency_audit',
+         'otlet.operational_event_log',
+         'otlet.worker_batch_timing_status',
+         'otlet.portable_protocol_status',
+         'otlet.runtime_capability_status',
+         'otlet.portable_worker_status',
+         'otlet.portable_claim_status',
+         'otlet.portable_receipt_status'
+       ]::text[]) prior_surface(name))
   AND NOT pg_catalog.has_table_privilege(:'operator_role', 'otlet.jobs', 'SELECT'),
+  pg_catalog.has_schema_privilege(:'application_role', 'otlet', 'USAGE')
+  AND pg_catalog.has_function_privilege(
+    :'application_role',
+    'otlet.application_submit_task_subject(text,text,text)',
+    'EXECUTE'
+  )
+  AND pg_catalog.has_function_privilege(
+    :'application_role',
+    'otlet.application_job_status(bigint)',
+    'EXECUTE'
+  )
+  AND pg_catalog.has_function_privilege(
+    :'application_role',
+    'otlet.application_cancel_job(bigint)',
+    'EXECUTE'
+  )
+  AND NOT pg_catalog.has_table_privilege(:'application_role', 'otlet.jobs', 'SELECT'),
+  NOT pg_catalog.has_table_privilege(
+    :'partial_auditor_role', 'otlet.failure_taxonomy', 'SELECT'
+  )
+  AND NOT pg_catalog.has_table_privilege(
+    :'partial_auditor_role', 'otlet.failure_retry_status', 'SELECT'
+  )
+  AND pg_catalog.has_schema_privilege(:'partial_auditor_role', 'otlet', 'USAGE')
+  AND pg_catalog.has_table_privilege(
+    :'partial_auditor_role', 'otlet.audit_receipt_export', 'SELECT'
+  )
+  AND (SELECT count(*) = 1
+       FROM pg_catalog.pg_class relation
+       JOIN pg_catalog.pg_namespace namespace
+         ON namespace.oid = relation.relnamespace
+       CROSS JOIN LATERAL pg_catalog.aclexplode(relation.relacl) privilege
+       WHERE namespace.nspname = 'otlet'
+         AND relation.relkind IN ('r', 'p', 'v', 'm', 'f')
+         AND privilege.grantee = :'partial_auditor_role'::regrole::oid
+         AND privilege.privilege_type = 'SELECT'),
   (SELECT count(*) = 3
    FROM pg_catalog.pg_constraint constraint_row
    WHERE constraint_row.conrelid = 'otlet.jobs'::regclass
@@ -172,7 +274,7 @@ SELECT concat_ws('|',
 );
 SQL
 )"
-[ "$application_migration_contract" = "t|t|t|t|t|t|t|t|t|t|t|t|t|t" ] || {
+[ "$application_migration_contract" = "t|t|t|t|t|t|t|t|t|t|t|t|t|t|t|t" ] || {
   echo "Portable application migration contract mismatch: $application_migration_contract" >&2
   exit 1
 }
@@ -1868,6 +1970,115 @@ model_artifact_lifecycle_migration_contract="$(
   exit 1
 }
 
+failure_retry_taxonomy_migration_contract="$(
+  docker exec -i "$container" psql -U postgres -d "$database" \
+    -X -qAt -v ON_ERROR_STOP=1 -v operator_role="$operator_role" <<'SQL'
+BEGIN;
+SELECT otlet.grant_application_access(:'operator_role'::regrole) \g /dev/null
+SELECT otlet.grant_auditor_access(:'operator_role'::regrole) \g /dev/null
+CREATE TEMP TABLE failure_taxonomy_immutability_proof (
+  guarded boolean NOT NULL
+) ON COMMIT DROP;
+DO $body$
+BEGIN
+  BEGIN
+    UPDATE otlet.failure_taxonomy
+    SET owner_action = owner_action
+    WHERE failure_reason_code = 'otlet.failure.v1.attempt_timeout';
+    INSERT INTO failure_taxonomy_immutability_proof VALUES (false);
+  EXCEPTION WHEN OTHERS THEN
+    INSERT INTO failure_taxonomy_immutability_proof
+    VALUES (SQLERRM LIKE 'otlet failure taxonomy rows are immutable%');
+  END;
+END
+$body$;
+SELECT concat_ws('|',
+  EXISTS (
+    SELECT 1
+    FROM otlet.portable_schema_migrations
+    WHERE version = 63
+      AND file LIKE '%0063_failure_retry_taxonomy.sql'
+  ),
+  (SELECT count(*) = 16
+      AND min(taxonomy_version) = 1
+      AND max(taxonomy_version) = 1
+    FROM otlet.failure_taxonomy),
+  (SELECT count(*) = 2
+    FROM information_schema.columns
+    WHERE table_schema = 'otlet'
+      AND table_name IN ('jobs', 'inference_receipts')
+      AND column_name = 'failure_reason_code'),
+  (SELECT count(*) = 4
+    FROM pg_catalog.pg_constraint constraint_row
+    WHERE constraint_row.conname IN (
+      'jobs_failure_reason_state_check',
+      'jobs_failure_reason_fk',
+      'inference_receipts_failure_reason_state_check',
+      'inference_receipts_failure_reason_fk'
+    )),
+  to_regclass('otlet.failure_retry_status') IS NOT NULL,
+  to_regprocedure('otlet.classify_failure_reason(text,text,text,text,jsonb,text,text)') IS NOT NULL,
+  otlet.classify_failure_reason(
+    'failed', 'direct', 'direct_attempt_failed', 'failed',
+    '{"stop_reason":"prompt_exceeds_context_window"}'::jsonb,
+    'linked llama.cpp prompt exceeds context window', 'linked_inproc'
+  ) = 'otlet.failure.v1.runtime_configuration_rejected',
+  otlet.classify_failure_reason(
+    'failed', 'direct', 'attempt_timeout', 'failed',
+    '{"stop_reason":"attempt_timeout"}'::jsonb,
+    'attempt_timeout', 'portable:llama_cpp'
+  ) = 'otlet.failure.v1.attempt_timeout',
+  otlet.classify_failure_reason(
+    'failed', NULL, NULL, NULL, '{}'::jsonb,
+    'source field allowlist violation', NULL
+  ) = 'otlet.failure.v1.source_contract_rejected',
+  (SELECT bool_and(
+      otlet.failure_reason_from_slug(failure_reason_code) = failure_reason_code
+      AND otlet.failure_reason_from_slug(
+        'otlet_error:' || reason_code || ':upgrade-proof'
+      ) = failure_reason_code
+    )
+    FROM otlet.failure_taxonomy),
+  (SELECT policy_version = 3
+          AND withheld_fields @> ARRAY['job_error', 'receipt_error']::text[]
+          AND export_views @> ARRAY['otlet.failure_retry_status']::text[]
+   FROM otlet.redaction_policy_status),
+  (SELECT guarded FROM failure_taxonomy_immutability_proof),
+  pg_catalog.pg_get_function_result(
+    'otlet.application_job_status(bigint)'::regprocedure
+  ) LIKE '%failure_reason_code text%failure_stage text%failure_retryability text%recommended_retry_mode text%',
+  NOT pg_catalog.has_table_privilege(
+    'public', 'otlet.failure_taxonomy', 'SELECT,INSERT,UPDATE,DELETE,TRUNCATE'
+  )
+    AND NOT pg_catalog.has_table_privilege(
+      'public', 'otlet.failure_retry_status', 'SELECT'
+    )
+    AND NOT pg_catalog.has_function_privilege(
+      'public',
+      'otlet.classify_failure_reason(text,text,text,text,jsonb,text,text)',
+      'EXECUTE'
+    ),
+  pg_catalog.has_function_privilege(
+    :'operator_role',
+    'otlet.application_job_status(bigint)',
+    'EXECUTE'
+  )
+    AND pg_catalog.has_table_privilege(
+      :'operator_role', 'otlet.failure_taxonomy', 'SELECT'
+    )
+    AND pg_catalog.has_table_privilege(
+      :'operator_role', 'otlet.failure_retry_status', 'SELECT'
+    )
+);
+ROLLBACK;
+SQL
+)"
+[ "$failure_retry_taxonomy_migration_contract" = \
+  "t|t|t|t|t|t|t|t|t|t|t|t|t|t|t" ] || {
+  echo "Portable failure-retry-taxonomy migration contract mismatch: $failure_retry_taxonomy_migration_contract" >&2
+  exit 1
+}
+
 identity_vector_contract="$(
   docker exec -i "$container" psql -U postgres -d "$database" \
     -X -qAt -v ON_ERROR_STOP=1 <<'SQL'
@@ -2291,6 +2502,7 @@ echo "portable_quality_data_drift_migration_contract=$quality_data_drift_migrati
 echo "portable_review_economics_migration_contract=$review_economics_migration_contract"
 echo "portable_model_license_use_migration_contract=$model_license_use_migration_contract"
 echo "portable_model_artifact_lifecycle_migration_contract=$model_artifact_lifecycle_migration_contract"
+echo "portable_failure_retry_taxonomy_migration_contract=$failure_retry_taxonomy_migration_contract"
 echo "portable_ask_administrative_contract=$portable_ask_administrative_contract"
 echo "portable_task_lifecycle_contract=$portable_task_lifecycle_contract"
 echo "portable_model_capacity_contract=$batch_claims|$batch_capacity_contract|$concurrent_capacity_contract|$cancel_blocked_claims|$replacement_claims|$lease_capacity_contract"

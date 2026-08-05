@@ -320,6 +320,11 @@ pgrx::extension_sql_file!(
     name = "permissions",
     requires = ["model_artifact_lifecycle"]
 );
+pgrx::extension_sql_file!(
+    "../sql/migrations/0063_failure_retry_taxonomy.sql",
+    name = "failure_retry_taxonomy",
+    requires = ["permissions"]
+);
 
 #[allow(non_snake_case)]
 #[pgrx::pg_guard]
