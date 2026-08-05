@@ -1085,3 +1085,5 @@ FROM review_economics_contract;
 
 SELECT 'review_economics_contract=' || contract
 FROM review_economics_contract;
+
+\ir /work/scripts/demo/model_license_use_policy.sql

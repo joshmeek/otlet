@@ -79,7 +79,7 @@ contract="$(
 SELECT concat_ws('|',
   max(version),
   count(*),
-  array_agg(version ORDER BY version) = ARRAY(SELECT generate_series(1, 60)),
+  array_agg(version ORDER BY version) = ARRAY(SELECT generate_series(1, 61)),
   bool_and(file ~ ('(^|/)' || lpad(version::text, 4, '0') || '_')),
   (SELECT value FROM public.portable_upgrade_sentinel),
   (SELECT count(*) FROM otlet.verify_invariants())
@@ -87,7 +87,7 @@ SELECT concat_ws('|',
 FROM otlet.portable_schema_migrations;
 SQL
 )"
-[ "$contract" = "60|60|t|t|preserved|0" ] || {
+[ "$contract" = "61|61|t|t|preserved|0" ] || {
   echo "Portable repeat-install contract mismatch: $contract" >&2
   exit 1
 }
@@ -1479,6 +1479,141 @@ review_economics_migration_contract="$(review_economics_migration_contract_query
   exit 1
 }
 
+model_license_use_migration_contract_query() {
+  docker exec -i "$container" psql -U postgres -d "$database" \
+    -X -qAt -v ON_ERROR_STOP=1 <<'SQL'
+BEGIN;
+SET LOCAL otlet.administrative_reason = 'portable model license use proof';
+SELECT otlet.register_model(
+  'model_license_use_upgrade_probe',
+  '/tmp/model-license-use-upgrade.gguf',
+  repeat('f', 64),
+  jsonb_build_object(
+    'sha256', repeat('f', 64),
+    'bytes', 1,
+    'source', 'portable-upgrade-demo',
+    'revision', 'model-license-use-v1',
+    'quantization', 'test',
+    'license', 'unknown'
+  )
+) \g /dev/null
+DO $body$
+BEGIN
+  BEGIN
+    PERFORM otlet.register_model(
+      'model_license_use_non_string_probe',
+      '/tmp/model-license-use-non-string.gguf',
+      repeat('e', 64),
+      jsonb_build_object(
+        'sha256', repeat('e', 64),
+        'bytes', 1,
+        'source', 'portable-upgrade-demo',
+        'revision', 'model-license-use-v1',
+        'quantization', 'test',
+        'license', 5
+      )
+    );
+    RAISE EXCEPTION 'non-string model license unexpectedly succeeded';
+  EXCEPTION WHEN check_violation THEN
+    PERFORM set_config('otlet.model_license_non_string_blocked', 'on', true);
+  END;
+END;
+$body$;
+SELECT concat_ws('|',
+  EXISTS (
+    SELECT 1
+    FROM otlet.portable_schema_migrations
+    WHERE version = 61
+      AND file LIKE '%0061_model_license_use_policy.sql'
+  ),
+  to_regclass('otlet.model_license_use_policies') IS NOT NULL
+    AND to_regclass('otlet.model_license_use_policy_status') IS NOT NULL
+    AND to_regprocedure(
+      'otlet.model_license_use_policy_valid(jsonb)'
+    ) IS NOT NULL
+    AND to_regprocedure(
+      'otlet.set_model_license_use_policy(jsonb,text,text)'
+    ) IS NOT NULL
+    AND current_setting('otlet.model_license_non_string_blocked', true) = 'on',
+  (SELECT count(*) = 2
+      AND bool_and(
+        trigger.tgrelid = expected.relation
+        AND trigger.tgfoid = expected.function
+        AND trigger.tgtype = expected.trigger_type
+        AND trigger.tgenabled = 'O'
+      )
+   FROM (VALUES
+     (
+       'model_license_use_policies_row_guard'::name,
+       'otlet.model_license_use_policies'::regclass,
+       'otlet.guard_model_license_use_policy()'::regprocedure,
+       31::smallint
+     ),
+     (
+       'model_license_use_policies_truncate_guard'::name,
+       'otlet.model_license_use_policies'::regclass,
+       'otlet.guard_model_license_use_policy()'::regprocedure,
+       34::smallint
+     )
+   ) expected(trigger_name, relation, function, trigger_type)
+   JOIN pg_catalog.pg_trigger trigger
+     ON trigger.tgname = expected.trigger_name
+    AND NOT trigger.tgisinternal),
+  otlet.model_license_use_policy_valid('{
+    "format":"otlet.model_license_use_policy.v1",
+    "deployment_purpose":"customer_support",
+    "redistribution_mode":"none",
+    "license_allowlist":[{
+      "license":"apache-2.0",
+      "deployment_purposes":["customer_support"],
+      "redistribution_modes":["none"],
+      "unresolved_fields":[]
+    }]
+  }'::jsonb)
+    AND NOT otlet.model_license_use_policy_valid('{
+      "format":"otlet.model_license_use_policy.v1",
+      "deployment_purpose":"customer_support",
+      "redistribution_mode":"none",
+      "license_allowlist":[],
+      "legal_interpretation":true
+    }'::jsonb),
+  (SELECT count(*) = 0 FROM otlet.model_license_use_policies)
+    AND (SELECT status.policy_state = 'unresolved'
+      AND status.policy_reason = 'policy_missing'
+      AND status.unresolved_fields = ARRAY['policy']::text[]
+    FROM otlet.model_license_use_policy_status status
+    WHERE status.model_name = 'model_license_use_upgrade_probe'),
+  NOT pg_catalog.has_table_privilege(
+    'public', 'otlet.model_license_use_policies',
+    'SELECT,INSERT,UPDATE,DELETE,TRUNCATE'
+  )
+    AND NOT pg_catalog.has_table_privilege(
+      'public', 'otlet.model_license_use_policy_status', 'SELECT'
+    )
+    AND NOT EXISTS (
+      SELECT 1
+      FROM pg_catalog.pg_proc function
+      JOIN pg_catalog.pg_namespace namespace
+        ON namespace.oid = function.pronamespace
+      WHERE namespace.nspname = 'otlet'
+        AND function.proname IN (
+          'model_license_use_policy_valid',
+          'guard_model_license_use_policy',
+          'set_model_license_use_policy'
+        )
+        AND pg_catalog.has_function_privilege('public', function.oid, 'EXECUTE')
+    ),
+  NOT EXISTS (SELECT 1 FROM otlet.verify_invariants())
+);
+ROLLBACK;
+SQL
+}
+model_license_use_migration_contract="$(model_license_use_migration_contract_query)"
+[ "$model_license_use_migration_contract" = "t|t|t|t|t|t|t" ] || {
+  echo "Portable model-license-use migration contract mismatch: $model_license_use_migration_contract" >&2
+  exit 1
+}
+
 identity_vector_contract="$(
   docker exec -i "$container" psql -U postgres -d "$database" \
     -X -qAt -v ON_ERROR_STOP=1 <<'SQL'
@@ -1900,6 +2035,7 @@ echo "portable_production_model_qualification_migration_contract=$production_mod
 echo "portable_promotion_shadow_rollback_migration_contract=$promotion_shadow_rollback_migration_contract"
 echo "portable_quality_data_drift_migration_contract=$quality_data_drift_migration_contract"
 echo "portable_review_economics_migration_contract=$review_economics_migration_contract"
+echo "portable_model_license_use_migration_contract=$model_license_use_migration_contract"
 echo "portable_ask_administrative_contract=$portable_ask_administrative_contract"
 echo "portable_task_lifecycle_contract=$portable_task_lifecycle_contract"
 echo "portable_model_capacity_contract=$batch_claims|$batch_capacity_contract|$concurrent_capacity_contract|$cancel_blocked_claims|$replacement_claims|$lease_capacity_contract"

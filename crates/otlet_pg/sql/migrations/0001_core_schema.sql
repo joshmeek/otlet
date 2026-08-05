@@ -90,7 +90,10 @@ CREATE TABLE otlet.models (
     AND NULLIF(artifact_identity ->> 'source', '') IS NOT NULL
     AND NULLIF(artifact_identity ->> 'revision', '') IS NOT NULL
     AND NULLIF(artifact_identity ->> 'quantization', '') IS NOT NULL
+    AND jsonb_typeof(artifact_identity -> 'license') = 'string'
     AND NULLIF(artifact_identity ->> 'license', '') IS NOT NULL
+    AND artifact_identity ->> 'license' = btrim(artifact_identity ->> 'license')
+    AND octet_length(artifact_identity ->> 'license') <= 512
   ),
   max_active_jobs int NOT NULL DEFAULT 1 CHECK (max_active_jobs BETWEEN 1 AND 1024),
   last_used_at timestamptz,

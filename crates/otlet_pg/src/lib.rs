@@ -306,9 +306,14 @@ pgrx::extension_sql_file!(
     requires = ["quality_data_drift"]
 );
 pgrx::extension_sql_file!(
+    "../sql/migrations/0061_model_license_use_policy.sql",
+    name = "model_license_use_policy",
+    requires = ["review_economics"]
+);
+pgrx::extension_sql_file!(
     "../sql/migrations/0043_permissions.sql",
     name = "permissions",
-    requires = ["review_economics"]
+    requires = ["model_license_use_policy"]
 );
 
 #[allow(non_snake_case)]
