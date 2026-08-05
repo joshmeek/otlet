@@ -720,3 +720,5 @@ FROM quality_data_drift_contract;
 
 SELECT 'quality_data_drift_contract=' || contract
 FROM quality_data_drift_contract;
+
+\ir /work/scripts/demo/review_economics.sql

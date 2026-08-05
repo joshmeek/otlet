@@ -79,7 +79,7 @@ contract="$(
 SELECT concat_ws('|',
   max(version),
   count(*),
-  array_agg(version ORDER BY version) = ARRAY(SELECT generate_series(1, 59)),
+  array_agg(version ORDER BY version) = ARRAY(SELECT generate_series(1, 60)),
   bool_and(file ~ ('(^|/)' || lpad(version::text, 4, '0') || '_')),
   (SELECT value FROM public.portable_upgrade_sentinel),
   (SELECT count(*) FROM otlet.verify_invariants())
@@ -87,7 +87,7 @@ SELECT concat_ws('|',
 FROM otlet.portable_schema_migrations;
 SQL
 )"
-[ "$contract" = "59|59|t|t|preserved|0" ] || {
+[ "$contract" = "60|60|t|t|preserved|0" ] || {
   echo "Portable repeat-install contract mismatch: $contract" >&2
   exit 1
 }
@@ -1318,6 +1318,167 @@ SQL
   exit 1
 }
 
+review_economics_migration_contract_query() {
+  docker exec -i "$container" psql -U postgres -d "$database" \
+    -X -qAt -v ON_ERROR_STOP=1 <<'SQL'
+SELECT concat_ws('|',
+  EXISTS (
+    SELECT 1
+    FROM otlet.portable_schema_migrations
+    WHERE version = 60
+      AND file LIKE '%0060_review_economics.sql'
+  ),
+  to_regclass('otlet.review_economics_reports') IS NOT NULL
+    AND to_regclass('otlet.review_economics_status') IS NOT NULL
+    AND to_regprocedure(
+      'otlet.review_economics_comparison(numeric,numeric,integer,integer,integer)'
+    ) IS NOT NULL
+    AND to_regprocedure(
+      'otlet.review_economics_metrics(text,text,jsonb,numeric,numeric)'
+    ) IS NOT NULL
+    AND to_regprocedure(
+      'otlet.record_review_economics_report(text,text,jsonb,text)'
+    ) IS NOT NULL,
+  (SELECT count(*) = 4
+      AND bool_and(
+        trigger.tgrelid = expected.relation
+        AND trigger.tgfoid = expected.function
+        AND trigger.tgtype = expected.trigger_type
+        AND trigger.tgenabled = 'O'
+      )
+   FROM (VALUES
+     (
+       'workload_acceptance_contracts_d_review_economics'::name,
+       'otlet.workload_acceptance_contracts'::regclass,
+       'otlet.validate_review_economics_contract()'::regprocedure,
+       7::smallint
+     ),
+     (
+       'review_economics_reports_a_guard'::name,
+       'otlet.review_economics_reports'::regclass,
+       'otlet.guard_review_economics_append()'::regprocedure,
+       31::smallint
+     ),
+     (
+       'review_economics_reports_b_validate'::name,
+       'otlet.review_economics_reports'::regclass,
+       'otlet.validate_review_economics_report()'::regprocedure,
+       7::smallint
+     ),
+     (
+       'review_economics_reports_truncate_guard'::name,
+       'otlet.review_economics_reports'::regclass,
+       'otlet.guard_review_economics_append()'::regprocedure,
+       34::smallint
+     )
+   ) expected(trigger_name, relation, function, trigger_type)
+   JOIN pg_catalog.pg_trigger trigger
+     ON trigger.tgname = expected.trigger_name
+    AND NOT trigger.tgisinternal),
+  otlet.review_economics_declaration_valid('{
+    "format":"otlet.review_economics.v1",
+    "cost_unit":"USD",
+    "reviewer_cost_per_hour":60,
+    "model_generation_cost_per_hour":3600,
+    "minimum_support":2
+  }'::jsonb)
+    AND NOT otlet.review_economics_declaration_valid('{
+      "format":"otlet.review_economics.v1",
+      "cost_unit":"USD",
+      "reviewer_cost_per_hour":60,
+      "model_generation_cost_per_hour":3600,
+      "minimum_support":2,
+      "currency_conversion":true
+    }'::jsonb),
+  (WITH claim AS (
+     SELECT jsonb_build_object(
+       'case_hash', 'otlet:v1:sha256:' || repeat('a', 64),
+       'variant', 'baseline',
+       'reported_disposition', 'failed',
+       'reported_downstream_success', false,
+       'reported_avoided_work_seconds', 0,
+       'reported_at', '2026-08-02T00:00:00.000000Z'
+     ) AS value
+   ), manifest AS (
+     SELECT jsonb_build_array(claim.value) AS value
+     FROM claim
+   )
+   SELECT otlet.review_economics_observation_manifest_valid(manifest.value)
+     AND NOT otlet.review_economics_observation_manifest_valid(jsonb_set(
+       manifest.value,
+       '{0,unexpected}',
+       'true'::jsonb
+     ))
+   FROM manifest),
+  (otlet.review_economics_comparison(2, 3, 2, 2, 2) #>>
+    '{absolute_delta}')::numeric = 1
+    AND otlet.review_economics_comparison(2, 3, 2, 2, 2) ->
+      'evidence_ready' = 'true'::jsonb
+    AND otlet.review_economics_comparison(0, 1, 2, 1, 2) ->
+      'evidence_ready' = 'false'::jsonb
+    AND otlet.review_economics_comparison(0, 1, 2, 1, 2) ->
+      'absolute_delta' = 'null'::jsonb
+    AND otlet.review_economics_comparison(0, 1, 2, 1, 2) ->
+      'relative_delta' = 'null'::jsonb
+    AND (otlet.review_economics_comparison(0, 0, 2, 2, 2) #>>
+      '{relative_delta}')::numeric = 0,
+  pg_get_viewdef('otlet.review_economics_status'::regclass, true)
+      LIKE '%insufficient_evidence%'
+    AND pg_get_viewdef('otlet.review_economics_status'::regclass, true)
+      LIKE '%partial_evidence%'
+    AND pg_get_viewdef('otlet.review_economics_status'::regclass, true)
+      LIKE '%model_generation_cost_per_hour%'
+    AND pg_get_functiondef(
+      'otlet.validate_review_economics_contract()'::regprocedure
+    ) LIKE '%requires distinct revisions%'
+    AND pg_get_viewdef('otlet.review_economics_status'::regclass, true)
+      LIKE '%non_authoritative%'
+    AND pg_get_functiondef(
+      'otlet.review_economics_metrics(text,text,jsonb,numeric,numeric)'::regprocedure
+    ) LIKE '%model_generation_time_only%'
+    AND pg_get_functiondef(
+      'otlet.review_economics_metrics(text,text,jsonb,numeric,numeric)'::regprocedure
+    ) LIKE '%shared_worker_process_snapshot_not_costed%',
+  NOT pg_catalog.has_table_privilege(
+    'public', 'otlet.review_economics_reports',
+    'SELECT,INSERT,UPDATE,DELETE,TRUNCATE'
+  )
+    AND NOT pg_catalog.has_table_privilege(
+      'public', 'otlet.review_economics_status', 'SELECT'
+    )
+    AND NOT EXISTS (
+      SELECT 1
+      FROM pg_catalog.pg_proc function
+      JOIN pg_catalog.pg_namespace namespace
+        ON namespace.oid = function.pronamespace
+      WHERE namespace.nspname = 'otlet'
+        AND function.proname IN (
+          'guard_review_economics_append',
+          'review_economics_observation_manifest_valid',
+          'review_economics_declaration_valid',
+          'validate_review_economics_contract',
+          'review_economics_comparison',
+          'review_economics_metrics',
+          'validate_review_economics_report',
+          'record_review_economics_report'
+        )
+        AND pg_catalog.has_function_privilege('public', function.oid, 'EXECUTE')
+    ),
+  (SELECT count(*) = 1
+   FROM pg_catalog.pg_constraint constraint_row
+   WHERE constraint_row.conrelid = 'otlet.review_economics_reports'::regclass
+     AND constraint_row.contype = 'u')
+    AND (SELECT count(*) = 0 FROM otlet.review_economics_reports),
+  NOT EXISTS (SELECT 1 FROM otlet.verify_invariants())
+);
+SQL
+}
+review_economics_migration_contract="$(review_economics_migration_contract_query)"
+[ "$review_economics_migration_contract" = "t|t|t|t|t|t|t|t|t|t" ] || {
+  echo "Portable review-economics migration contract mismatch: $review_economics_migration_contract" >&2
+  exit 1
+}
+
 identity_vector_contract="$(
   docker exec -i "$container" psql -U postgres -d "$database" \
     -X -qAt -v ON_ERROR_STOP=1 <<'SQL'
@@ -1738,6 +1899,7 @@ echo "portable_label_provenance_migration_contract=$label_provenance_migration_c
 echo "portable_production_model_qualification_migration_contract=$production_model_qualification_migration_contract"
 echo "portable_promotion_shadow_rollback_migration_contract=$promotion_shadow_rollback_migration_contract"
 echo "portable_quality_data_drift_migration_contract=$quality_data_drift_migration_contract"
+echo "portable_review_economics_migration_contract=$review_economics_migration_contract"
 echo "portable_ask_administrative_contract=$portable_ask_administrative_contract"
 echo "portable_task_lifecycle_contract=$portable_task_lifecycle_contract"
 echo "portable_model_capacity_contract=$batch_claims|$batch_capacity_contract|$concurrent_capacity_contract|$cancel_blocked_claims|$replacement_claims|$lease_capacity_contract"

@@ -301,9 +301,14 @@ pgrx::extension_sql_file!(
     requires = ["promotion_shadow_rollback"]
 );
 pgrx::extension_sql_file!(
+    "../sql/migrations/0060_review_economics.sql",
+    name = "review_economics",
+    requires = ["quality_data_drift"]
+);
+pgrx::extension_sql_file!(
     "../sql/migrations/0043_permissions.sql",
     name = "permissions",
-    requires = ["quality_data_drift"]
+    requires = ["review_economics"]
 );
 
 #[allow(non_snake_case)]

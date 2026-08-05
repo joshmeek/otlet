@@ -199,5 +199,8 @@ $$;
 \set portable_migration_file ../../../otlet_pg/sql/migrations/0059_quality_data_drift.sql
 \ir migrations/apply.sql
 
+\set portable_migration_file ../../../otlet_pg/sql/migrations/0060_review_economics.sql
+\ir migrations/apply.sql
+
 \set portable_migration_file 0043_permissions.sql
 \ir migrations/apply.sql
