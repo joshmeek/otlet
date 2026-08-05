@@ -391,7 +391,7 @@ const SEMANTIC_ROW_WAIT_MATERIALIZE_STATE_SQL: &str = "WITH active AS ( \
                    FROM active \
                    LEFT JOIN LATERAL ( \
                      SELECT sm.subject_id, sm.stale, sm.body \
-                     FROM otlet.semantic_materializations sm \
+                     FROM otlet.semantic_materializations_effective sm \
                      WHERE NOT active.is_active \
                        AND sm.task_name = $4 \
                        AND sm.record_type = $5 \
@@ -438,7 +438,7 @@ const SEMANTIC_JOIN_WAIT_MATERIALIZE_STATE_SQL: &str = "WITH active AS ( \
                    FROM active \
                    LEFT JOIN LATERAL ( \
                      SELECT sm.subject_id, sm.stale, sm.body \
-                     FROM otlet.semantic_materializations sm \
+                     FROM otlet.semantic_materializations_effective sm \
                      WHERE NOT active.is_active \
                        AND sm.task_name = $4 \
                        AND sm.record_type = $6 \

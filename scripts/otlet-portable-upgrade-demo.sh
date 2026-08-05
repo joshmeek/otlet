@@ -20,9 +20,9 @@ install_portable() {
     -f crates/otlet_worker/sql/install.sql
 }
 
-install_portable_through_66() {
+install_portable_through_67() {
   docker exec -w /work/crates/otlet_worker/sql "$container" \
-    sed '/0067_entity_graph_conflict_status.sql/,$d' migrate.sql |
+    sed '/0068_authoritative_semantic_correction.sql/,$d' migrate.sql |
     docker exec -i -w /work/crates/otlet_worker/sql "$container" \
       psql -U postgres -d "$database" -X -q -v ON_ERROR_STOP=1 --single-transaction
 }
@@ -62,7 +62,7 @@ SELECT format(
   'portable upgrade executable proof'
 ) \gexec
 SQL
-install_portable_through_66
+install_portable_through_67
 
 docker exec -i "$container" psql -U postgres -d "$database" \
   -X -q -v ON_ERROR_STOP=1 <<'SQL' >/dev/null
@@ -70,7 +70,9 @@ CREATE TABLE public.portable_upgrade_sentinel (
   id integer PRIMARY KEY,
   value text NOT NULL,
   export_function_oid oid,
-  export_function_acl text
+  export_function_acl text,
+  audit_review_oid oid,
+  audit_review_acl text
 );
 INSERT INTO public.portable_upgrade_sentinel VALUES (1, 'preserved');
 SQL
@@ -107,6 +109,7 @@ GRANT SELECT ON TABLE
 TO :"operator_role";
 GRANT EXECUTE ON FUNCTION otlet.application_retry_job(bigint, text) TO :"operator_role";
 GRANT EXECUTE ON FUNCTION otlet.export_eval_cases(integer) TO :"operator_role";
+GRANT EXECUTE ON FUNCTION otlet.correct_action(bigint, jsonb, text) TO :"operator_role";
 GRANT USAGE ON SCHEMA otlet TO :"partial_auditor_role";
 GRANT SELECT ON TABLE otlet.audit_receipt_export TO :"partial_auditor_role";
 UPDATE public.portable_upgrade_sentinel sentinel
@@ -115,6 +118,12 @@ SET export_function_oid = function.oid,
 FROM pg_catalog.pg_proc function
 WHERE sentinel.id = 1
   AND function.oid = 'otlet.export_eval_cases(integer)'::regprocedure;
+UPDATE public.portable_upgrade_sentinel sentinel
+SET audit_review_oid = relation.oid,
+    audit_review_acl = relation.relacl::text
+FROM pg_catalog.pg_class relation
+WHERE sentinel.id = 1
+  AND relation.oid = 'otlet.audit_review_export'::regclass;
 SQL
 
 install_portable
@@ -126,7 +135,7 @@ contract="$(
 SELECT concat_ws('|',
   max(version),
   count(*),
-  array_agg(version ORDER BY version) = ARRAY(SELECT generate_series(1, 67)),
+  array_agg(version ORDER BY version) = ARRAY(SELECT generate_series(1, 68)),
   bool_and(file ~ ('(^|/)' || lpad(version::text, 4, '0') || '_')),
   (SELECT value FROM public.portable_upgrade_sentinel),
   (SELECT count(*) FROM otlet.verify_invariants())
@@ -134,7 +143,7 @@ SELECT concat_ws('|',
 FROM otlet.portable_schema_migrations;
 SQL
 )"
-[ "$contract" = "67|67|t|t|preserved|0" ] || {
+[ "$contract" = "68|68|t|t|preserved|0" ] || {
   echo "Portable repeat-install contract mismatch: $contract" >&2
   exit 1
 }
@@ -2491,7 +2500,8 @@ SELECT concat_ws('|',
     JOIN pg_catalog.pg_depend dependency
       ON dependency.classid = 'pg_rewrite'::regclass
      AND dependency.objid = rewrite.oid
-    WHERE rewrite.ev_class = 'otlet.review_queue'::regclass
+    WHERE rewrite.ev_class =
+        'otlet.review_queue_without_semantic_corrections'::regclass
       AND dependency.refobjid =
         'otlet.entity_graph_conflict_status'::regclass
   ) AND EXISTS (
@@ -2565,6 +2575,208 @@ SQL
 [ "$entity_graph_conflict_migration_contract" = \
   "t|t|t|t|t|t|t|t|t|t|t|t|t" ] || {
   echo "Portable entity-graph-conflict migration contract mismatch: $entity_graph_conflict_migration_contract" >&2
+  exit 1
+}
+
+semantic_correction_migration_contract="$(
+  docker exec -i "$container" psql -U postgres -d "$database" \
+    -X -qAt -v ON_ERROR_STOP=1 \
+    -v operator_role="$operator_role" \
+    -v partial_auditor_role="$partial_auditor_role" <<'SQL'
+SELECT concat_ws('|',
+  EXISTS (
+    SELECT 1
+    FROM otlet.portable_schema_migrations
+    WHERE version = 68
+      AND file LIKE '%0068_authoritative_semantic_correction.sql'
+  ),
+  to_regclass('otlet.semantic_correction_overrides') IS NOT NULL
+    AND to_regclass('otlet.semantic_correction_status') IS NOT NULL
+    AND to_regclass('otlet.semantic_materializations_effective') IS NOT NULL
+    AND to_regclass('otlet.audit_semantic_correction_export') IS NOT NULL
+    AND to_regclass(
+      'otlet.review_queue_without_semantic_corrections'
+    ) IS NOT NULL
+    AND (
+      SELECT position('extract(epoch' IN lower(function.prosrc)) > 0
+      FROM pg_catalog.pg_proc function
+      WHERE function.oid =
+        'otlet.semantic_correction_override_hash(otlet.semantic_correction_overrides)'::regprocedure
+    ),
+  to_regprocedure(
+    'otlet.approve_semantic_correction(bigint,bigint,jsonb,timestamptz,numeric,text,text)'
+  ) IS NOT NULL
+    AND to_regprocedure(
+      'otlet.semantic_correction_status_for_task(text)'
+    ) IS NOT NULL,
+  (
+    SELECT function.prosecdef
+      AND function.provolatile = 'v'
+      AND function.proconfig @>
+        ARRAY['search_path=pg_catalog, otlet, pg_temp']
+      AND position(
+        'json_schema_validation_error' IN function.prosrc
+      ) > 0
+      AND position('require_entity_graph_clear' IN function.prosrc) > 0
+      AND position('lock_eval_label_series' IN function.prosrc) > 0
+      AND position('lock_eval_label_series' IN function.prosrc) <
+        position('require_entity_graph_clear' IN function.prosrc)
+    FROM pg_catalog.pg_proc function
+    WHERE function.oid =
+      'otlet.approve_semantic_correction(bigint,bigint,jsonb,timestamptz,numeric,text,text)'::regprocedure
+  ),
+  (
+    SELECT count(*) = 2
+    FROM (VALUES
+      (
+        'semantic_correction_overrides_change_guard',
+        27::smallint
+      ),
+      (
+        'semantic_correction_overrides_truncate_guard',
+        34::smallint
+      )
+    ) expected(trigger_name, trigger_type)
+    JOIN pg_catalog.pg_trigger trigger
+      ON trigger.tgname = expected.trigger_name
+     AND trigger.tgrelid =
+       'otlet.semantic_correction_overrides'::regclass
+     AND trigger.tgtype = expected.trigger_type
+     AND trigger.tgfoid =
+       'otlet.reject_semantic_correction_change()'::regprocedure::oid
+     AND NOT trigger.tgisinternal
+  ),
+  (
+    SELECT count(*) = 6
+    FROM pg_catalog.pg_proc function
+    WHERE function.oid = ANY(ARRAY[
+      'otlet.semantic_index_current_rows(text,boolean,text)'::regprocedure::oid,
+      'otlet.semantic_join_index_current_rows(text,boolean,text)'::regprocedure::oid,
+      'otlet.semantic_join_matches(text,text,jsonb)'::regprocedure::oid,
+      'otlet.semantic_matches(text,text,jsonb)'::regprocedure::oid,
+      'otlet.semantic_join_index_plan(text,boolean,text)'::regprocedure::oid,
+      'otlet.semantic_index_plan(text,boolean,text)'::regprocedure::oid
+    ])
+      AND position(
+        'semantic_materializations_effective' IN function.prosrc
+      ) > 0
+  ),
+  EXISTS (
+    SELECT 1
+    FROM pg_catalog.pg_rewrite rewrite
+    JOIN pg_catalog.pg_depend dependency
+      ON dependency.classid = 'pg_rewrite'::regclass
+     AND dependency.objid = rewrite.oid
+    WHERE rewrite.ev_class = 'otlet.review_queue'::regclass
+      AND dependency.refobjid =
+        'otlet.semantic_correction_status'::regclass
+  ) AND (
+    SELECT position('reopened_pair_constraint' IN function.prosrc) > 0
+      AND position('pair_constraint_facts' IN function.prosrc) > 0
+    FROM pg_catalog.pg_proc function
+    WHERE function.oid =
+      'otlet.semantic_correction_status_for_task(text)'::regprocedure
+  ),
+  (
+    SELECT relation.oid = sentinel.audit_review_oid
+      AND relation.relacl::text = sentinel.audit_review_acl
+    FROM pg_catalog.pg_class relation
+    CROSS JOIN public.portable_upgrade_sentinel sentinel
+    WHERE relation.oid = 'otlet.audit_review_export'::regclass
+      AND sentinel.id = 1
+  ),
+  (
+    SELECT count(*) = 11
+    FROM information_schema.columns column_row
+    WHERE column_row.table_schema = 'otlet'
+      AND column_row.table_name = 'audit_review_export'
+      AND column_row.column_name LIKE 'semantic_correction%'
+        OR (
+          column_row.table_schema = 'otlet'
+          AND column_row.table_name = 'audit_review_export'
+          AND column_row.column_name IN (
+            'semantic_corrected_body_hash',
+            'semantic_supersedes_correction_hash'
+          )
+        )
+  ),
+  NOT EXISTS (
+    SELECT 1
+    FROM information_schema.columns column_row
+    WHERE column_row.table_schema = 'otlet'
+      AND column_row.table_name = 'audit_semantic_correction_export'
+      AND column_row.column_name = 'corrected_body'
+  ),
+  pg_catalog.has_table_privilege(
+    :'operator_role',
+    'otlet.audit_semantic_correction_export',
+    'SELECT'
+  )
+    AND pg_catalog.has_function_privilege(
+      :'operator_role',
+      'otlet.semantic_correction_status_for_task(text)',
+      'EXECUTE'
+    )
+    AND pg_catalog.has_function_privilege(
+      :'operator_role',
+      'otlet.approve_semantic_correction(bigint,bigint,jsonb,timestamptz,numeric,text,text)',
+      'EXECUTE'
+    )
+    AND NOT pg_catalog.has_table_privilege(
+      :'operator_role',
+      'otlet.semantic_correction_overrides',
+      'SELECT'
+    ),
+  NOT pg_catalog.has_table_privilege(
+      :'partial_auditor_role',
+      'otlet.audit_semantic_correction_export',
+      'SELECT'
+    )
+    AND NOT pg_catalog.has_function_privilege(
+      :'partial_auditor_role',
+      'otlet.approve_semantic_correction(bigint,bigint,jsonb,timestamptz,numeric,text,text)',
+      'EXECUTE'
+    ),
+  NOT pg_catalog.has_table_privilege(
+      'public',
+      'otlet.semantic_correction_overrides',
+      'SELECT'
+    )
+    AND NOT pg_catalog.has_table_privilege(
+      'public',
+      'otlet.semantic_materializations_effective',
+      'SELECT'
+    )
+    AND NOT EXISTS (
+      SELECT 1
+      FROM pg_catalog.pg_proc function
+      JOIN pg_catalog.pg_namespace namespace
+        ON namespace.oid = function.pronamespace
+      WHERE namespace.nspname = 'otlet'
+        AND function.proname LIKE '%semantic_correction%'
+        AND pg_catalog.has_function_privilege(
+          'public', function.oid, 'EXECUTE'
+        )
+    ),
+  (
+    SELECT operator_functions = 10
+      AND operator_security_definer_functions = 10
+      AND operator_fixed_search_path_functions = 10
+    FROM otlet.access_policy_status
+  ),
+  (SELECT count(*) = 0 FROM otlet.semantic_correction_overrides)
+    AND NOT EXISTS (
+      SELECT 1
+      FROM otlet.review_queue
+      WHERE queue_kind = 'semantic_correction_re_review'
+    ),
+  NOT EXISTS (SELECT 1 FROM otlet.verify_invariants())
+);
+SQL
+)"
+[ "$semantic_correction_migration_contract" = \
+  "t|t|t|t|t|t|t|t|t|t|t|t|t|t|t|t" ] || {
+  echo "Portable semantic-correction migration contract mismatch: $semantic_correction_migration_contract" >&2
   exit 1
 }
 
@@ -2996,6 +3208,7 @@ echo "portable_candidate_set_coverage_migration_contract=$candidate_set_coverage
 echo "portable_entity_resolution_quality_migration_contract=$entity_resolution_quality_migration_contract"
 echo "portable_pair_constraint_migration_contract=$pair_constraint_migration_contract"
 echo "portable_entity_graph_conflict_migration_contract=$entity_graph_conflict_migration_contract"
+echo "portable_semantic_correction_migration_contract=$semantic_correction_migration_contract"
 echo "portable_ask_administrative_contract=$portable_ask_administrative_contract"
 echo "portable_task_lifecycle_contract=$portable_task_lifecycle_contract"
 echo "portable_model_capacity_contract=$batch_claims|$batch_capacity_contract|$concurrent_capacity_contract|$cancel_blocked_claims|$replacement_claims|$lease_capacity_contract"

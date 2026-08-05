@@ -88,6 +88,7 @@ SELECT (SELECT count(*) = 1 FROM otlet.redaction_policy_status)::text || '|' ||
        (SELECT count(*) > 0 FROM otlet.audit_review_event_export)::text || '|' ||
        (SELECT count(*) > 0 FROM otlet.audit_action_execution_export)::text || '|' ||
        (SELECT count(*) > 0 FROM otlet.audit_eval_label_export)::text || '|' ||
+       (SELECT count(*) >= 0 FROM otlet.audit_semantic_correction_export)::text || '|' ||
        (SELECT count(*) > 0 FROM otlet.audit_administrative_change_export)::text || '|' ||
        (SELECT count(*) > 0 FROM otlet.action_workflow_policy_status)::text || '|' ||
        (SELECT count(*) > 0 FROM otlet.semantic_dependency_audit)::text || '|' ||
@@ -100,12 +101,13 @@ SELECT (SELECT count(*) = 1 FROM otlet.redaction_policy_status)::text || '|' ||
        (SELECT count(*) >= 0 FROM otlet.portable_receipt_status)::text || '|' ||
        (SELECT count(*) = 16 FROM otlet.failure_taxonomy)::text || '|' ||
        (SELECT count(*) > 0 FROM otlet.failure_retry_status)::text || '|' ||
+       (SELECT count(*) >= 0 FROM otlet.semantic_correction_status_for_task('$row_triage_task'))::text || '|' ||
        (otlet.semantic_content_hash('{"signal":"auditor proof"}'::jsonb) ~ '^otlet:v1:sha256:[0-9a-f]{64}$')::text;
 ROLLBACK;
 SQL
 )"
 echo "auditor_read_contract=$auditor_read_contract"
-[ "$auditor_read_contract" = "true|true|true|true|true|true|true|true|true|true|true|true|true|true|true|true|true|true|true|true" ] || {
+[ "$auditor_read_contract" = "true|true|true|true|true|true|true|true|true|true|true|true|true|true|true|true|true|true|true|true|true|true" ] || {
   echo "Expected auditor access to all redacted exports, got $auditor_read_contract" >&2
   exit 1
 }
@@ -115,6 +117,7 @@ expect_permission_denied "$permission_auditor_role" "SELECT count(*) FROM otlet.
 expect_permission_denied "$permission_auditor_role" "SELECT count(*) FROM otlet.outputs" "auditor outputs table read"
 expect_permission_denied "$permission_auditor_role" "SELECT count(*) FROM otlet.actions" "auditor actions table read"
 expect_permission_denied "$permission_auditor_role" "SELECT count(*) FROM otlet.review_events" "auditor review event table read"
+expect_permission_denied "$permission_auditor_role" "SELECT count(*) FROM otlet.semantic_correction_overrides" "auditor correction ledger read"
 expect_permission_denied "$permission_auditor_role" "SELECT count(*) FROM otlet.administrative_change_events" "auditor administrative event table read"
 expect_permission_denied "$permission_auditor_role" "SELECT otlet.append_administrative_change('model', 'denied', 'update', NULL, 'otlet:v1:sha256:' || repeat('0', 64))" "auditor administrative event append"
 expect_permission_denied "$permission_auditor_role" "SELECT count(*) FROM otlet.action_targets" "auditor action target read"
@@ -127,6 +130,7 @@ expect_permission_denied "$permission_auditor_role" "SELECT * FROM otlet.approve
 expect_permission_denied "$permission_auditor_role" "SELECT * FROM otlet.reject_action(0)" "auditor action rejection"
 expect_permission_denied "$permission_auditor_role" "SELECT * FROM otlet.label_action(0)" "auditor action labeling"
 expect_permission_denied "$permission_auditor_role" "SELECT * FROM otlet.correct_action(0)" "auditor action correction"
+expect_permission_denied "$permission_auditor_role" "SELECT otlet.approve_semantic_correction(0, 0, '{}'::jsonb, now() + interval '1 minute', 1, 'denied')" "auditor semantic correction approval"
 expect_permission_denied "$permission_auditor_role" "SELECT * FROM otlet.defer_action(0)" "auditor action deferral"
 expect_permission_denied "$permission_auditor_role" "SELECT * FROM otlet.abstain_review(0)" "auditor review abstention"
 expect_permission_denied "$permission_auditor_role" "SELECT * FROM otlet.dry_run_action(0)" "auditor action dry run"
@@ -157,12 +161,23 @@ WHERE id = $merge_action_id;
 SET LOCAL ROLE $permission_operator_role;
 SELECT (SELECT count(*) = 1 FROM otlet.audit_review_export WHERE action_id = $merge_action_id)::text || '|' ||
        (SELECT count(*) > 0 FROM otlet.audit_receipt_export)::text || '|' ||
+       (SELECT count(*) >= 0 FROM otlet.audit_semantic_correction_export)::text || '|' ||
        (SELECT count(*) > 0 FROM otlet.audit_administrative_change_export)::text || '|' ||
+       pg_catalog.has_function_privilege(
+         current_user,
+         'otlet.semantic_correction_status_for_task(text)',
+         'EXECUTE'
+       )::text || '|' ||
+       pg_catalog.has_function_privilege(
+         current_user,
+         'otlet.approve_semantic_correction(bigint,bigint,jsonb,timestamptz,numeric,text,text)',
+         'EXECUTE'
+       )::text || '|' ||
        (SELECT count(*) = 1 FROM otlet.access_policy_status)::text;
 ROLLBACK;
 SQL
 )"
-[ "$operator_audit_contract" = "true|true|true|true" ] || {
+[ "$operator_audit_contract" = "true|true|true|true|true|true|true" ] || {
   echo "Expected operator access to auditor views, got $operator_audit_contract" >&2
   exit 1
 }
@@ -414,6 +429,7 @@ expect_permission_denied "$permission_operator_role" "SELECT count(*) FROM otlet
 expect_permission_denied "$permission_operator_role" "SELECT count(*) FROM otlet.action_workflow_policies" "operator action workflow policy read"
 expect_permission_denied "$permission_operator_role" "SELECT count(*) FROM otlet.action_execution_receipts" "operator action execution receipt read"
 expect_permission_denied "$permission_operator_role" "SELECT count(*) FROM otlet.review_events" "operator review event table read"
+expect_permission_denied "$permission_operator_role" "SELECT count(*) FROM otlet.semantic_correction_overrides" "operator correction ledger read"
 expect_permission_denied "$permission_operator_role" "SELECT count(*) FROM otlet.administrative_change_events" "operator administrative event table read"
 expect_permission_denied "$permission_operator_role" "SELECT otlet.append_administrative_change('model', 'denied', 'update', NULL, 'otlet:v1:sha256:' || repeat('0', 64))" "operator administrative event append"
 expect_permission_denied "$permission_operator_role" "UPDATE public.otlet_demo_bounded_actions SET review_state = review_state WHERE false" "operator direct target update"
@@ -460,6 +476,7 @@ WITH table_grants AS (
             'audit_review_event_export',
             'audit_action_execution_export',
             'audit_eval_label_export',
+            'audit_semantic_correction_export',
             'audit_administrative_change_export',
             'action_workflow_policy_status',
             'semantic_dependency_audit',
@@ -504,7 +521,8 @@ WITH table_grants AS (
           'source_function_descriptor',
           'source_query_binding_descriptor',
           'source_query_contract_error',
-          'entity_graph_conflict_status_for_task'
+          'entity_graph_conflict_status_for_task',
+          'semantic_correction_status_for_task'
         )
     )::bigint AS unexpected_auditor_grants,
     count(*) FILTER (
@@ -531,6 +549,7 @@ WITH table_grants AS (
           'source_query_binding_descriptor',
           'source_query_contract_error',
           'entity_graph_conflict_status_for_task',
+          'semantic_correction_status_for_task',
           'approve_action',
           'reject_action',
           'label_action',
@@ -539,7 +558,8 @@ WITH table_grants AS (
           'abstain_review',
           'dry_run_action',
           'apply_action',
-          'application_retry_job'
+          'application_retry_job',
+          'approve_semantic_correction'
         )
     )::bigint AS unexpected_operator_grants
   FROM information_schema.routine_privileges
@@ -569,6 +589,8 @@ WITH table_grants AS (
           'otlet.application_cancel_job(bigint)'::regprocedure,
           'otlet.application_retry_job(bigint,text)'::regprocedure,
           'otlet.entity_graph_conflict_status_for_task(text)'::regprocedure,
+          'otlet.semantic_correction_status_for_task(text)'::regprocedure,
+          'otlet.approve_semantic_correction(bigint,bigint,jsonb,timestamptz,numeric,text,text)'::regprocedure,
           'otlet.export_eval_cases(integer)'::regprocedure,
           'otlet.grant_auditor_access(regrole)'::regprocedure,
           'otlet.grant_operator_access(regrole)'::regprocedure,
@@ -627,19 +649,16 @@ CROSS JOIN definer_status;
 SQL
 )"
 echo "permission_catalog_contract=$permission_catalog_contract"
-[ "$permission_catalog_contract" = "false|0|0|0|19|21|19|30|0|0|0|0|28|28|0|3|3|3|8|8|8|true" ] || {
+[ "$permission_catalog_contract" = "false|0|0|0|20|22|20|32|0|0|0|0|30|30|0|3|3|3|8|8|8|true" ] || {
   echo "Expected exact public, auditor, operator, and owner ACLs, got $permission_catalog_contract" >&2
   exit 1
 }
 
 source "$demo_dir/review_provenance.sh"
 
-permission_contract="public=0/0/0|auditor=19/21|operator=19/30|definer=28/28|application=3/3/3|portable=8/8/8|positive=7|denied=$permission_denied_count"
+permission_contract="public=0/0/0|auditor=20/22|operator=20/32|definer=30/30|application=3/3/3|portable=8/8/8|positive=8|denied=$permission_denied_count"
 echo "permission_contract=$permission_contract"
-[ "$permission_contract" = "public=0/0/0|auditor=19/21|operator=19/30|definer=28/28|application=3/3/3|portable=8/8/8|positive=7|denied=72" ] || {
+[ "$permission_contract" = "public=0/0/0|auditor=20/22|operator=20/32|definer=30/30|application=3/3/3|portable=8/8/8|positive=8|denied=75" ] || {
   echo "Expected complete permission contract, got $permission_contract" >&2
   exit 1
 }
-
-cleanup_permission_roles
-trap - EXIT

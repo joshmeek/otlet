@@ -345,6 +345,11 @@ pgrx::extension_sql_file!(
     name = "entity_graph_conflict_status",
     requires = ["pair_constraint_ledger"]
 );
+pgrx::extension_sql_file!(
+    "../sql/migrations/0068_authoritative_semantic_correction.sql",
+    name = "authoritative_semantic_correction",
+    requires = ["entity_graph_conflict_status"]
+);
 
 #[allow(non_snake_case)]
 #[pgrx::pg_guard]

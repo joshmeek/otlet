@@ -102,7 +102,7 @@ const INFER_NOW_PROVENANCE_AND_ROW_STATE_SQL: &str = "WITH receipt AS ( \
                  latest AS ( \
                    SELECT sm.subject_id, sm.stale, (sm.body @> $3::jsonb) AS matches_expected, \
                      sm.updated_at, sm.id \
-                   FROM otlet.semantic_materializations sm \
+                   FROM otlet.semantic_materializations_effective sm \
                    WHERE sm.task_name = $4 \
                      AND sm.record_type = $5 \
                      AND sm.subject_id = $2 \
@@ -184,7 +184,7 @@ const INFER_NOW_PROVENANCE_AND_JOIN_STATE_SQL: &str = "WITH receipt AS ( \
                  ), \
                  current_row AS ( \
                    SELECT sm.subject_id, sm.body, sm.stale \
-                   FROM otlet.semantic_materializations sm \
+                   FROM otlet.semantic_materializations_effective sm \
                    WHERE sm.task_name = $5 \
                      AND sm.record_type = $7 \
                      AND sm.subject_id = $3 \

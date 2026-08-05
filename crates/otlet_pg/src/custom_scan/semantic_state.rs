@@ -126,7 +126,7 @@ fn load_semantic_states(
              sm.updated_at, \
              sm.id \
            FROM source_rows src \
-           JOIN otlet.semantic_materializations sm \
+           JOIN otlet.semantic_materializations_effective sm \
              ON sm.subject_id = src.subject_id \
            WHERE sm.task_name = $1 \
              AND sm.record_type = $2 \
