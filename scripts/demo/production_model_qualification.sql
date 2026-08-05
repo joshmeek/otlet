@@ -10,7 +10,7 @@ CREATE TEMP TABLE production_model_qualification_proof (
   sample_immutable boolean NOT NULL DEFAULT false,
   probe_immutable boolean NOT NULL DEFAULT false,
   event_immutable boolean NOT NULL DEFAULT false,
-  artifact_drift_closed boolean NOT NULL DEFAULT false
+  artifact_mutation_blocked boolean NOT NULL DEFAULT false
 ) ON COMMIT DROP;
 INSERT INTO production_model_qualification_proof DEFAULT VALUES;
 
@@ -347,48 +347,41 @@ BEGIN
 END
 $body$;
 
-SELECT otlet.register_model(
-  'evaluation_slice_cheap',
-  '/tmp/evaluation_slice_cheap_replacement.gguf',
-  repeat('4', 64),
-  jsonb_build_object(
-    'sha256', repeat('4', 64),
-    'bytes', 1,
-    'source', 'repository-demo',
-    'revision', 'evaluation_slice_cheap_replacement',
-    'quantization', 'fixture',
-    'license', 'fixture'
-  ),
-  4
-) \g /dev/null
+DO $body$
+BEGIN
+  BEGIN
+    PERFORM otlet.register_model(
+      'evaluation_slice_cheap',
+      '/tmp/evaluation_slice_cheap_replacement.gguf',
+      repeat('4', 64),
+      jsonb_build_object(
+        'sha256', repeat('4', 64),
+        'bytes', 1,
+        'source', 'repository-demo',
+        'revision', 'evaluation_slice_cheap_replacement',
+        'quantization', 'fixture',
+        'license', 'fixture'
+      ),
+      4
+    );
+    RAISE EXCEPTION 'model artifact mutation was accepted';
+  EXCEPTION WHEN OTHERS THEN
+    IF SQLERRM <>
+      'otlet model evaluation_slice_cheap artifact identity is immutable; register a new model name' THEN
+      RAISE;
+    END IF;
+  END;
 
-UPDATE production_model_qualification_proof
-SET artifact_drift_closed = (
-  SELECT count(*) = 2
-    AND count(*) FILTER (WHERE production_approved) = 1
-    AND bool_and(NOT production_approved) FILTER (
-      WHERE selection_role = 'cheap'
+  UPDATE production_model_qualification_proof
+  SET artifact_mutation_blocked = (
+    SELECT count(*) = 2 AND bool_and(production_approved)
+    FROM otlet.production_model_qualification_status
+    WHERE qualification_event_hash = (
+      SELECT qualification_hash FROM production_model_qualification_proof
     )
-  FROM otlet.production_model_qualification_status
-  WHERE qualification_event_hash = (
-    SELECT qualification_hash FROM production_model_qualification_proof
-  )
-);
-
-SELECT otlet.register_model(
-  'evaluation_slice_cheap',
-  '/tmp/evaluation_slice_cheap.gguf',
-  repeat('2', 64),
-  jsonb_build_object(
-    'sha256', repeat('2', 64),
-    'bytes', 1,
-    'source', 'repository-demo',
-    'revision', 'evaluation_slice_cheap',
-    'quantization', 'fixture',
-    'license', 'fixture'
-  ),
-  4
-) \g /dev/null
+  );
+END
+$body$;
 
 CREATE TEMP TABLE production_model_qualification_contract ON COMMIT DROP AS
 SELECT concat_ws('|',
@@ -407,7 +400,7 @@ SELECT concat_ws('|',
      AND count(DISTINCT status.model_identity_hash) = 2
    FROM otlet.production_model_qualification_status status
    WHERE status.qualification_event_hash = proof.qualification_hash),
-  proof.artifact_drift_closed,
+  proof.artifact_mutation_blocked,
   NOT pg_catalog.has_table_privilege(
     'public', 'otlet.production_model_database_samples',
     'SELECT,INSERT,UPDATE,DELETE,TRUNCATE'

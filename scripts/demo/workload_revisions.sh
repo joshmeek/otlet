@@ -127,7 +127,7 @@ FROM otlet.portable_start_worker(
 RESET ROLE;
 
 SELECT otlet.register_model(
-  'revision_cheap',
+  'revision_cheap_b',
   '/tmp/revision-cheap-b.gguf',
   repeat('3', 64),
   jsonb_build_object(
@@ -140,7 +140,7 @@ SELECT otlet.register_model(
   )
 ) \g /dev/null
 SELECT otlet.register_model(
-  'revision_strong',
+  'revision_strong_b',
   '/tmp/revision-strong-b.gguf',
   repeat('4', 64),
   jsonb_build_object(
@@ -157,15 +157,15 @@ SELECT otlet.create_task(
   'SELECT ''portable-b''::text AS subject_id, ''{"y":"b"}''::jsonb AS input',
   'Return the new decision',
   '{"type":"object","required":["new","confidence"],"additionalProperties":false,"properties":{"new":{"const":"b"},"confidence":{"enum":["low","high"]}}}'::jsonb,
-  'revision_cheap',
+  'revision_cheap_b',
   '{"max_tokens":70,"reasoning":"off","inference_cache":false}'::jsonb,
   '{"source_fields":["y"]}'::jsonb,
   '{"answer_field":"new","confidence_field":"confidence","accepted_confidence":["low"],"action_types":[]}'::jsonb
 ) \g /dev/null
 SELECT otlet.set_model_selection_policy(
   'workload_revision_portable_probe',
-  'revision_cheap',
-  'revision_strong',
+  'revision_cheap_b',
+  'revision_strong_b',
   '{"confidence_field":"confidence","accepted_confidence":["low"]}'::jsonb
 ) \g /dev/null
 DELETE FROM otlet.action_type_schemas WHERE action_type = 'review_flag';
@@ -640,10 +640,17 @@ VALUES ('workload_revision_queue_probe', 'old-route', '{}'::jsonb);
 UPDATE otlet.tasks
 SET model_name = 'revision_queue_b'
 WHERE name = 'workload_revision_queue_probe';
-DELETE FROM otlet.models WHERE name = 'revision_queue_a';
-
 DO $$
 BEGIN
+  BEGIN
+    DELETE FROM otlet.models WHERE name = 'revision_queue_a';
+    RAISE EXCEPTION 'retained model registration was deleted';
+  EXCEPTION WHEN OTHERS THEN
+    IF SQLERRM <>
+      'otlet model registrations are retained; use lifecycle state and the pruning plan' THEN
+      RAISE;
+    END IF;
+  END;
   IF NOT EXISTS (
     SELECT 1
     FROM otlet.model_queue_status status

@@ -79,7 +79,7 @@ contract="$(
 SELECT concat_ws('|',
   max(version),
   count(*),
-  array_agg(version ORDER BY version) = ARRAY(SELECT generate_series(1, 61)),
+  array_agg(version ORDER BY version) = ARRAY(SELECT generate_series(1, 62)),
   bool_and(file ~ ('(^|/)' || lpad(version::text, 4, '0') || '_')),
   (SELECT value FROM public.portable_upgrade_sentinel),
   (SELECT count(*) FROM otlet.verify_invariants())
@@ -87,7 +87,7 @@ SELECT concat_ws('|',
 FROM otlet.portable_schema_migrations;
 SQL
 )"
-[ "$contract" = "61|61|t|t|preserved|0" ] || {
+[ "$contract" = "62|62|t|t|preserved|0" ] || {
   echo "Portable repeat-install contract mismatch: $contract" >&2
   exit 1
 }
@@ -1614,6 +1614,260 @@ model_license_use_migration_contract="$(model_license_use_migration_contract_que
   exit 1
 }
 
+model_artifact_lifecycle_migration_contract_query() {
+  docker exec -i "$container" psql -U postgres -d "$database" \
+    -X -qAt -v ON_ERROR_STOP=1 <<'SQL'
+BEGIN;
+SET LOCAL otlet.administrative_reason = 'portable model lifecycle proof';
+CREATE TEMP TABLE model_artifact_lifecycle_proof (
+  identity_guarded boolean NOT NULL DEFAULT false,
+  lifecycle_guarded boolean NOT NULL DEFAULT false,
+  delete_guarded boolean NOT NULL DEFAULT false,
+  observation_guarded boolean NOT NULL DEFAULT false
+);
+INSERT INTO model_artifact_lifecycle_proof DEFAULT VALUES;
+SELECT otlet.register_model(
+  'model_lifecycle_upgrade_old',
+  '/tmp/model-lifecycle-upgrade/old.gguf',
+  repeat('1', 64),
+  jsonb_build_object(
+    'sha256', repeat('1', 64),
+    'bytes', 3,
+    'source', 'portable-upgrade-demo',
+    'revision', 'old-v1',
+    'quantization', 'test',
+    'license', 'test'
+  )
+) \g /dev/null
+SELECT otlet.register_model(
+  'model_lifecycle_upgrade_alias',
+  '/tmp/model-lifecycle-upgrade/old.gguf',
+  repeat('1', 64),
+  jsonb_build_object(
+    'sha256', repeat('1', 64),
+    'bytes', 3,
+    'source', 'portable-upgrade-demo',
+    'revision', 'old-v1',
+    'quantization', 'test',
+    'license', 'test'
+  )
+) \g /dev/null
+SELECT otlet.register_model(
+  'model_lifecycle_upgrade_new',
+  '/tmp/model-lifecycle-upgrade/new.gguf',
+  repeat('2', 64),
+  jsonb_build_object(
+    'sha256', repeat('2', 64),
+    'bytes', 4,
+    'source', 'portable-upgrade-demo',
+    'revision', 'new-v1',
+    'quantization', 'test',
+    'license', 'test'
+  )
+) \g /dev/null
+DO $proof$
+BEGIN
+  BEGIN
+    PERFORM otlet.register_model(
+      'model_lifecycle_upgrade_old',
+      '/tmp/model-lifecycle-upgrade/replaced.gguf',
+      repeat('3', 64),
+      jsonb_build_object(
+        'sha256', repeat('3', 64),
+        'bytes', 5,
+        'source', 'portable-upgrade-demo',
+        'revision', 'changed',
+        'quantization', 'test',
+        'license', 'test'
+      )
+    );
+  EXCEPTION WHEN OTHERS THEN
+    IF position('artifact identity is immutable' IN SQLERRM) = 0 THEN
+      RAISE;
+    END IF;
+    UPDATE model_artifact_lifecycle_proof SET identity_guarded = true;
+  END;
+  BEGIN
+    UPDATE otlet.models
+    SET lifecycle_state = 'disabled'
+    WHERE name = 'model_lifecycle_upgrade_old';
+  EXCEPTION WHEN OTHERS THEN
+    IF position('require set_model_lifecycle' IN SQLERRM) = 0 THEN
+      RAISE;
+    END IF;
+    UPDATE model_artifact_lifecycle_proof SET lifecycle_guarded = true;
+  END;
+  BEGIN
+    DELETE FROM otlet.models WHERE name = 'model_lifecycle_upgrade_old';
+  EXCEPTION WHEN OTHERS THEN
+    IF position('model registrations are retained' IN SQLERRM) = 0 THEN
+      RAISE;
+    END IF;
+    UPDATE model_artifact_lifecycle_proof SET delete_guarded = true;
+  END;
+END
+$proof$;
+SELECT otlet.reconcile_model_artifact_store(
+  1,
+  jsonb_build_object(
+    'format', 'otlet.model_artifact_store.observation.v1',
+    'evidence_source', 'deployment_reported',
+    'store_root', '/tmp/model-lifecycle-upgrade',
+    'capacity_bytes', 100,
+    'available_bytes', 90,
+    'artifacts', jsonb_build_array(
+      jsonb_build_object(
+        'path', '/tmp/model-lifecycle-upgrade/new.gguf',
+        'sha256', repeat('2', 64),
+        'bytes', 4
+      ),
+      jsonb_build_object(
+        'path', '/tmp/model-lifecycle-upgrade/old.gguf',
+        'sha256', repeat('1', 64),
+        'bytes', 3
+      )
+    )
+  ),
+  'portable model lifecycle proof',
+  NULL
+) \gset lifecycle_
+SELECT otlet.reconcile_model_artifact_store(
+  1,
+  (SELECT definition FROM otlet.model_artifact_store_observations),
+  'exact retry',
+  NULL
+) = :'lifecycle_reconcile_model_artifact_store' \g /dev/null
+DO $proof$
+BEGIN
+  BEGIN
+    UPDATE otlet.model_artifact_store_observations
+    SET generation = generation + 1;
+  EXCEPTION WHEN OTHERS THEN
+    IF position('require reconcile_model_artifact_store' IN SQLERRM) = 0 THEN
+      RAISE;
+    END IF;
+    UPDATE model_artifact_lifecycle_proof SET observation_guarded = true;
+  END;
+END
+$proof$;
+SELECT otlet.set_model_lifecycle(
+  'model_lifecycle_upgrade_old',
+  'deprecated',
+  'model_lifecycle_upgrade_new',
+  NULL,
+  'replacement declared',
+  NULL
+) \g /dev/null
+SELECT otlet.set_model_lifecycle(
+  'model_lifecycle_upgrade_old',
+  'draining',
+  'model_lifecycle_upgrade_new',
+  NULL,
+  'drain old model',
+  NULL
+) \g /dev/null
+SELECT otlet.set_model_lifecycle(
+  'model_lifecycle_upgrade_old',
+  'disabled',
+  'model_lifecycle_upgrade_new',
+  NULL,
+  'disable old model',
+  NULL
+) \g /dev/null
+SELECT otlet.set_model_lifecycle(
+  'model_lifecycle_upgrade_alias',
+  'disabled',
+  NULL,
+  NULL,
+  'disable shared alias',
+  NULL
+) \g /dev/null
+SELECT concat_ws('|',
+  EXISTS (
+    SELECT 1
+    FROM otlet.portable_schema_migrations
+    WHERE version = 62
+      AND file LIKE '%0062_model_artifact_lifecycle.sql'
+  ),
+  (SELECT identity_guarded AND lifecycle_guarded AND delete_guarded
+      AND observation_guarded
+    FROM model_artifact_lifecycle_proof),
+  (SELECT count(*) = 3
+      AND bool_and(artifact_reconciliation_state = 'verified')
+    FROM otlet.model_lifecycle_status
+    WHERE model_name LIKE 'model_lifecycle_upgrade_%'),
+  (SELECT lifecycle_state = 'disabled'
+      AND replacement_model_name = 'model_lifecycle_upgrade_new'
+      AND release_requested
+      AND drain_complete
+    FROM otlet.model_lifecycle_status
+    WHERE model_name = 'model_lifecycle_upgrade_old'),
+  (SELECT prune_ready
+      AND action = 'delete_external_file'
+      AND registration_count = 2
+      AND matching_registrations = 2
+      AND reclaimable_bytes = 3
+      AND deletion_owner = 'deployment'
+      AND dry_run
+    FROM otlet.model_artifact_pruning_plan
+    WHERE artifact_path = '/tmp/model-lifecycle-upgrade/old.gguf'),
+  (SELECT reconciliation_state = 'reconciled'
+      AND capacity_bytes = 100
+      AND available_bytes = 90
+      AND reclaimable_bytes = 3
+      AND projected_available_bytes = 93
+      AND recorded_by = current_user
+      AND deletion_owner = 'deployment'
+    FROM otlet.model_artifact_store_status),
+  NOT pg_catalog.has_table_privilege(
+    'public', 'otlet.model_artifact_store_observations',
+    'SELECT,INSERT,UPDATE,DELETE,TRUNCATE'
+  )
+    AND NOT pg_catalog.has_table_privilege(
+      'public', 'otlet.model_artifact_dependency_status', 'SELECT'
+    )
+    AND NOT pg_catalog.has_table_privilege(
+      'public', 'otlet.model_lifecycle_status', 'SELECT'
+    )
+    AND NOT pg_catalog.has_table_privilege(
+      'public', 'otlet.model_artifact_pruning_plan', 'SELECT'
+    )
+    AND NOT pg_catalog.has_table_privilege(
+      'public', 'otlet.model_artifact_store_status', 'SELECT'
+    ),
+  NOT EXISTS (
+    SELECT 1
+    FROM pg_catalog.pg_proc function
+    JOIN pg_catalog.pg_namespace namespace
+      ON namespace.oid = function.pronamespace
+    WHERE namespace.nspname = 'otlet'
+      AND function.proname IN (
+        'set_model_lifecycle',
+        'reconcile_model_artifact_store',
+        'model_artifact_release_requested',
+        'synchronize_portable_worker_model_release'
+      )
+      AND pg_catalog.has_function_privilege('public', function.oid, 'EXECUTE')
+  ),
+  (SELECT count(*) = 1
+    FROM otlet.administrative_change_events
+    WHERE object_type = 'model'
+      AND object_name = 'artifact_store:default'
+      AND operation = 'reconcile'),
+  NOT EXISTS (SELECT 1 FROM otlet.verify_invariants())
+);
+ROLLBACK;
+SQL
+}
+model_artifact_lifecycle_migration_contract="$(
+  model_artifact_lifecycle_migration_contract_query
+)"
+[ "$model_artifact_lifecycle_migration_contract" = \
+  "t|t|t|t|t|t|t|t|t|t" ] || {
+  echo "Portable model-artifact-lifecycle migration contract mismatch: $model_artifact_lifecycle_migration_contract" >&2
+  exit 1
+}
+
 identity_vector_contract="$(
   docker exec -i "$container" psql -U postgres -d "$database" \
     -X -qAt -v ON_ERROR_STOP=1 <<'SQL'
@@ -2036,6 +2290,7 @@ echo "portable_promotion_shadow_rollback_migration_contract=$promotion_shadow_ro
 echo "portable_quality_data_drift_migration_contract=$quality_data_drift_migration_contract"
 echo "portable_review_economics_migration_contract=$review_economics_migration_contract"
 echo "portable_model_license_use_migration_contract=$model_license_use_migration_contract"
+echo "portable_model_artifact_lifecycle_migration_contract=$model_artifact_lifecycle_migration_contract"
 echo "portable_ask_administrative_contract=$portable_ask_administrative_contract"
 echo "portable_task_lifecycle_contract=$portable_task_lifecycle_contract"
 echo "portable_model_capacity_contract=$batch_claims|$batch_capacity_contract|$concurrent_capacity_contract|$cancel_blocked_claims|$replacement_claims|$lease_capacity_contract"

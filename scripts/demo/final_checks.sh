@@ -1,4 +1,4 @@
-runtime_contract="$(psql_exec -qAt -v model_name="$cheap_model_name" <<'SQL'
+runtime_contract="$(psql_exec -qAt <<'SQL'
 SELECT runtime_status || '|' ||
        slot_state || '|' ||
        COALESCE(tokens_per_second::text, '') || '|' ||
@@ -8,7 +8,9 @@ SELECT runtime_status || '|' ||
        COALESCE(inference_cache_last_eviction_reason, '') || '|' ||
        COALESCE(worker_memory_sample_policy, '')
 FROM otlet.runtime_status
-WHERE model_name = :'model_name'
+WHERE runtime_status = 'ready'
+  AND slot_state = 'ready'
+ORDER BY last_used_at DESC NULLS LAST, model_name
 LIMIT 1;
 SQL
 )"

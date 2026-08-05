@@ -311,9 +311,14 @@ pgrx::extension_sql_file!(
     requires = ["review_economics"]
 );
 pgrx::extension_sql_file!(
+    "../sql/migrations/0062_model_artifact_lifecycle.sql",
+    name = "model_artifact_lifecycle",
+    requires = ["model_license_use_policy"]
+);
+pgrx::extension_sql_file!(
     "../sql/migrations/0043_permissions.sql",
     name = "permissions",
-    requires = ["model_license_use_policy"]
+    requires = ["model_artifact_lifecycle"]
 );
 
 #[allow(non_snake_case)]

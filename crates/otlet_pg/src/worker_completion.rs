@@ -445,7 +445,22 @@ fn fail_attempt_with_model(
 }
 
 fn record_metrics(job: &Job, model_name: &str, metrics: &ModelMetrics) {
+    let resident_model_name = match linked_resident_model_name() {
+        Ok(model_name) => model_name,
+        Err(error) => {
+            pgrx::warning!("otlet resident model lookup failed: {}", error.message);
+            None
+        }
+    };
     if job.execution_mode != "production" {
+        let result = BackgroundWorker::transaction(|| {
+            pgrx::Spi::connect_mut(|client| {
+                clear_runtime_slot_residency(client, resident_model_name.as_deref())
+            })
+        });
+        if let Err(error) = result {
+            pgrx::warning!("otlet runtime residency update failed: {error}");
+        }
         return;
     }
     let result: pgrx::spi::Result<()> = BackgroundWorker::transaction(|| {
@@ -501,6 +516,7 @@ fn record_metrics(job: &Job, model_name: &str, metrics: &ModelMetrics) {
                     &event_args,
                 )?;
             }
+            clear_runtime_slot_residency(client, resident_model_name.as_deref())?;
             Ok(())
         })
     });

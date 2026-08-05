@@ -521,13 +521,13 @@ fi
 async_administrative_contract="$(
   docker exec -i "$container" psql -U postgres -d "$portable_database" \
     -X -qAt -v ON_ERROR_STOP=1 -v async_job_id="$async_job_id" <<'SQL'
-SELECT NOT EXISTS (
+SELECT (NOT EXISTS (
   SELECT 1
   FROM otlet.administrative_change_events event
   JOIN otlet.jobs job ON job.task_name = event.object_name
   WHERE job.id = :'async_job_id'::bigint
     AND event.object_type = 'task'
-)::text;
+))::text;
 SQL
 )"
 if [ "$async_administrative_contract" != "true" ]; then
@@ -1963,14 +1963,90 @@ if [ "$watch_restart_contract" != "complete|retain newest|keep|false|1|0|cancele
 fi
 
 docker exec -i "$container" psql -U postgres -d "$portable_database" -X -qAt \
-  -v ON_ERROR_STOP=1 -v worker_id="$worker_id" <<'SQL' >/dev/null
-SELECT otlet.set_portable_worker_control(:'worker_id', 'draining');
+  -v ON_ERROR_STOP=1 -v model_name="$model_name" <<'SQL' >/dev/null
+CREATE SEQUENCE public.portable_release_ack_attempts;
+CREATE FUNCTION public.delay_first_portable_release_ack() RETURNS trigger
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, public
+AS $$
+BEGIN
+  IF NEW.reported_state = 'drained'
+     AND OLD.reported_state IS DISTINCT FROM NEW.reported_state
+     AND nextval('public.portable_release_ack_attempts') = 1 THEN
+    PERFORM pg_sleep(5);
+  END IF;
+  RETURN NEW;
+END;
+$$;
+CREATE TRIGGER delay_first_portable_release_ack
+BEFORE UPDATE OF reported_state ON otlet.portable_workers
+FOR EACH ROW EXECUTE FUNCTION public.delay_first_portable_release_ack();
+SELECT otlet.set_model_lifecycle(
+  :'model_name',
+  'draining',
+  NULL,
+  NULL,
+  'portable model release proof',
+  NULL
+);
 SQL
+release_ack_waiting=false
+for _ in {1..100}; do
+  release_ack_waiting="$(
+    docker exec "$container" psql -U postgres -d "$portable_database" -X -qAt \
+      -c "SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE datname = '$portable_database' AND wait_event = 'PgSleep' AND query LIKE '%portable_worker_heartbeat%' AND pid <> pg_backend_pid())"
+  )"
+  [ "$release_ack_waiting" = "t" ] && break
+  sleep 0.05
+done
+if [ "$release_ack_waiting" != "t" ]; then
+  docker logs --tail 120 "$recovery_container" >&2 || true
+  echo "Portable model release did not reach the acknowledgement retry proof" >&2
+  exit 1
+fi
+docker exec "$container" psql -U postgres -d "$portable_database" -X -qAt \
+  -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '$portable_database' AND wait_event = 'PgSleep' AND query LIKE '%portable_worker_heartbeat%' AND pid <> pg_backend_pid()" \
+  >/dev/null
 for _ in {1..400}; do
   [ "$(docker inspect -f '{{.State.Running}}' "$recovery_container")" = "false" ] && break
   sleep 0.1
 done
 wait_for_worker_state drained
+portable_model_release_contract="$(
+  docker exec -i "$container" psql -U postgres -d "$portable_database" \
+    -X -qAt -v ON_ERROR_STOP=1 -v worker_id="$worker_id" \
+    -v model_name="$model_name" <<'SQL'
+SELECT concat_ws('|',
+  model.lifecycle_state,
+  worker.desired_state,
+  worker.reported_state,
+  worker.model_status,
+  otlet.model_artifact_release_requested(model.name),
+  NOT dependency.blocks_pruning,
+  (SELECT last_value >= 2 FROM public.portable_release_ack_attempts)
+)
+FROM otlet.models model
+JOIN otlet.portable_workers worker ON worker.model_name = model.name
+JOIN otlet.model_artifact_dependency_status dependency
+  ON dependency.model_name = model.name
+ AND dependency.dependency_type = 'portable_worker'
+ AND dependency.dependency_key = worker.worker_id
+WHERE model.name = :'model_name'
+  AND worker.worker_id = :'worker_id';
+SQL
+)"
+if [ "$portable_model_release_contract" != \
+  "draining|draining|drained|unverified|t|t|t" ]; then
+  echo "Expected portable model release contract, got $portable_model_release_contract" >&2
+  exit 1
+fi
+docker exec -i "$container" psql -U postgres -d "$portable_database" \
+  -X -qAt -v ON_ERROR_STOP=1 <<'SQL' >/dev/null
+DROP TRIGGER delay_first_portable_release_ack ON otlet.portable_workers;
+DROP FUNCTION public.delay_first_portable_release_ack();
+DROP SEQUENCE public.portable_release_ack_attempts;
+SQL
 archive_recovery_worker
 
 for secret in \
@@ -2088,4 +2164,5 @@ echo "portable_row_watch_contract=$watch_queued_contract|$watch_insert_contract|
 echo "portable_pair_watch_contract=$pair_refresh_contract|$pair_insert_contract|$pair_update_contract|$pair_replacement_contract|$(tr '\n' ':' <<<"$pair_delete_contract")"
 echo "portable_external_worker_contract=$contract|source_access=denied|protocol=1"
 echo "portable_recovery_contract=$recovery_contract|logs=structured_redacted|duplicate=covered_by_protocol"
+echo "portable_model_release_contract=$portable_model_release_contract"
 echo "portable_parity_contract=$portable_parity_contract"

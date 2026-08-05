@@ -205,5 +205,8 @@ $$;
 \set portable_migration_file ../../../otlet_pg/sql/migrations/0061_model_license_use_policy.sql
 \ir migrations/apply.sql
 
+\set portable_migration_file ../../../otlet_pg/sql/migrations/0062_model_artifact_lifecycle.sql
+\ir migrations/apply.sql
+
 \set portable_migration_file 0043_permissions.sql
 \ir migrations/apply.sql

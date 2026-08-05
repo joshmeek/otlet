@@ -13,7 +13,6 @@ CREATE TEMP TABLE promotion_shadow_rollback_proof (
   shadow_non_authoritative boolean NOT NULL DEFAULT false,
   bad_evidence_blocked boolean NOT NULL DEFAULT false,
   stale_activation_blocked boolean NOT NULL DEFAULT false,
-  artifact_drift_blocked boolean NOT NULL DEFAULT false,
   raw_activation_blocked boolean NOT NULL DEFAULT false,
   activation_conflict_blocked boolean NOT NULL DEFAULT false,
   rollback_conflict_blocked boolean NOT NULL DEFAULT false,
@@ -453,57 +452,6 @@ BEGIN
 END
 $body$;
 
-SELECT otlet.register_model(
-  'evaluation_slice_cheap',
-  '/tmp/evaluation_slice_cheap_promotion_drift.gguf',
-  repeat('4', 64),
-  jsonb_build_object(
-    'sha256', repeat('4', 64),
-    'bytes', 1,
-    'source', 'repository-demo',
-    'revision', 'promotion-drift',
-    'quantization', 'fixture',
-    'license', 'fixture'
-  ),
-  4
-) \g /dev/null
-
-DO $body$
-DECLARE
-  proof promotion_shadow_rollback_proof%ROWTYPE;
-BEGIN
-  SELECT * INTO proof FROM promotion_shadow_rollback_proof;
-  BEGIN
-    PERFORM otlet.activate_workload_promotion(
-      proof.decision_event_hash,
-      (SELECT baseline_revision_hash FROM evaluation_slice_proof)
-    );
-    RAISE EXCEPTION 'artifact drift unexpectedly activated';
-  EXCEPTION WHEN OTHERS THEN
-    IF SQLERRM <>
-         'otlet workload promotion activation model qualification is not current' THEN
-      RAISE;
-    END IF;
-  END;
-  UPDATE promotion_shadow_rollback_proof SET artifact_drift_blocked = true;
-END
-$body$;
-
-SELECT otlet.register_model(
-  'evaluation_slice_cheap',
-  '/tmp/evaluation_slice_cheap.gguf',
-  repeat('2', 64),
-  jsonb_build_object(
-    'sha256', repeat('2', 64),
-    'bytes', 1,
-    'source', 'repository-demo',
-    'revision', 'evaluation_slice_cheap',
-    'quantization', 'fixture',
-    'license', 'fixture'
-  ),
-  4
-) \g /dev/null
-
 UPDATE promotion_shadow_rollback_proof proof
 SET activation_event_hash = otlet.activate_workload_promotion(
   proof.decision_event_hash,
@@ -626,7 +574,6 @@ SELECT concat_ws('|',
   proof.shadow_non_authoritative,
   proof.bad_evidence_blocked,
   proof.stale_activation_blocked,
-  proof.artifact_drift_blocked,
   proof.raw_activation_blocked,
   proof.activation_event_hash = proof.repeated_activation_event_hash
     AND proof.activation_conflict_blocked
@@ -677,7 +624,7 @@ SELECT concat_ws('|',
 FROM promotion_shadow_rollback_proof proof;
 
 SELECT pg_temp.assert_true(
-  contract = 't|t|t|t|t|t|t|t|t|t|t|t|t',
+  contract = 't|t|t|t|t|t|t|t|t|t|t|t',
   'promotion shadow and rollback contract mismatch: ' || contract
 )
 FROM promotion_shadow_rollback_contract;

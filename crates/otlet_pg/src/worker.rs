@@ -3,7 +3,8 @@ use crate::job::{
     model_selection_policy, replay_watch_reconciliation,
 };
 use crate::model::{
-    ModelError, ModelMetrics, ModelPreload, ModelRun, preload_model, run_job, run_job_with_model,
+    ModelError, ModelMetrics, ModelPreload, ModelRun, linked_resident_model_name, preload_model,
+    release_linked_model, run_job, run_job_with_model,
 };
 use pgrx::JsonB;
 use pgrx::bgworkers::{BackgroundWorker, SignalWakeFlags};
@@ -180,8 +181,10 @@ pub extern "C-unwind" fn otlet_worker_main(_arg: pgrx::pg_sys::Datum) {
             } else {
                 drained += u64::try_from(batch_result.completed + batch_result.failed).unwrap_or(0);
             }
+            release_requested_resident_model();
         }
         crate::wake::record_worker_drain(drained);
+        release_requested_resident_model();
         if drained > 0 {
             // After productive work, reclaim expired leases and re-check schema promptly.
             last_expired_sweep = Instant::now()
@@ -235,6 +238,7 @@ fn startup_runtime_options() -> pgrx::spi::Result<Value> {
 fn record_worker_started(max_worker_rss_bytes: u64) -> pgrx::spi::Result<()> {
     pgrx::Spi::connect_mut(|client| {
         let max_worker_rss_bytes = i64::try_from(max_worker_rss_bytes).unwrap_or(i64::MAX);
+        clear_runtime_slot_residency(client, None)?;
         client.update(
             "SELECT otlet.record_worker_event(\
                'worker_started', NULL, 'linked_inproc', 'otlet worker connected', \
@@ -247,6 +251,90 @@ fn record_worker_started(max_worker_rss_bytes: u64) -> pgrx::spi::Result<()> {
         )?;
         Ok(())
     })
+}
+
+fn clear_runtime_slot_residency(
+    client: &mut pgrx::spi::SpiClient<'_>,
+    resident_model_name: Option<&str>,
+) -> pgrx::spi::Result<()> {
+    client.update(
+        "UPDATE otlet.runtime_slots \
+         SET artifact_path=NULL, status='cold', active_jobs=0, loaded_at=NULL, \
+             model_memory_bytes=0, model_parameters=0, context_window_tokens=0, \
+             model_device_policy=NULL, resident_memory_tracked_bytes=0, \
+             memory_accounting_policy=NULL, worker_process_rss_bytes=0, \
+             worker_process_virtual_bytes=0, worker_memory_sample_policy=NULL \
+         WHERE ($1::text IS NULL OR model_name <> $1) \
+           AND (status='ready' OR artifact_path IS NOT NULL \
+                OR model_memory_bytes > 0 OR resident_memory_tracked_bytes > 0)",
+        None,
+        &[resident_model_name.into()],
+    )?;
+    Ok(())
+}
+
+fn release_requested_resident_model() {
+    let model_name = match linked_resident_model_name() {
+        Ok(Some(model_name)) => model_name,
+        Ok(None) => {
+            let result = BackgroundWorker::transaction(|| {
+                pgrx::Spi::connect_mut(|client| clear_runtime_slot_residency(client, None))
+            });
+            if let Err(error) = result {
+                pgrx::warning!("otlet stale runtime residency cleanup failed: {error}");
+            }
+            return;
+        }
+        Err(error) => {
+            pgrx::warning!("otlet resident model lookup failed: {}", error.message);
+            return;
+        }
+    };
+    let requested = BackgroundWorker::transaction(|| {
+        pgrx::Spi::get_one_with_args::<bool>(
+            "SELECT otlet.model_artifact_release_requested($1)",
+            &[model_name.as_str().into()],
+        )
+    });
+    match requested {
+        Ok(Some(true)) => {}
+        Ok(_) => return,
+        Err(error) => {
+            pgrx::warning!("otlet resident model release check failed: {error}");
+            return;
+        }
+    }
+    match release_linked_model(&model_name) {
+        Ok(true) => {}
+        Ok(false) => {
+            pgrx::warning!("otlet resident model changed before release");
+            return;
+        }
+        Err(error) => {
+            pgrx::warning!("otlet resident model unload failed: {}", error.message);
+            return;
+        }
+    }
+    let acknowledged: pgrx::spi::Result<()> = BackgroundWorker::transaction(|| {
+        pgrx::Spi::connect_mut(|client| {
+            let args = [model_name.as_str().into()];
+            clear_runtime_slot_residency(client, None)?;
+            client.update(
+                "SELECT otlet.record_worker_event(\
+                   'model_unloaded', NULL, 'linked_inproc', 'model artifact released', \
+                   jsonb_build_object('model_name', $1))",
+                Some(1),
+                &args,
+            )?;
+            Ok(())
+        })
+    });
+    match acknowledged {
+        Ok(()) => pgrx::log!("otlet worker unloaded model {model_name}"),
+        Err(error) => {
+            pgrx::warning!("otlet resident model unload acknowledgement failed: {error}")
+        }
+    }
 }
 
 fn record_worker_startup_failure(error: &str) {
@@ -276,7 +364,7 @@ struct StartupPreload {
 fn startup_preload_config() -> pgrx::spi::Result<Option<StartupPreload>> {
     pgrx::Spi::connect(|client| {
         let rows = client.select(
-            "SELECT p.preload_model_name, m.artifact_path, m.artifact_hash, m.artifact_identity, p.default_runtime_options FROM otlet.production_policy p LEFT JOIN otlet.models m ON m.name = p.preload_model_name WHERE p.name = 'default' AND p.preload_model_name IS NOT NULL LIMIT 1",
+            "SELECT p.preload_model_name, m.artifact_path, m.artifact_hash, m.artifact_identity, p.default_runtime_options FROM otlet.production_policy p JOIN otlet.models m ON m.name = p.preload_model_name WHERE p.name = 'default' AND m.lifecycle_state IN ('active','deprecated') AND otlet.model_artifact_ready(m.name) LIMIT 1",
             Some(1),
             &[],
         )?;
@@ -354,6 +442,7 @@ fn record_model_preload_success(model_name: &str, preload: &ModelPreload) {
                 Some(1),
                 &args,
             )?;
+            clear_runtime_slot_residency(client, Some(model_name))?;
             Ok(())
         })
     });
@@ -618,7 +707,7 @@ fn materialize_infer_now_subject(
 fn otlet_schema_ready() -> pgrx::spi::Result<bool> {
     pgrx::Spi::connect(|client| {
         let rows = client.select(
-            "SELECT to_regprocedure('otlet.claim_jobs(text,integer,jsonb)') IS NOT NULL AND to_regprocedure('otlet.replay_watch_reconciliation(boolean)') IS NOT NULL AND to_regprocedure('otlet.materialize_completed_semantic_job(bigint)') IS NOT NULL AND to_regprocedure('otlet.complete_and_materialize_job(bigint,jsonb,text,jsonb,text,text,text,text,jsonb,text,text,text,text)') IS NOT NULL",
+            "SELECT to_regprocedure('otlet.claim_jobs(text,integer,jsonb)') IS NOT NULL AND to_regprocedure('otlet.replay_watch_reconciliation(boolean)') IS NOT NULL AND to_regprocedure('otlet.materialize_completed_semantic_job(bigint)') IS NOT NULL AND to_regprocedure('otlet.complete_and_materialize_job(bigint,jsonb,text,jsonb,text,text,text,text,jsonb,text,text,text,text)') IS NOT NULL AND to_regprocedure('otlet.model_artifact_release_requested(text)') IS NOT NULL",
             Some(1),
             &[],
         )?;

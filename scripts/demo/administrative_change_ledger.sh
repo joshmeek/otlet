@@ -229,8 +229,6 @@ SELECT otlet.register_model(
   ),
   1
 ) \g /dev/null
-UPDATE otlet.models SET name = :'renamed_model' WHERE name = :'model_b';
-UPDATE otlet.models SET name = :'model_b' WHERE name = :'renamed_model';
 
 SELECT otlet.create_task(
   task_name => :'first_task',
@@ -327,6 +325,7 @@ SELECT otlet.register_action_workflow_policy(
 SELECT otlet.disable_action_workflow_policy(:'task_name', 'update_row') \g /dev/null
 
 CREATE TEMP TABLE administrative_guard_proof (
+  model_identity_guarded boolean NOT NULL DEFAULT false,
   insert_guarded boolean NOT NULL DEFAULT false,
   update_guarded boolean NOT NULL DEFAULT false,
   delete_guarded boolean NOT NULL DEFAULT false,
@@ -336,10 +335,25 @@ INSERT INTO administrative_guard_proof DEFAULT VALUES;
 CREATE TEMP TABLE administrative_parameters ON COMMIT DROP AS
 SELECT
   :'model_a'::text AS model_a,
+  :'model_b'::text AS model_b,
+  :'renamed_model'::text AS renamed_model,
   :'rollback_model'::text AS rollback_model;
 
 DO $proof$
 BEGIN
+  BEGIN
+    UPDATE otlet.models
+    SET name = (SELECT renamed_model FROM administrative_parameters)
+    WHERE name = (SELECT model_b FROM administrative_parameters);
+    RAISE EXCEPTION 'model identity mutation was accepted';
+  EXCEPTION WHEN OTHERS THEN
+    IF SQLERRM <>
+      'otlet model name and artifact identity are immutable; register a new model name' THEN
+      RAISE;
+    END IF;
+    UPDATE administrative_guard_proof SET model_identity_guarded = true;
+  END;
+
   BEGIN
     INSERT INTO otlet.administrative_change_events (
       object_type,
@@ -575,15 +589,19 @@ WITH model_chain AS (
               OR old_revision_hash = prior_revision_hash
             )
      FROM retention_chain),
-    EXISTS (
-      SELECT 1
-      FROM otlet.administrative_change_events
-      WHERE object_type = 'model'
-        AND object_name = :'renamed_model'
-        AND operation = 'update'
-        AND old_revision_hash IS NOT NULL
-        AND new_revision_hash IS NOT NULL
-    ) AND EXISTS (
+    (SELECT model_identity_guarded FROM administrative_guard_proof)
+      AND EXISTS (
+        SELECT 1 FROM otlet.models WHERE name = :'model_b'
+      )
+      AND NOT EXISTS (
+        SELECT 1 FROM otlet.models WHERE name = :'renamed_model'
+      )
+      AND NOT EXISTS (
+        SELECT 1
+        FROM otlet.administrative_change_events
+        WHERE object_type = 'model'
+          AND object_name = :'renamed_model'
+      ) AND EXISTS (
       SELECT 1
       FROM otlet.administrative_change_events
       WHERE object_type = 'task'

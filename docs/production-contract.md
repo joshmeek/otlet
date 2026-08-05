@@ -41,7 +41,9 @@ SELECT 'runtime_status_contract=' ||
        COALESCE(inference_cache_last_eviction_reason, '') || '|' ||
        COALESCE(worker_memory_sample_policy, '') AS runtime_status_contract
 FROM otlet.runtime_status
-WHERE model_name = 'qwen3_1_7b'
+WHERE runtime_status = 'ready'
+  AND slot_state = 'ready'
+ORDER BY last_used_at DESC NULLS LAST, model_name
 LIMIT 1;
 ```
 

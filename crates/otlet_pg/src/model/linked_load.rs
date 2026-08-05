@@ -48,6 +48,32 @@ pub(crate) fn preload_model(
     })
 }
 
+pub(crate) fn linked_resident_model_name() -> Result<Option<String>, ModelError> {
+    let Some(cache) = LINKED_CACHE.get() else {
+        return Ok(None);
+    };
+    let cache = cache
+        .lock()
+        .map_err(|_| ModelError::new("linked llama.cpp cache lock poisoned"))?;
+    Ok(cache.as_ref().map(|loaded| loaded.model_name.clone()))
+}
+
+pub(crate) fn release_linked_model(model_name: &str) -> Result<bool, ModelError> {
+    let Some(cache) = LINKED_CACHE.get() else {
+        return Ok(false);
+    };
+    let mut cache = cache
+        .lock()
+        .map_err(|_| ModelError::new("linked llama.cpp cache lock poisoned"))?;
+    let release = cache
+        .as_ref()
+        .is_some_and(|loaded| loaded.model_name == model_name);
+    if release {
+        cache.take();
+    }
+    Ok(release)
+}
+
 fn ensure_linked_model(
     cache: &mut Option<LinkedCache>,
     job_model: JobModelRef<'_>,
@@ -74,6 +100,10 @@ fn ensure_linked_model(
             && cached.model_fingerprint_hash.as_ref() == model_fingerprint_hash
             && cached.verified_artifact.stamp == verified_artifact.stamp
     });
+    if cache_hit && let Some(cached) = cache.as_mut() {
+        cached.model_name.clear();
+        cached.model_name.push_str(job_model.name);
+    }
     if !cache_hit && verified_artifact.digest_cached {
         verified_artifact.verify_digest()?;
     }
@@ -190,6 +220,7 @@ fn ensure_linked_model(
         }
 
         *cache = Some(LinkedCache {
+            model_name: job_model.name.to_owned(),
             artifact_path: job_model.artifact_path.to_owned(),
             model_fingerprint_hash: Arc::<str>::from(model_fingerprint_hash),
             verified_artifact,

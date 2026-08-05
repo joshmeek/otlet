@@ -2190,13 +2190,20 @@ fn run() -> Result<(), String> {
         deployment_preflight_until_available(&database, &config, &mut database_unavailable)?;
     log_preflight(&config);
     if config.preflight_only {
-        database.heartbeat(&config, "stopped", Some("verified"), None)?;
+        drop(verified_artifact);
         return Ok(());
     }
     let (incarnation_nonce, desired) = database.start(&config)?;
     config.incarnation_nonce = Some(incarnation_nonce);
     if desired == "draining" {
-        database.heartbeat(&config, "drained", Some("verified"), None)?;
+        drop(verified_artifact);
+        heartbeat_until_available(
+            &database,
+            &config,
+            "drained",
+            Some("unverified"),
+            &mut database_unavailable,
+        )?;
         log_worker("worker_drained", &config, None);
         return Ok(());
     }
@@ -2247,7 +2254,14 @@ fn run() -> Result<(), String> {
             continue;
         }
         if desired == "draining" {
-            database.heartbeat(&config, "drained", Some("ready"), None)?;
+            drop(model);
+            heartbeat_until_available(
+                &database,
+                &config,
+                "drained",
+                Some("unverified"),
+                &mut database_unavailable,
+            )?;
             log_worker("worker_drained", &config, None);
             return Ok(());
         }
@@ -2273,7 +2287,8 @@ fn run() -> Result<(), String> {
         }
         thread::sleep(config.poll_interval);
     }
-    let _ = database.heartbeat(&config, "stopped", Some("ready"), None);
+    drop(model);
+    let _ = database.heartbeat(&config, "stopped", Some("unverified"), None);
     log_worker("worker_stopped", &config, None);
     Ok(())
 }
@@ -2324,7 +2339,7 @@ fn heartbeat_until_available(
                 }
                 return Ok(desired);
             }
-            Err(error) if is_connection_error(&error) && !config.once => {
+            Err(error) if is_connection_error(&error) && (!config.once || state == "drained") => {
                 if !*unavailable {
                     log_worker("database_unavailable", config, Some("heartbeat_failed"));
                     *unavailable = true;

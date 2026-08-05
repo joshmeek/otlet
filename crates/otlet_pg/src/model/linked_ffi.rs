@@ -10,6 +10,7 @@ struct LinkedLoadEvidence {
 }
 
 struct LinkedCache {
+    model_name: String,
     artifact_path: String,
     model_fingerprint_hash: Arc<str>,
     context: LinkedContext,

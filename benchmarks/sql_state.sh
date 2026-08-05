@@ -389,20 +389,14 @@ cleanup_models() {
   psql_exec -v model_names="$names" >/dev/null <<'SQL'
 WITH names AS (
   SELECT unnest(string_to_array(:'model_names', ',')) AS model_name
-),
-deleted_slots AS (
-  DELETE FROM otlet.runtime_slots s
-  USING names
-  WHERE s.model_name = names.model_name
-  RETURNING s.model_name
 )
-DELETE FROM otlet.models m
+DELETE FROM otlet.runtime_slots slot
 USING names
-WHERE m.name = names.model_name;
+WHERE slot.model_name = names.model_name;
 SQL
 }
 
-created_model_residue_count() {
+created_model_runtime_slot_residue_count() {
   local names
   if [[ ! -s "$created_models" ]]; then
     printf '0'
@@ -414,8 +408,7 @@ WITH names AS (
   SELECT unnest(string_to_array(:'model_names', ',')) AS model_name
 )
 SELECT
-  (SELECT count(*) FROM otlet.models m JOIN names ON names.model_name = m.name)
-  + (SELECT count(*) FROM otlet.runtime_slots s JOIN names ON names.model_name = s.model_name);
+  count(*) FROM otlet.runtime_slots slot JOIN names ON names.model_name = slot.model_name;
 SQL
 }
 
@@ -439,7 +432,7 @@ perform_cleanup() {
   local removed_bytes=0
   local scratch_removed=false
   local sql_removed=false
-  local models_removed=false
+  local runtime_slots_removed=false
   local model_residue=0
 
   if [[ "$keep_sql_state" = "1" ]]; then
@@ -458,9 +451,9 @@ perform_cleanup() {
     removed_bytes="$(scratch_bytes)"
     docker exec "$container" sh -lc "rm -rf $(sh_quote "$scratch_dir")" >/dev/null || true
     removed_bytes=$((removed_bytes + artifact_bytes_removed_early))
-    model_residue="$(created_model_residue_count)"
+    model_residue="$(created_model_runtime_slot_residue_count)"
     if [[ "$model_residue" = "0" ]]; then
-      models_removed=true
+      runtime_slots_removed=true
     fi
     scratch_removed=true
     append_kv "$cleanup_tsv" model_artifacts_removed true
@@ -483,9 +476,10 @@ SQL
   append_kv "$cleanup_tsv" model_cleanup_policy "$keep_models"
   append_kv "$cleanup_tsv" downloaded_path_count "$(wc -l < "$downloaded_paths" | tr -d ' ')"
   append_kv "$cleanup_tsv" created_model_count "$(wc -l < "$created_models" | tr -d ' ')"
-  append_kv "$cleanup_tsv" created_model_residue_count "$model_residue"
+  append_kv "$cleanup_tsv" created_model_runtime_slot_residue_count "$model_residue"
+  append_kv "$cleanup_tsv" model_registrations_retained true
   append_kv "$cleanup_tsv" cleanup_complete true
   append_kv "$cleanup_tsv" scratch_removed "$scratch_removed"
   append_kv "$cleanup_tsv" sql_removed "$sql_removed"
-  append_kv "$cleanup_tsv" created_models_removed "$models_removed"
+  append_kv "$cleanup_tsv" created_model_runtime_slots_removed "$runtime_slots_removed"
 }
