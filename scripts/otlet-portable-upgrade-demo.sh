@@ -20,9 +20,9 @@ install_portable() {
     -f crates/otlet_worker/sql/install.sql
 }
 
-install_portable_through_64() {
+install_portable_through_65() {
   docker exec -w /work/crates/otlet_worker/sql "$container" \
-    sed '/0065_entity_resolution_quality.sql/,$d' migrate.sql |
+    sed '/0066_pair_constraint_ledger.sql/,$d' migrate.sql |
     docker exec -i -w /work/crates/otlet_worker/sql "$container" \
       psql -U postgres -d "$database" -X -q -v ON_ERROR_STOP=1 --single-transaction
 }
@@ -62,7 +62,7 @@ SELECT format(
   'portable upgrade executable proof'
 ) \gexec
 SQL
-install_portable_through_64
+install_portable_through_65
 
 docker exec -i "$container" psql -U postgres -d "$database" \
   -X -q -v ON_ERROR_STOP=1 <<'SQL' >/dev/null
@@ -117,7 +117,7 @@ contract="$(
 SELECT concat_ws('|',
   max(version),
   count(*),
-  array_agg(version ORDER BY version) = ARRAY(SELECT generate_series(1, 65)),
+  array_agg(version ORDER BY version) = ARRAY(SELECT generate_series(1, 66)),
   bool_and(file ~ ('(^|/)' || lpad(version::text, 4, '0') || '_')),
   (SELECT value FROM public.portable_upgrade_sentinel),
   (SELECT count(*) FROM otlet.verify_invariants())
@@ -125,7 +125,7 @@ SELECT concat_ws('|',
 FROM otlet.portable_schema_migrations;
 SQL
 )"
-[ "$contract" = "65|65|t|t|preserved|0" ] || {
+[ "$contract" = "66|66|t|t|preserved|0" ] || {
   echo "Portable repeat-install contract mismatch: $contract" >&2
   exit 1
 }
@@ -2285,6 +2285,102 @@ SQL
   exit 1
 }
 
+pair_constraint_migration_contract="$(
+  docker exec -i "$container" psql -U postgres -d "$database" \
+    -X -qAt -v ON_ERROR_STOP=1 \
+    -v operator_role="$operator_role" \
+    -v partial_auditor_role="$partial_auditor_role" <<'SQL'
+SELECT concat_ws('|',
+  EXISTS (
+    SELECT 1
+    FROM otlet.portable_schema_migrations
+    WHERE version = 66
+      AND file LIKE '%0066_pair_constraint_ledger.sql'
+  ),
+  to_regclass('otlet.pair_constraint_facts') IS NOT NULL,
+  to_regclass('otlet.pair_constraint_status') IS NOT NULL,
+  to_regprocedure('otlet.pair_constraint_contract_hash(jsonb)') IS NOT NULL,
+  (
+    SELECT count(*) = 4
+    FROM (VALUES
+      (
+        'pair_constraint_facts_immutable',
+        'otlet.pair_constraint_facts'::regclass,
+        'otlet.reject_pair_constraint_fact_change()'::regprocedure::oid,
+        27::smallint
+      ),
+      (
+        'pair_constraint_facts_no_truncate',
+        'otlet.pair_constraint_facts'::regclass,
+        'otlet.reject_pair_constraint_fact_change()'::regprocedure::oid,
+        34::smallint
+      ),
+      (
+        'review_events_pair_constraint_fact',
+        'otlet.review_events'::regclass,
+        'otlet.record_pair_constraint_fact()'::regprocedure::oid,
+        5::smallint
+      ),
+      (
+        'semantic_materializations_pair_constraint',
+        'otlet.semantic_materializations'::regclass,
+        'otlet.guard_pair_constraint_materialization()'::regprocedure::oid,
+        23::smallint
+      )
+    ) expected(trigger_name, relation_oid, function_oid, trigger_type)
+    JOIN pg_catalog.pg_trigger trigger
+      ON trigger.tgname = expected.trigger_name
+     AND trigger.tgrelid = expected.relation_oid
+     AND trigger.tgfoid = expected.function_oid
+     AND trigger.tgtype = expected.trigger_type
+     AND NOT trigger.tgisinternal
+  ),
+  EXISTS (
+    SELECT 1
+    FROM pg_catalog.pg_constraint constraint_row
+    WHERE constraint_row.conrelid = 'otlet.semantic_materializations'::regclass
+      AND constraint_row.conname =
+        'semantic_materializations_stale_reason_check'
+      AND pg_catalog.pg_get_constraintdef(constraint_row.oid)
+        LIKE '%pair_constraint_conflict%'
+  ),
+  (SELECT count(*) = 0 FROM otlet.pair_constraint_facts),
+  (SELECT count(*) = 0 FROM otlet.pair_constraint_status),
+  NOT pg_catalog.has_table_privilege(
+    'public',
+    'otlet.pair_constraint_facts',
+    'SELECT,INSERT,UPDATE,DELETE,TRUNCATE'
+  )
+    AND NOT pg_catalog.has_table_privilege(
+      'public', 'otlet.pair_constraint_status', 'SELECT'
+    )
+    AND NOT EXISTS (
+      SELECT 1
+      FROM pg_catalog.pg_proc function
+      JOIN pg_catalog.pg_namespace namespace
+        ON namespace.oid = function.pronamespace
+      WHERE namespace.nspname = 'otlet'
+        AND function.proname LIKE '%pair_constraint%'
+        AND pg_catalog.has_function_privilege(
+          'public', function.oid, 'EXECUTE'
+        )
+    ),
+  NOT pg_catalog.has_table_privilege(
+    :'operator_role', 'otlet.pair_constraint_facts', 'SELECT'
+  )
+    AND NOT pg_catalog.has_table_privilege(
+      :'partial_auditor_role', 'otlet.pair_constraint_status', 'SELECT'
+    ),
+  NOT EXISTS (SELECT 1 FROM otlet.verify_invariants())
+);
+SQL
+)"
+[ "$pair_constraint_migration_contract" = \
+  "t|t|t|t|t|t|t|t|t|t|t" ] || {
+  echo "Portable pair-constraint migration contract mismatch: $pair_constraint_migration_contract" >&2
+  exit 1
+}
+
 identity_vector_contract="$(
   docker exec -i "$container" psql -U postgres -d "$database" \
     -X -qAt -v ON_ERROR_STOP=1 <<'SQL'
@@ -2711,6 +2807,7 @@ echo "portable_model_artifact_lifecycle_migration_contract=$model_artifact_lifec
 echo "portable_failure_retry_taxonomy_migration_contract=$failure_retry_taxonomy_migration_contract"
 echo "portable_candidate_set_coverage_migration_contract=$candidate_set_coverage_migration_contract"
 echo "portable_entity_resolution_quality_migration_contract=$entity_resolution_quality_migration_contract"
+echo "portable_pair_constraint_migration_contract=$pair_constraint_migration_contract"
 echo "portable_ask_administrative_contract=$portable_ask_administrative_contract"
 echo "portable_task_lifecycle_contract=$portable_task_lifecycle_contract"
 echo "portable_model_capacity_contract=$batch_claims|$batch_capacity_contract|$concurrent_capacity_contract|$cancel_blocked_claims|$replacement_claims|$lease_capacity_contract"

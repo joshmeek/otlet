@@ -219,3 +219,6 @@ $$;
 
 \set portable_migration_file ../../../otlet_pg/sql/migrations/0065_entity_resolution_quality.sql
 \ir migrations/apply.sql
+
+\set portable_migration_file ../../../otlet_pg/sql/migrations/0066_pair_constraint_ledger.sql
+\ir migrations/apply.sql

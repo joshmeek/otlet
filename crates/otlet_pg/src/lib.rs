@@ -335,6 +335,11 @@ pgrx::extension_sql_file!(
     name = "entity_resolution_quality",
     requires = ["candidate_set_coverage"]
 );
+pgrx::extension_sql_file!(
+    "../sql/migrations/0066_pair_constraint_ledger.sql",
+    name = "pair_constraint_ledger",
+    requires = ["entity_resolution_quality"]
+);
 
 #[allow(non_snake_case)]
 #[pgrx::pg_guard]
