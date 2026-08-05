@@ -583,7 +583,7 @@ SELECT concat_ws('|',
     AND proof.rollback_conflict_blocked
     AND proof.rollback_status_verified,
   (SELECT head.active_workload_revision_hash = slice.baseline_revision_hash
-     AND head.previous_workload_revision_hash = slice.candidate_revision_hash
+     AND head.previous_workload_revision_hash IS NULL
    FROM otlet.workload_revision_heads head
    JOIN evaluation_slice_proof slice
      ON head.task_name = 'evaluation_slice_probe_task'),

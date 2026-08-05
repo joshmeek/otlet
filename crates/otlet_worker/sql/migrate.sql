@@ -213,3 +213,6 @@ $$;
 
 \set portable_migration_file ../../../otlet_pg/sql/migrations/0063_failure_retry_taxonomy.sql
 \ir migrations/apply.sql
+
+\set portable_migration_file ../../../otlet_pg/sql/migrations/0064_candidate_set_coverage.sql
+\ir migrations/apply.sql

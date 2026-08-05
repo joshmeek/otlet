@@ -325,6 +325,11 @@ pgrx::extension_sql_file!(
     name = "failure_retry_taxonomy",
     requires = ["permissions"]
 );
+pgrx::extension_sql_file!(
+    "../sql/migrations/0064_candidate_set_coverage.sql",
+    name = "candidate_set_coverage",
+    requires = ["failure_retry_taxonomy"]
+);
 
 #[allow(non_snake_case)]
 #[pgrx::pg_guard]

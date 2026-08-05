@@ -41,6 +41,13 @@ SELECT
   jsonb_build_object(
     '_otlet_mvcc', jsonb_build_object(
       'table', 'public.otlet_demo_vendor_entity',
+      'source', CASE
+        WHEN p.pair_id IN (
+          'vendor-1001:vendor-42',
+          'vendor-1001:vendor-77'
+        ) THEN 'erp'
+        ELSE 'crm'
+      END,
       'subject_id', p.pair_id,
       'left_id', p.left_id,
       'right_id', p.right_id,

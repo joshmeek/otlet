@@ -20,9 +20,9 @@ install_portable() {
     -f crates/otlet_worker/sql/install.sql
 }
 
-install_portable_through_62() {
+install_portable_through_63() {
   docker exec -w /work/crates/otlet_worker/sql "$container" \
-    sed '/0063_failure_retry_taxonomy.sql/,$d' migrate.sql |
+    sed '/0064_candidate_set_coverage.sql/,$d' migrate.sql |
     docker exec -i -w /work/crates/otlet_worker/sql "$container" \
       psql -U postgres -d "$database" -X -q -v ON_ERROR_STOP=1 --single-transaction
 }
@@ -62,7 +62,7 @@ SELECT format(
   'portable upgrade executable proof'
 ) \gexec
 SQL
-install_portable_through_62
+install_portable_through_63
 
 docker exec -i "$container" psql -U postgres -d "$database" \
   -X -q -v ON_ERROR_STOP=1 <<'SQL' >/dev/null
@@ -99,7 +99,9 @@ GRANT SELECT ON TABLE
   otlet.runtime_capability_status,
   otlet.portable_worker_status,
   otlet.portable_claim_status,
-  otlet.portable_receipt_status
+  otlet.portable_receipt_status,
+  otlet.failure_taxonomy,
+  otlet.failure_retry_status
 TO :"operator_role";
 GRANT EXECUTE ON FUNCTION otlet.application_retry_job(bigint, text) TO :"operator_role";
 GRANT USAGE ON SCHEMA otlet TO :"partial_auditor_role";
@@ -115,7 +117,7 @@ contract="$(
 SELECT concat_ws('|',
   max(version),
   count(*),
-  array_agg(version ORDER BY version) = ARRAY(SELECT generate_series(1, 63)),
+  array_agg(version ORDER BY version) = ARRAY(SELECT generate_series(1, 64)),
   bool_and(file ~ ('(^|/)' || lpad(version::text, 4, '0') || '_')),
   (SELECT value FROM public.portable_upgrade_sentinel),
   (SELECT count(*) FROM otlet.verify_invariants())
@@ -123,7 +125,7 @@ SELECT concat_ws('|',
 FROM otlet.portable_schema_migrations;
 SQL
 )"
-[ "$contract" = "63|63|t|t|preserved|0" ] || {
+[ "$contract" = "64|64|t|t|preserved|0" ] || {
   echo "Portable repeat-install contract mismatch: $contract" >&2
   exit 1
 }
@@ -2079,6 +2081,128 @@ SQL
   exit 1
 }
 
+candidate_set_coverage_migration_contract="$(
+  docker exec -i "$container" psql -U postgres -d "$database" \
+    -X -qAt -v ON_ERROR_STOP=1 \
+    -v operator_role="$operator_role" \
+    -v partial_auditor_role="$partial_auditor_role" <<'SQL'
+BEGIN;
+CREATE TABLE public.otlet_candidate_set_coverage_upgrade_probe (
+  subject_id text PRIMARY KEY,
+  input jsonb NOT NULL
+);
+WITH built AS (
+  SELECT otlet.build_candidate_set_coverage_rule(
+    $query$
+      SELECT 1::bigint AS candidate_rank, subject_id, input
+      FROM public.otlet_candidate_set_coverage_upgrade_probe
+    $query$,
+    ARRAY['_otlet_mvcc', 'source'],
+    20,
+    0.95,
+    5,
+    0.9,
+    1,
+    0.2
+  ) AS rule
+)
+SELECT concat_ws('|',
+  EXISTS (
+    SELECT 1
+    FROM otlet.portable_schema_migrations
+    WHERE version = 64
+      AND file LIKE '%0064_candidate_set_coverage.sql'
+  ),
+  to_regclass('otlet.candidate_set_coverage_reports') IS NOT NULL,
+  to_regclass('otlet.candidate_set_coverage_status') IS NOT NULL,
+  to_regprocedure(
+    'otlet.record_candidate_set_coverage(text,text)'
+  ) IS NOT NULL,
+  to_regprocedure(
+    'otlet.build_candidate_set_coverage_rule(text,text[],integer,numeric,integer,numeric,integer,numeric)'
+  ) IS NOT NULL,
+  (SELECT count(*) = 5
+   FROM pg_catalog.pg_trigger trigger
+   JOIN pg_catalog.pg_class relation ON relation.oid = trigger.tgrelid
+   JOIN pg_catalog.pg_namespace namespace ON namespace.oid = relation.relnamespace
+   WHERE namespace.nspname = 'otlet'
+     AND NOT trigger.tgisinternal
+     AND trigger.tgname IN (
+       'workload_acceptance_contracts_e_candidate_set_coverage',
+       'candidate_set_coverage_reports_a_guard',
+       'candidate_set_coverage_reports_b_validate',
+       'candidate_set_coverage_reports_truncate_guard',
+       'workload_revision_heads_candidate_set_coverage'
+     )),
+  pg_catalog.pg_get_functiondef(
+    'otlet.guard_candidate_set_coverage_promotion()'::regprocedure
+  ) LIKE '%source,candidate_query%source,max_candidate_rows%task,decision_contract%task,output_schema%measure_candidate_set_coverage%current passing candidate-set coverage report%'
+    AND pg_catalog.pg_get_functiondef(
+      'otlet.guard_candidate_set_coverage_promotion()'::regprocedure
+    ) NOT LIKE '%source,query_contract%',
+  pg_catalog.pg_get_functiondef(
+    'otlet.rollback_workload_revision(text,text,text)'::regprocedure
+  ) LIKE '%workload_revision_operation%rollback%previous_workload_revision_hash = NULL%',
+  otlet.candidate_set_coverage_rule_valid(built.rule),
+  NOT otlet.candidate_set_coverage_rule_valid(
+    jsonb_set(built.rule, '{source_path}', '[]'::jsonb)
+  ),
+  otlet.candidate_set_coverage_workload_eligible('{
+    "source":{"kind":"pair"},
+    "task":{
+      "decision_contract":{
+        "answer_field":"match",
+        "action_types":["merge_candidate"]
+      },
+      "output_schema":{"properties":{"match":{"enum":["same_entity"]}}}
+    }
+  }'::jsonb)
+    AND NOT otlet.candidate_set_coverage_workload_eligible('{
+      "source":{"kind":"pair"},
+      "task":{
+        "decision_contract":{"answer_field":"match"},
+        "output_schema":{"properties":{"match":{"enum":["same_entity"]}}}
+      }
+    }'::jsonb),
+  NOT EXISTS (SELECT 1 FROM otlet.candidate_set_coverage_reports),
+  NOT pg_catalog.has_table_privilege(
+    'public',
+    'otlet.candidate_set_coverage_reports',
+    'SELECT,INSERT,UPDATE,DELETE,TRUNCATE'
+  )
+    AND NOT pg_catalog.has_table_privilege(
+      'public', 'otlet.candidate_set_coverage_status', 'SELECT'
+    )
+    AND NOT EXISTS (
+      SELECT 1
+      FROM pg_catalog.pg_proc function
+      JOIN pg_catalog.pg_namespace namespace
+        ON namespace.oid = function.pronamespace
+      WHERE namespace.nspname = 'otlet'
+        AND function.proname LIKE '%candidate_set%'
+        AND pg_catalog.has_function_privilege(
+          'public', function.oid, 'EXECUTE'
+        )
+    ),
+  NOT pg_catalog.has_table_privilege(
+    :'operator_role', 'otlet.candidate_set_coverage_reports', 'SELECT'
+  )
+    AND NOT pg_catalog.has_table_privilege(
+      :'partial_auditor_role',
+      'otlet.candidate_set_coverage_status',
+      'SELECT'
+  ),
+  NOT EXISTS (SELECT 1 FROM otlet.verify_invariants())
+) FROM built;
+ROLLBACK;
+SQL
+)"
+[ "$candidate_set_coverage_migration_contract" = \
+  "t|t|t|t|t|t|t|t|t|t|t|t|t|t|t" ] || {
+  echo "Portable candidate-set-coverage migration contract mismatch: $candidate_set_coverage_migration_contract" >&2
+  exit 1
+}
+
 identity_vector_contract="$(
   docker exec -i "$container" psql -U postgres -d "$database" \
     -X -qAt -v ON_ERROR_STOP=1 <<'SQL'
@@ -2503,6 +2627,7 @@ echo "portable_review_economics_migration_contract=$review_economics_migration_c
 echo "portable_model_license_use_migration_contract=$model_license_use_migration_contract"
 echo "portable_model_artifact_lifecycle_migration_contract=$model_artifact_lifecycle_migration_contract"
 echo "portable_failure_retry_taxonomy_migration_contract=$failure_retry_taxonomy_migration_contract"
+echo "portable_candidate_set_coverage_migration_contract=$candidate_set_coverage_migration_contract"
 echo "portable_ask_administrative_contract=$portable_ask_administrative_contract"
 echo "portable_task_lifecycle_contract=$portable_task_lifecycle_contract"
 echo "portable_model_capacity_contract=$batch_claims|$batch_capacity_contract|$concurrent_capacity_contract|$cancel_blocked_claims|$replacement_claims|$lease_capacity_contract"

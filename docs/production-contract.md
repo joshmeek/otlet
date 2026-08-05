@@ -157,6 +157,45 @@ Definition limits are fixed and SQL-visible through `otlet.definition_complexity
 
 Pair-watch creation stores a non-executing candidate `EXPLAIN` plan on the immutable workload revision and rejects invalid or over-cost plans. Every pair execution revalidates dependencies and plan cost, and watch status compares the accepted evidence with a live read-only plan. Otlet rebinds stored SQL against the recorded author path, executes and explains the resolved query under one canonical path with `pg_catalog` first, and restores the caller path. Candidate overflow rejects the operation before jobs or `candidate_removed` reconciliation. Pair refresh requires a caller `statement_timeout` from 1 ms through the policy limit because Postgres cannot arm a timeout from inside the statement already running. See [the workload admission contract](workload-admission.md) for the transaction form and SQL-visible limits
 
+Candidate-set coverage is an optional predeclared field inside the workload acceptance contract's `population.rule`. Build the field before registering the contract; the query remains ordinary application SQL and returns the complete ranked pool as `candidate_rank bigint`, `subject_id text`, and `input jsonb`:
+
+```sql
+SELECT otlet.build_candidate_set_coverage_rule(
+  $$
+    SELECT
+      row_number() OVER (ORDER BY score DESC, pair_id) AS candidate_rank,
+      pair_id AS subject_id,
+      input
+    FROM app.entity_pair_candidates
+  $$,
+  ARRAY['_otlet_mvcc', 'source'],
+  20,   -- minimum positive support
+  0.95, -- minimum overall coverage
+  5,    -- minimum support per source
+  0.90, -- minimum coverage per source
+  1,    -- maximum positives excluded by the cap
+  0.20  -- maximum range in per-source mean normalized rank
+);
+```
+
+Store the returned object at `population.rule.candidate_coverage`. Non-empty ranks must be unique and contiguous from 1, subjects must be unique, and the full pool is limited to 100,000 rows. An empty result records candidate collapse rather than raising. After the observation window closes, record the report under the normal candidate-query statement timeout:
+
+```sql
+BEGIN;
+SET LOCAL statement_timeout = '2s';
+SELECT otlet.record_candidate_set_coverage(
+  'otlet:v1:sha256:contract_hash',
+  'Measure the proposed candidate set'
+);
+COMMIT;
+```
+
+Otlet executes the declared full-pool query, binds it to the source-query contract, and requires the target revision's candidate SQL to return the exact rows and inputs in its prefix through `max_candidate_rows`. It derives every current accepted, fresh, noncontradictory `merge_candidate` positive label, rejects duplicate positive subjects or missing string source values, and records full and bounded volume, SQL misses, cap exclusions, overall and per-source coverage, per-source mean normalized rank and range, and both query costs. The report stores hashes and aggregates, not candidate subjects or inputs
+
+Production pair execution is unchanged: `max_candidate_rows` remains an overflow-reject fence and never truncates work. `candidate_set_coverage_status` shows stored evidence and contract, baseline, and label currency without executing application SQL. Promotion reruns both queries, revalidates plan cost, and compares the live full-pool, target-prefix, input, and label manifests with the passing report. Run the promotion or activation call under the same bounded candidate-query `statement_timeout`
+
+Changing candidate SQL, `max_candidate_rows`, output schema, or the pair decision contract requires a current passing report for the exact active-to-candidate revision pair. First activation and one-step rollback remain available. Source-contract repair, model, task instruction, runtime, and unrelated revision changes do not require another candidate-set report
+
 Semantic row and pair status, plan, current-row, predicate, and invariant reads pin one workload revision and use read-only source-contract checks. They do not create temporary views or mark materializations stale, and status views reject a concurrent revision change instead of combining revisions. Detected row-source column-contract drift returns no current matches and a `lookup_fail_closed` plan with no wait, infer, or queue work in read-only transactions; the same contract suspends writable execution checkpoints. During PostgreSQL recovery, CustomScan suppresses wait, infer, and queue work. Otlet does not yet claim physical-standby read support. Run `mark_semantic_schema_drift(...)` from a writable owner maintenance session to persist `schema_drift`; after repairing the source, run `repair_source_query_contract(...)` to promote the revised contract and restore watch triggers and execution
 
 Claimed jobs use `otlet.effective_job_lease_interval(...)`, which covers the task attempt timeout plus 30 seconds of completion grace. The claim function creates a random opaque token each time. Renew, attempt, complete, fail, and worker-owned cancel calls must present the token while its lease is live. Reclaim replaces the token, so an expired or displaced worker cannot add trusted state. Exact terminal retries return the existing result; PostgreSQL rejects a retry that changes the terminal request. `model_selection_policy_status.effective_job_lease_interval` exposes the derived interval
