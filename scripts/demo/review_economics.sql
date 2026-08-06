@@ -65,11 +65,13 @@ INSERT INTO public.otlet_demo_evaluation_slice_primary (
 SELECT fixture_id, 'pending', '{"kind":"stable"}'::jsonb, 'DO_NOT_TOUCH'
 FROM review_economics_cases;
 
+SET LOCAL statement_timeout = '2s';
 SELECT pg_temp.assert_true(
   sum(otlet.run_task_subject('evaluation_slice_probe_task', fixture_id)) = 6,
   'review economics source rows did not queue once each'
 )
 FROM review_economics_cases;
+SET LOCAL statement_timeout = 0;
 
 UPDATE otlet.jobs
 SET status = 'running',

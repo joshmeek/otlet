@@ -17,6 +17,11 @@ $function$;
 CREATE TEMP TABLE evaluation_slice_proof (
   baseline_revision_hash text,
   candidate_revision_hash text,
+  baseline_pack_definition jsonb,
+  baseline_pack_spec_hash text,
+  candidate_pack_definition jsonb,
+  candidate_pack_hash text,
+  candidate_pack_spec_hash text,
   contract_hash text,
   run_hash text,
   incomplete_run_hash text,
@@ -165,13 +170,6 @@ SELECT pg_temp.assert_true(
   'multi-source evaluation fixture did not queue every source row'
 ) \g /dev/null
 
-UPDATE evaluation_slice_proof
-SET baseline_revision_hash = (
-  SELECT active_workload_revision_hash
-  FROM otlet.workload_revision_heads
-  WHERE task_name = 'evaluation_slice_probe_task'
-);
-
 UPDATE otlet.jobs
 SET status = 'running',
     attempts = 1,
@@ -309,34 +307,133 @@ BEGIN
 END
 $body$;
 
-SELECT otlet.set_model_selection_policy(
-  'evaluation_slice_probe_task',
-  'evaluation_slice_cheap',
-  'evaluation_slice_strong',
-  '{
-    "answer_field":"decision",
-    "abstain_values":["unclear"],
-    "confidence_field":"confidence",
-    "accepted_confidence":["high"]
-  }'::jsonb
+SELECT otlet.create_watch(
+  watch_name => 'evaluation_slice_probe',
+  kind => 'pair',
+  instruction => task.instruction,
+  output_schema => task.output_schema,
+  model_name => task.model_name,
+  candidate_query => task.input_query,
+  record_type => 'evaluation_slice_probe',
+  runtime_options => task.runtime_options,
+  action_types => ARRAY['review_flag'],
+  input_shaping => task.input_shaping,
+  decision_contract => task.decision_contract,
+  pair_sources => '[
+    {"table":"public.otlet_demo_evaluation_slice_primary","subject_column":"id"},
+    {"table":"public.otlet_demo_evaluation_slice_secondary","subject_column":"id"}
+  ]'::jsonb
+)
+FROM otlet.tasks task
+WHERE task.name = 'evaluation_slice_probe_task' \g /dev/null
+
+SET LOCAL statement_timeout = '2s';
+SELECT pg_temp.assert_true(
+  otlet.run_task('evaluation_slice_probe_task') = 6,
+  'pair-watch baseline did not observe every evaluation fixture row'
 ) \g /dev/null
-SELECT otlet.promote_configured_workload_revision(
-  'evaluation_slice_probe_task'
-) \g /dev/null
+SET LOCAL statement_timeout = 0;
+
 UPDATE evaluation_slice_proof
-SET candidate_revision_hash = (
+SET baseline_revision_hash = (
   SELECT active_workload_revision_hash
   FROM otlet.workload_revision_heads
   WHERE task_name = 'evaluation_slice_probe_task'
-), unlabeled_lineage_hash = (
-  SELECT lineage_hash
-  FROM evaluation_slice_cases
-  WHERE fixture_id = 'slice-f'
+), baseline_pack_definition = otlet.export_workload_pack(
+  'evaluation_slice_probe',
+  1
+), baseline_pack_spec_hash = otlet.workload_pack_spec_hash(
+  otlet.export_workload_pack('evaluation_slice_probe', 1)
 );
-SELECT otlet.promote_workload_revision(
-  'evaluation_slice_probe_task',
-  baseline_revision_hash,
-  candidate_revision_hash
+
+DO $body$
+DECLARE
+  proof evaluation_slice_proof%ROWTYPE;
+  candidate_definition jsonb;
+  cheap_model_definition jsonb;
+  strong_model_definition jsonb;
+  prepared_pack_hash text;
+BEGIN
+  SELECT * INTO proof FROM evaluation_slice_proof;
+  SELECT jsonb_build_object(
+    'name', model.name,
+    'artifact_identity', otlet.workload_pack_artifact_identity(
+      model.artifact_identity
+    )
+  )
+  INTO STRICT cheap_model_definition
+  FROM otlet.models model
+  WHERE model.name = 'evaluation_slice_cheap';
+  SELECT jsonb_build_object(
+    'name', model.name,
+    'artifact_identity', otlet.workload_pack_artifact_identity(
+      model.artifact_identity
+    )
+  )
+  INTO STRICT strong_model_definition
+  FROM otlet.models model
+  WHERE model.name = 'evaluation_slice_strong';
+  candidate_definition := proof.baseline_pack_definition ||
+    jsonb_build_object(
+      'version', 2,
+      'watch', proof.baseline_pack_definition -> 'watch' ||
+        jsonb_build_object(
+          'model_name', 'evaluation_slice_cheap',
+          'model_artifact_identity',
+            cheap_model_definition -> 'artifact_identity',
+          'selection_policy', '{
+            "cheap_model_name":"evaluation_slice_cheap",
+            "strong_model_name":"evaluation_slice_strong",
+            "accept_field_checks":{
+              "answer_field":"decision",
+              "abstain_values":["unclear"],
+              "confidence_field":"confidence",
+              "accepted_confidence":["high"]
+            }
+          }'::jsonb
+        ),
+      'models', proof.baseline_pack_definition -> 'models' ||
+        jsonb_build_object(
+          'direct', cheap_model_definition,
+          'cheap', cheap_model_definition,
+          'strong', strong_model_definition
+        )
+    );
+  prepared_pack_hash := otlet.prepare_workload_pack(
+    candidate_definition,
+    proof.baseline_pack_spec_hash,
+    proof.baseline_revision_hash,
+    'Prepare the evaluation slice candidate pack',
+    'OTLET-58-PACK'
+  );
+  UPDATE evaluation_slice_proof
+  SET candidate_pack_definition = candidate_definition,
+      candidate_pack_hash = prepared_pack_hash,
+      candidate_pack_spec_hash = otlet.workload_pack_spec_hash(
+        candidate_definition
+      ),
+      candidate_revision_hash = (
+        SELECT stored.candidate_workload_revision_hash
+        FROM otlet.workload_pack_definitions stored
+        WHERE stored.pack_hash = prepared_pack_hash
+      ),
+      unlabeled_lineage_hash = (
+        SELECT lineage_hash
+        FROM evaluation_slice_cases
+        WHERE fixture_id = 'slice-f'
+      );
+END
+$body$;
+
+SELECT pg_temp.assert_true(
+  otlet.export_workload_pack('evaluation_slice_probe', 1) =
+    baseline_pack_definition
+  AND (
+    SELECT active_workload_revision_hash
+    FROM otlet.workload_revision_heads
+    WHERE task_name = 'evaluation_slice_probe_task'
+  ) = baseline_revision_hash,
+  'workload pack preparation changed the active evaluation fixture'
 )
 FROM evaluation_slice_proof \g /dev/null
 

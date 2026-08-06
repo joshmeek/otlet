@@ -616,6 +616,71 @@ FROM otlet.import_watch(
 
 Import validates `otlet.watch.v1`, resolves database dependencies, and calls `otlet.create_watch(...)`. A failed import rolls back its statement and leaves an existing watch unchanged. Identity changes require a new watch name
 
+## Promote A Workload Pack
+
+Use `import_watch(...)` once to bootstrap an empty destination. After that, `otlet.workload_pack.v1` carries versioned portable configuration for one existing active destination watch: its task, schema, selection policy, action policies, and six-field model artifact identities:
+
+```sql
+SELECT otlet.export_workload_pack('learning_entity_pair_idx') AS baseline_pack \gset
+
+SELECT jsonb_set(
+         jsonb_set(:'baseline_pack'::jsonb, '{version}', '2'::jsonb),
+         '{watch,instruction}',
+         to_jsonb('Compare one candidate pair under revision 2'::text)
+       ) AS candidate_pack \gset
+
+SELECT otlet.workload_pack_spec_hash(:'baseline_pack'::jsonb) AS baseline_spec \gset
+SELECT active_workload_revision_hash AS baseline_revision
+FROM otlet.workload_revision_heads
+WHERE task_name = 'learning_entity_pair_idx_task' \gset
+
+SELECT * FROM otlet.lint_workload_pack(:'candidate_pack'::jsonb);
+SELECT * FROM otlet.diff_workload_packs(
+  :'baseline_pack'::jsonb,
+  :'candidate_pack'::jsonb
+);
+SELECT * FROM otlet.workload_pack_capability_report(:'candidate_pack'::jsonb);
+
+SELECT otlet.prepare_workload_pack(
+  :'candidate_pack'::jsonb,
+  :'baseline_spec',
+  :'baseline_revision',
+  'Prepare pair comparison revision 2'
+) AS candidate_hash \gset
+
+SELECT otlet.apply_workload_pack(
+  :'candidate_hash',
+  :'baseline_spec',
+  :'baseline_revision',
+  'Apply pair comparison revision 2'
+) AS application_event_hash \gset
+
+SELECT state, active_spec_hash, active_workload_revision_hash,
+       configured_drift, rollback_ready
+FROM otlet.workload_pack_status
+WHERE pack_hash = :'candidate_hash';
+```
+
+Lint returns no rows for a valid canonical pack. Capability rows separate compatibility from live readiness; either can change after preparation without rewriting the pack. Apply rejects incompatible dependencies and reports readiness without enforcing it. It rechecks the prepared definition, expected spec, and expected active workload revision in one transaction. If the candidate has a promotion-shadow contract, pass its current `promote` decision event hash as the sixth `apply_workload_pack(...)` argument so Otlet uses the existing governed activation gate
+
+Rollback accepts only the latest application event and its exact current spec and workload revision:
+
+```sql
+SELECT active_spec_hash AS applied_spec,
+       active_workload_revision_hash AS applied_revision
+FROM otlet.workload_pack_status
+WHERE application_event_hash = :'application_event_hash' \gset
+
+SELECT otlet.rollback_workload_pack(
+  :'application_event_hash',
+  :'applied_spec',
+  :'applied_revision',
+  'Restore the prior pair comparison revision'
+);
+```
+
+Packs refer to existing models, source relations, and action targets; they do not create those dependencies. Source rows, jobs, results, receipts, actions, labels, stored credentials, model files, local artifact paths and bytes, runtime state, timestamps, and access policy remain outside the pack. Operators must not embed secrets in instructions, candidate SQL, schemas, policies, or runtime options
+
 ## Pause Or Retire A Watch
 
 The backing task owns watch state. Inspect its exact pin and blockers before changing it:

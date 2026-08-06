@@ -13,7 +13,7 @@ Otlet treats source text, imported configuration, identifiers, model files, mode
 | Review | Shaped inputs, redacted outputs, proposed actions, rubrics, calibrations, labels, and review events | `otlet_reviewer` login | Calibrated decision RPCs and bounded queues with no raw table access |
 | Operations | Dry run, apply, bounded application retry, and policy status | `otlet_operator` session | Three allowlisted execution RPCs and redacted views with no review authority |
 | Audit | Receipts, labels, policy state, administrative history, and redacted operational evidence | `otlet_auditor` session | Read-only allowlisted views |
-| Portable authoring | `otlet.watch.v1`, SQL text, JSON Schema, model policy, runtime options, and ordinary files | Pack author and importer | Untrusted bytes until database validation and import |
+| Portable authoring | `otlet.watch.v1`, `otlet.workload_pack.v1`, SQL text, JSON Schema, model policy, runtime options, and ordinary files | Pack author and importer | Untrusted bytes until database validation, preparation, and apply |
 | Portable protocol | Shaped snapshots and claim, attempt, completion, failure, and cancellation messages | Allowlisted external worker identity and current process incarnation | Exact-version, role-bound, fenced RPC authority with no direct table access |
 
 Deployers trust the native worker and PostgreSQL extension code. The local model is not a principal and receives no database authority. Its text stays untrusted until schema, decision, action, authority, identity, freshness, and evidence checks pass
@@ -23,7 +23,7 @@ Deployers trust the native worker and PostgreSQL extension code. The local model
 | Transition | Untrusted input | Control | Closed result |
 | --- | --- | --- | --- |
 | Configuration to registry | Task, watch, runtime, shaping, decision, and candidate SQL fields | Fixed byte, depth, node, identifier, dependency, and prompt bounds before schema traversal, query binding, or hashing; allowlists, bounded candidate `EXPLAIN`, statement timeout, and transaction rollback | Reject the definition without a task, revision, watch, policy, queue, or materialization mutation |
-| Administrative change to history | Model, task, watch, selection, action-policy, Otlet grant-helper, and retention mutations | Required reason or ticket, authenticated actor, active role, canonical prior and resulting identities, append guard, and transaction commit | Reject missing context without registry mutation; append one committed change while no-ops and rollbacks leave no event |
+| Administrative change to history | Model, task, watch, selection, action-policy, workload-pack, Otlet grant-helper, and retention mutations | Required reason or ticket, authenticated actor, active role, canonical prior and resulting identities, append guard, and transaction commit | Reject missing context without registry mutation; append one committed change while no-ops and failed transactions leave no event |
 | Task lifecycle to execution authority | Target state and expected revision pin | Owner-only transition, production-policy, task, and declared-source locks, exact revision comparison, live-work drain, unfinished job and reconciliation checks, and revision-head authority | Reject a stale pin or unsafe transition without mutation; pause and retirement remove execution authority without losing queued, dirty-source, or terminal evidence |
 | Artifact to native runtime | File path, bytes, digest, size, and GGUF structure | Registered identity, streamed SHA-256, byte count, parser check, and recheck before each load | Fail the job with a receipt and keep the worker available |
 | Source to job snapshot | Candidate query rows, source fields, application request key, and retry mode | Immutable workload revision, row, byte, queue, plan-cost, timeout, and source-field admission; authenticated owner and active-role provenance; owner-scoped key bound to a PostgreSQL-authored operation, task, and subject hash; original-snapshot retry limited to an active original revision | Queue every eligible row under one captured contract or none; return the prior keyed job for an exact retry; reject a changed payload or inactive original revision without mutation |
@@ -74,9 +74,18 @@ task_watch_lifecycle_race_contract=definition_write_fenced|action_policy_seriali
 portable_task_lifecycle_contract=t|t|t|t|t|t|t|t|t|t|t
 ```
 
+## Workload Pack Promotion Contract
+
+`./scripts/demo/workload_pack_promotion.sh` creates one watch, exports its canonical `otlet.workload_pack.v1` baseline, and exercises revisioned preparation, apply, status, and exact one-step rollback without model inference. The proof covers lint and semantic diff, source, schema, model, runtime, and action-target capability findings, stale readiness, source and result canary exclusion, six-field artifact identities, exact preparation retries, stale compare-and-swap rejection, metadata-only revisions, rollback, append-only lineage, an untouched source row, no generated jobs, `PUBLIC` closure, and zero invariants. The SQL-only upgrade proof sources the same contract after applying migration 74. `./scripts/demo/evaluation_slices_support.sh` sources the native promotion proof, which runs governed pack apply, retry, and rollback while checking the bound events, task, baseline, candidate, and active head
+
+```text
+workload_pack_promotion_contract=38|true
+promotion_shadow_rollback_contract=t|t|t|t|t|t|t|t|t|t|t|t
+```
+
 ## Administrative Change Contract
 
-`./scripts/demo/administrative_change_ledger.sh` covers all seven administrative categories, direct registry renames, retention delete and recreate, target recertification across relation renames, explicit workload promotion, revision chains, delegated active-role attribution, concurrent same-role grants, reason and ticket context, missing-context rejection, no-op and rollback suppression, append guards, the audit grant, export declaration, `PUBLIC` closure, hash shape, and invariants. Direct and queued ask proofs keep deterministic task synthesis out of administrative history. The action-target drift proof does the same for automatic generation bumps. The SQL-only upgrade proof checks migration 51, the table, triggers, helpers, access events, revision chain, queued ask behavior, and closure
+`./scripts/demo/administrative_change_ledger.sh` covers the seven registry, policy, access, and retention categories that predate workload packs, plus direct registry renames, retention delete and recreate, target recertification across relation renames, explicit workload promotion, revision chains, delegated active-role attribution, concurrent same-role grants, reason and ticket context, missing-context rejection, no-op and rollback suppression, append guards, the audit grant, export declaration, `PUBLIC` closure, hash shape, and invariants. The workload-pack proof covers the eighth category through preparation, apply, exact rollback, and failed-transaction suppression. Direct and queued ask proofs keep deterministic task synthesis out of administrative history. The action-target drift proof does the same for automatic generation bumps. The SQL-only upgrade proof checks migration 51, the table, triggers, helpers, access events, revision chain, queued ask behavior, and closure
 
 ```text
 administrative_change_ledger_contract=t|t|t|t|t|t|t|t|t|t|t|t|t|t|t|t|t|t|t

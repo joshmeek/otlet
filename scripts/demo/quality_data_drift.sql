@@ -29,11 +29,13 @@ INSERT INTO public.otlet_demo_evaluation_slice_primary (
   ('slice-g', 'pending', '{"kind":"stable"}'::jsonb, 'DO_NOT_TOUCH'),
   ('slice-h', 'pending', '"changed"'::jsonb, 'DO_NOT_TOUCH');
 
+SET LOCAL statement_timeout = '2s';
 SELECT pg_temp.assert_true(
   otlet.run_task_subject('evaluation_slice_probe_task', 'slice-g')
     + otlet.run_task_subject('evaluation_slice_probe_task', 'slice-h') = 2,
   'quality and data drift source rows did not queue once each'
 );
+SET LOCAL statement_timeout = 0;
 
 UPDATE otlet.jobs
 SET status = 'running',
@@ -334,6 +336,7 @@ SET run_hash = otlet.start_replay_evaluation(
 DELETE FROM public.otlet_demo_evaluation_slice_primary WHERE id <> 'slice-h';
 DELETE FROM public.otlet_demo_evaluation_slice_secondary;
 
+SET LOCAL statement_timeout = '2s';
 DO $body$
 DECLARE
   queued bigint;
@@ -368,6 +371,7 @@ BEGIN
         );
 END
 $body$;
+SET LOCAL statement_timeout = 0;
 
 UPDATE otlet.jobs job
 SET status = 'running',

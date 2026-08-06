@@ -243,3 +243,6 @@ $$;
 
 \set portable_migration_file ../../../otlet_pg/sql/migrations/0073_minimal_bounded_backfill.sql
 \ir migrations/apply.sql
+
+\set portable_migration_file ../../../otlet_pg/sql/migrations/0074_workload_pack_promotion.sql
+\ir migrations/apply.sql

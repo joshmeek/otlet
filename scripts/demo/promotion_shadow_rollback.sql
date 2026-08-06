@@ -5,14 +5,19 @@ CREATE TEMP TABLE promotion_shadow_rollback_proof (
   shadow_report_hash text,
   qualification_contract_hash text,
   decision_event_hash text,
+  pack_application_event_hash text,
+  repeated_pack_application_event_hash text,
   activation_event_hash text,
   repeated_activation_event_hash text,
+  pack_rollback_event_hash text,
+  repeated_pack_rollback_event_hash text,
   rollback_event_hash text,
   repeated_rollback_event_hash text,
   shadow_ready boolean NOT NULL DEFAULT false,
   shadow_non_authoritative boolean NOT NULL DEFAULT false,
   bad_evidence_blocked boolean NOT NULL DEFAULT false,
   stale_activation_blocked boolean NOT NULL DEFAULT false,
+  missing_pack_decision_blocked boolean NOT NULL DEFAULT false,
   raw_activation_blocked boolean NOT NULL DEFAULT false,
   activation_conflict_blocked boolean NOT NULL DEFAULT false,
   rollback_conflict_blocked boolean NOT NULL DEFAULT false,
@@ -452,16 +457,52 @@ BEGIN
 END
 $body$;
 
+DO $body$
+BEGIN
+  BEGIN
+    PERFORM otlet.apply_workload_pack(
+      (SELECT candidate_pack_hash FROM evaluation_slice_proof),
+      (SELECT baseline_pack_spec_hash FROM evaluation_slice_proof),
+      (SELECT baseline_revision_hash FROM evaluation_slice_proof),
+      'Reject a governed pack without its decision',
+      'OTLET-58-PACK'
+    );
+    RAISE EXCEPTION 'governed workload pack unexpectedly applied without a decision';
+  EXCEPTION WHEN OTHERS THEN
+    IF SQLERRM <> 'otlet governed workload pack requires a promotion decision event' THEN
+      RAISE;
+    END IF;
+  END;
+  UPDATE promotion_shadow_rollback_proof
+  SET missing_pack_decision_blocked = true;
+END
+$body$;
+
 UPDATE promotion_shadow_rollback_proof proof
-SET activation_event_hash = otlet.activate_workload_promotion(
-  proof.decision_event_hash,
-  (SELECT baseline_revision_hash FROM evaluation_slice_proof)
+SET pack_application_event_hash = otlet.apply_workload_pack(
+  (SELECT candidate_pack_hash FROM evaluation_slice_proof),
+  (SELECT baseline_pack_spec_hash FROM evaluation_slice_proof),
+  (SELECT baseline_revision_hash FROM evaluation_slice_proof),
+  'Apply the qualified evaluation slice pack',
+  'OTLET-58-PACK',
+  proof.decision_event_hash
 );
 UPDATE promotion_shadow_rollback_proof proof
-SET repeated_activation_event_hash = otlet.activate_workload_promotion(
-  proof.decision_event_hash,
-  (SELECT baseline_revision_hash FROM evaluation_slice_proof)
+SET repeated_pack_application_event_hash = otlet.apply_workload_pack(
+  (SELECT candidate_pack_hash FROM evaluation_slice_proof),
+  (SELECT baseline_pack_spec_hash FROM evaluation_slice_proof),
+  (SELECT baseline_revision_hash FROM evaluation_slice_proof),
+  'Apply the qualified evaluation slice pack',
+  'OTLET-58-PACK',
+  proof.decision_event_hash
 );
+UPDATE promotion_shadow_rollback_proof proof
+SET activation_event_hash = application.governance_event_hash,
+    repeated_activation_event_hash = repeated.governance_event_hash
+FROM otlet.workload_pack_events application,
+     otlet.workload_pack_events repeated
+WHERE application.event_hash = proof.pack_application_event_hash
+  AND repeated.event_hash = proof.repeated_pack_application_event_hash;
 
 UPDATE promotion_shadow_rollback_proof proof
 SET active_status_verified = EXISTS (
@@ -477,6 +518,71 @@ SET active_status_verified = EXISTS (
     AND status.activation_reason =
       'Activate the qualified candidate after shadow comparison'
     AND status.activation_ticket = 'OTLET-58'
+    AND EXISTS (
+      SELECT 1
+      FROM otlet.workload_pack_status pack_status
+      JOIN evaluation_slice_proof slice
+        ON pack_status.pack_hash = slice.candidate_pack_hash
+      JOIN otlet.workload_pack_events application
+        ON application.event_hash = pack_status.application_event_hash
+      JOIN otlet.administrative_change_events administrative
+        ON administrative.event_id = application.administrative_event_id
+      JOIN otlet.workload_acceptance_events activation
+        ON activation.event_hash = application.governance_event_hash
+      JOIN otlet.workload_revision_heads head
+        ON head.task_name = application.task_name
+      WHERE pack_status.application_event_hash =
+            proof.pack_application_event_hash
+        AND pack_status.promotion_activation_event_hash =
+            proof.activation_event_hash
+        AND pack_status.state = 'applied'
+        AND NOT pack_status.configured_drift
+        AND pack_status.rollback_ready
+        AND application.event_kind = 'apply'
+        AND application.application_pack_hash = slice.candidate_pack_hash
+        AND application.pack_name = 'evaluation_slice_probe'
+        AND application.task_name = 'evaluation_slice_probe_task'
+        AND application.prior_pack_hash = otlet.workload_pack_hash(
+          jsonb_set(slice.baseline_pack_definition, '{version}', '2'::jsonb)
+        )
+        AND application.result_pack_hash = slice.candidate_pack_hash
+        AND application.prior_spec_hash = slice.baseline_pack_spec_hash
+        AND application.result_spec_hash = slice.candidate_pack_spec_hash
+        AND application.prior_definition = jsonb_set(
+          slice.baseline_pack_definition,
+          '{version}',
+          '2'::jsonb
+        )
+        AND application.result_definition = slice.candidate_pack_definition
+        AND application.prior_workload_revision_hash =
+            slice.baseline_revision_hash
+        AND application.result_workload_revision_hash =
+            slice.candidate_revision_hash
+        AND activation.event_kind = 'promotion_activation'
+        AND activation.definition #>>
+            '{payload,promotion_decision_event_hash}' =
+            proof.decision_event_hash
+        AND activation.definition #>> '{payload,task_name}' =
+            application.task_name
+        AND activation.definition #>>
+            '{payload,prior_workload_revision_hash}' =
+            slice.baseline_revision_hash
+        AND activation.definition #>>
+            '{payload,resulting_workload_revision_hash}' =
+            slice.candidate_revision_hash
+        AND administrative.object_type = 'workload_pack'
+        AND administrative.object_name = 'evaluation_slice_probe'
+        AND administrative.operation = 'apply'
+        AND administrative.reason =
+            'Apply the qualified evaluation slice pack'
+        AND administrative.ticket = 'OTLET-58-PACK'
+        AND otlet.export_workload_pack('evaluation_slice_probe', 2) =
+            slice.candidate_pack_definition
+        AND head.active_workload_revision_hash =
+            slice.candidate_revision_hash
+        AND head.previous_workload_revision_hash =
+            slice.baseline_revision_hash
+    )
 );
 
 SELECT otlet.set_task_lifecycle(
@@ -520,19 +626,28 @@ END
 $body$;
 
 UPDATE promotion_shadow_rollback_proof proof
-SET rollback_event_hash = otlet.rollback_workload_promotion(
-  proof.activation_event_hash,
+SET pack_rollback_event_hash = otlet.rollback_workload_pack(
+  proof.pack_application_event_hash,
+  (SELECT candidate_pack_spec_hash FROM evaluation_slice_proof),
   (SELECT candidate_revision_hash FROM evaluation_slice_proof),
   'Restore the prior active workload revision',
   'OTLET-58-ROLLBACK'
 );
 UPDATE promotion_shadow_rollback_proof proof
-SET repeated_rollback_event_hash = otlet.rollback_workload_promotion(
-  proof.activation_event_hash,
+SET repeated_pack_rollback_event_hash = otlet.rollback_workload_pack(
+  proof.pack_application_event_hash,
+  (SELECT candidate_pack_spec_hash FROM evaluation_slice_proof),
   (SELECT candidate_revision_hash FROM evaluation_slice_proof),
   'Restore the prior active workload revision',
   'OTLET-58-ROLLBACK'
 );
+UPDATE promotion_shadow_rollback_proof proof
+SET rollback_event_hash = rollback.governance_event_hash,
+    repeated_rollback_event_hash = repeated.governance_event_hash
+FROM otlet.workload_pack_events rollback,
+     otlet.workload_pack_events repeated
+WHERE rollback.event_hash = proof.pack_rollback_event_hash
+  AND repeated.event_hash = proof.repeated_pack_rollback_event_hash;
 
 UPDATE promotion_shadow_rollback_proof proof
 SET rollback_status_verified = EXISTS (
@@ -544,6 +659,74 @@ SET rollback_status_verified = EXISTS (
     AND NOT status.rollback_ready
     AND status.rollback_reason = 'Restore the prior active workload revision'
     AND status.rollback_ticket = 'OTLET-58-ROLLBACK'
+    AND EXISTS (
+      SELECT 1
+      FROM otlet.workload_pack_status pack_status
+      JOIN evaluation_slice_proof slice
+        ON pack_status.pack_hash = slice.candidate_pack_hash
+      JOIN otlet.workload_pack_events rollback
+        ON rollback.event_hash = pack_status.rollback_event_hash
+      JOIN otlet.workload_pack_events application
+        ON application.event_hash = rollback.rollback_of_event_hash
+      JOIN otlet.administrative_change_events administrative
+        ON administrative.event_id = rollback.administrative_event_id
+      JOIN otlet.workload_acceptance_events governance
+        ON governance.event_hash = rollback.governance_event_hash
+      JOIN otlet.workload_revision_heads head
+        ON head.task_name = rollback.task_name
+      WHERE pack_status.rollback_event_hash = proof.pack_rollback_event_hash
+        AND pack_status.promotion_rollback_event_hash =
+            proof.rollback_event_hash
+        AND pack_status.state = 'rolled_back'
+        AND NOT pack_status.configured_drift
+        AND NOT pack_status.rollback_ready
+        AND pack_status.rollback_blocker = 'already_rolled_back'
+        AND rollback.event_kind = 'rollback'
+        AND rollback.application_pack_hash = slice.candidate_pack_hash
+        AND rollback.predecessor_event_hash = application.event_hash
+        AND rollback.rollback_of_event_hash = application.event_hash
+        AND rollback.prior_pack_hash = slice.candidate_pack_hash
+        AND rollback.result_pack_hash = application.prior_pack_hash
+        AND rollback.prior_spec_hash = slice.candidate_pack_spec_hash
+        AND rollback.result_spec_hash = slice.baseline_pack_spec_hash
+        AND rollback.prior_definition = slice.candidate_pack_definition
+        AND rollback.result_definition = jsonb_set(
+          slice.baseline_pack_definition,
+          '{version}',
+          '2'::jsonb
+        )
+        AND rollback.prior_workload_revision_hash =
+            slice.candidate_revision_hash
+        AND rollback.result_workload_revision_hash =
+            slice.baseline_revision_hash
+        AND governance.event_kind = 'promotion_rollback'
+        AND governance.definition #>>
+            '{payload,promotion_activation_event_hash}' =
+            proof.activation_event_hash
+        AND governance.definition #>> '{payload,task_name}' =
+            rollback.task_name
+        AND governance.definition #>>
+            '{payload,prior_workload_revision_hash}' =
+            slice.candidate_revision_hash
+        AND governance.definition #>>
+            '{payload,resulting_workload_revision_hash}' =
+            slice.baseline_revision_hash
+        AND administrative.object_type = 'workload_pack'
+        AND administrative.object_name = 'evaluation_slice_probe'
+        AND administrative.operation = 'rollback'
+        AND administrative.reason =
+            'Restore the prior active workload revision'
+        AND administrative.ticket = 'OTLET-58-ROLLBACK'
+        AND otlet.export_workload_pack('evaluation_slice_probe', 2) =
+            jsonb_set(
+              slice.baseline_pack_definition,
+              '{version}',
+              '2'::jsonb
+            )
+        AND head.active_workload_revision_hash =
+            slice.baseline_revision_hash
+        AND head.previous_workload_revision_hash IS NULL
+    )
 );
 
 DO $body$
@@ -573,13 +756,16 @@ SELECT concat_ws('|',
   proof.shadow_ready,
   proof.shadow_non_authoritative,
   proof.bad_evidence_blocked,
-  proof.stale_activation_blocked,
+  proof.stale_activation_blocked AND proof.missing_pack_decision_blocked,
   proof.raw_activation_blocked,
-  proof.activation_event_hash = proof.repeated_activation_event_hash
+  proof.pack_application_event_hash =
+      proof.repeated_pack_application_event_hash
+    AND proof.activation_event_hash = proof.repeated_activation_event_hash
     AND proof.activation_conflict_blocked
     AND proof.active_status_verified
     AND proof.pause_resume_verified,
-  proof.rollback_event_hash = proof.repeated_rollback_event_hash
+  proof.pack_rollback_event_hash = proof.repeated_pack_rollback_event_hash
+    AND proof.rollback_event_hash = proof.repeated_rollback_event_hash
     AND proof.rollback_conflict_blocked
     AND proof.rollback_status_verified,
   (SELECT head.active_workload_revision_hash = slice.baseline_revision_hash

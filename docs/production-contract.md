@@ -92,7 +92,7 @@ preload_admission_contract=failed|model_load_admission_rejected|rejected|true|tr
 
 The production policy row and status views expose SQL state under `otlet`: `production_policy_status`, `production_status`, `model_queue_status`, `worker_throughput_status`, and `cleanup_policy_state(true)`. Cross-task batch entries expose every claimed task through `task_names`
 
-Model, task, watch, selection, action-policy, Otlet access-grant, and retention changes require a reason or ticket in the same transaction. The helper uses transaction-local settings, so calling it in autocommit mode does not authorize a later statement:
+Model, task, watch, selection, action-policy, workload-pack, Otlet access-grant, and retention changes require a reason or ticket in the same transaction. The helper uses transaction-local settings, so calling it in autocommit mode does not authorize a later statement:
 
 Otlet treats deterministic task synthesis for direct and queued one-off asks, plus automatic target-generation bumps after contract drift, as runtime bookkeeping. These paths append no administrative event and restore the caller's suppression state. Explicit task changes, target recertification, and workload promotion append events
 
@@ -119,6 +119,8 @@ ORDER BY event_id DESC;
 ```
 
 Otlet records changes from migration installation forward and leaves earlier history absent. Raw owner `GRANT` and `REVOKE` statements are outside the grant-helper ledger until the planned access-policy lifecycle. The database or extension owner can disable or replace database guards; the planned signed-checkpoint work covers that stronger boundary. Repository demo connections and disposable SQL-only databases supply a generic proof reason. Production sessions should supply a specific transaction-local context
+
+Workload packs are owner-only administrative changes for an existing active watch. `prepare_workload_pack(...)` stores one immutable canonical candidate against the expected configured spec and active workload revision; `apply_workload_pack(...)` rechecks both and changes the task, watch, selection, and action-policy configuration in one transaction. A governed candidate must cite the current promotion decision so Otlet reuses the existing activation gate. `rollback_workload_pack(...)` restores only the exact predecessor of the latest application and records both pack and administrative lineage. Pack status reports configured drift and rollback readiness without creating work
 
 Workload acceptance policy lives outside executable workload revisions. `register_workload_acceptance_contract(...)` pins one immutable declaration to exact candidate and baseline revisions, one full-population or sample rule, a closed future UTC window, a named baseline, and all 11 required threshold categories. The declaration must exist before its observation window begins. Owners must name the current contract hash in each successor declaration, so concurrent or stale edits fail instead of forking the chain. `record_workload_acceptance_exception(...)` and `record_workload_promotion_decision(...)` append attributed, content-addressed events with bounded evidence and exact exception and qualification-run links
 

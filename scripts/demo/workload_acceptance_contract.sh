@@ -392,7 +392,9 @@ BEGIN
   END;
 
   BEGIN
-    TRUNCATE otlet.workload_acceptance_events;
+    TRUNCATE
+      otlet.workload_acceptance_events,
+      otlet.workload_pack_events;
     RAISE EXCEPTION 'acceptance event truncate unexpectedly succeeded';
   EXCEPTION WHEN OTHERS THEN
     IF SQLERRM NOT LIKE '%append only%' THEN

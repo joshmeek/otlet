@@ -405,7 +405,10 @@ BEGIN
   END;
 
   BEGIN
-    TRUNCATE otlet.administrative_change_events;
+    TRUNCATE
+      otlet.administrative_change_events,
+      otlet.workload_pack_events,
+      otlet.workload_pack_definitions;
   EXCEPTION WHEN OTHERS THEN
     IF position('append only' IN SQLERRM) = 0 THEN
       RAISE;

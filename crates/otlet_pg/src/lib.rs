@@ -375,6 +375,11 @@ pgrx::extension_sql_file!(
     name = "minimal_bounded_backfill",
     requires = ["time_based_freshness"]
 );
+pgrx::extension_sql_file!(
+    "../sql/migrations/0074_workload_pack_promotion.sql",
+    name = "workload_pack_promotion",
+    requires = ["minimal_bounded_backfill"]
+);
 
 #[allow(non_snake_case)]
 #[pgrx::pg_guard]

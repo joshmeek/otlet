@@ -22,9 +22,9 @@ install_portable() {
     -f crates/otlet_worker/sql/install.sql
 }
 
-install_portable_through_72() {
+install_portable_through_73() {
   docker exec -w /work/crates/otlet_worker/sql "$container" \
-    sed '/0073_minimal_bounded_backfill.sql/,$d' migrate.sql |
+    sed '/0074_workload_pack_promotion.sql/,$d' migrate.sql |
     docker exec -i -w /work/crates/otlet_worker/sql "$container" \
       psql -U postgres -d "$database" -X -q -v ON_ERROR_STOP=1 --single-transaction
 }
@@ -64,7 +64,7 @@ SELECT format(
   'portable upgrade executable proof'
 ) \gexec
 SQL
-install_portable_through_72
+install_portable_through_73
 
 docker exec -i "$container" psql -U postgres -d "$database" \
   -X -q -v ON_ERROR_STOP=1 <<'SQL' >/dev/null
@@ -295,7 +295,7 @@ contract="$(
 SELECT concat_ws('|',
   max(version),
   count(*),
-  array_agg(version ORDER BY version) = ARRAY(SELECT generate_series(1, 73)),
+  array_agg(version ORDER BY version) = ARRAY(SELECT generate_series(1, 74)),
   bool_and(file ~ ('(^|/)' || lpad(version::text, 4, '0') || '_')),
   (SELECT value FROM public.portable_upgrade_sentinel),
   (
@@ -348,7 +348,7 @@ SELECT concat_ws('|',
 FROM otlet.portable_schema_migrations;
 SQL
 )"
-[ "$contract" = "73|73|t|t|preserved|t|0|t|t|t" ] || {
+[ "$contract" = "74|74|t|t|preserved|t|0|t|t|t" ] || {
   echo "Portable repeat-install contract mismatch: $contract" >&2
   exit 1
 }
@@ -401,6 +401,22 @@ SQL
 [ "$portable_bounded_backfill_contract" = \
   "minimal_bounded_backfill_contract=t|t|t|t|t|t|t|t|t|t|0" ] || {
   echo "Portable bounded-backfill contract mismatch: $portable_bounded_backfill_contract" >&2
+  exit 1
+}
+
+portable_workload_pack_promotion_contract="$(
+  (
+    log() { :; }
+    psql_exec() {
+      docker exec -i "$container" psql -U postgres -d "$database" \
+        -X -v ON_ERROR_STOP=1 "$@"
+    }
+    source "$(dirname "$0")/demo/workload_pack_promotion.sh"
+  ) | awk 'NF { line = $0 } END { print line }'
+)"
+[ "$portable_workload_pack_promotion_contract" = \
+  "workload_pack_promotion_contract=38|true" ] || {
+  echo "Portable workload-pack contract mismatch: $portable_workload_pack_promotion_contract" >&2
   exit 1
 }
 
@@ -4536,5 +4552,6 @@ echo "portable_review_sampling_contract=$portable_review_sampling_contract"
 echo "portable_decision_evidence_contract=$portable_decision_evidence_contract"
 echo "portable_ask_administrative_contract=$portable_ask_administrative_contract"
 echo "portable_task_lifecycle_contract=$portable_task_lifecycle_contract"
+echo "portable_$portable_workload_pack_promotion_contract"
 echo "portable_model_capacity_contract=$batch_claims|$batch_capacity_contract|$concurrent_capacity_contract|$cancel_blocked_claims|$replacement_claims|$lease_capacity_contract"
 echo "portable_renewal_race_contract=$renewal_race_contract"
