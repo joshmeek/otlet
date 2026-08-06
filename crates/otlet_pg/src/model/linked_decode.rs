@@ -9,6 +9,8 @@ fn run_linked(
 ) -> Result<LinkedRun, ModelError> {
     let attempt_start = Instant::now();
     let attempt_deadline = linked_attempt_deadline(attempt_start, job.max_attempt_ms);
+    let context_budget = model_context_budget(job_model.artifact_identity, options)?;
+    validate_model_context_budget(context_budget)?;
     let cache = LINKED_CACHE.get_or_init(|| Mutex::new(None));
     let mut cache = cache
         .lock()
@@ -19,6 +21,7 @@ fn run_linked(
         verified_artifact,
         options,
         model_fingerprint_hash,
+        context_budget,
     )?;
     let cache = cache
         .as_mut()
@@ -36,15 +39,32 @@ fn run_linked(
     match result {
         Err(err) if !load.cache_hit => {
             let worker_memory = process_memory_sample();
-            let memory_trace = build_memory_trace(
+            let request_admission = err
+                .trace_summary
+                .as_ref()
+                .and_then(|trace| trace.get("memory"))
+                .and_then(|memory| memory.get("request_admission"))
+                .cloned();
+            let mut memory_trace = build_memory_trace(
                 &load.memory_before,
                 &worker_memory,
                 &load.memory_admission,
                 options.max_worker_rss_bytes,
             );
-            Err(err.with_memory_trace(memory_trace.clone()).with_metrics(
-                linked_residency_metrics(cache, false, &worker_memory, memory_trace, options),
-            ))
+            if let (Some(request_admission), Value::Object(memory)) =
+                (request_admission, &mut memory_trace)
+            {
+                memory.insert("request_admission".to_owned(), request_admission);
+            }
+            Err(err
+                .with_memory_trace(memory_trace.clone())
+                .with_metrics(linked_residency_metrics(
+                    cache,
+                    false,
+                    &worker_memory,
+                    memory_trace,
+                    options,
+                )))
         }
         result => result,
     }
@@ -87,25 +107,81 @@ fn run_loaded_linked(
     };
     let tokenize_ms = elapsed_ms(tokenize_start);
     if tokens.is_empty() {
-        return Err(ModelError::new("linked llama.cpp prompt produced no tokens"));
+        return Err(ModelError::new(
+            "linked llama.cpp prompt produced no tokens",
+        ));
     }
 
-    validate_linked_token_budget(tokens.len(), options.max_tokens, cache.context_window_tokens)?;
-
-    if options.max_worker_rss_bytes > 0 {
-        let resident_memory = process_memory_sample();
-        if let Err(err) =
-            enforce_worker_rss_budget(&resident_memory, options.max_worker_rss_bytes)
+    let prefix_reusable = linked_prompt_prefix_reusable(&tokens, &prompt_prefix_tokens);
+    let projected_prompt_prefix_state_bytes = if prefix_reusable {
+        LINKED_PROMPT_PREFIX_STATE_MAX_BYTES
+    } else {
+        0
+    };
+    let request_memory = process_memory_sample();
+    let mut request_admission = RequestMemoryAdmission::new(
+        prompt.len(),
+        tokens.len(),
+        options.max_tokens,
+        projected_prompt_prefix_state_bytes,
+        &request_memory,
+        options.max_worker_rss_bytes,
+    );
+    if let Err(err) = validate_linked_token_budget(
+        tokens.len(),
+        options.max_tokens,
+        i64::from(load.context_budget.effective),
+    ) {
+        request_admission.decision = "rejected";
+        request_admission.reason = match err
+            .trace_summary
+            .as_ref()
+            .and_then(|trace| trace.get("stop_reason"))
+            .and_then(Value::as_str)
         {
-            return Err(err.with_memory_trace(build_memory_trace(
-                &memory_before,
-                &resident_memory,
-                &memory_admission,
+            Some("prompt_exceeds_context_window") => "prompt_exceeds_context_window",
+            Some("prompt_and_generation_exceed_context_window") => {
+                "prompt_and_generation_exceed_context_window"
+            }
+            _ => "context_window_rejected",
+        };
+        return Err(err.with_memory_trace(with_request_memory_admission(
+            build_memory_trace(
+                memory_before,
+                &request_memory,
+                memory_admission,
                 options.max_worker_rss_bytes,
-            )));
-        }
+            ),
+            &request_admission,
+        )));
+    }
+    if request_admission.rejected() {
+        let memory_trace = with_request_memory_admission(
+            build_memory_trace(
+                memory_before,
+                &request_memory,
+                memory_admission,
+                options.max_worker_rss_bytes,
+            ),
+            &request_admission,
+        );
+        return Err(ModelError::clean_failure(
+            format!(
+                "linked request memory admission rejected: reason={} prompt_tokens={} max_generation_tokens={} projected_prompt_bytes={} projected_decode_bytes={} projected_prompt_prefix_state_bytes={}",
+                request_admission.reason,
+                request_admission.prompt_tokens,
+                request_admission.max_generation_tokens,
+                request_admission.projected_prompt_bytes,
+                request_admission.projected_decode_bytes,
+                request_admission.projected_prompt_prefix_state_bytes
+            ),
+            "request_memory_admission_before_decode",
+            "request_memory_admission_rejected",
+        )
+        .with_memory_trace(memory_trace));
     }
 
+    let result = (|| -> Result<LinkedRun, ModelError> {
     if linked_cancel_requested(job.id)? {
         return Err(ModelError::new("canceled"));
     }
@@ -135,7 +211,6 @@ fn run_loaded_linked(
     let mut prompt_decoded_tokens = tokens.len();
     let mut prompt_reuse_strategy: &'static str = "full_prompt_decode";
     let mut prompt_prefix_state_bytes = 0_i64;
-    let prefix_reusable = linked_prompt_prefix_reusable(&tokens, &prompt_prefix_tokens);
     if prefix_reusable {
         let prompt_prefix_hash = prompt_prefix_hash
             .as_deref()
@@ -317,18 +392,24 @@ fn run_loaded_linked(
     };
     let worker_memory = process_memory_sample();
     if let Err(err) = enforce_worker_rss_budget(&worker_memory, options.max_worker_rss_bytes) {
-        return Err(err.with_memory_trace(build_memory_trace(
-            &memory_before,
-            &worker_memory,
-            &memory_admission,
-            options.max_worker_rss_bytes,
+        return Err(err.with_memory_trace(with_request_memory_admission(
+            build_memory_trace(
+                memory_before,
+                &worker_memory,
+                memory_admission,
+                options.max_worker_rss_bytes,
+            ),
+            &request_admission,
         )));
     }
-    let memory_trace = build_memory_trace(
-        &memory_before,
-        &worker_memory,
-        &memory_admission,
-        options.max_worker_rss_bytes,
+    let memory_trace = with_request_memory_admission(
+        build_memory_trace(
+            memory_before,
+            &worker_memory,
+            memory_admission,
+            options.max_worker_rss_bytes,
+        ),
+        &request_admission,
     );
     let output = String::from_utf8(output).map_err(|err| {
         ModelError::new(format!(
@@ -348,9 +429,9 @@ fn run_loaded_linked(
             prompt_reuse_strategy,
             prompt_prefix_state_bytes,
             prompt_prefix_cache_entries: usize_to_i64_saturating(cache.prompt_prefix_states.len()),
-            prompt_prefix_cache_bytes: usize_to_i64_saturating(
-                linked_prompt_prefix_cache_bytes(&cache.prompt_prefix_states),
-            ),
+            prompt_prefix_cache_bytes: usize_to_i64_saturating(linked_prompt_prefix_cache_bytes(
+                &cache.prompt_prefix_states,
+            )),
             effective_llama_threads: i64::from(decode_threads),
             effective_llama_batch_threads: i64::from(batch_threads),
             generated_tokens,
@@ -364,6 +445,19 @@ fn run_loaded_linked(
             stop_reason,
             ..linked_residency_metrics(cache, cache_hit, &worker_memory, memory_trace, options)
         },
+    })
+    })();
+    result.map_err(|err| {
+        let worker_memory = process_memory_sample();
+        err.with_memory_trace(with_request_memory_admission(
+            build_memory_trace(
+                memory_before,
+                &worker_memory,
+                memory_admission,
+                options.max_worker_rss_bytes,
+            ),
+            &request_admission,
+        ))
     })
 }
 

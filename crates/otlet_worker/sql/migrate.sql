@@ -261,3 +261,6 @@ $$;
 
 \set portable_migration_file ../../../otlet_pg/sql/migrations/0079_bounded_customscan_state.sql
 \ir migrations/apply.sql
+
+\set portable_migration_file ../../../otlet_pg/sql/migrations/0080_model_bound_context_budgets.sql
+\ir migrations/apply.sql

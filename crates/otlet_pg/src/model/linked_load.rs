@@ -9,6 +9,8 @@ pub(crate) fn preload_model(
         artifact_hash: model.artifact_hash.as_str(),
         artifact_identity: &model.artifact_identity,
     };
+    let context_budget = model_context_budget(model.artifact_identity, &options)?;
+    validate_model_context_budget(context_budget)?;
     let model_fingerprint_hash = model_fingerprint_hash(model);
     let verified_artifact = verify_model_artifact(model)?;
     let cache = LINKED_CACHE.get_or_init(|| Mutex::new(None));
@@ -21,6 +23,7 @@ pub(crate) fn preload_model(
         verified_artifact,
         &options,
         &model_fingerprint_hash,
+        context_budget,
     )?;
     let loaded = cache
         .as_ref()
@@ -80,11 +83,14 @@ fn ensure_linked_model(
     mut verified_artifact: VerifiedArtifact,
     options: &crate::runtime::RuntimeOptions,
     model_fingerprint_hash: &str,
+    context_budget: ModelContextBudget,
 ) -> Result<LinkedLoadEvidence, ModelError> {
     use std::ffi::CString;
 
     if job_model.artifact_path.starts_with("hf:") {
-        return Err(ModelError::new("linked llama.cpp runtime requires a local GGUF artifact path"));
+        return Err(ModelError::new(
+            "linked llama.cpp runtime requires a local GGUF artifact path",
+        ));
     }
     LINKED_BACKEND.get_or_init(|| unsafe {
         llama_cpp_sys_4::llama_backend_init();
@@ -99,6 +105,8 @@ fn ensure_linked_model(
         cached.artifact_path == job_model.artifact_path
             && cached.model_fingerprint_hash.as_ref() == model_fingerprint_hash
             && cached.verified_artifact.stamp == verified_artifact.stamp
+            && cached.tested_context_window_tokens == context_budget.tested
+            && cached.context_window_tokens == i64::from(context_budget.physical)
     });
     if cache_hit && let Some(cached) = cache.as_mut() {
         cached.model_name.clear();
@@ -134,11 +142,14 @@ fn ensure_linked_model(
         )
     } else {
         linked_model_load_admission(
-            model_load_path.as_deref().expect("cache miss has a load path"),
+            model_load_path
+                .as_deref()
+                .expect("cache miss has a load path"),
             u64_to_i64_saturating(verified_artifact.bytes()),
             options,
             &memory_before,
             resident_reclaim_bytes,
+            context_budget.physical,
         )
     };
     verified_artifact.ensure_unchanged()?;
@@ -171,7 +182,7 @@ fn ensure_linked_model(
                 .expect("cache miss has a load path")
                 .as_bytes(),
         )
-            .map_err(|_| ModelError::new("linked llama.cpp model path is invalid"))?;
+        .map_err(|_| ModelError::new("linked llama.cpp model path is invalid"))?;
         let prompt_batch_tokens = linked_prompt_batch_tokens();
         let prompt_micro_batch_tokens = linked_prompt_ubatch_tokens(prompt_batch_tokens);
         let decode_threads = linked_decode_threads(options);
@@ -190,7 +201,7 @@ fn ensure_linked_model(
         verified_artifact.ensure_unchanged()?;
 
         let mut ctx_params = unsafe { llama_cpp_sys_4::llama_context_default_params() };
-        ctx_params.n_ctx = LINKED_CONTEXT_WINDOW_TOKENS;
+        ctx_params.n_ctx = context_budget.physical;
         ctx_params.n_batch = usize_to_u32_saturating(prompt_batch_tokens);
         ctx_params.n_ubatch = usize_to_u32_saturating(prompt_micro_batch_tokens);
         ctx_params.no_perf = linked_env_bool("OTLET_LLAMA_NO_PERF", true);
@@ -211,8 +222,9 @@ fn ensure_linked_model(
             u64_to_i64_saturating(unsafe { llama_cpp_sys_4::llama_model_size(model.ptr) });
         let model_parameters =
             u64_to_i64_saturating(unsafe { llama_cpp_sys_4::llama_model_n_params(model.ptr) });
-        let context_window_tokens =
-            u64_to_i64_saturating(u64::from(unsafe { llama_cpp_sys_4::llama_n_ctx(context.ptr) }));
+        let context_window_tokens = u64_to_i64_saturating(u64::from(unsafe {
+            llama_cpp_sys_4::llama_n_ctx(context.ptr)
+        }));
 
         let vocab = unsafe { llama_cpp_sys_4::llama_model_get_vocab(model.ptr) };
         if vocab.is_null() {
@@ -234,6 +246,7 @@ fn ensure_linked_model(
             ctx_ms,
             model_memory_bytes,
             model_parameters,
+            tested_context_window_tokens: context_budget.tested,
             context_window_tokens,
             model_device_policy: LINKED_MODEL_DEVICE_POLICY,
             memory_accounting_policy: LINKED_MEMORY_ACCOUNTING_POLICY,
@@ -246,6 +259,7 @@ fn ensure_linked_model(
         cache_hit,
         memory_before,
         memory_admission,
+        context_budget,
     })
 }
 
@@ -255,11 +269,10 @@ fn linked_model_load_admission(
     options: &crate::runtime::RuntimeOptions,
     sample: &ProcessMemorySample,
     resident_reclaim_bytes: i64,
+    physical_context_window_tokens: u32,
 ) -> ModelLoadAdmission {
     let worker_budget_bytes = u64_to_i64_saturating(options.max_worker_rss_bytes);
-    let worker_budget_headroom_bytes = worker_budget_bytes
-        .saturating_sub(sample.rss_bytes)
-        .max(0);
+    let worker_budget_headroom_bytes = worker_budget_bytes.saturating_sub(sample.rss_bytes).max(0);
     let cgroup_headroom_bytes = cgroup_memory_headroom(sample);
     let resident_reclaim_bytes = resident_reclaim_bytes.max(0);
     let mut admission = ModelLoadAdmission {
@@ -321,7 +334,11 @@ fn linked_model_load_admission(
         return admission;
     }
 
-    let projection = linked_model_load_projection(artifact_load_path, artifact_bytes);
+    let projection = linked_model_load_projection(
+        artifact_load_path,
+        artifact_bytes,
+        physical_context_window_tokens,
+    );
     let Ok(projection) = projection else {
         admission.reason = "llama_projection_error";
         return admission;
@@ -370,7 +387,7 @@ fn linked_mapped_file_rss_bytes_from(smaps: &str, path: &str) -> i64 {
                     && !end.is_empty()
                     && start.bytes().all(|byte| byte.is_ascii_hexdigit())
                     && end.bytes().all(|byte| byte.is_ascii_hexdigit())
-        });
+            });
         if mapping_header {
             let mut fields = line.split_ascii_whitespace();
             for _ in 0..5 {
@@ -413,6 +430,7 @@ struct LinkedModelLoadProjection {
 fn linked_model_load_projection(
     artifact_path: &str,
     artifact_bytes: i64,
+    physical_context_window_tokens: u32,
 ) -> Result<LinkedModelLoadProjection, ()> {
     let model_path = std::ffi::CString::new(artifact_path.as_bytes()).map_err(|_| ())?;
     let mut model_params = unsafe { llama_cpp_sys_4::llama_model_default_params() };
@@ -420,9 +438,8 @@ fn linked_model_load_projection(
     model_params.no_alloc = true;
     model_params.use_mmap = false;
     model_params.use_mlock = false;
-    let model_ptr = unsafe {
-        llama_cpp_sys_4::llama_model_load_from_file(model_path.as_ptr(), model_params)
-    };
+    let model_ptr =
+        unsafe { llama_cpp_sys_4::llama_model_load_from_file(model_path.as_ptr(), model_params) };
     if model_ptr.is_null() {
         return Err(());
     }
@@ -433,13 +450,12 @@ fn linked_model_load_projection(
     let layers = i64::from(unsafe { llama_cpp_sys_4::llama_model_n_layer(model.ptr) }).max(1);
     let embedding = i64::from(unsafe { llama_cpp_sys_4::llama_model_n_embd(model.ptr) }).max(1);
     let heads = i64::from(unsafe { llama_cpp_sys_4::llama_model_n_head(model.ptr) }).max(1);
-    let kv_heads =
-        i64::from(unsafe { llama_cpp_sys_4::llama_model_n_head_kv(model.ptr) }).max(1);
+    let kv_heads = i64::from(unsafe { llama_cpp_sys_4::llama_model_n_head_kv(model.ptr) }).max(1);
     let head_width = embedding.saturating_add(heads - 1) / heads;
     // Two f16-sized K/V buffers, conservative for the supported q8/q4 settings
     let context_kv_bytes = 2_i64
         .saturating_mul(layers)
-        .saturating_mul(i64::from(LINKED_CONTEXT_WINDOW_TOKENS))
+        .saturating_mul(i64::from(physical_context_window_tokens))
         .saturating_mul(head_width)
         .saturating_mul(kv_heads)
         .saturating_mul(2);

@@ -499,7 +499,7 @@ SELECT otlet.enqueue_ask(
   'Return decision keep',
   '{"signal":"retain"}'::jsonb,
   '{"type":"object","required":["decision"],"additionalProperties":false,"properties":{"decision":{"const":"keep"}}}'::jsonb,
-  '{"reasoning":"off","max_tokens":48,"inference_cache":false,"llama_threads":2,"llama_batch_threads":3}'::jsonb
+  '{"reasoning":"off","max_tokens":48,"context_window_tokens":4096,"inference_cache":false,"llama_threads":2,"llama_batch_threads":3}'::jsonb
 ) AS async_job_id \gset
 SELECT concat_ws('|',
   :'async_job_id',
@@ -740,9 +740,9 @@ SELECT concat_ws('|',
   )::text,
   (
     contract.option_status -> 'requested' =
-      '{"reasoning":"off","max_tokens":48,"inference_cache":false,"llama_threads":2,"llama_batch_threads":3}'::jsonb
+      '{"reasoning":"off","max_tokens":48,"context_window_tokens":4096,"inference_cache":false,"llama_threads":2,"llama_batch_threads":3}'::jsonb
     AND contract.option_status -> 'honored' =
-      '{"reasoning":"off","max_tokens":48,"inference_cache":false,"llama_threads":2,"llama_batch_threads":3}'::jsonb
+      '{"reasoning":"off","max_tokens":48,"context_window_tokens":4096,"inference_cache":false,"llama_threads":2,"llama_batch_threads":3}'::jsonb
   )::text,
   (
     contract.option_status -> 'defaulted' ?&
@@ -758,6 +758,9 @@ SELECT concat_ws('|',
   (
     contract.option_status #>> '{envelope,model_artifact_hash}' = :'model_sha256'
     AND (contract.option_status #>> '{envelope,model_artifact_bytes}')::bigint = :'model_bytes'::bigint
+    AND (contract.option_status #>> '{envelope,tested_context_window_tokens}')::integer = 4096
+    AND (contract.option_status #>> '{envelope,requested_context_window_tokens}')::integer = 4096
+    AND (contract.option_status #>> '{envelope,effective_context_window_tokens}')::integer = 4096
     AND (contract.option_status #>> '{envelope,context_window_tokens}')::integer = 4096
     AND (contract.option_status #>> '{envelope,batch_tokens}')::integer = 512
     AND (contract.option_status #>> '{envelope,ubatch_tokens}')::integer = 128
@@ -778,6 +781,13 @@ SELECT concat_ws('|',
     AND contract.trace_summary #>> '{memory,worker_memory_budget_bytes}' =
       contract.option_status #>> '{envelope,max_worker_rss_bytes}'
     AND contract.trace_summary #>> '{memory,admission,decision}' = 'allowed'
+    AND contract.trace_summary #>> '{memory,request_admission,decision}' = 'allowed'
+    AND contract.trace_summary #>> '{memory,request_admission,reason}' =
+      'projected_request_memory_within_job_budget'
+    AND (contract.trace_summary #>> '{memory,request_admission,prompt_tokens}')::integer > 0
+    AND (contract.trace_summary #>> '{memory,request_admission,max_generation_tokens}')::integer = 48
+    AND (contract.trace_summary #>> '{memory,request_admission,projected_prompt_bytes}')::bigint > 0
+    AND (contract.trace_summary #>> '{memory,request_admission,projected_decode_bytes}')::bigint > 0
     AND contract.trace_summary #>> '{memory,post_inference_enforcement,decision}' = 'allowed'
   )::text,
   (
@@ -785,6 +795,9 @@ SELECT concat_ws('|',
     AND (contract.trace_summary #>> '{runtime_fingerprint,artifact,bytes}')::bigint = :'model_bytes'::bigint
     AND contract.trace_summary #>> '{runtime_fingerprint,artifact,verification}' = 'sha256_verified_file_descriptor_load'
     AND (contract.trace_summary #>> '{runtime_fingerprint,context,tokens}')::integer = 4096
+    AND (contract.trace_summary #>> '{runtime_fingerprint,context,tested_context_window_tokens}')::integer = 4096
+    AND (contract.trace_summary #>> '{runtime_fingerprint,context,requested_context_window_tokens}')::integer = 4096
+    AND (contract.trace_summary #>> '{runtime_fingerprint,context,effective_context_window_tokens}')::integer = 4096
     AND (contract.trace_summary #>> '{runtime_fingerprint,context,batch_tokens}')::integer = 512
     AND (contract.trace_summary #>> '{runtime_fingerprint,context,ubatch_tokens}')::integer = 128
     AND contract.trace_summary #>> '{runtime_fingerprint,runtime,load_policy}' = 'eager_single_resident_model'
@@ -823,6 +836,106 @@ DELETE FROM otlet.jobs
 WHERE task_name = 'aaa_portable_runtime_incompatible'
   AND subject_id = 'runtime-incompatible';
 SQL
+
+portable_context_overflow_job_id="$(
+  docker exec -i "$container" psql -U postgres -d "$portable_database" \
+    -X -qAt -v ON_ERROR_STOP=1 -v model_name="$model_name" <<'SQL'
+SELECT otlet.enqueue_ask(
+  :'model_name',
+  'Return decision keep',
+  '{"signal":"retain"}'::jsonb,
+  '{"type":"object","required":["decision"],"additionalProperties":false,"properties":{"decision":{"const":"keep"}}}'::jsonb,
+  '{"reasoning":"off","max_tokens":48,"context_window_tokens":64,"inference_cache":false}'::jsonb
+);
+SQL
+)"
+run_worker_once_for \
+  "$worker_id" \
+  "$worker_database_url" \
+  "$worker_password" \
+  "$model_name" \
+  "$model_artifact" \
+  "$model_sha256" \
+  job_failed
+portable_context_overflow_contract="$(
+  docker exec -i "$container" psql -U postgres -d "$portable_database" \
+    -X -qAt -v ON_ERROR_STOP=1 \
+    -v job_id="$portable_context_overflow_job_id" <<'SQL'
+WITH evidence AS (
+  SELECT
+    job.id,
+    job.status,
+    job.failure_reason_code,
+    receipt.status AS receipt_status,
+    receipt.failure_reason_code AS receipt_failure_reason_code,
+    receipt.trace_summary
+  FROM otlet.jobs job
+  JOIN otlet.inference_receipts receipt ON receipt.job_id = job.id
+  WHERE job.id = :'job_id'::bigint
+)
+SELECT concat_ws('|',
+  evidence.status,
+  evidence.receipt_status,
+  (evidence.trace_summary ->> 'stop_reason' IN (
+    'prompt_exceeds_context_window',
+    'prompt_and_generation_exceed_context_window'
+  ))::text,
+  (evidence.failure_reason_code = 'otlet.failure.v1.runtime_configuration_rejected')::text,
+  (evidence.receipt_failure_reason_code = 'otlet.failure.v1.runtime_configuration_rejected')::text,
+  jsonb_extract_path_text(
+    evidence.trace_summary,
+    'runtime_options_status', 'envelope', 'tested_context_window_tokens'
+  ),
+  jsonb_extract_path_text(
+    evidence.trace_summary,
+    'runtime_options_status', 'envelope', 'requested_context_window_tokens'
+  ),
+  jsonb_extract_path_text(
+    evidence.trace_summary,
+    'runtime_options_status', 'envelope', 'effective_context_window_tokens'
+  ),
+  jsonb_extract_path_text(
+    evidence.trace_summary,
+    'runtime_fingerprint', 'context', 'tested_context_window_tokens'
+  ),
+  jsonb_extract_path_text(
+    evidence.trace_summary,
+    'runtime_fingerprint', 'context', 'requested_context_window_tokens'
+  ),
+  jsonb_extract_path_text(
+    evidence.trace_summary,
+    'runtime_fingerprint', 'context', 'effective_context_window_tokens'
+  ),
+  jsonb_extract_path_text(
+    evidence.trace_summary, 'memory', 'request_admission', 'decision'
+  ),
+  (jsonb_extract_path_text(
+    evidence.trace_summary, 'memory', 'request_admission', 'reason'
+  ) IN (
+    'prompt_exceeds_context_window',
+    'prompt_and_generation_exceed_context_window'
+  ))::text,
+  (jsonb_extract_path_text(
+    evidence.trace_summary, 'memory', 'request_admission', 'prompt_tokens'
+  )::integer > 0)::text,
+  (jsonb_extract_path_text(
+    evidence.trace_summary, 'memory', 'request_admission', 'projected_prompt_bytes'
+  )::bigint > 0)::text,
+  (jsonb_extract_path_text(
+    evidence.trace_summary, 'memory', 'request_admission', 'projected_decode_bytes'
+  )::bigint > 0)::text,
+  (SELECT count(*) FROM otlet.outputs output WHERE output.job_id = evidence.id),
+  (SELECT count(*) FROM otlet.verify_invariants())
+)
+FROM evidence;
+SQL
+)"
+expected_portable_context_overflow="failed|failed|true|true|true|4096|64|64|4096|64|64|rejected|true|true|true|true|0|0"
+if [ "$portable_context_overflow_contract" != "$expected_portable_context_overflow" ]; then
+  echo "Expected portable context overflow contract $expected_portable_context_overflow, got $portable_context_overflow_contract" >&2
+  exit 1
+fi
+echo "portable_context_overflow_contract=$portable_context_overflow_contract"
 
 async_result_contract="$(
   docker exec -i "$container" psql -U postgres -d "$portable_database" \
@@ -1059,7 +1172,21 @@ SELECT concat_ws('|',
       AND r.selection_status = 'accepted'
       AND r.model_name = :'cheap_model_name'
   ),
-  count(c.id) FILTER (WHERE c.status = 'complete')
+  count(c.id) FILTER (WHERE c.status = 'complete'),
+  bool_and(
+    jsonb_extract_path(
+      r.trace_summary,
+      'runtime_fingerprint', 'context', 'requested_context_window_tokens'
+    ) = 'null'::jsonb
+    AND jsonb_extract_path_text(
+      r.trace_summary,
+      'runtime_fingerprint', 'context', 'tested_context_window_tokens'
+    ) = '4096'
+    AND jsonb_extract_path_text(
+      r.trace_summary,
+      'runtime_fingerprint', 'context', 'effective_context_window_tokens'
+    ) = '4096'
+  )
 )
 FROM otlet.jobs j
 JOIN otlet.outputs o ON o.job_id = j.id
@@ -1071,7 +1198,7 @@ WHERE j.task_name = 'portable_routing_accept_demo'
 GROUP BY j.id, o.id;
 SQL
 )"
-if [ "$routing_accept_contract" != "complete|keep|1|t|1|1|1" ]; then
+if [ "$routing_accept_contract" != "complete|keep|1|t|1|1|1|t" ]; then
   echo "Expected a portable cheap result to complete without escalation, got $routing_accept_contract" >&2
   exit 1
 fi

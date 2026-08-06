@@ -23,9 +23,9 @@ install_portable() {
     -f crates/otlet_worker/sql/install.sql
 }
 
-install_portable_through_78() {
+install_portable_through_79() {
   docker exec -w /work/crates/otlet_worker/sql "$container" \
-    sed '/0079_bounded_customscan_state.sql/,$d' migrate.sql |
+    sed '/0080_model_bound_context_budgets.sql/,$d' migrate.sql |
     docker exec -i -w /work/crates/otlet_worker/sql "$container" \
       psql -U postgres -d "$database" -X -q -v ON_ERROR_STOP=1 --single-transaction
 }
@@ -65,7 +65,7 @@ SELECT format(
   'portable upgrade executable proof'
 ) \gexec
 SQL
-install_portable_through_78
+install_portable_through_79
 
 docker exec -i "$container" psql -U postgres -d "$database" \
   -X -q -v ON_ERROR_STOP=1 <<'SQL' >/dev/null
@@ -85,7 +85,8 @@ CREATE TABLE public.portable_upgrade_sentinel (
   planner_statistics_version bigint,
   planner_statistics_refreshed_at timestamptz,
   legacy_watch_revision_hash text,
-  legacy_materialization_id bigint
+  legacy_materialization_id bigint,
+  legacy_workload_pack_hash text
 );
 INSERT INTO public.portable_upgrade_sentinel VALUES (1, 'preserved');
 SQL
@@ -255,6 +256,9 @@ DO $proof$
 DECLARE
   revision_definition jsonb;
   revision_hash text;
+  baseline_pack jsonb;
+  candidate_pack jsonb;
+  prepared_pack_hash text;
   input jsonb;
   record_id bigint;
   materialization_id bigint;
@@ -265,6 +269,19 @@ BEGIN
   JOIN otlet.workload_revision_heads head
     ON head.active_workload_revision_hash = revision.workload_revision_hash
   WHERE head.task_name = 'portable_time_legacy_task';
+  baseline_pack := otlet.export_workload_pack('portable_time_legacy', 1);
+  candidate_pack := jsonb_set(
+    jsonb_set(baseline_pack, '{version}', '2'::jsonb),
+    '{watch,instruction}',
+    to_jsonb('Return the upgraded legacy decision'::text)
+  );
+  prepared_pack_hash := otlet.prepare_workload_pack(
+    candidate_pack,
+    otlet.workload_pack_spec_hash(baseline_pack),
+    revision_hash,
+    'Prepare a six-field legacy workload pack',
+    'PORTABLE-UPGRADE'
+  );
   input := otlet.task_subject_input(
     revision_definition #>> '{task,input_query}',
     'legacy-row',
@@ -306,7 +323,8 @@ BEGIN
   ) RETURNING id INTO materialization_id;
   UPDATE public.portable_upgrade_sentinel
   SET legacy_watch_revision_hash = revision_hash,
-      legacy_materialization_id = materialization_id
+      legacy_materialization_id = materialization_id,
+      legacy_workload_pack_hash = prepared_pack_hash
   WHERE id = 1;
 END;
 $proof$;
@@ -723,6 +741,34 @@ SQL
 
 install_portable
 
+docker exec -i "$container" psql -U postgres -d "$database" \
+  -X -q -v ON_ERROR_STOP=1 <<'SQL' >/dev/null
+SELECT otlet.register_model(
+  'portable_context_limit_probe',
+  '/tmp/portable_context_limit_probe.gguf',
+  repeat('8', 64),
+  jsonb_build_object(
+    'sha256', repeat('8', 64),
+    'bytes', 1,
+    'source', 'portable-upgrade-demo',
+    'revision', 'context-limit-v1',
+    'quantization', 'test',
+    'license', 'test',
+    'context_window_tokens', 1024
+  ),
+  1
+) \g /dev/null
+SELECT otlet.create_task(
+  task_name => 'portable_context_selection_probe',
+  input_query => NULL,
+  instruction => 'Return an empty object',
+  output_schema => '{"type":"object"}'::jsonb,
+  model_name => 'model_concurrency_probe',
+  runtime_options => '{"context_window_tokens":2048}'::jsonb,
+  input_shaping => '{"source_fields":["value"]}'::jsonb
+) \g /dev/null
+SQL
+
 contract="$(
   docker exec -i "$container" psql -U postgres -d "$database" \
     -X -qAt -v ON_ERROR_STOP=1 \
@@ -834,12 +880,91 @@ $function$;
 SELECT concat_ws('|',
   max(version),
   count(*),
-  array_agg(version ORDER BY version) = ARRAY(SELECT generate_series(1, 79)),
+  array_agg(version ORDER BY version) = ARRAY(SELECT generate_series(1, 80)),
   bool_and(file ~ ('(^|/)' || lpad(version::text, 4, '0') || '_')),
   (SELECT value FROM public.portable_upgrade_sentinel),
   (
+    SELECT NOT model.artifact_identity ? 'context_window_tokens'
+      AND model.tested_context_window_tokens = 4096
+    FROM otlet.models model
+    WHERE model.name = 'model_concurrency_probe'
+  ),
+  (
+    SELECT COALESCE(
+      otlet.workload_model_definition(model.name) ->>
+        'tested_context_window_tokens',
+      'NULL'
+    )
+    FROM otlet.models model
+    WHERE model.name = 'model_concurrency_probe'
+  ),
+  (
+    SELECT otlet.workload_pack_shape_error(definition.definition) IS NULL
+      AND NOT (
+        definition.definition #> '{watch,model_artifact_identity}'
+          ? 'context_window_tokens'
+      )
+      AND NOT EXISTS (
+        SELECT 1
+        FROM jsonb_each(definition.definition -> 'models') role
+        WHERE role.value -> 'artifact_identity' ? 'context_window_tokens'
+      )
+      AND NOT EXISTS (
+        SELECT 1
+        FROM otlet.workload_pack_capability_report(definition.definition) report
+        WHERE report.component = 'model'
+          AND NOT report.compatible
+      )
+    FROM public.portable_upgrade_sentinel sentinel
+    JOIN otlet.workload_pack_definitions definition
+      ON definition.pack_hash = sentinel.legacy_workload_pack_hash
+    WHERE sentinel.id = 1
+  ),
+  pg_temp.expect_error(
+    $statement$
+      SELECT otlet.create_task(
+        task_name => 'portable_context_direct_rejected',
+        input_query => NULL,
+        instruction => 'Return an empty object',
+        output_schema => '{"type":"object"}'::jsonb,
+        model_name => 'portable_context_limit_probe',
+        runtime_options => '{"context_window_tokens":2048}'::jsonb,
+        input_shaping => '{"source_fields":["value"]}'::jsonb
+      )
+    $statement$,
+    'requested_context_window_exceeds_model_limit'
+  ) AND pg_temp.expect_error(
+    $statement$
+      SELECT otlet.set_model_selection_policy(
+        'portable_context_selection_probe',
+        'portable_context_limit_probe',
+        'model_concurrency_probe'
+      )
+    $statement$,
+    'requested_context_window_exceeds_model_limit'
+  ) AND pg_temp.expect_error(
+    $statement$
+      SELECT otlet.set_model_selection_policy(
+        'portable_context_selection_probe',
+        'model_concurrency_probe',
+        'portable_context_limit_probe'
+      )
+    $statement$,
+    'requested_context_window_exceeds_model_limit'
+  ),
+  (
+    SELECT position('''context_window''' IN function.prosrc) > 0
+      AND position('''tested_context_window_tokens''' IN function.prosrc) > 0
+      AND position('''requested_context_window_tokens''' IN function.prosrc) > 0
+      AND position('''effective_context_window_tokens''' IN function.prosrc) > 0
+      AND position('runtime_options_status' IN function.prosrc) > 0
+    FROM pg_catalog.pg_proc function
+    WHERE function.oid =
+      'otlet.portable_claim_jobs(text,integer,text,text,bigint,integer,integer)'::regprocedure
+  ),
+  (
     SELECT sentinel.legacy_watch_revision_hash = head.active_workload_revision_hash
-      AND head.active_workload_revision_hash = otlet.identity_hash(
+      AND head.active_workload_revision_hash IS DISTINCT FROM otlet.identity_hash(
         'workload_revision',
         otlet.current_workload_revision_definition('portable_time_legacy_task')
       )
@@ -1123,7 +1248,7 @@ SELECT concat_ws('|',
 FROM otlet.portable_schema_migrations;
 SQL
 )"
-[ "$contract" = "79|79|t|t|preserved|t|0|t|t|t|t|t|t|t|t|t|t|t|t|t" ] || {
+[ "$contract" = "80|80|t|t|preserved|t|4096|t|t|t|t|0|t|t|t|t|t|t|t|t|t|t|t|t|t" ] || {
   echo "Portable repeat-install contract mismatch: $contract" >&2
   exit 1
 }
@@ -1199,7 +1324,7 @@ portable_workload_pack_promotion_contract="$(
   ) | awk 'NF { line = $0 } END { print line }'
 )"
 [ "$portable_workload_pack_promotion_contract" = \
-  "workload_pack_promotion_contract=38|true" ] || {
+  "workload_pack_promotion_contract=39|true" ] || {
   echo "Portable workload-pack contract mismatch: $portable_workload_pack_promotion_contract" >&2
   exit 1
 }

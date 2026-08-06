@@ -36,6 +36,7 @@ const SUPPORTED_RUNTIME_OPTIONS: &[&str] = &[
     "max_attempt_ms",
     "inference_cache",
     "max_worker_rss_bytes",
+    "context_window_tokens",
     "generation_trace",
     "llama_threads",
     "llama_batch_threads",
@@ -136,6 +137,7 @@ impl Config {
 struct RuntimeOptions {
     max_tokens: usize,
     max_worker_rss_bytes: u64,
+    context_window_tokens: Option<u32>,
     llama_threads: i32,
     llama_batch_threads: i32,
 }
@@ -178,6 +180,19 @@ impl RuntimeOptions {
         }
         let max_worker_rss_bytes =
             required_runtime_integer(object, "max_worker_rss_bytes", 1, 70_368_744_177_664)?;
+        let context_window_tokens = object
+            .contains_key("context_window_tokens")
+            .then(|| {
+                bounded_runtime_integer(
+                    object,
+                    "context_window_tokens",
+                    1,
+                    1,
+                    u64::from(CONTEXT_TOKENS),
+                )
+                .map(|value| value as u32)
+            })
+            .transpose()?;
         match object.get("generation_trace") {
             Some(Value::Bool(false)) | None => {}
             Some(Value::Bool(true)) => {
@@ -192,9 +207,142 @@ impl RuntimeOptions {
         Ok(Self {
             max_tokens: max_tokens as usize,
             max_worker_rss_bytes,
+            context_window_tokens,
             llama_threads,
             llama_batch_threads,
         })
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ContextWindowEvidence {
+    tested: u32,
+    requested: Option<u32>,
+    effective: u32,
+}
+
+#[derive(Clone, Copy)]
+struct RequestAdmission {
+    tested_context_window_tokens: u32,
+    requested_context_window_tokens: Option<u32>,
+    effective_context_window_tokens: u32,
+    prompt_tokens: usize,
+    max_generation_tokens: usize,
+    projected_prompt_bytes: u64,
+    projected_decode_bytes: u64,
+    decision: &'static str,
+    reason: &'static str,
+}
+
+fn tested_context_window_tokens(
+    artifact_identity: &serde_json::Map<String, Value>,
+) -> Result<u32, String> {
+    let Some(value) = artifact_identity.get("context_window_tokens") else {
+        return Ok(CONTEXT_TOKENS);
+    };
+    let value = value
+        .as_u64()
+        .and_then(|value| u32::try_from(value).ok())
+        .filter(|value| (1..=CONTEXT_TOKENS).contains(value))
+        .ok_or("model artifact context_window_tokens must be between 1 and 4096")?;
+    Ok(value)
+}
+
+fn context_window_evidence(
+    evidence_limits: &Value,
+    options: &RuntimeOptions,
+    artifact_tested: u32,
+) -> Result<ContextWindowEvidence, String> {
+    let evidence = evidence_limits
+        .get("context_window")
+        .and_then(Value::as_object)
+        .ok_or("evidence_limits.context_window must be an object")?;
+    let tokens = |name: &str| {
+        evidence
+            .get(name)
+            .and_then(Value::as_u64)
+            .and_then(|value| u32::try_from(value).ok())
+            .filter(|value| (1..=CONTEXT_TOKENS).contains(value))
+            .ok_or_else(|| {
+                format!(
+                    "evidence_limits.context_window.{name} must be an integer between 1 and 4096"
+                )
+            })
+    };
+    let tested = tokens("tested_context_window_tokens")?;
+    let requested = match evidence.get("requested_context_window_tokens") {
+        Some(Value::Null) => None,
+        Some(_) => Some(tokens("requested_context_window_tokens")?),
+        None => {
+            return Err(
+                "evidence_limits.context_window.requested_context_window_tokens is required"
+                    .to_owned(),
+            );
+        }
+    };
+    let effective = tokens("effective_context_window_tokens")?;
+    if tested != artifact_tested
+        || requested.is_some_and(|requested| requested > tested)
+        || effective != requested.unwrap_or(tested)
+        || options.context_window_tokens != Some(effective)
+    {
+        return Err("portable context window evidence is inconsistent".to_owned());
+    }
+    Ok(ContextWindowEvidence {
+        tested,
+        requested,
+        effective,
+    })
+}
+
+fn request_admission(
+    prompt_bytes: usize,
+    prompt_tokens: usize,
+    max_output_bytes: usize,
+    options: &RuntimeOptions,
+    context_window: ContextWindowEvidence,
+    current_rss_bytes: u64,
+) -> RequestAdmission {
+    let projected_prompt_bytes = u64::try_from(prompt_bytes)
+        .unwrap_or(u64::MAX)
+        .saturating_add(
+            u64::try_from(prompt_tokens)
+                .unwrap_or(u64::MAX)
+                .saturating_mul(std::mem::size_of::<llama_cpp_sys_4::llama_token>() as u64),
+        );
+    let projected_decode_bytes = u64::try_from(options.max_tokens)
+        .unwrap_or(u64::MAX)
+        .saturating_mul(MAX_TOKEN_PIECE_BYTES as u64)
+        .min(
+            u64::try_from(max_output_bytes)
+                .unwrap_or(u64::MAX)
+                .saturating_add(MAX_TOKEN_PIECE_BYTES as u64),
+        )
+        .saturating_add(MAX_TOKEN_PIECE_BYTES as u64)
+        .saturating_add((BATCH_TOKENS as u64).saturating_mul(16));
+    let (decision, reason) = if prompt_tokens >= context_window.effective as usize {
+        ("rejected", "prompt_exceeds_context_window")
+    } else if prompt_tokens.saturating_add(options.max_tokens) > context_window.effective as usize {
+        ("rejected", "prompt_and_generation_exceed_context_window")
+    } else if current_rss_bytes
+        .saturating_add(projected_prompt_bytes)
+        .saturating_add(projected_decode_bytes)
+        > options.max_worker_rss_bytes
+    {
+        ("rejected", "portable_worker_rss_budget_exceeded")
+    } else {
+        ("allowed", "projected_request_memory_within_job_budget")
+    };
+    RequestAdmission {
+        tested_context_window_tokens: context_window.tested,
+        requested_context_window_tokens: context_window.requested,
+        effective_context_window_tokens: context_window.effective,
+        prompt_tokens,
+        max_generation_tokens: options.max_tokens,
+        projected_prompt_bytes,
+        projected_decode_bytes,
+        decision,
+        reason,
     }
 }
 
@@ -1127,7 +1275,7 @@ impl LocalModel {
 
     fn infer(
         &mut self,
-        prompt: &str,
+        tokens: &[llama_cpp_sys_4::llama_token],
         max_tokens: usize,
         max_output_bytes: usize,
         threads: i32,
@@ -1143,16 +1291,9 @@ impl LocalModel {
                 llama_cpp_sys_4::llama_memory_clear(memory, true);
             }
         }
-        let tokens = tokenize(self.vocab, prompt)?;
         signal.ensure_active()?;
         if tokens.is_empty() {
             return Err("prompt produced no tokens".to_owned());
-        }
-        if tokens.len().saturating_add(max_tokens) > self.context_window_tokens as usize {
-            return Err(format!(
-                "prompt and generation exceed the {}-token context",
-                self.context_window_tokens
-            ));
         }
 
         let mut batch = Batch::new(BATCH_TOKENS)?;
@@ -1585,10 +1726,10 @@ impl JsonCompletion {
     }
 }
 
-fn tokenize(
+fn prompt_token_count(
     vocab: *const llama_cpp_sys_4::llama_vocab,
     prompt: &str,
-) -> Result<Vec<llama_cpp_sys_4::llama_token>, String> {
+) -> Result<usize, String> {
     let prompt = CString::new(prompt).map_err(|_| "prompt contains a null byte".to_owned())?;
     let prompt_len =
         i32::try_from(prompt.as_bytes().len()).map_err(|_| "prompt is too large".to_owned())?;
@@ -1606,8 +1747,17 @@ fn tokenize(
     if required == i32::MIN {
         return Err("llama.cpp returned an invalid token count".to_owned());
     }
-    let capacity =
-        usize::try_from(required.abs()).map_err(|_| "prompt token count overflowed".to_owned())?;
+    usize::try_from(required.abs()).map_err(|_| "prompt token count overflowed".to_owned())
+}
+
+fn tokenize(
+    vocab: *const llama_cpp_sys_4::llama_vocab,
+    prompt: &str,
+    capacity: usize,
+) -> Result<Vec<llama_cpp_sys_4::llama_token>, String> {
+    let prompt = CString::new(prompt).map_err(|_| "prompt contains a null byte".to_owned())?;
+    let prompt_len =
+        i32::try_from(prompt.as_bytes().len()).map_err(|_| "prompt is too large".to_owned())?;
     let mut tokens = vec![0; capacity];
     let actual = unsafe {
         llama_cpp_sys_4::llama_tokenize(
@@ -1675,6 +1825,7 @@ fn runtime_trace(
     claim: &Claim,
     model: &LocalModel,
     options: Option<&RuntimeOptions>,
+    request: Option<&RequestAdmission>,
     rss_before: Option<u64>,
     rss_after: Option<u64>,
     inference: Option<&Inference>,
@@ -1698,35 +1849,69 @@ fn runtime_trace(
         (Some(_), None) => ("not_evaluated", "post_inference_rss_not_recorded"),
         (None, _) => ("not_evaluated", "worker_memory_budget_unavailable"),
     };
+    let request_admission_trace = json!({
+        "prompt_tokens": request.map(|request| request.prompt_tokens),
+        "max_generation_tokens": request.map(|request| request.max_generation_tokens),
+        "projected_prompt_bytes": request.map(|request| request.projected_prompt_bytes),
+        "projected_decode_bytes": request.map(|request| request.projected_decode_bytes),
+        "decision": request.map(|request| request.decision).unwrap_or("not_evaluated"),
+        "reason": request.map(|request| request.reason).unwrap_or("request_not_prepared"),
+        "policy": "portable_prompt_decode_projection_v1"
+    });
+    let runtime_fingerprint = json!({
+        "artifact": {
+            "sha256": model.artifact.sha256.as_str(),
+            "bytes": model.artifact.bytes(),
+            "verification": "sha256_verified_file_descriptor_load"
+        },
+        "context": {
+            "tokens": model.context_window_tokens,
+            "tested_context_window_tokens": request.map(|request| request.tested_context_window_tokens),
+            "requested_context_window_tokens": request.and_then(|request| request.requested_context_window_tokens),
+            "effective_context_window_tokens": request.map(|request| request.effective_context_window_tokens),
+            "batch_tokens": BATCH_TOKENS,
+            "ubatch_tokens": UBATCH_TOKENS,
+            "decode_threads": options.map(|options| options.llama_threads),
+            "batch_threads": options.map(|options| options.llama_batch_threads)
+        },
+        "runtime": {
+            "load_policy": LOAD_POLICY,
+            "device_policy": DEVICE_POLICY,
+            "rss_policy": RSS_POLICY
+        }
+    });
+    let memory = json!({
+        "worker_memory_sample_policy": RSS_POLICY,
+        "worker_memory_budget_bytes": budget,
+        "worker_memory_budget_policy": "max_worker_rss_bytes_fail_closed",
+        "claim": { "process_rss_bytes": claim.claim_rss_bytes },
+        "before": rss_before.map(|rss| json!({ "process_rss_bytes": rss })).unwrap_or_else(|| json!({})),
+        "after": rss_after.map(|rss| json!({ "process_rss_bytes": rss })).unwrap_or_else(|| json!({})),
+        "admission": {
+            "decision": admission,
+            "reason": admission_reason,
+            "policy": "portable_claim_and_pre_inference_rss_v1"
+        },
+        "request_admission": request_admission_trace,
+        "post_inference_enforcement": {
+            "decision": post_enforcement,
+            "reason": post_enforcement_reason,
+            "policy": "max_worker_rss_bytes_fail_closed"
+        }
+    });
     json!({
         "trace_version": "otlet_portable_worker_trace_v1",
         "workload_revision_hash": claim.workload_revision_hash,
         "prompt_hash": claim.prompt_hash,
-        "prompt_tokens": inference.map(|inference| inference.prompt_tokens),
+        "prompt_tokens": inference
+            .map(|inference| inference.prompt_tokens)
+            .or_else(|| request.map(|request| i64::try_from(request.prompt_tokens).unwrap_or(i64::MAX))),
         "generated_tokens": inference.map(|inference| inference.generated_tokens),
         "generate_ms": inference.map(|inference| inference.generate_ms),
         "schema_validation_status": "not_run",
         "runtime": "local_llama_cpp",
         "runtime_fingerprint_version": "otlet_portable_runtime_contract_v1",
-        "runtime_fingerprint": {
-            "artifact": {
-                "sha256": model.artifact.sha256.as_str(),
-                "bytes": model.artifact.bytes(),
-                "verification": "sha256_verified_file_descriptor_load"
-            },
-            "context": {
-                "tokens": model.context_window_tokens,
-                "batch_tokens": BATCH_TOKENS,
-                "ubatch_tokens": UBATCH_TOKENS,
-                "decode_threads": options.map(|options| options.llama_threads),
-                "batch_threads": options.map(|options| options.llama_batch_threads)
-            },
-            "runtime": {
-                "load_policy": LOAD_POLICY,
-                "device_policy": DEVICE_POLICY,
-                "rss_policy": RSS_POLICY
-            }
-        },
+        "runtime_fingerprint": runtime_fingerprint,
         "model_load_ms": 0,
         "model_context_ms": 0,
         "resident_model_load_ms": model.load_ms,
@@ -1734,6 +1919,9 @@ fn runtime_trace(
         "model_memory_bytes": model.model_memory_bytes,
         "model_parameters": model.model_parameters,
         "context_window_tokens": model.context_window_tokens,
+        "tested_context_window_tokens": request.map(|request| request.tested_context_window_tokens),
+        "requested_context_window_tokens": request.and_then(|request| request.requested_context_window_tokens),
+        "effective_context_window_tokens": request.map(|request| request.effective_context_window_tokens),
         "model_device_policy": DEVICE_POLICY,
         "memory_accounting_policy": "linux_proc_status_vmrss_resident_model",
         "model_cache_hit": true,
@@ -1743,24 +1931,7 @@ fn runtime_trace(
         "worker_process_rss_bytes": final_rss,
         "worker_memory_sample_policy": RSS_POLICY,
         "worker_memory_budget_bytes": budget,
-        "memory": {
-            "worker_memory_sample_policy": RSS_POLICY,
-            "worker_memory_budget_bytes": budget,
-            "worker_memory_budget_policy": "max_worker_rss_bytes_fail_closed",
-            "claim": { "process_rss_bytes": claim.claim_rss_bytes },
-            "before": rss_before.map(|rss| json!({ "process_rss_bytes": rss })).unwrap_or_else(|| json!({})),
-            "after": rss_after.map(|rss| json!({ "process_rss_bytes": rss })).unwrap_or_else(|| json!({})),
-            "admission": {
-                "decision": admission,
-                "reason": admission_reason,
-                "policy": "portable_claim_and_pre_inference_rss_v1"
-            },
-            "post_inference_enforcement": {
-                "decision": post_enforcement,
-                "reason": post_enforcement_reason,
-                "policy": "max_worker_rss_bytes_fail_closed"
-            }
-        }
+        "memory": memory
     })
 }
 
@@ -1779,7 +1950,7 @@ fn process_claim(
         return Err("portable claim selection role is invalid".to_owned());
     }
     let Some(selected_model) = claim.model.as_object() else {
-        let trace = runtime_trace(claim, model, None, None, None, None);
+        let trace = runtime_trace(claim, model, None, None, None, None, None);
         let state = database.fail(
             config,
             claim,
@@ -1806,7 +1977,7 @@ fn process_claim(
             .and_then(Value::as_u64)
             != Some(model.artifact.bytes())
     {
-        let trace = runtime_trace(claim, model, None, None, None, None);
+        let trace = runtime_trace(claim, model, None, None, None, None, None);
         let state = database.fail(
             config,
             claim,
@@ -1818,10 +1989,48 @@ fn process_claim(
         log_failure_state(&state, claim, "model_identity_mismatch");
         return Ok(());
     }
+    let tested_context_window_tokens =
+        match tested_context_window_tokens(artifact_identity.expect("validated artifact identity"))
+        {
+            Ok(tokens) => tokens,
+            Err(_) => {
+                let trace = runtime_trace(claim, model, None, None, None, None, None);
+                let state = database.fail(
+                    config,
+                    claim,
+                    "portable_model_identity_mismatch",
+                    None,
+                    None,
+                    &trace,
+                )?;
+                log_failure_state(&state, claim, "model_identity_mismatch");
+                return Ok(());
+            }
+        };
     let options = match RuntimeOptions::parse(&claim.runtime_options) {
         Ok(options) => options,
         Err(_) => {
-            let trace = runtime_trace(claim, model, None, None, None, None);
+            let trace = runtime_trace(claim, model, None, None, None, None, None);
+            let state = database.fail(
+                config,
+                claim,
+                "portable_runtime_options_rejected",
+                None,
+                None,
+                &trace,
+            )?;
+            log_failure_state(&state, claim, "runtime_options_rejected");
+            return Ok(());
+        }
+    };
+    let context_window = match context_window_evidence(
+        &claim.evidence_limits,
+        &options,
+        tested_context_window_tokens,
+    ) {
+        Ok(context_window) => context_window,
+        Err(_) => {
+            let trace = runtime_trace(claim, model, Some(&options), None, None, None, None);
             let state = database.fail(
                 config,
                 claim,
@@ -1844,7 +2053,7 @@ fn process_claim(
     let rss_before = match process_rss_bytes() {
         Ok(rss) => rss,
         Err(_) => {
-            let trace = runtime_trace(claim, model, Some(&options), None, None, None);
+            let trace = runtime_trace(claim, model, Some(&options), None, None, None, None);
             let state = database.fail(
                 config,
                 claim,
@@ -1857,29 +2066,41 @@ fn process_claim(
             return Ok(());
         }
     };
-    if enforce_worker_rss_budget(rss_before, options.max_worker_rss_bytes).is_err() {
-        let trace = runtime_trace(claim, model, Some(&options), Some(rss_before), None, None);
-        let state = database.fail(
-            config,
-            claim,
-            "portable_worker_rss_budget_exceeded",
-            None,
-            None,
-            &trace,
-        )?;
-        log_failure_state(&state, claim, "worker_rss_budget_exceeded");
-        return Ok(());
-    }
     let lease = LeaseGuard::start(database.clone(), config.clone(), claim);
     let signal = lease.signal();
-    let inference = model.infer(
-        &claim.prompt,
-        options.max_tokens,
-        max_output_bytes,
-        options.llama_threads,
-        options.llama_batch_threads,
-        &signal,
-    );
+    let mut request = None;
+    let tokens = prompt_token_count(model.vocab, &claim.prompt).and_then(|prompt_tokens| {
+        signal.ensure_active()?;
+        let admission = request_admission(
+            claim.prompt.len(),
+            prompt_tokens,
+            max_output_bytes,
+            &options,
+            context_window,
+            rss_before,
+        );
+        request = Some(admission);
+        if admission.decision == "rejected" {
+            return Err(coded(
+                admission.reason,
+                "portable request admission rejected",
+            ));
+        }
+        let tokens = tokenize(model.vocab, &claim.prompt, prompt_tokens)?;
+        signal.ensure_active()?;
+        Ok(tokens)
+    });
+    let inference = match tokens {
+        Ok(tokens) => model.infer(
+            &tokens,
+            options.max_tokens,
+            max_output_bytes,
+            options.llama_threads,
+            options.llama_batch_threads,
+            &signal,
+        ),
+        Err(error) => Err(error),
+    };
     let inference_state = signal.state();
     drop(lease);
     let artifact_state = model.artifact.ensure_unchanged();
@@ -1894,7 +2115,15 @@ fn process_claim(
             return Ok(());
         }
         CLAIM_TIMED_OUT if inference_state == CLAIM_TIMED_OUT => {
-            let trace = runtime_trace(claim, model, Some(&options), Some(rss_before), None, None);
+            let trace = runtime_trace(
+                claim,
+                model,
+                Some(&options),
+                request.as_ref(),
+                Some(rss_before),
+                None,
+                None,
+            );
             let state = database.fail(config, claim, "attempt_timeout", None, None, &trace)?;
             log_failure_state(&state, claim, "attempt_timeout");
             return Ok(());
@@ -1912,6 +2141,7 @@ fn process_claim(
                 claim,
                 model,
                 Some(&options),
+                request.as_ref(),
                 Some(rss_before),
                 None,
                 inference.as_ref().ok(),
@@ -1932,11 +2162,18 @@ fn process_claim(
         claim,
         model,
         Some(&options),
+        request.as_ref(),
         Some(rss_before),
         Some(rss_after),
         inference.as_ref().ok(),
     );
-    if enforce_worker_rss_budget(rss_after, options.max_worker_rss_bytes).is_err() {
+    if request
+        .as_ref()
+        .is_none_or(|request| request.decision != "rejected")
+        && enforce_worker_rss_budget(rss_after, options.max_worker_rss_bytes).is_err()
+    {
+        let mut trace = trace;
+        trace["stop_reason"] = Value::String("portable_worker_rss_budget_exceeded".to_owned());
         let state = database.fail(
             config,
             claim,
@@ -1951,9 +2188,27 @@ fn process_claim(
     let inference = match inference {
         Ok(inference) => inference,
         Err(error) => {
-            let state =
-                database.fail(config, claim, &truncate(&error, 1024), None, None, &trace)?;
-            log_failure_state(&state, claim, "local_inference_failed");
+            let coded_failure = error.starts_with("otlet_error:");
+            let reason = error_code(&error).to_owned();
+            let failure = if coded_failure {
+                reason.clone()
+            } else {
+                truncate(&error, 1024)
+            };
+            let mut trace = trace;
+            if coded_failure {
+                trace["stop_reason"] = Value::String(reason.clone());
+            }
+            let state = database.fail(config, claim, &failure, None, None, &trace)?;
+            log_failure_state(
+                &state,
+                claim,
+                if coded_failure {
+                    &reason
+                } else {
+                    "local_inference_failed"
+                },
+            );
             return Ok(());
         }
     };
@@ -2060,6 +2315,8 @@ fn runtime_identity() -> Value {
             },
             "context_limits": {
                 "context_window_tokens": CONTEXT_TOKENS,
+                "model_context_window_source": "artifact_identity.context_window_tokens",
+                "task_context_window_option": "context_window_tokens_optional_lte_model_limit",
                 "batch_tokens": BATCH_TOKENS,
                 "ubatch_tokens": UBATCH_TOKENS,
                 "max_generation_tokens": 4096
@@ -2097,6 +2354,7 @@ fn runtime_identity() -> Value {
             "resource_admission": {
                 "budget_option": "max_worker_rss_bytes",
                 "rss_policy": RSS_POLICY,
+                "request_projection_policy": "portable_prompt_decode_projection_v1",
                 "required_evidence": ["current_rss_bytes", "artifact_bytes"],
                 "process_slots": 1
             }
@@ -3086,8 +3344,17 @@ esac
         let parsed = RuntimeOptions::parse(&options).expect("valid options must parse");
         assert_eq!(parsed.max_tokens, 16);
         assert_eq!(parsed.max_worker_rss_bytes, 1024);
+        assert_eq!(parsed.context_window_tokens, None);
         assert_eq!(parsed.llama_threads, 3);
         assert_eq!(parsed.llama_batch_threads, 2);
+
+        options["context_window_tokens"] = json!(2048);
+        assert_eq!(
+            RuntimeOptions::parse(&options)
+                .expect("task context cap must parse")
+                .context_window_tokens,
+            Some(2048)
+        );
 
         let required = options.as_object_mut().expect("options are an object");
         required.remove("inference_cache");
@@ -3108,6 +3375,8 @@ esac
         for (key, value) in [
             ("inference_cache", json!(true)),
             ("max_worker_rss_bytes", json!(0)),
+            ("context_window_tokens", json!(0)),
+            ("context_window_tokens", json!(4097)),
             ("generation_trace", json!(true)),
             ("llama_threads", json!(0)),
             ("llama_batch_threads", json!(1025)),
@@ -3131,6 +3400,96 @@ esac
     }
 
     #[test]
+    fn portable_request_admission_binds_context_and_memory() {
+        let legacy = serde_json::Map::new();
+        assert_eq!(tested_context_window_tokens(&legacy).unwrap(), 4096);
+        let tested = json!({"context_window_tokens": 32});
+        assert_eq!(
+            tested_context_window_tokens(tested.as_object().unwrap()).unwrap(),
+            32
+        );
+        for invalid in [json!(0), json!(4097), json!("32")] {
+            let identity = json!({"context_window_tokens": invalid});
+            assert!(tested_context_window_tokens(identity.as_object().unwrap()).is_err());
+        }
+
+        let mut options = RuntimeOptions {
+            max_tokens: 2,
+            max_worker_rss_bytes: u64::MAX,
+            context_window_tokens: Some(16),
+            llama_threads: 1,
+            llama_batch_threads: 1,
+        };
+        let max_output_bytes = 1000;
+        let context_window = ContextWindowEvidence {
+            tested: 32,
+            requested: Some(16),
+            effective: 16,
+        };
+        let allowed = request_admission(10, 14, max_output_bytes, &options, context_window, 100);
+        assert_eq!(allowed.decision, "allowed");
+        assert_eq!(allowed.requested_context_window_tokens, Some(16));
+        assert_eq!(allowed.effective_context_window_tokens, 16);
+        assert_eq!(
+            allowed.projected_prompt_bytes,
+            10 + 14 * std::mem::size_of::<llama_cpp_sys_4::llama_token>() as u64
+        );
+        assert_eq!(allowed.projected_decode_bytes, 17_384 + 16_384 + 8_192);
+
+        options.context_window_tokens = Some(32);
+        let omitted = json!({
+            "context_window": {
+                "tested_context_window_tokens": 32,
+                "requested_context_window_tokens": null,
+                "effective_context_window_tokens": 32
+            }
+        });
+        assert_eq!(
+            context_window_evidence(&omitted, &options, 32)
+                .unwrap()
+                .requested,
+            None
+        );
+        let explicit = json!({
+            "context_window": {
+                "tested_context_window_tokens": 32,
+                "requested_context_window_tokens": 32,
+                "effective_context_window_tokens": 32
+            }
+        });
+        assert_eq!(
+            context_window_evidence(&explicit, &options, 32)
+                .unwrap()
+                .requested,
+            Some(32)
+        );
+        let mut invalid = explicit;
+        invalid["context_window"]["effective_context_window_tokens"] = json!(31);
+        assert!(context_window_evidence(&invalid, &options, 32).is_err());
+
+        options.context_window_tokens = Some(16);
+        let prompt_overflow =
+            request_admission(0, 16, max_output_bytes, &options, context_window, 0);
+        assert_eq!(prompt_overflow.reason, "prompt_exceeds_context_window");
+        assert_eq!(
+            error_code(&coded(prompt_overflow.reason, "request rejected")),
+            "prompt_exceeds_context_window"
+        );
+        assert_eq!(
+            request_admission(0, 15, max_output_bytes, &options, context_window, 0).reason,
+            "prompt_and_generation_exceed_context_window"
+        );
+        options.max_tokens = 1;
+        let projected = request_admission(10, 14, max_output_bytes, &options, context_window, 100);
+        options.max_worker_rss_bytes =
+            100 + projected.projected_prompt_bytes + projected.projected_decode_bytes - 1;
+        assert_eq!(
+            request_admission(10, 14, max_output_bytes, &options, context_window, 100).reason,
+            "portable_worker_rss_budget_exceeded"
+        );
+    }
+
+    #[test]
     fn portable_runtime_identity_has_the_fixed_contract() {
         let identity = runtime_identity();
         let contract = &identity["runtime_contract"];
@@ -3140,6 +3499,14 @@ esac
             json!(SUPPORTED_RUNTIME_OPTIONS)
         );
         assert_eq!(contract["context_limits"]["context_window_tokens"], 4096);
+        assert_eq!(
+            contract["context_limits"]["model_context_window_source"],
+            "artifact_identity.context_window_tokens"
+        );
+        assert_eq!(
+            contract["resource_admission"]["request_projection_policy"],
+            "portable_prompt_decode_projection_v1"
+        );
         assert_eq!(contract["runtime_build"]["revision"], LLAMA_CPP_REVISION);
         for name in [
             "schema_behavior",

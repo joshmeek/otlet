@@ -437,6 +437,63 @@ SELECT pg_temp.prove(
 ) \g /dev/null
 
 SELECT pg_temp.prove(
+  'model context budget export',
+  (
+    SELECT bool_and(
+      ARRAY(
+        SELECT key
+        FROM jsonb_object_keys(role.value -> 'artifact_identity') key
+        ORDER BY key COLLATE "C"
+      ) = ARRAY[
+        'bytes', 'context_window_tokens', 'license', 'quantization',
+        'revision', 'sha256', 'source'
+      ]
+      AND role.value #>> '{artifact_identity,context_window_tokens}' = '4096'
+    )
+    FROM workload_pack_documents document
+    CROSS JOIN LATERAL jsonb_each(document.definition -> 'models') role
+    WHERE document.stage = 'baseline'
+  )
+  AND otlet.workload_pack_artifact_identity('{}'::jsonb) ->>
+    'context_window_tokens' = '4096'
+  AND (
+    WITH legacy AS (
+      SELECT jsonb_set(
+        jsonb_set(
+          document.definition,
+          '{models}',
+          (
+            SELECT jsonb_object_agg(
+              role.key,
+              jsonb_set(
+                role.value,
+                '{artifact_identity}',
+                (role.value -> 'artifact_identity') - 'context_window_tokens'
+              )
+              ORDER BY role.key COLLATE "C"
+            )
+            FROM jsonb_each(document.definition -> 'models') role
+          )
+        ),
+        '{watch,model_artifact_identity}',
+        (document.definition #> '{watch,model_artifact_identity}') -
+          'context_window_tokens'
+      ) AS definition
+      FROM workload_pack_documents document
+      WHERE document.stage = 'baseline'
+    )
+    SELECT otlet.workload_pack_shape_error(legacy.definition) IS NULL
+      AND NOT EXISTS (
+        SELECT 1
+        FROM otlet.workload_pack_capability_report(legacy.definition) report
+        WHERE report.component = 'model'
+          AND NOT report.compatible
+      )
+    FROM legacy
+  )
+) \g /dev/null
+
+SELECT pg_temp.prove(
   'export exclusions',
   (
     SELECT
@@ -1474,7 +1531,7 @@ workload_pack_promotion_contract="$(tail -n 1 "$workload_pack_promotion_output")
 rm -f "$workload_pack_promotion_output"
 
 echo "workload_pack_promotion_contract=$workload_pack_promotion_contract"
-[ "$workload_pack_promotion_contract" = "38|true" ] || {
+[ "$workload_pack_promotion_contract" = "39|true" ] || {
   echo "Expected complete workload-pack promotion proof, got $workload_pack_promotion_contract" >&2
   exit 1
 }

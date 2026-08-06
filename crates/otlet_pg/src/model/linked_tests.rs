@@ -1,11 +1,19 @@
 #[cfg(test)]
 mod tests {
     use super::{
-        CancelProbe, JsonCompletion, PromptPrefixState, linked_attempt_deadline,
-        linked_attempt_timed_out, linked_cached_prompt_prefix_tokens,
-        linked_evict_prompt_prefix_states, linked_prompt_prefix_cache_bytes, trim_model_output,
+        CancelProbe, JsonCompletion, ProcessMemorySample, PromptPrefixState,
+        ModelError, RequestMemoryAdmission, linked_attempt_deadline, linked_attempt_timed_out,
+        linked_cached_prompt_prefix_tokens, linked_evict_prompt_prefix_states,
+        linked_physical_context_window_tokens, linked_prompt_batch_tokens,
+        linked_prompt_prefix_cache_bytes, model_context_budget, trim_model_output,
+        validate_linked_token_budget, validate_model_context_budget,
     };
-    use crate::model::LINKED_PROMPT_PREFIX_STATE_MAX_ENTRIES;
+    use crate::model::{
+        LINKED_CONTEXT_WINDOW_QUANTUM_TOKENS, LINKED_CONTEXT_WINDOW_TOKENS,
+        LINKED_MAX_TOKEN_PIECE_BYTES, LINKED_PROMPT_PREFIX_STATE_MAX_BYTES,
+        LINKED_PROMPT_PREFIX_STATE_MAX_ENTRIES,
+    };
+    use serde_json::json;
     use std::mem::size_of;
     use std::sync::Arc;
     use std::time::{Duration, Instant};
@@ -38,7 +46,9 @@ mod tests {
         assert_eq!(hit.as_ref(), [1, 2, 3]);
         assert_eq!(states[0].prefix.as_ref(), "exact prefix");
         assert!(linked_cached_prompt_prefix_tokens(&mut states, "wanted", "collision").is_none());
-        assert!(linked_cached_prompt_prefix_tokens(&mut states, "changed", "exact prefix").is_none());
+        assert!(
+            linked_cached_prompt_prefix_tokens(&mut states, "changed", "exact prefix").is_none()
+        );
     }
 
     #[test]
@@ -125,5 +135,156 @@ mod tests {
         assert!(probe.due());
         assert!(!probe.due());
     }
-}
 
+    #[test]
+    fn model_context_budget_defaults_bounds_and_preserves_overflow_reasons() {
+        let defaults = crate::runtime::RuntimeOptions::default();
+        let legacy = model_context_budget(&json!({}), &defaults)
+            .unwrap_or_else(|err| panic!("{}", err.message));
+        assert_eq!(legacy.tested, LINKED_CONTEXT_WINDOW_TOKENS);
+        assert_eq!(legacy.requested, None);
+        assert_eq!(legacy.effective, LINKED_CONTEXT_WINDOW_TOKENS);
+        assert_eq!(legacy.physical, LINKED_CONTEXT_WINDOW_TOKENS);
+
+        let options = crate::runtime::parse_runtime_options(&json!({
+            "context_window_tokens": 1024,
+            "max_tokens": 25
+        }))
+        .unwrap();
+        let bounded = model_context_budget(&json!({"context_window_tokens": 2048}), &options)
+            .unwrap_or_else(|err| panic!("{}", err.message));
+        assert_eq!(
+            (bounded.tested, bounded.requested, bounded.effective),
+            (2048, Some(1024), 1024)
+        );
+        assert_eq!(bounded.physical, 2048);
+        assert_eq!(linked_physical_context_window_tokens(1), 256);
+        assert_eq!(linked_physical_context_window_tokens(256), 256);
+        assert_eq!(linked_physical_context_window_tokens(2049), 2304);
+        assert_eq!(
+            linked_physical_context_window_tokens(LINKED_CONTEXT_WINDOW_TOKENS),
+            LINKED_CONTEXT_WINDOW_TOKENS
+        );
+        assert_eq!(LINKED_CONTEXT_WINDOW_QUANTUM_TOKENS, 256);
+        assert!(validate_linked_token_budget(999, options.max_tokens, 1024).is_ok());
+        assert_eq!(
+            validate_linked_token_budget(1000, options.max_tokens, 1024)
+                .err()
+                .and_then(|err| err.trace_summary)
+                .and_then(|trace| trace.get("stop_reason").cloned()),
+            Some(json!("prompt_and_generation_exceed_context_window"))
+        );
+
+        let requested_too_large = crate::runtime::parse_runtime_options(&json!({
+            "context_window_tokens": 2049
+        }))
+        .unwrap();
+        let rejected_budget = model_context_budget(
+                &json!({"context_window_tokens": 2048}),
+                &requested_too_large
+            )
+            .unwrap_or_else(|err| panic!("{}", err.message));
+        assert_eq!(rejected_budget.effective, 2048);
+        let rejected = validate_model_context_budget(rejected_budget)
+            .err()
+            .expect("oversized request must fail");
+        assert_eq!(
+            rejected
+            .trace_summary
+            .as_ref()
+            .and_then(|trace| trace.get("stop_reason").cloned()),
+            Some(json!("requested_context_window_exceeds_model_limit"))
+        );
+        let status = crate::runtime::runtime_option_status(
+            &json!({"context_window_tokens": 2049}),
+            2048,
+            2048,
+        );
+        let fingerprint = json!({
+            "output_contract": {
+                "context": {
+                    "tested_context_window_tokens": 2048,
+                    "requested_context_window_tokens": 2049,
+                    "effective_context_window_tokens": 2048,
+                    "physical_context_window_tokens": 2048
+                }
+            }
+        });
+        let rejected = rejected.with_runtime_evidence(
+            &status,
+            "model",
+            &fingerprint,
+            "runtime",
+            "output",
+        );
+        let trace = rejected.trace_summary.expect("runtime evidence must be recorded");
+        assert_eq!(
+            trace.pointer(
+                "/runtime_options_status/context_window/requested_context_window_tokens"
+            ).and_then(serde_json::Value::as_u64),
+            Some(2049)
+        );
+        assert_eq!(
+            trace.pointer(
+                "/runtime_fingerprint/output_contract/context/effective_context_window_tokens"
+            ).and_then(serde_json::Value::as_u64),
+            Some(2048)
+        );
+    }
+
+    #[test]
+    fn request_memory_admission_projects_prompt_and_decode_before_work() {
+        let sample = ProcessMemorySample {
+            rss_bytes: 100,
+            ..ProcessMemorySample::default()
+        };
+        let allowed = RequestMemoryAdmission::new("hello".len(), 3, 7, 0, &sample, u64::MAX);
+        let projected_prompt = "hello".len() + 3 * size_of::<llama_cpp_sys_4::llama_token>();
+        let projected_decode = 7 * LINKED_MAX_TOKEN_PIECE_BYTES
+            + LINKED_MAX_TOKEN_PIECE_BYTES
+            + linked_prompt_batch_tokens() * 16;
+        assert_eq!(allowed.projected_prompt_bytes, projected_prompt as i64);
+        assert_eq!(allowed.projected_decode_bytes, projected_decode as i64);
+        assert_eq!(allowed.decision, "allowed");
+
+        let rejected = RequestMemoryAdmission::new(
+            "hello".len(),
+            3,
+            7,
+            0,
+            &sample,
+            (100 + projected_prompt + projected_decode - 1) as u64,
+        );
+        assert!(rejected.rejected());
+        assert_eq!(
+            rejected.reason,
+            "prompt_decode_projection_exceeds_worker_rss_budget"
+        );
+
+        let prefix_rejected = RequestMemoryAdmission::new(
+            "hello".len(),
+            3,
+            7,
+            LINKED_PROMPT_PREFIX_STATE_MAX_BYTES,
+            &sample,
+            (100
+                + projected_prompt
+                + projected_decode
+                + LINKED_PROMPT_PREFIX_STATE_MAX_BYTES
+                - 1) as u64,
+        );
+        assert_eq!(
+            prefix_rejected.projected_prompt_prefix_state_bytes,
+            LINKED_PROMPT_PREFIX_STATE_MAX_BYTES as i64
+        );
+        assert!(prefix_rejected.rejected());
+
+        let error = ModelError::new("failed").with_memory_trace(json!({"decision": "allowed"}));
+        assert_eq!(
+            error
+                .trace_summary
+                .and_then(|trace| trace.get("memory").cloned()),
+            Some(json!({"decision": "allowed"}))
+        );
+    }
+}

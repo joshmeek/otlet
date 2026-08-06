@@ -303,6 +303,100 @@ impl ModelLoadAdmission {
     }
 }
 
+struct RequestMemoryAdmission {
+    prompt_tokens: i64,
+    max_generation_tokens: i64,
+    projected_prompt_bytes: i64,
+    projected_decode_bytes: i64,
+    projected_prompt_prefix_state_bytes: i64,
+    worker_process_rss_bytes: i64,
+    max_worker_rss_bytes: i64,
+    decision: &'static str,
+    reason: &'static str,
+}
+
+impl RequestMemoryAdmission {
+    fn new(
+        prompt_bytes: usize,
+        prompt_tokens: usize,
+        max_generation_tokens: u64,
+        projected_prompt_prefix_state_bytes: usize,
+        sample: &ProcessMemorySample,
+        max_worker_rss_bytes: u64,
+    ) -> Self {
+        let projected_prompt_bytes = prompt_bytes.saturating_add(
+            prompt_tokens.saturating_mul(std::mem::size_of::<llama_cpp_sys_4::llama_token>()),
+        );
+        let projected_decode_bytes = usize::try_from(max_generation_tokens)
+            .unwrap_or(usize::MAX)
+            .saturating_mul(LINKED_MAX_TOKEN_PIECE_BYTES)
+            .saturating_add(LINKED_MAX_TOKEN_PIECE_BYTES)
+            .saturating_add(linked_prompt_batch_tokens().saturating_mul(16));
+        let mut admission = Self {
+            prompt_tokens: usize_to_i64_saturating(prompt_tokens),
+            max_generation_tokens: u64_to_i64_saturating(max_generation_tokens),
+            projected_prompt_bytes: usize_to_i64_saturating(projected_prompt_bytes),
+            projected_decode_bytes: usize_to_i64_saturating(projected_decode_bytes),
+            projected_prompt_prefix_state_bytes: usize_to_i64_saturating(
+                projected_prompt_prefix_state_bytes,
+            ),
+            worker_process_rss_bytes: sample.rss_bytes,
+            max_worker_rss_bytes: u64_to_i64_saturating(max_worker_rss_bytes),
+            decision: "not_required",
+            reason: "unbounded_worker_rss_reporting_only",
+        };
+        if max_worker_rss_bytes == 0 {
+            return admission;
+        }
+        admission.decision = "rejected";
+        if sample.rss_bytes <= 0 {
+            admission.reason = "required_linux_memory_sample_unavailable";
+            return admission;
+        }
+        let projected_total_bytes = sample
+            .rss_bytes
+            .saturating_add(admission.projected_prompt_bytes)
+            .saturating_add(admission.projected_decode_bytes)
+            .saturating_add(admission.projected_prompt_prefix_state_bytes);
+        if projected_total_bytes <= admission.max_worker_rss_bytes {
+            admission.decision = "allowed";
+            admission.reason = "prompt_decode_projection_fits_worker_rss_budget";
+        } else {
+            admission.reason = "prompt_decode_projection_exceeds_worker_rss_budget";
+        }
+        admission
+    }
+
+    fn rejected(&self) -> bool {
+        self.decision == "rejected"
+    }
+
+    fn as_json(&self) -> Value {
+        json!({
+            "policy": "linked_prompt_token_output_piece_batch_prefix_state_projection_v1",
+            "prompt_tokens": self.prompt_tokens,
+            "max_generation_tokens": self.max_generation_tokens,
+            "projected_prompt_bytes": self.projected_prompt_bytes,
+            "projected_decode_bytes": self.projected_decode_bytes,
+            "projected_prompt_prefix_state_bytes": self.projected_prompt_prefix_state_bytes,
+            "worker_process_rss_bytes": self.worker_process_rss_bytes,
+            "max_worker_rss_bytes": self.max_worker_rss_bytes,
+            "decision": self.decision,
+            "reason": self.reason
+        })
+    }
+}
+
+fn with_request_memory_admission(
+    mut memory_trace: Value,
+    admission: &RequestMemoryAdmission,
+) -> Value {
+    if let Value::Object(memory) = &mut memory_trace {
+        memory.insert("request_admission".to_owned(), admission.as_json());
+    }
+    memory_trace
+}
+
 fn cgroup_memory_headroom(sample: &ProcessMemorySample) -> i64 {
     if sample.cgroup_memory_max_bytes > 0 {
         sample

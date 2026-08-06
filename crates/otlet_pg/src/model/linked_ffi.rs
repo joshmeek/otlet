@@ -7,6 +7,7 @@ struct LinkedLoadEvidence {
     cache_hit: bool,
     memory_before: ProcessMemorySample,
     memory_admission: ModelLoadAdmission,
+    context_budget: ModelContextBudget,
 }
 
 struct LinkedCache {
@@ -27,6 +28,7 @@ struct LinkedCache {
     ctx_ms: i64,
     model_memory_bytes: i64,
     model_parameters: i64,
+    tested_context_window_tokens: u32,
     context_window_tokens: i64,
     model_device_policy: &'static str,
     memory_accounting_policy: &'static str,
@@ -94,9 +96,8 @@ struct LinkedBatch {
 
 impl LinkedBatch {
     fn new(capacity: usize) -> Result<Self, ModelError> {
-        let capacity_i32 = i32::try_from(capacity).map_err(|_| {
-            ModelError::new("linked llama.cpp batch capacity overflowed i32")
-        })?;
+        let capacity_i32 = i32::try_from(capacity)
+            .map_err(|_| ModelError::new("linked llama.cpp batch capacity overflowed i32"))?;
         let value = unsafe { llama_cpp_sys_4::llama_batch_init(capacity_i32, 0, 1) };
         let batch = Self { value, capacity };
         if batch.value.token.is_null()
@@ -122,12 +123,13 @@ impl LinkedBatch {
         logits: bool,
     ) -> Result<(), ModelError> {
         if self.value.n_tokens < 0 {
-            return Err(ModelError::new("linked llama.cpp batch token count is invalid"));
+            return Err(ModelError::new(
+                "linked llama.cpp batch token count is invalid",
+            ));
         }
 
-        let index = usize::try_from(self.value.n_tokens).map_err(|_| {
-            ModelError::new("linked llama.cpp batch token count overflowed usize")
-        })?;
+        let index = usize::try_from(self.value.n_tokens)
+            .map_err(|_| ModelError::new("linked llama.cpp batch token count overflowed usize"))?;
         if index >= self.capacity {
             return Err(ModelError::new(format!(
                 "linked llama.cpp batch capacity exceeded: index {index} capacity {}",
@@ -137,7 +139,9 @@ impl LinkedBatch {
 
         let seq_id = unsafe { *self.value.seq_id.add(index) };
         if seq_id.is_null() {
-            return Err(ModelError::new("linked llama.cpp batch sequence slot is null"));
+            return Err(ModelError::new(
+                "linked llama.cpp batch sequence slot is null",
+            ));
         }
 
         unsafe {
@@ -210,13 +214,11 @@ fn tokenize_linked(
         ));
     }
 
-    let capacity_usize = usize::try_from(capacity).map_err(|_| {
-        ModelError::new("linked llama.cpp prompt capacity overflowed usize")
-    })?;
+    let capacity_usize = usize::try_from(capacity)
+        .map_err(|_| ModelError::new("linked llama.cpp prompt capacity overflowed usize"))?;
     let mut tokens = vec![0; capacity_usize];
-    let tokens_len = i32::try_from(tokens.len()).map_err(|_| {
-        ModelError::new("linked llama.cpp token buffer length overflowed i32")
-    })?;
+    let tokens_len = i32::try_from(tokens.len())
+        .map_err(|_| ModelError::new("linked llama.cpp token buffer length overflowed i32"))?;
     let actual = unsafe {
         llama_cpp_sys_4::llama_tokenize(
             vocab,
@@ -233,9 +235,8 @@ fn tokenize_linked(
             "linked llama.cpp tokenize failed: {actual}"
         )));
     }
-    let actual_usize = usize::try_from(actual).map_err(|_| {
-        ModelError::new("linked llama.cpp tokenize result overflowed usize")
-    })?;
+    let actual_usize = usize::try_from(actual)
+        .map_err(|_| ModelError::new("linked llama.cpp tokenize result overflowed usize"))?;
     if actual_usize > tokens.len() {
         return Err(ModelError::new(format!(
             "linked llama.cpp tokenize wrote more tokens than allocated: {actual} > {}",
@@ -248,7 +249,9 @@ fn tokenize_linked(
 
 fn token_capacity_from_probe(size: i32) -> Result<i32, ModelError> {
     if size == i32::MIN {
-        return Err(ModelError::new("linked llama.cpp tokenize returned invalid token count"));
+        return Err(ModelError::new(
+            "linked llama.cpp tokenize returned invalid token count",
+        ));
     }
 
     Ok(size.abs())
@@ -263,9 +266,8 @@ fn linked_token_to_piece_into(
     if buffer.len() < 128 {
         buffer.resize(128, 0);
     }
-    let buffer_len = i32::try_from(buffer.len()).map_err(|_| {
-        ModelError::new("linked llama.cpp token piece buffer overflowed i32")
-    })?;
+    let buffer_len = i32::try_from(buffer.len())
+        .map_err(|_| ModelError::new("linked llama.cpp token piece buffer overflowed i32"))?;
     let mut size = unsafe {
         llama_cpp_sys_4::llama_token_to_piece(
             vocab,
@@ -280,18 +282,15 @@ fn linked_token_to_piece_into(
         let required = size
             .checked_neg()
             .and_then(|value| usize::try_from(value).ok())
-            .ok_or_else(|| {
-                ModelError::new("linked llama.cpp token piece size was invalid")
-            })?;
+            .ok_or_else(|| ModelError::new("linked llama.cpp token piece size was invalid"))?;
         if required > LINKED_MAX_TOKEN_PIECE_BYTES {
             return Err(ModelError::new(format!(
                 "linked llama.cpp token piece exceeded {LINKED_MAX_TOKEN_PIECE_BYTES} bytes"
             )));
         }
         buffer.resize(required, 0);
-        let buffer_len = i32::try_from(buffer.len()).map_err(|_| {
-            ModelError::new("linked llama.cpp token piece buffer overflowed i32")
-        })?;
+        let buffer_len = i32::try_from(buffer.len())
+            .map_err(|_| ModelError::new("linked llama.cpp token piece buffer overflowed i32"))?;
         size = unsafe {
             llama_cpp_sys_4::llama_token_to_piece(
                 vocab,
@@ -306,9 +305,8 @@ fn linked_token_to_piece_into(
     if size <= 0 {
         return Ok(());
     }
-    let size = usize::try_from(size).map_err(|_| {
-        ModelError::new("linked llama.cpp token piece size overflowed usize")
-    })?;
+    let size = usize::try_from(size)
+        .map_err(|_| ModelError::new("linked llama.cpp token piece size overflowed usize"))?;
     if size > buffer.len() {
         return Err(ModelError::new(format!(
             "linked llama.cpp token piece exceeded its buffer: {size} > {}",

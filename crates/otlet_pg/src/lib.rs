@@ -405,6 +405,11 @@ pgrx::extension_sql_file!(
     name = "bounded_customscan_state",
     requires = ["semantic_planner_statistics"]
 );
+pgrx::extension_sql_file!(
+    "../sql/migrations/0080_model_bound_context_budgets.sql",
+    name = "model_bound_context_budgets",
+    requires = ["bounded_customscan_state"]
+);
 
 #[allow(non_snake_case)]
 #[pgrx::pg_guard]

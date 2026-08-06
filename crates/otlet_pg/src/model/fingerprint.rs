@@ -34,6 +34,9 @@ fn linked_runtime_capabilities() -> Value {
         },
         "context_limits": {
             "context_window_tokens": LINKED_CONTEXT_WINDOW_TOKENS,
+            "physical_context_quantum_tokens": LINKED_CONTEXT_WINDOW_QUANTUM_TOKENS,
+            "model_context_window_source": "artifact_identity.context_window_tokens",
+            "task_context_window_option": "context_window_tokens_optional_lte_model_limit",
             "batch_tokens": batch_tokens,
             "ubatch_tokens": linked_prompt_ubatch_tokens(batch_tokens),
             "max_generation_tokens": 4096
@@ -78,6 +81,16 @@ fn linked_runtime_capabilities() -> Value {
             "default_max_worker_rss_bytes": crate::runtime::DEFAULT_MAX_WORKER_RSS_BYTES,
             "memory_accounting": LINKED_MEMORY_ACCOUNTING_POLICY,
             "load_policy": "one_resident_model_preflight_before_tensor_allocation",
+            "request_projection_policy": "linked_prompt_token_output_piece_batch_prefix_state_projection_v1",
+            "request_projection_evidence": [
+                "prompt_tokens",
+                "max_generation_tokens",
+                "projected_prompt_bytes",
+                "projected_decode_bytes",
+                "projected_prompt_prefix_state_bytes",
+                "decision",
+                "reason"
+            ],
             "required_evidence": [
                 "artifact_bytes",
                 "worker_rss",
@@ -114,6 +127,7 @@ fn runtime_fingerprint(
     verified_artifact_sha256: &str,
     verified_artifact_bytes: u64,
     options: &crate::runtime::RuntimeOptions,
+    context_budget: ModelContextBudget,
 ) -> RuntimeFingerprint {
     let batch_tokens = linked_prompt_batch_tokens();
     let ubatch_tokens = linked_prompt_ubatch_tokens(batch_tokens);
@@ -145,7 +159,11 @@ fn runtime_fingerprint(
             "target_arch": std::env::consts::ARCH
         },
         "context": {
-            "tokens": LINKED_CONTEXT_WINDOW_TOKENS,
+            "tokens": context_budget.tested,
+            "tested_context_window_tokens": context_budget.tested,
+            "requested_context_window_tokens": context_budget.requested,
+            "effective_context_window_tokens": context_budget.effective,
+            "physical_context_window_tokens": context_budget.physical,
             "batch_tokens": batch_tokens,
             "ubatch_tokens": ubatch_tokens,
             "kv_type_k": ggml_type_name(kv_type_k),
@@ -266,7 +284,8 @@ fn host_fingerprint() -> Value {
             "memory_bytes": meminfo_bytes("MemTotal"),
             "swap_bytes": meminfo_bytes("SwapTotal")
         })
-    }).clone()
+    })
+    .clone()
 }
 
 fn read_trimmed(path: &str) -> Value {
@@ -302,6 +321,39 @@ mod runtime_fingerprint_tests {
     use super::*;
 
     #[test]
+    fn capabilities_advertise_model_bound_context_and_request_projection() {
+        let capabilities = linked_runtime_capabilities();
+        assert_eq!(
+            capabilities["context_limits"]["model_context_window_source"],
+            "artifact_identity.context_window_tokens"
+        );
+        assert_eq!(
+            capabilities["context_limits"]["task_context_window_option"],
+            "context_window_tokens_optional_lte_model_limit"
+        );
+        assert_eq!(
+            capabilities["context_limits"]["physical_context_quantum_tokens"],
+            LINKED_CONTEXT_WINDOW_QUANTUM_TOKENS
+        );
+        assert_eq!(
+            capabilities["resource_admission"]["request_projection_policy"],
+            "linked_prompt_token_output_piece_batch_prefix_state_projection_v1"
+        );
+        assert_eq!(
+            capabilities["resource_admission"]["request_projection_evidence"],
+            json!([
+                "prompt_tokens",
+                "max_generation_tokens",
+                "projected_prompt_bytes",
+                "projected_decode_bytes",
+                "projected_prompt_prefix_state_bytes",
+                "decision",
+                "reason"
+            ])
+        );
+    }
+
+    #[test]
     fn output_contract_hash_is_stable_and_scoped() {
         let identity = json!({
             "sha256": "1111111111111111111111111111111111111111111111111111111111111111",
@@ -318,8 +370,38 @@ mod runtime_fingerprint_tests {
             artifact_identity: &identity,
         };
         let options = crate::runtime::RuntimeOptions::default();
-        let first = runtime_fingerprint(model, "model-hash", model.artifact_hash, 24, &options);
-        let second = runtime_fingerprint(model, "model-hash", model.artifact_hash, 24, &options);
+        let context_budget = model_context_budget(&identity, &options)
+            .unwrap_or_else(|err| panic!("{}", err.message));
+        let first = runtime_fingerprint(
+            model,
+            "model-hash",
+            model.artifact_hash,
+            24,
+            &options,
+            context_budget,
+        );
+        let second = runtime_fingerprint(
+            model,
+            "model-hash",
+            model.artifact_hash,
+            24,
+            &options,
+            context_budget,
+        );
+        let narrowed_options = crate::runtime::RuntimeOptions {
+            context_window_tokens: Some(1024),
+            ..Default::default()
+        };
+        let narrowed_budget = model_context_budget(&identity, &narrowed_options)
+            .unwrap_or_else(|err| panic!("{}", err.message));
+        let narrowed = runtime_fingerprint(
+            model,
+            "model-hash",
+            model.artifact_hash,
+            24,
+            &narrowed_options,
+            narrowed_budget,
+        );
         let mut changed_options = crate::runtime::RuntimeOptions::default();
         changed_options.llama_threads = 2;
         let changed = runtime_fingerprint(
@@ -328,6 +410,7 @@ mod runtime_fingerprint_tests {
             model.artifact_hash,
             24,
             &changed_options,
+            context_budget,
         );
         let mut reasoning_on = crate::runtime::RuntimeOptions::default();
         reasoning_on.reasoning = "on";
@@ -337,6 +420,7 @@ mod runtime_fingerprint_tests {
             model.artifact_hash,
             24,
             &reasoning_on,
+            context_budget,
         );
         let mut changed_host = first.document.clone();
         changed_host["host"]["memory_bytes"] = json!(1);
@@ -350,17 +434,41 @@ mod runtime_fingerprint_tests {
         });
         let changed_artifact = runtime_fingerprint(
             JobModelRef {
-                artifact_hash: changed_identity.get("sha256").and_then(Value::as_str).unwrap(),
+                artifact_hash: changed_identity
+                    .get("sha256")
+                    .and_then(Value::as_str)
+                    .unwrap(),
                 artifact_identity: &changed_identity,
                 ..model
             },
             "changed-model-hash",
-            changed_identity.get("sha256").and_then(Value::as_str).unwrap(),
+            changed_identity
+                .get("sha256")
+                .and_then(Value::as_str)
+                .unwrap(),
             24,
             &options,
+            context_budget,
         );
 
         assert_eq!(first.hash, second.hash);
+        assert_eq!(
+            first.document["output_contract"]["context"]["effective_context_window_tokens"],
+            LINKED_CONTEXT_WINDOW_TOKENS
+        );
+        assert_eq!(
+            narrowed.document["output_contract"]["context"]["requested_context_window_tokens"],
+            1024
+        );
+        assert_eq!(
+            narrowed.document["output_contract"]["context"]["effective_context_window_tokens"],
+            1024
+        );
+        assert_eq!(
+            narrowed.document["output_contract"]["context"]["physical_context_window_tokens"],
+            LINKED_CONTEXT_WINDOW_TOKENS
+        );
+        assert_ne!(first.output_contract_hash, narrowed.output_contract_hash);
         assert_eq!(first.output_contract_hash, second.output_contract_hash);
         assert_ne!(first.output_contract_hash, changed.output_contract_hash);
         assert_ne!(
@@ -378,7 +486,13 @@ mod runtime_fingerprint_tests {
     #[test]
     fn quantization_comes_from_common_gguf_names() {
         assert_eq!(artifact_quantization("Qwen3.5-4B-Q4_K_M.gguf"), "Q4_K_M");
-        assert_eq!(artifact_quantization("model-IQ4_XS-00001-of-00002.gguf"), "IQ4_XS");
-        assert_eq!(artifact_quantization("model.gguf"), "artifact_bound_unknown");
+        assert_eq!(
+            artifact_quantization("model-IQ4_XS-00001-of-00002.gguf"),
+            "IQ4_XS"
+        );
+        assert_eq!(
+            artifact_quantization("model.gguf"),
+            "artifact_bound_unknown"
+        );
     }
 }

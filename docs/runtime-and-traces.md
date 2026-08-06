@@ -220,6 +220,35 @@ SQL shows whether the model loaded, is busy, failed, cached, or went over budget
 
 Generated runs record `memory_evidence` before and after the model path. Typed receipt and runtime-status columns expose process RSS and swap, system available memory and swap, major-fault and file-read deltas, PSI totals, supported cgroup-v2 usage and events, and the model-load admission decision. With an explicit RSS budget, a cache miss loads llama.cpp metadata without tensor allocation and projects model, KV, and prompt-decode workspace bytes. Otlet rejects the load when that total exceeds worker-budget, system, or finite cgroup headroom. The current resident model stays usable
 
+Every request also records its artifact-tested, task-requested, and effective context ceilings in the database-authored option status and runtime fingerprint. `memory.request_admission` reports prompt tokens, declared generation tokens, projected prompt and decode bytes, decision, and reason. Context rejection happens before decode, stores no output, and keeps the stable reason in `stop_reason` and the `otlet.failure.v1.runtime_configuration_rejected` taxonomy
+
+```sql
+SELECT receipt_id,
+       COALESCE(
+         trace_summary #>> '{runtime_options_status,context_window,tested_context_window_tokens}',
+         trace_summary #>> '{runtime_options_status,envelope,tested_context_window_tokens}'
+       ) AS tested_tokens,
+       COALESCE(
+         trace_summary #>> '{runtime_options_status,context_window,requested_context_window_tokens}',
+         trace_summary #>> '{runtime_options_status,envelope,requested_context_window_tokens}'
+       ) AS requested_tokens,
+       COALESCE(
+         trace_summary #>> '{runtime_options_status,context_window,effective_context_window_tokens}',
+         trace_summary #>> '{runtime_options_status,envelope,effective_context_window_tokens}'
+       ) AS effective_tokens,
+       trace_summary #>> '{memory,request_admission,prompt_tokens}' AS prompt_tokens,
+       trace_summary #>> '{memory,request_admission,max_generation_tokens}' AS max_generation_tokens,
+       trace_summary #>> '{memory,request_admission,projected_prompt_bytes}' AS projected_prompt_bytes,
+       trace_summary #>> '{memory,request_admission,projected_decode_bytes}' AS projected_decode_bytes,
+       trace_summary #>> '{memory,request_admission,projected_prompt_prefix_state_bytes}' AS projected_prompt_prefix_state_bytes,
+       trace_summary #>> '{memory,request_admission,decision}' AS request_admission,
+       trace_summary #>> '{memory,request_admission,reason}' AS request_admission_reason,
+       trace_summary ->> 'stop_reason' AS stop_reason
+FROM otlet.inference_receipt_trace_status
+ORDER BY receipt_id DESC
+LIMIT 1;
+```
+
 ```sql
 SELECT model_load_admission_decision,
        model_load_admission_reason,
