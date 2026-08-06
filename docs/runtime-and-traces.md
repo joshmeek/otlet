@@ -29,6 +29,43 @@ ORDER BY runtime_id;
 
 Use this view to choose a compatible runtime. The native worker declares its 10-second transaction and 1-second lock deadlines here and records the applied values in each `worker_started` event. PostgreSQL rolls a timed-out transaction back, restarts the worker, and leaves fenced leases for retry or reclaim. The portable worker keeps its separate process deadlines. Use `otlet.runtime_status` and the portable status views for observed residency, health, memory, claims, and receipts
 
+## Inspect Route Readiness
+
+Auditors and operators with delegated access can inspect each configured direct, cheap, and strong route before queued work relies on it:
+
+```sql
+SELECT task_name,
+       workload_revision_hash,
+       selection_role,
+       model_name,
+       registration_state,
+       native_eligible_workers,
+       portable_eligible_workers,
+       route_ready,
+       readiness_reason
+FROM otlet.route_readiness_status
+ORDER BY task_name, selection_role;
+```
+
+The view keeps direct and cheap as separate routes even when both use the same model. A native route needs a live worker in the current database, supported runtime options, a claim-ready exact artifact, and no errored model slot. A portable route also needs an active protocol, the complete eight-RPC worker grant, current incarnation, matching artifact, claim-reported RSS compatible with the workload, ready model, and heartbeat no older than two minutes. Busy workers remain ready
+
+Portable cheap-to-strong handoffs stay on the same job. When their strong route is not ready, `otlet.stranded_escalation_status` reports the job immediately without a minimum retry age:
+
+```sql
+SELECT job_id,
+       task_name,
+       workload_revision_hash,
+       strong_model_name,
+       escalated_at,
+       escalation_age,
+       escalation_reason,
+       stranded_reason
+FROM otlet.stranded_escalation_status
+ORDER BY escalated_at, job_id;
+```
+
+`escalated_at` comes from the latest cheap receipt and falls back to job creation only for an invalid handoff with no cheap receipt. Active heads and every revision with queued work remain visible, including paused direct work and non-head evaluation jobs. Non-head evaluation work can be ready while non-head production work reports `workload_revision_inactive`. The grant helpers expose both views to auditors and operators while `PUBLIC` remains closed
+
 ## Step 1 - Inspect Model Selection Attempts
 
 ```sql

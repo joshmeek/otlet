@@ -880,7 +880,7 @@ $function$;
 SELECT concat_ws('|',
   max(version),
   count(*),
-  array_agg(version ORDER BY version) = ARRAY(SELECT generate_series(1, 82)),
+  array_agg(version ORDER BY version) = ARRAY(SELECT generate_series(1, 83)),
   bool_and(file ~ ('(^|/)' || lpad(version::text, 4, '0') || '_')),
   (SELECT value FROM public.portable_upgrade_sentinel),
   (
@@ -1324,12 +1324,69 @@ SELECT concat_ws('|',
     WHERE sentinel.id = 1
       AND function.oid =
         'otlet.semantic_index_plan(text,boolean,text)'::regprocedure
+  ),
+  (
+    pg_catalog.to_regclass('otlet.route_readiness_status') IS NOT NULL
+    AND pg_catalog.to_regclass('otlet.stranded_escalation_status') IS NOT NULL
+    AND EXISTS (
+      SELECT 1
+      FROM otlet.route_readiness_status route
+      WHERE route.task_name = 'portable_preflight_probe'
+        AND route.selection_role = 'direct'
+        AND route.model_name = 'model_concurrency_probe'
+        AND route.registration_state = 'active'
+    )
+    AND NOT EXISTS (
+      SELECT 1
+      FROM otlet.stranded_escalation_status stranded
+      WHERE stranded.task_name = 'portable_preflight_probe'
+    )
+    AND NOT pg_catalog.has_table_privilege(
+      'public', 'otlet.route_readiness_status', 'SELECT'
+    )
+    AND NOT pg_catalog.has_table_privilege(
+      'public', 'otlet.stranded_escalation_status', 'SELECT'
+    )
+    AND pg_catalog.has_table_privilege(
+      :'operator_role', 'otlet.route_readiness_status', 'SELECT'
+    )
+    AND pg_catalog.has_table_privilege(
+      :'operator_role', 'otlet.stranded_escalation_status', 'SELECT'
+    )
+    AND pg_catalog.has_function_privilege(
+      :'operator_role', 'otlet.route_readiness_status_rows()', 'EXECUTE'
+    )
+    AND pg_catalog.has_function_privilege(
+      :'operator_role', 'otlet.stranded_escalation_status_rows()', 'EXECUTE'
+    )
+    AND NOT pg_catalog.has_table_privilege(
+      :'partial_auditor_role', 'otlet.route_readiness_status', 'SELECT'
+    )
+    AND NOT pg_catalog.has_table_privilege(
+      :'partial_auditor_role', 'otlet.stranded_escalation_status', 'SELECT'
+    )
+    AND NOT pg_catalog.has_function_privilege(
+      :'partial_auditor_role',
+      'otlet.route_readiness_status_rows()',
+      'EXECUTE'
+    )
+    AND NOT pg_catalog.has_function_privilege(
+      :'partial_auditor_role',
+      'otlet.stranded_escalation_status_rows()',
+      'EXECUTE'
+    )
+    AND NOT pg_catalog.has_function_privilege(
+      'public', 'otlet.route_readiness_status_rows()', 'EXECUTE'
+    )
+    AND NOT pg_catalog.has_function_privilege(
+      'public', 'otlet.stranded_escalation_status_rows()', 'EXECUTE'
+    )
   )
 )
 FROM otlet.portable_schema_migrations;
 SQL
 )"
-[ "$contract" = "82|82|t|t|preserved|t|4096|t|t|t|t|0|t|t|t|t|t|t|t|t|t|t|t|t|t|t" ] || {
+[ "$contract" = "83|83|t|t|preserved|t|4096|t|t|t|t|0|t|t|t|t|t|t|t|t|t|t|t|t|t|t|t" ] || {
   echo "Portable repeat-install contract mismatch: $contract" >&2
   exit 1
 }

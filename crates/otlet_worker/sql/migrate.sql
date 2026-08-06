@@ -270,3 +270,6 @@ $$;
 
 \set portable_migration_file ../../../otlet_pg/sql/migrations/0082_worker_database_operation_deadlines.sql
 \ir migrations/apply.sql
+
+\set portable_migration_file ../../../otlet_pg/sql/migrations/0083_route_readiness_stranded_escalation.sql
+\ir migrations/apply.sql

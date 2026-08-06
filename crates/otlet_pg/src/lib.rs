@@ -420,6 +420,11 @@ pgrx::extension_sql_file!(
     name = "worker_database_operation_deadlines",
     requires = ["native_cancellation_slo"]
 );
+pgrx::extension_sql_file!(
+    "../sql/migrations/0083_route_readiness_stranded_escalation.sql",
+    name = "route_readiness_stranded_escalation",
+    requires = ["worker_database_operation_deadlines"]
+);
 
 #[allow(non_snake_case)]
 #[pgrx::pg_guard]

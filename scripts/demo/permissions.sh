@@ -105,6 +105,8 @@ SELECT (SELECT count(*) = 1 FROM otlet.redaction_policy_status)::text || '|' ||
        (SELECT count(*) >= 0 FROM otlet.portable_worker_status)::text || '|' ||
        (SELECT count(*) >= 0 FROM otlet.portable_claim_status)::text || '|' ||
        (SELECT count(*) >= 0 FROM otlet.portable_receipt_status)::text || '|' ||
+       (SELECT count(*) >= 0 FROM otlet.route_readiness_status)::text || '|' ||
+       (SELECT count(*) >= 0 FROM otlet.stranded_escalation_status)::text || '|' ||
        (SELECT count(*) = 16 FROM otlet.failure_taxonomy)::text || '|' ||
        (SELECT count(*) > 0 FROM otlet.failure_retry_status)::text || '|' ||
        (SELECT count(*) >= 0 FROM otlet.semantic_correction_status_for_task('$row_triage_task'))::text || '|' ||
@@ -113,7 +115,7 @@ ROLLBACK;
 SQL
 )"
 echo "auditor_read_contract=$auditor_read_contract"
-[ "$auditor_read_contract" = "true|true|true|true|true|true|true|true|true|true|true|true|true|true|true|true|true|true|true|true|true|true|true|true" ] || {
+[ "$auditor_read_contract" = "true|true|true|true|true|true|true|true|true|true|true|true|true|true|true|true|true|true|true|true|true|true|true|true|true|true" ] || {
   echo "Expected auditor access to all redacted exports, got $auditor_read_contract" >&2
   exit 1
 }
@@ -236,11 +238,13 @@ SELECT (SELECT count(*) = 1 FROM otlet.audit_review_export WHERE action_id = $me
          'otlet.approve_semantic_correction(bigint,bigint,jsonb,timestamptz,numeric,text,text)',
          'EXECUTE'
        )::text || '|' ||
-       (SELECT count(*) = 1 FROM otlet.access_policy_status)::text;
+       (SELECT count(*) = 1 FROM otlet.access_policy_status)::text || '|' ||
+       (SELECT count(*) >= 0 FROM otlet.route_readiness_status)::text || '|' ||
+       (SELECT count(*) >= 0 FROM otlet.stranded_escalation_status)::text;
 ROLLBACK;
 SQL
 )"
-[ "$operator_audit_contract" = "true|true|true|true|true|true|true|false|true" ] || {
+[ "$operator_audit_contract" = "true|true|true|true|true|true|true|false|true|true|true" ] || {
   echo "Expected operator access to auditor views, got $operator_audit_contract" >&2
   exit 1
 }
@@ -563,6 +567,9 @@ WITH table_grants AS (
             'portable_receipt_status',
             'task_queue_status',
             'task_resource_status',
+            'native_cancellation_slo_status',
+            'route_readiness_status',
+            'stranded_escalation_status',
             'failure_taxonomy',
             'failure_retry_status'
           )
@@ -613,7 +620,9 @@ WITH table_grants AS (
           'semantic_correction_status_for_task',
           'pair_constraint_contract_hash',
           'reviewer_calibration_state',
-          'semantic_time_freshness_state'
+          'semantic_time_freshness_state',
+          'route_readiness_status_rows',
+          'stranded_escalation_status_rows'
         )
     )::bigint AS unexpected_auditor_grants,
     count(*) FILTER (
@@ -644,6 +653,8 @@ WITH table_grants AS (
           'pair_constraint_contract_hash',
           'reviewer_calibration_state',
           'semantic_time_freshness_state',
+          'route_readiness_status_rows',
+          'stranded_escalation_status_rows',
           'dry_run_action',
           'apply_action',
           'application_retry_job'
@@ -705,7 +716,9 @@ WITH table_grants AS (
           'otlet.grant_operator_access(regrole)'::regprocedure,
           'otlet.grant_reviewer_access(regrole)'::regprocedure,
           'otlet.grant_portable_worker_access(regrole)'::regprocedure,
-          'otlet.grant_application_access(regrole)'::regprocedure
+          'otlet.grant_application_access(regrole)'::regprocedure,
+          'otlet.route_readiness_status_rows()'::regprocedure,
+          'otlet.stranded_escalation_status_rows()'::regprocedure
         )
         AND p.proname NOT IN (
           'portable_start_worker',
@@ -769,16 +782,16 @@ CROSS JOIN definer_status;
 SQL
 )"
 echo "permission_catalog_contract=$permission_catalog_contract"
-[ "$permission_catalog_contract" = "false|0|0|0|25|25|25|28|3|11|0|0|0|0|0|0|37|37|0|3|3|3|3|3|3|8|8|8|8|8|8|true" ] || {
+[ "$permission_catalog_contract" = "false|0|0|0|28|27|28|30|3|11|0|0|0|0|0|0|39|39|0|3|3|3|3|3|3|8|8|8|8|8|8|true" ] || {
   echo "Expected exact public, auditor, operator, reviewer, and owner ACLs, got $permission_catalog_contract" >&2
   exit 1
 }
 
 source "$demo_dir/review_provenance.sh"
 
-permission_contract="public=0/0/0|auditor=25/25|operator=25/28|reviewer=3/11|definer=37/37|application=3/3/3|operator_rpc=3/3/3|reviewer_rpc=8/8/8|portable=8/8/8|positive=7|denied=$permission_denied_count"
+permission_contract="public=0/0/0|auditor=28/27|operator=28/30|reviewer=3/11|definer=39/39|application=3/3/3|operator_rpc=3/3/3|reviewer_rpc=8/8/8|portable=8/8/8|positive=7|denied=$permission_denied_count"
 echo "permission_contract=$permission_contract"
-[ "$permission_contract" = "public=0/0/0|auditor=25/25|operator=25/28|reviewer=3/11|definer=37/37|application=3/3/3|operator_rpc=3/3/3|reviewer_rpc=8/8/8|portable=8/8/8|positive=7|denied=112" ] || {
+[ "$permission_contract" = "public=0/0/0|auditor=28/27|operator=28/30|reviewer=3/11|definer=39/39|application=3/3/3|operator_rpc=3/3/3|reviewer_rpc=8/8/8|portable=8/8/8|positive=7|denied=112" ] || {
   echo "Expected complete permission contract, got $permission_contract" >&2
   exit 1
 }
