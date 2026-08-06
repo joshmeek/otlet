@@ -438,6 +438,66 @@ SELECT otlet.run_task(:'row_customscan_watch' || '_task');
 SQL
 wait_task_complete "$row_customscan_task" 4 900 1
 
+customscan_preload_policy_contract="$(psql_exec -qAt <<'SQL'
+SELECT customscan_preload_max_rows::text || '|' ||
+       customscan_preload_max_bytes::text || '|' ||
+       customscan_preload_max_ms::text
+FROM otlet.production_policy_status;
+SQL
+)"
+echo "customscan_preload_policy_contract=$customscan_preload_policy_contract"
+[ "$customscan_preload_policy_contract" = "100000|67108864|30000" ] || {
+  echo "Expected default CustomScan preload policy, got $customscan_preload_policy_contract" >&2
+  exit 1
+}
+
+customscan_preload_decline_plan="$(psql_exec -P border=2 -P null='' \
+  -v watch_name="$row_customscan_watch" <<'SQL'
+BEGIN;
+UPDATE otlet.production_policy
+SET customscan_preload_max_rows = 1
+WHERE name = 'default';
+EXPLAIN (VERBOSE, COSTS, SUMMARY OFF)
+SELECT id
+FROM public.otlet_demo_customscan_signal
+WHERE otlet.semantic_matches(:'watch_name', id, '{}'::jsonb);
+ROLLBACK;
+SQL
+)"
+require_contains "$customscan_preload_decline_plan" \
+  "Seq Scan on public.otlet_demo_customscan_signal" \
+  "Expected preload policy to leave the standard Postgres plan"
+if [[ "$customscan_preload_decline_plan" == *"Otlet Semantic Source CustomScan"* ]]; then
+  echo "Preload estimate above policy unexpectedly added a CustomPath" >&2
+  exit 1
+fi
+
+customscan_preload_hard_cap_contract="$(psql_exec -qAt -v ON_ERROR_STOP=0 \
+  -v watch_name="$row_customscan_watch" 2>&1 <<'SQL'
+BEGIN;
+SET LOCAL plan_cache_mode = force_generic_plan;
+UPDATE otlet.production_policy
+SET customscan_preload_max_rows = 2
+WHERE name = 'default';
+PREPARE customscan_preload_cap AS
+SELECT id
+FROM public.otlet_demo_customscan_signal
+WHERE otlet.semantic_matches(:'watch_name', id, '{}'::jsonb);
+\o /dev/null
+EXPLAIN (VERBOSE, COSTS OFF) EXECUTE customscan_preload_cap;
+\o
+UPDATE otlet.production_policy
+SET customscan_preload_max_rows = 1
+WHERE name = 'default';
+EXECUTE customscan_preload_cap;
+ROLLBACK;
+SQL
+)"
+echo "customscan_preload_hard_cap_contract=$customscan_preload_hard_cap_contract"
+require_contains "$customscan_preload_hard_cap_contract" \
+  "preload hard cap exceeded: dimension=rows actual=2 limit=1" \
+  "Expected a cached CustomScan plan to enforce the current executor row cap"
+
 correlated_customscan_plan="$(psql_exec -P border=2 -P null='' -v watch_name="$row_customscan_watch" <<'SQL'
 EXPLAIN (ANALYZE, VERBOSE, COSTS, SUMMARY OFF, TIMING OFF)
 SELECT repeated.pass, refreshed.id

@@ -23,9 +23,9 @@ install_portable() {
     -f crates/otlet_worker/sql/install.sql
 }
 
-install_portable_through_77() {
+install_portable_through_78() {
   docker exec -w /work/crates/otlet_worker/sql "$container" \
-    sed '/0078_semantic_planner_statistics.sql/,$d' migrate.sql |
+    sed '/0079_bounded_customscan_state.sql/,$d' migrate.sql |
     docker exec -i -w /work/crates/otlet_worker/sql "$container" \
       psql -U postgres -d "$database" -X -q -v ON_ERROR_STOP=1 --single-transaction
 }
@@ -65,7 +65,7 @@ SELECT format(
   'portable upgrade executable proof'
 ) \gexec
 SQL
-install_portable_through_77
+install_portable_through_78
 
 docker exec -i "$container" psql -U postgres -d "$database" \
   -X -q -v ON_ERROR_STOP=1 <<'SQL' >/dev/null
@@ -330,6 +330,14 @@ DECLARE
   version_before bigint;
   refreshed_before timestamptz;
 BEGIN
+  IF NOT (
+    SELECT customscan_preload_max_rows = 100000
+      AND customscan_preload_max_bytes = 67108864
+      AND customscan_preload_max_ms = 30000
+    FROM otlet.production_policy_status
+  ) THEN
+    RAISE EXCEPTION 'portable CustomScan preload defaults are invalid';
+  END IF;
   SELECT legacy_watch_revision_hash
   INTO STRICT revision_hash
   FROM public.portable_upgrade_sentinel
@@ -704,6 +712,15 @@ $proof$;
 ROLLBACK;
 SQL
 
+docker exec -i "$container" psql -U postgres -d "$database" \
+  -X -q -v ON_ERROR_STOP=1 <<'SQL' >/dev/null
+UPDATE otlet.production_policy
+SET customscan_preload_max_rows = 99999,
+    customscan_preload_max_bytes = 67108863,
+    customscan_preload_max_ms = 29999
+WHERE name = 'default';
+SQL
+
 install_portable
 
 contract="$(
@@ -719,6 +736,12 @@ DECLARE
   interactive_rejected boolean := false;
   asynchronous_rejected boolean := false;
   cancellation_rejected boolean := false;
+  preload_rows_rejected boolean := false;
+  preload_rows_upper_rejected boolean := false;
+  preload_bytes_rejected boolean := false;
+  preload_bytes_upper_rejected boolean := false;
+  preload_ms_rejected boolean := false;
+  preload_ms_upper_rejected boolean := false;
 BEGIN
   BEGIN
     UPDATE otlet.production_policy
@@ -741,7 +764,57 @@ BEGIN
   EXCEPTION WHEN check_violation THEN
     cancellation_rejected := true;
   END;
-  RETURN interactive_rejected AND asynchronous_rejected AND cancellation_rejected;
+  BEGIN
+    UPDATE otlet.production_policy
+    SET customscan_preload_max_rows = 0
+    WHERE name = 'default';
+  EXCEPTION WHEN check_violation THEN
+    preload_rows_rejected := true;
+  END;
+  BEGIN
+    UPDATE otlet.production_policy
+    SET customscan_preload_max_rows = 1000001
+    WHERE name = 'default';
+  EXCEPTION WHEN check_violation THEN
+    preload_rows_upper_rejected := true;
+  END;
+  BEGIN
+    UPDATE otlet.production_policy
+    SET customscan_preload_max_bytes = 1023
+    WHERE name = 'default';
+  EXCEPTION WHEN check_violation THEN
+    preload_bytes_rejected := true;
+  END;
+  BEGIN
+    UPDATE otlet.production_policy
+    SET customscan_preload_max_bytes = 1073741825
+    WHERE name = 'default';
+  EXCEPTION WHEN check_violation THEN
+    preload_bytes_upper_rejected := true;
+  END;
+  BEGIN
+    UPDATE otlet.production_policy
+    SET customscan_preload_max_ms = 0
+    WHERE name = 'default';
+  EXCEPTION WHEN check_violation THEN
+    preload_ms_rejected := true;
+  END;
+  BEGIN
+    UPDATE otlet.production_policy
+    SET customscan_preload_max_ms = 300001
+    WHERE name = 'default';
+  EXCEPTION WHEN check_violation THEN
+    preload_ms_upper_rejected := true;
+  END;
+  RETURN interactive_rejected
+    AND asynchronous_rejected
+    AND cancellation_rejected
+    AND preload_rows_rejected
+    AND preload_rows_upper_rejected
+    AND preload_bytes_rejected
+    AND preload_bytes_upper_rejected
+    AND preload_ms_rejected
+    AND preload_ms_upper_rejected;
 END
 $function$;
 
@@ -761,7 +834,7 @@ $function$;
 SELECT concat_ws('|',
   max(version),
   count(*),
-  array_agg(version ORDER BY version) = ARRAY(SELECT generate_series(1, 78)),
+  array_agg(version ORDER BY version) = ARRAY(SELECT generate_series(1, 79)),
   bool_and(file ~ ('(^|/)' || lpad(version::text, 4, '0') || '_')),
   (SELECT value FROM public.portable_upgrade_sentinel),
   (
@@ -834,6 +907,9 @@ SELECT concat_ws('|',
     SELECT interactive_queue_age_p99_target_ms = 30000
       AND asynchronous_queue_age_p99_target_ms = 30000
       AND cancellation_observation_p99_target_ms = 1000
+      AND customscan_preload_max_rows = 99999
+      AND customscan_preload_max_bytes = 67108863
+      AND customscan_preload_max_ms = 29999
       AND NOT pg_catalog.has_table_privilege(
         'public', 'otlet.production_policy_status', 'SELECT'
       )
@@ -1047,7 +1123,7 @@ SELECT concat_ws('|',
 FROM otlet.portable_schema_migrations;
 SQL
 )"
-[ "$contract" = "78|78|t|t|preserved|t|0|t|t|t|t|t|t|t|t|t|t|t|t|t" ] || {
+[ "$contract" = "79|79|t|t|preserved|t|0|t|t|t|t|t|t|t|t|t|t|t|t|t" ] || {
   echo "Portable repeat-install contract mismatch: $contract" >&2
   exit 1
 }

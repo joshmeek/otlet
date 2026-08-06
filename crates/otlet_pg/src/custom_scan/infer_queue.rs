@@ -29,11 +29,10 @@ fn queue_refresh_if_allowed(runtime: &mut RuntimeState, subject_id: &str) {
     if !runtime.allow_refresh {
         return;
     }
-    if runtime.queued_refresh_subjects.contains(subject_id)
-        || runtime
-            .pending_refresh_subjects
-            .iter()
-            .any(|pending| pending == subject_id)
+    if runtime
+        .pending_refresh_subjects
+        .iter()
+        .any(|pending| pending == subject_id)
     {
         runtime.refresh_queue_skips = runtime.refresh_queue_skips.saturating_add(1);
         return;
@@ -72,8 +71,7 @@ fn flush_refresh_queue(runtime: &mut RuntimeState) -> Result<(), String> {
             return Err(err);
         }
     };
-    for (subject_id, queued) in results {
-        runtime.queued_refresh_subjects.insert(subject_id);
+    for (_, queued) in results {
         if queued {
             runtime.queued_refreshes = runtime.queued_refreshes.saturating_add(1);
         } else {
@@ -245,9 +243,7 @@ fn wait_poll_active_or_materialize(
         if is_active {
             return Ok(WaitPollOutcome::StillActive);
         }
-        runtime
-            .semantic_states
-            .insert(subject_id.to_owned(), state);
+        retain_runtime_semantic_state(runtime, subject_id, state)?;
         Ok(WaitPollOutcome::Resolved(state))
     })
 }

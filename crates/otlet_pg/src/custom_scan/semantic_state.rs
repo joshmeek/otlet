@@ -3,10 +3,17 @@ fn load_semantic_states(
     index_name: &str,
     expected_json: &str,
     workload_revision_hash: &str,
+    policy: &SemanticAutoPolicy,
 ) -> Result<LoadedSemanticState, String> {
     if index_kind == SemanticIndexKind::Join {
-        return load_semantic_join_states(index_name, expected_json, workload_revision_hash);
+        return load_semantic_join_states(
+            index_name,
+            expected_json,
+            workload_revision_hash,
+            policy,
+        );
     }
+    let preload_started = std::time::Instant::now();
     pgrx::Spi::connect(|client| {
         let metadata_args = [index_name.into(), workload_revision_hash.into()];
         let metadata = client
@@ -108,8 +115,17 @@ fn load_semantic_states(
             record_type.as_str().into(),
             contract_hash.as_str().into(),
             expected_json.into(),
+            i64::try_from(CUSTOM_SCAN_PRELOAD_ROW_ACCOUNTED_BYTES)
+                .unwrap_or(i64::MAX)
+                .into(),
+            i64::try_from(CUSTOM_SCAN_PRELOAD_FRESHNESS_ACCOUNTED_BYTES)
+                .unwrap_or(i64::MAX)
+                .into(),
+            i64::try_from(policy.preload_max_rows.saturating_add(1))
+                .unwrap_or(i64::MAX)
+                .into(),
         ];
-        let query = format!(
+        let query_prefix = format!(
             "WITH source_rows AS ( \
            {source_rows_sql} \
          ), \
@@ -166,20 +182,59 @@ fn load_semantic_states(
            LEFT JOIN latest_materializations l USING (subject_id) \
            LEFT JOIN active_jobs a USING (subject_id) \
            LEFT JOIN LATERAL {freshness_status_sql} status ON l.subject_id IS NOT NULL \
-         ) \
-         SELECT subject_id, semantic_state, freshness_basis, stale_reason \
-         FROM semantic_state \
-         ORDER BY subject_id NULLS LAST"
+	         ) "
+        );
+        let preflight_query = format!(
+            "{query_prefix} \
+             SELECT \
+               count(subject_id)::pg_catalog.int8 AS preload_rows, \
+               COALESCE(sum( \
+                 $5::pg_catalog.int8 + octet_length(subject_id)::pg_catalog.int8 + \
+                 CASE \
+                   WHEN semantic_state IN ('fresh_match', 'fresh_non_match') \
+                     AND freshness_basis IS NOT NULL \
+                   THEN $6::pg_catalog.int8 + \
+                     octet_length(subject_id)::pg_catalog.int8 + \
+                     octet_length(freshness_basis)::pg_catalog.int8 \
+                   ELSE 0 \
+                 END \
+               ), 0)::pg_catalog.int8 AS preload_bytes \
+             FROM semantic_state"
+        );
+        let preflight = client
+            .select(preflight_query.as_str(), Some(1), &query_args)
+            .map_err(to_string)?;
+        let preflight_row = preflight.first();
+        let preload_rows = preflight_row
+            .get_by_name::<i64, _>("preload_rows")
+            .map_err(to_string)?
+            .map_or(0, nonnegative_count);
+        let preload_bytes = preflight_row
+            .get_by_name::<i64, _>("preload_bytes")
+            .map_err(to_string)?
+            .map_or(0, nonnegative_count);
+        require_preload_within_caps(
+            preload_rows,
+            preload_bytes,
+            preload_elapsed_ms(preload_started),
+            policy,
+        )?;
+        let query = format!(
+            "{query_prefix} \
+             SELECT subject_id, semantic_state, freshness_basis, stale_reason \
+             FROM semantic_state \
+             ORDER BY subject_id NULLS LAST \
+             LIMIT $7"
         );
         let table = client
             .select(query.as_str(), None, &query_args)
             .map_err(to_string)?;
-        let capacity = table.len().max(8);
-        let mut subjects = HashMap::with_capacity(capacity);
+        let mut subjects = HashMap::new();
         let mut subject_counts = PreloadedSubjectCounts::new();
         let mut freshness_basis_counts = BTreeMap::new();
         let mut stale_reason_counts = BTreeMap::new();
-        let mut freshness_basis_by_subject = HashMap::with_capacity(capacity);
+        let mut freshness_basis_by_subject = HashMap::new();
+        let mut actual_preload_bytes = 0_u64;
         for row in table {
             let Some(subject_id) = row
                 .get_by_name::<String, _>("subject_id")
@@ -196,15 +251,26 @@ fn load_semantic_states(
             let state = SubjectSemanticState::from_label(&label).ok_or_else(|| {
                 format!("otlet unexpected semantic_state from preload SPI: {label}")
             })?;
-            if matches!(
+            let freshness_basis = if matches!(
                 state,
                 SubjectSemanticState::FreshMatch | SubjectSemanticState::FreshNonMatch
-            ) && let Some(freshness_basis) = row
-                .get_by_name::<String, _>("freshness_basis")
-                .map_err(to_string)?
-            {
-                // One clone for the aggregate key; move the owned string into
-                // the per-subject map.
+            ) {
+                row.get_by_name::<String, _>("freshness_basis")
+                    .map_err(to_string)?
+            } else {
+                None
+            };
+            actual_preload_bytes = actual_preload_bytes.saturating_add(
+                accounted_preload_row_bytes(&subject_id, freshness_basis.as_deref()),
+            );
+            require_preload_within_caps(
+                (subjects.len() as u64).saturating_add(1),
+                actual_preload_bytes,
+                preload_elapsed_ms(preload_started),
+                policy,
+            )?;
+            if let Some(freshness_basis) = freshness_basis {
+                // Reuse the owned value after cloning the aggregate key
                 *freshness_basis_counts
                     .entry(freshness_basis.clone())
                     .or_insert(0) += 1;
@@ -223,6 +289,14 @@ fn load_semantic_states(
             subject_counts.record(state);
             subjects.insert(subject_id, state);
         }
+        let actual_preload_ms = preload_elapsed_ms(preload_started);
+        require_preload_within_caps(
+            subjects.len() as u64,
+            actual_preload_bytes,
+            actual_preload_ms,
+            policy,
+        )?;
+        let actual_preload_rows = subjects.len() as u64;
         Ok(LoadedSemanticState {
             source_table,
             task_name,
@@ -236,6 +310,9 @@ fn load_semantic_states(
             freshness_basis_by_subject,
             subjects,
             subject_counts,
+            preload_rows: actual_preload_rows,
+            preload_bytes: actual_preload_bytes,
+            preload_ms: actual_preload_ms,
         })
     })
 }
@@ -244,14 +321,25 @@ fn load_semantic_join_states(
     index_name: &str,
     expected_json: &str,
     workload_revision_hash: &str,
+    policy: &SemanticAutoPolicy,
 ) -> Result<LoadedSemanticState, String> {
+    let preload_started = std::time::Instant::now();
     pgrx::Spi::connect(|client| {
         let args = [
             index_name.into(),
             expected_json.into(),
             workload_revision_hash.into(),
+            i64::try_from(CUSTOM_SCAN_PRELOAD_ROW_ACCOUNTED_BYTES)
+                .unwrap_or(i64::MAX)
+                .into(),
+            i64::try_from(CUSTOM_SCAN_PRELOAD_FRESHNESS_ACCOUNTED_BYTES)
+                .unwrap_or(i64::MAX)
+                .into(),
+            i64::try_from(policy.preload_max_rows.saturating_add(1))
+                .unwrap_or(i64::MAX)
+                .into(),
         ];
-        let query = "WITH meta AS ( \
+        let query_prefix = "WITH meta AS ( \
                    SELECT \
                      revision.task_name, \
                      revision.definition #>> '{source,record_type}' AS record_type, \
@@ -304,9 +392,52 @@ fn load_semantic_join_states(
                      c.freshness_basis \
                    FROM current_rows c \
                    FULL JOIN active_jobs a USING (subject_id) \
-                 ) \
-                 SELECT \
-                   m.task_name, \
+	                 ) ";
+        let preflight_query = format!(
+            "{query_prefix} \
+             SELECT \
+               count(s.subject_id)::pg_catalog.int8 AS preload_rows, \
+               COALESCE(sum( \
+                 $4::pg_catalog.int8 + octet_length(s.subject_id)::pg_catalog.int8 + \
+                 CASE \
+                   WHEN s.semantic_state IN ('fresh_match', 'fresh_non_match') \
+                     AND s.freshness_basis IS NOT NULL \
+                   THEN $5::pg_catalog.int8 + \
+                     octet_length(s.subject_id)::pg_catalog.int8 + \
+                     octet_length(s.freshness_basis)::pg_catalog.int8 \
+                   ELSE 0 \
+                 END \
+               ), 0)::pg_catalog.int8 AS preload_bytes \
+             FROM meta m \
+             LEFT JOIN subjects s ON true"
+        );
+        let preflight = client
+            .select(preflight_query.as_str(), Some(1), &args)
+            .map_err(to_string)?;
+        if preflight.is_empty() {
+            return Err(format!(
+                "otlet semantic join index {index_name} does not exist"
+            ));
+        }
+        let preflight_row = preflight.first();
+        let preload_rows = preflight_row
+            .get_by_name::<i64, _>("preload_rows")
+            .map_err(to_string)?
+            .map_or(0, nonnegative_count);
+        let preload_bytes = preflight_row
+            .get_by_name::<i64, _>("preload_bytes")
+            .map_err(to_string)?
+            .map_or(0, nonnegative_count);
+        require_preload_within_caps(
+            preload_rows,
+            preload_bytes,
+            preload_elapsed_ms(preload_started),
+            policy,
+        )?;
+        let query = format!(
+            "{query_prefix} \
+	                 SELECT \
+	                   m.task_name, \
                    m.record_type, \
                    m.workload_revision_hash, \
                    m.model_ms, \
@@ -315,11 +446,13 @@ fn load_semantic_join_states(
                    s.subject_id, \
                    s.semantic_state, \
                    s.freshness_basis \
-                 FROM meta m \
-                 LEFT JOIN subjects s ON true \
-                 ORDER BY s.subject_id NULLS LAST";
+	                 FROM meta m \
+	                 LEFT JOIN subjects s ON true \
+	                 ORDER BY s.subject_id NULLS LAST \
+                   LIMIT $6"
+        );
         let table = client
-            .select(query, None, &args)
+            .select(query.as_str(), None, &args)
             .map_err(to_string)?;
         if table.is_empty() {
             return Err(format!(
@@ -332,11 +465,11 @@ fn load_semantic_join_states(
         let mut model_ms = 2500.0;
         let mut model_cost_source = "static_fallback".to_owned();
         let mut stale_reasons = "{}".to_owned();
-        let capacity = table.len().max(8);
-        let mut subjects = HashMap::with_capacity(capacity);
+        let mut subjects = HashMap::new();
         let mut subject_counts = PreloadedSubjectCounts::new();
         let mut freshness_basis_counts = BTreeMap::new();
-        let mut freshness_basis_by_subject = HashMap::with_capacity(capacity);
+        let mut freshness_basis_by_subject = HashMap::new();
+        let mut actual_preload_bytes = 0_u64;
         let mut saw_meta = false;
         for row in table {
             if !saw_meta {
@@ -376,13 +509,25 @@ fn load_semantic_join_states(
                 let state = SubjectSemanticState::from_label(&label).ok_or_else(|| {
                     format!("otlet unexpected semantic_state from join preload SPI: {label}")
                 })?;
-                if matches!(
+                let freshness_basis = if matches!(
                     state,
                     SubjectSemanticState::FreshMatch | SubjectSemanticState::FreshNonMatch
-                ) && let Some(freshness_basis) = row
-                    .get_by_name::<String, _>("freshness_basis")
-                    .map_err(to_string)?
-                {
+                ) {
+                    row.get_by_name::<String, _>("freshness_basis")
+                        .map_err(to_string)?
+                } else {
+                    None
+                };
+                actual_preload_bytes = actual_preload_bytes.saturating_add(
+                    accounted_preload_row_bytes(&subject_id, freshness_basis.as_deref()),
+                );
+                require_preload_within_caps(
+                    (subjects.len() as u64).saturating_add(1),
+                    actual_preload_bytes,
+                    preload_elapsed_ms(preload_started),
+                    policy,
+                )?;
+                if let Some(freshness_basis) = freshness_basis {
                     *freshness_basis_counts
                         .entry(freshness_basis.clone())
                         .or_insert(0) += 1;
@@ -399,6 +544,14 @@ fn load_semantic_join_states(
         let loaded_workload_revision_hash = loaded_workload_revision_hash.ok_or_else(|| {
             format!("otlet semantic join index {index_name} has no active workload revision")
         })?;
+        let actual_preload_rows = subjects.len() as u64;
+        let actual_preload_ms = preload_elapsed_ms(preload_started);
+        require_preload_within_caps(
+            actual_preload_rows,
+            actual_preload_bytes,
+            actual_preload_ms,
+            policy,
+        )?;
         Ok(LoadedSemanticState {
             source_table: format!("otlet.semantic_join:{index_name}"),
             task_name,
@@ -412,10 +565,90 @@ fn load_semantic_join_states(
             freshness_basis_by_subject,
             subjects,
             subject_counts,
+            preload_rows: actual_preload_rows,
+            preload_bytes: actual_preload_bytes,
+            preload_ms: actual_preload_ms,
         })
     })
 }
 
 fn freshness_basis_counts_json(counts: &BTreeMap<String, u64>) -> String {
     serde_json::to_string(counts).unwrap_or_else(|_| "{}".to_owned())
+}
+
+fn accounted_preload_row_bytes(subject_id: &str, freshness_basis: Option<&str>) -> u64 {
+    let subject_bytes = u64::try_from(subject_id.len()).unwrap_or(u64::MAX);
+    let freshness_bytes = freshness_basis.map_or(0, |basis| {
+        CUSTOM_SCAN_PRELOAD_FRESHNESS_ACCOUNTED_BYTES
+            .saturating_add(subject_bytes)
+            .saturating_add(u64::try_from(basis.len()).unwrap_or(u64::MAX))
+    });
+    CUSTOM_SCAN_PRELOAD_ROW_ACCOUNTED_BYTES
+        .saturating_add(subject_bytes)
+        .saturating_add(freshness_bytes)
+}
+
+fn preload_elapsed_ms(started: std::time::Instant) -> u64 {
+    let nanos = started.elapsed().as_nanos();
+    u64::try_from(nanos.saturating_add(999_999) / 1_000_000).unwrap_or(u64::MAX)
+}
+
+fn require_preload_within_caps(
+    rows: u64,
+    bytes: u64,
+    elapsed_ms: u64,
+    policy: &SemanticAutoPolicy,
+) -> Result<(), String> {
+    require_preload_within_limits(
+        rows,
+        bytes,
+        elapsed_ms,
+        policy.preload_max_rows,
+        policy.preload_max_bytes,
+        policy.preload_max_ms,
+    )
+}
+
+fn require_preload_within_limits(
+    rows: u64,
+    bytes: u64,
+    elapsed_ms: u64,
+    max_rows: u64,
+    max_bytes: u64,
+    max_ms: u64,
+) -> Result<(), String> {
+    if let Some((dimension, actual, limit)) =
+        preload_cap_violation(rows, bytes, elapsed_ms, max_rows, max_bytes, max_ms)
+    {
+        return Err(format!(
+            "otlet semantic CustomScan preload hard cap exceeded: dimension={dimension} actual={actual} limit={limit}"
+        ));
+    }
+    Ok(())
+}
+
+fn retain_runtime_semantic_state(
+    runtime: &mut RuntimeState,
+    subject_id: &str,
+    state: SubjectSemanticState,
+) -> Result<(), String> {
+    if let Some(existing) = runtime.semantic_states.get_mut(subject_id) {
+        *existing = state;
+        return Ok(());
+    }
+    let rows = (runtime.semantic_states.len() as u64).saturating_add(1);
+    let bytes = runtime
+        .retained_state_bytes
+        .saturating_add(accounted_preload_row_bytes(subject_id, None));
+    require_preload_within_limits(
+        rows,
+        bytes,
+        runtime.actual_preload_ms,
+        runtime.preload_max_rows,
+        runtime.preload_max_bytes,
+        runtime.preload_max_ms,
+    )?;
+    runtime.semantic_states.insert(subject_id.to_owned(), state);
+    runtime.retained_state_bytes = bytes;
+    Ok(())
 }

@@ -16,7 +16,7 @@ Run the installer as the database owner from the repository checkout:
 psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f crates/otlet_worker/sql/install.sql
 ```
 
-The install transaction runs the current SQL contract as migrations `0001` through `0078`. Re-running it skips recorded migrations and preserves existing data. This greenfield path rejects older unversioned `otlet` schemas instead of converting them
+The install transaction runs the current SQL contract as migrations `0001` through `0079`. Re-running it skips recorded migrations and preserves existing data. This greenfield path rejects older unversioned `otlet` schemas instead of converting them
 
 The database keeps zero `otlet` extension objects and zero C-language Otlet functions
 
@@ -255,9 +255,9 @@ Run the repeat-install proof:
 ./scripts/otlet-portable-upgrade-demo.sh
 ```
 
-It installs through migration `0077`, lowers the per-job input and task, model, and total queue-byte caps, grants existing operator, application, reviewer, partial audit, and preflight roles, applies `0078`, and repeats the current install. The proof checks all 78 migrations, revision-pinned maintained semantic counts, read-only exact predicate diagnostics, subject move, delete-reinsert, and truncate behavior, pair invalidation and bounded maintenance, read-only workload sizing, source-check limits, runtime fallback, capacity reserves, declared native service targets, lower-cap preservation, immutable job-origin attribution, per-task queue and claim budgets, existing data and grants, blinded reviewer calibration, review sampling, evidence-linked decisions, time freshness, bounded backfill, workload-pack promotion and rollback, lifecycle, administrative-ledger, workload-acceptance and candidate-set promotion fences, entity-resolution quality decomposition, pair constraints, entity-graph conflict status and gates, bounded validators, queued ask behavior, `PUBLIC` closure, and invariants
+It installs through migration `0078`, lowers the per-job input, task, model, total queue-byte, and CustomScan preload caps, grants existing operator, application, reviewer, partial audit, and preflight roles, applies `0079`, and repeats the current install. The proof checks all 79 migrations, revision-pinned maintained semantic counts, bounded CustomScan policy defaults and validation, lower-cap preservation, read-only exact predicate diagnostics, subject move, delete-reinsert, and truncate behavior, pair invalidation and bounded maintenance, read-only workload sizing, source-check limits, runtime fallback, capacity reserves, declared native service targets, immutable job-origin attribution, per-task queue and claim budgets, existing data and grants, blinded reviewer calibration, review sampling, evidence-linked decisions, time freshness, bounded backfill, workload-pack promotion and rollback, lifecycle, administrative-ledger, workload-acceptance and candidate-set promotion fences, entity-resolution quality decomposition, pair constraints, entity-graph conflict status and gates, bounded validators, queued ask behavior, `PUBLIC` closure, and invariants
 
 ```text
-portable_upgrade_contract=78|78|t|t|preserved|t|0|t|t|t|t|t|t|t|t|t|t|t|t|t
+portable_upgrade_contract=79|79|t|t|preserved|t|0|t|t|t|t|t|t|t|t|t|t|t|t|t
 portable_job_origin_workload_budget_contract=4|2|1|t|t|t|t
 ```

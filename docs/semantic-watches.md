@@ -252,6 +252,7 @@ The SQL plan row and CustomScan EXPLAIN share planner terms
 | Model cost basis | `model_cost_source` | `Model Cost Source` | Ordered basis: task receipt, runtime slot, model receipt, static fallback |
 | Stale reasons | `stale_reasons` | `Planner Stale Reasons` | Shared JSON shape for stale subject counts |
 | Infer-now prediction | `infer_now_subjects`, `fail_closed_subjects` | `Planner Infer Now Subjects`, `Planner Fail Closed Subjects` | CustomScan also reports actual executor counters |
+| Preload budget | (none) | `Estimated Preload Rows`, `Estimated Preload Bytes`, `Estimated Preload Elapsed Ms`, `Preload Estimate Basis`, and `Preload Hard Max ...` | Plan-only fields use maintained subject counts and the plan-time policy; `EXPLAIN ANALYZE` also reports `Actual Preload ...` |
 | Freshness basis | `semantic_index_current_rows.freshness_basis` | `Preloaded Fresh Subjects / Basis`, `Emitted Freshness Basis` | Current-row SQL reports row freshness; CustomScan reports aggregate executor evidence |
 | Child plan attachment | (none) | `Child Plan Attached` | Counter; `1` once begin-scan attaches the Postgres child plan |
 | Source tuple path | (none) | `Source Tuple Provider` | Matches executor context; row scans report `child_plan_execprocnode`, joins report `child_subquery_join_execprocnode` |
@@ -277,10 +278,18 @@ Planner Selected Path: semantic_lookup
 Planner Stale Reasons: {}
 Count Basis: maintained
 Model Cost Source: task_receipt
+Estimated Preload Rows: 3
+Estimated Preload Bytes: 768
+Estimated Preload Elapsed Ms: 2
+Preload Estimate Basis: maintained_subjects_256_bytes_per_row_20_rows_per_ms_plus_1ms
+Preload Hard Max Rows: 100000
+Preload Hard Max Bytes: 67108864
+Preload Hard Max Elapsed Ms: 30000
+Preload Byte Accounting: logical_subject_state_not_heap_or_rss
 Executor Evidence: not collected for plan-only EXPLAIN
 ```
 
-Planning does not evaluate the JSON predicate or preload semantic rows. Use `semantic_predicate_counts(...)` for an exact, read-only predicate diagnostic pinned to the expected workload revision:
+Planning does not evaluate the JSON predicate or preload semantic rows. It estimates 256 logical bytes per maintained subject and `1 + ceil(subjects / 20)` milliseconds. The policy fields `customscan_preload_max_rows`, `customscan_preload_max_bytes`, and `customscan_preload_max_ms` default to 100,000 rows, 64 MiB, and 30 seconds. When an estimate exceeds a cap, Otlet does not add the CustomPath and PostgreSQL uses its standard plan. Use `semantic_predicate_counts(...)` for an exact, read-only predicate diagnostic pinned to the expected workload revision:
 
 ```sql
 SELECT count_basis,
@@ -327,16 +336,28 @@ Custom Scan (Otlet Semantic Source CustomScan) on public.otlet_demo_semantic_ven
   Count Basis: maintained
   Model Cost Source: task_receipt
   Planner Stale Reasons: {}
+  Estimated Preload Rows: 3
+  Estimated Preload Bytes: 768
+  Estimated Preload Elapsed Ms: 2
+  Preload Hard Max Rows: 100000
+  Preload Hard Max Bytes: 67108864
+  Preload Hard Max Elapsed Ms: 30000
+  Preload Byte Accounting: logical_subject_state_not_heap_or_rss
   Preloaded Fresh Subjects / Basis: 3 {"mvcc_match": 3}
   Preloaded Predicate Matches: 3
   Preloaded Predicate Non Matches: 0
   Emitted Freshness Basis: {"mvcc_match": 3}
   Actual Fresh Subjects: 3
+  Actual Preload Rows: 3
+  Actual Preload Bytes: 612
+  Actual Preload Elapsed Ms: 4
 ```
 
-The child scan reads the source table. Otlet strips the semantic predicate from the child plan and evaluates it against preloaded semantic state. `EXPLAIN ANALYZE` adds exact preload and executor counters while the planner count basis remains `maintained`
+The child scan reads the source table. Otlet strips the semantic predicate from the child plan and evaluates it against preloaded semantic state. `EXPLAIN ANALYZE` adds exact preload and executor counters while the planner count basis remains `maintained`. Actual byte accounting is logical, not allocator, heap, or RSS measurement: every subject costs 128 bytes plus its ID bytes, and a fresh subject adds 64 bytes plus another copy of its ID and freshness-basis bytes
 
-CustomScan uses statement preload semantics. Row-marked queries such as `FOR UPDATE` and correlated `LATERAL` relations stay on the standard Postgres plan. Otlet blocks CustomScan for both shapes so Postgres owns locking, parameter propagation, rescans, and row rechecks. For supported CustomScan plans, stale triggers and the next statement pick up concurrent source changes instead of a per-tuple recheck inside that scan
+CustomScan uses statement preload semantics. Before building detailed state, execution uses the statement-current caps and computes exact row and logical-byte totals in one aggregate result. It resolves the caps again for each cached prepared-plan execution, then fetches at most the row cap plus one and checks elapsed time as it builds state. A cached join plan may observe a candidate that had no state during preload; Otlet applies the same row and logical-byte caps before retaining or queuing that subject. Crossing any cap raises `otlet semantic CustomScan preload hard cap exceeded` and fails the statement
+
+Row-marked queries such as `FOR UPDATE` and correlated `LATERAL` relations stay on the standard Postgres plan. Otlet blocks CustomScan for both shapes so Postgres owns locking, parameter propagation, rescans, and row rechecks. For supported CustomScan plans, stale triggers and the next statement pick up concurrent source changes instead of a per-tuple recheck inside that scan
 
 ## Step 8 - Fail Closed On Stale Rows
 

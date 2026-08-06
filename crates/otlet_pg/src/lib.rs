@@ -400,6 +400,11 @@ pgrx::extension_sql_file!(
     name = "semantic_planner_statistics",
     requires = ["workload_enablement_preflight"]
 );
+pgrx::extension_sql_file!(
+    "../sql/migrations/0079_bounded_customscan_state.sql",
+    name = "bounded_customscan_state",
+    requires = ["semantic_planner_statistics"]
+);
 
 #[allow(non_snake_case)]
 #[pgrx::pg_guard]

@@ -44,6 +44,14 @@ unsafe fn prefetch_infer_now_batch(
         let Some(subject_id) = (unsafe { datum_to_text(value, runtime.subject_typid) }) else {
             continue;
         };
+        if !runtime.semantic_states.contains_key(&subject_id) {
+            retain_runtime_semantic_state(
+                runtime,
+                &subject_id,
+                SubjectSemanticState::Missing,
+            )
+            .unwrap_or_else(|err| pgrx::error!("{err}"));
+        }
         let semantic_state = runtime
             .semantic_states
             .get(&subject_id)
@@ -415,8 +423,6 @@ fn finish_infer_now_success_spi(
     runtime.infer_trace_detailed_status = provenance.detailed_trace_status;
     runtime.infer_trace_detailed_captured_tokens = provenance.detailed_trace_captured_tokens;
     runtime.infer_trace_detailed_top_k = provenance.detailed_trace_top_k;
-    runtime
-        .semantic_states
-        .insert(subject_id.to_owned(), state);
+    retain_runtime_semantic_state(runtime, subject_id, state)?;
     Ok(state)
 }

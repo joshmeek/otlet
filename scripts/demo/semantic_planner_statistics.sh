@@ -74,10 +74,37 @@ require_contains "$semantic_plan_only_explain" \
   "Count Basis: maintained" \
   "Expected plan-only CustomScan to use maintained statistics"
 require_contains "$semantic_plan_only_explain" \
+  "Estimated Preload Rows: 1" \
+  "Expected plan-only CustomScan to expose its preload row estimate"
+require_regex "$semantic_plan_only_explain" \
+  'Estimated Preload Bytes: [1-9][0-9]*' \
+  "Expected plan-only CustomScan to expose its preload byte estimate"
+require_regex "$semantic_plan_only_explain" \
+  'Estimated Preload Elapsed Ms: [1-9][0-9]*' \
+  "Expected plan-only CustomScan to expose its preload time estimate"
+require_contains "$semantic_plan_only_explain" \
+  "Preload Estimate Basis: maintained_subjects_256_bytes_per_row_20_rows_per_ms_plus_1ms" \
+  "Expected plan-only CustomScan to expose its preload estimate basis"
+require_contains "$semantic_plan_only_explain" \
+  "Preload Hard Max Rows: 100000" \
+  "Expected plan-only CustomScan to expose its row cap"
+require_contains "$semantic_plan_only_explain" \
+  "Preload Hard Max Bytes: 67108864" \
+  "Expected plan-only CustomScan to expose its byte cap"
+require_contains "$semantic_plan_only_explain" \
+  "Preload Hard Max Elapsed Ms: 30000" \
+  "Expected plan-only CustomScan to expose its time cap"
+require_contains "$semantic_plan_only_explain" \
+  "Preload Byte Accounting: logical_subject_state_not_heap_or_rss" \
+  "Expected plan-only CustomScan to identify logical byte accounting"
+require_contains "$semantic_plan_only_explain" \
   "Executor Evidence: not collected for plan-only EXPLAIN" \
   "Expected plan-only CustomScan to skip exact executor evidence"
-if [[ "$semantic_plan_only_explain" == *"Preloaded Predicate Matches:"* ]]; then
-  echo "Plan-only CustomScan unexpectedly preloaded predicate evidence" >&2
+if [[ "$semantic_plan_only_explain" == *"Actual Preload Rows:"* ||
+      "$semantic_plan_only_explain" == *"Actual Preload Bytes:"* ||
+      "$semantic_plan_only_explain" == *"Actual Preload Elapsed Ms:"* ||
+      "$semantic_plan_only_explain" == *"Preloaded Predicate Matches:"* ]]; then
+  echo "Plan-only CustomScan unexpectedly collected executor evidence" >&2
   exit 1
 fi
 

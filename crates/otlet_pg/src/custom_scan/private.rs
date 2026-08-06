@@ -214,6 +214,13 @@ fn reload_private_planner_stats_plan_only(private: &CustomScanPrivate) -> Semant
                 .max(0.0),
             stale_reasons: text!("stale_reasons", "{}"),
             count_basis: text!("count_basis", "maintained_missing"),
+            preload_estimated_rows: 0,
+            preload_estimated_bytes: 0,
+            preload_estimated_ms: 0,
+            preload_estimate_basis: "unavailable".to_owned(),
+            preload_max_rows: 0,
+            preload_max_bytes: 0,
+            preload_max_ms: 0,
         };
         finish_planner_stats(
             &mut stats,

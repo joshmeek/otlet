@@ -241,6 +241,12 @@ require_contains "$join_customscan_plan" "Semantic Index Kind: join" "Expected j
 require_contains "$join_customscan_plan" "Planner Selected Path: semantic_join_lookup" "Expected join CustomScan lookup path"
 require_contains "$join_customscan_plan" "Count Basis: maintained" "Expected join CustomScan maintained count basis"
 require_contains "$join_customscan_plan" "Model Cost Source:" "Expected join CustomScan model cost source"
+require_contains "$join_customscan_plan" "Estimated Preload Rows: 4" "Expected four estimated join preload rows"
+require_regex "$join_customscan_plan" 'Estimated Preload Bytes: [1-9][0-9]*' "Expected an estimated join preload byte count"
+require_regex "$join_customscan_plan" 'Estimated Preload Elapsed Ms: [1-9][0-9]*' "Expected an estimated join preload time"
+require_contains "$join_customscan_plan" "Actual Preload Rows: 4" "Expected four actual join preload rows"
+require_regex "$join_customscan_plan" 'Actual Preload Bytes: [1-9][0-9]*' "Expected an actual join preload byte count"
+require_regex "$join_customscan_plan" 'Actual Preload Elapsed Ms: [0-9]+' "Expected an actual join preload time"
 require_contains "$join_customscan_plan" "Preloaded Fresh Subjects / Basis: 4" "Expected join CustomScan preload count and basis"
 require_contains "$join_customscan_plan" "Preloaded Predicate Matches:" "Expected join CustomScan predicate match preload count"
 require_contains "$join_customscan_plan" "Preloaded Predicate Non Matches:" "Expected join CustomScan predicate non-match preload count"
@@ -252,6 +258,67 @@ require_contains "$join_customscan_plan" "Actual Stale Subjects: 0" "Expected jo
 require_contains "$join_customscan_plan" "Actual Lookup Rows: 4" "Expected join CustomScan lookup rows"
 require_contains "$join_customscan_plan" "Infer Now Batches: 0" "Expected join CustomScan zero infer-now"
 require_contains "$join_customscan_plan" "Child Plan Source Rows: 4" "Expected join CustomScan child rows"
+
+join_preload_growth_before="$(psql_exec -qAt -v task_name="$join_task" <<'SQL'
+SELECT concat_ws('|',
+  (SELECT count(*) FROM public.otlet_demo_vendor_pair),
+  (SELECT count(*) FROM otlet.jobs WHERE task_name = :'task_name'),
+  (SELECT count(*) FROM otlet.inference_receipts receipt
+   JOIN otlet.jobs job ON job.id = receipt.job_id
+   WHERE job.task_name = :'task_name'),
+  (SELECT count(*) FROM otlet.semantic_materializations WHERE task_name = :'task_name')
+);
+SQL
+)"
+join_preload_growth_contract="$(psql_exec -qAt -v ON_ERROR_STOP=0 \
+  -v index_name="$join_index_name" 2>&1 <<'SQL'
+BEGIN;
+SET LOCAL plan_cache_mode = force_generic_plan;
+UPDATE otlet.production_policy
+SET customscan_preload_max_rows = 4,
+    semantic_auto_wait_ms = 0,
+    semantic_auto_infer_ms = 0,
+    semantic_auto_max_rows = 0,
+    stale_policy = 'refresh_then_fail_closed'
+WHERE name = 'default';
+PREPARE join_preload_growth AS
+SELECT subject_id
+FROM (
+  SELECT subject_id
+  FROM public.otlet_demo_vendor_pair_input
+  OFFSET 0
+) pair_subjects
+WHERE otlet.semantic_join_matches_auto(
+  :'index_name', subject_id, '{"match":"same_entity"}'::jsonb
+);
+EXPLAIN (VERBOSE, COSTS OFF) EXECUTE join_preload_growth;
+INSERT INTO public.otlet_demo_vendor_pair (pair_id, left_id, right_id)
+VALUES ('vendor-42:vendor-77', 'vendor-42', 'vendor-77');
+EXECUTE join_preload_growth;
+ROLLBACK;
+SQL
+)"
+require_contains "$join_preload_growth_contract" \
+  "Otlet Semantic Source CustomScan" \
+  "Expected the cached join fixture to establish a CustomScan"
+require_contains "$join_preload_growth_contract" \
+  "preload hard cap exceeded: dimension=rows actual=5 limit=4" \
+  "Expected a new missing join subject to hit the retained-state cap"
+join_preload_growth_after="$(psql_exec -qAt -v task_name="$join_task" <<'SQL'
+SELECT concat_ws('|',
+  (SELECT count(*) FROM public.otlet_demo_vendor_pair),
+  (SELECT count(*) FROM otlet.jobs WHERE task_name = :'task_name'),
+  (SELECT count(*) FROM otlet.inference_receipts receipt
+   JOIN otlet.jobs job ON job.id = receipt.job_id
+   WHERE job.task_name = :'task_name'),
+  (SELECT count(*) FROM otlet.semantic_materializations WHERE task_name = :'task_name')
+);
+SQL
+)"
+[ "$join_preload_growth_after" = "$join_preload_growth_before" ] || {
+  echo "Join preload cap changed pair or semantic evidence state: $join_preload_growth_before -> $join_preload_growth_after" >&2
+  exit 1
+}
 
 join_current_row_contract="$(psql_exec -qAt -v index_name="$join_index_name" <<'SQL'
 SELECT count(*)::text

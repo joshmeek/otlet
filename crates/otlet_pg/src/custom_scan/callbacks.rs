@@ -89,6 +89,9 @@ unsafe extern "C-unwind" fn begin_semantic_custom_scan(
                     wait_ms: private.wait_ms,
                     infer_ms: private.infer_ms,
                     infer_max_rows: private.infer_max_rows,
+                    preload_max_rows: planner_stats.preload_max_rows,
+                    preload_max_bytes: planner_stats.preload_max_bytes,
+                    preload_max_ms: planner_stats.preload_max_ms,
                 },
             );
             return;
@@ -96,6 +99,7 @@ unsafe extern "C-unwind" fn begin_semantic_custom_scan(
         let executor_schema_drift =
             require_custom_scan_source_contract(&private.workload_revision_hash)
                 .unwrap_or_else(|err| pgrx::error!("{err}"));
+        let execution_policy = semantic_auto_policy(private.auto_policy);
         let relation = (*node).ss.ss_currentRelation;
         if relation.is_null() && private.index_kind == SemanticIndexKind::Row {
             pgrx::error!("otlet semantic CustomScan could not open source relation");
@@ -127,6 +131,7 @@ unsafe extern "C-unwind" fn begin_semantic_custom_scan(
             &private.index_name,
             &private.expected_json,
             &private.workload_revision_hash,
+            &execution_policy,
         )
         .unwrap_or_else(|err| pgrx::error!("{err}"));
         if executor_schema_drift {
@@ -145,10 +150,17 @@ unsafe extern "C-unwind" fn begin_semantic_custom_scan(
             loaded_state.freshness_basis_by_subject.clear();
             loaded_state.stale_reasons = format!("{{\"schema_drift\":{source_rows}}}");
         }
-        // Prefer plan-time vocabulary from custom_private; overlay exact preload
-        // counts. Keep executor knobs from plan-time private data.
+        // Keep plan vocabulary and refresh knobs while overlaying exact preload counts
         let (mut planner_stats, preloaded_counts) =
             planner_stats_from_loaded_state(&private, stashed_stats, &mut loaded_state);
+        if planner_stats.preload_estimate_basis == "unavailable" {
+            apply_preload_estimate(
+                &mut planner_stats,
+                execution_policy.preload_max_rows,
+                execution_policy.preload_max_bytes,
+                execution_policy.preload_max_ms,
+            );
+        }
         if executor_schema_drift {
             planner_stats.selected_path = "lookup_fail_closed".to_owned();
             planner_stats.reason = format!(
@@ -179,8 +191,14 @@ unsafe extern "C-unwind" fn begin_semantic_custom_scan(
             } else {
                 private.infer_max_rows
             },
+            preload_max_rows: execution_policy.preload_max_rows,
+            preload_max_bytes: execution_policy.preload_max_bytes,
+            preload_max_ms: execution_policy.preload_max_ms,
         };
         snapshot_planner_state(state, &planner_stats, &policy);
+        (*state).preload_max_rows = execution_policy.preload_max_rows;
+        (*state).preload_max_bytes = execution_policy.preload_max_bytes;
+        (*state).preload_max_ms = execution_policy.preload_max_ms;
         (*state).index_kind = private.index_kind;
         // Child plan is required above; snapshot for EXPLAIN after runtime free.
         (*state).has_child_plan = !child_plan.is_null();
@@ -195,6 +213,9 @@ unsafe extern "C-unwind" fn begin_semantic_custom_scan(
         (*state).preloaded_stale_subjects = preloaded_counts.stale;
         (*state).preloaded_missing_subjects = preloaded_counts.missing;
         (*state).preloaded_inflight_subjects = preloaded_counts.inflight;
+        (*state).actual_preload_rows = loaded_state.preload_rows;
+        (*state).actual_preload_bytes = loaded_state.preload_bytes;
+        (*state).actual_preload_ms = loaded_state.preload_ms;
         let mut runtime = RuntimeState {
             index_kind: private.index_kind,
             index_name: private.index_name,
@@ -213,6 +234,17 @@ unsafe extern "C-unwind" fn begin_semantic_custom_scan(
             planner_path_cost: planner_stats.path_cost,
             planner_infer_decision_rows: planner_stats.infer_decision_rows,
             planner_fail_closed_decision_rows: planner_stats.fail_closed_decision_rows,
+            planner_preload_estimated_rows: planner_stats.preload_estimated_rows,
+            planner_preload_estimated_bytes: planner_stats.preload_estimated_bytes,
+            planner_preload_estimated_ms: planner_stats.preload_estimated_ms,
+            planner_preload_estimate_basis: planner_stats.preload_estimate_basis,
+            preload_max_rows: execution_policy.preload_max_rows,
+            preload_max_bytes: execution_policy.preload_max_bytes,
+            preload_max_ms: execution_policy.preload_max_ms,
+            actual_preload_rows: loaded_state.preload_rows,
+            actual_preload_bytes: loaded_state.preload_bytes,
+            actual_preload_ms: loaded_state.preload_ms,
+            retained_state_bytes: loaded_state.preload_bytes,
             source_table: loaded_state.source_table,
             task_name: loaded_state.task_name,
             workload_revision_hash: loaded_state.workload_revision_hash,
@@ -276,9 +308,6 @@ unsafe extern "C-unwind" fn begin_semantic_custom_scan(
             infer_trace_detailed_captured_tokens: 0,
             infer_trace_detailed_top_k: 0,
             child_plan_rows: 0,
-            queued_refresh_subjects: HashSet::with_capacity(
-                usize::try_from(private.infer_max_rows.max(8)).unwrap_or(8),
-            ),
             pending_refresh_subjects: Vec::with_capacity(CUSTOM_SCAN_REFRESH_BATCH_SIZE),
             pending_output_rows: VecDeque::with_capacity(
                 usize::try_from(private.infer_max_rows)
@@ -312,6 +341,13 @@ unsafe fn snapshot_planner_state(
         (*state).planner_path_cost = planner_stats.path_cost;
         (*state).planner_infer_decision_rows = planner_stats.infer_decision_rows;
         (*state).planner_fail_closed_decision_rows = planner_stats.fail_closed_decision_rows;
+        (*state).planner_preload_estimated_rows = planner_stats.preload_estimated_rows;
+        (*state).planner_preload_estimated_bytes = planner_stats.preload_estimated_bytes;
+        (*state).planner_preload_estimated_ms = planner_stats.preload_estimated_ms;
+        (*state).planner_preload_estimate_basis = pg_cstr(&planner_stats.preload_estimate_basis);
+        (*state).preload_max_rows = planner_stats.preload_max_rows;
+        (*state).preload_max_bytes = planner_stats.preload_max_bytes;
+        (*state).preload_max_ms = planner_stats.preload_max_ms;
     }
 }
 
@@ -363,6 +399,14 @@ unsafe extern "C-unwind" fn semantic_custom_scan_access(
             let Some(subject_id) = datum_to_text(value, runtime.subject_typid) else {
                 continue;
             };
+            if !runtime.semantic_states.contains_key(&subject_id) {
+                retain_runtime_semantic_state(
+                    runtime,
+                    &subject_id,
+                    SubjectSemanticState::Missing,
+                )
+                .unwrap_or_else(|err| pgrx::error!("{err}"));
+            }
             match runtime
                 .semantic_states
                 .get(&subject_id)
@@ -608,7 +652,6 @@ unsafe extern "C-unwind" fn rescan_semantic_custom_scan(node: *mut pg_sys::Custo
             runtime.infer_trace_detailed_top_k = 0;
             runtime.child_plan_rows = 0;
             runtime.emitted_freshness_basis.clear();
-            runtime.queued_refresh_subjects.clear();
             runtime.pending_refresh_subjects.clear();
             runtime.pending_output_rows.clear();
             if !runtime.child_plan.is_null() {

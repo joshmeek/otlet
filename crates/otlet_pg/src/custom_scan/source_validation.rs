@@ -121,20 +121,16 @@ fn nonnegative_count(value: i64) -> u64 {
     value.max(0).cast_unsigned()
 }
 
-#[allow(clippy::too_many_arguments)]
 fn validate_semantic_index_source(
-    index_name: &str,
+    predicate: &SemanticMatchPredicate,
     relid: pg_sys::Oid,
     subject_attno: i16,
-    _expected_json: &str,
-    allow_refresh: bool,
-    wait_ms: u32,
-    infer_ms: u32,
-    infer_max_rows: u32,
-    auto_policy: bool,
 ) -> Option<(SemanticPlannerStats, String)> {
     match pgrx::Spi::connect(|client| {
-        let args = [index_name.into(), i64::from(relid.to_u32()).into()];
+        let args = [
+            predicate.index_name.as_str().into(),
+            i64::from(relid.to_u32()).into(),
+        ];
         let table = client
             .select(
                 "WITH meta AS ( \
@@ -265,14 +261,27 @@ fn validate_semantic_index_source(
                 .get_by_name::<String, _>("count_basis")
                 .map_err(to_string)?
                 .unwrap_or_else(|| "maintained_missing".to_owned()),
+            preload_estimated_rows: 0,
+            preload_estimated_bytes: 0,
+            preload_estimated_ms: 0,
+            preload_estimate_basis: String::new(),
+            preload_max_rows: predicate.preload_max_rows,
+            preload_max_bytes: predicate.preload_max_bytes,
+            preload_max_ms: predicate.preload_max_ms,
         };
         finish_planner_stats(
             &mut stats,
-            allow_refresh,
-            wait_ms,
-            infer_ms,
-            infer_max_rows,
-            auto_policy,
+            predicate.allow_refresh,
+            predicate.wait_ms,
+            predicate.infer_ms,
+            predicate.infer_max_rows,
+            predicate.auto_policy,
+        );
+        apply_preload_estimate(
+            &mut stats,
+            predicate.preload_max_rows,
+            predicate.preload_max_bytes,
+            predicate.preload_max_ms,
         );
         Ok::<Option<(SemanticPlannerStats, String)>, String>(Some((
             stats,
@@ -288,16 +297,10 @@ fn validate_semantic_index_source(
 }
 
 fn validate_semantic_join_index_source(
-    index_name: &str,
-    _expected_json: &str,
-    allow_refresh: bool,
-    wait_ms: u32,
-    infer_ms: u32,
-    infer_max_rows: u32,
-    auto_policy: bool,
+    predicate: &SemanticMatchPredicate,
 ) -> Option<(SemanticPlannerStats, String)> {
     match pgrx::Spi::connect(|client| {
-        let stats_args = [index_name.into()];
+        let stats_args = [predicate.index_name.as_str().into()];
         let stats_table = client
             .select(
                  "WITH meta AS ( \
@@ -411,14 +414,27 @@ fn validate_semantic_join_index_source(
                 .get_by_name::<String, _>("count_basis")
                 .map_err(to_string)?
                 .unwrap_or_else(|| "maintained_missing".to_owned()),
+            preload_estimated_rows: 0,
+            preload_estimated_bytes: 0,
+            preload_estimated_ms: 0,
+            preload_estimate_basis: String::new(),
+            preload_max_rows: predicate.preload_max_rows,
+            preload_max_bytes: predicate.preload_max_bytes,
+            preload_max_ms: predicate.preload_max_ms,
         };
         finish_planner_stats(
             &mut stats,
-            allow_refresh,
-            wait_ms,
-            infer_ms,
-            infer_max_rows,
-            auto_policy,
+            predicate.allow_refresh,
+            predicate.wait_ms,
+            predicate.infer_ms,
+            predicate.infer_max_rows,
+            predicate.auto_policy,
+        );
+        apply_preload_estimate(
+            &mut stats,
+            predicate.preload_max_rows,
+            predicate.preload_max_bytes,
+            predicate.preload_max_ms,
         );
         if stats.selected_path == "semantic_lookup" {
             stats.selected_path = "semantic_join_lookup".to_owned();

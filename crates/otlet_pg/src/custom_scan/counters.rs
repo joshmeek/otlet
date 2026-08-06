@@ -55,6 +55,13 @@ fn planner_stats_from_loaded_state(
         path_cost: 1.0,
         stale_reasons: std::mem::take(&mut loaded_state.stale_reasons),
         count_basis: "executor_exact".to_owned(),
+        preload_estimated_rows: 0,
+        preload_estimated_bytes: 0,
+        preload_estimated_ms: 0,
+        preload_estimate_basis: "unavailable".to_owned(),
+        preload_max_rows: 0,
+        preload_max_bytes: 0,
+        preload_max_ms: 0,
     };
     finish_planner_stats(
         &mut stats,
@@ -138,6 +145,12 @@ unsafe fn snapshot_runtime_counters(
             runtime.infer_trace_detailed_captured_tokens;
         (*state).infer_trace_detailed_top_k = runtime.infer_trace_detailed_top_k;
         (*state).child_plan_rows = runtime.child_plan_rows;
+        (*state).actual_preload_rows = runtime.actual_preload_rows;
+        (*state).actual_preload_bytes = runtime.actual_preload_bytes;
+        (*state).actual_preload_ms = runtime.actual_preload_ms;
+        (*state).preload_max_rows = runtime.preload_max_rows;
+        (*state).preload_max_bytes = runtime.preload_max_bytes;
+        (*state).preload_max_ms = runtime.preload_max_ms;
         (*state).has_child_plan = !runtime.child_plan.is_null() || runtime.owns_child_plan;
         (*state).emitted_freshness_basis =
             pg_cstr(&emitted_freshness_counts_json(&runtime.emitted_freshness_basis));
