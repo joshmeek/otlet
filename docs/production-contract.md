@@ -28,7 +28,7 @@ The five booleans confirm receipts, numeric token steps, numeric top-k alternati
 
 Runtime status shows the resident model slot, cache bounds, memory samples, pressure, and last run metrics
 
-`otlet.runtime_capability_status` is the cold declaration for native and registered portable runtimes. It exposes supported options, schema behavior, context limits, cancellation, tracing, GGUF handling, llama.cpp revision and build features, device settings, and admission policy without requiring a receipt. `otlet.runtime_status` remains the observed native state after work runs
+`otlet.runtime_capability_status` is the cold declaration for native and registered portable runtimes. It exposes supported options, schema behavior, context limits, cancellation, tracing, GGUF handling, llama.cpp revision and build features, device settings, admission policy, and native database-operation deadlines without requiring a receipt. `otlet.runtime_status` remains the observed native state after work runs
 
 ```sql
 SELECT 'runtime_status_contract=' ||

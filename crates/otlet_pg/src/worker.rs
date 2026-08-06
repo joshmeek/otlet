@@ -21,6 +21,9 @@ const EXPIRED_JOB_SWEEP_INTERVAL: Duration = Duration::from_secs(30);
 /// next probe, claim errors, or after productive drain.
 const SCHEMA_READY_PROBE_INTERVAL: Duration = Duration::from_secs(30);
 
+pub(crate) const DATABASE_TRANSACTION_TIMEOUT_MS: i64 = 10_000;
+pub(crate) const DATABASE_LOCK_TIMEOUT_MS: i64 = 1_000;
+
 #[pgrx::pg_guard]
 #[unsafe(no_mangle)]
 pub extern "C-unwind" fn otlet_worker_main(_arg: pgrx::pg_sys::Datum) {
@@ -31,6 +34,9 @@ pub extern "C-unwind" fn otlet_worker_main(_arg: pgrx::pg_sys::Datum) {
     };
     pgrx::log!("otlet worker connecting database={database}");
     BackgroundWorker::connect_worker_to_spi(Some(&database), None);
+    if let Err(error) = BackgroundWorker::transaction(configure_database_deadlines) {
+        pgrx::error!("otlet worker database deadline setup failed: {error}");
+    }
 
     crate::wake::register_worker_latch();
     pgrx::log!("otlet worker started database={database}");
@@ -248,6 +254,23 @@ fn startup_runtime_options() -> pgrx::spi::Result<Value> {
     .ok_or(pgrx::spi::SpiError::InvalidPosition)
 }
 
+fn configure_database_deadlines() -> pgrx::spi::Result<()> {
+    let transaction_timeout = format!("{DATABASE_TRANSACTION_TIMEOUT_MS}ms");
+    let lock_timeout = format!("{DATABASE_LOCK_TIMEOUT_MS}ms");
+    pgrx::Spi::connect_mut(|client| {
+        client.select(
+            "SELECT pg_catalog.set_config('transaction_timeout', $1, false), \
+                    pg_catalog.set_config('lock_timeout', $2, false)",
+            Some(1),
+            &[
+                transaction_timeout.as_str().into(),
+                lock_timeout.as_str().into(),
+            ],
+        )?;
+        Ok(())
+    })
+}
+
 fn record_worker_started(max_worker_rss_bytes: u64) -> pgrx::spi::Result<()> {
     pgrx::Spi::connect_mut(|client| {
         let max_worker_rss_bytes = i64::try_from(max_worker_rss_bytes).unwrap_or(i64::MAX);
@@ -258,9 +281,15 @@ fn record_worker_started(max_worker_rss_bytes: u64) -> pgrx::spi::Result<()> {
                jsonb_build_object(\
                  'database', current_database(), \
                  'role', current_user, \
-                 'default_max_worker_rss_bytes', $1))",
+                 'default_max_worker_rss_bytes', $1, \
+                 'database_transaction_timeout_ms', $2, \
+                 'database_lock_timeout_ms', $3))",
             Some(1),
-            &[max_worker_rss_bytes.into()],
+            &[
+                max_worker_rss_bytes.into(),
+                DATABASE_TRANSACTION_TIMEOUT_MS.into(),
+                DATABASE_LOCK_TIMEOUT_MS.into(),
+            ],
         )?;
         Ok(())
     })

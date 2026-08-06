@@ -21,12 +21,13 @@ SELECT runtime_id,
        artifact_formats,
        runtime_build,
        device_settings,
-       resource_admission
+       resource_admission,
+       database_operations
 FROM otlet.runtime_capability_status
 ORDER BY runtime_id;
 ```
 
-Use this view to choose a compatible runtime. Use `otlet.runtime_status` and the portable status views for observed residency, health, memory, claims, and receipts
+Use this view to choose a compatible runtime. The native worker declares its 10-second transaction and 1-second lock deadlines here and records the applied values in each `worker_started` event. PostgreSQL rolls a timed-out transaction back, restarts the worker, and leaves fenced leases for retry or reclaim. The portable worker keeps its separate process deadlines. Use `otlet.runtime_status` and the portable status views for observed residency, health, memory, claims, and receipts
 
 ## Step 1 - Inspect Model Selection Attempts
 

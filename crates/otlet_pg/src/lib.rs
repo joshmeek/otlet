@@ -415,6 +415,11 @@ pgrx::extension_sql_file!(
     name = "native_cancellation_slo",
     requires = ["model_bound_context_budgets"]
 );
+pgrx::extension_sql_file!(
+    "../sql/migrations/0082_worker_database_operation_deadlines.sql",
+    name = "worker_database_operation_deadlines",
+    requires = ["native_cancellation_slo"]
+);
 
 #[allow(non_snake_case)]
 #[pgrx::pg_guard]

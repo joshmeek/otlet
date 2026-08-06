@@ -97,6 +97,15 @@ fn linked_runtime_capabilities() -> Value {
                 "system_available_memory",
                 "cgroup_memory"
             ]
+        },
+        "database_operations": {
+            "transaction_timeout_ms": crate::worker::DATABASE_TRANSACTION_TIMEOUT_MS,
+            "lock_timeout_ms": crate::worker::DATABASE_LOCK_TIMEOUT_MS,
+            "scope": "native_worker_session",
+            "covered_operations": [
+                "claim", "sweep", "renewal", "receipt", "completion", "materialization"
+            ],
+            "timeout_recovery": "transaction_rollback_worker_restart_lease_reclaim"
         }
     })
 }
@@ -350,6 +359,18 @@ mod runtime_fingerprint_tests {
                 "decision",
                 "reason"
             ])
+        );
+        assert_eq!(
+            capabilities["database_operations"],
+            json!({
+                "transaction_timeout_ms": 10_000,
+                "lock_timeout_ms": 1_000,
+                "scope": "native_worker_session",
+                "covered_operations": [
+                    "claim", "sweep", "renewal", "receipt", "completion", "materialization"
+                ],
+                "timeout_recovery": "transaction_rollback_worker_restart_lease_reclaim"
+            })
         );
     }
 
