@@ -188,6 +188,8 @@ WHERE name = 'vendor_note_summary';
 
 PostgreSQL marks inserts and updates stale and writes one coalesced reconciliation entry per subject in the source transaction. A running worker replays one due entry from heartbeat after commit; admission failure backs off without losing the newest source identity. Portable completion stores the output and semantic materialization in one transaction. Deletes clear the durable entry without inference and remove prior materializations from current-row reads. Canceled jobs do not materialize
 
+For a row watch with `max_age_ms`, `refresh_window_ms`, and `on_overdue: "reconcile"`, the same heartbeat seeds and replays one indexed due subject at a time. Reads stay open during the refresh window and close exactly at expiry. Read queries never enqueue work, paused tasks retain their deadline, source changes supersede a pending time refresh, and a durable attempt marker prevents terminal cleanup from reseeding the same deadline. Correction-owned materializations retain their explicit expiry and re-review path
+
 Pair watches use the same `create_watch(..., kind => 'pair')`, `refresh_semantic_join_index(...)`, `semantic_join_index_current_rows(...)`, and `semantic_join_index_plan(...)` functions as the native installation. Candidate preflight, bounded refresh, pair-source stale triggers, completion materialization, deletion reconciliation, watch export, and status are PostgreSQL-owned and work without the extension
 
 ## Run Deployment Preflight

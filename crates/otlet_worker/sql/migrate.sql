@@ -237,3 +237,6 @@ $$;
 
 \set portable_migration_file ../../../otlet_pg/sql/migrations/0071_reviewer_rubric_calibration.sql
 \ir migrations/apply.sql
+
+\set portable_migration_file ../../../otlet_pg/sql/migrations/0072_time_based_freshness.sql
+\ir migrations/apply.sql

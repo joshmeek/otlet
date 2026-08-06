@@ -22,9 +22,9 @@ install_portable() {
     -f crates/otlet_worker/sql/install.sql
 }
 
-install_portable_through_70() {
+install_portable_through_71() {
   docker exec -w /work/crates/otlet_worker/sql "$container" \
-    sed '/0071_reviewer_rubric_calibration.sql/,$d' migrate.sql |
+    sed '/0072_time_based_freshness.sql/,$d' migrate.sql |
     docker exec -i -w /work/crates/otlet_worker/sql "$container" \
       psql -U postgres -d "$database" -X -q -v ON_ERROR_STOP=1 --single-transaction
 }
@@ -64,7 +64,7 @@ SELECT format(
   'portable upgrade executable proof'
 ) \gexec
 SQL
-install_portable_through_70
+install_portable_through_71
 
 docker exec -i "$container" psql -U postgres -d "$database" \
   -X -q -v ON_ERROR_STOP=1 <<'SQL' >/dev/null
@@ -74,7 +74,9 @@ CREATE TABLE public.portable_upgrade_sentinel (
   export_function_oid oid,
   export_function_acl text,
   audit_review_oid oid,
-  audit_review_acl text
+  audit_review_acl text,
+  legacy_watch_revision_hash text,
+  legacy_materialization_id bigint
 );
 INSERT INTO public.portable_upgrade_sentinel VALUES (1, 'preserved');
 SQL
@@ -203,6 +205,83 @@ INSERT INTO otlet.jobs (
   now() + interval '5 minutes',
   'decision-evidence-legacy-token'
 );
+
+CREATE TABLE public.portable_time_legacy_source (
+  id text PRIMARY KEY,
+  payload text NOT NULL
+);
+INSERT INTO public.portable_time_legacy_source
+VALUES ('legacy-row', 'legacy');
+SELECT otlet.create_watch(
+  watch_name => 'portable_time_legacy',
+  kind => 'row',
+  instruction => 'Return the decision',
+  output_schema => '{"type":"object","properties":{"decision":{"type":"string"}},"required":["decision"],"additionalProperties":false}'::jsonb,
+  model_name => 'model_concurrency_probe',
+  table_name => 'public.portable_time_legacy_source'::regclass,
+  subject_column => 'id',
+  input_columns => ARRAY['id', 'payload']
+) \g /dev/null
+
+DO $proof$
+DECLARE
+  revision_definition jsonb;
+  revision_hash text;
+  input jsonb;
+  record_id bigint;
+  materialization_id bigint;
+BEGIN
+  SELECT revision.definition, revision.workload_revision_hash
+  INTO STRICT revision_definition, revision_hash
+  FROM otlet.workload_revisions revision
+  JOIN otlet.workload_revision_heads head
+    ON head.active_workload_revision_hash = revision.workload_revision_hash
+  WHERE head.task_name = 'portable_time_legacy_task';
+  input := otlet.task_subject_input(
+    revision_definition #>> '{task,input_query}',
+    'legacy-row',
+    revision_definition
+  );
+  INSERT INTO otlet.records (record_type, subject_id, body)
+  VALUES ('portable_time_legacy', 'legacy-row', '{"decision":"keep"}'::jsonb)
+  RETURNING id INTO record_id;
+  INSERT INTO otlet.semantic_materializations (
+    record_id,
+    record_type,
+    source_table,
+    subject_id,
+    source_dependencies,
+    task_name,
+    model_name,
+    body,
+    source_hash,
+    content_hash,
+    contract_hash,
+    freshness_basis,
+    created_at,
+    updated_at
+  ) VALUES (
+    record_id,
+    'portable_time_legacy',
+    'public.portable_time_legacy_source',
+    'legacy-row',
+    otlet.semantic_input_dependencies(input),
+    'portable_time_legacy_task',
+    'model_concurrency_probe',
+    '{"decision":"keep"}'::jsonb,
+    otlet.semantic_source_hash(input),
+    otlet.semantic_content_hash(input, revision_definition #> '{task,input_shaping}'),
+    revision_hash,
+    'content_hash_match',
+    statement_timestamp() - interval '1 day',
+    statement_timestamp() - interval '1 day'
+  ) RETURNING id INTO materialization_id;
+  UPDATE public.portable_upgrade_sentinel
+  SET legacy_watch_revision_hash = revision_hash,
+      legacy_materialization_id = materialization_id
+  WHERE id = 1;
+END;
+$proof$;
 SQL
 
 install_portable
@@ -210,20 +289,85 @@ install_portable
 
 contract="$(
   docker exec -i "$container" psql -U postgres -d "$database" \
-    -X -qAt -v ON_ERROR_STOP=1 <<'SQL'
+    -X -qAt -v ON_ERROR_STOP=1 \
+    -v operator_role="$operator_role" \
+    -v partial_auditor_role="$partial_auditor_role" <<'SQL'
 SELECT concat_ws('|',
   max(version),
   count(*),
-  array_agg(version ORDER BY version) = ARRAY(SELECT generate_series(1, 71)),
+  array_agg(version ORDER BY version) = ARRAY(SELECT generate_series(1, 72)),
   bool_and(file ~ ('(^|/)' || lpad(version::text, 4, '0') || '_')),
   (SELECT value FROM public.portable_upgrade_sentinel),
-  (SELECT count(*) FROM otlet.verify_invariants())
+  (
+    SELECT sentinel.legacy_watch_revision_hash = head.active_workload_revision_hash
+      AND head.active_workload_revision_hash = otlet.identity_hash(
+        'workload_revision',
+        otlet.current_workload_revision_definition('portable_time_legacy_task')
+      )
+      AND otlet.semantic_matches(
+        'portable_time_legacy',
+        'legacy-row',
+        '{"decision":"keep"}'::jsonb
+      )
+      AND EXISTS (
+        SELECT 1
+        FROM otlet.semantic_materializations_effective materialization
+        WHERE materialization.id = sentinel.legacy_materialization_id
+          AND materialization.subject_id = 'legacy-row'
+          AND NOT materialization.stale
+      )
+      AND NOT EXISTS (
+        SELECT 1
+        FROM otlet.watch_time_freshness freshness
+        WHERE freshness.watch_name = 'portable_time_legacy'
+      )
+    FROM public.portable_upgrade_sentinel sentinel
+    JOIN otlet.workload_revision_heads head
+      ON head.task_name = 'portable_time_legacy_task'
+  ),
+  (SELECT count(*) FROM otlet.verify_invariants()),
+  pg_catalog.has_function_privilege(
+    :'operator_role',
+    'otlet.semantic_time_freshness_state('
+      'timestamptz,bigint,bigint,timestamptz)',
+    'EXECUTE'
+  ),
+  NOT pg_catalog.has_function_privilege(
+    :'partial_auditor_role',
+    'otlet.semantic_time_freshness_state('
+      'timestamptz,bigint,bigint,timestamptz)',
+    'EXECUTE'
+  ),
+  NOT pg_catalog.has_function_privilege(
+    'public',
+    'otlet.semantic_time_freshness_state('
+      'timestamptz,bigint,bigint,timestamptz)',
+    'EXECUTE'
+  )
 )
 FROM otlet.portable_schema_migrations;
 SQL
 )"
-[ "$contract" = "71|71|t|t|preserved|0" ] || {
+[ "$contract" = "72|72|t|t|preserved|t|0|t|t|t" ] || {
   echo "Portable repeat-install contract mismatch: $contract" >&2
+  exit 1
+}
+
+portable_time_freshness_contract="$(
+  (
+    cheap_model_name="model_concurrency_probe"
+    time_based_freshness_expect_customscan=false
+    log() { :; }
+    psql_exec() {
+      docker exec -i "$container" psql -U postgres -d "$database" \
+        -X -v ON_ERROR_STOP=1 "$@"
+    }
+    source "$(dirname "$0")/demo/time_based_freshness.sh"
+  ) | awk 'NF { line = $0 } END { print line }'
+)"
+[ "$portable_time_freshness_contract" = \
+  "time_based_freshness_contract=t|t|t|t|t|t|t|t" ] || {
+  echo "Portable time-freshness contract mismatch: $portable_time_freshness_contract" >&2
   exit 1
 }
 

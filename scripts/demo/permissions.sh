@@ -610,7 +610,8 @@ WITH table_grants AS (
           'entity_graph_conflict_status_for_task',
           'semantic_correction_status_for_task',
           'pair_constraint_contract_hash',
-          'reviewer_calibration_state'
+          'reviewer_calibration_state',
+          'semantic_time_freshness_state'
         )
     )::bigint AS unexpected_auditor_grants,
     count(*) FILTER (
@@ -640,6 +641,7 @@ WITH table_grants AS (
           'semantic_correction_status_for_task',
           'pair_constraint_contract_hash',
           'reviewer_calibration_state',
+          'semantic_time_freshness_state',
           'dry_run_action',
           'apply_action',
           'application_retry_job'
@@ -765,16 +767,16 @@ CROSS JOIN definer_status;
 SQL
 )"
 echo "permission_catalog_contract=$permission_catalog_contract"
-[ "$permission_catalog_contract" = "false|0|0|0|23|24|23|27|3|11|0|0|0|0|0|0|37|37|0|3|3|3|3|3|3|8|8|8|8|8|8|true" ] || {
+[ "$permission_catalog_contract" = "false|0|0|0|23|25|23|28|3|11|0|0|0|0|0|0|37|37|0|3|3|3|3|3|3|8|8|8|8|8|8|true" ] || {
   echo "Expected exact public, auditor, operator, reviewer, and owner ACLs, got $permission_catalog_contract" >&2
   exit 1
 }
 
 source "$demo_dir/review_provenance.sh"
 
-permission_contract="public=0/0/0|auditor=23/24|operator=23/27|reviewer=3/11|definer=37/37|application=3/3/3|operator_rpc=3/3/3|reviewer_rpc=8/8/8|portable=8/8/8|positive=7|denied=$permission_denied_count"
+permission_contract="public=0/0/0|auditor=23/25|operator=23/28|reviewer=3/11|definer=37/37|application=3/3/3|operator_rpc=3/3/3|reviewer_rpc=8/8/8|portable=8/8/8|positive=7|denied=$permission_denied_count"
 echo "permission_contract=$permission_contract"
-[ "$permission_contract" = "public=0/0/0|auditor=23/24|operator=23/27|reviewer=3/11|definer=37/37|application=3/3/3|operator_rpc=3/3/3|reviewer_rpc=8/8/8|portable=8/8/8|positive=7|denied=112" ] || {
+[ "$permission_contract" = "public=0/0/0|auditor=23/25|operator=23/28|reviewer=3/11|definer=37/37|application=3/3/3|operator_rpc=3/3/3|reviewer_rpc=8/8/8|portable=8/8/8|positive=7|denied=112" ] || {
   echo "Expected complete permission contract, got $permission_contract" >&2
   exit 1
 }

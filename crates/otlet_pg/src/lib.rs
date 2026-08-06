@@ -365,6 +365,11 @@ pgrx::extension_sql_file!(
     name = "reviewer_rubric_calibration",
     requires = ["review_sampling"]
 );
+pgrx::extension_sql_file!(
+    "../sql/migrations/0072_time_based_freshness.sql",
+    name = "time_based_freshness",
+    requires = ["reviewer_rubric_calibration"]
+);
 
 #[allow(non_snake_case)]
 #[pgrx::pg_guard]

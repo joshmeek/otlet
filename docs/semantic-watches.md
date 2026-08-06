@@ -194,6 +194,23 @@ semantic_index_plan_contract=semantic_lookup|3|3|0|0|1.0000
 
 `semantic_index_plan` shows whether Otlet can reuse materialized state, refresh, wait, or run fresh inference
 
+Add wall-clock freshness to a row watch by using the enqueueing source-change policy and declaring all three time fields:
+
+```json
+{
+  "on_change": "mark_stale_and_enqueue",
+  "max_age_ms": 86400000,
+  "refresh_window_ms": 3600000,
+  "on_overdue": "reconcile"
+}
+```
+
+The materialization remains readable when its age reaches the refresh window. Native pre-claim and portable heartbeat maintenance then seed one due row into durable watch reconciliation. The read closes exactly at `max_age_ms`, even if admission is delayed or exhausted; status remains visible in `otlet.watch_time_freshness_status`. A newer accepted receipt starts a new clock from its immutable completion timestamp. Once work exists for a deadline, `attempted_at` prevents the same deadline from returning after terminal-job cleanup. Source changes still take precedence and retain their existing stale reason
+
+A semantic materialization with a current or expired correction stays under the explicit correction expiry and re-review contract instead of automatic model-age refresh. This keeps a known-wrong model body from regaining authority merely because another inference completed
+
+Use `on_overdue: "fail_closed"` when refresh is operator-driven. Pair watches require this mode because candidate reconciliation must remain one explicit bounded `refresh_semantic_join_index(...)` transaction under the caller's statement timeout. Omitting all three time fields preserves source-change-only freshness. A zero-width refresh window is valid and makes the refresh deadline equal the expiry boundary
+
 ## Step 5 - Read Current Semantic Rows
 
 `semantic_index_current_rows` returns materialized semantic state without adding another public access path:

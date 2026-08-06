@@ -68,6 +68,7 @@ Every shipped track needs SQL-visible state, a closed failure path, executable D
 | Optional native model preload | An owner can preload one registered model with normal artifact, memory, cgroup, fingerprint, and failure checks when predictable first-request latency justifies resident memory |
 | Semantic row watches | Row changes can mark one subject stale, enqueue refresh work, materialize trusted records, and fail closed when stored output no longer matches current source state |
 | Durable watch reconciliation | A row source change persists one coalesced entry per watch and subject with the newest workload revision, source identity, deletion state, and sequence-fenced generation. Native pre-claim and portable heartbeat paths replay one due entry per transaction with bounded backoff. Status exposes pending age and exhaustion, and owners can force replay or acknowledge an exact generation. Pair watches keep explicit atomic full refresh under the caller statement timeout |
+| Time-based freshness | Watches can bind exact `max_age_ms`, `refresh_window_ms`, and `on_overdue` policy to the workload revision. Reads remain open through the refresh window and close at expiry. Row watches can send due subjects through durable reconciliation; pair watches stay fail-closed and use explicit bounded refresh. Accepted receipts provide immutable age anchors, one durable attempt marker prevents terminal reseeding, correction-owned materializations stay on their explicit expiry and re-review lifecycle, and untimed watches keep source-change behavior |
 | Semantic pair watches | Bounded candidate SQL drives pair judgments with plan-cost preflight, caller statement timeout, candidate drift detection, source dependencies, and pair materialization |
 | Native semantic query planning | Native CustomScan serves supported fresh semantic predicates, refreshes bounded stale rows through infer-now, exposes plan evidence, and leaves unsupported correlated or row-locking shapes on a standard PostgreSQL plan |
 | Semantic SQL reads | Native and SQL-only installations expose current row and pair materializations, freshness status, dependency audit, predicate reads, and plan-status functions |
@@ -108,7 +109,6 @@ These tracks complete the first product loop after the contract-safe alpha gate
 
 | Feature | Explanation |
 | --- | --- |
-| Time-based freshness | Let a watch declare `max_age`, refresh window, and overdue policy in addition to source-change freshness. Keep expired reads closed and feed overdue subjects through durable reconciliation |
 | Minimal bounded backfill | Submit one revision over a deterministic paged subject set with progress, pause, cancellation, rate limits, and latest-source checks. Keep backfill behind interactive and catch-up work without building a general scheduler |
 | Workload pack promotion | Extend `otlet.watch.v1` into versioned task, watch, schema, selection, and action-policy packs with lint, semantic diff, capability checks, transactional apply, and rollback metadata. Keep source data, results, secrets, and model files outside the pack |
 
