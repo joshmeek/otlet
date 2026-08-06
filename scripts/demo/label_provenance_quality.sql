@@ -642,9 +642,22 @@ SELECT
   :'cleanup_first_label_id'::bigint AS first_label_id,
   :'cleanup_second_label_id'::bigint AS second_label_id;
 
+ALTER TABLE otlet.eval_labels DISABLE TRIGGER eval_labels_c_adjudication;
+UPDATE otlet.eval_labels label
+SET created_at = label.created_at - interval '2 days',
+    adjudicated_at = label.adjudicated_at - interval '2 days'
+FROM label_cleanup_chain chain
+WHERE label.id IN (chain.first_label_id, chain.second_label_id);
+ALTER TABLE otlet.eval_labels ENABLE TRIGGER eval_labels_c_adjudication;
+UPDATE otlet.production_policy
+SET eval_label_retention = interval '1 day'
+WHERE name = 'default';
+
 DO $body$
 DECLARE
   chain label_cleanup_chain%ROWTYPE;
+  cleanup_run otlet.maintenance_runs%ROWTYPE;
+  cleanup_run_id bigint;
   direct_delete_blocked boolean := false;
   truncate_blocked boolean := false;
   dry_count bigint;
@@ -671,15 +684,16 @@ BEGIN
     truncate_blocked := true;
   END;
   dry_count := otlet.cleanup_eval_label_series(
-    clock_timestamp() + interval '1 day',
+    clock_timestamp() - interval '1 day',
     true
   );
-  deleted_count := otlet.cleanup_eval_label_series(
-    clock_timestamp() + interval '1 day',
-    false
-  );
+  cleanup_run_id := otlet.create_maintenance_run('cleanup');
+  cleanup_run := otlet.run_maintenance_slice(cleanup_run_id, 0);
+  deleted_count := cleanup_run.changed_rows;
   IF dry_count <> 2
      OR deleted_count <> 2
+     OR cleanup_run.control_state <> 'complete'
+     OR cleanup_run.processed_items <> 1
      OR EXISTS (
        SELECT 1
        FROM otlet.eval_labels

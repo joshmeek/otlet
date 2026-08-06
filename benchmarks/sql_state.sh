@@ -434,6 +434,11 @@ perform_cleanup() {
   local sql_removed=false
   local runtime_slots_removed=false
   local model_residue=0
+  local cleanup_generation=0
+  local cleanup_result
+  local cleanup_run_id
+  local cleanup_slice
+  local cleanup_state
 
   if [[ "$keep_sql_state" = "1" ]]; then
     append_kv "$cleanup_tsv" sql_state_removed false
@@ -466,8 +471,52 @@ perform_cleanup() {
 UPDATE otlet.production_policy
 SET sensitive_evidence_mode = 'redacted'
 WHERE name = 'default';
-SELECT * FROM otlet.cleanup_policy_state(false);
 SQL
+    cleanup_run_id="$(psql_value -c "SELECT otlet.create_maintenance_run('cleanup');")"
+    for ((cleanup_slice = 0; cleanup_slice < 1024; cleanup_slice++)); do
+      cleanup_result="$(psql_value \
+        -v run_id="$cleanup_run_id" \
+        -v generation="$cleanup_generation" <<'SQL'
+SELECT slice.control_state || '|' || slice.generation
+FROM otlet.run_maintenance_slice(
+  :'run_id'::bigint,
+  :'generation'::bigint
+) slice;
+SQL
+)"
+      IFS='|' read -r cleanup_state cleanup_generation <<<"$cleanup_result"
+      [[ "$cleanup_state" = "complete" ]] && break
+      [[ "$cleanup_state" = "running" ]] || {
+        echo "Benchmark cleanup maintenance stopped in state $cleanup_state" >&2
+        return 1
+      }
+    done
+    [[ "$cleanup_state" = "complete" ]] || {
+      echo "Benchmark cleanup maintenance exceeded 1024 slices" >&2
+      return 1
+    }
+    cleanup_result="$(psql_value -v run_id="$cleanup_run_id" <<'SQL'
+SELECT generation || '|' || vacuum_handoff_required
+FROM otlet.maintenance_run_status
+WHERE maintenance_run_id = :'run_id'::bigint;
+SQL
+)"
+    IFS='|' read -r cleanup_generation cleanup_state <<<"$cleanup_result"
+    if [[ "$cleanup_state" = "true" ]]; then
+      psql_exec \
+        -v run_id="$cleanup_run_id" \
+        -v generation="$cleanup_generation" >/dev/null <<'SQL'
+SELECT unnest(vacuum_handoff_sql)
+FROM otlet.maintenance_run_status
+WHERE maintenance_run_id = :'run_id'::bigint
+\gexec
+SELECT otlet.acknowledge_maintenance_vacuum(
+  :'run_id'::bigint,
+  :'generation'::bigint,
+  'benchmark cleanup'
+);
+SQL
+    fi
     sensitive_mode_enabled=0
     append_kv "$cleanup_tsv" sensitive_evidence_mode_restored redacted
   fi

@@ -1185,12 +1185,15 @@ SQL
 label_cleanup_isolation_contract="$(psql_exec -qAt <<'SQL'
 BEGIN ISOLATION LEVEL REPEATABLE READ;
 DO $body$
+DECLARE
+  cleanup_run_id bigint;
 BEGIN
+  cleanup_run_id := otlet.create_maintenance_run('cleanup');
   BEGIN
-    PERFORM otlet.cleanup_eval_label_series(clock_timestamp(), false);
+    PERFORM otlet.run_maintenance_slice(cleanup_run_id, 0);
     RAISE EXCEPTION 'negative probe unexpectedly succeeded';
   EXCEPTION WHEN OTHERS THEN
-    IF SQLERRM <> 'otlet evaluation label cleanup requires read committed isolation' THEN
+    IF SQLERRM <> 'otlet cleanup maintenance requires read committed isolation' THEN
       RAISE;
     END IF;
   END;

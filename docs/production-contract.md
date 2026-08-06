@@ -384,9 +384,23 @@ WHERE name = 'default';
 UPDATE otlet.production_policy
 SET sensitive_evidence_mode = 'redacted'
 WHERE name = 'default';
-SELECT * FROM otlet.cleanup_policy_state(false);
 COMMIT;
+
+SELECT otlet.create_maintenance_run(
+  'cleanup', NULL, NULL, 64, 16777216, 1000
+) AS maintenance_run_id \gset
+SELECT *
+FROM otlet.run_maintenance_slice(:maintenance_run_id, 0);
+SELECT *
+FROM otlet.maintenance_run_status
+WHERE maintenance_run_id = :maintenance_run_id;
 ```
+
+`cleanup_policy_state(true)` remains the retention preview and uses the runner's retained-evidence fences. `cleanup_policy_state(false)`, `cleanup_policy_state_without_label_quality(false)`, and `cleanup_eval_label_series(..., false)` reject mutation. Create a durable run and call `run_maintenance_slice(...)` again after a row, WAL, time, or lock stop. Every slice and control transition advances the generation, so each caller must use the generation returned by the prior call
+
+The owner-only runner has four fixed kinds. `cleanup` and `reconciliation` have no target. Reconciliation uses the existing replay path, including due time-refresh seeding, active-work backoff, exhausted-row retry, and `SKIP LOCKED` selection. `archive` requires a paused task and its exact pinned revision, then calls the fail-closed retirement transition. `repair` requires an active row or pair revision and can recreate a missing semantic-statistics row. Archive, repair, evaluation-label series, and retained failed-job chains stay atomic. The runner checks elapsed time and cluster WAL between items, so one item can cross either boundary. Concurrent database writes can make the cluster-WAL check stop a slice early. The primary-item limit remains exact
+
+`changed_rows` counts logical changes reported by completed items. Delete and update slices collect a conservative `vacuum_relations` allowlist, including cascaded and trigger-updated relations. When terminal status reports `vacuum_handoff_required`, run the emitted `VACUUM (ANALYZE)` statements after the slice transaction commits, then call `acknowledge_maintenance_vacuum(...)`. The acknowledgement is write-once. Otlet does not run `VACUUM` inside a function and does not add a maintenance worker or scheduler. Archive retains task evidence in place; the separate evidence-lifecycle contract owns archive-before-delete
 
 Every task also has an explicit top-level source-field allowlist in `input_shaping.source_fields`. A missing allowlist becomes an empty array, so Otlet admits only `{}` until the owner names fields. `create_task`, `run_task`, `admit_task_input`, watch refresh, direct job insertion, and claim all enforce the same contract. Row watches store their selected column list at creation; a later table column does not enter model input by accident
 
@@ -614,6 +628,6 @@ permission_contract=public=0/0/0|auditor=25/25|operator=25/28|reviewer=3/11|defi
 Your application still owns these deployment boundaries:
 
 - add RLS or schema isolation if multiple tenants share the database
-- schedule `otlet.cleanup_policy_state(false)` for worker-event, trace-detail, diagnostic evidence, stale materialization, and unreferenced failed/canceled job pruning
+- schedule caller-driven `cleanup` maintenance slices for worker-event, trace-detail, diagnostic evidence, stale materialization, and unreferenced failed/canceled job pruning, followed by the declared vacuum handoff
 - allow action types your application has code to interpret
 - decide which users inherit the auditor, operator, and reviewer roles, keeping reviewer logins away from gold access

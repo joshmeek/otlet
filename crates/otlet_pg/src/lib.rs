@@ -425,6 +425,11 @@ pgrx::extension_sql_file!(
     name = "route_readiness_stranded_escalation",
     requires = ["worker_database_operation_deadlines"]
 );
+pgrx::extension_sql_file!(
+    "../sql/migrations/0084_bounded_maintenance_execution.sql",
+    name = "bounded_maintenance_execution",
+    requires = ["route_readiness_stranded_escalation"]
+);
 
 #[allow(non_snake_case)]
 #[pgrx::pg_guard]

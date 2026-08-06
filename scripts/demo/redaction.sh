@@ -209,19 +209,21 @@ SET finished_at = now() - interval '2 days'
 WHERE id = :diagnostic_receipt_id;
 CREATE TEMP TABLE redaction_old_dry AS
 SELECT * FROM otlet.cleanup_policy_state(true);
+SELECT otlet.create_maintenance_run('cleanup') AS redaction_old_run_id \gset
 CREATE TEMP TABLE redaction_old_apply AS
-SELECT * FROM otlet.cleanup_policy_state(false);
+SELECT * FROM otlet.run_maintenance_slice(:redaction_old_run_id, 0);
+SELECT otlet.create_maintenance_run('cleanup') AS redaction_old_repeat_run_id \gset
+CREATE TEMP TABLE redaction_old_repeat AS
+SELECT * FROM otlet.run_maintenance_slice(:redaction_old_repeat_run_id, 0);
 SELECT (SELECT sensitive_raw_outputs = 1
                AND sensitive_chosen_texts = 1
                AND sensitive_token_texts = 1
                AND sensitive_alternative_token_texts = 1
                AND dry_run
         FROM redaction_old_dry)::text || '|' ||
-       (SELECT sensitive_raw_outputs = 1
-               AND sensitive_chosen_texts = 1
-               AND sensitive_token_texts = 1
-               AND sensitive_alternative_token_texts = 1
-               AND NOT dry_run
+       (SELECT control_state = 'complete'
+               AND processed_items = 1
+               AND changed_rows = 1
         FROM redaction_old_apply)::text || '|' ||
        (SELECT raw_output IS NULL
                AND raw_output_hash = otlet.portable_text_hash('DIAGNOSTIC-RAW-SENTINEL')
@@ -231,11 +233,10 @@ SELECT (SELECT sensitive_raw_outputs = 1
                AND trace_summary #>> '{detailed_trace,steps,0,token_id}' = '7'
         FROM otlet.inference_receipts
         WHERE id = :diagnostic_receipt_id)::text || '|' ||
-       (SELECT sensitive_raw_outputs = 0
-               AND sensitive_chosen_texts = 0
-               AND sensitive_token_texts = 0
-               AND sensitive_alternative_token_texts = 0
-        FROM otlet.cleanup_policy_state(false))::text;
+       (SELECT control_state = 'complete'
+               AND processed_items = 0
+               AND changed_rows = 0
+        FROM redaction_old_repeat)::text;
 ROLLBACK;
 SQL
 redaction_diagnostic_first="$(sed -n '1p' "$redaction_result_file")"
@@ -279,14 +280,18 @@ SET sensitive_evidence_mode = 'redacted'
 WHERE name = 'default';
 CREATE TEMP TABLE redaction_switch_dry AS
 SELECT * FROM otlet.cleanup_policy_state(true);
+SELECT otlet.create_maintenance_run('cleanup') AS redaction_switch_run_id \gset
 CREATE TEMP TABLE redaction_switch_apply AS
-SELECT * FROM otlet.cleanup_policy_state(false);
+SELECT * FROM otlet.run_maintenance_slice(:redaction_switch_run_id, 0);
 SELECT (SELECT sensitive_raw_outputs = 1
                AND sensitive_chosen_texts = 1
                AND sensitive_token_texts = 1
                AND dry_run
         FROM redaction_switch_dry)::text || '|' ||
-       (SELECT count(*) = 1 FROM redaction_switch_apply)::text || '|' ||
+       (SELECT control_state = 'complete'
+               AND processed_items = 1
+               AND changed_rows = 1
+        FROM redaction_switch_apply)::text || '|' ||
        (SELECT raw_output IS NULL
                AND trace_summary #>> '{detailed_trace,chosen_text}' IS NULL
                AND NOT jsonb_path_exists(trace_summary, '$.detailed_trace.steps[*].token_text')

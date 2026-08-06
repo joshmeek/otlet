@@ -148,11 +148,16 @@ SELECT
 FROM cleanup_contract_jobs;
 CREATE TEMP TABLE cleanup_contract_dry AS
 SELECT * FROM otlet.cleanup_policy_state(true);
+SELECT otlet.create_maintenance_run('cleanup') AS cleanup_contract_run_id \gset
 CREATE TEMP TABLE cleanup_contract_run AS
-SELECT * FROM otlet.cleanup_policy_state(false);
+SELECT * FROM otlet.run_maintenance_slice(:cleanup_contract_run_id, 0);
 SELECT (
-         (SELECT worker_events = 3 AND failed_canceled_jobs = 2 AND dry_run FROM cleanup_contract_dry)
-         AND (SELECT worker_events = 3 AND failed_canceled_jobs = 2 AND NOT dry_run FROM cleanup_contract_run)
+         (SELECT worker_events = 3 AND failed_canceled_jobs = 2 AND dry_run
+          FROM cleanup_contract_dry)
+         AND (SELECT control_state = 'complete'
+                     AND processed_items = 3
+                     AND changed_rows = 5
+              FROM cleanup_contract_run)
        )::text || '|' ||
        ((SELECT count(*) FROM otlet.jobs WHERE task_name = 'cleanup_policy_contract') = 3)::text || '|' ||
        ((SELECT count(*) FROM otlet.worker_events WHERE event_type = 'cleanup_policy_contract') = 2)::text || '|' ||

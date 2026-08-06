@@ -542,8 +542,10 @@ WHERE name = 'default';
 UPDATE otlet.inference_receipts
 SET finished_at = now() - interval '2 days'
 WHERE job_id = :decision_evidence_id;
+SELECT otlet.create_maintenance_run('cleanup') AS decision_evidence_cleanup_run_id \gset
 CREATE TEMP TABLE decision_evidence_cleanup AS
-SELECT * FROM otlet.cleanup_policy_state(false);
+SELECT *
+FROM otlet.run_maintenance_slice(:decision_evidence_cleanup_run_id, 0);
 
 SELECT concat_ws('|',
   (SELECT output_count = 1 FROM decision_evidence_completed),
@@ -605,7 +607,9 @@ SELECT concat_ws('|',
           AND trace_summary #> '{portable_validation,decision_evidence}' =
             (SELECT links FROM decision_evidence_before_cleanup)
           AND raw_output IS NULL
-          AND (SELECT sensitive_raw_outputs >= 1 AND NOT dry_run
+          AND (SELECT control_state = 'complete'
+                      AND processed_items = 1
+                      AND changed_rows = 1
                FROM decision_evidence_cleanup)
           AND trace_summary::text NOT LIKE '%ACME%'
           AND trace_summary::text NOT LIKE '%Acme Inc%'

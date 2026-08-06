@@ -761,10 +761,20 @@ BEGIN
 END;
 $$;
 
-SELECT otlet.cleanup_eval_label_series(
-  clock_timestamp() + interval '1 second',
-  false
-) \g /dev/null
+ALTER TABLE otlet.eval_labels DISABLE TRIGGER eval_labels_c_adjudication;
+UPDATE otlet.eval_labels
+SET created_at = created_at - interval '2 days',
+    adjudicated_at = adjudicated_at - interval '2 days'
+WHERE task_name = 'review_sampling_probe';
+ALTER TABLE otlet.eval_labels ENABLE TRIGGER eval_labels_c_adjudication;
+UPDATE otlet.production_policy
+SET eval_label_retention = interval '1 day'
+WHERE name = 'default';
+CREATE TEMP TABLE review_sampling_cleanup_preview AS
+SELECT * FROM otlet.cleanup_policy_state(true);
+SELECT otlet.create_maintenance_run('cleanup') AS review_cleanup_run_id \gset
+CREATE TEMP TABLE review_sampling_cleanup AS
+SELECT * FROM otlet.run_maintenance_slice(:review_cleanup_run_id, 0);
 
 UPDATE review_sampling_proof
 SET cleanup_preserved = (
@@ -782,6 +792,14 @@ SET cleanup_preserved = (
       FROM otlet.review_queue queue
       WHERE queue.task_name = 'review_sampling_probe'
         AND queue.queue_kind = 'sampled_output'
+    )
+    AND (
+      SELECT control_state = 'complete' AND processed_items = 0
+      FROM review_sampling_cleanup
+    )
+    AND (
+      SELECT eval_labels = 0
+      FROM review_sampling_cleanup_preview
     );
 
 DO $$

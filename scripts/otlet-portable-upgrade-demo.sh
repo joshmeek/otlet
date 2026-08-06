@@ -880,7 +880,7 @@ $function$;
 SELECT concat_ws('|',
   max(version),
   count(*),
-  array_agg(version ORDER BY version) = ARRAY(SELECT generate_series(1, 83)),
+  array_agg(version ORDER BY version) = ARRAY(SELECT generate_series(1, 84)),
   bool_and(file ~ ('(^|/)' || lpad(version::text, 4, '0') || '_')),
   (SELECT value FROM public.portable_upgrade_sentinel),
   (
@@ -1381,12 +1381,55 @@ SELECT concat_ws('|',
     AND NOT pg_catalog.has_function_privilege(
       'public', 'otlet.stranded_escalation_status_rows()', 'EXECUTE'
     )
+  ),
+  (
+    pg_catalog.to_regclass('otlet.maintenance_runs') IS NOT NULL
+    AND pg_catalog.to_regclass('otlet.maintenance_run_status') IS NOT NULL
+    AND pg_catalog.to_regprocedure(
+      'otlet.create_maintenance_run(text,text,text,integer,bigint,integer)'
+    ) IS NOT NULL
+    AND pg_catalog.to_regprocedure(
+      'otlet.set_maintenance_run_state(bigint,bigint,text,text)'
+    ) IS NOT NULL
+    AND pg_catalog.to_regprocedure(
+      'otlet.run_maintenance_slice(bigint,bigint)'
+    ) IS NOT NULL
+    AND pg_catalog.to_regprocedure(
+      'otlet.acknowledge_maintenance_vacuum(bigint,bigint,text)'
+    ) IS NOT NULL
+    AND (
+      SELECT policy.maintenance_max_rows = 64
+        AND policy.maintenance_max_wal_bytes = 16777216
+        AND policy.maintenance_max_time_ms = 1000
+      FROM otlet.production_policy_status policy
+    )
+    AND NOT pg_catalog.has_table_privilege(
+      'public', 'otlet.maintenance_runs', 'SELECT'
+    )
+    AND NOT pg_catalog.has_table_privilege(
+      'public', 'otlet.maintenance_run_status', 'SELECT'
+    )
+    AND NOT EXISTS (
+      SELECT 1
+      FROM unnest(ARRAY['public', :'operator_role']) principal(role_name)
+      CROSS JOIN unnest(ARRAY[
+        'otlet.create_maintenance_run(text,text,text,integer,bigint,integer)',
+        'otlet.set_maintenance_run_state(bigint,bigint,text,text)',
+        'otlet.run_maintenance_slice(bigint,bigint)',
+        'otlet.acknowledge_maintenance_vacuum(bigint,bigint,text)'
+      ]) api(signature)
+      WHERE pg_catalog.has_function_privilege(
+        principal.role_name,
+        api.signature,
+        'EXECUTE'
+      )
+    )
   )
 )
 FROM otlet.portable_schema_migrations;
 SQL
 )"
-[ "$contract" = "83|83|t|t|preserved|t|4096|t|t|t|t|0|t|t|t|t|t|t|t|t|t|t|t|t|t|t|t" ] || {
+[ "$contract" = "84|84|t|t|preserved|t|4096|t|t|t|t|0|t|t|t|t|t|t|t|t|t|t|t|t|t|t|t|t" ] || {
   echo "Portable repeat-install contract mismatch: $contract" >&2
   exit 1
 }
@@ -4555,6 +4598,7 @@ CREATE TEMP TABLE review_sampling_upgrade_proof (
   invalid_rule_blocked boolean NOT NULL DEFAULT false,
   redacted_class_blocked boolean NOT NULL DEFAULT false,
   append_blocked boolean NOT NULL DEFAULT false,
+  cleanup_rejected boolean NOT NULL DEFAULT false,
   cleanup_preserved boolean NOT NULL DEFAULT false
 );
 INSERT INTO review_sampling_upgrade_proof DEFAULT VALUES;
@@ -4836,10 +4880,20 @@ FROM otlet.label_review_sample(
   'Confirmed action-free sample'
 ) \g /dev/null
 
-SELECT otlet.cleanup_eval_label_series(
-  clock_timestamp() + interval '1 second',
-  false
-) \g /dev/null
+DO $body$
+BEGIN
+  BEGIN
+    PERFORM otlet.cleanup_eval_label_series(
+      clock_timestamp() + interval '1 second',
+      false
+    );
+  EXCEPTION WHEN OTHERS THEN
+    UPDATE review_sampling_upgrade_proof
+    SET cleanup_rejected = SQLERRM =
+      'otlet mutating evaluation label cleanup requires a bounded maintenance run';
+  END;
+END
+$body$;
 
 UPDATE review_sampling_upgrade_proof
 SET cleanup_preserved = (
@@ -5017,6 +5071,7 @@ SELECT concat_ws('|',
     SELECT invalid_rule_blocked
       AND redacted_class_blocked
       AND append_blocked
+      AND cleanup_rejected
       AND cleanup_preserved
     FROM review_sampling_upgrade_proof
   ),

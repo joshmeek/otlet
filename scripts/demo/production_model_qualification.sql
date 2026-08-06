@@ -10,7 +10,8 @@ CREATE TEMP TABLE production_model_qualification_proof (
   sample_immutable boolean NOT NULL DEFAULT false,
   probe_immutable boolean NOT NULL DEFAULT false,
   event_immutable boolean NOT NULL DEFAULT false,
-  artifact_mutation_blocked boolean NOT NULL DEFAULT false
+  artifact_mutation_blocked boolean NOT NULL DEFAULT false,
+  cleanup_preview_preserved boolean NOT NULL DEFAULT false
 ) ON COMMIT DROP;
 INSERT INTO production_model_qualification_proof DEFAULT VALUES;
 
@@ -144,6 +145,38 @@ CROSS JOIN LATERAL otlet.cancel_job(
   'Production qualification cancellation probe'
 ) canceled
 ORDER BY probe.selection_role \g /dev/null
+
+CREATE TEMP TABLE production_model_qualification_cleanup_fixture ON COMMIT DROP AS
+SELECT
+  policy.failed_job_retention,
+  job.id AS job_id,
+  job.finished_at
+FROM production_model_qualification_probes probe
+JOIN otlet.jobs job ON job.id = probe.job_id
+CROSS JOIN otlet.production_policy policy
+WHERE policy.name = 'default'
+ORDER BY probe.selection_role
+LIMIT 1;
+UPDATE otlet.production_policy
+SET failed_job_retention = interval '1 day'
+WHERE name = 'default';
+UPDATE otlet.jobs job
+SET finished_at = clock_timestamp() - interval '2 days'
+FROM production_model_qualification_cleanup_fixture fixture
+WHERE job.id = fixture.job_id;
+UPDATE production_model_qualification_proof
+SET cleanup_preview_preserved = (
+  SELECT failed_canceled_jobs = 0
+  FROM otlet.cleanup_policy_state(true)
+);
+UPDATE otlet.jobs job
+SET finished_at = fixture.finished_at
+FROM production_model_qualification_cleanup_fixture fixture
+WHERE job.id = fixture.job_id;
+UPDATE otlet.production_policy policy
+SET failed_job_retention = fixture.failed_job_retention
+FROM production_model_qualification_cleanup_fixture fixture
+WHERE policy.name = 'default';
 
 INSERT INTO production_model_qualification_runs (repeat_number, run_hash)
 SELECT repeat_number, otlet.start_replay_evaluation(
@@ -401,6 +434,7 @@ SELECT concat_ws('|',
    FROM otlet.production_model_qualification_status status
    WHERE status.qualification_event_hash = proof.qualification_hash),
   proof.artifact_mutation_blocked,
+  proof.cleanup_preview_preserved,
   NOT pg_catalog.has_table_privilege(
     'public', 'otlet.production_model_database_samples',
     'SELECT,INSERT,UPDATE,DELETE,TRUNCATE'
@@ -432,7 +466,7 @@ SELECT concat_ws('|',
 FROM production_model_qualification_proof proof;
 
 SELECT pg_temp.assert_true(
-  contract = 't|t|t|t|t|t|t',
+  contract = 't|t|t|t|t|t|t|t',
   'production model qualification contract mismatch: ' || contract
 )
 FROM production_model_qualification_contract;

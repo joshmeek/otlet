@@ -273,3 +273,6 @@ $$;
 
 \set portable_migration_file ../../../otlet_pg/sql/migrations/0083_route_readiness_stranded_escalation.sql
 \ir migrations/apply.sql
+
+\set portable_migration_file ../../../otlet_pg/sql/migrations/0084_bounded_maintenance_execution.sql
+\ir migrations/apply.sql
