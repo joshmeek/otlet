@@ -3,8 +3,8 @@ use crate::job::{
     model_selection_policy, replay_watch_reconciliation,
 };
 use crate::model::{
-    ModelError, ModelMetrics, ModelPreload, ModelRun, linked_resident_model_name, preload_model,
-    release_linked_model, run_job, run_job_with_model,
+    ModelError, ModelMetrics, ModelPreload, ModelRun, linked_cancel_requested,
+    linked_resident_model_name, preload_model, release_linked_model, run_job, run_job_with_model,
 };
 use pgrx::JsonB;
 use pgrx::bgworkers::{BackgroundWorker, SignalWakeFlags};

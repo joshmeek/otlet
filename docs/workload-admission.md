@@ -46,7 +46,7 @@ Each model registration sets `max_active_jobs`, with a default of one. The produ
 
 The singleton production policy applies task limits separately to each task. `max_queued_input_bytes_per_task` accepts 1 byte through 1 GiB and cannot exceed `max_queued_input_bytes_total`. `max_queue_age` accepts 1 second through 30 days. Otlet has no per-task or per-origin override
 
-Operators set three positive bounded native p99 targets. Otlet reports them as `declared_not_measured` and continues to use `max_queue_age` for admission backpressure
+Operators set three positive bounded native p99 targets. The interactive and asynchronous queue targets remain declared and unmeasured, while `native_cancellation_slo_status` measures the cancellation target. Admission backpressure continues to use `max_queue_age`
 
 PostgreSQL assigns one immutable origin at admission:
 

@@ -23,6 +23,9 @@ fn run_linked(
         model_fingerprint_hash,
         context_budget,
     )?;
+    if linked_cancel_requested(job, "model_load")? {
+        return Err(ModelError::new("canceled"));
+    }
     let cache = cache
         .as_mut()
         .ok_or_else(|| ModelError::new("linked llama.cpp cache did not initialize"))?;
@@ -182,7 +185,7 @@ fn run_loaded_linked(
     }
 
     let result = (|| -> Result<LinkedRun, ModelError> {
-    if linked_cancel_requested(job.id)? {
+    if linked_cancel_requested(job, "prompt_decode")? {
         return Err(ModelError::new("canceled"));
     }
     let mut cancel_probe = CancelProbe::new();
@@ -313,7 +316,7 @@ fn run_loaded_linked(
         return Err(ModelError::attempt_timeout());
     }
     for _ in 0..options.max_tokens {
-        if cancel_probe.due() && linked_cancel_requested(job.id)? {
+        if cancel_probe.due() && linked_cancel_requested(job, "generation")? {
             return Err(ModelError::new("canceled"));
         }
         let token =
@@ -541,7 +544,7 @@ fn linked_decode_prompt_tokens(
                 final_logits && decoded_tokens + chunk_index + 1 == tokens.len(),
             )?;
         }
-        if cancel_probe.due() && linked_cancel_requested(job.id)? {
+        if cancel_probe.due() && linked_cancel_requested(job, "prompt_decode")? {
             return Err(ModelError::new("canceled"));
         }
         let decode_status = unsafe { llama_cpp_sys_4::llama_decode(context, batch.value) };

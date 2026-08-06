@@ -197,9 +197,30 @@ SELECT state ->> 'queue_policy' AS queue_policy,
        state ->> 'priority_classes' AS priority_classes,
        state ->> 'service_measurement_status' AS measurement_status
 FROM (SELECT otlet.worker_infer_now_state() AS state) current;
+
+SELECT phase,
+       observation_samples,
+       stop_samples,
+       request_to_observation_p95_ms,
+       request_to_observation_p99_ms,
+       cancel_to_stop_p95_ms,
+       cancel_to_stop_p99_ms,
+       cancellation_observation_p99_target_ms,
+       minimum_observation_samples,
+       measurement_status,
+       active_unobserved_cancellations,
+       active_observed_not_stopped,
+       overdue_unobserved_cancellations,
+       finer_preemption_required
+FROM otlet.native_cancellation_slo_status
+ORDER BY phase = 'all' DESC, phase;
 ```
 
-The interactive queue target runs from shared-memory `requested_at` to `started_at`. The asynchronous target runs from `jobs.created_at` to the matching `worker_events.created_at` for `job_started`; `jobs.started_at` records claim time for the whole batch and hides held-batch delay. Cancellation observation ends at the first runtime check after `cancel_requested_at`; terminal `finished_at` records job completion. Otlet reports the target as `declared_not_measured`; the separate native cancellation-SLO work will add the observation timestamp and measured p99
+The interactive and asynchronous queue targets remain declared but unmeasured. Native cancellation starts at `jobs.cancel_requested_at`, observes at the first active-claim runtime boundary, stops at `jobs.native_cancel_stopped_at` after native work unwinds, and terminalizes later at `jobs.finished_at`. `jobs.started_at` is batch claim time and is not used as the claimed-wait endpoint
+
+The status has one overall row and one row for each observation phase. It exposes p95 and p99 as soon as samples exist, but target compliance stays `collecting` until 100 observations can resolve a one-percent tail. `finer_preemption_required` changes only when that measured p99 exceeds `cancellation_observation_p99_target_ms`; the current 250 ms prompt-decode and generation checks remain in place until then. Active unobserved, observed-but-not-stopped, and overdue counts stay separate from completed percentiles
+
+Only the linked native worker writes this observation evidence. SQL-only installations expose the same empty status shape for inspection, while portable cancellation keeps its existing claim and receipt contract
 
 The full fingerprint describes the artifact, linked build, effective generation settings, CPU placement, and host capacity. The prompt-template hash covers the exact reasoning prefix and static prompt body. Its output-contract hash omits observational host fields and joins content, task contract, and model identity in the inference-cache key:
 

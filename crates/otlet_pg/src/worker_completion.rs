@@ -4,34 +4,30 @@ fn accept_attempt_with_model(
     run: ModelRun,
     selection_role: &str,
     selection_reason: &str,
-) -> (bool, bool) {
+) -> (bool, bool, Option<String>) {
     // Keep telemetry separate so a metric error cannot roll back completion
-    // Returns (completed, semantic_materialized).
+    // Returns (completed, semantic_materialized, failure_message).
     let metrics = run.metrics.as_ref();
     if let Some(metrics) = metrics {
         record_metrics(job, model_name, metrics);
     }
-    match crate::infer_now::persist_timeout_cancel(job.id) {
+    match linked_cancel_requested(job, "output_acceptance") {
         Ok(true) => {
             let err = ModelError::new("canceled");
-            return (
-                fail_attempt_with_model(job, model_name, &err, selection_role, "canceled"),
-                false,
-            );
+            let failure_message =
+                fail_attempt_with_model(job, model_name, &err, selection_role, "canceled");
+            return (false, false, Some(failure_message));
         }
         Ok(false) => {}
-        Err(message) => {
-            let err = ModelError::new(message);
-            return (
-                fail_attempt_with_model(
-                    job,
-                    model_name,
-                    &err,
-                    selection_role,
-                    "infer_now_timeout_cancel_failed",
-                ),
-                false,
+        Err(err) => {
+            let failure_message = fail_attempt_with_model(
+                job,
+                model_name,
+                &err,
+                selection_role,
+                "cancellation_observation_failed",
             );
+            return (false, false, Some(failure_message));
         }
     }
     let result: pgrx::spi::Result<(bool, bool, Option<String>, Option<String>)> =
@@ -77,21 +73,22 @@ fn accept_attempt_with_model(
                 );
             }
             pgrx::log!("otlet worker completed job {}", job.id);
-            (true, semantic_materialized)
+            (true, semantic_materialized, None)
+        }
+        Ok((false, _, Some(error), _)) if error == "canceled" => {
+            (false, false, Some("canceled".to_owned()))
         }
         Ok((false, _, Some(error), _)) => {
             pgrx::warning!("otlet worker complete failed: {error}");
             let model_err = ModelError::new(format!("complete_job failed: {error}"));
-            (
-                fail_attempt_with_model(
-                    job,
-                    model_name,
-                    &model_err,
-                    selection_role,
-                    "complete_job_spi_failed",
-                ),
-                false,
-            )
+            let failure_message = fail_attempt_with_model(
+                job,
+                model_name,
+                &model_err,
+                selection_role,
+                "complete_job_spi_failed",
+            );
+            (false, false, Some(failure_message))
         }
         Ok((false, _, None, _)) => {
             pgrx::warning!(
@@ -99,30 +96,26 @@ fn accept_attempt_with_model(
                 job.id
             );
             let err = ModelError::new("complete_job_produced_no_output");
-            (
-                fail_attempt_with_model(
-                    job,
-                    model_name,
-                    &err,
-                    selection_role,
-                    "complete_job_failed",
-                ),
-                false,
-            )
+            let failure_message = fail_attempt_with_model(
+                job,
+                model_name,
+                &err,
+                selection_role,
+                "complete_job_failed",
+            );
+            (false, false, Some(failure_message))
         }
         Err(err) => {
             pgrx::warning!("otlet worker complete failed: {err}");
             let model_err = ModelError::new(format!("complete_job failed: {err}"));
-            (
-                fail_attempt_with_model(
-                    job,
-                    model_name,
-                    &model_err,
-                    selection_role,
-                    "complete_job_spi_failed",
-                ),
-                false,
-            )
+            let failure_message = fail_attempt_with_model(
+                job,
+                model_name,
+                &model_err,
+                selection_role,
+                "complete_job_spi_failed",
+            );
+            (false, false, Some(failure_message))
         }
     }
 }
@@ -219,9 +212,9 @@ fn record_rejected_attempt_with_model(
     )
 }
 
-fn reject_direct_attempt(job: &Job, run: ModelRun, selection_reason: &str) -> bool {
+fn reject_direct_attempt(job: &Job, run: ModelRun, selection_reason: &str) -> String {
     let metrics = run.metrics.as_ref();
-    let result: pgrx::spi::Result<()> = BackgroundWorker::transaction(|| {
+    let result: pgrx::spi::Result<bool> = BackgroundWorker::transaction(|| {
         pgrx::Spi::connect_mut(|client| {
             let args = [
                 job.id.into(),
@@ -236,40 +229,47 @@ fn reject_direct_attempt(job: &Job, run: ModelRun, selection_reason: &str) -> bo
                 JsonB(run.output.clone()).into(),
                 job.claim_token.as_str().into(),
             ];
-            client.update(
-                "SELECT otlet.fail_job($1, $2, $3, $4, $5, $6, $7, schema_validation_status => 'passed', trace_summary => $8, model_name => $9, selection_role => 'direct', selection_status => 'rejected', selection_reason => 'direct_rejected_by_decision_contract', candidate_output => $10, expected_claim_token => $11)",
+            let rows = client.update(
+                "SELECT terminal.status FROM otlet.fail_job($1, $2, $3, $4, $5, $6, $7, schema_validation_status => 'passed', trace_summary => $8, model_name => $9, selection_role => 'direct', selection_status => 'rejected', selection_reason => 'direct_rejected_by_decision_contract', candidate_output => $10, expected_claim_token => $11) terminal",
                 Some(1),
                 &args,
             )?;
-            Ok(())
+            Ok(rows.first().get::<String>(1)?.as_deref() == Some("canceled"))
         })
     });
-    if let Err(err) = result {
-        // Fail closed: do not leave the job running after a rejected direct attempt.
-        pgrx::warning!("otlet worker direct rejection failed: {err}");
-        let model_err = ModelError {
-            message: selection_reason.to_owned(),
-            raw_output: Some(run.raw_output),
-            prompt_hash: Some(run.prompt_hash),
-            input_hash: Some(run.input_hash),
-            output_schema_hash: Some(run.output_schema_hash),
-            raw_output_hash: Some(run.raw_output_hash),
-            schema_validation_status: Some("passed".to_owned()),
-            trace_summary: Some(run.trace_summary),
-            metrics: run.metrics.map(Box::new),
-        };
-        return fail_attempt_with_model(
-            job,
-            job.model_name.as_str(),
-            &model_err,
-            "direct",
-            selection_reason,
-        );
-    }
+    let canceled = match result {
+        Ok(canceled) => canceled,
+        Err(err) => {
+            // Fail closed: do not leave the job running after a rejected direct attempt.
+            pgrx::warning!("otlet worker direct rejection failed: {err}");
+            let model_err = ModelError {
+                message: selection_reason.to_owned(),
+                raw_output: Some(run.raw_output),
+                prompt_hash: Some(run.prompt_hash),
+                input_hash: Some(run.input_hash),
+                output_schema_hash: Some(run.output_schema_hash),
+                raw_output_hash: Some(run.raw_output_hash),
+                schema_validation_status: Some("passed".to_owned()),
+                trace_summary: Some(run.trace_summary),
+                metrics: run.metrics.map(Box::new),
+            };
+            return fail_attempt_with_model(
+                job,
+                job.model_name.as_str(),
+                &model_err,
+                "direct",
+                selection_reason,
+            );
+        }
+    };
     if let Some(metrics) = metrics {
         record_metrics(job, job.model_name.as_str(), metrics);
     }
-    false
+    if canceled {
+        "canceled".to_owned()
+    } else {
+        selection_reason.to_owned()
+    }
 }
 
 fn record_failed_model_attempt_with_model(
@@ -308,16 +308,26 @@ fn fail_attempt_result_with_model(
     selection_reason: &str,
 ) -> JobProcessResult {
     let mut result = JobProcessResult::failed_with(err);
-    result.completed =
-        fail_attempt_with_model(job, model_name, err, selection_role, selection_reason);
+    result.failure_message = Some(fail_attempt_with_model(
+        job,
+        model_name,
+        err,
+        selection_role,
+        selection_reason,
+    ));
     result
 }
 
-fn force_terminal_job_failure(job_id: i64, claim_token: &str, model_name: &str, error: &str) {
+fn force_terminal_job_failure(
+    job_id: i64,
+    claim_token: &str,
+    model_name: &str,
+    error: &str,
+) -> bool {
     // Emergency fallback terminalizes the row when fail_job SPI fails
     // No receipt, metric, or event can be recorded through the failing path
     // A cancel request becomes canceled and other live work becomes failed
-    let recovery: pgrx::spi::Result<()> = BackgroundWorker::transaction(|| {
+    let recovery: pgrx::spi::Result<bool> = BackgroundWorker::transaction(|| {
         pgrx::Spi::connect_mut(|client| {
             let args = [
                 job_id.into(),
@@ -325,7 +335,7 @@ fn force_terminal_job_failure(job_id: i64, claim_token: &str, model_name: &str, 
                 claim_token.into(),
                 model_name.into(),
             ];
-            client.update(
+            let rows = client.update(
                 "UPDATE otlet.jobs \
                  SET status = CASE \
                        WHEN status = 'cancel_requested' THEN 'canceled' \
@@ -338,12 +348,29 @@ fn force_terminal_job_failure(job_id: i64, claim_token: &str, model_name: &str, 
                      ), \
                      claim_token = NULL, \
                      error = $2, \
+                     native_cancel_observed_at = CASE \
+                       WHEN status = 'cancel_requested' THEN \
+                         COALESCE(native_cancel_observed_at, wall.stopped_at) \
+                       ELSE native_cancel_observed_at \
+                     END, \
+                     native_cancel_observed_phase = CASE \
+                       WHEN status = 'cancel_requested' THEN \
+                         COALESCE(native_cancel_observed_phase, 'output_acceptance') \
+                       ELSE native_cancel_observed_phase \
+                     END, \
+                     native_cancel_stopped_at = CASE \
+                       WHEN status = 'cancel_requested' THEN \
+                         COALESCE(native_cancel_stopped_at, wall.stopped_at) \
+                       ELSE native_cancel_stopped_at \
+                     END, \
                      finished_at = COALESCE(finished_at, now()) \
+                 FROM (SELECT clock_timestamp() AS stopped_at) wall \
                  WHERE id = $1 \
                    AND status IN ('running', 'cancel_requested') \
                    AND claim_token = $3 \
                    AND leased_until IS NOT NULL \
-                   AND leased_until >= now()",
+                   AND leased_until >= now() \
+                 RETURNING status",
                 Some(1),
                 &args,
             )?;
@@ -355,11 +382,15 @@ fn force_terminal_job_failure(job_id: i64, claim_token: &str, model_name: &str, 
                 Some(1),
                 &args,
             );
-            Ok(())
+            Ok(rows.first().get::<String>(1)?.as_deref() == Some("canceled"))
         })
     });
-    if let Err(recovery_err) = recovery {
-        pgrx::warning!("otlet worker terminal job recovery failed: {recovery_err}");
+    match recovery {
+        Ok(canceled) => canceled,
+        Err(recovery_err) => {
+            pgrx::warning!("otlet worker terminal job recovery failed: {recovery_err}");
+            false
+        }
     }
 }
 
@@ -369,7 +400,24 @@ fn fail_attempt_with_model(
     err: &ModelError,
     selection_role: &str,
     selection_reason: &str,
-) -> bool {
+) -> String {
+    let requested_cancellation = err.message == "canceled";
+    if requested_cancellation {
+        let stopped: pgrx::spi::Result<bool> = BackgroundWorker::transaction(|| {
+            pgrx::Spi::connect_mut(|client| {
+                let args = [job.id.into(), job.claim_token.as_str().into()];
+                let rows = client.update(
+                    "SELECT otlet.stop_native_job_cancellation($1, $2)",
+                    Some(1),
+                    &args,
+                )?;
+                Ok(rows.first().get::<bool>(1)?.unwrap_or(false))
+            })
+        });
+        if !matches!(stopped, Ok(true)) {
+            pgrx::warning!("otlet worker cancellation stop checkpoint failed: {stopped:?}");
+        }
+    }
     let metrics = err.metrics.as_ref().map(|m| m.as_ref());
     let rejected_memory = err.trace_summary.as_ref().and_then(|trace| {
         (trace
@@ -383,8 +431,7 @@ fn fail_attempt_with_model(
         // Metrics are best effort and must not roll back terminal job state
         record_metrics(job, model_name, metrics);
     }
-    let canceled = err.message == "canceled";
-    let result: pgrx::spi::Result<()> = BackgroundWorker::transaction(|| {
+    let result: pgrx::spi::Result<bool> = BackgroundWorker::transaction(|| {
         pgrx::Spi::connect_mut(|client| {
             let trace_summary = err.trace_summary.as_ref().unwrap_or(&EMPTY_TRACE_SUMMARY);
             let args = [
@@ -403,14 +450,15 @@ fn fail_attempt_with_model(
                 job.claim_token.as_str().into(),
             ];
             let rows = client.update(
-                "SELECT otlet.fail_job($1, $2, $3, $4, $5, $6, $7, schema_validation_status => $8, trace_summary => $9, model_name => $10, selection_role => $11, selection_reason => $12, expected_claim_token => $13)",
+                "SELECT terminal.status FROM otlet.fail_job($1, $2, $3, $4, $5, $6, $7, schema_validation_status => $8, trace_summary => $9, model_name => $10, selection_role => $11, selection_reason => $12, expected_claim_token => $13) terminal",
                 Some(1),
                 &args,
             )?;
             if rows.is_empty() {
-                return Ok(());
+                return Ok(false);
             }
-            if let Some(memory) = &rejected_memory {
+            let canceled = rows.first().get::<String>(1)?.as_deref() == Some("canceled");
+            if !canceled && let Some(memory) = &rejected_memory {
                 let event_args = [
                     job.id.into(),
                     job.task_name.as_str().into(),
@@ -423,25 +471,33 @@ fn fail_attempt_with_model(
                     &event_args,
                 )?;
             }
-            Ok(())
+            Ok(canceled)
         })
     });
-    if let Err(fail_err) = result {
-        pgrx::warning!("otlet worker fail_job call failed: {fail_err}");
-        let recovery_error = format!("fail_job_spi_failed: {fail_err}; original: {}", err.message);
-        force_terminal_job_failure(
-            job.id,
-            job.claim_token.as_str(),
-            model_name,
-            &recovery_error,
-        );
-    }
+    let canceled = match result {
+        Ok(canceled) => canceled,
+        Err(fail_err) => {
+            pgrx::warning!("otlet worker fail_job call failed: {fail_err}");
+            let recovery_error =
+                format!("fail_job_spi_failed: {fail_err}; original: {}", err.message);
+            force_terminal_job_failure(
+                job.id,
+                job.claim_token.as_str(),
+                model_name,
+                &recovery_error,
+            )
+        }
+    };
     if canceled {
         pgrx::log!("otlet worker canceled job {}", job.id);
     } else {
         pgrx::warning!("otlet worker failed job {}: {}", job.id, err.message);
     }
-    false
+    if canceled {
+        "canceled".to_owned()
+    } else {
+        err.message.clone()
+    }
 }
 
 fn record_metrics(job: &Job, model_name: &str, metrics: &ModelMetrics) {

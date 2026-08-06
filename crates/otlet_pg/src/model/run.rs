@@ -114,6 +114,9 @@ pub(crate) fn run_job_with_model(job: &Job, model: &JobModel) -> Result<ModelRun
 fn run_job_with_model_ref(job: &Job, model: JobModelRef<'_>) -> Result<ModelRun, ModelError> {
     let prepare_started = Instant::now();
     let verified_artifact = verify_model_artifact(model)?;
+    if linked_cancel_requested(job, "model_load")? {
+        return Err(ModelError::new("canceled"));
+    }
     let digests = task_contract_digests(job);
     let options = digests
         .runtime_options
@@ -220,7 +223,7 @@ fn run_job_with_model_ref(job: &Job, model: JobModelRef<'_>) -> Result<ModelRun,
         cache_lookup.raw_output
     {
         // Trusted cache entry already passed schema validation when stored.
-        if linked_cancel_requested(job.id)? {
+        if linked_cancel_requested(job, "inference_cache_hit")? {
             return Err(ModelError::new("canceled"));
         }
         let (prompt_hash, input_hash, shaped_bytes, original_bytes, input_truncated) =

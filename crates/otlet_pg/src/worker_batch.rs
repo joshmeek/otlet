@@ -235,6 +235,28 @@ fn process_job_deferred(
     job: &Job,
     policy_cache: &mut ModelSelectionPolicyCache,
 ) -> JobProcessResult {
+    match linked_cancel_requested(job, "claimed_batch_wait") {
+        Ok(true) => {
+            return fail_attempt_result_with_model(
+                job,
+                job.model_name.as_str(),
+                &ModelError::new("canceled"),
+                job.selection_role.as_str(),
+                "canceled",
+            );
+        }
+        Ok(false) => {}
+        Err(err) => {
+            return fail_attempt_result_with_model(
+                job,
+                job.model_name.as_str(),
+                &err,
+                job.selection_role.as_str(),
+                "cancellation_observation_failed",
+            );
+        }
+    }
+
     if !mark_job_started(job) {
         let err = ModelError::new("job claim is stale before start");
         return JobProcessResult::failed_with(&err);

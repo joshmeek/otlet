@@ -237,7 +237,7 @@ echo "service_quantum_policy_contract=$service_quantum_policy_contract"
 echo "service_quantum_contract=$service_quantum_contract"
 
 [ "$service_quantum_policy_contract" = \
-  "30000|30000|1000|8|work_conserving_round_robin|oldest_request_id_first|1|1|false|declared_not_measured|true|true" ] || {
+  "30000|30000|1000|8|work_conserving_round_robin|oldest_request_id_first|1|1|false|native_cancellation_measured_queue_targets_declared|true|true" ] || {
   echo "Expected declared service targets and fixed native quanta, got $service_quantum_policy_contract" >&2
   exit 1
 }

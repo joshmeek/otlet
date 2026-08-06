@@ -69,7 +69,7 @@ pub(crate) fn status_json() -> JsonB {
         "infer_now_request_quantum": 1,
         "queued_claim_batch_quantum": 1,
         "priority_classes": false,
-        "service_measurement_status": "declared_not_measured",
+        "service_measurement_status": "native_cancellation_measured_queue_targets_declared",
         "cap_policy": "task_subject_inline_task_input_byte_caps_reject_before_queue_insert",
         "timeout_policy": "requester_fail_closed_job_cancel_requested_no_late_materialization",
         "cancellation_policy": "timeout_requests_cancellation_then_linked_runtime_checks_cancel_requested",

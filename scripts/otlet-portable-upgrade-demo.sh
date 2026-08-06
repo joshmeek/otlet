@@ -880,7 +880,7 @@ $function$;
 SELECT concat_ws('|',
   max(version),
   count(*),
-  array_agg(version ORDER BY version) = ARRAY(SELECT generate_series(1, 80)),
+  array_agg(version ORDER BY version) = ARRAY(SELECT generate_series(1, 81)),
   bool_and(file ~ ('(^|/)' || lpad(version::text, 4, '0') || '_')),
   (SELECT value FROM public.portable_upgrade_sentinel),
   (
@@ -1018,6 +1018,87 @@ SELECT concat_ws('|',
   ),
   pg_catalog.has_table_privilege(
     :'operator_role', 'otlet.task_resource_status', 'SELECT'
+  ),
+  (
+    pg_catalog.has_table_privilege(
+      :'operator_role', 'otlet.native_cancellation_slo_status', 'SELECT'
+    )
+    AND NOT pg_catalog.has_table_privilege(
+      :'partial_auditor_role',
+      'otlet.native_cancellation_slo_status',
+      'SELECT'
+    )
+    AND NOT pg_catalog.has_table_privilege(
+      'public', 'otlet.native_cancellation_slo_status', 'SELECT'
+    )
+    AND NOT pg_catalog.has_function_privilege(
+      'public',
+      'otlet.observe_native_job_cancellation(bigint,text,text)',
+      'EXECUTE'
+    )
+    AND NOT pg_catalog.has_function_privilege(
+      :'operator_role',
+      'otlet.observe_native_job_cancellation(bigint,text,text)',
+      'EXECUTE'
+    )
+    AND NOT pg_catalog.has_function_privilege(
+      'public',
+      'otlet.stop_native_job_cancellation(bigint,text)',
+      'EXECUTE'
+    )
+    AND NOT pg_catalog.has_function_privilege(
+      :'operator_role',
+      'otlet.stop_native_job_cancellation(bigint,text)',
+      'EXECUTE'
+    )
+    AND (SELECT count(*) = 8 FROM otlet.native_cancellation_slo_status)
+    AND NOT EXISTS (
+      SELECT 1
+      FROM otlet.jobs
+      WHERE native_cancel_observed_at IS NOT NULL
+         OR native_cancel_observed_phase IS NOT NULL
+         OR native_cancel_stopped_at IS NOT NULL
+    )
+    AND position(
+      'observe_native_job_cancellation' IN (
+        SELECT function.prosrc
+        FROM pg_catalog.pg_proc function
+        WHERE function.oid =
+          'otlet.complete_job(bigint,jsonb,text,jsonb,text,text,text,text,timestamptz,jsonb,text,text,text,text,text,text,text)'::regprocedure
+      )
+    ) > 0
+    AND position(
+      'stop_native_job_cancellation' IN (
+        SELECT function.prosrc
+        FROM pg_catalog.pg_proc function
+        WHERE function.oid =
+          'otlet.complete_job(bigint,jsonb,text,jsonb,text,text,text,text,timestamptz,jsonb,text,text,text,text,text,text,text)'::regprocedure
+      )
+    ) > 0
+    AND position(
+      'CASE WHEN job.status = ''canceled'' THEN ''canceled'' END' IN (
+        SELECT function.prosrc
+        FROM pg_catalog.pg_proc function
+        WHERE function.oid =
+          'otlet.complete_and_materialize_job(bigint,jsonb,text,jsonb,text,text,text,text,jsonb,text,text,text,text)'::regprocedure
+      )
+    ) > 0
+    AND position(
+      'observe_native_job_cancellation' IN (
+        SELECT function.prosrc
+        FROM pg_catalog.pg_proc function
+        WHERE function.oid =
+          'otlet.fail_job(bigint,text,text,text,text,text,text,timestamptz,text,jsonb,text,text,text,text,jsonb,text,text,text)'::regprocedure
+      )
+    ) > 0
+    AND position(
+      'stop_native_job_cancellation' IN (
+        SELECT function.prosrc
+        FROM pg_catalog.pg_proc function
+        WHERE function.oid =
+          'otlet.fail_job(bigint,text,text,text,text,text,text,timestamptz,text,jsonb,text,text,text,text,jsonb,text,text,text)'::regprocedure
+      )
+    ) > 0
   ),
   NOT pg_catalog.has_table_privilege(
     :'partial_auditor_role', 'otlet.task_queue_status', 'SELECT'
@@ -1248,7 +1329,7 @@ SELECT concat_ws('|',
 FROM otlet.portable_schema_migrations;
 SQL
 )"
-[ "$contract" = "80|80|t|t|preserved|t|4096|t|t|t|t|0|t|t|t|t|t|t|t|t|t|t|t|t|t" ] || {
+[ "$contract" = "81|81|t|t|preserved|t|4096|t|t|t|t|0|t|t|t|t|t|t|t|t|t|t|t|t|t|t" ] || {
   echo "Portable repeat-install contract mismatch: $contract" >&2
   exit 1
 }

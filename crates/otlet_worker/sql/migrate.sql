@@ -264,3 +264,6 @@ $$;
 
 \set portable_migration_file ../../../otlet_pg/sql/migrations/0080_model_bound_context_budgets.sql
 \ir migrations/apply.sql
+
+\set portable_migration_file ../../../otlet_pg/sql/migrations/0081_native_cancellation_slo.sql
+\ir migrations/apply.sql

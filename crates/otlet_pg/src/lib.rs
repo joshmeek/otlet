@@ -410,6 +410,11 @@ pgrx::extension_sql_file!(
     name = "model_bound_context_budgets",
     requires = ["bounded_customscan_state"]
 );
+pgrx::extension_sql_file!(
+    "../sql/migrations/0081_native_cancellation_slo.sql",
+    name = "native_cancellation_slo",
+    requires = ["model_bound_context_budgets"]
+);
 
 #[allow(non_snake_case)]
 #[pgrx::pg_guard]
