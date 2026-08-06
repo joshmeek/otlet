@@ -762,3 +762,5 @@ echo "queue_suppression_contract=$queue_suppression_contract"
   echo "Expected durable queue suppression contract 1|2|1|1|true|true|true, got $queue_suppression_contract" >&2
   exit 1
 }
+
+source "$demo_dir/planner_shape_conformance.sh"
