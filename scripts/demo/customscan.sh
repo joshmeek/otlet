@@ -524,6 +524,24 @@ require_contains "$row_customscan_read_only_plan" "Queued Refreshes: 0" "Expecte
 require_contains "$row_customscan_read_only_plan" "Infer Now Batches: 0" "Expected read-only auto scan to run no inference"
 require_contains "$row_customscan_read_only_plan" "Rows Returned: 0" "Expected read-only auto scan to return no rows"
 require_contains "$row_customscan_read_only_plan" "read_only_auto_after=on|t" "Expected schema-current auto CustomScan to leave no temp schema"
+row_customscan_read_only_plan_only="$(
+  psql_exec -P border=2 -P null='' -v watch_name="$row_customscan_watch" <<'SQL'
+BEGIN READ ONLY;
+EXPLAIN (VERBOSE, COSTS, SUMMARY OFF)
+SELECT id
+FROM public.otlet_demo_customscan_signal
+WHERE otlet.semantic_matches_auto(:'watch_name', id, '{}'::jsonb);
+COMMIT;
+SQL
+)"
+require_contains "$row_customscan_read_only_plan_only" "Planner Selected Path: lookup_fail_closed" "Expected plan-only read-only CustomScan fail-closed path"
+require_contains "$row_customscan_read_only_plan_only" "Planner Infer Now Subjects: 0" "Expected plan-only read-only CustomScan to disable infer decisions"
+require_contains "$row_customscan_read_only_plan_only" "Planner Fail Closed Subjects: 2" "Expected plan-only read-only CustomScan to retain maintained unresolved counts"
+require_contains "$row_customscan_read_only_plan_only" "Executor Evidence: not collected for plan-only EXPLAIN" "Expected plan-only read-only CustomScan to skip executor evidence"
+if [[ "$row_customscan_read_only_plan_only" == *"Preloaded Predicate Matches:"* ]]; then
+  echo "Plan-only read-only CustomScan unexpectedly preloaded predicate evidence" >&2
+  exit 1
+fi
 row_customscan_queue_origin_contract="$(
   psql_exec -qAt \
     -v watch_name="$row_customscan_watch" \
@@ -584,7 +602,7 @@ echo "row_customscan_sql_plan_contract=$row_customscan_sql_plan_contract"
   exit 1
 }
 require_contains "$row_customscan_infer_plan" "Planner Selected Path: bounded_infer_now" "Expected CustomScan bounded infer-now path"
-require_contains "$row_customscan_infer_plan" "Count Basis: exact" "Expected infer CustomScan exact count basis"
+require_contains "$row_customscan_infer_plan" "Count Basis: maintained" "Expected infer CustomScan maintained count basis"
 require_contains "$row_customscan_infer_plan" "Model Cost Source:" "Expected infer CustomScan model cost source"
 require_contains "$row_customscan_infer_plan" "Planner Infer Now Subjects: 1" "Expected planned infer-now count"
 require_contains "$row_customscan_infer_plan" "Planner Fail Closed Subjects: 1" "Expected planned fail-closed count"

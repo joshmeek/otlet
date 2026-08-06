@@ -183,6 +183,7 @@ SELECT 'semantic_index_plan_contract=' ||
        fresh_subjects::text || '|' ||
        stale_subjects::text || '|' ||
        missing_subjects::text || '|' ||
+       count_basis || '|' ||
        freshness::text AS semantic_index_plan_contract
 FROM otlet.semantic_index_plan('demo_semantic_vendor_idx');
 ```
@@ -191,10 +192,10 @@ Representative output:
 
 ```text
 semantic_index_status_contract=demo_semantic_vendor_idx|3|0|0|refresh_then_fail_closed
-semantic_index_plan_contract=semantic_lookup|3|3|0|0|1.0000
+semantic_index_plan_contract=semantic_lookup|3|3|0|0|maintained|1.0000
 ```
 
-`semantic_index_plan` shows whether Otlet can reuse materialized state, refresh, wait, or run fresh inference
+`semantic_index_plan` shows whether Otlet can reuse materialized state, refresh, wait, or run fresh inference. Its generic counts come from the revision-pinned `semantic_planner_statistics_status` snapshot maintained outside planning
 
 Add wall-clock freshness to a row watch by using the enqueueing source-change policy and declaring all three time fields:
 
@@ -247,7 +248,7 @@ The SQL plan row and CustomScan EXPLAIN share planner terms
 | --- | --- | --- | --- |
 | Chosen path | `selected_path` | `Planner Selected Path` | Shared vocabulary; CustomScan prefixes planner-owned decisions |
 | Reason | `reason` | `Planner Reason` | Equivalent meaning |
-| Count basis | `count_basis` | `Count Basis` | SQL plan rows describe index state; CustomScan source-row predicates use exact or child-plan counts |
+| Count basis | `count_basis` | `Count Basis` | Plans use revision-pinned generic maintained counts; executor-only predicate counters stay separate |
 | Model cost basis | `model_cost_source` | `Model Cost Source` | Ordered basis: task receipt, runtime slot, model receipt, static fallback |
 | Stale reasons | `stale_reasons` | `Planner Stale Reasons` | Shared JSON shape for stale subject counts |
 | Infer-now prediction | `infer_now_subjects`, `fail_closed_subjects` | `Planner Infer Now Subjects`, `Planner Fail Closed Subjects` | CustomScan also reports actual executor counters |
@@ -265,22 +266,41 @@ Row-plan excerpt:
 selected_path | semantic_lookup
 stale_reasons | {}
 model_cost_source | task_receipt
-count_basis | exact
+count_basis | maintained
 ```
 
-CustomScan EXPLAIN excerpt:
+CustomScan plan-only EXPLAIN excerpt:
 
 ```text
-Child Plan Attached: 1
 Semantic Predicate Owner: otlet_customscan_executor
-Source Tuple Provider: child_plan_execprocnode
 Planner Selected Path: semantic_lookup
 Planner Stale Reasons: {}
-Count Basis: exact
+Count Basis: maintained
 Model Cost Source: task_receipt
-Preloaded Fresh Subjects / Basis: 3 {"mvcc_match": 3}
-Emitted Freshness Basis: {"mvcc_match": 3}
+Executor Evidence: not collected for plan-only EXPLAIN
 ```
+
+Planning does not evaluate the JSON predicate or preload semantic rows. Use `semantic_predicate_counts(...)` for an exact, read-only predicate diagnostic pinned to the expected workload revision:
+
+```sql
+SELECT count_basis,
+       total_subjects,
+       fresh_matches,
+       fresh_non_matches,
+       stale_subjects,
+       missing_subjects
+FROM otlet.semantic_predicate_counts(
+  'demo_semantic_vendor_idx',
+  '{"status":"needs_review"}'::jsonb,
+  (
+    SELECT active_workload_revision_hash
+    FROM otlet.workload_revision_heads
+    WHERE task_name = 'demo_semantic_vendor_idx_task'
+  )
+);
+```
+
+The diagnostic reports `count_basis=exact_predicate_diagnostic` and does not change the maintained snapshot
 
 ## Step 7 - Use CustomScan For Source-Row Predicates
 
@@ -304,15 +324,17 @@ Custom Scan (Otlet Semantic Source CustomScan) on public.otlet_demo_semantic_ven
   Source Tuple Provider: child_plan_execprocnode
   Semantic Index: demo_semantic_vendor_idx
   Planner Selected Path: semantic_lookup
-  Count Basis: exact
+  Count Basis: maintained
   Model Cost Source: task_receipt
   Planner Stale Reasons: {}
   Preloaded Fresh Subjects / Basis: 3 {"mvcc_match": 3}
+  Preloaded Predicate Matches: 3
+  Preloaded Predicate Non Matches: 0
   Emitted Freshness Basis: {"mvcc_match": 3}
   Actual Fresh Subjects: 3
 ```
 
-The child scan reads the source table. Otlet strips the semantic predicate from the child plan and evaluates it against preloaded semantic state
+The child scan reads the source table. Otlet strips the semantic predicate from the child plan and evaluates it against preloaded semantic state. `EXPLAIN ANALYZE` adds exact preload and executor counters while the planner count basis remains `maintained`
 
 CustomScan uses statement preload semantics. Row-marked queries such as `FOR UPDATE` and correlated `LATERAL` relations stay on the standard Postgres plan. Otlet blocks CustomScan for both shapes so Postgres owns locking, parameter propagation, rescans, and row rechecks. For supported CustomScan plans, stale triggers and the next statement pick up concurrent source changes instead of a per-tuple recheck inside that scan
 
@@ -351,6 +373,8 @@ semantic_stale_status_contract=2|1|0
 ```
 
 Fail-closed reads exclude stale facts even when old model output matched
+
+The maintained snapshot changes in the same source transaction. An ordinary update keeps the subject total and marks its prior output stale. A subject-key update removes the old subject and counts the new subject as missing. Delete removes the subject and excludes its stored materialization from the generic count. Delete then reinsert restores the subject but keeps the prior output stale with `source_update` until refresh. Truncate sets every generic count to zero. Exact predicate diagnostics may revalidate unchanged content, but they do not rewrite the conservative maintained snapshot
 
 ## Step 9 - Let CustomScan Refresh A Stale Row With Infer-Now
 
@@ -392,7 +416,7 @@ Custom Scan (Otlet Semantic Source CustomScan) on public.otlet_demo_semantic_ven
   Infer Now Timeout Ms: 15000
   Infer Now Max Rows: 1
   Planner Selected Path: bounded_infer_now
-  Count Basis: exact
+  Count Basis: maintained
   Model Cost Source: task_receipt
   Planner Infer Now Subjects: 1
   Planner Fail Closed Subjects: 0
@@ -513,6 +537,8 @@ semantic_join_auto_materialized=1
 ```
 
 `pair_sources` installs the row-index stale trigger. Updates to declared source rows mark matching pair materializations through `_otlet_mvcc` dependencies, and pinned deletion of a retired watch removes the trigger when no row index or pair watch still needs it
+
+A committed pair-source change also sets the generic statistics basis to `maintained_invalid`. Plans treat the unknown candidate population as missing up to `max_candidate_rows` and do not execute the candidate query. `refresh_semantic_join_index(...)` or owner-run `maintain_semantic_planner_statistics(...)` enumerates the bounded candidate set outside planning and restores a maintained snapshot
 
 Pair refresh reads one row past the candidate cap and rejects the whole operation on overflow. Only a complete candidate set reaches reconciliation, so unseen overflow rows never become `candidate_removed`. Within a complete set, a removed subject gets `candidate_removed` and a subject with changed shaped content gets `candidate_changed`. Removed candidates queue no work. New and changed candidates continue through the existing queue. If the same candidate content returns, Otlet clears the candidate-drift state and reuses its materialization
 

@@ -49,12 +49,49 @@ unsafe extern "C-unwind" fn begin_semantic_custom_scan(
         let Some(mut private) = custom_private_from_plan(node) else {
             return;
         };
-        if pg_sys::XactReadOnly || pg_sys::RecoveryInProgress() {
+        let explain_only = (eflags as u32 & pg_sys::EXEC_FLAG_EXPLAIN_ONLY) != 0;
+        let read_only = pg_sys::XactReadOnly || pg_sys::RecoveryInProgress();
+        if read_only {
             private.allow_refresh = false;
             private.wait_ms = 0;
             private.infer_ms = 0;
             private.infer_max_rows = 0;
-            private.planner_stats = None;
+            if !explain_only {
+                private.planner_stats = None;
+            }
+        }
+        if explain_only {
+            let scan = (*node).ss.ps.plan.cast::<pg_sys::CustomScan>();
+            (*state).index_kind = private.index_kind;
+            (*state).has_child_plan = (!(*node).custom_ps.is_null()
+                && pg_sys::list_length((*node).custom_ps) > 0)
+                || (!scan.is_null()
+                    && !(*scan).custom_plans.is_null()
+                    && pg_sys::list_length((*scan).custom_plans) > 0);
+            let mut planner_stats = private
+                .planner_stats
+                .take()
+                .unwrap_or_else(|| reload_private_planner_stats_plan_only(&private));
+            if read_only {
+                finish_planner_stats(&mut planner_stats, false, 0, 0, 0, private.auto_policy);
+                if private.index_kind == SemanticIndexKind::Join
+                    && planner_stats.selected_path == "semantic_lookup"
+                {
+                    planner_stats.selected_path = "semantic_join_lookup".to_owned();
+                }
+            }
+            snapshot_planner_state(
+                state,
+                &planner_stats,
+                &SemanticAutoPolicy {
+                    auto_policy: private.auto_policy,
+                    allow_refresh: private.allow_refresh,
+                    wait_ms: private.wait_ms,
+                    infer_ms: private.infer_ms,
+                    infer_max_rows: private.infer_max_rows,
+                },
+            );
+            return;
         }
         let executor_schema_drift =
             require_custom_scan_source_contract(&private.workload_revision_hash)
@@ -120,6 +157,7 @@ unsafe extern "C-unwind" fn begin_semantic_custom_scan(
             );
             planner_stats.fresh_matches = 0;
             planner_stats.fresh_non_matches = 0;
+            planner_stats.fresh_rows = 0;
             planner_stats.stale_rows = planner_stats.source_rows;
             planner_stats.missing_rows = 0;
             planner_stats.inflight_rows = 0;

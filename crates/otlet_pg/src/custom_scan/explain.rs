@@ -79,6 +79,16 @@ unsafe extern "C-unwind" fn explain_semantic_custom_scan(
                 ),
                 es,
             );
+            explain_counter(
+                "Preloaded Predicate Matches",
+                runtime.preloaded_fresh_matches,
+                es,
+            );
+            explain_counter(
+                "Preloaded Predicate Non Matches",
+                runtime.preloaded_fresh_non_matches,
+                es,
+            );
             explain_optional_text(
                 "Emitted Freshness Basis",
                 nonempty_str(&emitted_freshness_counts_json(&runtime.emitted_freshness_basis)),
@@ -189,6 +199,14 @@ unsafe extern "C-unwind" fn explain_semantic_custom_scan(
                 model_ms = planner_stats.model_ms;
                 infer_decision_rows = planner_stats.infer_decision_rows;
             }
+            if !(*es).analyze {
+                explain_text(
+                    "Executor Evidence",
+                    "not collected for plan-only EXPLAIN",
+                    es,
+                );
+                return;
+            }
             explain_pg_cstr("Source Relation", (*state).source_table, es);
             explain_pg_cstr("Task", (*state).task_name, es);
             explain_text(
@@ -207,6 +225,16 @@ unsafe extern "C-unwind" fn explain_semantic_custom_scan(
                     preloaded_fresh,
                     pg_cstr_str((*state).preloaded_freshness_basis).unwrap_or(""),
                 ),
+                es,
+            );
+            explain_counter(
+                "Preloaded Predicate Matches",
+                (*state).preloaded_fresh_matches,
+                es,
+            );
+            explain_counter(
+                "Preloaded Predicate Non Matches",
+                (*state).preloaded_fresh_non_matches,
                 es,
             );
             explain_optional_text(

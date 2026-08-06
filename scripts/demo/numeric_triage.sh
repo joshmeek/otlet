@@ -293,13 +293,13 @@ row_watch_status_contract="$(sed -n '1p' <<<"$row_status_plan_contracts")"
 row_plan_estimated="$(sed -n '2p' <<<"$row_status_plan_contracts")"
 row_plan_exact="$(sed -n '3p' <<<"$row_status_plan_contracts")"
 echo "row_watch_status_contract=$row_watch_status_contract"
-[ "$row_watch_status_contract" = "$row_triage_watch|row|1|1|0|0|0|1|estimated" ] || {
+[ "$row_watch_status_contract" = "$row_triage_watch|row|1|1|0|0|0|1|maintained" ] || {
   echo "Expected row watch status to show one fresh completed row, got $row_watch_status_contract" >&2
   exit 1
 }
 echo "row_plan_basis_contract=$row_plan_estimated|exact=$row_plan_exact"
-[ "$row_plan_estimated|$row_plan_exact" = "estimated|1|1|0|0|exact|1|1|0|0" ] || {
-  echo "Expected estimated and exact row plan counts to match on demo row, got $row_plan_estimated|$row_plan_exact" >&2
+[ "$row_plan_estimated|$row_plan_exact" = "maintained|1|1|0|0|exact|1|1|0|0" ] || {
+  echo "Expected maintained and exact row plan counts to match on demo row, got $row_plan_estimated|$row_plan_exact" >&2
   exit 1
 }
 row_lookup_basis_contract="$(psql_exec -qAt -v watch_name="$row_triage_watch" <<'SQL'
@@ -323,7 +323,7 @@ SQL
 printf '%s\n' "$row_fresh_customscan_plan"
 require_contains "$row_fresh_customscan_plan" "Otlet Node: Semantic Source CustomScan" "Expected fresh CustomScan explain details"
 require_contains "$row_fresh_customscan_plan" "Planner Selected Path: semantic_lookup" "Expected fresh CustomScan lookup path"
-require_contains "$row_fresh_customscan_plan" "Count Basis: exact" "Expected fresh CustomScan exact count basis"
+require_contains "$row_fresh_customscan_plan" "Count Basis: maintained" "Expected fresh CustomScan maintained count basis"
 require_contains "$row_fresh_customscan_plan" "Model Cost Source:" "Expected fresh CustomScan model cost source"
 require_contains "$row_fresh_customscan_plan" "Preloaded Fresh Subjects / Basis: 1" "Expected fresh CustomScan preload count and basis"
 require_contains "$row_fresh_customscan_plan" "Emitted Freshness Basis:" "Expected fresh CustomScan emitted freshness basis breakdown"

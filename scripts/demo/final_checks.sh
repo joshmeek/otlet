@@ -93,8 +93,8 @@ planner_1m_basis="$(cut -d'|' -f1 <<<"$planner_1m_contract")"
 planner_1m_total="$(cut -d'|' -f2 <<<"$planner_1m_contract")"
 planner_1m_fast="$(cut -d'|' -f4 <<<"$planner_1m_contract")"
 echo "planner_1m_contract=$planner_1m_contract"
-[ "$planner_1m_basis" = "estimated" ] && [ "$planner_1m_total" -ge 1000000 ] && [ "$planner_1m_fast" = "true" ] || {
-  echo "Expected estimated 1M-row plan under 100ms, got $planner_1m_contract" >&2
+[ "$planner_1m_basis" = "maintained" ] && [ "$planner_1m_total" -eq 1000000 ] && [ "$planner_1m_fast" = "true" ] || {
+  echo "Expected maintained 1M-row plan under 100ms, got $planner_1m_contract" >&2
   exit 1
 }
 
@@ -1133,13 +1133,16 @@ SELECT concat_ws('|',
      AND task_name = :'task_name'
      AND subject_id = 'vendor-1001:vendor-313'),
   (SELECT message LIKE 'otlet entity graph blocker prevents%'
-   FROM pair_correction_conflict_result)
+   FROM pair_correction_conflict_result),
+  (SELECT stale_reasons ->> 'semantic_correction_re_review' = '1'
+   FROM otlet.semantic_planner_statistics_status
+   WHERE task_name = :'task_name')
 );
 ROLLBACK;
 SQL
 )"
 echo "pair_correction_conflict_contract=$pair_correction_conflict_contract"
-[ "$pair_correction_conflict_contract" = "reopened_pair_constraint|1|t" ] || {
+[ "$pair_correction_conflict_contract" = "reopened_pair_constraint|1|t|t" ] || {
   echo "Expected pair conflict to reopen correction and block approval, got $pair_correction_conflict_contract" >&2
   exit 1
 }

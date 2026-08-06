@@ -8,6 +8,9 @@ fn planner_stats_from_loaded_state(
     // custom_private stash; overlay exact preload subject counts for EXPLAIN.
     if let Some(mut stats) = stashed_stats {
         stats.source_rows = loaded_state.subjects.len() as u64;
+        stats.fresh_rows = counts
+            .fresh_matches
+            .saturating_add(counts.fresh_non_matches);
         stats.fresh_matches = counts.fresh_matches;
         stats.fresh_non_matches = counts.fresh_non_matches;
         stats.stale_rows = counts.stale;
@@ -36,6 +39,9 @@ fn planner_stats_from_loaded_state(
         selected_path: "semantic_lookup".to_owned(),
         reason: "derived_from_begin_scan_preload".to_owned(),
         source_rows: loaded_state.subjects.len() as u64,
+        fresh_rows: counts
+            .fresh_matches
+            .saturating_add(counts.fresh_non_matches),
         fresh_matches: counts.fresh_matches,
         fresh_non_matches: counts.fresh_non_matches,
         stale_rows: counts.stale,
@@ -48,12 +54,7 @@ fn planner_stats_from_loaded_state(
         model_cost_source: std::mem::take(&mut loaded_state.model_cost_source),
         path_cost: 1.0,
         stale_reasons: std::mem::take(&mut loaded_state.stale_reasons),
-        // Join SQL plans use estimated candidate coverage; row preload is exact.
-        count_basis: if private.index_kind == SemanticIndexKind::Join {
-            "estimated".to_owned()
-        } else {
-            "exact".to_owned()
-        },
+        count_basis: "executor_exact".to_owned(),
     };
     finish_planner_stats(
         &mut stats,

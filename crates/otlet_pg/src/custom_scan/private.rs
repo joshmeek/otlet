@@ -115,6 +115,7 @@ fn reload_private_planner_stats_plan_only(private: &CustomScanPrivate) -> Semant
                    COALESCE(selected_path, 'semantic_lookup')::pg_catalog.text AS selected_path, \
                    COALESCE(reason, 'reloaded_from_sql_plan')::pg_catalog.text AS reason, \
                    COALESCE(total_subjects, 0)::pg_catalog.int8 AS total_subjects, \
+                   COALESCE(fresh_subjects, 0)::pg_catalog.int8 AS fresh_rows, \
                    0::pg_catalog.int8 AS fresh_matches, \
                    0::pg_catalog.int8 AS fresh_non_matches, \
                    COALESCE(stale_subjects, 0)::pg_catalog.int8 AS stale_subjects, \
@@ -126,8 +127,8 @@ fn reload_private_planner_stats_plan_only(private: &CustomScanPrivate) -> Semant
                    COALESCE(model_cost_source, 'static_fallback')::pg_catalog.text AS model_cost_source, \
                    COALESCE(path_cost, 1)::pg_catalog.float8 AS path_cost, \
                    COALESCE(stale_reasons::pg_catalog.text, '{}')::pg_catalog.text AS stale_reasons, \
-                   COALESCE(count_basis, 'exact')::pg_catalog.text AS count_basis \
-                 FROM otlet.semantic_index_plan($1, true, $2) \
+                   COALESCE(count_basis, 'maintained_missing')::pg_catalog.text AS count_basis \
+                 FROM otlet.semantic_index_plan($1, false, $2) \
                  WHERE EXISTS ( \
                    SELECT 1 \
                    FROM otlet.workload_revision_heads head \
@@ -143,6 +144,7 @@ fn reload_private_planner_stats_plan_only(private: &CustomScanPrivate) -> Semant
                    COALESCE(selected_path, 'semantic_lookup')::pg_catalog.text AS selected_path, \
                    COALESCE(reason, 'reloaded_from_sql_plan')::pg_catalog.text AS reason, \
                    COALESCE(total_subjects, 0)::pg_catalog.int8 AS total_subjects, \
+                   COALESCE(fresh_subjects, 0)::pg_catalog.int8 AS fresh_rows, \
                    0::pg_catalog.int8 AS fresh_matches, \
                    0::pg_catalog.int8 AS fresh_non_matches, \
                    COALESCE(stale_subjects, 0)::pg_catalog.int8 AS stale_subjects, \
@@ -154,7 +156,7 @@ fn reload_private_planner_stats_plan_only(private: &CustomScanPrivate) -> Semant
                    COALESCE(model_cost_source, 'static_fallback')::pg_catalog.text AS model_cost_source, \
                    COALESCE(path_cost, 1)::pg_catalog.float8 AS path_cost, \
                    COALESCE(stale_reasons::pg_catalog.text, '{}')::pg_catalog.text AS stale_reasons, \
-                   COALESCE(count_basis, 'exact')::pg_catalog.text AS count_basis \
+                   COALESCE(count_basis, 'maintained_missing')::pg_catalog.text AS count_basis \
                  FROM otlet.semantic_join_index_plan($1, false, $2) \
                  WHERE EXISTS ( \
                    SELECT 1 \
@@ -190,6 +192,7 @@ fn reload_private_planner_stats_plan_only(private: &CustomScanPrivate) -> Semant
             selected_path: text!("selected_path", "semantic_lookup"),
             reason: text!("reason", "reloaded_from_sql_plan"),
             source_rows: count!("total_subjects"),
+            fresh_rows: count!("fresh_rows"),
             fresh_matches: count!("fresh_matches"),
             fresh_non_matches: count!("fresh_non_matches"),
             stale_rows: count!("stale_subjects"),
@@ -210,7 +213,7 @@ fn reload_private_planner_stats_plan_only(private: &CustomScanPrivate) -> Semant
                 .unwrap_or(1.0)
                 .max(0.0),
             stale_reasons: text!("stale_reasons", "{}"),
-            count_basis: text!("count_basis", "estimated"),
+            count_basis: text!("count_basis", "maintained_missing"),
         };
         finish_planner_stats(
             &mut stats,

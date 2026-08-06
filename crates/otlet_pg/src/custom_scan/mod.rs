@@ -34,6 +34,12 @@ macro_rules! explain_scan_counters {
                 .saturating_add(source.fresh_non_matches),
             $es,
         );
+        explain_counter("Actual Predicate Matches", source.fresh_matches, $es);
+        explain_counter(
+            "Actual Predicate Non Matches",
+            source.fresh_non_matches,
+            $es,
+        );
         explain_counter("Actual Stale Subjects", source.stale_rows, $es);
         explain_counter("Actual Missing Subjects", source.missing_rows, $es);
         explain_counter("Actual In Flight Subjects", source.inflight_rows, $es);

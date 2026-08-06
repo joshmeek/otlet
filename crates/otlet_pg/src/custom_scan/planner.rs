@@ -189,6 +189,7 @@ fn planner_stats_with_reason(reason: &'static str) -> SemanticPlannerStats {
         selected_path: "semantic_lookup".to_owned(),
         reason: reason.to_owned(),
         source_rows: 0,
+        fresh_rows: 0,
         fresh_matches: 0,
         fresh_non_matches: 0,
         stale_rows: 0,
@@ -218,7 +219,7 @@ fn finish_planner_stats(
         .saturating_add(stats.missing_rows)
         .saturating_add(stats.inflight_rows);
     let base_scan = stats.source_rows.max(1) as f64 * 0.02 + 1.0;
-    let lookup_cost = stats.fresh_matches.saturating_add(stats.fresh_non_matches) as f64 * 0.05;
+    let lookup_cost = stats.fresh_rows as f64 * 0.05;
     let model_cost = planner_model_cost_unit(stats.model_ms, infer_ms);
     stats.infer_decision_rows = 0;
     stats.fail_closed_decision_rows = 0;
@@ -257,12 +258,12 @@ fn finish_planner_stats(
         if unresolved > 0 {
             stats.reason = format!(
                 "auto semantic policy: fresh={} wait={} infer={} queue={} fail_closed={}",
-                stats.fresh_matches, waited_rows, bounded_infer_rows, queued_rows, fail_closed_rows
+                stats.fresh_rows, waited_rows, bounded_infer_rows, queued_rows, fail_closed_rows
             );
         } else {
             stats.reason = format!(
                 "auto semantic policy: all source rows resolved from fresh semantic state; fresh={}",
-                stats.fresh_matches
+                stats.fresh_rows
             );
         }
     } else if infer_ms > 0 && infer_max_rows > 0 && unresolved > 0 {
@@ -278,7 +279,7 @@ fn finish_planner_stats(
         stats.selected_path = "bounded_infer_now".to_owned();
         stats.reason = format!(
             "bounded infer-now over {bounded_infer_rows} unresolved rows; fresh={} stale={} missing={} in_flight={}",
-            stats.fresh_matches, stats.stale_rows, stats.missing_rows, stats.inflight_rows
+            stats.fresh_rows, stats.stale_rows, stats.missing_rows, stats.inflight_rows
         );
     } else if wait_ms > 0 && stats.inflight_rows > 0 {
         stats.fail_closed_decision_rows = unresolved.saturating_sub(stats.inflight_rows);
@@ -287,14 +288,14 @@ fn finish_planner_stats(
         stats.selected_path = "wait_for_refresh".to_owned();
         stats.reason = format!(
             "bounded wait for {} in-flight rows; fresh={} stale={} missing={}",
-            stats.inflight_rows, stats.fresh_matches, stats.stale_rows, stats.missing_rows
+            stats.inflight_rows, stats.fresh_rows, stats.stale_rows, stats.missing_rows
         );
     } else if allow_refresh && unresolved > 0 {
         stats.path_cost = base_scan + lookup_cost + unresolved as f64 * 0.50;
         stats.selected_path = "queue_refresh".to_owned();
         stats.reason = format!(
             "queue refresh and fail closed for {unresolved} unresolved rows; fresh={}",
-            stats.fresh_matches
+            stats.fresh_rows
         );
     } else if unresolved > 0 {
         stats.fail_closed_decision_rows = unresolved;
@@ -302,14 +303,14 @@ fn finish_planner_stats(
         stats.selected_path = "lookup_fail_closed".to_owned();
         stats.reason = format!(
             "fail closed for {unresolved} unresolved rows; fresh={}",
-            stats.fresh_matches
+            stats.fresh_rows
         );
     } else {
         stats.path_cost = base_scan + lookup_cost;
         stats.selected_path = "semantic_lookup".to_owned();
         stats.reason = format!(
             "all source rows resolved from fresh semantic state; fresh={}",
-            stats.fresh_matches
+            stats.fresh_rows
         );
     }
 }
@@ -360,7 +361,9 @@ fn planner_bounded_infer_cost(
 const PLANNER_CACHE_HIT_COST_UNIT: f64 = 0.05;
 
 fn estimated_result_rows(stats: &SemanticPlannerStats, predicate: &SemanticMatchPredicate) -> f64 {
-    let mut rows = stats.fresh_matches;
+    // PostgreSQL owns predicate selectivity
+    // Semantic statistics only cap current executor coverage
+    let mut rows = stats.fresh_rows;
     if predicate.auto_policy {
         if predicate.wait_ms > 0 {
             rows = rows.saturating_add(stats.inflight_rows);

@@ -395,6 +395,11 @@ pgrx::extension_sql_file!(
     name = "workload_enablement_preflight",
     requires = ["interactive_async_service_quantum"]
 );
+pgrx::extension_sql_file!(
+    "../sql/migrations/0078_semantic_planner_statistics.sql",
+    name = "semantic_planner_statistics",
+    requires = ["workload_enablement_preflight"]
+);
 
 #[allow(non_snake_case)]
 #[pgrx::pg_guard]

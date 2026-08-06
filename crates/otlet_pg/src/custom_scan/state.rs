@@ -356,6 +356,7 @@ struct SemanticPlannerStats {
     selected_path: String,
     reason: String,
     source_rows: u64,
+    fresh_rows: u64,
     fresh_matches: u64,
     fresh_non_matches: u64,
     stale_rows: u64,

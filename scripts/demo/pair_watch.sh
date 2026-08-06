@@ -130,7 +130,7 @@ SQL
 join_status_estimated="$(head -n 1 <<<"$join_status_contract")"
 join_status_exact="$(tail -n 1 <<<"$join_status_contract")"
 echo "semantic_join_status_contract=$join_status_contract"
-[ "$join_status_estimated|$join_status_exact" = "semantic_join_lookup|4|4|0|0|0|0|estimated|semantic_join_lookup|4|4|0|0|0|0|exact" ] || {
+[ "$join_status_estimated|$join_status_exact" = "semantic_join_lookup|4|4|0|0|0|0|maintained|semantic_join_lookup|4|4|0|0|0|0|exact" ] || {
   echo "Expected fresh semantic join status, got $join_status_contract" >&2
   exit 1
 }

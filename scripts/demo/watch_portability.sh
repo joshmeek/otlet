@@ -16,7 +16,7 @@ SELECT concat_ws('|',
   current_setting('transaction_read_only'),
   pg_my_temp_schema() = 0,
   (SELECT count(*) > 0 FROM otlet.semantic_index_current_rows(:'row_watch', true)),
-  (SELECT count_basis = 'estimated' FROM row_estimated),
+  (SELECT count_basis = 'maintained' FROM row_estimated),
   (SELECT count_basis = 'exact' FROM row_exact),
   EXISTS (
     SELECT 1
@@ -30,7 +30,7 @@ SELECT concat_ws('|',
       AND otlet.semantic_matches_auto(:'row_watch', source.id, '{"decision":"flag"}'::jsonb)
   ),
   (SELECT count(*) > 0 FROM otlet.semantic_join_index_current_rows(:'pair_watch', true)),
-  (SELECT count_basis = 'estimated' FROM pair_estimated),
+  (SELECT count_basis = 'maintained' FROM pair_estimated),
   (SELECT count_basis = 'exact' FROM pair_exact),
   otlet.semantic_join_matches(:'pair_watch', 'vendor-1001:vendor-42', '{"match":"same_entity"}'::jsonb),
   NOT otlet.semantic_join_matches(:'pair_watch', 'vendor-1001:vendor-77', '{"match":"same_entity"}'::jsonb),
@@ -239,11 +239,15 @@ printf '%s\n' "$join_customscan_plan"
 require_contains "$join_customscan_plan" "Otlet Node: Semantic Source CustomScan" "Expected join CustomScan explain details"
 require_contains "$join_customscan_plan" "Semantic Index Kind: join" "Expected join CustomScan index kind"
 require_contains "$join_customscan_plan" "Planner Selected Path: semantic_join_lookup" "Expected join CustomScan lookup path"
-require_contains "$join_customscan_plan" "Count Basis: estimated" "Expected join CustomScan estimated count basis"
+require_contains "$join_customscan_plan" "Count Basis: maintained" "Expected join CustomScan maintained count basis"
 require_contains "$join_customscan_plan" "Model Cost Source:" "Expected join CustomScan model cost source"
 require_contains "$join_customscan_plan" "Preloaded Fresh Subjects / Basis: 4" "Expected join CustomScan preload count and basis"
+require_contains "$join_customscan_plan" "Preloaded Predicate Matches:" "Expected join CustomScan predicate match preload count"
+require_contains "$join_customscan_plan" "Preloaded Predicate Non Matches:" "Expected join CustomScan predicate non-match preload count"
 require_contains "$join_customscan_plan" "Emitted Freshness Basis:" "Expected join CustomScan emitted freshness basis breakdown"
 require_contains "$join_customscan_plan" "Actual Fresh Subjects: 4" "Expected join CustomScan fresh count"
+require_contains "$join_customscan_plan" "Actual Predicate Matches:" "Expected join CustomScan predicate match count"
+require_contains "$join_customscan_plan" "Actual Predicate Non Matches:" "Expected join CustomScan predicate non-match count"
 require_contains "$join_customscan_plan" "Actual Stale Subjects: 0" "Expected join CustomScan stale count"
 require_contains "$join_customscan_plan" "Actual Lookup Rows: 4" "Expected join CustomScan lookup rows"
 require_contains "$join_customscan_plan" "Infer Now Batches: 0" "Expected join CustomScan zero infer-now"

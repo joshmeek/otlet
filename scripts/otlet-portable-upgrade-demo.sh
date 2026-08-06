@@ -23,9 +23,9 @@ install_portable() {
     -f crates/otlet_worker/sql/install.sql
 }
 
-install_portable_through_76() {
+install_portable_through_77() {
   docker exec -w /work/crates/otlet_worker/sql "$container" \
-    sed '/0077_workload_enablement_preflight.sql/,$d' migrate.sql |
+    sed '/0078_semantic_planner_statistics.sql/,$d' migrate.sql |
     docker exec -i -w /work/crates/otlet_worker/sql "$container" \
       psql -U postgres -d "$database" -X -q -v ON_ERROR_STOP=1 --single-transaction
 }
@@ -65,7 +65,7 @@ SELECT format(
   'portable upgrade executable proof'
 ) \gexec
 SQL
-install_portable_through_76
+install_portable_through_77
 
 docker exec -i "$container" psql -U postgres -d "$database" \
   -X -q -v ON_ERROR_STOP=1 <<'SQL' >/dev/null
@@ -80,6 +80,10 @@ CREATE TABLE public.portable_upgrade_sentinel (
   production_policy_status_acl text,
   preflight_function_oid oid,
   preflight_function_acl text,
+  semantic_index_plan_oid oid,
+  semantic_index_plan_acl text,
+  planner_statistics_version bigint,
+  planner_statistics_refreshed_at timestamptz,
   legacy_watch_revision_hash text,
   legacy_materialization_id bigint
 );
@@ -172,6 +176,13 @@ SET production_policy_status_oid = relation.oid,
 FROM pg_catalog.pg_class relation
 WHERE sentinel.id = 1
   AND relation.oid = 'otlet.production_policy_status'::regclass;
+UPDATE public.portable_upgrade_sentinel sentinel
+SET semantic_index_plan_oid = function.oid,
+    semantic_index_plan_acl = function.proacl::text
+FROM pg_catalog.pg_proc function
+WHERE sentinel.id = 1
+  AND function.oid =
+    'otlet.semantic_index_plan(text,boolean,text)'::regprocedure;
 
 SELECT otlet.register_model(
   'model_concurrency_probe',
@@ -311,6 +322,326 @@ SQL
 install_portable
 
 docker exec -i "$container" psql -U postgres -d "$database" \
+  -X -q -v ON_ERROR_STOP=1 <<'SQL' >/dev/null
+BEGIN READ ONLY;
+DO $proof$
+DECLARE
+  revision_hash text;
+  version_before bigint;
+  refreshed_before timestamptz;
+BEGIN
+  SELECT legacy_watch_revision_hash
+  INTO STRICT revision_hash
+  FROM public.portable_upgrade_sentinel
+  WHERE id = 1;
+  SELECT statistics_version, refreshed_at
+  INTO STRICT version_before, refreshed_before
+  FROM otlet.semantic_planner_statistics
+  WHERE task_name = 'portable_time_legacy_task'
+    AND workload_revision_hash = revision_hash;
+  IF NOT (
+    SELECT total_subjects = 1
+      AND fresh_subjects = 1
+      AND stale_subjects = 0
+      AND missing_subjects = 0
+      AND count_basis = 'maintained'
+    FROM otlet.semantic_index_plan(
+      'portable_time_legacy', false, revision_hash
+    )
+  ) THEN
+    RAISE EXCEPTION 'portable semantic planner snapshot is invalid';
+  END IF;
+  IF NOT (
+    SELECT total_subjects = 1
+      AND fresh_matches = 1
+      AND fresh_non_matches = 0
+      AND stale_subjects = 0
+      AND missing_subjects = 0
+      AND count_basis = 'exact_predicate_diagnostic'
+    FROM otlet.semantic_predicate_counts(
+      'portable_time_legacy', '{"decision":"keep"}'::jsonb, revision_hash
+    )
+  ) THEN
+    RAISE EXCEPTION 'portable semantic predicate diagnostic is invalid';
+  END IF;
+  IF EXISTS (
+    SELECT 1
+    FROM otlet.semantic_planner_statistics
+    WHERE task_name = 'portable_time_legacy_task'
+      AND workload_revision_hash = revision_hash
+      AND (
+        statistics_version IS DISTINCT FROM version_before
+        OR refreshed_at IS DISTINCT FROM refreshed_before
+      )
+  ) THEN
+    RAISE EXCEPTION 'portable semantic planning changed its snapshot';
+  END IF;
+  BEGIN
+    PERFORM *
+    FROM otlet.semantic_predicate_counts(
+      'portable_time_legacy', NULL, revision_hash
+    );
+    RAISE EXCEPTION 'portable semantic predicate diagnostic accepted null expected json';
+  EXCEPTION WHEN OTHERS THEN
+    IF position('require expected json' IN SQLERRM) = 0 THEN
+      RAISE;
+    END IF;
+  END;
+  BEGIN
+    PERFORM *
+    FROM otlet.semantic_index_plan(
+      'portable_time_legacy', false, repeat('0', 64)
+    );
+    RAISE EXCEPTION 'portable semantic planner accepted a stale revision';
+  EXCEPTION WHEN OTHERS THEN
+    IF position('workload revision changed' IN SQLERRM) = 0 THEN
+      RAISE;
+    END IF;
+  END;
+END;
+$proof$;
+ROLLBACK;
+
+BEGIN;
+INSERT INTO public.portable_time_legacy_source
+VALUES ('missing-row', 'missing');
+DO $proof$
+BEGIN
+  IF NOT (
+    SELECT total_subjects = 2
+      AND fresh_subjects = 1
+      AND stale_subjects = 0
+      AND missing_subjects = 1
+      AND count_basis = 'maintained'
+    FROM otlet.semantic_planner_statistics_status
+    WHERE task_name = 'portable_time_legacy_task'
+  ) THEN
+    RAISE EXCEPTION 'portable semantic source maintenance is invalid';
+  END IF;
+END;
+$proof$;
+ROLLBACK;
+
+BEGIN;
+DO $proof$
+DECLARE
+  trigger_name name;
+BEGIN
+  FOR trigger_name IN
+    SELECT trigger_row.tgname
+    FROM pg_catalog.pg_trigger trigger_row
+    WHERE trigger_row.tgrelid =
+        'public.portable_time_legacy_source'::regclass
+      AND trigger_row.tgfoid =
+        'otlet.watch_change_trigger()'::regprocedure::oid
+      AND NOT trigger_row.tgisinternal
+  LOOP
+    EXECUTE format(
+      'ALTER TABLE public.portable_time_legacy_source DISABLE TRIGGER %I',
+      trigger_name
+    );
+  END LOOP;
+END;
+$proof$;
+UPDATE public.portable_time_legacy_source
+SET id = 'moved-row'
+WHERE id = 'legacy-row';
+DO $proof$
+DECLARE
+  revision_hash text;
+  revision_definition jsonb;
+BEGIN
+  SELECT sentinel.legacy_watch_revision_hash, revision.definition
+  INTO STRICT revision_hash, revision_definition
+  FROM public.portable_upgrade_sentinel sentinel
+  JOIN otlet.workload_revisions revision
+    ON revision.task_name = 'portable_time_legacy_task'
+   AND revision.workload_revision_hash = sentinel.legacy_watch_revision_hash
+  WHERE sentinel.id = 1;
+  IF NOT (
+    SELECT total_subjects = 1
+      AND fresh_subjects = 0
+      AND stale_subjects = 0
+      AND missing_subjects = 1
+      AND count_basis = 'maintained'
+    FROM otlet.semantic_planner_statistics_status
+    WHERE task_name = 'portable_time_legacy_task'
+  ) OR NOT (
+    SELECT total_subjects = 1
+      AND fresh_subjects = 0
+      AND stale_subjects = 0
+      AND missing_subjects = 1
+    FROM otlet.semantic_row_exact_counts(
+      revision_definition,
+      revision_hash
+    )
+  ) THEN
+    RAISE EXCEPTION 'portable semantic subject move maintenance is invalid';
+  END IF;
+END;
+$proof$;
+ROLLBACK;
+
+BEGIN;
+DO $proof$
+DECLARE
+  trigger_name name;
+BEGIN
+  FOR trigger_name IN
+    SELECT trigger_row.tgname
+    FROM pg_catalog.pg_trigger trigger_row
+    WHERE trigger_row.tgrelid =
+        'public.portable_time_legacy_source'::regclass
+      AND trigger_row.tgfoid =
+        'otlet.watch_change_trigger()'::regprocedure::oid
+      AND NOT trigger_row.tgisinternal
+  LOOP
+    EXECUTE format(
+      'ALTER TABLE public.portable_time_legacy_source DISABLE TRIGGER %I',
+      trigger_name
+    );
+  END LOOP;
+END;
+$proof$;
+DELETE FROM public.portable_time_legacy_source
+WHERE id = 'legacy-row';
+INSERT INTO public.portable_time_legacy_source
+VALUES ('legacy-row', 'legacy');
+DO $proof$
+DECLARE
+  revision_hash text;
+  revision_definition jsonb;
+  maintained_contract text;
+  exact_contract text;
+BEGIN
+  SELECT sentinel.legacy_watch_revision_hash, revision.definition
+  INTO STRICT revision_hash, revision_definition
+  FROM public.portable_upgrade_sentinel sentinel
+  JOIN otlet.workload_revisions revision
+    ON revision.task_name = 'portable_time_legacy_task'
+   AND revision.workload_revision_hash = sentinel.legacy_watch_revision_hash
+  WHERE sentinel.id = 1;
+  SELECT concat_ws('|', count_basis, total_subjects, fresh_subjects,
+                   stale_subjects, missing_subjects)
+  INTO STRICT maintained_contract
+  FROM otlet.semantic_planner_statistics_status
+  WHERE task_name = 'portable_time_legacy_task';
+  SELECT concat_ws('|', total_subjects, fresh_subjects,
+                   stale_subjects, missing_subjects)
+  INTO STRICT exact_contract
+  FROM otlet.semantic_row_exact_counts(
+    revision_definition,
+    revision_hash
+  );
+  IF maintained_contract <> 'maintained|1|0|1|0'
+     OR exact_contract <> '1|1|0|0' THEN
+    RAISE EXCEPTION 'portable semantic subject reinsert maintenance is invalid: % / %',
+      maintained_contract, exact_contract;
+  END IF;
+END;
+$proof$;
+ROLLBACK;
+
+BEGIN;
+TRUNCATE public.portable_time_legacy_source;
+DO $proof$
+BEGIN
+  IF NOT (
+    SELECT total_subjects = 0
+      AND fresh_subjects = 0
+      AND stale_subjects = 0
+      AND missing_subjects = 0
+      AND count_basis = 'maintained'
+    FROM otlet.semantic_planner_statistics_status
+    WHERE task_name = 'portable_time_legacy_task'
+  ) THEN
+    RAISE EXCEPTION 'portable semantic truncate maintenance is invalid';
+  END IF;
+END;
+$proof$;
+ROLLBACK;
+
+BEGIN;
+UPDATE otlet.semantic_planner_statistics statistics
+SET total_subjects = 3,
+    fresh_subjects = 2,
+    stale_subjects = 1,
+    missing_subjects = 0,
+    stale_reasons = '{"time_expired":1}'::jsonb,
+    count_basis = 'maintained',
+    valid_until = statement_timestamp() - interval '1 second',
+    invalidated_at = NULL,
+    invalidation_reason = NULL
+FROM public.portable_upgrade_sentinel sentinel
+WHERE sentinel.id = 1
+  AND statistics.task_name = 'portable_time_legacy_task'
+  AND statistics.workload_revision_hash = sentinel.legacy_watch_revision_hash;
+DO $proof$
+DECLARE
+  revision_hash text;
+BEGIN
+  SELECT legacy_watch_revision_hash
+  INTO STRICT revision_hash
+  FROM public.portable_upgrade_sentinel
+  WHERE id = 1;
+  IF NOT (
+    SELECT total_subjects = 3
+      AND fresh_subjects = 0
+      AND stale_subjects = 3
+      AND missing_subjects = 0
+      AND stale_reasons ->> 'time_expired' = '3'
+      AND count_basis = 'maintained_expired'
+    FROM otlet.semantic_planner_counts(
+      'portable_time_legacy_task', revision_hash, 3
+    )
+  ) THEN
+    RAISE EXCEPTION 'portable semantic expiry aggregation is invalid';
+  END IF;
+END;
+$proof$;
+ROLLBACK;
+
+BEGIN;
+DO $proof$
+DECLARE
+  duplicate_definition jsonb := jsonb_build_object(
+    'source', jsonb_build_object(
+      'kind', 'pair',
+      'pair_sources', jsonb_build_array(
+        jsonb_build_object('table', 'public.portable_time_legacy_source'),
+        jsonb_build_object('table', 'public.portable_time_legacy_source')
+      )
+    )
+  );
+  trigger_prefix text := 'otlet_stats_' ||
+    substr(md5('portable_duplicate_source_probe'), 1, 16);
+BEGIN
+  PERFORM otlet.install_semantic_planner_source_triggers(
+    'portable_duplicate_source_probe', duplicate_definition
+  );
+  IF (
+    SELECT count(*)
+    FROM pg_catalog.pg_trigger trigger
+    WHERE trigger.tgrelid = 'public.portable_time_legacy_source'::regclass
+      AND trigger.tgname LIKE trigger_prefix || '%'
+      AND NOT trigger.tgisinternal
+  ) <> 4 THEN
+    RAISE EXCEPTION 'portable duplicate source trigger installation is invalid';
+  END IF;
+END;
+$proof$;
+ROLLBACK;
+
+UPDATE public.portable_upgrade_sentinel sentinel
+SET planner_statistics_version = statistics.statistics_version,
+    planner_statistics_refreshed_at = statistics.refreshed_at
+FROM otlet.semantic_planner_statistics statistics
+WHERE sentinel.id = 1
+  AND statistics.task_name = 'portable_time_legacy_task'
+  AND statistics.workload_revision_hash = sentinel.legacy_watch_revision_hash;
+SQL
+
+docker exec -i "$container" psql -U postgres -d "$database" \
   -X -q -v ON_ERROR_STOP=1 -v preflight_role="$preflight_role" <<'SQL' >/dev/null
 GRANT EXECUTE ON FUNCTION otlet.workload_enablement_preflight(
   text, text, text, integer, integer, integer, integer
@@ -430,7 +761,7 @@ $function$;
 SELECT concat_ws('|',
   max(version),
   count(*),
-  array_agg(version ORDER BY version) = ARRAY(SELECT generate_series(1, 77)),
+  array_agg(version ORDER BY version) = ARRAY(SELECT generate_series(1, 78)),
   bool_and(file ~ ('(^|/)' || lpad(version::text, 4, '0') || '_')),
   (SELECT value FROM public.portable_upgrade_sentinel),
   (
@@ -621,12 +952,102 @@ SELECT concat_ws('|',
     WHERE sentinel.id = 1
       AND function.oid =
         'otlet.workload_enablement_preflight(text,text,text,integer,integer,integer,integer)'::regprocedure
+  ),
+  (
+    SELECT function.oid = sentinel.semantic_index_plan_oid
+      AND function.proacl::text IS NOT DISTINCT FROM
+        sentinel.semantic_index_plan_acl
+      AND statistics.statistics_version =
+        sentinel.planner_statistics_version
+      AND statistics.refreshed_at =
+        sentinel.planner_statistics_refreshed_at
+      AND statistics.total_subjects = 1
+      AND statistics.fresh_subjects = 1
+      AND statistics.stale_subjects = 0
+      AND statistics.missing_subjects = 0
+      AND statistics.count_basis = 'maintained'
+      AND NOT pg_catalog.has_table_privilege(
+        'public', 'otlet.semantic_planner_statistics', 'SELECT'
+      )
+      AND NOT pg_catalog.has_table_privilege(
+        'public', 'otlet.semantic_planner_statistics_status', 'SELECT'
+      )
+      AND NOT pg_catalog.has_function_privilege(
+        'public',
+        'otlet.semantic_predicate_counts(text,jsonb,text)',
+        'EXECUTE'
+      )
+      AND NOT pg_catalog.has_function_privilege(
+        'public',
+        'otlet.recompute_reviewed_semantic_planner_statistics()',
+        'EXECUTE'
+      )
+      AND position(
+        'workload_revision_heads' IN pg_catalog.pg_get_viewdef(
+          'otlet.semantic_planner_statistics_status'::regclass,
+          true
+        )
+      ) > 0
+      AND (
+        SELECT position('relevant_contract_hash' IN changed.prosrc) > 0
+          AND position('pair_constraint_contract_hash' IN changed.prosrc) > 0
+          AND position('supersedes_correction_hash' IN changed.prosrc) > 0
+        FROM pg_catalog.pg_proc changed
+        WHERE changed.oid =
+          'otlet.recompute_corrected_semantic_planner_statistics()'::regprocedure
+      )
+      AND EXISTS (
+        SELECT 1
+        FROM pg_catalog.pg_trigger trigger
+        WHERE trigger.tgname = 'pair_constraint_facts_planner_statistics'
+          AND trigger.tgrelid = 'otlet.pair_constraint_facts'::regclass
+          AND trigger.tgfoid =
+            'otlet.recompute_constrained_semantic_planner_statistics()'::regprocedure::oid
+          AND NOT trigger.tgisinternal
+      )
+      AND EXISTS (
+        SELECT 1
+        FROM pg_catalog.pg_trigger trigger
+        WHERE trigger.tgname = 'review_events_zz_semantic_planner_statistics'
+          AND trigger.tgrelid = 'otlet.review_events'::regclass
+          AND trigger.tgfoid =
+            'otlet.recompute_reviewed_semantic_planner_statistics()'::regprocedure::oid
+          AND NOT trigger.tgisinternal
+      )
+      AND (
+        SELECT position('pg_trigger_depth() > 1' IN changed.prosrc) > 0
+        FROM pg_catalog.pg_proc changed
+        WHERE changed.oid =
+          'otlet.recompute_changed_semantic_planner_statistics()'::regprocedure
+      )
+      AND (
+        SELECT position('pg_trigger_depth() > 1' IN constrained.prosrc) > 0
+        FROM pg_catalog.pg_proc constrained
+        WHERE constrained.oid =
+          'otlet.recompute_constrained_semantic_planner_statistics()'::regprocedure
+      )
+      AND (
+        SELECT position('relevant_contract_hash' IN recompute.prosrc) > 0
+          AND position('pair_constraint_contract_hash' IN recompute.prosrc) > 0
+        FROM pg_catalog.pg_proc recompute
+        WHERE recompute.oid =
+          'otlet.recompute_semantic_planner_statistics(text,text,bigint,text)'::regprocedure
+      )
+    FROM public.portable_upgrade_sentinel sentinel
+    JOIN otlet.semantic_planner_statistics statistics
+      ON statistics.task_name = 'portable_time_legacy_task'
+     AND statistics.workload_revision_hash =
+       sentinel.legacy_watch_revision_hash
+    CROSS JOIN pg_catalog.pg_proc function
+    WHERE sentinel.id = 1
+      AND function.oid =
+        'otlet.semantic_index_plan(text,boolean,text)'::regprocedure
   )
 )
 FROM otlet.portable_schema_migrations;
 SQL
 )"
-[ "$contract" = "77|77|t|t|preserved|t|0|t|t|t|t|t|t|t|t|t|t|t|t" ] || {
+[ "$contract" = "78|78|t|t|preserved|t|0|t|t|t|t|t|t|t|t|t|t|t|t|t" ] || {
   echo "Portable repeat-install contract mismatch: $contract" >&2
   exit 1
 }
@@ -3222,19 +3643,32 @@ SELECT concat_ws('|',
      AND NOT trigger.tgisinternal
   ),
   (
-    SELECT count(*) = 6
+    SELECT count(*) = 4
     FROM pg_catalog.pg_proc function
     WHERE function.oid = ANY(ARRAY[
       'otlet.semantic_index_current_rows(text,boolean,text)'::regprocedure::oid,
       'otlet.semantic_join_index_current_rows(text,boolean,text)'::regprocedure::oid,
       'otlet.semantic_join_matches(text,text,jsonb)'::regprocedure::oid,
-      'otlet.semantic_matches(text,text,jsonb)'::regprocedure::oid,
-      'otlet.semantic_join_index_plan(text,boolean,text)'::regprocedure::oid,
-      'otlet.semantic_index_plan(text,boolean,text)'::regprocedure::oid
+      'otlet.semantic_matches(text,text,jsonb)'::regprocedure::oid
     ])
       AND position(
         'semantic_materializations_effective' IN function.prosrc
       ) > 0
+  ) AND (
+    SELECT position('semantic_materializations_effective' IN function.prosrc) > 0
+    FROM pg_catalog.pg_proc function
+    WHERE function.oid =
+      'otlet.recompute_semantic_planner_statistics(text,text,bigint,text)'::regprocedure
+  ) AND (
+    SELECT position('semantic_row_exact_counts' IN function.prosrc) > 0
+    FROM pg_catalog.pg_proc function
+    WHERE function.oid =
+      'otlet.semantic_index_plan(text,boolean,text)'::regprocedure
+  ) AND (
+    SELECT position('semantic_pair_exact_counts' IN function.prosrc) > 0
+    FROM pg_catalog.pg_proc function
+    WHERE function.oid =
+      'otlet.semantic_join_index_plan(text,boolean,text)'::regprocedure
   ),
   EXISTS (
     SELECT 1
