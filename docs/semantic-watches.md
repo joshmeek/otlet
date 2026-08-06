@@ -163,6 +163,8 @@ Contract output:
 semantic_index_refresh_queued=3
 ```
 
+Before the first refresh of a large row or pair watch, run `otlet.workload_enablement_preflight(...)` against the active watch task revision with `requested_enablement_kind => 'watch'`. The report uses `EXPLAIN` and current semantic state without executing candidates or requiring the pair-refresh statement timeout. Exact refresh still revalidates the source and enforces its normal timeout and admission limits. See [workload admission](workload-admission.md#enablement-preflight) for the call and field contract
+
 Once materialized, the index has planner-visible status:
 
 ```sql

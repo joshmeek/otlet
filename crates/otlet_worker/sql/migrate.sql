@@ -252,3 +252,6 @@ $$;
 
 \set portable_migration_file ../../../otlet_pg/sql/migrations/0076_interactive_async_service_quantum.sql
 \ir migrations/apply.sql
+
+\set portable_migration_file ../../../otlet_pg/sql/migrations/0077_workload_enablement_preflight.sql
+\ir migrations/apply.sql

@@ -68,6 +68,37 @@ Queue bytes count evaluation work plus production work under each active task re
 
 Admission also requires an active task revision. Pausing a task removes its revision head after leased work drains, so direct, application, native, portable, and watch admission reject new work and claims leave existing queued jobs untouched. Exact-pin resume restores that queue under the same revision. Retirement requires an empty queue and watch-reconciliation backlog, locks the pinned source identities, and is terminal. `task_lifecycle_status` exposes the state, pin, queue and reconciliation counts, source identity drift, and transition blockers
 
+## Enablement Preflight
+
+The extension owner can inspect one active watch refresh or bounded backfill before admission. Pass the expected active revision so a concurrent revision change fails instead of producing a report for the wrong workload:
+
+```sql
+SELECT *
+FROM otlet.workload_enablement_preflight(
+  requested_task_name => 'entity_resolution_task',
+  expected_workload_revision_hash => (
+    SELECT active_workload_revision_hash
+    FROM otlet.workload_revision_heads
+    WHERE task_name = 'entity_resolution_task'
+  ),
+  requested_enablement_kind => 'backfill',
+  requested_max_subjects => 1000,
+  requested_page_size => 64,
+  requested_max_jobs_per_minute => 64,
+  requested_max_outstanding_jobs => 64
+);
+```
+
+Use `watch` without backfill bounds for an existing row or pair watch. The function can run inside a read-only transaction and creates no jobs, backfill, observation, or capacity reservation. It checks stored source identity, dependencies, and row schema, then uses non-executing `EXPLAIN`. It does not run candidate rows or the temp-view source-query rebind, and names those estimate limits in `uncertainty_reasons`
+
+`estimated_candidates` is the estimated work set before active-job subtraction. Row watches use estimated stale and missing semantic state. Pair watches combine the candidate plan with known fresh and stale materializations because membership is not executed. `estimated_jobs` removes current in-flight subjects. Generic backfills use plan cardinality and active same-revision jobs. Recent nonempty candidate observations other than row-cap overflow supply input size; otherwise the estimate uses plan width
+
+`model_ms_p25`, `model_ms_p50`, and `model_ms_p75` cover prompt decode plus generation. The matching `service_ms_*` fields use stage-accounted worker time. Samples prefer the active revision, then the task on a current route, then other production work on a current route, with at most 101 observations per scope. Missing history falls back to the revision attempt deadline
+
+Catch-up scenarios use serial stage-accounted service time, current queued, running, and cancel-requested model work, and the backfill rate floor. They exclude worker parallelism, manual delay between backfill pages, and unmeasured worker overhead. Observed and current queue bytes use `octet_length(input::text)`; the no-observation fallback uses plan width. Neither estimates heap, index, TOAST, or WAL storage
+
+`within_current_policy` is true only when `policy_blockers` is empty. Backfill capacity uses the lower of estimated jobs and requested outstanding jobs, preserves one foreground model slot and one maximum-input reserve under the task, model, and total byte caps, and rejects another unfinished backfill for the task revision. Exact watch refresh or backfill admission rechecks source binding, candidate execution, queue state, and every policy limit under its own transaction fence
+
 Pair-watch creation runs `EXPLAIN (FORMAT JSON)` without executing candidate rows. Otlet stores the accepted plan, total cost, and preflight timestamp on the immutable workload revision and rejects invalid or over-cost plans before watch mutation
 
 Every pair execution revalidates source dependencies and reruns plan-cost preflight. `otlet.watch_status` keeps the accepted revision evidence separate from the current read-only plan, reports drift and current preflight status, and suspends the watch when the live plan exceeds policy. Source-query repair must capture fresh accepted evidence before it can promote a revision

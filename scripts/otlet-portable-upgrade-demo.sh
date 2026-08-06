@@ -8,11 +8,12 @@ reviewer_role="otlet_portable_upgrade_reviewer_$$"
 reviewer_login="otlet_portable_upgrade_reviewer_login_$$"
 application_role="otlet_portable_upgrade_application_$$"
 partial_auditor_role="otlet_portable_upgrade_partial_auditor_$$"
+preflight_role="otlet_portable_upgrade_preflight_$$"
 
 cleanup() {
   docker exec "$container" dropdb -U postgres --if-exists "$database" >/dev/null 2>&1 || true
   docker exec "$container" psql -U postgres -d postgres -X -q \
-    -c "DROP ROLE IF EXISTS $reviewer_login, $reviewer_role, $operator_role, $application_role, $partial_auditor_role" >/dev/null 2>&1 || true
+    -c "DROP ROLE IF EXISTS $reviewer_login, $reviewer_role, $operator_role, $application_role, $partial_auditor_role, $preflight_role" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
 
@@ -22,9 +23,9 @@ install_portable() {
     -f crates/otlet_worker/sql/install.sql
 }
 
-install_portable_through_75() {
+install_portable_through_76() {
   docker exec -w /work/crates/otlet_worker/sql "$container" \
-    sed '/0076_interactive_async_service_quantum.sql/,$d' migrate.sql |
+    sed '/0077_workload_enablement_preflight.sql/,$d' migrate.sql |
     docker exec -i -w /work/crates/otlet_worker/sql "$container" \
       psql -U postgres -d "$database" -X -q -v ON_ERROR_STOP=1 --single-transaction
 }
@@ -64,7 +65,7 @@ SELECT format(
   'portable upgrade executable proof'
 ) \gexec
 SQL
-install_portable_through_75
+install_portable_through_76
 
 docker exec -i "$container" psql -U postgres -d "$database" \
   -X -q -v ON_ERROR_STOP=1 <<'SQL' >/dev/null
@@ -77,6 +78,8 @@ CREATE TABLE public.portable_upgrade_sentinel (
   audit_review_acl text,
   production_policy_status_oid oid,
   production_policy_status_acl text,
+  preflight_function_oid oid,
+  preflight_function_acl text,
   legacy_watch_revision_hash text,
   legacy_materialization_id bigint
 );
@@ -87,10 +90,12 @@ docker exec -i "$container" psql -U postgres -d "$database" \
   -X -q -v ON_ERROR_STOP=1 \
   -v operator_role="$operator_role" \
   -v application_role="$application_role" \
-  -v partial_auditor_role="$partial_auditor_role" <<'SQL' >/dev/null
+  -v partial_auditor_role="$partial_auditor_role" \
+  -v preflight_role="$preflight_role" <<'SQL' >/dev/null
 CREATE ROLE :"operator_role" NOLOGIN;
 CREATE ROLE :"application_role" NOLOGIN;
 CREATE ROLE :"partial_auditor_role" NOLOGIN;
+CREATE ROLE :"preflight_role" NOLOGIN;
 SELECT otlet.grant_application_access(:'application_role'::regrole);
 SELECT otlet.access_policy_revision(:'operator_role'::regrole)
   AS operator_old_revision \gset
@@ -148,6 +153,7 @@ SELECT otlet.finish_access_policy_grant(
 );
 GRANT USAGE ON SCHEMA otlet TO :"partial_auditor_role";
 GRANT SELECT ON TABLE otlet.audit_review_export TO :"partial_auditor_role";
+GRANT USAGE ON SCHEMA otlet TO :"preflight_role";
 UPDATE public.portable_upgrade_sentinel sentinel
 SET export_function_oid = function.oid,
     export_function_acl = function.proacl::text
@@ -295,20 +301,86 @@ END;
 $proof$;
 
 UPDATE otlet.production_policy
-SET max_queued_input_bytes_per_task = 4096,
+SET max_input_bytes_per_job = 1024,
+    max_queued_input_bytes_per_task = 4096,
     max_queued_input_bytes_per_model = 4096,
     max_queued_input_bytes_total = 4096
 WHERE name = 'default';
 SQL
 
 install_portable
+
+docker exec -i "$container" psql -U postgres -d "$database" \
+  -X -q -v ON_ERROR_STOP=1 -v preflight_role="$preflight_role" <<'SQL' >/dev/null
+GRANT EXECUTE ON FUNCTION otlet.workload_enablement_preflight(
+  text, text, text, integer, integer, integer, integer
+) TO :"preflight_role";
+UPDATE public.portable_upgrade_sentinel sentinel
+SET preflight_function_oid = function.oid,
+    preflight_function_acl = function.proacl::text
+FROM pg_catalog.pg_proc function
+WHERE sentinel.id = 1
+  AND function.oid =
+    'otlet.workload_enablement_preflight(text,text,text,integer,integer,integer,integer)'::regprocedure;
+
+CREATE TABLE public.portable_preflight_source (
+  id text PRIMARY KEY,
+  value text NOT NULL
+);
+INSERT INTO public.portable_preflight_source
+VALUES ('one', '1'), ('two', '2'), ('three', '3');
+ANALYZE public.portable_preflight_source;
+SELECT otlet.create_task(
+  task_name => 'portable_preflight_probe',
+  input_query => $$
+    SELECT id AS subject_id, jsonb_build_object('value', value) AS input
+    FROM public.portable_preflight_source
+  $$,
+  instruction => 'Return an empty object',
+  output_schema => '{"type":"object"}'::jsonb,
+  model_name => 'model_concurrency_probe',
+  runtime_options => '{"max_tokens":16,"reasoning":"off","inference_cache":false}'::jsonb,
+  input_shaping => '{"source_fields":["value"]}'::jsonb,
+  source_relations => '[{"table":"public.portable_preflight_source","subject_column":"id"}]'::jsonb
+) \g /dev/null
+SELECT otlet.promote_configured_workload_revision('portable_preflight_probe') \g /dev/null
+
+BEGIN READ ONLY;
+DO $proof$
+BEGIN
+  IF NOT (
+    SELECT candidate_plan_status = 'ready'
+      AND estimated_candidates = 3
+      AND estimated_jobs = 3
+    FROM otlet.workload_enablement_preflight(
+      'portable_preflight_probe',
+      (
+        SELECT active_workload_revision_hash
+        FROM otlet.workload_revision_heads
+        WHERE task_name = 'portable_preflight_probe'
+      ),
+      'backfill',
+      3,
+      3,
+      64,
+      3
+    )
+  ) THEN
+    RAISE EXCEPTION 'portable workload preflight is not read-only';
+  END IF;
+END
+$proof$;
+ROLLBACK;
+SQL
+
 install_portable
 
 contract="$(
   docker exec -i "$container" psql -U postgres -d "$database" \
     -X -qAt -v ON_ERROR_STOP=1 \
     -v operator_role="$operator_role" \
-    -v partial_auditor_role="$partial_auditor_role" <<'SQL'
+    -v partial_auditor_role="$partial_auditor_role" \
+    -v preflight_role="$preflight_role" <<'SQL'
 CREATE FUNCTION pg_temp.reject_invalid_service_targets() RETURNS boolean
 LANGUAGE plpgsql
 AS $function$
@@ -342,10 +414,23 @@ BEGIN
 END
 $function$;
 
+CREATE FUNCTION pg_temp.expect_error(statement text, fragment text) RETURNS boolean
+LANGUAGE plpgsql
+AS $function$
+BEGIN
+  BEGIN
+    EXECUTE expect_error.statement;
+  EXCEPTION WHEN OTHERS THEN
+    RETURN position(expect_error.fragment IN SQLERRM) > 0;
+  END;
+  RETURN false;
+END
+$function$;
+
 SELECT concat_ws('|',
   max(version),
   count(*),
-  array_agg(version ORDER BY version) = ARRAY(SELECT generate_series(1, 76)),
+  array_agg(version ORDER BY version) = ARRAY(SELECT generate_series(1, 77)),
   bool_and(file ~ ('(^|/)' || lpad(version::text, 4, '0') || '_')),
   (SELECT value FROM public.portable_upgrade_sentinel),
   (
@@ -433,19 +518,123 @@ SELECT concat_ws('|',
     FROM public.portable_upgrade_sentinel sentinel
     CROSS JOIN pg_catalog.pg_class relation
     WHERE relation.oid = 'otlet.production_policy_status'::regclass
+  ),
+  (
+    SELECT report.candidate_plan_status = 'ready'
+      AND report.candidate_plan_error IS NULL
+      AND report.candidate_plan_rows = 3
+      AND report.candidate_plan_rows = jsonb_extract_path_text(
+        report.candidate_plan, '0', 'Plan', 'Plan Rows'
+      )::bigint
+      AND report.estimated_candidates = 3
+      AND report.estimated_jobs = 3
+      AND report.estimated_total_input_bytes =
+        report.estimated_jobs * report.estimated_input_bytes_per_job
+      AND report.estimated_peak_queue_input_bytes =
+        report.estimated_total_input_bytes
+      AND report.runtime_observations = 0
+      AND report.runtime_sample_scope = 'attempt_deadline_fallback'
+      AND report.model_ms_p25 = report.model_ms_p50
+      AND report.model_ms_p50 = report.model_ms_p75
+      AND report.service_ms_p25 = report.service_ms_p50
+      AND report.service_ms_p50 = report.service_ms_p75
+      AND report.estimated_catch_up_ms_p25 =
+        report.estimated_catch_up_ms_p50
+      AND report.estimated_catch_up_ms_p50 =
+        report.estimated_catch_up_ms_p75
+      AND report.capacity ->> 'estimated_peak_queue_jobs' = '3'
+      AND report.capacity ->> 'effective_available_model_queue_slots' = '999'
+      AND report.capacity ->> 'effective_available_task_queue_input_bytes' = '3072'
+      AND report.capacity ->> 'effective_available_model_queue_input_bytes' = '3072'
+      AND report.capacity ->> 'effective_available_total_queue_input_bytes' = '3072'
+      AND report.uncertainty_level = 'high'
+      AND report.uncertainty_reasons @> ARRAY[
+        'planner_cardinality_estimate',
+        'source_query_rebinding_not_executed',
+        'input_bytes_from_plan_width',
+        'runtime_history_missing'
+      ]
+      AND report.within_current_policy
+      AND NOT EXISTS (
+        SELECT 1 FROM otlet.jobs WHERE task_name = 'portable_preflight_probe'
+      )
+      AND NOT EXISTS (
+        SELECT 1
+        FROM otlet.task_backfills
+        WHERE task_name = 'portable_preflight_probe'
+      )
+      AND pg_temp.expect_error(
+        format(
+          'SELECT * FROM otlet.workload_enablement_preflight(%L, %L, %L)',
+          'portable_preflight_probe',
+          report.workload_revision_hash,
+          'bulk'
+        ),
+        'kind must be'
+      )
+      AND pg_temp.expect_error(
+        format(
+          'SELECT * FROM otlet.workload_enablement_preflight(%L, %L, %L, NULL)',
+          'portable_preflight_probe',
+          report.workload_revision_hash,
+          'backfill'
+        ),
+        'max subjects'
+      )
+      AND pg_temp.expect_error(
+        format(
+          'SELECT * FROM otlet.workload_enablement_preflight(%L, %L, %L)',
+          'portable_preflight_probe',
+          repeat('0', 64),
+          'watch'
+        ),
+        'is not active'
+      )
+      AND function.oid = sentinel.preflight_function_oid
+      AND function.proacl::text = sentinel.preflight_function_acl
+      AND NOT function.prosecdef
+      AND function.provolatile = 'v'
+      AND function.proconfig @> ARRAY[
+        'search_path=pg_catalog, otlet, pg_temp'
+      ]
+      AND pg_catalog.has_function_privilege(
+        :'preflight_role', function.oid, 'EXECUTE'
+      )
+      AND NOT pg_catalog.has_function_privilege(
+        'public', function.oid, 'EXECUTE'
+      )
+    FROM otlet.workload_enablement_preflight(
+      'portable_preflight_probe',
+      (
+        SELECT active_workload_revision_hash
+        FROM otlet.workload_revision_heads
+        WHERE task_name = 'portable_preflight_probe'
+      ),
+      'backfill',
+      3,
+      3,
+      64,
+      3
+    ) report
+    CROSS JOIN public.portable_upgrade_sentinel sentinel
+    CROSS JOIN pg_catalog.pg_proc function
+    WHERE sentinel.id = 1
+      AND function.oid =
+        'otlet.workload_enablement_preflight(text,text,text,integer,integer,integer,integer)'::regprocedure
   )
 )
 FROM otlet.portable_schema_migrations;
 SQL
 )"
-[ "$contract" = "76|76|t|t|preserved|t|0|t|t|t|t|t|t|t|t|t|t|t" ] || {
+[ "$contract" = "77|77|t|t|preserved|t|0|t|t|t|t|t|t|t|t|t|t|t|t" ] || {
   echo "Portable repeat-install contract mismatch: $contract" >&2
   exit 1
 }
 docker exec -i "$container" psql -U postgres -d "$database" \
   -X -q -v ON_ERROR_STOP=1 <<'SQL'
 UPDATE otlet.production_policy
-SET max_queued_input_bytes_per_task = 67108864,
+SET max_input_bytes_per_job = 1048576,
+    max_queued_input_bytes_per_task = 67108864,
     max_queued_input_bytes_per_model = 67108864,
     max_queued_input_bytes_total = 268435456
 WHERE name = 'default';

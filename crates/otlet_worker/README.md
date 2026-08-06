@@ -255,8 +255,9 @@ Run the repeat-install proof:
 ./scripts/otlet-portable-upgrade-demo.sh
 ```
 
-It installs through migration `0075`, lowers the existing task, model, and total queue-byte caps, grants existing operator, application, reviewer, and partial audit roles, applies `0076`, and repeats the current install. The proof checks all 76 migrations, declared native service targets, lower-cap preservation, immutable job-origin attribution, per-task queue and claim budgets, existing data and grants, blinded reviewer calibration, review sampling, evidence-linked decisions, time freshness, bounded backfill, workload-pack promotion and rollback, lifecycle, administrative-ledger, workload-acceptance and candidate-set promotion fences, entity-resolution quality decomposition, pair constraints, entity-graph conflict status and gates, bounded validators, queued ask behavior, `PUBLIC` closure, and invariants
+It installs through migration `0076`, lowers the per-job input and task, model, and total queue-byte caps, grants existing operator, application, reviewer, partial audit, and preflight roles, applies `0077`, and repeats the current install. The proof checks all 77 migrations, read-only workload sizing, source-check limits, runtime fallback, capacity reserves, declared native service targets, lower-cap preservation, immutable job-origin attribution, per-task queue and claim budgets, existing data and grants, blinded reviewer calibration, review sampling, evidence-linked decisions, time freshness, bounded backfill, workload-pack promotion and rollback, lifecycle, administrative-ledger, workload-acceptance and candidate-set promotion fences, entity-resolution quality decomposition, pair constraints, entity-graph conflict status and gates, bounded validators, queued ask behavior, `PUBLIC` closure, and invariants
 
 ```text
+portable_upgrade_contract=77|77|t|t|preserved|t|0|t|t|t|t|t|t|t|t|t|t|t|t
 portable_job_origin_workload_budget_contract=4|2|1|t|t|t|t
 ```

@@ -390,6 +390,11 @@ pgrx::extension_sql_file!(
     name = "interactive_async_service_quantum",
     requires = ["job_origin_workload_budgets"]
 );
+pgrx::extension_sql_file!(
+    "../sql/migrations/0077_workload_enablement_preflight.sql",
+    name = "workload_enablement_preflight",
+    requires = ["interactive_async_service_quantum"]
+);
 
 #[allow(non_snake_case)]
 #[pgrx::pg_guard]
