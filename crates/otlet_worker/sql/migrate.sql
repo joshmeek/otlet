@@ -246,3 +246,6 @@ $$;
 
 \set portable_migration_file ../../../otlet_pg/sql/migrations/0074_workload_pack_promotion.sql
 \ir migrations/apply.sql
+
+\set portable_migration_file ../../../otlet_pg/sql/migrations/0075_job_origin_workload_budgets.sql
+\ir migrations/apply.sql

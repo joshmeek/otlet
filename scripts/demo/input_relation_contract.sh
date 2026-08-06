@@ -470,7 +470,7 @@ SELECT otlet.register_model(
     'quantization', 'test',
     'license', 'test'
   ),
-  1
+  2
 ) \g /dev/null
 
 SELECT otlet.create_task(
@@ -481,6 +481,10 @@ SELECT otlet.create_task(
   model_name => :'model_name',
   input_shaping => '{"source_fields":["value"]}'::jsonb
 ) \g /dev/null
+
+UPDATE otlet.production_policy
+SET max_active_jobs_per_task = 1
+WHERE name = 'default';
 
 WITH revision AS (
   SELECT otlet.ensure_active_workload_revision(:'task_name') AS revision_hash
@@ -542,17 +546,27 @@ SELECT concat_ws('|',
   job.job_count,
   status.active_claimed_jobs,
   status.max_active_jobs,
-  status.available_active_job_slots
+  status.available_active_job_slots,
+  task_status.active_claimed_jobs,
+  task_status.max_active_jobs_per_task,
+  task_status.available_active_job_slots
 )
 FROM (
   SELECT status, input, count(*) OVER () AS job_count
   FROM otlet.jobs
   WHERE task_name = :'task_name'
 ) job
-JOIN otlet.model_queue_status status ON status.model_name = :'model_name';
+JOIN otlet.model_queue_status status ON status.model_name = :'model_name'
+JOIN otlet.task_claim_capacity task_status
+  ON task_status.task_name = :'task_name';
 SQL
 )"
 
+psql_exec -qAt >/dev/null <<'SQL'
+UPDATE otlet.production_policy
+SET max_active_jobs_per_task = 8
+WHERE name = 'default';
+SQL
 cleanup_task "$infer_now_task"
 psql_exec -qAt -v task_name="$infer_now_task" >/dev/null <<'SQL'
 DELETE FROM otlet.workload_revision_heads WHERE task_name = :'task_name';
@@ -560,18 +574,18 @@ SQL
 
 if [ "$infer_now_conflict_exit" -eq 0 ] \
    || [[ "$infer_now_conflict_output" != *"input relation conflicts with active input for subject active"* ]] \
-   || [ "$infer_now_contract_state" != "running|t|1|1|1|0" ]; then
+   || [ "$infer_now_contract_state" != "running|t|1|1|2|1|1|1|0" ]; then
   echo "Native infer-now did not reject the active input conflict atomically" >&2
   printf '%s\n' "$infer_now_conflict_output" >&2
   echo "state=$infer_now_contract_state" >&2
   exit 1
 fi
 if [ "$infer_now_capacity_exit" -eq 0 ] \
-   || [[ "$infer_now_capacity_output" != *"infer-now model active-job capacity exhausted"* ]]; then
-  echo "Native infer-now did not enforce model claim capacity" >&2
+   || [[ "$infer_now_capacity_output" != *"infer-now task or model active-job capacity exhausted"* ]]; then
+  echo "Native infer-now did not enforce task claim capacity" >&2
   printf '%s\n' "$infer_now_capacity_output" >&2
   echo "state=$infer_now_contract_state" >&2
   exit 1
 fi
 echo "infer_now_input_conflict_contract=failed|$infer_now_contract_state"
-echo "infer_now_model_capacity_contract=failed|$infer_now_contract_state"
+echo "infer_now_task_capacity_contract=failed|$infer_now_contract_state"

@@ -839,6 +839,7 @@ WITH rpc_catalog AS (
     count(*) AS receipts,
     bool_and(runtime_name = 'portable:reference-worker') AS portable_runtime,
     bool_and(runtime_endpoint = 'postgres_rpc') AS portable_endpoint,
+    bool_and(r.job_origin = 'task_run') AS task_run_origin,
     count(*) FILTER (WHERE receipt_status = 'complete' AND schema_validation_status = 'passed') AS complete_receipts,
     count(*) FILTER (WHERE receipt_status = 'rejected') AS rejected_receipts,
     count(*) FILTER (WHERE receipt_status = 'failed') AS failed_receipts,
@@ -853,6 +854,7 @@ SELECT
   worker.enabled::text || '|' || worker.claims || '|' || worker.live_claims || '|' ||
   claims.value || '|' ||
   receipts.receipts || '|' || receipts.portable_runtime || '|' || receipts.portable_endpoint || '|' ||
+  receipts.task_run_origin || '|' ||
   receipts.complete_receipts || '|' || receipts.rejected_receipts || '|' ||
   receipts.failed_receipts || '|' || receipts.canceled_receipts || '|' ||
   rpc.rpc_count || '|' || rpc.definer_count || '|' || rpc.fixed_path_count || '|' ||
@@ -871,7 +873,7 @@ SQL
 }
 portable_protocol_contract="$(portable_protocol_contract_query)"
 echo "portable_protocol_contract=$portable_protocol_contract"
-expected_portable_protocol_contract="1|active|true|true|3|0|cancel:canceled:canceled,complete:complete:complete,fail:failed:failed|5|true|true|1|1|2|1|8|8|8|1|8|false|false"
+expected_portable_protocol_contract="1|active|true|true|3|0|cancel:canceled:canceled,complete:complete:complete,fail:failed:failed|5|true|true|true|1|1|2|1|8|8|8|1|8|false|false"
 [ "$portable_protocol_contract" = "$expected_portable_protocol_contract" ] || {
   echo "Unexpected portable protocol contract: $portable_protocol_contract" >&2
   exit 1

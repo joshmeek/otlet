@@ -502,6 +502,7 @@ fn process_infer_now_request(request: crate::infer_now::InferNowRequest) {
 
     let crate::infer_now::InferNowRequest {
         id,
+        customscan_origin,
         task_name,
         subject_id,
         expected_workload_revision_hash,
@@ -514,6 +515,11 @@ fn process_infer_now_request(request: crate::infer_now::InferNowRequest) {
             &subject_id,
             expected_workload_revision_hash.as_deref(),
             &input_json,
+            if customscan_origin {
+                "customscan"
+            } else {
+                "direct_ask"
+            },
         )
     }) {
         Ok(InferNowJobAdmission::Inserted(job)) => job,
@@ -529,7 +535,7 @@ fn process_infer_now_request(request: crate::infer_now::InferNowRequest) {
             crate::infer_now::finish_request(
                 id,
                 0,
-                Some("infer-now model active-job capacity exhausted"),
+                Some("infer-now task or model active-job capacity exhausted"),
             );
             return;
         }

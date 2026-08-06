@@ -231,6 +231,7 @@ DECLARE
   old_max_input_bytes_per_job bigint;
   old_max_queued_input_bytes_per_model bigint;
   old_max_queued_input_bytes_total bigint;
+  old_max_queued_input_bytes_per_task bigint;
 BEGIN
   SELECT * INTO proof FROM revision_invalidation_proof;
 
@@ -646,19 +647,22 @@ BEGIN
     policy.max_queued_jobs_per_model,
     policy.max_input_bytes_per_job,
     policy.max_queued_input_bytes_per_model,
-    policy.max_queued_input_bytes_total
+    policy.max_queued_input_bytes_total,
+    policy.max_queued_input_bytes_per_task
   INTO
     old_max_queued_jobs_per_model,
     old_max_input_bytes_per_job,
     old_max_queued_input_bytes_per_model,
-    old_max_queued_input_bytes_total
+    old_max_queued_input_bytes_total,
+    old_max_queued_input_bytes_per_task
   FROM otlet.production_policy policy
   WHERE policy.name = 'default';
   UPDATE otlet.production_policy
   SET max_queued_jobs_per_model = 1,
       max_input_bytes_per_job = active_model_queue_bytes,
       max_queued_input_bytes_per_model = active_model_queue_bytes,
-      max_queued_input_bytes_total = active_total_queue_bytes
+      max_queued_input_bytes_total = active_total_queue_bytes,
+      max_queued_input_bytes_per_task = active_total_queue_bytes
   WHERE name = 'default';
 
   IF NOT EXISTS (
@@ -743,7 +747,8 @@ BEGIN
   SET max_queued_jobs_per_model = old_max_queued_jobs_per_model,
       max_input_bytes_per_job = old_max_input_bytes_per_job,
       max_queued_input_bytes_per_model = old_max_queued_input_bytes_per_model,
-      max_queued_input_bytes_total = old_max_queued_input_bytes_total
+      max_queued_input_bytes_total = old_max_queued_input_bytes_total,
+      max_queued_input_bytes_per_task = old_max_queued_input_bytes_per_task
   WHERE name = 'default';
 
   PERFORM 1

@@ -406,7 +406,8 @@ The executor refreshed the stale row with a bounded infer-now budget and a recei
 Inspect that receipt:
 
 ```sql
-SELECT executor_origin || '|' ||
+SELECT job_origin || '|' ||
+       executor_origin || '|' ||
        semantic_index_name || '|' ||
        status || '|' ||
        (prompt_tokens > 0)::text || '|' ||
@@ -423,11 +424,11 @@ Representative output:
 ```text
                          receipt_contract
 ------------------------------------------------------------------
- customscan_infer_now|demo_semantic_vendor_idx|complete|true|true
+ customscan|customscan_infer_now|demo_semantic_vendor_idx|complete|true|true
 (1 row)
 ```
 
-Receipts carry executor provenance because one model task can run from the worker queue or from CustomScan infer-now
+Receipts carry immutable `job_origin=customscan` beside `executor_origin=customscan_infer_now`. Job origin identifies the ingress path; executor origin distinguishes CustomScan infer-now from queued worker execution
 
 ## Step 10 - Build A Pair Watch
 

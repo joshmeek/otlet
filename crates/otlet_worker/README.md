@@ -16,7 +16,7 @@ Run the installer as the database owner from the repository checkout:
 psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f crates/otlet_worker/sql/install.sql
 ```
 
-The install transaction runs the current SQL contract as migrations `0001` through `0074`. Re-running it skips recorded migrations and preserves existing data. This greenfield path rejects older unversioned `otlet` schemas instead of converting them
+The install transaction runs the current SQL contract as migrations `0001` through `0075`. Re-running it skips recorded migrations and preserves existing data. This greenfield path rejects older unversioned `otlet` schemas instead of converting them
 
 The database keeps zero `otlet` extension objects and zero C-language Otlet functions
 
@@ -255,4 +255,8 @@ Run the repeat-install proof:
 ./scripts/otlet-portable-upgrade-demo.sh
 ```
 
-It installs through migration `0073`, grants existing operator and application roles plus a partial audit role, applies `0074`, grants a reviewer role, and repeats the current install. The proof checks all 74 migrations, existing data and grants, blinded reviewer calibration, review sampling, evidence-linked decisions, time freshness, bounded backfill, workload-pack promotion and rollback, lifecycle, administrative-ledger, workload-acceptance and candidate-set promotion fences, entity-resolution quality decomposition, pair constraints, entity-graph conflict status and gates, bounded validators, queued ask behavior, `PUBLIC` closure, and invariants
+It installs through migration `0074`, lowers the existing total queue-byte cap, grants existing operator, application, reviewer, and partial audit roles, applies `0075`, and repeats the current install. The proof checks all 75 migrations, lower-cap-safe policy migration, immutable job-origin attribution, per-task queue and claim budgets, existing data and grants, blinded reviewer calibration, review sampling, evidence-linked decisions, time freshness, bounded backfill, workload-pack promotion and rollback, lifecycle, administrative-ledger, workload-acceptance and candidate-set promotion fences, entity-resolution quality decomposition, pair constraints, entity-graph conflict status and gates, bounded validators, queued ask behavior, `PUBLIC` closure, and invariants
+
+```text
+portable_job_origin_workload_budget_contract=4|2|1|t|t|t|t
+```

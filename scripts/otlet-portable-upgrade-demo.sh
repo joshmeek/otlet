@@ -22,9 +22,9 @@ install_portable() {
     -f crates/otlet_worker/sql/install.sql
 }
 
-install_portable_through_73() {
+install_portable_through_74() {
   docker exec -w /work/crates/otlet_worker/sql "$container" \
-    sed '/0074_workload_pack_promotion.sql/,$d' migrate.sql |
+    sed '/0075_job_origin_workload_budgets.sql/,$d' migrate.sql |
     docker exec -i -w /work/crates/otlet_worker/sql "$container" \
       psql -U postgres -d "$database" -X -q -v ON_ERROR_STOP=1 --single-transaction
 }
@@ -64,7 +64,7 @@ SELECT format(
   'portable upgrade executable proof'
 ) \gexec
 SQL
-install_portable_through_73
+install_portable_through_74
 
 docker exec -i "$container" psql -U postgres -d "$database" \
   -X -q -v ON_ERROR_STOP=1 <<'SQL' >/dev/null
@@ -282,6 +282,11 @@ BEGIN
   WHERE id = 1;
 END;
 $proof$;
+
+UPDATE otlet.production_policy
+SET max_queued_input_bytes_per_model = 4096,
+    max_queued_input_bytes_total = 4096
+WHERE name = 'default';
 SQL
 
 install_portable
@@ -295,7 +300,7 @@ contract="$(
 SELECT concat_ws('|',
   max(version),
   count(*),
-  array_agg(version ORDER BY version) = ARRAY(SELECT generate_series(1, 74)),
+  array_agg(version ORDER BY version) = ARRAY(SELECT generate_series(1, 75)),
   bool_and(file ~ ('(^|/)' || lpad(version::text, 4, '0') || '_')),
   (SELECT value FROM public.portable_upgrade_sentinel),
   (
@@ -343,15 +348,41 @@ SELECT concat_ws('|',
     'otlet.semantic_time_freshness_state('
       'timestamptz,bigint,bigint,timestamptz)',
     'EXECUTE'
+  ),
+  (
+    SELECT job_origin = 'task_run'
+    FROM otlet.jobs
+    WHERE task_name = 'decision_evidence_legacy'
+  ),
+  pg_catalog.has_table_privilege(
+    :'operator_role', 'otlet.task_queue_status', 'SELECT'
+  ),
+  pg_catalog.has_table_privilege(
+    :'operator_role', 'otlet.task_resource_status', 'SELECT'
+  ),
+  NOT pg_catalog.has_table_privilege(
+    :'partial_auditor_role', 'otlet.task_queue_status', 'SELECT'
+  ),
+  (
+    SELECT max_queued_input_bytes_per_task = 4096
+    FROM otlet.production_policy_status
   )
 )
 FROM otlet.portable_schema_migrations;
 SQL
 )"
-[ "$contract" = "74|74|t|t|preserved|t|0|t|t|t" ] || {
+[ "$contract" = "75|75|t|t|preserved|t|0|t|t|t|t|t|t|t|t" ] || {
   echo "Portable repeat-install contract mismatch: $contract" >&2
   exit 1
 }
+docker exec -i "$container" psql -U postgres -d "$database" \
+  -X -q -v ON_ERROR_STOP=1 <<'SQL'
+UPDATE otlet.production_policy
+SET max_queued_input_bytes_per_task = 67108864,
+    max_queued_input_bytes_per_model = 67108864,
+    max_queued_input_bytes_total = 268435456
+WHERE name = 'default';
+SQL
 
 portable_time_freshness_contract="$(
   (
@@ -417,6 +448,22 @@ portable_workload_pack_promotion_contract="$(
 [ "$portable_workload_pack_promotion_contract" = \
   "workload_pack_promotion_contract=38|true" ] || {
   echo "Portable workload-pack contract mismatch: $portable_workload_pack_promotion_contract" >&2
+  exit 1
+}
+
+portable_job_origin_workload_budget_contract="$(
+  (
+    log() { :; }
+    psql_exec() {
+      docker exec -i "$container" psql -U postgres -d "$database" \
+        -X -v ON_ERROR_STOP=1 "$@"
+    }
+    source "$(dirname "$0")/demo/job_origin_workload_budgets.sh"
+  ) | awk 'NF { line = $0 } END { print line }'
+)"
+[ "$portable_job_origin_workload_budget_contract" = \
+  "job_origin_workload_budget_contract=4|2|1|t|t|t|t" ] || {
+  echo "Portable job-origin contract mismatch: $portable_job_origin_workload_budget_contract" >&2
   exit 1
 }
 
@@ -1585,7 +1632,7 @@ SELECT concat_ws('|',
   )
     AND position(
       'record_task_candidate_observation' IN
-      pg_get_functiondef('otlet.run_task(text)'::regprocedure)
+      pg_get_functiondef('otlet.run_task_with_origin(text,text)'::regprocedure)
     ) > 0,
   (SELECT count(*) = 7
    FROM pg_catalog.pg_trigger trigger
@@ -4553,5 +4600,6 @@ echo "portable_decision_evidence_contract=$portable_decision_evidence_contract"
 echo "portable_ask_administrative_contract=$portable_ask_administrative_contract"
 echo "portable_task_lifecycle_contract=$portable_task_lifecycle_contract"
 echo "portable_$portable_workload_pack_promotion_contract"
+echo "portable_$portable_job_origin_workload_budget_contract"
 echo "portable_model_capacity_contract=$batch_claims|$batch_capacity_contract|$concurrent_capacity_contract|$cancel_blocked_claims|$replacement_claims|$lease_capacity_contract"
 echo "portable_renewal_race_contract=$renewal_race_contract"

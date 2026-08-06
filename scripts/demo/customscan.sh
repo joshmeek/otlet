@@ -524,6 +524,34 @@ require_contains "$row_customscan_read_only_plan" "Queued Refreshes: 0" "Expecte
 require_contains "$row_customscan_read_only_plan" "Infer Now Batches: 0" "Expected read-only auto scan to run no inference"
 require_contains "$row_customscan_read_only_plan" "Rows Returned: 0" "Expected read-only auto scan to return no rows"
 require_contains "$row_customscan_read_only_plan" "read_only_auto_after=on|t" "Expected schema-current auto CustomScan to leave no temp schema"
+row_customscan_queue_origin_contract="$(
+  psql_exec -qAt \
+    -v watch_name="$row_customscan_watch" \
+    -v task_name="$row_customscan_task" <<'SQL' | tail -n 1
+BEGIN;
+UPDATE otlet.production_policy
+SET stale_policy = 'refresh_then_fail_closed',
+    semantic_auto_wait_ms = 0,
+    semantic_auto_infer_ms = 0,
+    semantic_auto_max_rows = 0
+WHERE name = 'default';
+\o /dev/null
+SELECT id
+FROM public.otlet_demo_customscan_signal
+WHERE otlet.semantic_matches_auto(:'watch_name', id, '{}'::jsonb);
+\o
+SELECT count(*)::text || '|' || bool_and(job_origin = 'customscan')::text
+FROM otlet.jobs
+WHERE task_name = :'task_name'
+  AND status = 'queued';
+ROLLBACK;
+SQL
+)"
+echo "row_customscan_queue_origin_contract=$row_customscan_queue_origin_contract"
+[ "$row_customscan_queue_origin_contract" = "2|true" ] || {
+  echo "Expected CustomScan to queue two customscan-origin jobs, got $row_customscan_queue_origin_contract" >&2
+  exit 1
+}
 row_customscan_sql_plan_contract="$(psql_exec -qAt -v watch_name="$row_customscan_watch" <<'SQL'
 SELECT selected_path || '|' ||
        infer_now_subjects::text || '|' ||
@@ -571,6 +599,21 @@ require_contains "$row_customscan_infer_plan" "Infer Now Receipts: 1" "Expected 
 require_contains "$row_customscan_infer_plan" "Infer Now Runtime Fingerprint Hash:" "Expected infer-now EXPLAIN to identify the receipt runtime"
 require_contains "$row_customscan_infer_plan" "Infer Now Trace Receipt Id:" "Expected infer-now receipt pointer"
 require_contains "$row_customscan_infer_plan" "Rows Returned: 1" "Expected one inferred row returned after bounded infer-now"
+
+row_customscan_infer_origin_contract="$(psql_value -v task_name="$row_customscan_task" <<'SQL'
+SELECT job_origin
+FROM otlet.inference_receipt_trace_status
+WHERE task_name = :'task_name'
+  AND executor_origin = 'customscan_infer_now'
+ORDER BY receipt_id DESC
+LIMIT 1;
+SQL
+)"
+echo "row_customscan_infer_origin_contract=$row_customscan_infer_origin_contract"
+[ "$row_customscan_infer_origin_contract" = "customscan" ] || {
+  echo "Expected CustomScan infer-now receipt origin, got $row_customscan_infer_origin_contract" >&2
+  exit 1
+}
 
 queue_suppression_output="$(psql_exec -qAt -v model_name="$strong_model_name" <<'SQL'
 BEGIN;

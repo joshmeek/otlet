@@ -171,6 +171,7 @@ pub(crate) fn insert_infer_now_job(
     subject_id: &str,
     expected_workload_revision_hash: Option<&str>,
     input_json: &str,
+    job_origin: &str,
 ) -> pgrx::spi::Result<InferNowJobAdmission> {
     pgrx::Spi::connect_mut(|client| {
         let active_rows = client.select(
@@ -191,6 +192,7 @@ pub(crate) fn insert_infer_now_job(
             subject_id.into(),
             input_json.into(),
             active_revision_hash.as_str().into(),
+            job_origin.into(),
         ];
         client.select(
             "SELECT pg_advisory_xact_lock(hashtext('otlet_queue_admission'))",
@@ -203,10 +205,13 @@ SELECT
   count(j.id)::bigint,
   COALESCE(bool_or(j.id IS NOT NULL AND j.input IS DISTINCT FROM $3::jsonb), false),
   capacity.available_active_job_slots,
-  min(j.id) FILTER (WHERE j.backfill_deferred AND j.status IN ('queued', 'running'))
+  min(j.id) FILTER (WHERE j.backfill_deferred AND j.status IN ('queued', 'running')),
+  task_capacity.available_active_job_slots
 FROM otlet.workload_revisions revision
 LEFT JOIN otlet.model_claim_capacity capacity
   ON capacity.model_name = revision.definition #>> '{models,direct,name}'
+LEFT JOIN otlet.task_claim_capacity task_capacity
+  ON task_capacity.task_name = revision.task_name
 LEFT JOIN otlet.jobs j
   ON j.task_name = revision.task_name
  AND j.workload_revision_hash = revision.workload_revision_hash
@@ -215,7 +220,7 @@ LEFT JOIN otlet.jobs j
  AND j.status IN ('queued', 'running', 'cancel_requested')
 WHERE revision.task_name = $1
   AND revision.workload_revision_hash = $4
-GROUP BY capacity.available_active_job_slots
+GROUP BY capacity.available_active_job_slots, task_capacity.available_active_job_slots
 	",
             Some(1),
             &args,
@@ -234,7 +239,9 @@ GROUP BY capacity.available_active_job_slots
             }
             return Ok(InferNowJobAdmission::Active);
         }
-        if active_row.get::<i64>(3)?.unwrap_or(0) <= 0 {
+        if active_row.get::<i64>(3)?.unwrap_or(0) <= 0
+            || active_row.get::<i64>(5)?.unwrap_or(0) <= 0
+        {
             return Ok(InferNowJobAdmission::Capacity);
         }
         let rows = client.update(
@@ -251,6 +258,7 @@ inserted AS (
     workload_revision_hash,
     subject_id,
     input,
+    job_origin,
     status,
     attempts,
     leased_until,
@@ -263,6 +271,7 @@ inserted AS (
     revision.workload_revision_hash,
     $2,
     $3::jsonb,
+    $5,
     'running',
     1,
     now() + make_interval(

@@ -90,7 +90,7 @@ preload_admission_contract=failed|model_load_admission_rejected|rejected|true|tr
 
 ## Step 3 - Inspect Production Policy
 
-The production policy row and status views expose SQL state under `otlet`: `production_policy_status`, `production_status`, `model_queue_status`, `worker_throughput_status`, and `cleanup_policy_state(true)`. Cross-task batch entries expose every claimed task through `task_names`
+The production policy row and status views expose SQL state under `otlet`: `production_policy_status`, `production_status`, `model_queue_status`, `task_queue_status`, `task_resource_status`, `worker_throughput_status`, and `cleanup_policy_state(true)`. Cross-task batch entries expose every claimed task through `task_names`. Task queue and resource status group work by immutable `job_origin`; `runs`, `inference_receipt_trace_status`, `portable_receipt_status`, and `audit_receipt_export` expose the same attribution
 
 Model, task, watch, selection, action-policy, workload-pack, Otlet access-grant, and retention changes require a reason or ticket in the same transaction. The helper uses transaction-local settings, so calling it in autocommit mode does not authorize a later statement:
 
@@ -144,7 +144,7 @@ Completion verifies the submitted envelope against its accepted receipt, uses it
 
 Native and portable claims share the task-cursor ring. Within each ring segment and task, expired claims rank before queued work, reclaim replaces the claim token, cancellation state survives reclaim, and model residency does not change the order
 
-`max_active_jobs` caps live claimed leases per model across native claims, portable claims, and infer-now. A `running` or `cancel_requested` job consumes one slot while `leased_until >= now()`; an expired or null lease consumes none. Claims stop at the smaller of the requested batch and the remaining slots. Claims, infer-now admission, and renewal share the queue-admission fence. Otlet locks the lease row before it checks wall time and rejects a renewal if its lease expired while waiting. `model_queue_status` and `worker_throughput_status` expose `active_claimed_jobs` and `available_active_job_slots`, and `verify_invariants()` reports `active_claimed_jobs_within_model_cap`
+`max_active_jobs` caps live claimed leases per model across native claims, portable claims, and infer-now. `max_active_jobs_per_task` applies under the same global policy across models and execution modes. A `running` or `cancel_requested` job consumes both slots while `leased_until >= now()`; an expired or null lease consumes neither. Claims stop at the requested batch, model headroom, or task headroom, whichever is smallest. Claims, infer-now admission, and renewal share the queue-admission fence. Otlet locks the lease row before it checks wall time and rejects a renewal if its lease expired while waiting. `model_queue_status` and `worker_throughput_status` expose model slots; `task_resource_status` exposes task slots by origin. `verify_invariants()` reports `active_claimed_jobs_within_model_cap`; migration 0075 adds no task-cap invariant
 
 Native batches contain only claims with the same immutable lease horizon. Before each direct, cheap, or deferred strong attempt, the worker locks and validates every claim it still holds, then renews the full set in one transaction. The worker stops the batch without a partial renewal when any claim is stale. The worker renews the current token before Otlet records `job_started` or touches runtime state. The Docker test expires the old visible deadlines while the worker holds renewal locks; a second claimer and the sweeper return zero without changing attempts or ownership, and each job receives one start event and one receipt
 
@@ -163,7 +163,13 @@ WHERE name = 'default';
 
 Preload applies `default_runtime_options`, including the default 8 GiB `max_worker_rss_bytes`, and uses the normal artifact, fingerprint, memory, cgroup, and RSS admission checks. Set `OTLET_MAX_WORKER_RSS_BYTES` during setup or update the policy to override it; an explicit `0` disables RSS enforcement. Preload creates no job or receipt. Inspect the ready slot in `otlet.runtime_status` and the latest `model_preload_succeeded` or `model_preload_failed` row in `otlet.worker_events`. Set `preload_model_name = NULL` and restart to restore the cold default
 
-Admission caps cover bulk rows, raw bytes per job, queue depth, queued bytes per model, and total queued bytes. Bulk `run_task` calls enqueue every eligible row or none. Row-watch source triggers never wait for queue capacity; they persist one coalesced dirty identity per watch and subject. Native pre-claim and portable heartbeat reconciliation each retry one due subject per transaction. Rejected admission backs off to the policy cap, while exhausted entries remain visible for owner replay or generation-fenced acknowledgement. Rows enter `otlet.jobs` through `run_task`, durable watch reconciliation, watch refresh, semantic refresh, `ask`, or owner-only replay evaluation; direct inserts are internal/testing-only and bypass admission accounting. `verify_invariants()` returns one row per violation and the demo requires zero violations
+Admission caps cover bulk rows, raw bytes per job, queue depth, queued bytes per task and model, total queued bytes, and oldest queue age per task. Bulk `run_task` calls enqueue every eligible row or none. Row-watch source triggers never wait for queue capacity; they persist one coalesced dirty identity per watch and subject. Native pre-claim and portable heartbeat reconciliation each retry one due subject per transaction. Rejected admission backs off to the policy cap, while exhausted entries remain visible for owner replay or generation-fenced acknowledgement. Queue age blocks new work for that task but does not expire, cancel, reorder, or prevent claims for existing jobs. Rows enter `otlet.jobs` through `run_task`, durable watch reconciliation, watch refresh, semantic refresh, `ask`, CustomScan, or owner-only replay evaluation. Direct inserts are internal/testing-only; the job trigger still enforces the origin vocabulary, origin immutability, and per-task insert budgets. `verify_invariants()` returns one row per violation and the demo requires zero violations
+
+The full demo covers all seven origins, task-isolated queue and claim caps, queue-age recovery, status and receipt attribution, infer-now, portable claims, and the closed internal function surface:
+
+```text
+job_origin_workload_budget_contract=4|2|1|t|t|t|t
+```
 
 Time-based row refresh reuses that reconciliation path. One indexed current deadline per watch revision and subject becomes eligible at the refresh window; no semantic read writes or queues work. Reconciliation rechecks lifecycle, pinned revision, immutable age anchor, current content, existing terminal or active work, and expiry before submission. Paused tasks retain due state without replay, source-change reconciliation supersedes time refresh, and exact-generation acknowledgement suppresses the same deadline without suppressing newer evidence. Job admission records one durable attempt on the deadline so normal terminal-job cleanup cannot reseed it; newer evidence resets the marker. Correction-owned materializations keep their explicit expiry and re-review path. Pair expiry remains fail-closed until an explicit bounded pair refresh
 
@@ -480,7 +486,7 @@ SELECT count(*) FROM otlet.verify_invariants();
 
 Contract: `0` (demo prints `invariant_contract=0`). The suite fails closed on expired or NULL leases for `running` and `cancel_requested` jobs, complete receipts without schema pass, sensitive evidence that violates the active storage policy, materializations missing `source_hash`, and error runtime slots. `production_status` and `verify_invariants` name the receipt invariant `complete_receipts_are_schema_validated`; throughput views use `completed_jobs` and `last_batch_completed_jobs`. Step 6 of `docs/semantic-watches.md` anchors the planner vocabulary for `selected_path` / `Planner Selected Path` and `freshness_basis`
 
-Auditors and operators query redacted, read-only projections through `otlet.audit_receipt_export`, `otlet.audit_review_sample_export`, `otlet.audit_review_export`, `otlet.audit_review_event_export`, `otlet.audit_reviewer_calibration_export`, `otlet.audit_action_execution_export`, `otlet.audit_eval_label_export`, `otlet.audit_administrative_change_export`, `otlet.audit_decision_evidence_export`, `otlet.semantic_dependency_audit`, `otlet.operational_event_log`, `otlet.worker_batch_timing_status`, and `otlet.failure_retry_status`. `otlet.redaction_policy_status` lists withheld evidence for the audit exports. `otlet.failure_retry_status` exposes whether raw error detail exists without exposing the detail
+Auditors and operators query redacted, read-only projections through `otlet.audit_receipt_export`, `otlet.audit_review_sample_export`, `otlet.audit_review_export`, `otlet.audit_review_event_export`, `otlet.audit_reviewer_calibration_export`, `otlet.audit_action_execution_export`, `otlet.audit_eval_label_export`, `otlet.audit_administrative_change_export`, `otlet.audit_decision_evidence_export`, `otlet.semantic_dependency_audit`, `otlet.operational_event_log`, `otlet.worker_batch_timing_status`, `otlet.task_queue_status`, `otlet.task_resource_status`, and `otlet.failure_retry_status`. `otlet.redaction_policy_status` lists withheld evidence for the audit exports. `otlet.failure_retry_status` exposes whether raw error detail exists without exposing the detail
 
 ## Step 4 - Grant Role-Scoped Access
 
@@ -531,6 +537,8 @@ The auditor capability grants read-only access to these redacted policy and audi
 - `otlet.portable_worker_status`
 - `otlet.portable_claim_status`
 - `otlet.portable_receipt_status`
+- `otlet.task_queue_status`
+- `otlet.task_resource_status`
 - `otlet.failure_taxonomy`
 - `otlet.failure_retry_status`
 
@@ -579,11 +587,11 @@ SELECT * FROM otlet.access_policy_status;
 SELECT * FROM otlet.application_access_policy_status;
 ```
 
-The demo proves the catalog ACLs, 23 auditor relations and 24 function grants, 23 operator relations and 27 function grants, three reviewer relations and 11 function grants, three operator RPCs, eight reviewer RPCs, 37 exact security-definer functions, three application RPCs, eight portable RPCs, seven positive delegated paths, and 112 denied paths. The calibrated reviewer proves all five review outcomes:
+The demo proves the catalog ACLs, 25 auditor relations and 25 function grants, 25 operator relations and 28 function grants, three reviewer relations and 11 function grants, three operator RPCs, eight reviewer RPCs, 37 exact security-definer functions, three application RPCs, eight portable RPCs, seven positive delegated paths, and 112 denied paths. The calibrated reviewer proves all five review outcomes:
 
 ```text
 review_provenance_contract=true|true|true|true|true|true|true|true|true|true|true
-permission_contract=public=0/0/0|auditor=23/24|operator=23/27|reviewer=3/11|definer=37/37|application=3/3/3|operator_rpc=3/3/3|reviewer_rpc=8/8/8|portable=8/8/8|positive=7|denied=112
+permission_contract=public=0/0/0|auditor=25/25|operator=25/28|reviewer=3/11|definer=37/37|application=3/3/3|operator_rpc=3/3/3|reviewer_rpc=8/8/8|portable=8/8/8|positive=7|denied=112
 ```
 
 Your application still owns these deployment boundaries:

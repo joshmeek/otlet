@@ -349,7 +349,8 @@ SELECT otlet.create_task(
 UPDATE otlet.production_policy
 SET max_input_bytes_per_job = 1000,
     max_queued_input_bytes_per_model = 100,
-    max_queued_input_bytes_total = 1000
+    max_queued_input_bytes_total = 1000,
+    max_queued_input_bytes_per_task = 1000
 WHERE name = 'default';
 CREATE TEMP TABLE admission_model_bytes_result AS
 SELECT otlet.run_task('admission_model_bytes_demo') AS queued;
@@ -394,7 +395,8 @@ SELECT otlet.create_task(
 UPDATE otlet.production_policy
 SET max_input_bytes_per_job = 200,
     max_queued_input_bytes_per_model = 200,
-    max_queued_input_bytes_total = 200
+    max_queued_input_bytes_total = 200,
+    max_queued_input_bytes_per_task = 200
 WHERE name = 'default';
 INSERT INTO otlet.jobs (task_name, subject_id, input)
 VALUES (
@@ -470,12 +472,13 @@ CREATE TEMP TABLE admission_enqueue_result AS
 SELECT otlet.run_task('admission_enqueue_only_demo') AS queued;
 SELECT (SELECT queued FROM admission_enqueue_result)::text || '|' ||
        (SELECT status FROM otlet.jobs WHERE task_name = 'admission_enqueue_only_demo') || '|' ||
+       (SELECT job_origin FROM otlet.jobs WHERE task_name = 'admission_enqueue_only_demo') || '|' ||
        (SELECT 42)::text;
 ROLLBACK;
 SQL
 )"
 echo "enqueue_only_contract=$enqueue_only_contract"
-[ "$enqueue_only_contract" = "1|queued|42" ] || {
+[ "$enqueue_only_contract" = "1|queued|task_run|42" ] || {
   echo "Expected enqueue-only admission without a worker wait, got $enqueue_only_contract" >&2
   exit 1
 }

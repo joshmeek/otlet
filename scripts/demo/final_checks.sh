@@ -352,6 +352,16 @@ SQL
   echo "Expected an authoritative-correction proof job" >&2
   exit 1
 }
+row_correction_job_origin="$(psql_value -v job_id="$row_correction_job_id" <<'SQL'
+SELECT job_origin
+FROM otlet.jobs
+WHERE id = :'job_id'::bigint;
+SQL
+)"
+[ "$row_correction_job_origin" = "row_watch" ] || {
+  echo "Expected a row-watch origin, got $row_correction_job_origin" >&2
+  exit 1
+}
 row_correction_job_status=""
 for _ in $(seq 1 900); do
   row_correction_job_status="$(psql_value -v job_id="$row_correction_job_id" <<'SQL'

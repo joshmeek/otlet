@@ -542,13 +542,14 @@ SELECT concat_ws('|',
   status,
   (output IS NULL)::text,
   (receipt_id IS NULL)::text,
-  (task_name LIKE 'ask_%')::text
+  (task_name LIKE 'ask_%')::text,
+  job_origin
 )
 FROM otlet.runs
 WHERE job_id = :'async_job_id'::bigint;
 SQL
 )"
-if [ "$async_queued_contract" != "queued|true|true|true" ]; then
+if [ "$async_queued_contract" != "queued|true|true|true|direct_ask" ]; then
   echo "Expected queued asynchronous ask state, got $async_queued_contract" >&2
   exit 1
 fi

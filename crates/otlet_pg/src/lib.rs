@@ -380,6 +380,11 @@ pgrx::extension_sql_file!(
     name = "workload_pack_promotion",
     requires = ["minimal_bounded_backfill"]
 );
+pgrx::extension_sql_file!(
+    "../sql/migrations/0075_job_origin_workload_budgets.sql",
+    name = "job_origin_workload_budgets",
+    requires = ["workload_pack_promotion"]
+);
 
 #[allow(non_snake_case)]
 #[pgrx::pg_guard]

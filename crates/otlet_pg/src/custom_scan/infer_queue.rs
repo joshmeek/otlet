@@ -94,10 +94,11 @@ fn queue_subject_refreshes(
             task_name.into(),
             subject_refs.as_slice().into(),
             workload_revision_hash.into(),
+            "customscan".into(),
         ];
         let table = client
             .select(
-                "SELECT subject_id, queued FROM otlet.run_task_subjects($1, $2::text[], $3)",
+                "SELECT subject_id, queued FROM otlet.run_task_subjects_with_origin($1, $2::text[], $3, $4)",
                 Some(subject_ids.len() as i64),
                 &args,
             )

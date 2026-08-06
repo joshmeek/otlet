@@ -44,7 +44,7 @@ pub(crate) fn submit_infer_now(
     input: &Value,
 ) -> Result<Option<SubmittedInferNow>, String> {
     let input_text = serde_json::to_string(input).map_err(|err| err.to_string())?;
-    submit_infer_now_text(task_name, subject_id, None, None, &input_text)
+    submit_infer_now_text(task_name, subject_id, None, None, &input_text, false)
 }
 
 pub(crate) fn submit_infer_now_bytes(
@@ -61,6 +61,7 @@ pub(crate) fn submit_infer_now_bytes(
         Some(expected_workload_revision_hash),
         None,
         input_text,
+        true,
     )
 }
 
@@ -95,6 +96,7 @@ fn submit_infer_now_with_inline_task(
         None,
         Some(&inline_task_text),
         &input_text,
+        false,
     )
 }
 
@@ -104,6 +106,7 @@ fn submit_infer_now_text(
     expected_workload_revision_hash: Option<&str>,
     inline_task_text: Option<&str>,
     input_text: &str,
+    customscan_origin: bool,
 ) -> Result<Option<SubmittedInferNow>, String> {
     check_len("task_name", task_name.len(), TASK_CAP)?;
     check_len("subject_id", subject_id.len(), SUBJECT_CAP)?;
@@ -132,6 +135,7 @@ fn submit_infer_now_text(
         slot.request_id = request_id;
         slot.state = STATE_REQUESTED;
         slot.timeout_cancel_pending = false;
+        slot.customscan_origin = customscan_origin;
         slot.requester_latch = unsafe { pg_sys::MyLatch as usize };
         slot.last_job_id = 0;
         slot.last_elapsed_ms = 0;

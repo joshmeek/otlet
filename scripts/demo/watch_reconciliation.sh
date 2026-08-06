@@ -377,6 +377,7 @@ BEGIN
         AND revision.workload_revision_hash = job.workload_revision_hash
        WHERE job.task_name = 'watch_reconciliation_demo_task'
          AND job.subject_id = 'coalesce'
+         AND job.job_origin = 'catch_up'
          AND otlet.semantic_source_hash(job.input)
            = (SELECT source_identity FROM watch_reconciliation_expected)
      ) THEN

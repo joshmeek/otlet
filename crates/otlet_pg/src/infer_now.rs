@@ -23,6 +23,7 @@ pub(crate) const INFER_NOW_ADMISSION_POLICY: &str = "bounded_shared_memory_infer
 struct InferNowSlot {
     state: u32,
     timeout_cancel_pending: bool,
+    customscan_origin: bool,
     request_id: u64,
     requester_latch: usize,
     last_job_id: i64,
@@ -51,6 +52,7 @@ impl Default for InferNowSlot {
         Self {
             state: STATE_IDLE,
             timeout_cancel_pending: false,
+            customscan_origin: false,
             request_id: 0,
             requester_latch: 0,
             last_job_id: 0,
@@ -127,6 +129,7 @@ static OTLET_WORKER_INFER_NOW_STATE_FINFO: pg_sys::Pg_finfo_record =
 
 pub(crate) struct InferNowRequest {
     pub(crate) id: u64,
+    pub(crate) customscan_origin: bool,
     pub(crate) task_name: String,
     pub(crate) subject_id: String,
     pub(crate) expected_workload_revision_hash: Option<String>,
@@ -171,6 +174,7 @@ pub(crate) fn take_request() -> Option<InferNowRequest> {
 
     let slot = &state.slots[slot_index];
     let id = slot.request_id;
+    let customscan_origin = slot.customscan_origin;
     let task_name = read_buf(&slot.task, slot.task_len as usize);
     let subject_id = read_buf(&slot.subject, slot.subject_len as usize);
     let expected_workload_revision_hash =
@@ -216,6 +220,7 @@ pub(crate) fn take_request() -> Option<InferNowRequest> {
     state.started = state.started.saturating_add(1);
     Some(InferNowRequest {
         id,
+        customscan_origin,
         task_name,
         subject_id,
         expected_workload_revision_hash,

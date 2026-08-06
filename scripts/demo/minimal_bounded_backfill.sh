@@ -144,6 +144,21 @@ SELECT pg_temp.assert_true(
   otlet.reconcile_watch_subject('bounded_backfill_a', 'a', true) = 'active_job',
   'foreground promotion left watch reconciliation pending'
 );
+SELECT pg_temp.assert_true(
+  EXISTS (
+    SELECT 1
+    FROM otlet.jobs job
+    WHERE job.backfill_id = (
+      SELECT value::bigint
+      FROM backfill_proof_context
+      WHERE name = 'rate_backfill'
+    )
+      AND job.subject_id = 'a'
+      AND job.job_origin = 'backfill'
+      AND NOT job.backfill_deferred
+  ),
+  'foreground promotion changed the backfill job origin'
+);
 INSERT INTO backfill_proof_rpc
 SELECT 'rate_second', page.*
 FROM otlet.submit_task_backfill_page(

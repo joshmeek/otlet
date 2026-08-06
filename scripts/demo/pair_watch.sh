@@ -59,7 +59,8 @@ throughput_contracts="$(psql_exec -qAt \
   -v record_type="$record_type" \
   -v model_name="$cheap_model_name" <<'SQL'
 SELECT count(*) FILTER (WHERE a.action_type = 'create_record' AND a.status = 'complete')::text || '|' ||
-       count(*) FILTER (WHERE r.record_type = :'record_type')::text
+       count(*) FILTER (WHERE r.record_type = :'record_type')::text || '|' ||
+       bool_and(j.job_origin = 'pair_watch')::text
 FROM otlet.jobs j
 LEFT JOIN otlet.actions a ON a.job_id = j.id
 LEFT JOIN otlet.records r ON r.action_id = a.id
@@ -88,8 +89,8 @@ auto_records="$(sed -n '1p' <<<"$throughput_contracts")"
 materialized="$(sed -n '2p' <<<"$throughput_contracts")"
 throughput_status_contract="$(sed -n '3p' <<<"$throughput_contracts")"
 echo "semantic_join_auto_records=$auto_records"
-[ "$auto_records" = "4|4" ] || {
-  echo "Expected 4 auto actions and records, got $auto_records" >&2
+[ "$auto_records" = "4|4|true" ] || {
+  echo "Expected 4 pair-watch jobs, auto actions, and records, got $auto_records" >&2
   exit 1
 }
 
