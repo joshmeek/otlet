@@ -22,9 +22,9 @@ install_portable() {
     -f crates/otlet_worker/sql/install.sql
 }
 
-install_portable_through_71() {
+install_portable_through_72() {
   docker exec -w /work/crates/otlet_worker/sql "$container" \
-    sed '/0072_time_based_freshness.sql/,$d' migrate.sql |
+    sed '/0073_minimal_bounded_backfill.sql/,$d' migrate.sql |
     docker exec -i -w /work/crates/otlet_worker/sql "$container" \
       psql -U postgres -d "$database" -X -q -v ON_ERROR_STOP=1 --single-transaction
 }
@@ -64,7 +64,7 @@ SELECT format(
   'portable upgrade executable proof'
 ) \gexec
 SQL
-install_portable_through_71
+install_portable_through_72
 
 docker exec -i "$container" psql -U postgres -d "$database" \
   -X -q -v ON_ERROR_STOP=1 <<'SQL' >/dev/null
@@ -295,7 +295,7 @@ contract="$(
 SELECT concat_ws('|',
   max(version),
   count(*),
-  array_agg(version ORDER BY version) = ARRAY(SELECT generate_series(1, 72)),
+  array_agg(version ORDER BY version) = ARRAY(SELECT generate_series(1, 73)),
   bool_and(file ~ ('(^|/)' || lpad(version::text, 4, '0') || '_')),
   (SELECT value FROM public.portable_upgrade_sentinel),
   (
@@ -348,7 +348,7 @@ SELECT concat_ws('|',
 FROM otlet.portable_schema_migrations;
 SQL
 )"
-[ "$contract" = "72|72|t|t|preserved|t|0|t|t|t" ] || {
+[ "$contract" = "73|73|t|t|preserved|t|0|t|t|t" ] || {
   echo "Portable repeat-install contract mismatch: $contract" >&2
   exit 1
 }
@@ -368,6 +368,39 @@ portable_time_freshness_contract="$(
 [ "$portable_time_freshness_contract" = \
   "time_based_freshness_contract=t|t|t|t|t|t|t|t" ] || {
   echo "Portable time-freshness contract mismatch: $portable_time_freshness_contract" >&2
+  exit 1
+}
+
+portable_bounded_backfill_contract="$(
+  (
+    cheap_model_name="bounded_backfill_probe"
+    log() { :; }
+    psql_exec() {
+      docker exec -i "$container" psql -U postgres -d "$database" \
+        -X -v ON_ERROR_STOP=1 "$@"
+    }
+    psql_exec -q >/dev/null <<'SQL'
+SELECT otlet.register_model(
+  'bounded_backfill_probe',
+  '/tmp/bounded_backfill_probe.gguf',
+  repeat('b', 64),
+  jsonb_build_object(
+    'sha256', repeat('b', 64),
+    'bytes', 1,
+    'source', 'portable-upgrade-demo',
+    'revision', 'bounded-backfill-v1',
+    'quantization', 'test',
+    'license', 'test'
+  ),
+  8
+);
+SQL
+    source "$(dirname "$0")/demo/minimal_bounded_backfill.sh"
+  ) | awk 'NF { line = $0 } END { print line }'
+)"
+[ "$portable_bounded_backfill_contract" = \
+  "minimal_bounded_backfill_contract=t|t|t|t|t|t|t|t|t|t|0" ] || {
+  echo "Portable bounded-backfill contract mismatch: $portable_bounded_backfill_contract" >&2
   exit 1
 }
 

@@ -240,3 +240,6 @@ $$;
 
 \set portable_migration_file ../../../otlet_pg/sql/migrations/0072_time_based_freshness.sql
 \ir migrations/apply.sql
+
+\set portable_migration_file ../../../otlet_pg/sql/migrations/0073_minimal_bounded_backfill.sql
+\ir migrations/apply.sql

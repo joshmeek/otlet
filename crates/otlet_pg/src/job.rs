@@ -202,7 +202,8 @@ pub(crate) fn insert_infer_now_job(
 SELECT
   count(j.id)::bigint,
   COALESCE(bool_or(j.id IS NOT NULL AND j.input IS DISTINCT FROM $3::jsonb), false),
-  capacity.available_active_job_slots
+  capacity.available_active_job_slots,
+  min(j.id) FILTER (WHERE j.backfill_deferred AND j.status IN ('queued', 'running'))
 FROM otlet.workload_revisions revision
 LEFT JOIN otlet.model_claim_capacity capacity
   ON capacity.model_name = revision.definition #>> '{models,direct,name}'
@@ -224,6 +225,13 @@ GROUP BY capacity.available_active_job_slots
             return Ok(InferNowJobAdmission::Conflict);
         }
         if active_row.get::<i64>(1)?.unwrap_or(0) > 0 {
+            if let Some(job_id) = active_row.get::<i64>(4)? {
+                client.select(
+                    "SELECT otlet.promote_task_backfill_job($1)",
+                    Some(1),
+                    &[job_id.into()],
+                )?;
+            }
             return Ok(InferNowJobAdmission::Active);
         }
         if active_row.get::<i64>(3)?.unwrap_or(0) <= 0 {

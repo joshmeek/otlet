@@ -192,7 +192,7 @@ CREATE TABLE otlet.workload_revision_heads (
   task_name text PRIMARY KEY REFERENCES otlet.tasks(name),
   active_workload_revision_hash text NOT NULL,
   previous_workload_revision_hash text,
-  promoted_at timestamptz NOT NULL DEFAULT now(),
+  promoted_at timestamptz NOT NULL DEFAULT clock_timestamp(),
   CHECK (
     previous_workload_revision_hash IS NULL
     OR previous_workload_revision_hash <> active_workload_revision_hash

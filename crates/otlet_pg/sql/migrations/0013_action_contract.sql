@@ -1570,7 +1570,7 @@ BEGIN
     UPDATE otlet.workload_revision_heads head
     SET previous_workload_revision_hash = active_hash,
         active_workload_revision_hash = promote_workload_revision.target_workload_revision_hash,
-        promoted_at = now()
+        promoted_at = clock_timestamp()
     WHERE head.task_name = promote_workload_revision.task_name;
   END IF;
 

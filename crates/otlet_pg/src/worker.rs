@@ -128,6 +128,10 @@ pub extern "C-unwind" fn otlet_worker_main(_arg: pgrx::pg_sys::Datum) {
 
         let mut drained = 0;
         loop {
+            while let Some(request) = crate::infer_now::take_request() {
+                process_infer_now_request(request);
+                schema_probe_due = true;
+            }
             if let Err(err) = BackgroundWorker::transaction(replay_watch_reconciliation) {
                 pgrx::warning!("otlet watch reconciliation failed: {err}");
                 schema_probe_due = true;

@@ -165,6 +165,28 @@ Admission caps cover bulk rows, raw bytes per job, queue depth, queued bytes per
 
 Time-based row refresh reuses that reconciliation path. One indexed current deadline per watch revision and subject becomes eligible at the refresh window; no semantic read writes or queues work. Reconciliation rechecks lifecycle, pinned revision, immutable age anchor, current content, existing terminal or active work, and expiry before submission. Paused tasks retain due state without replay, source-change reconciliation supersedes time refresh, and exact-generation acknowledgement suppresses the same deadline without suppressing newer evidence. Job admission records one durable attempt on the deadline so normal terminal-job cleanup cannot reseed it; newer evidence resets the marker. Correction-owned materializations keep their explicit expiry and re-review path. Pair expiry remains fail-closed until an explicit bounded pair refresh
 
+An owner can create one unfinished backfill per active task revision with `create_task_backfill(...)`. Creation stores a capped C-ordered subject manifest and rolls back if the source exceeds the declared cap. `submit_task_backfill_page(...)` accepts the current generation, rereads source input for the next page, and returns its state, new generation, processed-subject count, and queued-job count. `task_backfill_status` reports manifest progress, changed and missing sources, linked job states, rate headroom, and revision currency. Use `set_task_backfill_state(...)` to pause, resume, or cancel the run
+
+Backfill jobs remain deferred until foreground task or watch work adopts them. Claims serve foreground work before a one-job backfill quantum. Cancellation owns deferred jobs from that run and leaves adopted foreground jobs intact. Each page also enforces its jobs-per-minute and outstanding-job limits plus the global queue and input-byte caps
+
+```sql
+BEGIN;
+SET LOCAL statement_timeout = '5s';
+
+SELECT otlet.create_task_backfill(
+  'entity_resolution_task',
+  otlet.ensure_active_workload_revision('entity_resolution_task'),
+  1000,
+  64,
+  64,
+  64
+) AS backfill_id \gset
+
+SELECT * FROM otlet.submit_task_backfill_page(:backfill_id, 0);
+SELECT * FROM otlet.task_backfill_status WHERE backfill_id = :backfill_id;
+COMMIT;
+```
+
 Definition limits are fixed and SQL-visible through `otlet.definition_complexity_limits`; `otlet.definition_complexity_status` reports the same measurements for active workload revisions. Shared guards reject oversized or structurally excessive task, ask, watch, import, policy, preset, source-query, and revision definitions before recursive schema validation, query binding, identity hashing, or prompt construction. `scripts/demo/definition_complexity.sh` checks every limit and public authoring path in one transaction, including direct table writes, and requires the original task, revision, watch, policy, queue, materialization, and backend state after every rejection
 
 Pair-watch creation stores a non-executing candidate `EXPLAIN` plan on the immutable workload revision and rejects invalid or over-cost plans. Every pair execution revalidates dependencies and plan cost, and watch status compares the accepted evidence with a live read-only plan. Otlet rebinds stored SQL against the recorded author path, executes and explains the resolved query under one canonical path with `pg_catalog` first, and restores the caller path. Candidate overflow rejects the operation before jobs or `candidate_removed` reconciliation. Pair refresh requires a caller `statement_timeout` from 1 ms through the policy limit because Postgres cannot arm a timeout from inside the statement already running. See [the workload admission contract](workload-admission.md) for the transaction form and SQL-visible limits

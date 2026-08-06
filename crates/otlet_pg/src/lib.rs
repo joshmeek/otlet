@@ -370,6 +370,11 @@ pgrx::extension_sql_file!(
     name = "time_based_freshness",
     requires = ["reviewer_rubric_calibration"]
 );
+pgrx::extension_sql_file!(
+    "../sql/migrations/0073_minimal_bounded_backfill.sql",
+    name = "minimal_bounded_backfill",
+    requires = ["time_based_freshness"]
+);
 
 #[allow(non_snake_case)]
 #[pgrx::pg_guard]
