@@ -22,9 +22,9 @@ install_portable() {
     -f crates/otlet_worker/sql/install.sql
 }
 
-install_portable_through_74() {
+install_portable_through_75() {
   docker exec -w /work/crates/otlet_worker/sql "$container" \
-    sed '/0075_job_origin_workload_budgets.sql/,$d' migrate.sql |
+    sed '/0076_interactive_async_service_quantum.sql/,$d' migrate.sql |
     docker exec -i -w /work/crates/otlet_worker/sql "$container" \
       psql -U postgres -d "$database" -X -q -v ON_ERROR_STOP=1 --single-transaction
 }
@@ -64,7 +64,7 @@ SELECT format(
   'portable upgrade executable proof'
 ) \gexec
 SQL
-install_portable_through_74
+install_portable_through_75
 
 docker exec -i "$container" psql -U postgres -d "$database" \
   -X -q -v ON_ERROR_STOP=1 <<'SQL' >/dev/null
@@ -75,6 +75,8 @@ CREATE TABLE public.portable_upgrade_sentinel (
   export_function_acl text,
   audit_review_oid oid,
   audit_review_acl text,
+  production_policy_status_oid oid,
+  production_policy_status_acl text,
   legacy_watch_revision_hash text,
   legacy_materialization_id bigint
 );
@@ -117,6 +119,9 @@ GRANT SELECT ON TABLE
   otlet.portable_receipt_status,
   otlet.failure_taxonomy,
   otlet.failure_retry_status,
+  otlet.task_queue_status,
+  otlet.task_resource_status,
+  otlet.production_policy_status,
   otlet.audit_semantic_correction_export
 TO :"operator_role";
 GRANT EXECUTE ON FUNCTION
@@ -155,6 +160,12 @@ SET audit_review_oid = relation.oid,
 FROM pg_catalog.pg_class relation
 WHERE sentinel.id = 1
   AND relation.oid = 'otlet.audit_review_export'::regclass;
+UPDATE public.portable_upgrade_sentinel sentinel
+SET production_policy_status_oid = relation.oid,
+    production_policy_status_acl = relation.relacl::text
+FROM pg_catalog.pg_class relation
+WHERE sentinel.id = 1
+  AND relation.oid = 'otlet.production_policy_status'::regclass;
 
 SELECT otlet.register_model(
   'model_concurrency_probe',
@@ -284,7 +295,8 @@ END;
 $proof$;
 
 UPDATE otlet.production_policy
-SET max_queued_input_bytes_per_model = 4096,
+SET max_queued_input_bytes_per_task = 4096,
+    max_queued_input_bytes_per_model = 4096,
     max_queued_input_bytes_total = 4096
 WHERE name = 'default';
 SQL
@@ -297,10 +309,43 @@ contract="$(
     -X -qAt -v ON_ERROR_STOP=1 \
     -v operator_role="$operator_role" \
     -v partial_auditor_role="$partial_auditor_role" <<'SQL'
+CREATE FUNCTION pg_temp.reject_invalid_service_targets() RETURNS boolean
+LANGUAGE plpgsql
+AS $function$
+DECLARE
+  interactive_rejected boolean := false;
+  asynchronous_rejected boolean := false;
+  cancellation_rejected boolean := false;
+BEGIN
+  BEGIN
+    UPDATE otlet.production_policy
+    SET interactive_queue_age_p99_target_ms = 0
+    WHERE name = 'default';
+  EXCEPTION WHEN check_violation THEN
+    interactive_rejected := true;
+  END;
+  BEGIN
+    UPDATE otlet.production_policy
+    SET asynchronous_queue_age_p99_target_ms = 0
+    WHERE name = 'default';
+  EXCEPTION WHEN check_violation THEN
+    asynchronous_rejected := true;
+  END;
+  BEGIN
+    UPDATE otlet.production_policy
+    SET cancellation_observation_p99_target_ms = 0
+    WHERE name = 'default';
+  EXCEPTION WHEN check_violation THEN
+    cancellation_rejected := true;
+  END;
+  RETURN interactive_rejected AND asynchronous_rejected AND cancellation_rejected;
+END
+$function$;
+
 SELECT concat_ws('|',
   max(version),
   count(*),
-  array_agg(version ORDER BY version) = ARRAY(SELECT generate_series(1, 75)),
+  array_agg(version ORDER BY version) = ARRAY(SELECT generate_series(1, 76)),
   bool_and(file ~ ('(^|/)' || lpad(version::text, 4, '0') || '_')),
   (SELECT value FROM public.portable_upgrade_sentinel),
   (
@@ -365,13 +410,35 @@ SELECT concat_ws('|',
   ),
   (
     SELECT max_queued_input_bytes_per_task = 4096
+      AND max_queued_input_bytes_per_model = 4096
+      AND max_queued_input_bytes_total = 4096
     FROM otlet.production_policy_status
+  ),
+  (
+    SELECT interactive_queue_age_p99_target_ms = 30000
+      AND asynchronous_queue_age_p99_target_ms = 30000
+      AND cancellation_observation_p99_target_ms = 1000
+      AND NOT pg_catalog.has_table_privilege(
+        'public', 'otlet.production_policy_status', 'SELECT'
+      )
+    FROM otlet.production_policy_status
+  ),
+  pg_temp.reject_invalid_service_targets(),
+  (
+    SELECT relation.oid = sentinel.production_policy_status_oid
+      AND relation.relacl::text = sentinel.production_policy_status_acl
+      AND pg_catalog.has_table_privilege(
+        :'operator_role', 'otlet.production_policy_status', 'SELECT'
+      )
+    FROM public.portable_upgrade_sentinel sentinel
+    CROSS JOIN pg_catalog.pg_class relation
+    WHERE relation.oid = 'otlet.production_policy_status'::regclass
   )
 )
 FROM otlet.portable_schema_migrations;
 SQL
 )"
-[ "$contract" = "75|75|t|t|preserved|t|0|t|t|t|t|t|t|t|t" ] || {
+[ "$contract" = "76|76|t|t|preserved|t|0|t|t|t|t|t|t|t|t|t|t|t" ] || {
   echo "Portable repeat-install contract mismatch: $contract" >&2
   exit 1
 }

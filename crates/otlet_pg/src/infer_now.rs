@@ -170,7 +170,10 @@ pub(crate) fn take_request() -> Option<InferNowRequest> {
     let slot_index = state
         .slots
         .iter()
-        .position(|slot| slot.state == STATE_REQUESTED)?;
+        .enumerate()
+        .filter(|(_, slot)| slot.state == STATE_REQUESTED)
+        .min_by_key(|(_, slot)| slot.request_id)
+        .map(|(index, _)| index)?;
 
     let slot = &state.slots[slot_index];
     let id = slot.request_id;

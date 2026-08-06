@@ -14,6 +14,9 @@ The default production policy sets these limits:
 | Total queued input bytes | 256 MiB |
 | Active claimed jobs per task | 8 |
 | Maximum queue age per task | 1 day |
+| Native interactive queue-age p99 target | 30,000 ms |
+| Native asynchronous queue-age p99 target | 30,000 ms |
+| Native cancellation-observation p99 target | 1,000 ms |
 | Watch reconciliation attempts | 12 |
 | Watch reconciliation base delay | 1,000 ms |
 | Watch reconciliation maximum delay | 300,000 ms |
@@ -42,6 +45,8 @@ Definition authoring uses fixed platform limits rather than production-policy se
 Each model registration sets `max_active_jobs`, with a default of one. The production policy also sets `max_active_jobs_per_task`, from 1 through 1,024. Both limits count live claimed leases across native, portable, and infer-now execution. A `running` or `cancel_requested` job consumes a slot while its lease is live. Queued, terminal, null-lease, and expired-lease jobs consume none. A claim needs both a model slot and a task slot
 
 The singleton production policy applies task limits separately to each task. `max_queued_input_bytes_per_task` accepts 1 byte through 1 GiB and cannot exceed `max_queued_input_bytes_total`. `max_queue_age` accepts 1 second through 30 days. Otlet has no per-task or per-origin override
+
+Operators set three positive bounded native p99 targets. Otlet reports them as `declared_not_measured` and continues to use `max_queue_age` for admission backpressure
 
 PostgreSQL assigns one immutable origin at admission:
 

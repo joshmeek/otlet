@@ -385,6 +385,11 @@ pgrx::extension_sql_file!(
     name = "job_origin_workload_budgets",
     requires = ["workload_pack_promotion"]
 );
+pgrx::extension_sql_file!(
+    "../sql/migrations/0076_interactive_async_service_quantum.sql",
+    name = "interactive_async_service_quantum",
+    requires = ["job_origin_workload_budgets"]
+);
 
 #[allow(non_snake_case)]
 #[pgrx::pg_guard]

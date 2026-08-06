@@ -249,3 +249,6 @@ $$;
 
 \set portable_migration_file ../../../otlet_pg/sql/migrations/0075_job_origin_workload_budgets.sql
 \ir migrations/apply.sql
+
+\set portable_migration_file ../../../otlet_pg/sql/migrations/0076_interactive_async_service_quantum.sql
+\ir migrations/apply.sql

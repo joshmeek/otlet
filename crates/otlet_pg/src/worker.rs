@@ -49,6 +49,7 @@ pub extern "C-unwind" fn otlet_worker_main(_arg: pgrx::pg_sys::Datum) {
         .checked_sub(SCHEMA_READY_PROBE_INTERVAL)
         .unwrap_or_else(Instant::now);
     let mut preload_checked = false;
+    let mut prefer_infer_now = true;
 
     while BackgroundWorker::wait_latch(Some(recovery_interval)) {
         if schema_probe_due || last_schema_probe.elapsed() >= SCHEMA_READY_PROBE_INTERVAL {
@@ -107,11 +108,6 @@ pub extern "C-unwind" fn otlet_worker_main(_arg: pgrx::pg_sys::Datum) {
             }
         }
 
-        while let Some(request) = crate::infer_now::take_request() {
-            process_infer_now_request(request);
-            schema_probe_due = true;
-        }
-
         if last_expired_sweep.elapsed() >= EXPIRED_JOB_SWEEP_INTERVAL {
             let sweep_result: pgrx::spi::Result<()> = BackgroundWorker::transaction(|| {
                 pgrx::Spi::connect_mut(|client| {
@@ -128,23 +124,35 @@ pub extern "C-unwind" fn otlet_worker_main(_arg: pgrx::pg_sys::Datum) {
 
         let mut drained = 0;
         loop {
-            while let Some(request) = crate::infer_now::take_request() {
+            if prefer_infer_now && let Some(request) = crate::infer_now::take_request() {
                 process_infer_now_request(request);
                 schema_probe_due = true;
+                prefer_infer_now = false;
+                continue;
             }
             if let Err(err) = BackgroundWorker::transaction(replay_watch_reconciliation) {
                 pgrx::warning!("otlet watch reconciliation failed: {err}");
                 schema_probe_due = true;
             }
             let jobs = match BackgroundWorker::transaction(claim_jobs) {
-                Ok(jobs) if jobs.is_empty() => break,
                 Ok(jobs) => jobs,
                 Err(err) => {
                     pgrx::warning!("otlet worker claim failed: {err}");
                     schema_probe_due = true;
+                    prefer_infer_now = true;
                     break;
                 }
             };
+
+            if jobs.is_empty() {
+                if let Some(request) = crate::infer_now::take_request() {
+                    process_infer_now_request(request);
+                    schema_probe_due = true;
+                    prefer_infer_now = false;
+                    continue;
+                }
+                break;
+            }
 
             let batch_owned = jobs
                 .first()
@@ -186,6 +194,7 @@ pub extern "C-unwind" fn otlet_worker_main(_arg: pgrx::pg_sys::Datum) {
                 drained += u64::try_from(batch_result.completed + batch_result.failed).unwrap_or(0);
             }
             release_requested_resident_model();
+            prefer_infer_now = true;
         }
         crate::wake::record_worker_drain(drained);
         release_requested_resident_model();

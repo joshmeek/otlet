@@ -4,7 +4,7 @@ The portable worker runs one-off inference, model routing, and row or pair watch
 
 Use this path when PostgreSQL allows ordinary SQL but cannot load the native Otlet extension worker. The reference worker connects through `psql`, claims one model's bounded snapshots, runs one local GGUF with llama.cpp, and submits results through the fenced portable RPCs
 
-Synchronous `otlet.ask(...)`, CustomScan, and infer-now remain native-only because they require an in-process PostgreSQL worker or extension hooks. Portable callers use committed queues and the same SQL read functions
+Synchronous `otlet.ask(...)`, CustomScan, and infer-now remain native-only because they require an in-process PostgreSQL worker or extension hooks. Portable callers use committed queues and the same SQL read functions. Each portable process turn requests one asynchronous job. Native service quantum stays inside the PostgreSQL worker
 
 Each process loads one registered model. Register a separate role and worker identity for each additional model. The worker has no remote model API and no direct access to source or Otlet tables
 
@@ -16,7 +16,7 @@ Run the installer as the database owner from the repository checkout:
 psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f crates/otlet_worker/sql/install.sql
 ```
 
-The install transaction runs the current SQL contract as migrations `0001` through `0075`. Re-running it skips recorded migrations and preserves existing data. This greenfield path rejects older unversioned `otlet` schemas instead of converting them
+The install transaction runs the current SQL contract as migrations `0001` through `0076`. Re-running it skips recorded migrations and preserves existing data. This greenfield path rejects older unversioned `otlet` schemas instead of converting them
 
 The database keeps zero `otlet` extension objects and zero C-language Otlet functions
 
@@ -255,7 +255,7 @@ Run the repeat-install proof:
 ./scripts/otlet-portable-upgrade-demo.sh
 ```
 
-It installs through migration `0074`, lowers the existing total queue-byte cap, grants existing operator, application, reviewer, and partial audit roles, applies `0075`, and repeats the current install. The proof checks all 75 migrations, lower-cap-safe policy migration, immutable job-origin attribution, per-task queue and claim budgets, existing data and grants, blinded reviewer calibration, review sampling, evidence-linked decisions, time freshness, bounded backfill, workload-pack promotion and rollback, lifecycle, administrative-ledger, workload-acceptance and candidate-set promotion fences, entity-resolution quality decomposition, pair constraints, entity-graph conflict status and gates, bounded validators, queued ask behavior, `PUBLIC` closure, and invariants
+It installs through migration `0075`, lowers the existing task, model, and total queue-byte caps, grants existing operator, application, reviewer, and partial audit roles, applies `0076`, and repeats the current install. The proof checks all 76 migrations, declared native service targets, lower-cap preservation, immutable job-origin attribution, per-task queue and claim budgets, existing data and grants, blinded reviewer calibration, review sampling, evidence-linked decisions, time freshness, bounded backfill, workload-pack promotion and rollback, lifecycle, administrative-ledger, workload-acceptance and candidate-set promotion fences, entity-resolution quality decomposition, pair constraints, entity-graph conflict status and gates, bounded validators, queued ask behavior, `PUBLIC` closure, and invariants
 
 ```text
 portable_job_origin_workload_budget_contract=4|2|1|t|t|t|t

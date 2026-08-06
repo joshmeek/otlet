@@ -182,6 +182,25 @@ The worker keeps the local model/context warm across jobs. SQL can see the slot 
 
 `otlet.runtime_status` also reports the latest infer-now request split as start latency, worker time, and requester delivery time through `infer_now_last_start_latency_ms`, `infer_now_last_worker_run_ms`, and `infer_now_last_delivery_ms`
 
+The native dispatcher gives one service turn to the oldest infer-now request, then one turn to the existing bounded queued batch. Its cursor survives latch wakes, and an empty class leaves the other running. Inspect the declared contract and targets; latest-request fields remain per-request observations:
+
+```sql
+SELECT interactive_queue_age_p99_target_ms,
+       asynchronous_queue_age_p99_target_ms,
+       cancellation_observation_p99_target_ms
+FROM otlet.production_policy_status;
+
+SELECT state ->> 'queue_policy' AS queue_policy,
+       state ->> 'service_policy' AS service_policy,
+       state ->> 'infer_now_request_quantum' AS infer_now_request_quantum,
+       state ->> 'queued_claim_batch_quantum' AS queued_claim_batch_quantum,
+       state ->> 'priority_classes' AS priority_classes,
+       state ->> 'service_measurement_status' AS measurement_status
+FROM (SELECT otlet.worker_infer_now_state() AS state) current;
+```
+
+The interactive queue target runs from shared-memory `requested_at` to `started_at`. The asynchronous target runs from `jobs.created_at` to the matching `worker_events.created_at` for `job_started`; `jobs.started_at` records claim time for the whole batch and hides held-batch delay. Cancellation observation ends at the first runtime check after `cancel_requested_at`; terminal `finished_at` records job completion. Otlet reports the target as `declared_not_measured`; the separate native cancellation-SLO work will add the observation timestamp and measured p99
+
 The full fingerprint describes the artifact, linked build, effective generation settings, CPU placement, and host capacity. The prompt-template hash covers the exact reasoning prefix and static prompt body. Its output-contract hash omits observational host fields and joins content, task contract, and model identity in the inference-cache key:
 
 ```sql
