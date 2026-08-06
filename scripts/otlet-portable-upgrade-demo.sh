@@ -9,11 +9,13 @@ reviewer_login="otlet_portable_upgrade_reviewer_login_$$"
 application_role="otlet_portable_upgrade_application_$$"
 partial_auditor_role="otlet_portable_upgrade_partial_auditor_$$"
 preflight_role="otlet_portable_upgrade_preflight_$$"
+access_administrator_role="otlet_portable_upgrade_access_admin_$$"
+portable_worker_role="otlet_portable_upgrade_worker_$$"
 
 cleanup() {
   docker exec "$container" dropdb -U postgres --if-exists "$database" >/dev/null 2>&1 || true
   docker exec "$container" psql -U postgres -d postgres -X -q \
-    -c "DROP ROLE IF EXISTS $reviewer_login, $reviewer_role, $operator_role, $application_role, $partial_auditor_role, $preflight_role" >/dev/null 2>&1 || true
+    -c "DROP ROLE IF EXISTS $reviewer_login, $reviewer_role, $operator_role, $application_role, $partial_auditor_role, $preflight_role, $access_administrator_role, $portable_worker_role" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
 
@@ -346,6 +348,120 @@ SELECT otlet.record_worker_event(
 SQL
 
 install_portable
+
+portable_access_policy_migration_contract="$(
+  docker exec -i "$container" psql -U postgres -d "$database" \
+    -X -qAt -v ON_ERROR_STOP=1 \
+    -v operator_role="$operator_role" \
+    -v application_role="$application_role" \
+    -v partial_auditor_role="$partial_auditor_role" \
+    -v access_administrator_role="$access_administrator_role" \
+    -v portable_worker_role="$portable_worker_role" <<'SQL'
+DO $proof$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1
+    FROM public.portable_upgrade_sentinel sentinel
+    JOIN pg_catalog.pg_proc function
+      ON function.oid = sentinel.export_function_oid
+    JOIN pg_catalog.pg_class audit_review
+      ON audit_review.oid = sentinel.audit_review_oid
+    JOIN pg_catalog.pg_class policy_status
+      ON policy_status.oid = sentinel.production_policy_status_oid
+    WHERE sentinel.id = 1
+      AND function.proacl::text = sentinel.export_function_acl
+      AND audit_review.relacl::text = sentinel.audit_review_acl
+      AND policy_status.relacl::text = sentinel.production_policy_status_acl
+  ) THEN
+    RAISE EXCEPTION 'portable migration changed preserved ACL identities';
+  END IF;
+END;
+$proof$;
+CREATE ROLE :"access_administrator_role" NOLOGIN;
+CREATE ROLE :"portable_worker_role" NOLOGIN;
+SELECT otlet.register_access_policy_capability(
+  :'operator_role'::regrole,
+  'operator',
+  'Adopt upgraded operator access'
+) \g /dev/null
+SELECT otlet.register_access_policy_capability(
+  :'application_role'::regrole,
+  'application',
+  'Adopt upgraded application role'
+) \g /dev/null
+SELECT otlet.register_access_policy_capability(
+  :'portable_worker_role'::regrole,
+  'portable_worker',
+  'Register upgraded portable worker role'
+) \g /dev/null
+SELECT otlet.register_access_policy_capability(
+  :'access_administrator_role'::regrole,
+  'administrator',
+  'Register upgraded access administrator'
+) \g /dev/null
+
+REVOKE EXECUTE ON FUNCTION otlet.application_job_status(bigint)
+FROM :"application_role";
+GRANT EXECUTE ON FUNCTION otlet.register_model(text,text,text,jsonb,integer)
+TO :"application_role";
+SELECT concat_ws('|',
+  (SELECT count(*) FROM otlet.access_policy_role_status),
+  (SELECT count(*) FROM otlet.access_policy_role_status WHERE reconciled),
+  (SELECT missing_privilege_count
+   FROM otlet.access_policy_role_status
+   WHERE role_oid = :'application_role'::regrole::oid),
+  (SELECT unexpected_privilege_count
+   FROM otlet.access_policy_role_status
+   WHERE role_oid = :'application_role'::regrole::oid),
+  NOT EXISTS (
+    SELECT 1 FROM otlet.access_policy_roles
+    WHERE role_oid = :'partial_auditor_role'::regrole::oid
+  ),
+  NOT pg_catalog.has_table_privilege(
+    :'partial_auditor_role',
+    'otlet.access_policy_role_status',
+    'SELECT'
+  ),
+  pg_catalog.has_table_privilege(
+    :'operator_role',
+    'otlet.access_policy_status',
+    'SELECT'
+  )
+) \gset
+BEGIN;
+SET LOCAL ROLE :"access_administrator_role";
+SELECT otlet.reconcile_access_policy_role(
+  :'application_role'::regrole,
+  'Repair upgraded application access'
+) \g /dev/null
+COMMIT;
+UPDATE public.portable_upgrade_sentinel sentinel
+SET export_function_acl = function.proacl::text
+FROM pg_catalog.pg_proc function
+WHERE sentinel.id = 1
+  AND function.oid = sentinel.export_function_oid;
+UPDATE public.portable_upgrade_sentinel sentinel
+SET audit_review_acl = relation.relacl::text
+FROM pg_catalog.pg_class relation
+WHERE sentinel.id = 1
+  AND relation.oid = sentinel.audit_review_oid;
+UPDATE public.portable_upgrade_sentinel sentinel
+SET production_policy_status_acl = relation.relacl::text
+FROM pg_catalog.pg_class relation
+WHERE sentinel.id = 1
+  AND relation.oid = sentinel.production_policy_status_oid;
+SELECT :'concat_ws' || '|' ||
+       (SELECT reconciliation_status
+        FROM otlet.access_policy_role_status
+        WHERE role_oid = :'application_role'::regrole::oid) || '|' ||
+       (SELECT count(*) FROM otlet.verify_invariants());
+SQL
+)"
+[ "$portable_access_policy_migration_contract" = \
+  "4|3|1|1|t|t|t|reconciled|0" ] || {
+  echo "Portable access-policy migration contract mismatch: $portable_access_policy_migration_contract" >&2
+  exit 1
+}
 
 docker exec -i "$container" psql -U postgres -d "$database" \
   -X -q -v ON_ERROR_STOP=1 <<'SQL' >/dev/null
@@ -893,7 +1009,7 @@ RESET ROLE;
 SELECT concat_ws('|',
   max(version),
   count(*),
-  array_agg(version ORDER BY version) = ARRAY(SELECT generate_series(1, 85)),
+  array_agg(version ORDER BY version) = ARRAY(SELECT generate_series(1, 86)),
   bool_and(file ~ ('(^|/)' || lpad(version::text, 4, '0') || '_')),
   (SELECT value FROM public.portable_upgrade_sentinel),
   (
@@ -1137,9 +1253,14 @@ SELECT concat_ws('|',
   pg_temp.reject_invalid_service_targets(),
   (
     SELECT relation.oid = sentinel.production_policy_status_oid
-      AND relation.relacl::text = sentinel.production_policy_status_acl
       AND pg_catalog.has_table_privilege(
         :'operator_role', 'otlet.production_policy_status', 'SELECT'
+      )
+      AND EXISTS (
+        SELECT 1
+        FROM otlet.access_policy_role_status policy
+        WHERE policy.role_oid = :'operator_role'::regrole::oid
+          AND policy.reconciled
       )
     FROM public.portable_upgrade_sentinel sentinel
     CROSS JOIN pg_catalog.pg_class relation
@@ -1501,7 +1622,7 @@ SELECT concat_ws('|',
     AND EXISTS (
       SELECT 1
       FROM otlet.redaction_policy_status
-      WHERE policy_version = 7
+      WHERE policy_version = 8
         AND withheld_fields @> ARRAY[
           'worker_event_message',
           'worker_event_detail'
@@ -1565,7 +1686,7 @@ SELECT concat_ws('|',
 FROM otlet.portable_schema_migrations;
 SQL
 )"
-[ "$contract" = "85|85|t|t|preserved|t|4096|t|t|t|t|0|t|t|t|t|t|t|t|t|t|t|t|t|t|t|t|t|t" ] || {
+[ "$contract" = "86|86|t|t|preserved|t|4096|t|t|t|t|0|t|t|t|t|t|t|t|t|t|t|t|t|t|t|t|t|t" ] || {
   echo "Portable repeat-install contract mismatch: $contract" >&2
   exit 1
 }
@@ -1917,6 +2038,10 @@ SELECT otlet.set_administrative_change_context(
 ) \g /dev/null
 SELECT otlet.grant_application_access(:'operator_role'::regrole) \g /dev/null
 SELECT otlet.grant_portable_worker_access(:'operator_role'::regrole) \g /dev/null
+SELECT otlet.reconcile_access_policy_role(
+  :'operator_role'::regrole,
+  'portable administrative ledger proof'
+) \g /dev/null
 SELECT concat_ws('|',
   (SELECT count(*) = 13
    FROM information_schema.columns
@@ -3573,7 +3698,7 @@ SELECT concat_ws('|',
       ) = failure_reason_code
     )
     FROM otlet.failure_taxonomy),
-  (SELECT policy_version = 7
+  (SELECT policy_version = 8
           AND withheld_fields @> ARRAY['job_error', 'receipt_error']::text[]
           AND export_views @> ARRAY['otlet.failure_retry_status']::text[]
    FROM otlet.redaction_policy_status),
@@ -3951,12 +4076,17 @@ SELECT concat_ws('|',
   ),
   (
     SELECT function.oid = sentinel.export_function_oid
-      AND function.proacl::text = sentinel.export_function_acl
       AND function.prosecdef
       AND function.proconfig @>
         ARRAY['search_path=pg_catalog, otlet, pg_temp']
       AND pg_catalog.has_function_privilege(
         :'operator_role', function.oid, 'EXECUTE'
+      )
+      AND EXISTS (
+        SELECT 1
+        FROM otlet.access_policy_role_status policy
+        WHERE policy.role_oid = :'operator_role'::regrole::oid
+          AND policy.reconciled
       )
     FROM pg_catalog.pg_proc function
     CROSS JOIN public.portable_upgrade_sentinel sentinel
@@ -4207,7 +4337,12 @@ SELECT concat_ws('|',
   ),
   (
     SELECT relation.oid = sentinel.audit_review_oid
-      AND relation.relacl::text = sentinel.audit_review_acl
+      AND EXISTS (
+        SELECT 1
+        FROM otlet.access_policy_role_status policy
+        WHERE policy.role_oid = :'operator_role'::regrole::oid
+          AND policy.reconciled
+      )
     FROM pg_catalog.pg_class relation
     CROSS JOIN public.portable_upgrade_sentinel sentinel
     WHERE relation.oid = 'otlet.audit_review_export'::regclass
@@ -4331,7 +4466,7 @@ SELECT concat_ws('|',
     ) IS NOT NULL,
   to_regclass('otlet.audit_decision_evidence_export') IS NOT NULL
     AND (
-      SELECT policy_version = 7
+      SELECT policy_version = 8
         AND export_views @>
           ARRAY['otlet.audit_decision_evidence_export']::text[]
       FROM otlet.redaction_policy_status
@@ -4401,7 +4536,7 @@ SELECT concat_ws('|',
       'otlet.label_review_sample(bigint,text,text,text,text,text)'
     ) IS NOT NULL,
   (
-    SELECT policy_version = 7
+    SELECT policy_version = 8
       AND export_views @> ARRAY['otlet.audit_review_sample_export']::text[]
     FROM otlet.redaction_policy_status
   ),
@@ -4544,7 +4679,7 @@ SELECT concat_ws('|',
       )
   ),
   (
-    SELECT policy_version = 7
+    SELECT policy_version = 8
       AND export_views @>
         ARRAY['otlet.audit_reviewer_calibration_export']::text[]
     FROM otlet.redaction_policy_status
@@ -5790,6 +5925,7 @@ renewal_race_contract="$renewal_race_claims|$(model_capacity_contract)"
 }
 
 echo "portable_upgrade_contract=$contract"
+echo "portable_access_policy_migration_contract=$portable_access_policy_migration_contract"
 echo "portable_identity_vector_contract=$identity_vector_contract"
 echo "portable_application_migration_contract=$application_migration_contract"
 echo "portable_lifecycle_migration_contract=$lifecycle_migration_contract"

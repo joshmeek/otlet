@@ -435,6 +435,11 @@ pgrx::extension_sql_file!(
     name = "versioned_observability_quality_status",
     requires = ["bounded_maintenance_execution"]
 );
+pgrx::extension_sql_file!(
+    "../sql/migrations/0086_access_policy_lifecycle.sql",
+    name = "access_policy_lifecycle",
+    requires = ["versioned_observability_quality_status"]
+);
 
 #[allow(non_snake_case)]
 #[pgrx::pg_guard]

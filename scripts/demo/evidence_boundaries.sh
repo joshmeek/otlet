@@ -654,7 +654,7 @@ SELECT concat_ws('|',
      AND job.subject_id IN ('missing', 'disallowed')),
   (SELECT export_views @>
       ARRAY['otlet.audit_decision_evidence_export']::text[]
-      AND policy_version = 7
+      AND policy_version = 8
    FROM otlet.redaction_policy_status)
 );
 ROLLBACK;
@@ -992,7 +992,7 @@ SELECT
         WHERE job_id = :failure_id)
    AND (SELECT count(*) = 1
         FROM otlet.application_job_status(:failure_id))
-   AND (SELECT policy_version = 7
+   AND (SELECT policy_version = 8
                AND withheld_fields @> ARRAY['job_error', 'receipt_error']::text[]
                AND export_views @> ARRAY[
                  'otlet.failure_retry_status',

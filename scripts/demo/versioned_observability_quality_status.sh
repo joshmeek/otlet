@@ -1200,7 +1200,7 @@ BEGIN
      OR NOT EXISTS (
        SELECT 1
        FROM otlet.redaction_policy_status
-      WHERE policy_version = 7
+      WHERE policy_version = 8
          AND withheld_fields @> ARRAY[
            'worker_event_message',
            'worker_event_detail'

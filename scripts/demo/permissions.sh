@@ -554,6 +554,7 @@ WITH table_grants AS (
           OR table_name NOT IN (
             'redaction_policy_status',
             'access_policy_status',
+            'access_policy_role_status',
             'audit_receipt_export',
             'audit_decision_evidence_export',
             'audit_review_sample_export',
@@ -626,6 +627,8 @@ WITH table_grants AS (
           'source_function_descriptor',
           'source_query_binding_descriptor',
           'source_query_contract_error',
+          'access_policy_role_status_rows',
+          'export_eval_cases',
           'entity_graph_conflict_status_for_task',
           'semantic_correction_status_for_task',
           'pair_constraint_contract_hash',
@@ -660,6 +663,8 @@ WITH table_grants AS (
           'source_function_descriptor',
           'source_query_binding_descriptor',
           'source_query_contract_error',
+          'access_policy_role_status_rows',
+          'export_eval_cases',
           'entity_graph_conflict_status_for_task',
           'semantic_correction_status_for_task',
           'pair_constraint_contract_hash',
@@ -734,7 +739,11 @@ WITH table_grants AS (
           'otlet.route_readiness_status_rows()'::regprocedure,
           'otlet.stranded_escalation_status_rows()'::regprocedure,
           'otlet.operational_observability_status_rows()'::regprocedure,
-          'otlet.labeled_quality_status_rows()'::regprocedure
+          'otlet.labeled_quality_status_rows()'::regprocedure,
+          'otlet.access_policy_role_status_rows()'::regprocedure,
+          'otlet.register_access_policy_capability(regrole,text,text,text)'::regprocedure,
+          'otlet.reconcile_access_policy_role(regrole,text,text)'::regprocedure,
+          'otlet.revoke_access_policy_capability(regrole,text,text,text)'::regprocedure
         )
         AND p.proname NOT IN (
           'portable_start_worker',
@@ -798,16 +807,16 @@ CROSS JOIN definer_status;
 SQL
 )"
 echo "permission_catalog_contract=$permission_catalog_contract"
-[ "$permission_catalog_contract" = "false|0|0|0|30|29|30|32|3|11|0|0|0|0|0|0|41|41|0|3|3|3|3|3|3|8|8|8|8|8|8|true" ] || {
+[ "$permission_catalog_contract" = "false|0|0|0|32|31|32|34|3|11|0|0|0|0|0|0|45|45|0|3|3|3|3|3|3|8|8|8|8|8|8|true" ] || {
   echo "Expected exact public, auditor, operator, reviewer, and owner ACLs, got $permission_catalog_contract" >&2
   exit 1
 }
 
 source "$demo_dir/review_provenance.sh"
 
-permission_contract="public=0/0/0|auditor=30/29|operator=30/32|reviewer=3/11|definer=41/41|application=3/3/3|operator_rpc=3/3/3|reviewer_rpc=8/8/8|portable=8/8/8|positive=7|denied=$permission_denied_count"
+permission_contract="public=0/0/0|auditor=32/31|operator=32/34|reviewer=3/11|definer=45/45|application=3/3/3|operator_rpc=3/3/3|reviewer_rpc=8/8/8|portable=8/8/8|positive=7|denied=$permission_denied_count"
 echo "permission_contract=$permission_contract"
-[ "$permission_contract" = "public=0/0/0|auditor=30/29|operator=30/32|reviewer=3/11|definer=41/41|application=3/3/3|operator_rpc=3/3/3|reviewer_rpc=8/8/8|portable=8/8/8|positive=7|denied=112" ] || {
+[ "$permission_contract" = "public=0/0/0|auditor=32/31|operator=32/34|reviewer=3/11|definer=45/45|application=3/3/3|operator_rpc=3/3/3|reviewer_rpc=8/8/8|portable=8/8/8|positive=7|denied=112" ] || {
   echo "Expected complete permission contract, got $permission_contract" >&2
   exit 1
 }

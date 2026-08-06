@@ -118,7 +118,7 @@ FROM otlet.audit_administrative_change_export
 ORDER BY event_id DESC;
 ```
 
-Otlet records changes from migration installation forward and leaves earlier history absent. Raw owner `GRANT` and `REVOKE` statements are outside the grant-helper ledger until the planned access-policy lifecycle. The database or extension owner can disable or replace database guards; the planned signed-checkpoint work covers that stronger boundary. Repository demo connections and disposable SQL-only databases supply a generic proof reason. Production sessions should supply a specific transaction-local context
+Otlet records changes from migration installation forward and leaves earlier history absent. Registered access policies record lifecycle changes and report raw owner `GRANT` or `REVOKE` statements as manifest drift. The database or extension owner can disable or replace database guards; the planned signed-checkpoint work covers that stronger boundary. Repository demo connections and disposable SQL-only databases supply a generic proof reason. Production sessions should supply a specific reason or ticket
 
 Workload packs are owner-only administrative changes for an existing active watch. `prepare_workload_pack(...)` stores one immutable canonical candidate against the expected configured spec and active workload revision; `apply_workload_pack(...)` rechecks both and changes the task, watch, selection, and action-policy configuration in one transaction. A governed candidate must cite the current promotion decision so Otlet reuses the existing activation gate. `rollback_workload_pack(...)` restores only the exact predecessor of the latest application and records both pack and administrative lineage. Pack status reports configured drift and rollback readiness without creating work
 
@@ -517,30 +517,40 @@ SELECT count(*) FROM otlet.verify_invariants();
 
 Contract: `0` (demo prints `invariant_contract=0`). The suite fails closed on expired or NULL leases for `running` and `cancel_requested` jobs, complete receipts without schema pass, sensitive evidence that violates the active storage policy, materializations missing `source_hash`, and error runtime slots. `production_status` and `verify_invariants` name the receipt invariant `complete_receipts_are_schema_validated`; throughput views use `completed_jobs` and `last_batch_completed_jobs`. Step 6 of `docs/semantic-watches.md` anchors the planner vocabulary for `selected_path` / `Planner Selected Path` and `freshness_basis`
 
-Auditors and operators query redacted, read-only projections through `otlet.audit_receipt_export`, `otlet.audit_review_sample_export`, `otlet.audit_review_export`, `otlet.audit_review_event_export`, `otlet.audit_reviewer_calibration_export`, `otlet.audit_action_execution_export`, `otlet.audit_eval_label_export`, `otlet.audit_administrative_change_export`, `otlet.audit_decision_evidence_export`, `otlet.semantic_dependency_audit`, `otlet.operational_event_log`, `otlet.operational_observability_status`, `otlet.labeled_quality_status`, `otlet.worker_batch_timing_status`, `otlet.task_queue_status`, `otlet.task_resource_status`, and `otlet.failure_retry_status`. Redaction policy version 7 adds the observability and quality exports and names worker-event message and detail as withheld. `otlet.failure_retry_status` exposes whether raw error detail exists without exposing the detail
+Auditors and operators query redacted, read-only projections through `otlet.audit_receipt_export`, `otlet.audit_review_sample_export`, `otlet.audit_review_export`, `otlet.audit_review_event_export`, `otlet.audit_reviewer_calibration_export`, `otlet.audit_action_execution_export`, `otlet.audit_eval_label_export`, `otlet.audit_administrative_change_export`, `otlet.audit_decision_evidence_export`, `otlet.semantic_dependency_audit`, `otlet.operational_event_log`, `otlet.operational_observability_status`, `otlet.labeled_quality_status`, `otlet.worker_batch_timing_status`, `otlet.task_queue_status`, `otlet.task_resource_status`, `otlet.access_policy_role_status`, and `otlet.failure_retry_status`. Redaction policy version 8 adds the observability, quality, and registered access-policy exports and names worker-event message and detail as withheld. `otlet.failure_retry_status` exposes whether raw error detail exists without exposing the detail
 
-## Step 4 - Grant Role-Scoped Access
+## Step 4 - Register Role-Scoped Access
 
-Otlet revokes schema, table, sequence, and function access from `PUBLIC`. The extension owner keeps raw and administrative access. Applications create their own login or group roles, then the extension owner grants one of four bounded capabilities
+Otlet revokes schema, table, sequence, and function access from `PUBLIC`. The extension owner keeps raw and administrative access. Register dedicated roles with one or more of five bounded capabilities. The owner alone bootstraps the sixth capability, access-policy administrator
 
-Create roles through your normal provisioning path. These `NOLOGIN` roles show the grant contract:
+Create roles through your normal provisioning path. A registered target must not be privileged, own Otlet objects, or inherit or `SET ROLE` to another role. Login roles may inherit a registered `NOLOGIN` role
 
 ```sql
-BEGIN;
-SELECT otlet.set_administrative_change_context(
-  'Grant the application and review capabilities',
-  'ACCESS-42'
-);
 CREATE ROLE app_otlet_auditor NOLOGIN;
 CREATE ROLE app_otlet_operator NOLOGIN;
 CREATE ROLE app_otlet_reviewer NOLOGIN;
 CREATE ROLE app_otlet_application NOLOGIN;
+CREATE ROLE app_otlet_worker NOLOGIN;
+CREATE ROLE app_otlet_access_admin NOLOGIN;
 
-SELECT otlet.grant_auditor_access('app_otlet_auditor'::regrole);
-SELECT otlet.grant_operator_access('app_otlet_operator'::regrole);
-SELECT otlet.grant_reviewer_access('app_otlet_reviewer'::regrole);
-SELECT otlet.grant_application_access('app_otlet_application'::regrole);
-COMMIT;
+SELECT otlet.register_access_policy_capability(
+  'app_otlet_auditor'::regrole, 'auditor', 'Register auditor', 'ACCESS-42'
+);
+SELECT otlet.register_access_policy_capability(
+  'app_otlet_operator'::regrole, 'operator', 'Register operator', 'ACCESS-42'
+);
+SELECT otlet.register_access_policy_capability(
+  'app_otlet_reviewer'::regrole, 'reviewer', 'Register reviewer', 'ACCESS-42'
+);
+SELECT otlet.register_access_policy_capability(
+  'app_otlet_application'::regrole, 'application', 'Register application', 'ACCESS-42'
+);
+SELECT otlet.register_access_policy_capability(
+  'app_otlet_worker'::regrole, 'portable_worker', 'Register worker', 'ACCESS-42'
+);
+SELECT otlet.register_access_policy_capability(
+  'app_otlet_access_admin'::regrole, 'administrator', 'Register access administrator', 'ACCESS-42'
+);
 ```
 
 The application capability grants three functions: `application_submit_task_subject(...)`, `application_job_status(...)`, and `application_cancel_job(...)`. Login roles may inherit one shared capability role, but job ownership remains the authenticated `session_user`; PostgreSQL records the active `SET ROLE` value as invocation provenance and leaves ownership unchanged. The grant can invoke every active task in the database, so grant it to logins allowed to use that full task set. The capability grants no direct source or Otlet table access, task, model, or watch administration, review or apply authority, worker RPCs, receipt, trace, or cleanup views, retry authority, or further grant authority
@@ -549,6 +559,7 @@ The auditor capability grants read-only access to these redacted policy and audi
 
 - `otlet.redaction_policy_status`
 - `otlet.access_policy_status`
+- `otlet.access_policy_role_status`
 - `otlet.audit_receipt_export`
 - `otlet.audit_review_sample_export`
 - `otlet.audit_review_export`
@@ -572,13 +583,14 @@ The auditor capability grants read-only access to these redacted policy and audi
 - `otlet.portable_receipt_status`
 - `otlet.task_queue_status`
 - `otlet.task_resource_status`
+- `otlet.production_policy_status`
 - `otlet.native_cancellation_slo_status`
 - `otlet.route_readiness_status`
 - `otlet.stranded_escalation_status`
 - `otlet.failure_taxonomy`
 - `otlet.failure_retry_status`
 
-The grant also includes the pure JSON hashing helpers required by `audit_review_export`, the native capability reader used by `runtime_capability_status`, the task-scoped entity-graph and semantic-correction readers, the route, stranded-escalation, operational-observability, and labeled-quality status readers, and the calibration-state reader. The operator capability includes auditor access plus these functions:
+The grant also includes the pure JSON hashing helpers required by `audit_review_export`, the redacted evaluation export, the native capability reader used by `runtime_capability_status`, the task-scoped entity-graph and semantic-correction readers, the route, stranded-escalation, operational-observability, and labeled-quality status readers, and the calibration-state reader. The operator capability includes auditor access plus these functions:
 
 - `otlet.dry_run_action`
 - `otlet.apply_action`
@@ -597,7 +609,33 @@ The reviewer capability grants `SELECT` only on `otlet.reviewer_review_queue`, `
 
 The reviewer grant also includes three fixed-path queue and state helpers. `reviewer_correct_action(...)` accepts only a declared response action type or `none`, then returns the new label and immutable review-event IDs needed for semantic-correction approval without exposing either raw table. The three operator RPCs, eight reviewer RPCs, and reviewer helpers run as the extension owner with `search_path` fixed to `pg_catalog, otlet, pg_temp`. The retry RPC preserves the original application's job owner while recording the operator login and active role. Review RPCs require a current calibration for the authenticated login, even under `SET ROLE`. Operators and reviewers receive no direct table writes. `label_action(...)` and the unbounded `correct_action(...)` stay owner-only. The owner alone registers targets and workflow policies, disables them, and imports or exports watches. Watch exports contain instructions, policies, schemas, source identifiers, and owner-authored candidate SQL, so delegated roles cannot read or import them
 
-The SQL-only install exposes the same operator and reviewer grants through PostgreSQL. The portable worker permission sweep leaves all other Otlet functions and tables closed unless the owner grants them
+The SQL-only install exposes the same application, auditor, operator, reviewer, portable-worker, and administrator policies through PostgreSQL. An administrator can read `otlet.access_policy_role_status` and call `register_access_policy_capability(...)`, `reconcile_access_policy_role(...)`, and `revoke_access_policy_capability(...)` for non-administrator roles. It cannot read `otlet.access_policy_roles`, call the underlying grant helpers, manage administrator access, or use any task, model, watch, review, action, worker, or maintenance authority unless the owner separately gives it another database role
+
+One role may hold several non-administrator capabilities. Revocation preserves the others:
+
+```sql
+SELECT otlet.revoke_access_policy_capability(
+  'app_otlet_operator'::regrole,
+  'application',
+  'Remove application submission from the operator role',
+  'ACCESS-43'
+);
+```
+
+After an upgrade, explicitly register any pre-lifecycle role, then reconcile registered roles. Pre-lifecycle roles remain unmanaged and unchanged until adoption. Reconciliation removes unexpected or obsolete direct Otlet grants and adds the current canonical grants without touching privileges outside the `otlet` schema
+
+```sql
+SELECT otlet.reconcile_access_policy_role(
+  'app_otlet_operator'::regrole,
+  'Reconcile access after upgrade',
+  'ACCESS-44'
+);
+
+SELECT registered_role_name, capabilities, reconciliation_status,
+       missing_privilege_count, unexpected_privilege_count
+FROM otlet.access_policy_role_status
+ORDER BY registered_role_name;
+```
 
 Approval, rejection, correction, deferral, abstention, and semantic-correction approval append immutable rows to `otlet.review_events`. Otlet derives `reviewer_identity` from `session_user` and `reviewer_role` from the active `SET ROLE` state; none of the review functions accepts either value from the caller. Each event snapshots its reason, timestamp, source freshness, reviewer rubric and calibration hashes, and links to the job, action or output, receipt, model artifact, prompt, schema, runtime, and output identities
 
@@ -614,20 +652,22 @@ ORDER BY review_event_id;
 
 An action target must be an ordinary non-partitioned table without RLS, use one primary-key column, and list each writable non-key column. A row-watch task must also allow `update_row` and bind that action to the target with `otlet.register_action_workflow_policy(...)`. The policy starts recommendation-only and unevaluated unless the owner marks it `bounded_mutation` and `evaluated`. Otlet snapshots the task, target, source namespace, and authority hashes, then revalidates them during dry run and apply
 
-Raw targets, execution receipts, outputs, source evidence, trace summaries, token traces, worker functions, model registration, watch administration, cleanup, and the grant helpers stay owner-only. Auditors see execution mode, status, hashes, changed-column names, affected-row count, and replay linkage through `otlet.audit_action_execution_export`. They do not see target row values
+Raw targets, execution receipts, outputs, source evidence, trace summaries, token traces, worker functions, model registration, watch administration, cleanup, the registry table, and the underlying grant helpers stay owner-only. Auditors see execution mode, status, hashes, changed-column names, affected-row count, replay linkage, and registered policy drift through redacted views. They do not see target row values
 
 Check the installed policy:
 
 ```sql
 SELECT * FROM otlet.access_policy_status;
 SELECT * FROM otlet.application_access_policy_status;
+SELECT * FROM otlet.access_policy_role_status;
 ```
 
-The demo proves the catalog ACLs, 30 auditor relations and 29 function grants, 30 operator relations and 32 function grants, three reviewer relations and 11 function grants, three operator RPCs, eight reviewer RPCs, 41 exact security-definer functions, three application RPCs, eight portable RPCs, seven positive delegated paths, and 112 denied paths. The calibrated reviewer proves all five review outcomes:
+The demo proves the catalog ACLs, 32 auditor relations and 31 function grants, 32 operator relations and 34 function grants, three reviewer relations and 11 function grants, three operator RPCs, eight reviewer RPCs, 45 exact security-definer functions, three application RPCs, eight portable RPCs, seven positive delegated paths, and 112 denied paths. The focused lifecycle proof adds all six registered capabilities, delegated status reads, multi-capability revocation, ACL and manifest repair, identity and membership closure, narrow administrator authority, `PUBLIC` closure, and zero invariants. The calibrated reviewer proves all five review outcomes:
 
 ```text
 review_provenance_contract=true|true|true|true|true|true|true|true|true|true|true
-permission_contract=public=0/0/0|auditor=30/29|operator=30/32|reviewer=3/11|definer=41/41|application=3/3/3|operator_rpc=3/3/3|reviewer_rpc=8/8/8|portable=8/8/8|positive=7|denied=112
+permission_contract=public=0/0/0|auditor=32/31|operator=32/34|reviewer=3/11|definer=45/45|application=3/3/3|operator_rpc=3/3/3|reviewer_rpc=8/8/8|portable=8/8/8|positive=7|denied=112
+access_policy_contract=roles=6/6|revoke=auditor_preserved|drift=1/2_to_0/0|manifest=closed|membership=closed|rename=closed|admin=narrow|public=closed|invariants=0
 ```
 
 Your application still owns these deployment boundaries:
