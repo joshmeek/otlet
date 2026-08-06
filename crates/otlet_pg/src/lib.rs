@@ -430,6 +430,11 @@ pgrx::extension_sql_file!(
     name = "bounded_maintenance_execution",
     requires = ["route_readiness_stranded_escalation"]
 );
+pgrx::extension_sql_file!(
+    "../sql/migrations/0085_versioned_observability_quality_status.sql",
+    name = "versioned_observability_quality_status",
+    requires = ["bounded_maintenance_execution"]
+);
 
 #[allow(non_snake_case)]
 #[pgrx::pg_guard]

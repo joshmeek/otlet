@@ -49,6 +49,7 @@ pub extern "C-unwind" fn otlet_worker_main(_arg: pgrx::pg_sys::Datum) {
         .checked_sub(SCHEMA_READY_PROBE_INTERVAL)
         .unwrap_or_else(Instant::now);
     let mut schema_probe_due = true;
+    let mut worker_identity_set = false;
     let mut startup_recorded = false;
     let mut startup_probe_due = true;
     let mut last_startup_probe = Instant::now()
@@ -73,6 +74,17 @@ pub extern "C-unwind" fn otlet_worker_main(_arg: pgrx::pg_sys::Datum) {
                 continue;
             }
             schema_probe_due = false;
+        }
+
+        if !worker_identity_set {
+            match BackgroundWorker::transaction(configure_worker_identity) {
+                Ok(()) => worker_identity_set = true,
+                Err(err) => {
+                    pgrx::warning!("otlet worker identity setup failed: {err}");
+                    schema_probe_due = true;
+                    continue;
+                }
+            }
         }
 
         if !startup_recorded
@@ -266,6 +278,26 @@ fn configure_database_deadlines() -> pgrx::spi::Result<()> {
                 transaction_timeout.as_str().into(),
                 lock_timeout.as_str().into(),
             ],
+        )?;
+        Ok(())
+    })
+}
+
+fn configure_worker_identity() -> pgrx::spi::Result<()> {
+    pgrx::Spi::connect_mut(|client| {
+        client.update(
+            "SELECT pg_catalog.set_config(\
+               'otlet.worker_identity_hash', \
+               otlet.identity_hash(\
+                 'native_worker_process', \
+                 jsonb_build_object(\
+                   'database', current_database(), \
+                   'postmaster_started_at', pg_postmaster_start_time(), \
+                   'backend_pid', pg_backend_pid(), \
+                   'registered_at', clock_timestamp())), \
+               false)",
+            Some(1),
+            &[],
         )?;
         Ok(())
     })

@@ -335,6 +335,14 @@ SET max_input_bytes_per_job = 1024,
     max_queued_input_bytes_per_model = 4096,
     max_queued_input_bytes_total = 4096
 WHERE name = 'default';
+
+SELECT otlet.record_worker_event(
+  'portable_upgrade_legacy_event',
+  NULL,
+  'legacy-runtime',
+  'legacy-event-message-canary',
+  '{"secret":"legacy-event-detail-canary"}'::jsonb
+);
 SQL
 
 install_portable
@@ -877,10 +885,15 @@ BEGIN
 END
 $function$;
 
+SET ROLE :"operator_role";
+SELECT count(*) FROM otlet.operational_observability_status \g /dev/null
+SELECT count(*) FROM otlet.labeled_quality_status \g /dev/null
+RESET ROLE;
+
 SELECT concat_ws('|',
   max(version),
   count(*),
-  array_agg(version ORDER BY version) = ARRAY(SELECT generate_series(1, 84)),
+  array_agg(version ORDER BY version) = ARRAY(SELECT generate_series(1, 85)),
   bool_and(file ~ ('(^|/)' || lpad(version::text, 4, '0') || '_')),
   (SELECT value FROM public.portable_upgrade_sentinel),
   (
@@ -1424,12 +1437,135 @@ SELECT concat_ws('|',
         'EXECUTE'
       )
     )
+  ),
+  (
+    pg_catalog.to_regclass('otlet.operational_observability_status') IS NOT NULL
+    AND pg_catalog.to_regclass('otlet.labeled_quality_status') IS NOT NULL
+    AND EXISTS (
+      SELECT 1
+      FROM otlet.operational_observability_status
+      WHERE observability_schema = 'otlet.observability.status.v1'
+    )
+    AND NOT EXISTS (
+      SELECT 1
+      FROM otlet.operational_event_log
+      WHERE event_schema <> 'otlet.observability.event.v1'
+         OR event_version <> 1
+    )
+    AND EXISTS (
+      SELECT 1
+      FROM otlet.operational_event_log event
+      JOIN otlet.worker_events stored ON stored.id = event.event_id
+      WHERE stored.event_type = 'portable_upgrade_legacy_event'
+        AND stored.claim_attempt_index IS NULL
+        AND stored.claim_identity_hash IS NULL
+        AND stored.worker_identity_hash IS NULL
+        AND event.event_type = 'other'
+        AND event.runtime_name = 'other'
+        AND event.event_schema = 'otlet.observability.event.v1'
+        AND event.event_version = 1
+        AND event.claim_attempt_index IS NULL
+        AND event.claim_identity_hash IS NULL
+        AND event.worker_identity_hash IS NULL
+        AND event.evidence_redacted
+        AND to_jsonb(event)::text NOT LIKE '%legacy-event%canary%'
+    )
+    AND NOT EXISTS (
+      SELECT 1
+      FROM otlet.operational_observability_status
+      WHERE observability_schema <> 'otlet.observability.status.v1'
+    )
+    AND NOT EXISTS (
+      SELECT 1
+      FROM otlet.labeled_quality_status
+      WHERE quality_schema <> 'otlet.labeled_quality.status.v1'
+    )
+    AND (
+      SELECT count(*) = 3
+      FROM pg_catalog.pg_attribute attribute
+      WHERE attribute.attrelid = 'otlet.worker_events'::regclass
+        AND attribute.attname IN (
+          'claim_attempt_index',
+          'claim_identity_hash',
+          'worker_identity_hash'
+        )
+        AND NOT attribute.attisdropped
+    )
+    AND EXISTS (
+      SELECT 1
+      FROM pg_catalog.pg_trigger trigger
+      WHERE trigger.tgrelid = 'otlet.worker_events'::regclass
+        AND trigger.tgname = 'worker_events_identities'
+        AND trigger.tgenabled <> 'D'
+    )
+    AND EXISTS (
+      SELECT 1
+      FROM otlet.redaction_policy_status
+      WHERE policy_version = 7
+        AND withheld_fields @> ARRAY[
+          'worker_event_message',
+          'worker_event_detail'
+        ]::text[]
+        AND export_views @> ARRAY[
+          'otlet.operational_observability_status',
+          'otlet.labeled_quality_status'
+        ]::text[]
+    )
+    AND pg_catalog.has_table_privilege(
+      :'operator_role', 'otlet.operational_observability_status', 'SELECT'
+    )
+    AND pg_catalog.has_table_privilege(
+      :'operator_role', 'otlet.labeled_quality_status', 'SELECT'
+    )
+    AND pg_catalog.has_function_privilege(
+      :'operator_role',
+      'otlet.operational_observability_status_rows()',
+      'EXECUTE'
+    )
+    AND pg_catalog.has_function_privilege(
+      :'operator_role', 'otlet.labeled_quality_status_rows()', 'EXECUTE'
+    )
+    AND NOT EXISTS (
+      SELECT 1
+      FROM unnest(ARRAY[
+        'otlet.operational_event_log',
+        'otlet.operational_observability_status',
+        'otlet.operational_observability_status_internal',
+        'otlet.labeled_quality_status',
+        'otlet.labeled_quality_status_internal'
+      ]) relation(name)
+      CROSS JOIN unnest(ARRAY[
+        :'partial_auditor_role',
+        'public'
+      ]) principal(name)
+      WHERE pg_catalog.has_table_privilege(
+        principal.name,
+        relation.name,
+        'SELECT'
+      )
+    )
+    AND NOT EXISTS (
+      SELECT 1
+      FROM unnest(ARRAY[
+        'otlet.operational_observability_status_rows()',
+        'otlet.labeled_quality_status_rows()'
+      ]) api(signature)
+      CROSS JOIN unnest(ARRAY[
+        :'partial_auditor_role',
+        'public'
+      ]) principal(name)
+      WHERE pg_catalog.has_function_privilege(
+        principal.name,
+        api.signature,
+        'EXECUTE'
+      )
+    )
   )
 )
 FROM otlet.portable_schema_migrations;
 SQL
 )"
-[ "$contract" = "84|84|t|t|preserved|t|4096|t|t|t|t|0|t|t|t|t|t|t|t|t|t|t|t|t|t|t|t|t" ] || {
+[ "$contract" = "85|85|t|t|preserved|t|4096|t|t|t|t|0|t|t|t|t|t|t|t|t|t|t|t|t|t|t|t|t|t" ] || {
   echo "Portable repeat-install contract mismatch: $contract" >&2
   exit 1
 }
@@ -3437,7 +3573,7 @@ SELECT concat_ws('|',
       ) = failure_reason_code
     )
     FROM otlet.failure_taxonomy),
-  (SELECT policy_version = 6
+  (SELECT policy_version = 7
           AND withheld_fields @> ARRAY['job_error', 'receipt_error']::text[]
           AND export_views @> ARRAY['otlet.failure_retry_status']::text[]
    FROM otlet.redaction_policy_status),
@@ -4195,7 +4331,7 @@ SELECT concat_ws('|',
     ) IS NOT NULL,
   to_regclass('otlet.audit_decision_evidence_export') IS NOT NULL
     AND (
-      SELECT policy_version = 6
+      SELECT policy_version = 7
         AND export_views @>
           ARRAY['otlet.audit_decision_evidence_export']::text[]
       FROM otlet.redaction_policy_status
@@ -4265,7 +4401,7 @@ SELECT concat_ws('|',
       'otlet.label_review_sample(bigint,text,text,text,text,text)'
     ) IS NOT NULL,
   (
-    SELECT policy_version = 6
+    SELECT policy_version = 7
       AND export_views @> ARRAY['otlet.audit_review_sample_export']::text[]
     FROM otlet.redaction_policy_status
   ),
@@ -4408,7 +4544,7 @@ SELECT concat_ws('|',
       )
   ),
   (
-    SELECT policy_version = 6
+    SELECT policy_version = 7
       AND export_views @>
         ARRAY['otlet.audit_reviewer_calibration_export']::text[]
     FROM otlet.redaction_policy_status

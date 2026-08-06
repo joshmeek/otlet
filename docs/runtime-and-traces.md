@@ -66,6 +66,74 @@ ORDER BY escalated_at, job_id;
 
 `escalated_at` comes from the latest cheap receipt and falls back to job creation only for an invalid handoff with no cheap receipt. Active heads and every revision with queued work remain visible, including paused direct work and non-head evaluation jobs. Non-head evaluation work can be ready while non-head production work reports `workload_revision_inactive`. The grant helpers expose both views to auditors and operators while `PUBLIC` remains closed
 
+## Inspect Versioned Operational Status
+
+`otlet.operational_observability_status` gives auditors and operators one tall status surface. Durable queue, run, failure, and schema evidence uses closed 15-minute, 1-hour, and 24-hour windows. Mutable backlog, route, heartbeat, liveness, cleanup, and pressure rows use `window_name = 'current'`
+
+```sql
+SELECT window_name,
+       metric_name,
+       task_name,
+       workload_revision_hash,
+       worker_identity_hash,
+       category,
+       sample_count,
+       denominator,
+       value_numeric,
+       p50,
+       p95,
+       p99,
+       maximum,
+       unit,
+       status
+FROM otlet.operational_observability_status
+ORDER BY metric_name, window_name, task_name, category;
+```
+
+Failure categories are `<scope>:<reason_code>`, so a failed job and its failed receipt remain two named evidence rows instead of one implied incident. Timing, failure, and schema-rejection windows include production attempts only; labeled evaluation evidence stays in the quality view. Pressure categories name the measured limit: task queued bytes, task queue age, task active claims, model queued bytes, model queued jobs, or total queued bytes. A pressured row compares its displayed value with its displayed maximum
+
+`otlet.operational_event_log` exposes `otlet.observability.event.v1`. Unknown event types and runtime names become `other`; portable runtime names become `portable`; raw message and detail values stay withheld. New job events retain their claim attempt and hash, matching portable claim, receipt, action, revision, route, and worker-process identities when those identities exist. Native startup success and failure share the process hash, and a model-swap event requires the live claim that produced it. Client-supplied claim or worker fields are ignored. Batch events retain only registered task names from the bounded task list
+
+```sql
+SELECT event_id,
+       created_at,
+       event_type,
+       event_class,
+       severity,
+       runtime_name,
+       task_names,
+       job_id,
+       workload_revision_hash,
+       claim_attempt_index,
+       claim_identity_hash,
+       portable_claim_id,
+       receipt_ids,
+       worker_identity_hash,
+       action_ids,
+       selection_role
+FROM otlet.operational_event_log
+ORDER BY event_id DESC
+LIMIT 50;
+```
+
+Labeled quality stays out of the operational view. `otlet.labeled_quality_status` exposes the seven non-authoritative entity-resolution metrics with their exact numerator, denominator, evidence state, observation bounds, and lag from the observation end to the latest source report
+
+```sql
+SELECT metric,
+       eligible_count,
+       numerator,
+       denominator,
+       rate,
+       evidence_kind,
+       evidence_ready,
+       observation_started_at,
+       observation_ended_at,
+       observed_at,
+       observation_lag_ms
+FROM otlet.labeled_quality_status
+ORDER BY contract_hash, metric;
+```
+
 ## Step 1 - Inspect Model Selection Attempts
 
 ```sql

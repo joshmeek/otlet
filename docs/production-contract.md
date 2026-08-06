@@ -315,7 +315,7 @@ Otlet debounces suppressed queue-admission events per task and reason for one mi
 
 The resident worker attaches to `OTLET_DATABASE`, which defaults to `postgres`. One PostgreSQL cluster runs Otlet against one database because cross-database worker registration requires separate shared-memory and latch routing. Setup refuses an Otlet installation in a second database and checks the target database, extension files, model files, schema access, runtime role, and memory budget before enabling the worker
 
-Before claiming jobs, the worker validates `default_runtime_options`. It records `worker_started` with the database, role, and memory budget on success. Invalid policy records `worker_startup_failed`, leaves queued jobs untouched, and retries the preflight at a bounded interval
+After schema readiness, the worker fixes one process identity before validating `default_runtime_options`. Both `worker_started` and `worker_startup_failed` carry that identity. Invalid policy leaves queued jobs untouched and retries the preflight at a bounded interval
 
 Native llama.cpp faults bypass Rust's error boundary. Otlet contains them through Postgres worker restart and lease recovery. Otlet trusts no partial model output, and `otlet.sweep_expired_jobs()` fails expired running jobs that reached the attempt limit with a receipt. The demo scans container logs and prints `docker_crash_log_scan=ok` when the run contains no worker crash, panic, assertion, or terminated server process
 
@@ -470,7 +470,7 @@ SELECT otlet.create_task(
 COMMIT;
 ```
 
-`otlet.operational_event_log` exposes event type, task and model identity, status, reason, counts, timing, byte limits, and redaction state without the raw event message or detail document. Auditor exports add structured and action redaction state without exposing job input, source rows, raw model text, or full traces
+`otlet.operational_event_log` exposes versioned event class, severity, safe task and model identity, status, reason, counts, timing, byte limits, and stable job, claim-attempt, receipt, revision, worker-process, action, and route correlations when they exist. Unknown events and runtimes map to bounded values, while raw event message and detail stay withheld. `otlet.operational_observability_status` adds fixed operational windows and current gauges. `otlet.labeled_quality_status` keeps non-authoritative quality, exact denominators, observation bounds, and report lag separate. Auditor exports do not expose job input, source rows, raw model text, or full traces
 
 ### Step 3b - Performance Ratios
 
@@ -517,7 +517,7 @@ SELECT count(*) FROM otlet.verify_invariants();
 
 Contract: `0` (demo prints `invariant_contract=0`). The suite fails closed on expired or NULL leases for `running` and `cancel_requested` jobs, complete receipts without schema pass, sensitive evidence that violates the active storage policy, materializations missing `source_hash`, and error runtime slots. `production_status` and `verify_invariants` name the receipt invariant `complete_receipts_are_schema_validated`; throughput views use `completed_jobs` and `last_batch_completed_jobs`. Step 6 of `docs/semantic-watches.md` anchors the planner vocabulary for `selected_path` / `Planner Selected Path` and `freshness_basis`
 
-Auditors and operators query redacted, read-only projections through `otlet.audit_receipt_export`, `otlet.audit_review_sample_export`, `otlet.audit_review_export`, `otlet.audit_review_event_export`, `otlet.audit_reviewer_calibration_export`, `otlet.audit_action_execution_export`, `otlet.audit_eval_label_export`, `otlet.audit_administrative_change_export`, `otlet.audit_decision_evidence_export`, `otlet.semantic_dependency_audit`, `otlet.operational_event_log`, `otlet.worker_batch_timing_status`, `otlet.task_queue_status`, `otlet.task_resource_status`, and `otlet.failure_retry_status`. `otlet.redaction_policy_status` lists withheld evidence for the audit exports. `otlet.failure_retry_status` exposes whether raw error detail exists without exposing the detail
+Auditors and operators query redacted, read-only projections through `otlet.audit_receipt_export`, `otlet.audit_review_sample_export`, `otlet.audit_review_export`, `otlet.audit_review_event_export`, `otlet.audit_reviewer_calibration_export`, `otlet.audit_action_execution_export`, `otlet.audit_eval_label_export`, `otlet.audit_administrative_change_export`, `otlet.audit_decision_evidence_export`, `otlet.semantic_dependency_audit`, `otlet.operational_event_log`, `otlet.operational_observability_status`, `otlet.labeled_quality_status`, `otlet.worker_batch_timing_status`, `otlet.task_queue_status`, `otlet.task_resource_status`, and `otlet.failure_retry_status`. Redaction policy version 7 adds the observability and quality exports and names worker-event message and detail as withheld. `otlet.failure_retry_status` exposes whether raw error detail exists without exposing the detail
 
 ## Step 4 - Grant Role-Scoped Access
 
@@ -562,6 +562,8 @@ The auditor capability grants read-only access to these redacted policy and audi
 - `otlet.action_workflow_policy_status`
 - `otlet.semantic_dependency_audit`
 - `otlet.operational_event_log`
+- `otlet.operational_observability_status`
+- `otlet.labeled_quality_status`
 - `otlet.worker_batch_timing_status`
 - `otlet.runtime_capability_status`
 - `otlet.portable_protocol_status`
@@ -570,10 +572,13 @@ The auditor capability grants read-only access to these redacted policy and audi
 - `otlet.portable_receipt_status`
 - `otlet.task_queue_status`
 - `otlet.task_resource_status`
+- `otlet.native_cancellation_slo_status`
+- `otlet.route_readiness_status`
+- `otlet.stranded_escalation_status`
 - `otlet.failure_taxonomy`
 - `otlet.failure_retry_status`
 
-The grant also includes the pure JSON hashing helpers required by `audit_review_export`, the native capability reader used by `runtime_capability_status`, the task-scoped entity-graph and semantic-correction status readers, and the calibration-state reader. The operator capability includes auditor access plus these functions:
+The grant also includes the pure JSON hashing helpers required by `audit_review_export`, the native capability reader used by `runtime_capability_status`, the task-scoped entity-graph and semantic-correction readers, the route, stranded-escalation, operational-observability, and labeled-quality status readers, and the calibration-state reader. The operator capability includes auditor access plus these functions:
 
 - `otlet.dry_run_action`
 - `otlet.apply_action`
@@ -618,11 +623,11 @@ SELECT * FROM otlet.access_policy_status;
 SELECT * FROM otlet.application_access_policy_status;
 ```
 
-The demo proves the catalog ACLs, 25 auditor relations and 25 function grants, 25 operator relations and 28 function grants, three reviewer relations and 11 function grants, three operator RPCs, eight reviewer RPCs, 37 exact security-definer functions, three application RPCs, eight portable RPCs, seven positive delegated paths, and 112 denied paths. The calibrated reviewer proves all five review outcomes:
+The demo proves the catalog ACLs, 30 auditor relations and 29 function grants, 30 operator relations and 32 function grants, three reviewer relations and 11 function grants, three operator RPCs, eight reviewer RPCs, 41 exact security-definer functions, three application RPCs, eight portable RPCs, seven positive delegated paths, and 112 denied paths. The calibrated reviewer proves all five review outcomes:
 
 ```text
 review_provenance_contract=true|true|true|true|true|true|true|true|true|true|true
-permission_contract=public=0/0/0|auditor=25/25|operator=25/28|reviewer=3/11|definer=37/37|application=3/3/3|operator_rpc=3/3/3|reviewer_rpc=8/8/8|portable=8/8/8|positive=7|denied=112
+permission_contract=public=0/0/0|auditor=30/29|operator=30/32|reviewer=3/11|definer=41/41|application=3/3/3|operator_rpc=3/3/3|reviewer_rpc=8/8/8|portable=8/8/8|positive=7|denied=112
 ```
 
 Your application still owns these deployment boundaries:

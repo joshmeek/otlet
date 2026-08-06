@@ -810,6 +810,57 @@ BEGIN
 END
 $body$;
 
+DO $body$
+DECLARE
+  contract text := (
+    SELECT contract_hash FROM entity_resolution_quality_proof
+  );
+BEGIN
+  IF (
+    SELECT count(*)
+    FROM otlet.labeled_quality_status labeled
+    JOIN otlet.entity_resolution_quality_status quality
+      ON quality.contract_hash = labeled.contract_hash
+     AND quality.metric = labeled.metric
+     AND quality.numerator = labeled.numerator
+     AND quality.denominator = labeled.denominator
+     AND quality.rate IS NOT DISTINCT FROM labeled.rate
+    JOIN otlet.candidate_set_coverage_reports coverage
+      ON coverage.report_hash = quality.candidate_coverage_report_hash
+    JOIN otlet.evaluation_slice_reports evaluation
+      ON evaluation.report_hash = quality.evaluation_report_hash
+    JOIN otlet.review_economics_reports economics
+      ON economics.report_hash = quality.review_economics_report_hash
+    WHERE labeled.contract_hash = contract
+      AND labeled.quality_schema = 'otlet.labeled_quality.status.v1'
+      AND labeled.observed_at = GREATEST(
+        coverage.created_at,
+        evaluation.created_at,
+        economics.created_at
+      )
+      AND labeled.observation_lag_ms = GREATEST(
+        ceil(extract(epoch FROM (
+          GREATEST(
+            coverage.created_at,
+            evaluation.created_at,
+            economics.created_at
+          ) - (quality.observation_window ->> 'ends_at')::timestamptz
+        )) * 1000)::bigint,
+        0
+      )
+  ) <> 7
+     OR pg_catalog.has_table_privilege(
+       'public',
+       'otlet.labeled_quality_status',
+       'SELECT'
+     ) THEN
+    RAISE EXCEPTION 'otlet labeled quality status contract is invalid';
+  END IF;
+END
+$body$;
+
+SELECT 'labeled_quality_status_contract=7|denominators|lag|public_closed';
+
 SELECT 'entity_resolution_quality_contract=' || count(*)::text || '|true'
 FROM otlet.entity_resolution_quality_status status
 WHERE status.contract_hash = (

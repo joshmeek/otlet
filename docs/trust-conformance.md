@@ -74,6 +74,15 @@ revision_claim_serialization_contract=true|true
 bounded_maintenance_contract=budgets|cleanup|progress|partial_retry|pause_resume_cancel|wal|time|archive_retry|reconciliation_due_backoff_exhausted_seeded|repair|vacuum|cascade_vacuum|public_closed|invariants_clean|skip_locked
 ```
 
+`./scripts/demo/versioned_observability_quality_status.sh` proves closed 15-minute, 1-hour, and 24-hour windows, future-row and evaluation exclusion, scoped failure occurrences, schema-rejection denominators, current backlog ages, route and heartbeat transitions, cleanup lag, dimension-matched pressure, and retry-stable event correlation. It checks registered batch task sets, unknown event and runtime redaction, ignored caller-supplied identities, native startup success and failure identities, stale model-swap claim fencing, one portable worker hash, executable auditor access, partial and `PUBLIC` closure, redaction policy version 7 with event message and detail withheld, and zero invariants. The SQL-only upgrade keeps one legacy event and proves its versioned redacted projection with null legacy correlation fields
+
+`./scripts/demo/entity_resolution_quality.sql` independently binds labeled-quality observation time and lag to the latest candidate-coverage, evaluation-slice, and review-economics source report
+
+```text
+versioned_observability_contract=windows|failures|backlogs|routes|heartbeats|cleanup|pressure|events|acl|invariants
+labeled_quality_status_contract=7|denominators|lag|public_closed
+```
+
 ```text
 task_watch_lifecycle_contract=pin_conflict|pause_fenced|live_claim_fenced|unfinished_fenced|draft_unpromoted|watch_reconfig_fenced|resume_pinned|retire_fenced|watch_backlog|backlog_retire_fenced|watch_resume|rename_retire_fenced|name_reuse_fenced|rename_drop_fenced|drop_pin_fenced|archive_retained|exact_drop|path_independent_cleanup|shared_trigger_preserved|shared_trigger_released|invariants_clean
 task_watch_lifecycle_race_contract=definition_write_fenced|action_policy_serialized|repair_serialized|retirement_serialized|backlog_preserved|resume_queued|queue_canceled|repaused|source_missing|status_closed|retired|exact_drop|archive_retained|registry_removed|index_removed|reconciliation_removed|invariants_clean

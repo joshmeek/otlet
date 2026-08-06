@@ -276,3 +276,6 @@ $$;
 
 \set portable_migration_file ../../../otlet_pg/sql/migrations/0084_bounded_maintenance_execution.sql
 \ir migrations/apply.sql
+
+\set portable_migration_file ../../../otlet_pg/sql/migrations/0085_versioned_observability_quality_status.sql
+\ir migrations/apply.sql

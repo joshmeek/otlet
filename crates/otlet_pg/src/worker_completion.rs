@@ -565,9 +565,25 @@ fn record_metrics(job: &Job, model_name: &str, metrics: &ModelMetrics) {
                     metrics.worker_process_rss_bytes.into(),
                     metrics.worker_memory_budget_bytes.into(),
                     JsonB(metrics.memory_trace.clone()).into(),
+                    job.claim_token.as_str().into(),
                 ];
                 client.update(
-                    "SELECT otlet.record_worker_event('model_swap', $1, $2, 'model residency changed', jsonb_build_object('task_name', $3, 'model_name', $4, 'artifact_path', $5, 'load_ms', $6, 'model_memory_bytes', $7, 'worker_process_rss_bytes', $8, 'worker_memory_budget_bytes', $9, 'memory', $10))",
+                    "WITH owned AS MATERIALIZED (\
+                       SELECT 1 FROM otlet.jobs \
+                       WHERE id = $1 AND claim_token = $11 \
+                         AND status IN ('running', 'cancel_requested') \
+                         AND leased_until >= now() \
+                       FOR UPDATE\
+                     ) \
+                     SELECT otlet.record_worker_event(\
+                       'model_swap', $1, $2, 'model residency changed', \
+                       jsonb_build_object(\
+                         'task_name', $3, 'model_name', $4, \
+                         'artifact_path', $5, 'load_ms', $6, \
+                         'model_memory_bytes', $7, \
+                         'worker_process_rss_bytes', $8, \
+                         'worker_memory_budget_bytes', $9, 'memory', $10)) \
+                     FROM owned",
                     Some(1),
                     &event_args,
                 )?;
