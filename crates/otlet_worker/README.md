@@ -26,15 +26,18 @@ Deterministic task synthesis inside `otlet.enqueue_ask` is runtime bookkeeping. 
 
 ## Register The Worker
 
-Create one dedicated login with `NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS`. Register the model first. Read the exact runtime identity from the binary, then grant and bind the worker:
+Create one dedicated login with `NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS`. Register the model first. Read the exact runtime identity from the binary, then register its capability and bind the worker:
 
 ```sh
 runtime_identity="$(otlet_worker --print-runtime-identity)"
 
 psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -v runtime_identity="$runtime_identity" <<'SQL'
 BEGIN;
-SELECT otlet.set_administrative_change_context('Grant and register the portable worker');
-SELECT otlet.grant_portable_worker_access('otlet_worker'::regrole);
+SELECT otlet.register_access_policy_capability(
+  'otlet_worker'::regrole,
+  'portable_worker',
+  'Register the portable worker'
+);
 SELECT otlet.register_portable_worker(
   'customer-vpc-worker',
   'otlet_worker'::regrole,
@@ -54,7 +57,7 @@ The worker role receives schema usage, one protocol compatibility view, and eigh
 
 ```sh
 export OTLET_DATABASE_URL='postgresql://otlet_worker@database.example:5432/app?sslmode=verify-full&sslrootcert=/run/secrets/database-ca.pem'
-export PGPASSFILE='/run/secrets/otlet-worker.pgpass'
+export PGPASSFILE='/run/credentials/worker.pgpass'
 export OTLET_PORTABLE_WORKER_ID='customer-vpc-worker'
 export OTLET_PORTABLE_PROTOCOL_VERSION='1'
 export OTLET_PORTABLE_RUNTIME_IDENTITY_HASH='registered-runtime-identity-sha256'
@@ -77,6 +80,12 @@ Portable admission accepts `reasoning`, `max_tokens`, `max_attempt_ms`, `context
 PostgreSQL assembles the exact prompt from the shaped snapshot and immutable task contract, then recomputes and validates the terminal identities, schema result, output, actions, and receipt lineage. It stores the database-authored requested, honored, defaulted, rejected, effective, artifact, context, thread, and RSS evidence on the claim and linked receipt. The worker checks prompt tokens and prompt plus declared generation tokens against the effective ceiling before decode, projects prompt and bounded decode buffers against the job RSS budget, and records the inputs, decision, and stable reason. Rejection stores no output
 
 The worker permits one `psql` child at a time. It applies a 5-second connect limit, a 30-second ordinary query limit, a renewal limit of 30 seconds or the remaining attempt budget, and one 30-second deadline across all terminal retries. Requests stop at 128 MiB, stdout at 64 MiB, stderr at 64 KiB, and parsed results at 32 MiB. Each call also sets PostgreSQL statement and lock timeouts. A child that crosses its deadline is killed and reaped before the call returns
+
+## Rotate A Worker Credential
+
+Create the replacement login and a distinct worker ID, register its `portable_worker` capability, run preflight, and keep both identities ready during the overlap. Replace a mounted credential file by atomic rename inside its directory. Every new `psql` call rereads `PGPASSFILE`; after successful deployment preflight, a continuous worker reconnects between claims and while draining. Credential rejection during renewal abandons the claim and stops inference. A rejected initial credential still fails preflight
+
+Set the old worker to `draining`, wait for `reported_state = 'drained'` and `live_claims = 0`, disable it, then revoke its registered `portable_worker` capability. Starting a second process under the same worker ID is replacement fencing, not overlap. Deployment IAM owns credential issuance, storage, and external revocation; Otlet stores no credential
 
 ## Invoke a Configured Task
 
@@ -247,7 +256,7 @@ Run the isolated deployment-preflight proof:
 ./scripts/otlet-portable-preflight-demo.sh
 ```
 
-It starts a TLS-enabled disposable PostgreSQL on an internal-only Docker network, proves a valid configuration leaves a queued job unclaimed, then breaks connectivity, TLS, credentials, grants, protocol, runtime identity, model registration, artifact access, runtime storage, and client availability one dependency at a time
+It starts a TLS-enabled disposable PostgreSQL on an internal-only Docker network, proves a valid configuration leaves a queued job unclaimed, then breaks connectivity, TLS, credentials, grants, protocol, runtime identity, model registration, artifact access, runtime storage, and client availability one dependency at a time. It also proves distinct-role overlap, replacement nonce fencing, live password rotation through an atomic mounted `PGPASSFILE`, same-process recovery, zero-claim drain, disable-before-revoke, replacement readiness, no raw password canary in evidence, `PUBLIC` closure, and zero invariants
 
 Run the repeat-install proof:
 

@@ -540,7 +540,7 @@ impl Database {
         for attempt in 0..3 {
             match self.query_until(sql, deadline) {
                 Ok(rows) => return Ok(rows),
-                Err(error) if attempt < 2 && is_connection_error(&error) => {
+                Err(error) if attempt < 2 && is_reconnectable_database_error(&error) => {
                     let remaining = deadline.saturating_duration_since(Instant::now());
                     if remaining.is_zero() {
                         return Err(database_request_timeout());
@@ -1639,7 +1639,7 @@ impl LeaseGuard {
                             &workload_revision_hash,
                             Some(if timeout {
                                 "attempt_timeout"
-                            } else if is_connection_error(&error) {
+                            } else if is_reconnectable_database_error(&error) {
                                 "database_unavailable"
                             } else {
                                 "lease_renewal_rejected"
@@ -2252,7 +2252,7 @@ fn process_claim(
             log_event("job_escalated", claim, Some("cheap_attempt_rejected"))
         }
         Ok(_) => log_event("job_canceled", claim, Some("cancel_requested")),
-        Err(error) if is_connection_error(&error) => {
+        Err(error) if is_reconnectable_database_error(&error) => {
             log_event(
                 "job_terminal_uncertain",
                 claim,
@@ -2451,7 +2451,8 @@ fn run() -> Result<(), String> {
         drop(verified_artifact);
         return Ok(());
     }
-    let (incarnation_nonce, desired) = database.start(&config)?;
+    let (incarnation_nonce, desired) =
+        start_until_available(&database, &config, &mut database_unavailable)?;
     config.incarnation_nonce = Some(incarnation_nonce);
     if desired == "draining" {
         drop(verified_artifact);
@@ -2503,7 +2504,13 @@ fn run() -> Result<(), String> {
             &mut database_unavailable,
         )?;
         if desired == "paused" {
-            database.heartbeat(&config, "paused", Some("ready"), None)?;
+            heartbeat_until_available(
+                &database,
+                &config,
+                "paused",
+                Some("ready"),
+                &mut database_unavailable,
+            )?;
             log_worker("worker_paused", &config, None);
             if config.once {
                 break;
@@ -2525,7 +2532,7 @@ fn run() -> Result<(), String> {
         }
         let claims = match database.claim(&config, model.default_threads) {
             Ok(claims) => claims,
-            Err(error) if is_connection_error(&error) && !config.once => {
+            Err(error) if is_reconnectable_database_error(&error) && !config.once => {
                 if !database_unavailable {
                     log_worker("database_unavailable", &config, Some("claim_failed"));
                     database_unavailable = true;
@@ -2597,9 +2604,38 @@ fn heartbeat_until_available(
                 }
                 return Ok(desired);
             }
-            Err(error) if is_connection_error(&error) && (!config.once || state == "drained") => {
+            Err(error)
+                if is_reconnectable_database_error(&error)
+                    && (!config.once || state == "drained") =>
+            {
                 if !*unavailable {
                     log_worker("database_unavailable", config, Some("heartbeat_failed"));
+                    *unavailable = true;
+                }
+                thread::sleep(config.poll_interval);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn start_until_available(
+    database: &Database,
+    config: &Config,
+    unavailable: &mut bool,
+) -> Result<(String, String), String> {
+    loop {
+        match database.start(config) {
+            Ok(started) => {
+                if *unavailable {
+                    log_worker("database_recovered", config, None);
+                    *unavailable = false;
+                }
+                return Ok(started);
+            }
+            Err(error) if !config.once && is_reconnectable_database_error(&error) => {
+                if !*unavailable {
+                    log_worker("database_unavailable", config, Some(error_code(&error)));
                     *unavailable = true;
                 }
                 thread::sleep(config.poll_interval);
@@ -2887,6 +2923,10 @@ fn is_connection_error(error: &str) -> bool {
     .any(|needle| error.contains(needle))
 }
 
+fn is_reconnectable_database_error(error: &str) -> bool {
+    is_connection_error(error) || error_code(error) == "credentials_rejected"
+}
+
 fn is_claim_loss(error: &str) -> bool {
     let error = error.to_ascii_lowercase();
     error.contains("otlet_error:claim_lost:")
@@ -3039,6 +3079,10 @@ mod tests {
             error_code("psql failed: connection to server failed: timeout expired"),
             "database_unavailable"
         );
+        let credential_error = "psql failed: password authentication failed for user \"worker\"";
+        assert!(!is_connection_error(credential_error));
+        assert!(is_reconnectable_database_error(credential_error));
+        assert_eq!(error_code(credential_error), "credentials_rejected");
     }
 
     #[cfg(unix)]
@@ -3163,6 +3207,58 @@ printf 'ok\n'
             );
         }
         assert!(!overlap_path.exists(), "psql children should not overlap");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn terminal_query_reloads_external_credentials() {
+        let directory = TestDirectory::new();
+        let credential_path = directory.path("credential");
+        std::fs::write(&credential_path, "old").expect("credential should be written");
+        let psql = directory.script(&format!(
+            "cat >/dev/null\n[ \"$(cat '{}')\" = rotated ] || {{ printf rotated > '{}'; echo 'password authentication failed for user worker' >&2; exit 2; }}\nprintf 'ok\\n'",
+            credential_path.display(),
+            credential_path.display()
+        ));
+        let database = test_database(psql, "postgresql://worker@database/app");
+        assert_eq!(
+            database.terminal_query("SELECT 1;\n"),
+            Ok(vec!["ok".to_owned()])
+        );
+        assert_eq!(
+            std::fs::read_to_string(credential_path)
+                .expect("rotated credential should be readable"),
+            "rotated"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn start_retries_rejected_credentials_after_preflight() {
+        let directory = TestDirectory::new();
+        let first_attempt = directory.path("first-attempt");
+        let model_path = directory.path("model.gguf");
+        std::fs::write(&model_path, b"model").expect("test model should be written");
+        let nonce = "123e4567-e89b-12d3-a456-426614174000";
+        let model_hash = "b".repeat(64);
+        let psql = directory.script(&format!(
+            "cat >/dev/null\n[ -e '{}' ] || {{ : > '{}'; echo 'password authentication failed for user worker' >&2; exit 2; }}\nprintf '{}|running|model|{}|5\\n'",
+            first_attempt.display(),
+            first_attempt.display(),
+            nonce,
+            model_hash
+        ));
+        let database = test_database(psql, "postgresql://worker@database/app");
+        let mut config = test_config(model_path);
+        config.once = false;
+        config.poll_interval = Duration::from_millis(1);
+        let mut unavailable = false;
+        assert_eq!(
+            start_until_available(&database, &config, &mut unavailable),
+            Ok((nonce.to_owned(), "running".to_owned()))
+        );
+        assert!(first_attempt.exists());
+        assert!(!unavailable);
     }
 
     #[test]
