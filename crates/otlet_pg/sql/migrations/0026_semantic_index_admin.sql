@@ -19,23 +19,40 @@ DECLARE
   semantic_record_type text := COALESCE(record_type, index_name);
   semantic_task_name text := index_name || '_task';
   actual_input_shaping jsonb := COALESCE(input_shaping, '{}'::jsonb);
-  current_contract_hash text;
   actual_input_columns text[];
+  subject_attnum smallint;
+  subject_not_null boolean;
   query text;
 BEGIN
   IF semantic_task_name !~ '^[a-z0-9][a-z0-9_-]*$' THEN
     RAISE EXCEPTION 'semantic index name % creates invalid task name %', index_name, semantic_task_name;
   END IF;
 
-  IF NOT EXISTS (
-    SELECT 1
-    FROM pg_attribute
-    WHERE attrelid = table_name
-      AND attname = subject_column
-      AND attnum > 0
-      AND NOT attisdropped
-  ) THEN
+  SELECT attribute.attnum, attribute.attnotnull
+  INTO subject_attnum, subject_not_null
+  FROM pg_attribute attribute
+  WHERE attribute.attrelid = table_name
+    AND attribute.attname = subject_column
+    AND attribute.attnum > 0
+    AND NOT attribute.attisdropped;
+  IF NOT FOUND THEN
     RAISE EXCEPTION 'otlet subject column % does not exist on %', subject_column, table_name;
+  END IF;
+  IF NOT subject_not_null OR NOT EXISTS (
+    SELECT 1
+    FROM pg_index key_index
+    WHERE key_index.indrelid = table_name
+      AND key_index.indisunique
+      AND key_index.indisvalid
+      AND key_index.indisready
+      AND key_index.indimmediate
+      AND key_index.indnkeyatts = 1
+      AND key_index.indkey[0] = subject_attnum
+      AND key_index.indexprs IS NULL
+      AND key_index.indpred IS NULL
+  ) THEN
+    RAISE EXCEPTION 'otlet subject column % must be NOT NULL with an immediate unique key',
+      subject_column;
   END IF;
 
   SELECT format('%I.%I', n.nspname, c.relname)
@@ -45,7 +62,7 @@ BEGIN
   WHERE c.oid = table_name;
 
   IF input_columns IS NULL THEN
-    SELECT array_agg(a.attname::text ORDER BY a.attnum)
+    SELECT array_agg(a.attname::text ORDER BY a.attname)
     INTO actual_input_columns
     FROM pg_attribute a
     WHERE a.attrelid = table_name
@@ -83,15 +100,6 @@ BEGIN
     '["_otlet_mvcc","row","table"]'::jsonb,
     true
   );
-  current_contract_hash := otlet.task_contract_hash(
-    instruction,
-    output_schema,
-    model_name,
-    runtime_options,
-    actual_input_shaping,
-    decision_contract
-  );
-
   query := format(
     $query$
       SELECT subject_id, input
@@ -99,7 +107,7 @@ BEGIN
         SELECT
           shaped.subject_id,
           shaped.input,
-          otlet.semantic_content_hash(shaped.input, %7$L::jsonb) AS content_hash
+          otlet.semantic_content_hash(shaped.input, %6$L::jsonb) AS content_hash
         FROM (
           SELECT
             (src.%1$I)::text AS subject_id,
@@ -123,7 +131,12 @@ BEGIN
           AND sm.source_table = %2$L
           AND sm.subject_id = otlet_semantic_input.subject_id
           AND sm.content_hash = otlet_semantic_input.content_hash
-          AND sm.contract_hash = %6$L
+          AND sm.contract_hash = (
+            SELECT head.active_workload_revision_hash
+            FROM otlet.workload_revision_heads head
+            WHERE head.task_name = %4$L
+          )
+          AND NOT sm.stale
       )
     $query$,
     subject_column,
@@ -131,7 +144,6 @@ BEGIN
     table_name,
     semantic_task_name,
     actual_input_columns,
-    current_contract_hash,
     actual_input_shaping
   );
 
@@ -143,7 +155,8 @@ BEGIN
     model_name,
     runtime_options,
     actual_input_shaping,
-    decision_contract
+    decision_contract,
+    jsonb_build_array(jsonb_build_object('table', source_table))
   );
 
   INSERT INTO otlet.semantic_indexes (
@@ -200,20 +213,15 @@ BEGIN
     RETURN false;
   END IF;
 
-  DELETE FROM otlet.semantic_materializations sm
+  UPDATE otlet.semantic_materializations sm
+  SET stale = true,
+      stale_reason = 'contract_changed',
+      updated_at = now()
   WHERE sm.task_name = index_row.task_name
     AND sm.record_type = index_row.record_type;
 
   DELETE FROM otlet.semantic_indexes si
   WHERE si.name = index_row.name;
-
-  DELETE FROM otlet.tasks t
-  WHERE t.name = index_row.task_name
-    AND NOT EXISTS (
-      SELECT 1
-      FROM otlet.jobs j
-      WHERE j.task_name = t.name
-    );
 
   IF NOT EXISTS (
     SELECT 1
@@ -221,11 +229,10 @@ BEGIN
     WHERE si.source_table = index_row.source_table
       AND si.subject_column = index_row.subject_column
   ) THEN
-    stale_trigger_name := 'otlet_stale_' || substr(
-      md5(index_row.source_table::regclass::text || ':' || index_row.subject_column),
-      1,
-      16
-    );
+    stale_trigger_name := 'otlet_stale_v1_' || substr(right(otlet.identity_text_hash(
+      'semantic_stale_trigger',
+      index_row.subject_column
+    ), 64), 1, 16);
     EXECUTE format('DROP TRIGGER IF EXISTS %I ON %s', stale_trigger_name, index_row.source_table);
   END IF;
 
@@ -239,24 +246,23 @@ CREATE FUNCTION otlet.refresh_semantic_index(
 LANGUAGE plpgsql
 AS $$
 DECLARE
-  index_row otlet.semantic_indexes%ROWTYPE;
+  task_name text;
   queued bigint;
 BEGIN
-  SELECT *
-  INTO index_row
-  FROM otlet.semantic_indexes
-  WHERE name = refresh_semantic_index.index_name;
+  SELECT revision.definition #>> '{task,name}'
+  INTO task_name
+  FROM otlet.workload_revision_heads head
+  JOIN otlet.workload_revisions revision
+    ON revision.task_name = head.task_name
+   AND revision.workload_revision_hash = head.active_workload_revision_hash
+  WHERE revision.definition #>> '{source,semantic_index_name}' = refresh_semantic_index.index_name
+    AND revision.definition #>> '{source,kind}' = 'row';
 
   IF NOT FOUND THEN
     RAISE EXCEPTION 'otlet semantic index % does not exist', refresh_semantic_index.index_name;
   END IF;
 
-  SELECT otlet.run_task(index_row.task_name) INTO queued;
-
-  UPDATE otlet.semantic_indexes
-  SET last_refresh_at = now(),
-      updated_at = now()
-  WHERE name = index_row.name;
+  SELECT otlet.run_task(task_name) INTO queued;
 
   RETURN queued;
 END;
@@ -269,54 +275,47 @@ LANGUAGE plpgsql
 VOLATILE
 AS $$
 DECLARE
-  index_row otlet.semantic_indexes%ROWTYPE;
+  revision_definition jsonb;
+  current_task_name text;
+  current_record_type text;
+  current_contract_hash text;
+  drift_error text;
   updated_count bigint := 0;
 BEGIN
-  SELECT si.subject_column, si.source_table, si.input_columns, si.task_name, si.record_type
-  INTO index_row.subject_column, index_row.source_table, index_row.input_columns, index_row.task_name, index_row.record_type
-  FROM otlet.semantic_indexes si
-  WHERE si.name = mark_semantic_schema_drift.index_name;
+  SELECT
+    revision.definition,
+    revision.definition #>> '{task,name}',
+    revision.definition #>> '{source,record_type}',
+    revision.workload_revision_hash
+  INTO revision_definition, current_task_name, current_record_type, current_contract_hash
+  FROM otlet.workload_revision_heads head
+  JOIN otlet.workload_revisions revision
+    ON revision.task_name = head.task_name
+   AND revision.workload_revision_hash = head.active_workload_revision_hash
+  WHERE revision.definition #>> '{source,semantic_index_name}' = mark_semantic_schema_drift.index_name
+    AND revision.definition #>> '{source,kind}' = 'row';
 
-  IF NOT FOUND OR index_row.input_columns IS NULL THEN
+  IF NOT FOUND THEN
     RETURN 0;
   END IF;
 
-  EXECUTE format(
-    $sql$
-      WITH missing_columns AS (
-        SELECT 1
-        FROM unnest(%3$L::text[]) AS expected(column_name)
-        WHERE NOT EXISTS (
-          SELECT 1
-          FROM pg_attribute a
-          WHERE a.attrelid = %2$L::regclass
-            AND a.attname = expected.column_name
-            AND a.attnum > 0
-            AND NOT a.attisdropped
-        )
-        LIMIT 1
-      ),
-      drift_subjects AS (
-        SELECT (src.%1$I)::text AS subject_id
-        FROM %2$s AS src
-        WHERE EXISTS (SELECT 1 FROM missing_columns)
-      )
-      UPDATE otlet.semantic_materializations sm
-      SET stale = true,
-          stale_reason = 'schema_drift',
-          updated_at = now()
-      FROM drift_subjects ds
-      WHERE sm.task_name = %4$L
-        AND sm.record_type = %5$L
-        AND sm.subject_id = ds.subject_id
-        AND sm.stale_reason IS DISTINCT FROM 'schema_drift'
-    $sql$,
-    index_row.subject_column,
-    index_row.source_table,
-    index_row.input_columns,
-    index_row.task_name,
-    index_row.record_type
+  drift_error := COALESCE(
+    otlet.source_query_contract_error(revision_definition #> '{source,query_contract}'),
+    otlet.semantic_schema_drift_error(revision_definition)
   );
+  IF drift_error IS NULL THEN
+    RETURN 0;
+  END IF;
+
+  UPDATE otlet.semantic_materializations materialization
+  SET stale = true,
+      stale_reason = 'schema_drift',
+      updated_at = now()
+  WHERE materialization.task_name = current_task_name
+    AND materialization.record_type = current_record_type
+    AND materialization.contract_hash = current_contract_hash
+    AND materialization.stale_reason IS DISTINCT FROM 'contract_changed'
+    AND materialization.stale_reason IS DISTINCT FROM 'schema_drift';
 
   GET DIAGNOSTICS updated_count = ROW_COUNT;
   RETURN updated_count;

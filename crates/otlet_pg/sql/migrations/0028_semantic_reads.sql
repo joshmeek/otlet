@@ -1,6 +1,7 @@
 CREATE FUNCTION otlet.semantic_index_current_rows(
   index_name text,
-  fresh_only boolean DEFAULT true
+  fresh_only boolean DEFAULT true,
+  expected_workload_revision_hash text DEFAULT NULL
 ) RETURNS TABLE (
   subject_id text,
   body jsonb,
@@ -11,36 +12,62 @@ CREATE FUNCTION otlet.semantic_index_current_rows(
 )
 LANGUAGE plpgsql
 VOLATILE
+SET search_path = pg_catalog, pg_temp
 AS $$
 DECLARE
   index_row otlet.semantic_indexes%ROWTYPE;
   current_contract_hash text;
   current_input_shaping jsonb := '{}'::jsonb;
+  current_definition jsonb;
 BEGIN
-  SELECT *
-  INTO index_row
-  FROM otlet.semantic_indexes
-  WHERE name = semantic_index_current_rows.index_name;
+  SELECT
+    revision.definition #>> '{source,semantic_index_name}',
+    revision.definition #>> '{task,name}',
+    head.active_workload_revision_hash,
+    revision.definition #> '{task,input_shaping}',
+    revision.definition #>> '{source,subject_column}',
+    revision.definition #>> '{source,source_table}',
+    revision.definition #>> '{source,record_type}',
+    ARRAY(
+      SELECT value
+      FROM jsonb_array_elements_text(COALESCE(revision.definition #> '{source,input_columns}', '[]'::jsonb)) value
+    ),
+    revision.definition
+  INTO
+    index_row.name,
+    index_row.task_name,
+    current_contract_hash,
+    current_input_shaping,
+    index_row.subject_column,
+    index_row.source_table,
+    index_row.record_type,
+    index_row.input_columns,
+    current_definition
+  FROM otlet.workload_revision_heads head
+  JOIN otlet.workload_revisions revision
+    ON revision.task_name = head.task_name
+   AND revision.workload_revision_hash = head.active_workload_revision_hash
+  WHERE revision.definition #>> '{source,semantic_index_name}' = semantic_index_current_rows.index_name
+    AND revision.definition #>> '{source,kind}' = 'row';
 
   IF NOT FOUND THEN
     RAISE EXCEPTION 'otlet semantic index % does not exist', semantic_index_current_rows.index_name;
   END IF;
 
-  PERFORM otlet.mark_semantic_schema_drift(index_row.name);
+  IF semantic_index_current_rows.expected_workload_revision_hash IS NOT NULL
+     AND semantic_index_current_rows.expected_workload_revision_hash IS DISTINCT FROM current_contract_hash THEN
+    RAISE EXCEPTION 'otlet workload revision changed during semantic read for index %', index_row.name;
+  END IF;
 
-  SELECT
-    otlet.task_contract_hash(
-      t.instruction,
-      t.output_schema,
-      t.model_name,
-      t.runtime_options,
-      t.input_shaping,
-      t.decision_contract
-    ),
-    t.input_shaping
-  INTO current_contract_hash, current_input_shaping
-  FROM otlet.tasks t
-  WHERE t.name = index_row.task_name;
+  PERFORM otlet.require_workload_source_contract(
+    index_row.task_name,
+    current_contract_hash,
+    false
+  );
+
+  IF otlet.semantic_schema_drift_error(current_definition) IS NOT NULL THEN
+    RETURN;
+  END IF;
 
   RETURN QUERY EXECUTE format(
     $sql$
@@ -63,7 +90,7 @@ BEGIN
         SELECT
           subject_id,
           input,
-          md5(input::text) AS source_hash,
+          otlet.semantic_source_hash(input) AS source_hash,
           otlet.semantic_content_hash(input, %9$L::jsonb) AS content_hash
         FROM raw_inputs
       ),
@@ -84,6 +111,7 @@ BEGIN
           ON sm.subject_id = ci.subject_id
         WHERE sm.task_name = %4$L
           AND sm.record_type = %5$L
+          AND sm.contract_hash = %7$L
         ORDER BY
           sm.subject_id,
           (
@@ -151,28 +179,51 @@ DECLARE
   current_contract_hash text;
   current_input_shaping jsonb := '{}'::jsonb;
 BEGIN
-  SELECT *
-  INTO index_row
-  FROM otlet.semantic_indexes
-  WHERE name = revalidate_semantic_subjects.index_name;
+  SELECT
+    revision.definition #>> '{source,semantic_index_name}',
+    revision.definition #>> '{task,name}',
+    head.active_workload_revision_hash
+  INTO index_row.name, index_row.task_name, current_contract_hash
+  FROM otlet.workload_revision_heads head
+  JOIN otlet.workload_revisions revision
+    ON revision.task_name = head.task_name
+   AND revision.workload_revision_hash = head.active_workload_revision_hash
+  WHERE revision.definition #>> '{source,semantic_index_name}' = revalidate_semantic_subjects.index_name
+    AND revision.definition #>> '{source,kind}' = 'row';
 
   IF NOT FOUND THEN
     RAISE EXCEPTION 'otlet semantic index % does not exist', revalidate_semantic_subjects.index_name;
   END IF;
 
+  PERFORM otlet.require_workload_source_contract(index_row.task_name, current_contract_hash);
+
   SELECT
-    otlet.task_contract_hash(
-      t.instruction,
-      t.output_schema,
-      t.model_name,
-      t.runtime_options,
-      t.input_shaping,
-      t.decision_contract
-    ),
-    t.input_shaping
-  INTO current_contract_hash, current_input_shaping
-  FROM otlet.tasks t
-  WHERE t.name = index_row.task_name;
+    active.workload_revision_hash,
+    active.definition #> '{task,input_shaping}',
+    active.definition #>> '{source,subject_column}',
+    active.definition #>> '{source,source_table}',
+    active.definition #>> '{source,record_type}',
+    ARRAY(
+      SELECT value
+      FROM jsonb_array_elements_text(COALESCE(active.definition #> '{source,input_columns}', '[]'::jsonb)) value
+    )
+  INTO
+    current_contract_hash,
+    current_input_shaping,
+    index_row.subject_column,
+    index_row.source_table,
+    index_row.record_type,
+    index_row.input_columns
+  FROM otlet.active_workload_revision(index_row.task_name) active;
+
+  PERFORM 1
+  FROM otlet.workload_revision_heads head
+  WHERE head.task_name = index_row.task_name
+    AND head.active_workload_revision_hash = current_contract_hash
+  FOR UPDATE;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'otlet workload revision changed during semantic revalidation for index %', index_row.name;
+  END IF;
 
   RETURN QUERY EXECUTE format(
     $sql$
@@ -196,7 +247,7 @@ BEGIN
         SELECT
           subject_id,
           input,
-          md5(input::text) AS source_hash,
+          otlet.semantic_source_hash(input) AS source_hash,
           otlet.semantic_content_hash(input, %6$L::jsonb) AS content_hash
         FROM raw_inputs
       ),
@@ -216,6 +267,7 @@ BEGIN
           ON sm.subject_id = ci.subject_id
         WHERE sm.task_name = %4$L
           AND sm.record_type = %5$L
+          AND sm.contract_hash = %9$L
         ORDER BY
           sm.subject_id,
           (

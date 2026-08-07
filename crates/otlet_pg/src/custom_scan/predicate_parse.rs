@@ -20,38 +20,26 @@ unsafe fn find_semantic_match_predicate(
                     if rte_kind != pg_sys::RTEKind::RTE_RELATION {
                         continue;
                     }
-                    let stats = validate_semantic_index_source(
-                        &predicate.index_name,
+                    let (stats, workload_revision_hash) = validate_semantic_index_source(
+                        &predicate,
                         relid,
                         predicate.subject_attno,
-                        &predicate.expected_json,
-                        predicate.allow_refresh,
-                        predicate.wait_ms,
-                        predicate.infer_ms,
-                        predicate.infer_max_rows,
-                        predicate.auto_policy,
                     )?;
-                    Some(stats)
+                    Some((stats, workload_revision_hash))
                 }
                 SemanticIndexKind::Join => {
                     if rte_kind != pg_sys::RTEKind::RTE_SUBQUERY {
                         continue;
                     }
-                    let stats = validate_semantic_join_index_source(
-                        &predicate.index_name,
-                        &predicate.expected_json,
-                        predicate.allow_refresh,
-                        predicate.wait_ms,
-                        predicate.infer_ms,
-                        predicate.infer_max_rows,
-                        predicate.auto_policy,
-                    )?;
-                    Some(stats)
+                    let (stats, workload_revision_hash) =
+                        validate_semantic_join_index_source(&predicate)?;
+                    Some((stats, workload_revision_hash))
                 }
             };
-            if let Some(stats) = stats {
+            if let Some((stats, workload_revision_hash)) = stats {
                 predicate.estimated_rows = estimated_result_rows(&stats, &predicate);
                 predicate.planner_stats = stats;
+                predicate.workload_revision_hash = workload_revision_hash;
                 return Some(predicate);
             }
         }
@@ -75,12 +63,16 @@ unsafe fn semantic_match_from_clause(
         Some(SemanticMatchPredicate {
             index_kind: parts.index_kind,
             index_name: parts.index_name,
+            workload_revision_hash: String::new(),
             expected_json: parts.expected_json,
             auto_policy: parts.auto_policy,
             allow_refresh: parts.allow_refresh,
             wait_ms: parts.wait_ms,
             infer_ms: parts.infer_ms,
             infer_max_rows: parts.infer_max_rows,
+            preload_max_rows: parts.preload_max_rows,
+            preload_max_bytes: parts.preload_max_bytes,
+            preload_max_ms: parts.preload_max_ms,
             subject_attno: parts.subject.attno,
             subject_typid: parts.subject.typid,
             restrict_info: ptr::null_mut(),
@@ -100,6 +92,9 @@ struct ParsedSemanticMatch {
     wait_ms: u32,
     infer_ms: u32,
     infer_max_rows: u32,
+    preload_max_rows: u64,
+    preload_max_bytes: u64,
+    preload_max_ms: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -109,6 +104,22 @@ struct SemanticAutoPolicy {
     wait_ms: u32,
     infer_ms: u32,
     infer_max_rows: u32,
+    preload_max_rows: u64,
+    preload_max_bytes: u64,
+    preload_max_ms: u64,
+}
+
+impl SemanticAutoPolicy {
+    fn for_mode(mut self, enabled: bool) -> Self {
+        self.auto_policy = enabled;
+        if !enabled {
+            self.allow_refresh = false;
+            self.wait_ms = 0;
+            self.infer_ms = 0;
+            self.infer_max_rows = 0;
+        }
+        self
+    }
 }
 
 unsafe fn semantic_match_function_parts(
@@ -145,23 +156,15 @@ unsafe fn semantic_match_function_parts(
             wait_ms: policy.wait_ms,
             infer_ms: policy.infer_ms,
             infer_max_rows: policy.infer_max_rows,
+            preload_max_rows: policy.preload_max_rows,
+            preload_max_bytes: policy.preload_max_bytes,
+            preload_max_ms: policy.preload_max_ms,
         })
     }
 }
 
 fn semantic_auto_policy(enabled: bool) -> SemanticAutoPolicy {
-    if !enabled {
-        return SemanticAutoPolicy {
-            auto_policy: false,
-            allow_refresh: false,
-            wait_ms: 0,
-            infer_ms: 0,
-            infer_max_rows: 0,
-        };
-    }
-
-    // One SPI read per statement: production_policy is a single-row table and
-    // begin-scan already freezes knobs from plan-time private data.
+    // One policy read per statement shared by planning and execution
     let stmt_start = unsafe { pg_sys::GetCurrentStatementStartTimestamp() };
     thread_local! {
         static CACHED: std::cell::Cell<Option<(pg_sys::TimestampTz, SemanticAutoPolicy)>> =
@@ -170,7 +173,7 @@ fn semantic_auto_policy(enabled: bool) -> SemanticAutoPolicy {
     if let Some((cached_start, policy)) = CACHED.get()
         && cached_start == stmt_start
     {
-        return policy;
+        return policy.for_mode(enabled);
     }
 
     let policy = pgrx::Spi::connect(|client| {
@@ -180,7 +183,10 @@ fn semantic_auto_policy(enabled: bool) -> SemanticAutoPolicy {
                    stale_policy = 'refresh_then_fail_closed' AS allow_refresh, \
                    semantic_auto_wait_ms, \
                    semantic_auto_infer_ms, \
-                   semantic_auto_max_rows \
+                   semantic_auto_max_rows, \
+                   customscan_preload_max_rows, \
+                   customscan_preload_max_bytes, \
+                   customscan_preload_max_ms \
                  FROM otlet.production_policy \
                  WHERE name = 'default' \
                  LIMIT 1",
@@ -218,6 +224,24 @@ fn semantic_auto_policy(enabled: bool) -> SemanticAutoPolicy {
                 .unwrap_or(1)
                 .clamp(0, 10)
                 .cast_unsigned(),
+            preload_max_rows: row
+                .get_by_name::<i64, _>("customscan_preload_max_rows")
+                .ok()
+                .flatten()
+                .map_or(0, nonnegative_count),
+            preload_max_bytes: row
+                .get_by_name::<i64, _>("customscan_preload_max_bytes")
+                .ok()
+                .flatten()
+                .map_or(0, nonnegative_count),
+            preload_max_ms: row
+                .get_by_name::<i32, _>("customscan_preload_max_ms")
+                .ok()
+                .flatten()
+                .unwrap_or(0)
+                .max(0)
+                .cast_unsigned()
+                .into(),
         })
     })
     .unwrap_or(SemanticAutoPolicy {
@@ -227,7 +251,10 @@ fn semantic_auto_policy(enabled: bool) -> SemanticAutoPolicy {
         wait_ms: 0,
         infer_ms: 0,
         infer_max_rows: 0,
+        preload_max_rows: 0,
+        preload_max_bytes: 0,
+        preload_max_ms: 0,
     });
     CACHED.set(Some((stmt_start, policy)));
-    policy
+    policy.for_mode(enabled)
 }

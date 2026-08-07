@@ -8,6 +8,8 @@ mod cache_tests {
             content_key: 0,
             contract_key: 0,
             model_key: 0,
+            artifact_sha256: Arc::from("artifact"),
+            artifact_bytes: 1,
             raw_output: Arc::from("{}"),
             bytes: 1,
             last_access,
@@ -121,9 +123,57 @@ mod cache_tests {
         cached.contract_key = 30;
         cached.model_key = 40;
 
-        assert!(cached.matches_identity(10, 20, 30, 40));
-        assert!(!cached.matches_identity(10, 21, 30, 40));
-        assert!(!cached.matches_identity(10, 20, 31, 40));
-        assert!(!cached.matches_identity(10, 20, 30, 41));
+        assert!(cached.matches_identity(10, 20, 30, 40, "artifact", 1));
+        assert!(!cached.matches_identity(10, 21, 30, 40, "artifact", 1));
+        assert!(!cached.matches_identity(10, 20, 30, 40, "other", 1));
+        assert!(!cached.matches_identity(10, 20, 30, 40, "artifact", 2));
+        assert!(!cached.matches_identity(10, 20, 31, 40, "artifact", 1));
+        assert!(!cached.matches_identity(10, 20, 30, 41, "artifact", 1));
+    }
+
+    #[test]
+    fn evaluation_inference_cache_is_separate_from_production() {
+        let key = 9_223_372_036_854_775_001;
+        inference_cache_put(
+            "evaluation",
+            key,
+            101,
+            102,
+            103,
+            104,
+            "evaluation-artifact",
+            1,
+            "evaluation-output".to_owned(),
+        );
+
+        assert!(
+            inference_cache_get(
+                "production",
+                key,
+                101,
+                102,
+                103,
+                104,
+                "evaluation-artifact",
+                1,
+            )
+            .raw_output
+            .is_none()
+        );
+        assert_eq!(
+            inference_cache_get(
+                "evaluation",
+                key,
+                101,
+                102,
+                103,
+                104,
+                "evaluation-artifact",
+                1,
+            )
+            .raw_output
+            .as_deref(),
+            Some("evaluation-output")
+        );
     }
 }

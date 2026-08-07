@@ -76,7 +76,7 @@ join_stale_contract="$(psql_exec -qAt \
   -v index_name="$join_index_name" \
   -v task_name="$join_task" <<'SQL'
 SELECT stale_subjects::text || '|' || fresh_subjects::text
-FROM otlet.semantic_join_index_plan(:'index_name');
+FROM otlet.semantic_join_index_plan(:'index_name', true);
 SELECT count(*)::text
 FROM otlet.semantic_join_index_current_rows(:'index_name', true);
 SELECT count(*)::text
@@ -112,6 +112,7 @@ SELECT (otlet.create_task(
     decision_contract
   )).name
 FROM current_task;
+SELECT otlet.promote_configured_workload_revision(:'task_name');
 SQL
 contract_change_contract="$(psql_exec -qAt \
   -v task_name="$join_task" \

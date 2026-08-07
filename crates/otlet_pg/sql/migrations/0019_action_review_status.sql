@@ -1,6 +1,7 @@
 CREATE VIEW otlet.model_selection_attempts AS
 SELECT
   r.job_id,
+  r.workload_revision_hash,
   r.task_name,
   r.subject_id,
   r.attempt_index,
@@ -25,7 +26,9 @@ SELECT
   o.id AS output_id,
   r.finished_at
 FROM otlet.inference_receipts r
-LEFT JOIN otlet.outputs o ON o.receipt_id = r.id;
+JOIN otlet.jobs j ON j.id = r.job_id
+LEFT JOIN otlet.outputs o ON o.receipt_id = r.id
+WHERE j.execution_mode = 'production';
 
 CREATE VIEW otlet.runs AS
 WITH receipt_attempts AS (
@@ -38,6 +41,7 @@ WITH receipt_attempts AS (
 )
 SELECT
   j.id AS job_id,
+  j.workload_revision_hash,
   j.task_name,
   j.subject_id,
   j.status,
@@ -85,12 +89,34 @@ LEFT JOIN LATERAL (
   WHERE r.job_id = j.id
   ORDER BY r.attempt_index DESC, r.id DESC
   LIMIT 1
-) latest ON true;
+) latest ON true
+WHERE j.execution_mode = 'production';
 
 CREATE VIEW otlet.action_status AS
 SELECT
   a.id AS action_id,
   a.job_id,
+  j.workload_revision_hash,
+  head.active_workload_revision_hash,
+  CASE
+    WHEN j.workload_revision_hash = head.active_workload_revision_hash
+     AND otlet.source_query_contract_error(
+       revision.definition #> '{source,query_contract}'
+     ) IS NULL
+     AND (
+       a.action_type <> 'update_row'
+       OR a.authority_origin <> 'workflow'
+       OR otlet.action_workflow_policy_error(
+         j.task_name,
+         a.action_type,
+         a.authority_policy_hash,
+         a.target_name,
+         a.subject_namespace,
+         false
+       ) IS NULL
+     ) THEN 'active'
+    ELSE 'suspended'
+  END AS authority_status,
   j.task_name,
   j.subject_id AS job_subject_id,
   a.subject_id,
@@ -128,6 +154,10 @@ SELECT
   execution.replay_of_receipt_id
 FROM otlet.actions a
 JOIN otlet.jobs j ON j.id = a.job_id
+LEFT JOIN otlet.workload_revision_heads head ON head.task_name = j.task_name
+LEFT JOIN otlet.workload_revisions revision
+  ON revision.task_name = j.task_name
+ AND revision.workload_revision_hash = j.workload_revision_hash
 LEFT JOIN otlet.outputs o ON o.id = a.output_id
 LEFT JOIN otlet.inference_receipts r ON r.id = a.receipt_id
 LEFT JOIN LATERAL (
@@ -139,6 +169,16 @@ LEFT JOIN LATERAL (
 ) execution ON true;
 
 CREATE VIEW otlet.action_workflow_policy_status AS
+WITH active AS (
+  SELECT
+    head.task_name,
+    head.active_workload_revision_hash,
+    revision.definition
+  FROM otlet.workload_revision_heads head
+  JOIN otlet.workload_revisions revision
+    ON revision.task_name = head.task_name
+   AND revision.workload_revision_hash = head.active_workload_revision_hash
+)
 SELECT
   p.task_name,
   p.action_type,
@@ -148,23 +188,60 @@ SELECT
   p.evaluation_status,
   p.policy_hash,
   p.task_contract_hash,
+  p.target_contract,
   p.target_contract_hash,
   p.enabled,
-  p.task_contract_hash IS NOT DISTINCT FROM otlet.current_task_contract_hash(p.task_name)
-    AS task_contract_current,
-  p.target_contract_hash IS NOT DISTINCT FROM otlet.action_target_contract_hash(p.target_name)
+  active.active_workload_revision_hash,
+  p.policy_hash IS NOT DISTINCT FROM active.definition #>> ARRAY[
+    'action_policies', p.action_type, 'authority', 'policy_hash'
+  ] AS task_contract_current,
+  otlet.identity_hash(
+    'action_target_contract',
+    active.definition #> ARRAY[
+      'action_policies', p.action_type, 'authority', 'target_contract'
+    ]
+  ) IS NOT DISTINCT FROM otlet.action_target_contract_hash(
+    active.definition #>> ARRAY['action_policies', p.action_type, 'authority', 'target_name']
+  )
+    AND active.definition #>> ARRAY[
+      'action_policies', p.action_type, 'authority', 'target_contract_hash'
+    ] IS NOT DISTINCT FROM otlet.action_target_contract_hash(
+      active.definition #>> ARRAY['action_policies', p.action_type, 'authority', 'target_name']
+    )
     AS target_contract_current,
-  otlet.action_target_validation_error(p.target_name) AS target_error,
-  p.enabled
-    AND p.authority_mode = 'bounded_mutation'
-    AND p.evaluation_status = 'evaluated'
-    AND p.task_contract_hash IS NOT DISTINCT FROM otlet.current_task_contract_hash(p.task_name)
-    AND p.target_contract_hash IS NOT DISTINCT FROM otlet.action_target_contract_hash(p.target_name)
-    AND otlet.action_target_validation_error(p.target_name) IS NULL
+  otlet.action_target_validation_error(
+    active.definition #>> ARRAY['action_policies', p.action_type, 'authority', 'target_name']
+  ) AS target_error,
+  COALESCE((active.definition #>> ARRAY[
+    'action_policies', p.action_type, 'authority', 'enabled'
+  ])::boolean, false)
+    AND active.definition #>> ARRAY[
+      'action_policies', p.action_type, 'authority', 'mode'
+    ] = 'bounded_mutation'
+    AND active.definition #>> ARRAY[
+      'action_policies', p.action_type, 'authority', 'evaluation_status'
+    ] = 'evaluated'
+    AND otlet.identity_hash(
+      'action_target_contract',
+      active.definition #> ARRAY[
+        'action_policies', p.action_type, 'authority', 'target_contract'
+      ]
+    ) IS NOT DISTINCT FROM otlet.action_target_contract_hash(
+      active.definition #>> ARRAY['action_policies', p.action_type, 'authority', 'target_name']
+    )
+    AND active.definition #>> ARRAY[
+      'action_policies', p.action_type, 'authority', 'target_contract_hash'
+    ] IS NOT DISTINCT FROM otlet.action_target_contract_hash(
+      active.definition #>> ARRAY['action_policies', p.action_type, 'authority', 'target_name']
+    )
+    AND otlet.action_target_validation_error(
+      active.definition #>> ARRAY['action_policies', p.action_type, 'authority', 'target_name']
+    ) IS NULL
     AS mutation_authorized,
   p.created_at,
   p.updated_at
-FROM otlet.action_workflow_policies p;
+FROM otlet.action_workflow_policies p
+LEFT JOIN active ON active.task_name = p.task_name;
 
 CREATE VIEW otlet.eval_label_status AS
 SELECT
@@ -183,8 +260,14 @@ SELECT
   a.action_type AS observed_action_type,
   a.status AS action_status,
   a.approval_status,
-  o.output ->> COALESCE(NULLIF(t.decision_contract ->> 'answer_field', ''), 'match') AS observed_answer,
-  o.output ->> COALESCE(NULLIF(t.decision_contract ->> 'confidence_field', ''), 'confidence') AS observed_confidence,
+  o.output ->> COALESCE(
+    NULLIF(revision.definition #>> '{task,decision_contract,answer_field}', ''),
+    'match'
+  ) AS observed_answer,
+  o.output ->> COALESCE(
+    NULLIF(revision.definition #>> '{task,decision_contract,confidence_field}', ''),
+    'confidence'
+  ) AS observed_confidence,
   r.model_name,
   r.selection_role,
   r.selection_status,
@@ -192,7 +275,8 @@ SELECT
 FROM otlet.eval_labels l
 LEFT JOIN otlet.actions a ON a.id = l.action_id
 LEFT JOIN otlet.jobs j ON j.id = a.job_id
-LEFT JOIN otlet.tasks t ON t.name = j.task_name
+LEFT JOIN otlet.workload_revisions revision
+  ON revision.workload_revision_hash = j.workload_revision_hash
 LEFT JOIN otlet.outputs o ON o.id = l.output_id
 LEFT JOIN otlet.inference_receipts r ON r.id = l.receipt_id;
 
@@ -200,12 +284,40 @@ CREATE VIEW otlet.review_queue AS
 WITH action_items AS (
   SELECT
     CASE
+      WHEN j.workload_revision_hash IS DISTINCT FROM head.active_workload_revision_hash THEN 'suspended_authority'
+      WHEN a.action_type = 'update_row'
+       AND a.authority_origin = 'workflow'
+       AND otlet.action_workflow_policy_error(
+         j.task_name,
+         a.action_type,
+         a.authority_policy_hash,
+         a.target_name,
+         a.subject_namespace,
+         false
+       ) IS NOT NULL THEN 'suspended_authority'
+      WHEN otlet.source_query_contract_error(
+        revision.definition #> '{source,query_contract}'
+      ) IS NOT NULL THEN 'suspended_authority'
       WHEN a.action_type = 'update_row' AND a.dry_run_status = 'not_run' THEN 'pending_dry_run'
       WHEN a.approval_status = 'required' AND a.status = 'proposed' THEN 'pending_approval'
       WHEN a.action_type = 'update_row' AND a.status = 'approved' THEN 'ready_to_apply'
       ELSE 'review_flag'
     END AS queue_kind,
     CASE
+      WHEN j.workload_revision_hash IS DISTINCT FROM head.active_workload_revision_hash THEN 'review'
+      WHEN a.action_type = 'update_row'
+       AND a.authority_origin = 'workflow'
+       AND otlet.action_workflow_policy_error(
+         j.task_name,
+         a.action_type,
+         a.authority_policy_hash,
+         a.target_name,
+         a.subject_namespace,
+         false
+       ) IS NOT NULL THEN 'review'
+      WHEN otlet.source_query_contract_error(
+        revision.definition #> '{source,query_contract}'
+      ) IS NOT NULL THEN 'review'
       WHEN a.action_type = 'update_row' AND a.dry_run_status = 'not_run' THEN 'dry_run'
       WHEN a.action_type = 'update_row' AND a.dry_run_status = 'failed' THEN 'review_failure'
       WHEN a.action_type = 'update_row' AND a.status = 'proposed' THEN 'approve'
@@ -214,7 +326,12 @@ WITH action_items AS (
       ELSE 'review'
     END AS next_operator_step,
     j.task_name,
-    w.name AS watch_name,
+    j.workload_revision_hash,
+    COALESCE(
+      revision.definition #>> '{source,watch_name}',
+      revision.definition #>> '{source,semantic_index_name}',
+      revision.definition #>> '{source,semantic_join_index_name}'
+    ) AS watch_name,
     j.subject_id AS job_subject_id,
     a.subject_id,
     a.id AS action_id,
@@ -250,7 +367,9 @@ WITH action_items AS (
     a.created_at
   FROM otlet.actions a
   JOIN otlet.jobs j ON j.id = a.job_id
-  LEFT JOIN otlet.watches w ON w.task_name = j.task_name
+  LEFT JOIN otlet.workload_revision_heads head ON head.task_name = j.task_name
+  JOIN otlet.workload_revisions revision
+    ON revision.workload_revision_hash = j.workload_revision_hash
   LEFT JOIN otlet.outputs o ON o.id = a.output_id
   LEFT JOIN LATERAL (
     SELECT er.*
@@ -264,11 +383,16 @@ WITH action_items AS (
     FROM otlet.semantic_materializations sm
     WHERE sm.task_name = j.task_name
       AND sm.subject_id = j.subject_id
-      AND (w.record_type IS NULL OR sm.record_type = w.record_type)
+      AND sm.contract_hash = j.workload_revision_hash
+      AND (
+        revision.definition #>> '{source,record_type}' IS NULL
+        OR sm.record_type = revision.definition #>> '{source,record_type}'
+      )
     ORDER BY sm.updated_at DESC, sm.id DESC
     LIMIT 1
   ) materialization ON true
-  WHERE (
+  WHERE j.execution_mode = 'production'
+    AND (
       (
         a.approval_status = 'required'
         AND a.status = 'proposed'
@@ -295,7 +419,12 @@ abstention_items AS (
     'abstention_output'::text AS queue_kind,
     'review'::text AS next_operator_step,
     j.task_name,
-    w.name AS watch_name,
+    j.workload_revision_hash,
+    COALESCE(
+      revision.definition #>> '{source,watch_name}',
+      revision.definition #>> '{source,semantic_index_name}',
+      revision.definition #>> '{source,semantic_join_index_name}'
+    ) AS watch_name,
     j.subject_id AS job_subject_id,
     j.subject_id AS subject_id,
     NULL::bigint AS action_id,
@@ -317,7 +446,7 @@ abstention_items AS (
     NULL::text AS review_reason,
     o.output,
     r.trace_summary #>> '{mvcc,table}' AS source_table,
-    COALESCE(r.trace_summary #>> '{mvcc,source_hash}', md5((r.trace_summary -> 'mvcc')::text)) AS source_hash,
+    otlet.semantic_source_hash(j.input) AS source_hash,
     hashed.content_hash,
     COALESCE(materialization.content_hash, hashed.content_hash) AS current_content_hash,
     (
@@ -330,23 +459,36 @@ abstention_items AS (
     o.created_at
   FROM otlet.outputs o
   JOIN otlet.jobs j ON j.id = o.job_id
-  JOIN otlet.tasks t ON t.name = j.task_name
+  JOIN otlet.workload_revisions revision
+    ON revision.workload_revision_hash = j.workload_revision_hash
   JOIN otlet.inference_receipts r ON r.id = o.receipt_id
-  LEFT JOIN otlet.watches w ON w.task_name = j.task_name
   CROSS JOIN LATERAL (
-    SELECT otlet.semantic_content_hash(j.input, t.input_shaping) AS content_hash
+    SELECT otlet.semantic_content_hash(
+      j.input,
+      revision.definition #> '{task,input_shaping}'
+    ) AS content_hash
   ) hashed
   LEFT JOIN LATERAL (
     SELECT sm.content_hash, sm.stale
     FROM otlet.semantic_materializations sm
     WHERE sm.task_name = j.task_name
       AND sm.subject_id = j.subject_id
-      AND (w.record_type IS NULL OR sm.record_type = w.record_type)
+      AND sm.contract_hash = j.workload_revision_hash
+      AND (
+        revision.definition #>> '{source,record_type}' IS NULL
+        OR sm.record_type = revision.definition #>> '{source,record_type}'
+      )
     ORDER BY sm.updated_at DESC, sm.id DESC
     LIMIT 1
   ) materialization ON true
-  WHERE COALESCE(t.decision_contract -> 'abstain_values', '["unclear"]'::jsonb)
-      ? (o.output ->> COALESCE(NULLIF(t.decision_contract ->> 'answer_field', ''), 'match'))
+  WHERE j.execution_mode = 'production'
+    AND COALESCE(
+      revision.definition #> '{task,decision_contract,abstain_values}',
+      '["unclear"]'::jsonb
+    ) ? (o.output ->> COALESCE(
+      NULLIF(revision.definition #>> '{task,decision_contract,answer_field}', ''),
+      'match'
+    ))
     AND NOT EXISTS (
       SELECT 1
       FROM otlet.eval_labels l
@@ -365,7 +507,12 @@ direct_rejected_items AS (
     'direct_rejected_output'::text AS queue_kind,
     'review'::text AS next_operator_step,
     j.task_name,
-    w.name AS watch_name,
+    j.workload_revision_hash,
+    COALESCE(
+      revision.definition #>> '{source,watch_name}',
+      revision.definition #>> '{source,semantic_index_name}',
+      revision.definition #>> '{source,semantic_join_index_name}'
+    ) AS watch_name,
     j.subject_id AS job_subject_id,
     j.subject_id AS subject_id,
     NULL::bigint AS action_id,
@@ -387,7 +534,7 @@ direct_rejected_items AS (
     NULL::text AS review_reason,
     r.candidate_output AS output,
     r.trace_summary #>> '{mvcc,table}' AS source_table,
-    COALESCE(r.trace_summary #>> '{mvcc,source_hash}', md5((r.trace_summary -> 'mvcc')::text)) AS source_hash,
+    otlet.semantic_source_hash(j.input) AS source_hash,
     hashed.content_hash,
     COALESCE(materialization.content_hash, hashed.content_hash) AS current_content_hash,
     (
@@ -400,21 +547,29 @@ direct_rejected_items AS (
     r.finished_at AS created_at
   FROM otlet.inference_receipts r
   JOIN otlet.jobs j ON j.id = r.job_id
-  JOIN otlet.tasks t ON t.name = j.task_name
-  LEFT JOIN otlet.watches w ON w.task_name = j.task_name
+  JOIN otlet.workload_revisions revision
+    ON revision.workload_revision_hash = j.workload_revision_hash
   CROSS JOIN LATERAL (
-    SELECT otlet.semantic_content_hash(j.input, t.input_shaping) AS content_hash
+    SELECT otlet.semantic_content_hash(
+      j.input,
+      revision.definition #> '{task,input_shaping}'
+    ) AS content_hash
   ) hashed
   LEFT JOIN LATERAL (
     SELECT sm.content_hash, sm.stale
     FROM otlet.semantic_materializations sm
     WHERE sm.task_name = j.task_name
       AND sm.subject_id = j.subject_id
-      AND (w.record_type IS NULL OR sm.record_type = w.record_type)
+      AND sm.contract_hash = j.workload_revision_hash
+      AND (
+        revision.definition #>> '{source,record_type}' IS NULL
+        OR sm.record_type = revision.definition #>> '{source,record_type}'
+      )
     ORDER BY sm.updated_at DESC, sm.id DESC
     LIMIT 1
   ) materialization ON true
-  WHERE r.selection_role = 'direct'
+  WHERE j.execution_mode = 'production'
+    AND r.selection_role = 'direct'
     AND r.selection_status = 'rejected'
     AND r.selection_reason = 'direct_rejected_by_decision_contract'
     AND r.schema_validation_status = 'passed'
@@ -436,6 +591,7 @@ SELECT
   queue_kind,
   next_operator_step,
   task_name,
+  workload_revision_hash,
   watch_name,
   job_subject_id,
   subject_id,
@@ -469,6 +625,7 @@ SELECT
   queue_kind,
   next_operator_step,
   task_name,
+  workload_revision_hash,
   watch_name,
   job_subject_id,
   subject_id,
@@ -502,6 +659,7 @@ SELECT
   queue_kind,
   next_operator_step,
   task_name,
+  workload_revision_hash,
   watch_name,
   job_subject_id,
   subject_id,

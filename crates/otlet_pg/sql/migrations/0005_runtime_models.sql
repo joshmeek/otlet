@@ -33,6 +33,34 @@ BEGIN
 END;
 $$;
 
+CREATE FUNCTION otlet.model_artifact_identity_from_path(artifact_path text)
+RETURNS jsonb
+AS 'MODULE_PATHNAME', 'otlet_model_artifact_identity_from_path'
+LANGUAGE C STRICT;
+
+CREATE FUNCTION otlet.register_model(
+  model_name text,
+  artifact_path text,
+  max_active_jobs int DEFAULT 1
+) RETURNS otlet.models
+LANGUAGE plpgsql
+SET search_path = pg_catalog, otlet, pg_temp
+AS $$
+DECLARE
+  identity jsonb := otlet.model_artifact_identity_from_path(
+    register_model.artifact_path
+  );
+BEGIN
+  RETURN otlet.register_model(
+    register_model.model_name,
+    register_model.artifact_path,
+    identity ->> 'sha256',
+    identity,
+    register_model.max_active_jobs
+  );
+END;
+$$;
+
 CREATE FUNCTION otlet.wake_worker() RETURNS boolean
 AS 'MODULE_PATHNAME', 'otlet_wake_worker'
 LANGUAGE C STRICT;
@@ -57,3 +85,7 @@ LANGUAGE C;
 CREATE FUNCTION otlet.worker_infer_now_state() RETURNS jsonb
 AS 'MODULE_PATHNAME', 'otlet_worker_infer_now_state'
 LANGUAGE C STRICT;
+
+CREATE FUNCTION otlet.linked_runtime_capabilities() RETURNS jsonb
+AS 'MODULE_PATHNAME', 'otlet_linked_runtime_capabilities'
+LANGUAGE C STABLE PARALLEL SAFE STRICT;

@@ -45,6 +45,117 @@ echo "candidate_preflight_contract=$candidate_preflight_contract"
   exit 1
 }
 
+candidate_plan_drift_contract="$(psql_candidate_value -v model_name="$cheap_model_name" <<'SQL'
+BEGIN;
+
+CREATE TABLE public.otlet_candidate_plan_drift_demo (
+  subject_id text PRIMARY KEY,
+  input jsonb NOT NULL,
+  eligible boolean NOT NULL
+);
+INSERT INTO public.otlet_candidate_plan_drift_demo (subject_id, input, eligible)
+SELECT
+  'candidate-' || i,
+  jsonb_build_object('value', i),
+  true
+FROM generate_series(1, 8) candidate(i);
+
+SELECT otlet.create_watch(
+  watch_name => 'candidate_plan_drift_demo',
+  kind => 'pair',
+  instruction => 'Return an empty object',
+  output_schema => '{"type":"object"}'::jsonb,
+  model_name => :'model_name',
+  candidate_query => $query$
+    SELECT subject_id, input
+    FROM public.otlet_candidate_plan_drift_demo
+    WHERE eligible
+  $query$,
+  max_candidate_rows => 16,
+  input_shaping => '{"source_fields":["value"]}'::jsonb,
+  pair_sources => '[{
+    "table":"public.otlet_candidate_plan_drift_demo",
+    "subject_column":"subject_id"
+  }]'::jsonb
+) \g /dev/null
+
+SET LOCAL seq_page_cost = 1000;
+
+CREATE TEMP TABLE candidate_plan_ready AS
+SELECT
+  revision.candidate_plan IS NOT NULL
+    AND revision.candidate_plan_cost IS NOT NULL
+    AND revision.candidate_preflight_at IS NOT NULL AS stored,
+  status.source_dependency_status,
+  status.candidate_plan_drift,
+  status.candidate_preflight_status,
+  status.candidate_plan IS DISTINCT FROM status.current_candidate_plan AS distinct_plans,
+  revision.candidate_plan_cost AS accepted_candidate_plan_cost,
+  status.current_candidate_plan_cost
+FROM otlet.watch_status status
+JOIN otlet.workload_revision_heads head ON head.task_name = status.task_name
+JOIN otlet.workload_revisions revision
+  ON revision.task_name = head.task_name
+ AND revision.workload_revision_hash = head.active_workload_revision_hash
+WHERE status.watch_name = 'candidate_plan_drift_demo';
+
+UPDATE otlet.production_policy
+SET max_candidate_query_cost = (
+  SELECT accepted_candidate_plan_cost
+  FROM candidate_plan_ready
+)
+WHERE name = 'default';
+
+CREATE TEMP TABLE candidate_plan_rejected AS
+SELECT
+  candidate_preflight_status,
+  selected_path,
+  candidate_preflight_error
+FROM otlet.watch_status
+WHERE watch_name = 'candidate_plan_drift_demo';
+
+DO $body$
+BEGIN
+  BEGIN
+    PERFORM otlet.refresh_semantic_join_index('candidate_plan_drift_demo');
+    RAISE EXCEPTION 'over-cost candidate refresh succeeded';
+  EXCEPTION WHEN OTHERS THEN
+    IF position('candidate query plan cost' IN SQLERRM) = 0 THEN
+      RAISE;
+    END IF;
+  END;
+END
+$body$;
+
+SELECT concat_ws('|',
+  ready.stored,
+  ready.source_dependency_status,
+  ready.candidate_plan_drift,
+  ready.candidate_preflight_status,
+  ready.distinct_plans,
+  ready.current_candidate_plan_cost > ready.accepted_candidate_plan_cost,
+  rejected.candidate_preflight_status,
+  rejected.selected_path,
+  position('candidate query plan cost' IN rejected.candidate_preflight_error) > 0,
+  NOT EXISTS (
+    SELECT 1 FROM otlet.jobs WHERE task_name = 'candidate_plan_drift_demo_task'
+  ),
+  NOT EXISTS (
+    SELECT 1 FROM otlet.semantic_materializations
+    WHERE task_name = 'candidate_plan_drift_demo_task'
+  )
+)
+FROM candidate_plan_ready ready
+CROSS JOIN candidate_plan_rejected rejected;
+ROLLBACK;
+SQL
+)"
+echo "candidate_plan_drift_contract=$candidate_plan_drift_contract"
+[ "$candidate_plan_drift_contract" = "t|ready|t|ready|t|t|rejected|suspended|t|t|t" ] || {
+  echo "Expected immutable prior and live candidate plan drift evidence, got $candidate_plan_drift_contract" >&2
+  exit 1
+}
+
 set +e
 invalid_candidate_output="$(psql_exec -qAt 2>&1 <<'SQL'
 SELECT *
@@ -84,7 +195,7 @@ fi
 echo "candidate_cost_preflight_contract=failed|no_execution"
 
 psql_exec -qAt -v model_name="$cheap_model_name" >/dev/null <<'SQL'
-SELECT otlet.drop_watch('admission_timeout_demo');
+SELECT otlet.drop_watch_registry('admission_timeout_demo');
 SELECT otlet.create_watch(
   watch_name => 'admission_timeout_demo',
   kind => 'pair',
@@ -92,8 +203,10 @@ SELECT otlet.create_watch(
   output_schema => '{"type":"object"}'::jsonb,
   model_name => :'model_name',
   candidate_query => $$
-    SELECT 'slow-candidate'::text AS subject_id, '{}'::jsonb AS input
-    FROM (SELECT pg_sleep(1)) AS delayed
+    SELECT
+      'slow-candidate'::text AS subject_id,
+      jsonb_build_object('digest', max(md5(i::text))) AS input
+    FROM generate_series(1, 5000000) AS delayed(i)
   $$,
   max_candidate_rows => 1
 );
@@ -113,7 +226,7 @@ if [ "$missing_timeout_exit" -eq 0 ] || [[ "$missing_timeout_output" != *"requir
 fi
 
 set +e
-timed_candidate_output="$(docker exec -e PGOPTIONS='-c statement_timeout=100ms' -i "$container" \
+timed_candidate_output="$(docker exec -e PGOPTIONS="-c statement_timeout=100ms $demo_pgoptions" -i "$container" \
   psql -U postgres -d "$database" -qAt -v ON_ERROR_STOP=1 2>&1 <<'SQL'
 SELECT otlet.refresh_semantic_join_index('admission_timeout_demo');
 SQL
@@ -145,13 +258,13 @@ SQL
 invalid_import_exit=$?
 set -e
 invalid_import_count="$(psql_value -c "SELECT count(*) FROM otlet.watches WHERE name = 'admission_import_invalid';")"
-if [ "$invalid_import_exit" -eq 0 ] || [[ "$invalid_import_output" != *"candidate query EXPLAIN failed"* ]] || [ "$invalid_import_count" != "0" ]; then
+if [ "$invalid_import_exit" -eq 0 ] || [[ "$invalid_import_output" != *"source query binding failed"* ]] || [ "$invalid_import_count" != "0" ]; then
   echo "Invalid imported candidate query did not roll back cleanly" >&2
   printf '%s\n' "$invalid_import_output" >&2
   exit 1
 fi
-psql_exec -qAt -c "SELECT otlet.drop_watch('admission_timeout_demo');" >/dev/null
-echo "candidate_import_preflight_contract=failed|0"
+psql_exec -qAt -c "SELECT otlet.drop_watch_registry('admission_timeout_demo');" >/dev/null
+echo "candidate_import_validation_contract=failed|0"
 
 row_cap_contract="$(psql_value -v model_name="$cheap_model_name" <<'SQL'
 BEGIN;
@@ -236,7 +349,8 @@ SELECT otlet.create_task(
 UPDATE otlet.production_policy
 SET max_input_bytes_per_job = 1000,
     max_queued_input_bytes_per_model = 100,
-    max_queued_input_bytes_total = 1000
+    max_queued_input_bytes_total = 1000,
+    max_queued_input_bytes_per_task = 1000
 WHERE name = 'default';
 CREATE TEMP TABLE admission_model_bytes_result AS
 SELECT otlet.run_task('admission_model_bytes_demo') AS queued;
@@ -281,7 +395,8 @@ SELECT otlet.create_task(
 UPDATE otlet.production_policy
 SET max_input_bytes_per_job = 200,
     max_queued_input_bytes_per_model = 200,
-    max_queued_input_bytes_total = 200
+    max_queued_input_bytes_total = 200,
+    max_queued_input_bytes_per_task = 200
 WHERE name = 'default';
 INSERT INTO otlet.jobs (task_name, subject_id, input)
 VALUES (
@@ -357,12 +472,13 @@ CREATE TEMP TABLE admission_enqueue_result AS
 SELECT otlet.run_task('admission_enqueue_only_demo') AS queued;
 SELECT (SELECT queued FROM admission_enqueue_result)::text || '|' ||
        (SELECT status FROM otlet.jobs WHERE task_name = 'admission_enqueue_only_demo') || '|' ||
+       (SELECT job_origin FROM otlet.jobs WHERE task_name = 'admission_enqueue_only_demo') || '|' ||
        (SELECT 42)::text;
 ROLLBACK;
 SQL
 )"
 echo "enqueue_only_contract=$enqueue_only_contract"
-[ "$enqueue_only_contract" = "1|queued|42" ] || {
+[ "$enqueue_only_contract" = "1|queued|task_run|42" ] || {
   echo "Expected enqueue-only admission without a worker wait, got $enqueue_only_contract" >&2
   exit 1
 }

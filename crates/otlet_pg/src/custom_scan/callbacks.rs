@@ -12,6 +12,32 @@ unsafe extern "C-unwind" fn create_semantic_custom_scan_state(
     }
 }
 
+fn require_custom_scan_source_contract(workload_revision_hash: &str) -> Result<bool, String> {
+    pgrx::Spi::connect(|client| {
+        let args = [workload_revision_hash.into()];
+        let table = client
+            .select(
+                "SELECT otlet.require_workload_source_contract(\
+                   revision.task_name, revision.workload_revision_hash, false\
+                 ), \
+                 otlet.semantic_schema_drift_error(revision.definition) IS NOT NULL AS schema_drift \
+                 FROM otlet.workload_revisions revision \
+                 WHERE revision.workload_revision_hash = $1",
+                Some(1),
+                &args,
+            )
+            .map_err(to_string)?;
+        if table.is_empty() {
+            return Err("otlet semantic CustomScan workload revision is missing".to_owned());
+        }
+        table
+            .first()
+            .get_by_name::<bool, _>("schema_drift")
+            .map_err(to_string)?
+            .ok_or_else(|| "otlet semantic CustomScan drift status is missing".to_owned())
+    })
+}
+
 #[pgrx::pg_guard]
 unsafe extern "C-unwind" fn begin_semantic_custom_scan(
     node: *mut pg_sys::CustomScanState,
@@ -23,6 +49,57 @@ unsafe extern "C-unwind" fn begin_semantic_custom_scan(
         let Some(mut private) = custom_private_from_plan(node) else {
             return;
         };
+        let explain_only = (eflags as u32 & pg_sys::EXEC_FLAG_EXPLAIN_ONLY) != 0;
+        let read_only = pg_sys::XactReadOnly || pg_sys::RecoveryInProgress();
+        if read_only {
+            private.allow_refresh = false;
+            private.wait_ms = 0;
+            private.infer_ms = 0;
+            private.infer_max_rows = 0;
+            if !explain_only {
+                private.planner_stats = None;
+            }
+        }
+        if explain_only {
+            let scan = (*node).ss.ps.plan.cast::<pg_sys::CustomScan>();
+            (*state).index_kind = private.index_kind;
+            (*state).has_child_plan = (!(*node).custom_ps.is_null()
+                && pg_sys::list_length((*node).custom_ps) > 0)
+                || (!scan.is_null()
+                    && !(*scan).custom_plans.is_null()
+                    && pg_sys::list_length((*scan).custom_plans) > 0);
+            let mut planner_stats = private
+                .planner_stats
+                .take()
+                .unwrap_or_else(|| reload_private_planner_stats_plan_only(&private));
+            if read_only {
+                finish_planner_stats(&mut planner_stats, false, 0, 0, 0, private.auto_policy);
+                if private.index_kind == SemanticIndexKind::Join
+                    && planner_stats.selected_path == "semantic_lookup"
+                {
+                    planner_stats.selected_path = "semantic_join_lookup".to_owned();
+                }
+            }
+            snapshot_planner_state(
+                state,
+                &planner_stats,
+                &SemanticAutoPolicy {
+                    auto_policy: private.auto_policy,
+                    allow_refresh: private.allow_refresh,
+                    wait_ms: private.wait_ms,
+                    infer_ms: private.infer_ms,
+                    infer_max_rows: private.infer_max_rows,
+                    preload_max_rows: planner_stats.preload_max_rows,
+                    preload_max_bytes: planner_stats.preload_max_bytes,
+                    preload_max_ms: planner_stats.preload_max_ms,
+                },
+            );
+            return;
+        }
+        let executor_schema_drift =
+            require_custom_scan_source_contract(&private.workload_revision_hash)
+                .unwrap_or_else(|err| pgrx::error!("{err}"));
+        let execution_policy = semantic_auto_policy(private.auto_policy);
         let relation = (*node).ss.ss_currentRelation;
         if relation.is_null() && private.index_kind == SemanticIndexKind::Row {
             pgrx::error!("otlet semantic CustomScan could not open source relation");
@@ -53,20 +130,75 @@ unsafe extern "C-unwind" fn begin_semantic_custom_scan(
             private.index_kind,
             &private.index_name,
             &private.expected_json,
+            &private.workload_revision_hash,
+            &execution_policy,
         )
         .unwrap_or_else(|err| pgrx::error!("{err}"));
-        // Prefer plan-time vocabulary from custom_private; overlay exact preload
-        // counts. Keep executor knobs from plan-time private data.
-        let (planner_stats, preloaded_counts) =
+        if executor_schema_drift {
+            let source_rows = loaded_state.subjects.len() as u64;
+            for subject_state in loaded_state.subjects.values_mut() {
+                *subject_state = SubjectSemanticState::Stale;
+            }
+            loaded_state.subject_counts = PreloadedSubjectCounts {
+                fresh_matches: 0,
+                fresh_non_matches: 0,
+                stale: source_rows,
+                inflight: 0,
+                missing: 0,
+            };
+            loaded_state.freshness_basis_counts = "{}".to_owned();
+            loaded_state.freshness_basis_by_subject.clear();
+            loaded_state.stale_reasons = format!("{{\"schema_drift\":{source_rows}}}");
+        }
+        // Keep plan vocabulary and refresh knobs while overlaying exact preload counts
+        let (mut planner_stats, preloaded_counts) =
             planner_stats_from_loaded_state(&private, stashed_stats, &mut loaded_state);
+        if planner_stats.preload_estimate_basis == "unavailable" {
+            apply_preload_estimate(
+                &mut planner_stats,
+                execution_policy.preload_max_rows,
+                execution_policy.preload_max_bytes,
+                execution_policy.preload_max_ms,
+            );
+        }
+        if executor_schema_drift {
+            planner_stats.selected_path = "lookup_fail_closed".to_owned();
+            planner_stats.reason = format!(
+                "fail closed for {} unresolved rows; fresh=0",
+                planner_stats.source_rows
+            );
+            planner_stats.fresh_matches = 0;
+            planner_stats.fresh_non_matches = 0;
+            planner_stats.fresh_rows = 0;
+            planner_stats.stale_rows = planner_stats.source_rows;
+            planner_stats.missing_rows = 0;
+            planner_stats.inflight_rows = 0;
+            planner_stats.infer_decision_rows = 0;
+            planner_stats.fail_closed_decision_rows = planner_stats.source_rows;
+            planner_stats.stale_reasons =
+                format!("{{\"schema_drift\":{}}}", planner_stats.source_rows);
+            planner_stats.count_basis = "exact".to_owned();
+        }
+        let schema_drift = executor_schema_drift
+            || planner_stats.stale_reasons.contains("\"schema_drift\"");
         let policy = SemanticAutoPolicy {
             auto_policy: private.auto_policy,
-            allow_refresh: private.allow_refresh,
-            wait_ms: private.wait_ms,
-            infer_ms: private.infer_ms,
-            infer_max_rows: private.infer_max_rows,
+            allow_refresh: private.allow_refresh && !schema_drift,
+            wait_ms: if schema_drift { 0 } else { private.wait_ms },
+            infer_ms: if schema_drift { 0 } else { private.infer_ms },
+            infer_max_rows: if schema_drift {
+                0
+            } else {
+                private.infer_max_rows
+            },
+            preload_max_rows: execution_policy.preload_max_rows,
+            preload_max_bytes: execution_policy.preload_max_bytes,
+            preload_max_ms: execution_policy.preload_max_ms,
         };
         snapshot_planner_state(state, &planner_stats, &policy);
+        (*state).preload_max_rows = execution_policy.preload_max_rows;
+        (*state).preload_max_bytes = execution_policy.preload_max_bytes;
+        (*state).preload_max_ms = execution_policy.preload_max_ms;
         (*state).index_kind = private.index_kind;
         // Child plan is required above; snapshot for EXPLAIN after runtime free.
         (*state).has_child_plan = !child_plan.is_null();
@@ -81,6 +213,9 @@ unsafe extern "C-unwind" fn begin_semantic_custom_scan(
         (*state).preloaded_stale_subjects = preloaded_counts.stale;
         (*state).preloaded_missing_subjects = preloaded_counts.missing;
         (*state).preloaded_inflight_subjects = preloaded_counts.inflight;
+        (*state).actual_preload_rows = loaded_state.preload_rows;
+        (*state).actual_preload_bytes = loaded_state.preload_bytes;
+        (*state).actual_preload_ms = loaded_state.preload_ms;
         let mut runtime = RuntimeState {
             index_kind: private.index_kind,
             index_name: private.index_name,
@@ -99,8 +234,20 @@ unsafe extern "C-unwind" fn begin_semantic_custom_scan(
             planner_path_cost: planner_stats.path_cost,
             planner_infer_decision_rows: planner_stats.infer_decision_rows,
             planner_fail_closed_decision_rows: planner_stats.fail_closed_decision_rows,
+            planner_preload_estimated_rows: planner_stats.preload_estimated_rows,
+            planner_preload_estimated_bytes: planner_stats.preload_estimated_bytes,
+            planner_preload_estimated_ms: planner_stats.preload_estimated_ms,
+            planner_preload_estimate_basis: planner_stats.preload_estimate_basis,
+            preload_max_rows: execution_policy.preload_max_rows,
+            preload_max_bytes: execution_policy.preload_max_bytes,
+            preload_max_ms: execution_policy.preload_max_ms,
+            actual_preload_rows: loaded_state.preload_rows,
+            actual_preload_bytes: loaded_state.preload_bytes,
+            actual_preload_ms: loaded_state.preload_ms,
+            retained_state_bytes: loaded_state.preload_bytes,
             source_table: loaded_state.source_table,
             task_name: loaded_state.task_name,
+            workload_revision_hash: loaded_state.workload_revision_hash,
             record_type: loaded_state.record_type,
             // Filled after child_plan is set so provider/policy strings match runtime.
             infer_now_executor_context_json: String::new(),
@@ -161,9 +308,6 @@ unsafe extern "C-unwind" fn begin_semantic_custom_scan(
             infer_trace_detailed_captured_tokens: 0,
             infer_trace_detailed_top_k: 0,
             child_plan_rows: 0,
-            queued_refresh_subjects: HashSet::with_capacity(
-                usize::try_from(private.infer_max_rows.max(8)).unwrap_or(8),
-            ),
             pending_refresh_subjects: Vec::with_capacity(CUSTOM_SCAN_REFRESH_BATCH_SIZE),
             pending_output_rows: VecDeque::with_capacity(
                 usize::try_from(private.infer_max_rows)
@@ -197,6 +341,13 @@ unsafe fn snapshot_planner_state(
         (*state).planner_path_cost = planner_stats.path_cost;
         (*state).planner_infer_decision_rows = planner_stats.infer_decision_rows;
         (*state).planner_fail_closed_decision_rows = planner_stats.fail_closed_decision_rows;
+        (*state).planner_preload_estimated_rows = planner_stats.preload_estimated_rows;
+        (*state).planner_preload_estimated_bytes = planner_stats.preload_estimated_bytes;
+        (*state).planner_preload_estimated_ms = planner_stats.preload_estimated_ms;
+        (*state).planner_preload_estimate_basis = pg_cstr(&planner_stats.preload_estimate_basis);
+        (*state).preload_max_rows = planner_stats.preload_max_rows;
+        (*state).preload_max_bytes = planner_stats.preload_max_bytes;
+        (*state).preload_max_ms = planner_stats.preload_max_ms;
     }
 }
 
@@ -248,6 +399,14 @@ unsafe extern "C-unwind" fn semantic_custom_scan_access(
             let Some(subject_id) = datum_to_text(value, runtime.subject_typid) else {
                 continue;
             };
+            if !runtime.semantic_states.contains_key(&subject_id) {
+                retain_runtime_semantic_state(
+                    runtime,
+                    &subject_id,
+                    SubjectSemanticState::Missing,
+                )
+                .unwrap_or_else(|err| pgrx::error!("{err}"));
+            }
             match runtime
                 .semantic_states
                 .get(&subject_id)
@@ -493,7 +652,6 @@ unsafe extern "C-unwind" fn rescan_semantic_custom_scan(node: *mut pg_sys::Custo
             runtime.infer_trace_detailed_top_k = 0;
             runtime.child_plan_rows = 0;
             runtime.emitted_freshness_basis.clear();
-            runtime.queued_refresh_subjects.clear();
             runtime.pending_refresh_subjects.clear();
             runtime.pending_output_rows.clear();
             if !runtime.child_plan.is_null() {

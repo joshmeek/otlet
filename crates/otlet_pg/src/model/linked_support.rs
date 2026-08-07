@@ -235,34 +235,32 @@ impl JsonCompletion {
     }
 }
 
-fn linked_cancel_requested(job_id: i64) -> Result<bool, ModelError> {
-    match crate::infer_now::persist_timeout_cancel(job_id) {
-        Ok(true) => return Ok(true),
-        Ok(false) => {}
-        Err(err) => return Err(ModelError::new(err)),
-    }
+pub(crate) fn linked_cancel_requested(job: &Job, phase: &str) -> Result<bool, ModelError> {
+    crate::infer_now::persist_timeout_cancel(job.id).map_err(ModelError::new)?;
 
     let result: pgrx::spi::Result<Result<bool, ModelError>> =
         pgrx::bgworkers::BackgroundWorker::transaction(|| {
-            // Read-only probe — use select so the plan stays non-volatile.
-            pgrx::Spi::connect(|client| {
-                let args = [job_id.into()];
-                let rows = client.select(
-                    "SELECT status = 'cancel_requested' FROM otlet.jobs WHERE id = $1 LIMIT 1",
+            pgrx::Spi::connect_mut(|client| {
+                let args = [
+                    job.id.into(),
+                    job.claim_token.as_str().into(),
+                    phase.into(),
+                ];
+                let rows = client.update(
+                    "SELECT otlet.observe_native_job_cancellation($1, $2, $3)",
                     Some(1),
                     &args,
                 )?;
                 if rows.is_empty() {
-                    // Fail closed: a vanished job mid-decode must not keep generating.
                     return Ok(Err(ModelError::new(
-                        "linked cancellation check: job row missing",
+                        "linked cancellation check returned no state",
                     )));
                 }
 
                 match rows.first().get::<bool>(1)? {
                     Some(canceled) => Ok(Ok(canceled)),
                     None => Ok(Err(ModelError::new(
-                        "linked cancellation check: cancel flag unreadable",
+                        "linked cancellation check returned unreadable state",
                     ))),
                 }
             })
@@ -270,8 +268,10 @@ fn linked_cancel_requested(job_id: i64) -> Result<bool, ModelError> {
 
     match result {
         Ok(inner) => inner,
-        Err(err) => Err(ModelError::new(format!(
-            "linked cancellation check failed: {err}"
-        ))),
+        Err(err) => {
+            Err(ModelError::new(format!(
+                "linked cancellation check failed: {err}"
+            )))
+        }
     }
 }

@@ -62,14 +62,19 @@ struct ModelSelectionPolicyCache {
 }
 
 impl ModelSelectionPolicyCache {
-    fn get(&mut self, task_name: &str) -> pgrx::spi::Result<Option<&ModelSelectionPolicy>> {
+    fn get(
+        &mut self,
+        workload_revision_hash: &str,
+    ) -> pgrx::spi::Result<Option<&ModelSelectionPolicy>> {
         if self
             .cached
             .as_ref()
-            .is_none_or(|(cached_task, _)| cached_task != task_name)
+            .is_none_or(|(cached_revision, _)| cached_revision != workload_revision_hash)
         {
-            let policy = BackgroundWorker::transaction(|| model_selection_policy(task_name))?;
-            self.cached = Some((task_name.to_owned(), policy));
+            let policy = BackgroundWorker::transaction(|| {
+                model_selection_policy(workload_revision_hash)
+            })?;
+            self.cached = Some((workload_revision_hash.to_owned(), policy));
         }
         Ok(self.cached.as_ref().and_then(|(_, policy)| policy.as_ref()))
     }
@@ -91,24 +96,33 @@ impl BatchProcessResult {
 }
 
 fn process_job_batch(jobs: Vec<Job>) -> BatchProcessResult {
-    // One transaction for the whole claim batch: mark_job_started is warn-only
-    // and must stay outside the policy-lookup txn (SPI errors abort that txn).
-    mark_jobs_started(&jobs);
     let mut batch = BatchProcessResult::default();
     let mut policy_cache = ModelSelectionPolicyCache::default();
     let mut strong_jobs = Vec::with_capacity(jobs.len().min(8));
-    for job in jobs {
-        let mut result = process_job_deferred(&job, &mut policy_cache, true);
+    let mut jobs = jobs.into_iter();
+    while let Some(job) = jobs.next() {
+        if !renew_held_jobs(
+            jobs.as_slice()
+                .iter()
+                .chain(strong_jobs.iter().map(|(_, job, _)| job)),
+        ) {
+            return batch;
+        }
+        let mut result = process_job_deferred(&job, &mut policy_cache);
         if let Some(reason) = result.strong_fallback.take() {
-            // Move the original Job; strong model comes from the batch policy cache.
+            // Move the original Job; strong model comes from its revision policy.
             strong_jobs.push((result, job, reason));
         } else {
             batch.add_finished(&result);
         }
     }
 
-    for (mut result, job, reason) in strong_jobs {
-        let strong_result = match policy_cache.get(&job.task_name) {
+    let mut strong_jobs = strong_jobs.into_iter();
+    while let Some((mut result, job, reason)) = strong_jobs.next() {
+        if !renew_held_jobs(strong_jobs.as_slice().iter().map(|(_, job, _)| job)) {
+            return batch;
+        }
+        let strong_result = match policy_cache.get(&job.workload_revision_hash) {
             Ok(Some(policy)) => run_strong_attempt_with_model(&job, &policy.strong, reason),
             Ok(None) => {
                 let err = ModelError::new("strong_fallback_missing_policy");
@@ -143,11 +157,48 @@ fn process_job_batch(jobs: Vec<Job>) -> BatchProcessResult {
     batch
 }
 
+fn renew_held_jobs<'job>(jobs: impl Iterator<Item = &'job Job>) -> bool {
+    let jobs = jobs.collect::<Vec<_>>();
+    if jobs.is_empty() {
+        return true;
+    }
+    let ids = jobs.iter().map(|job| job.id).collect::<Vec<_>>();
+    let tokens = jobs
+        .iter()
+        .map(|job| job.claim_token.as_str())
+        .collect::<Vec<_>>();
+    let renewed: pgrx::spi::Result<i64> = BackgroundWorker::transaction(|| {
+        pgrx::Spi::connect_mut(|client| {
+            let args = [ids.as_slice().into(), tokens.as_slice().into()];
+            let rows = client.update(
+                "SELECT otlet.renew_job_leases($1, $2)",
+                Some(1),
+                &args,
+            )?;
+            Ok(rows.first().get::<i64>(1)?.unwrap_or(0))
+        })
+    });
+    match renewed {
+        Ok(count) if count == jobs.len() as i64 => true,
+        Ok(count) => {
+            pgrx::warning!(
+                "otlet worker renewed {count} of {} held batch claims",
+                jobs.len()
+            );
+            false
+        }
+        Err(err) => {
+            pgrx::warning!("otlet worker held-claim renewal failed: {err}");
+            false
+        }
+    }
+}
+
 fn process_job(job: Job) -> JobProcessResult {
     let mut policy_cache = ModelSelectionPolicyCache::default();
-    let mut result = process_job_deferred(&job, &mut policy_cache, false);
+    let mut result = process_job_deferred(&job, &mut policy_cache);
     if let Some(reason) = result.strong_fallback.take() {
-        let strong_result = match policy_cache.get(&job.task_name) {
+        let strong_result = match policy_cache.get(&job.workload_revision_hash) {
             Ok(Some(policy)) => run_strong_attempt_with_model(&job, &policy.strong, reason),
             Ok(None) => {
                 let err = ModelError::new("strong_fallback_missing_policy");
@@ -183,16 +234,36 @@ fn process_job(job: Job) -> JobProcessResult {
 fn process_job_deferred(
     job: &Job,
     policy_cache: &mut ModelSelectionPolicyCache,
-    already_marked: bool,
 ) -> JobProcessResult {
-    // Keep start marking separate: its failure only warns and must not abort
-    // the policy lookup transaction (SPI errors abort the current txn).
-    if !already_marked {
-        mark_jobs_started(std::slice::from_ref(job));
+    match linked_cancel_requested(job, "claimed_batch_wait") {
+        Ok(true) => {
+            return fail_attempt_result_with_model(
+                job,
+                job.model_name.as_str(),
+                &ModelError::new("canceled"),
+                job.selection_role.as_str(),
+                "canceled",
+            );
+        }
+        Ok(false) => {}
+        Err(err) => {
+            return fail_attempt_result_with_model(
+                job,
+                job.model_name.as_str(),
+                &err,
+                job.selection_role.as_str(),
+                "cancellation_observation_failed",
+            );
+        }
+    }
+
+    if !mark_job_started(job) {
+        let err = ModelError::new("job claim is stale before start");
+        return JobProcessResult::failed_with(&err);
     }
 
     if job.selection_role == "strong" {
-        return match policy_cache.get(&job.task_name) {
+        return match policy_cache.get(&job.workload_revision_hash) {
             Ok(Some(policy)) => {
                 run_strong_attempt_with_model(job, &policy.strong, "cheap_attempt_rejected")
             }
@@ -213,7 +284,7 @@ fn process_job_deferred(
         };
     }
 
-    match policy_cache.get(&job.task_name) {
+    match policy_cache.get(&job.workload_revision_hash) {
         Ok(Some(policy)) => process_selected_job(job, policy),
         Ok(None) => process_direct_job(job),
         Err(err) => {
@@ -239,26 +310,28 @@ fn process_job_deferred(
     }
 }
 
-fn mark_jobs_started(jobs: &[Job]) {
-    if jobs.is_empty() {
-        return;
-    }
-    // One SPI statement with a typed bigint[] arg — same per-id side effects as
-    // N mark_job_started calls, without building a dynamic ARRAY literal.
-    let ids: Vec<i64> = jobs.iter().map(|job| job.id).collect();
-    let start_result: pgrx::spi::Result<()> = BackgroundWorker::transaction(|| {
+fn mark_job_started(job: &Job) -> bool {
+    let start_result: pgrx::spi::Result<bool> = BackgroundWorker::transaction(|| {
         pgrx::Spi::connect_mut(|client| {
-            let args = [ids.as_slice().into()];
-            client.update(
-                "SELECT otlet.mark_job_started(id) FROM unnest($1::bigint[]) AS id",
-                Some(jobs.len() as i64),
+            let args = [job.id.into(), job.claim_token.as_str().into()];
+            let rows = client.update(
+                "SELECT otlet.mark_job_started($1, $2)",
+                Some(1),
                 &args,
             )?;
-            Ok(())
+            Ok(rows.first().get::<bool>(1)?.unwrap_or(false))
         })
     });
-    if let Err(err) = start_result {
-        pgrx::warning!("otlet worker start event batch failed: {err}");
+    match start_result {
+        Ok(true) => true,
+        Ok(false) => {
+            pgrx::warning!("otlet worker skipped stale job {} before start", job.id);
+            false
+        }
+        Err(err) => {
+            pgrx::warning!("otlet worker start event failed: {err}");
+            false
+        }
     }
 }
 

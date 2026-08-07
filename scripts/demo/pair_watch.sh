@@ -36,7 +36,11 @@ FROM otlet.create_watch(
   action_types => ARRAY['merge_candidate', 'new_entity', 'review_flag'],
   input_shaping => '{"source_fields":["_otlet_mvcc","action_ids","candidate_evidence","evidence_counts"],"evidence_fields":["candidate_evidence"],"action_id_fields":{"left_id":"left_id","right_id":"right_id"}}'::jsonb,
   decision_contract => '{"preset":"entity_resolution_evidence_v1"}'::jsonb,
-  max_candidate_rows => 10
+  max_candidate_rows => 10,
+  pair_sources => '[
+    {"table":"public.otlet_demo_vendor_entity","subject_column":"id"},
+    {"table":"public.otlet_demo_vendor_pair","subject_column":"pair_id"}
+  ]'::jsonb
 );
 SQL
 
@@ -55,7 +59,8 @@ throughput_contracts="$(psql_exec -qAt \
   -v record_type="$record_type" \
   -v model_name="$cheap_model_name" <<'SQL'
 SELECT count(*) FILTER (WHERE a.action_type = 'create_record' AND a.status = 'complete')::text || '|' ||
-       count(*) FILTER (WHERE r.record_type = :'record_type')::text
+       count(*) FILTER (WHERE r.record_type = :'record_type')::text || '|' ||
+       bool_and(j.job_origin = 'pair_watch')::text
 FROM otlet.jobs j
 LEFT JOIN otlet.actions a ON a.job_id = j.id
 LEFT JOIN otlet.records r ON r.action_id = a.id
@@ -72,7 +77,9 @@ SELECT q.queue_state || '|' ||
        w.running_jobs::text || '|' ||
        w.last_batch_jobs::text || '|' ||
        w.last_batch_completed_jobs::text || '|' ||
-       w.last_batch_failed_jobs::text
+       w.last_batch_failed_jobs::text || '|' ||
+       w.active_claimed_jobs::text || '|' ||
+       w.available_active_job_slots::text
 FROM otlet.worker_throughput_status w
 JOIN otlet.model_queue_status q ON q.model_name = w.model_name
 WHERE w.model_name = :'model_name';
@@ -82,8 +89,8 @@ auto_records="$(sed -n '1p' <<<"$throughput_contracts")"
 materialized="$(sed -n '2p' <<<"$throughput_contracts")"
 throughput_status_contract="$(sed -n '3p' <<<"$throughput_contracts")"
 echo "semantic_join_auto_records=$auto_records"
-[ "$auto_records" = "4|4" ] || {
-  echo "Expected 4 auto actions and records, got $auto_records" >&2
+[ "$auto_records" = "4|4|true" ] || {
+  echo "Expected 4 pair-watch jobs, auto actions, and records, got $auto_records" >&2
   exit 1
 }
 
@@ -94,8 +101,8 @@ echo "semantic_join_auto_materialized=$materialized"
 }
 
 echo "throughput_status_contract=$throughput_status_contract"
-[ "$throughput_status_contract" = "queue_accepting|0|0|4|4|0" ] || {
-  echo "Expected throughput status contract queue_accepting|0|0|4|4|0, got $throughput_status_contract" >&2
+[ "$throughput_status_contract" = "queue_accepting|0|0|4|4|0|0|8" ] || {
+  echo "Expected throughput status contract queue_accepting|0|0|4|4|0|0|8, got $throughput_status_contract" >&2
   exit 1
 }
 
@@ -123,7 +130,7 @@ SQL
 join_status_estimated="$(head -n 1 <<<"$join_status_contract")"
 join_status_exact="$(tail -n 1 <<<"$join_status_contract")"
 echo "semantic_join_status_contract=$join_status_contract"
-[ "$join_status_estimated|$join_status_exact" = "semantic_join_lookup|4|4|0|0|0|0|estimated|semantic_join_lookup|4|4|0|0|0|0|exact" ] || {
+[ "$join_status_estimated|$join_status_exact" = "semantic_join_lookup|4|4|0|0|0|0|maintained|semantic_join_lookup|4|4|0|0|0|0|exact" ] || {
   echo "Expected fresh semantic join status, got $join_status_contract" >&2
   exit 1
 }

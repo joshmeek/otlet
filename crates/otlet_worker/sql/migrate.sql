@@ -28,7 +28,28 @@ END;
 $$;
 \endif
 
+\if :portable_apply_migration_0001
+\else
+DO $migration$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1
+    FROM otlet.portable_schema_migrations
+    WHERE version = 44
+  ) THEN
+    RAISE EXCEPTION USING
+      ERRCODE = 'feature_not_supported',
+      MESSAGE = 'otlet cannot upgrade this unsupported pre-beta portable schema',
+      HINT = 'Create a fresh database and run the current portable install';
+  END IF;
+END;
+$migration$;
+\endif
+
 \set portable_migration_file ../../../otlet_pg/sql/migrations/0002_identity_contract.sql
+\ir migrations/apply.sql
+
+\set portable_migration_file ../../../otlet_pg/sql/migrations/0044_source_query_contract.sql
 \ir migrations/apply.sql
 
 \set portable_migration_file ../../../otlet_pg/sql/migrations/0003_action_schema.sql
@@ -127,6 +148,9 @@ $$;
 \set portable_migration_file ../../../otlet_pg/sql/migrations/0034_semantic_status_plan.sql
 \ir migrations/apply.sql
 
+\set portable_migration_file ../../../otlet_pg/sql/migrations/0045_watch_reconciliation.sql
+\ir migrations/apply.sql
+
 \set portable_migration_file ../../../otlet_pg/sql/migrations/0035_queue_policy_status.sql
 \ir migrations/apply.sql
 
@@ -151,5 +175,134 @@ $$;
 \set portable_migration_file ../../../otlet_pg/sql/migrations/0042_portable_permissions.sql
 \ir migrations/apply.sql
 
+\set portable_migration_file ../../../otlet_pg/sql/migrations/0046_definition_complexity.sql
+\ir migrations/apply.sql
+
+\set portable_migration_file ../../../otlet_pg/sql/migrations/0047_runtime_capabilities.sql
+\ir migrations/apply.sql
+
+\set portable_migration_file ../../../otlet_pg/sql/migrations/0048_application_invocation.sql
+\ir migrations/apply.sql
+
+\set portable_migration_file ../../../otlet_pg/sql/migrations/0049_invocation_provenance.sql
+\ir migrations/apply.sql
+
+\set portable_migration_file ../../../otlet_pg/sql/migrations/0050_task_watch_operational_lifecycle.sql
+\ir migrations/apply.sql
+
+\set portable_migration_file ../../../otlet_pg/sql/migrations/0051_administrative_change_ledger.sql
+\ir migrations/apply.sql
+
+\set portable_migration_file ../../../otlet_pg/sql/migrations/0052_workload_acceptance_contract.sql
+\ir migrations/apply.sql
+
+\set portable_migration_file ../../../otlet_pg/sql/migrations/0053_replayable_evaluation.sql
+\ir migrations/apply.sql
+
+\set portable_migration_file ../../../otlet_pg/sql/migrations/0054_evaluation_population_lineage.sql
+\ir migrations/apply.sql
+
+\set portable_migration_file ../../../otlet_pg/sql/migrations/0055_evaluation_slices_support.sql
+\ir migrations/apply.sql
+
+\set portable_migration_file ../../../otlet_pg/sql/migrations/0056_label_provenance_quality.sql
+\ir migrations/apply.sql
+
+\set portable_migration_file ../../../otlet_pg/sql/migrations/0057_production_model_qualification.sql
+\ir migrations/apply.sql
+
+\set portable_migration_file ../../../otlet_pg/sql/migrations/0058_promotion_shadow_rollback.sql
+\ir migrations/apply.sql
+
+\set portable_migration_file ../../../otlet_pg/sql/migrations/0059_quality_data_drift.sql
+\ir migrations/apply.sql
+
+\set portable_migration_file ../../../otlet_pg/sql/migrations/0060_review_economics.sql
+\ir migrations/apply.sql
+
+\set portable_migration_file ../../../otlet_pg/sql/migrations/0061_model_license_use_policy.sql
+\ir migrations/apply.sql
+
+\set portable_migration_file ../../../otlet_pg/sql/migrations/0062_model_artifact_lifecycle.sql
+\ir migrations/apply.sql
+
 \set portable_migration_file 0043_permissions.sql
+\ir migrations/apply.sql
+
+\set portable_migration_file ../../../otlet_pg/sql/migrations/0063_failure_retry_taxonomy.sql
+\ir migrations/apply.sql
+
+\set portable_migration_file ../../../otlet_pg/sql/migrations/0064_candidate_set_coverage.sql
+\ir migrations/apply.sql
+
+\set portable_migration_file ../../../otlet_pg/sql/migrations/0065_entity_resolution_quality.sql
+\ir migrations/apply.sql
+
+\set portable_migration_file ../../../otlet_pg/sql/migrations/0066_pair_constraint_ledger.sql
+\ir migrations/apply.sql
+
+\set portable_migration_file ../../../otlet_pg/sql/migrations/0067_entity_graph_conflict_status.sql
+\ir migrations/apply.sql
+
+\set portable_migration_file ../../../otlet_pg/sql/migrations/0068_authoritative_semantic_correction.sql
+\ir migrations/apply.sql
+
+\set portable_migration_file ../../../otlet_pg/sql/migrations/0069_evidence_linked_decisions.sql
+\ir migrations/apply.sql
+
+\set portable_migration_file ../../../otlet_pg/sql/migrations/0070_review_sampling.sql
+\ir migrations/apply.sql
+
+\set portable_migration_file ../../../otlet_pg/sql/migrations/0071_reviewer_rubric_calibration.sql
+\ir migrations/apply.sql
+
+\set portable_migration_file ../../../otlet_pg/sql/migrations/0072_time_based_freshness.sql
+\ir migrations/apply.sql
+
+\set portable_migration_file ../../../otlet_pg/sql/migrations/0073_minimal_bounded_backfill.sql
+\ir migrations/apply.sql
+
+\set portable_migration_file ../../../otlet_pg/sql/migrations/0074_workload_pack_promotion.sql
+\ir migrations/apply.sql
+
+\set portable_migration_file ../../../otlet_pg/sql/migrations/0075_job_origin_workload_budgets.sql
+\ir migrations/apply.sql
+
+\set portable_migration_file ../../../otlet_pg/sql/migrations/0076_interactive_async_service_quantum.sql
+\ir migrations/apply.sql
+
+\set portable_migration_file ../../../otlet_pg/sql/migrations/0077_workload_enablement_preflight.sql
+\ir migrations/apply.sql
+
+\set portable_migration_file ../../../otlet_pg/sql/migrations/0078_semantic_planner_statistics.sql
+\ir migrations/apply.sql
+
+\set portable_migration_file ../../../otlet_pg/sql/migrations/0079_bounded_customscan_state.sql
+\ir migrations/apply.sql
+
+\set portable_migration_file ../../../otlet_pg/sql/migrations/0080_model_bound_context_budgets.sql
+\ir migrations/apply.sql
+
+\set portable_migration_file ../../../otlet_pg/sql/migrations/0081_native_cancellation_slo.sql
+\ir migrations/apply.sql
+
+\set portable_migration_file ../../../otlet_pg/sql/migrations/0082_worker_database_operation_deadlines.sql
+\ir migrations/apply.sql
+
+\set portable_migration_file ../../../otlet_pg/sql/migrations/0083_route_readiness_stranded_escalation.sql
+\ir migrations/apply.sql
+
+\set portable_migration_file ../../../otlet_pg/sql/migrations/0084_bounded_maintenance_execution.sql
+\ir migrations/apply.sql
+
+\set portable_migration_file ../../../otlet_pg/sql/migrations/0085_versioned_observability_quality_status.sql
+\ir migrations/apply.sql
+
+\set portable_migration_file ../../../otlet_pg/sql/migrations/0086_access_policy_lifecycle.sql
+\ir migrations/apply.sql
+
+\set portable_migration_file ../../../otlet_pg/sql/migrations/0087_complete_evidence_lifecycle.sql
+\ir migrations/apply.sql
+
+\set portable_migration_file ../../../otlet_pg/sql/migrations/0088_branch_review_corrections.sql
 \ir migrations/apply.sql

@@ -1,6 +1,6 @@
 log "Proving bounded row updates"
 psql_exec -v watch_name="$bounded_action_watch" >/dev/null <<'SQL'
-SELECT otlet.drop_watch(:'watch_name');
+SELECT otlet.drop_watch_registry(:'watch_name');
 SQL
 cleanup_task "$bounded_action_task"
 
@@ -130,6 +130,9 @@ BEGIN
             'changes', jsonb_build_object(
               'review_state', 'approved',
               'review_reason', 'stale apply'
+            ),
+            'evidence', jsonb_build_array(
+              jsonb_build_array('row', 'review_state')
             )
           )
         ))
@@ -247,8 +250,35 @@ echo "bounded_proposal_contract=$bounded_proposal_contract"
   exit 1
 }
 
+bounded_update_evidence_contract="$(psql_value -v task_name="$bounded_action_task" <<'SQL'
+SELECT count(*) = 1
+       AND bool_and(evidence.action_index = 0)
+       AND bool_and(action.status = 'proposed' AND action.error IS NULL)
+       AND bool_and(context.validation_error IS NULL)
+       AND bool_and(
+         evidence.evidence_path = ARRAY['row','review_state']::text[]
+         AND evidence.value_hash = otlet.identity_hash(
+           'decision_evidence_value',
+           '"pending"'::jsonb
+         )
+       )
+FROM otlet.audit_decision_evidence_export evidence
+JOIN otlet.jobs job ON job.id = evidence.job_id
+JOIN otlet.actions action ON action.id = evidence.action_id
+CROSS JOIN LATERAL otlet.validated_action_context(action.id) context
+WHERE job.task_name = :'task_name'
+  AND job.subject_id = 'row-2'
+  AND evidence.target_kind = 'action';
+SQL
+)"
+echo "bounded_update_evidence_contract=$bounded_update_evidence_contract"
+[ "$bounded_update_evidence_contract" = "t" ] || {
+  echo "Expected one validated update_row evidence link, got $bounded_update_evidence_contract" >&2
+  exit 1
+}
+
 bounded_rows_before_dry_run="$(psql_value <<'SQL'
-SELECT md5(string_agg(otlet.semantic_canonical_jsonb(to_jsonb(source))::text, '' ORDER BY id))
+SELECT otlet.portable_text_hash(string_agg(otlet.semantic_canonical_jsonb(to_jsonb(source))::text, '' ORDER BY id))
 FROM public.otlet_demo_bounded_actions source;
 SQL
 )"
@@ -263,7 +293,7 @@ WHERE j.task_name = :'task_name'
 SQL
 
 bounded_rows_after_dry_run="$(psql_value <<'SQL'
-SELECT md5(string_agg(otlet.semantic_canonical_jsonb(to_jsonb(source))::text, '' ORDER BY id))
+SELECT otlet.portable_text_hash(string_agg(otlet.semantic_canonical_jsonb(to_jsonb(source))::text, '' ORDER BY id))
 FROM public.otlet_demo_bounded_actions source;
 SQL
 )"

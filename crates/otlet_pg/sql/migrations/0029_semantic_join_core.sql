@@ -1,5 +1,6 @@
 CREATE FUNCTION otlet.semantic_join_refresh_inputs(
-  index_name text
+  index_name text,
+  workload_revision_hash text DEFAULT NULL
 ) RETURNS TABLE (
   subject_id text,
   input jsonb
@@ -11,29 +12,40 @@ DECLARE
   index_row otlet.semantic_join_indexes%ROWTYPE;
   current_contract_hash text;
   current_input_shaping jsonb := '{}'::jsonb;
+  revision_definition jsonb;
+  requested_revision_hash text := semantic_join_refresh_inputs.workload_revision_hash;
 BEGIN
-  SELECT *
-  INTO index_row
-  FROM otlet.semantic_join_indexes sji
-  WHERE sji.name = semantic_join_refresh_inputs.index_name;
-
-  IF NOT FOUND THEN
-    RAISE EXCEPTION 'otlet semantic join index % does not exist', semantic_join_refresh_inputs.index_name;
+  IF requested_revision_hash IS NULL THEN
+    SELECT head.active_workload_revision_hash
+    INTO requested_revision_hash
+    FROM otlet.workload_revision_heads head
+    JOIN otlet.workload_revisions revision
+      ON revision.task_name = head.task_name
+     AND revision.workload_revision_hash = head.active_workload_revision_hash
+    WHERE revision.definition #>> '{source,semantic_join_index_name}' = semantic_join_refresh_inputs.index_name
+      AND revision.definition #>> '{source,kind}' = 'pair';
   END IF;
 
-  SELECT
-    otlet.task_contract_hash(
-      t.instruction,
-      t.output_schema,
-      t.model_name,
-      t.runtime_options,
-      t.input_shaping,
-      t.decision_contract
-    ),
-    t.input_shaping
-  INTO current_contract_hash, current_input_shaping
-  FROM otlet.tasks t
-  WHERE t.name = index_row.task_name;
+  SELECT revision.definition
+  INTO revision_definition
+  FROM otlet.workload_revisions revision
+  JOIN otlet.workload_revision_heads head
+    ON head.task_name = revision.task_name
+   AND head.active_workload_revision_hash = revision.workload_revision_hash
+  WHERE revision.workload_revision_hash = requested_revision_hash
+    AND revision.definition #>> '{source,semantic_join_index_name}' = semantic_join_refresh_inputs.index_name
+    AND revision.definition #>> '{source,kind}' = 'pair';
+
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'otlet active workload revision does not define semantic join index %',
+      semantic_join_refresh_inputs.index_name;
+  END IF;
+
+  index_row.name := revision_definition #>> '{source,semantic_join_index_name}';
+  index_row.task_name := revision_definition #>> '{task,name}';
+  index_row.record_type := revision_definition #>> '{source,record_type}';
+  current_input_shaping := revision_definition #> '{task,input_shaping}';
+  current_contract_hash := requested_revision_hash;
 
   RETURN QUERY EXECUTE format(
     $sql$
@@ -42,18 +54,14 @@ BEGIN
           candidate.subject_id,
           candidate.input,
           otlet.semantic_content_hash(candidate.input, %6$L::jsonb) AS content_hash
-        FROM (
-          SELECT subject_id::text AS subject_id, input::jsonb AS input
-          FROM (%1$s) otlet_join_candidate
-          ORDER BY subject_id
-          LIMIT %2$s
-        ) candidate
+        FROM otlet.semantic_join_candidate_rows(%1$L, %2$L) candidate
       ),
       candidate_materializations AS (
         SELECT
           sm.id,
           sm.content_hash AS material_content_hash,
           sm.contract_hash AS material_contract_hash,
+          sm.stale AS material_stale,
           sm.stale_reason,
           ci.subject_id AS current_subject_id,
           ci.content_hash AS current_content_hash,
@@ -71,8 +79,13 @@ BEGIN
           ON sm.task_name = %3$L
          AND sm.record_type = %4$L
          AND sm.subject_id = ci.subject_id
+         AND sm.contract_hash = %5$L
         WHERE ci.subject_id IS NOT NULL
-           OR (sm.task_name = %3$L AND sm.record_type = %4$L)
+           OR (
+             sm.task_name = %3$L
+             AND sm.record_type = %4$L
+             AND sm.contract_hash = %5$L
+           )
       ),
       candidate_states AS (
         SELECT
@@ -102,6 +115,7 @@ BEGIN
         FROM candidate_states state
         WHERE sm.id = state.id
           AND state.transition IS NOT NULL
+          AND sm.stale_reason IS DISTINCT FROM 'contract_changed'
           AND (
             sm.stale IS DISTINCT FROM (state.transition <> 'candidate_restored')
             OR sm.stale_reason IS DISTINCT FROM CASE
@@ -112,11 +126,13 @@ BEGIN
         RETURNING sm.id
       ),
       matched_inputs AS (
-        SELECT DISTINCT current_subject_id AS subject_id
-        FROM candidate_materializations
-        WHERE current_subject_id IS NOT NULL
-          AND material_content_hash = current_content_hash
-          AND material_contract_hash = %5$L
+        SELECT DISTINCT candidate.current_subject_id AS subject_id
+        FROM candidate_materializations candidate
+        LEFT JOIN candidate_states state ON state.id = candidate.id
+        WHERE candidate.current_subject_id IS NOT NULL
+          AND candidate.material_content_hash = candidate.current_content_hash
+          AND candidate.material_contract_hash = %5$L
+          AND (NOT candidate.material_stale OR state.transition = 'candidate_restored')
       )
       SELECT ci.subject_id, ci.input
       FROM current_inputs ci
@@ -125,10 +141,10 @@ BEGIN
         FROM matched_inputs matched
         WHERE matched.subject_id = ci.subject_id
       )
-      ORDER BY ci.subject_id
+      ORDER BY ci.subject_id COLLATE "C"
     $sql$,
-    index_row.candidate_query,
-    index_row.max_candidate_rows,
+    index_row.name,
+    current_contract_hash,
     index_row.task_name,
     index_row.record_type,
     current_contract_hash,
@@ -147,7 +163,8 @@ CREATE FUNCTION otlet.create_watch_pair_index(
   runtime_options jsonb DEFAULT '{}'::jsonb,
   max_candidate_rows integer DEFAULT 1000,
   input_shaping jsonb DEFAULT '{}'::jsonb,
-  decision_contract jsonb DEFAULT '{}'::jsonb
+  decision_contract jsonb DEFAULT '{}'::jsonb,
+  pair_sources jsonb DEFAULT '[]'::jsonb
 ) RETURNS otlet.semantic_join_indexes
 LANGUAGE plpgsql
 AS $$
@@ -156,9 +173,10 @@ DECLARE
   semantic_record_type text := COALESCE(record_type, index_name);
   semantic_task_name text := index_name || '_task';
   bounded_rows integer := GREATEST(1, LEAST(COALESCE(max_candidate_rows, 1000), 100000));
-  wrapped_query text;
   candidate_plan jsonb;
   candidate_plan_cost numeric;
+  candidate_preflight_at timestamptz;
+  candidate_contract jsonb;
 BEGIN
   IF index_name !~ '^[a-z0-9][a-z0-9_-]*$' THEN
     RAISE EXCEPTION 'otlet semantic join index name % must be a simple identifier', index_name;
@@ -168,25 +186,32 @@ BEGIN
     RAISE EXCEPTION 'otlet semantic join index name % creates invalid task name %', index_name, semantic_task_name;
   END IF;
 
-  SELECT preflight.candidate_plan, preflight.candidate_plan_cost
-  INTO candidate_plan, candidate_plan_cost
-  FROM otlet.preflight_candidate_query(candidate_query) preflight;
-
-  wrapped_query := format(
-    'SELECT subject_id, input FROM otlet.semantic_join_refresh_inputs(%L)',
-    index_name
-  );
-
   PERFORM otlet.create_task(
     semantic_task_name,
-    wrapped_query,
+    candidate_query,
     instruction,
     output_schema,
     model_name,
     runtime_options,
     input_shaping,
-    decision_contract
+    decision_contract,
+    pair_sources
   );
+  SELECT task.source_query_contract
+  INTO candidate_contract
+  FROM otlet.tasks task
+  WHERE task.name = semantic_task_name;
+  SELECT
+    preflight.candidate_plan,
+    preflight.candidate_plan_cost,
+    preflight.candidate_preflight_at
+  INTO candidate_plan, candidate_plan_cost, candidate_preflight_at
+  FROM otlet.preflight_candidate_query(
+    candidate_contract #>> '{query,resolved}',
+    true,
+    false,
+    candidate_contract
+  ) preflight;
 
   INSERT INTO otlet.semantic_join_indexes (
     name,
@@ -209,7 +234,7 @@ BEGIN
     bounded_rows,
     candidate_plan,
     candidate_plan_cost,
-    now(),
+    candidate_preflight_at,
     now()
   )
   ON CONFLICT (name) DO UPDATE
@@ -245,20 +270,15 @@ BEGIN
     RETURN false;
   END IF;
 
-  DELETE FROM otlet.semantic_materializations sm
+  UPDATE otlet.semantic_materializations sm
+  SET stale = true,
+      stale_reason = 'contract_changed',
+      updated_at = now()
   WHERE sm.task_name = index_row.task_name
     AND sm.record_type = index_row.record_type;
 
   DELETE FROM otlet.semantic_join_indexes sji
   WHERE sji.name = index_row.name;
-
-  DELETE FROM otlet.tasks t
-  WHERE t.name = index_row.task_name
-    AND NOT EXISTS (
-      SELECT 1
-      FROM otlet.jobs j
-      WHERE j.task_name = t.name
-    );
 
   RETURN true;
 END;
@@ -270,24 +290,23 @@ CREATE FUNCTION otlet.refresh_semantic_join_index(
 LANGUAGE plpgsql
 AS $$
 DECLARE
-  index_row otlet.semantic_join_indexes%ROWTYPE;
+  task_name text;
   queued bigint;
 BEGIN
-  SELECT sji.name, sji.task_name
-  INTO index_row.name, index_row.task_name
-  FROM otlet.semantic_join_indexes sji
-  WHERE sji.name = refresh_semantic_join_index.index_name;
+  SELECT revision.definition #>> '{task,name}'
+  INTO task_name
+  FROM otlet.workload_revision_heads head
+  JOIN otlet.workload_revisions revision
+    ON revision.task_name = head.task_name
+   AND revision.workload_revision_hash = head.active_workload_revision_hash
+  WHERE revision.definition #>> '{source,semantic_join_index_name}' = refresh_semantic_join_index.index_name
+    AND revision.definition #>> '{source,kind}' = 'pair';
 
   IF NOT FOUND THEN
     RAISE EXCEPTION 'otlet semantic join index % does not exist', refresh_semantic_join_index.index_name;
   END IF;
 
-  SELECT otlet.run_task(index_row.task_name) INTO queued;
-
-  UPDATE otlet.semantic_join_indexes
-  SET last_refresh_at = now(),
-      updated_at = now()
-  WHERE name = index_row.name;
+  SELECT otlet.run_task(task_name) INTO queued;
 
   RETURN queued;
 END;
@@ -302,28 +321,39 @@ DECLARE
   index_row otlet.semantic_join_indexes%ROWTYPE;
   input_query text;
   refreshed bigint;
+  revision_definition jsonb;
+  active_revision_hash text;
 BEGIN
-  SELECT sji.name, sji.task_name, sji.record_type, sji.candidate_query, sji.max_candidate_rows
-  INTO index_row.name, index_row.task_name, index_row.record_type, index_row.candidate_query, index_row.max_candidate_rows
-  FROM otlet.semantic_join_indexes sji
-  WHERE sji.name = materialize_semantic_join_index.index_name;
+  SELECT
+    revision.definition #>> '{source,semantic_join_index_name}',
+    revision.definition #>> '{task,name}',
+    head.active_workload_revision_hash
+  INTO index_row.name, index_row.task_name, active_revision_hash
+  FROM otlet.workload_revision_heads head
+  JOIN otlet.workload_revisions revision
+    ON revision.task_name = head.task_name
+   AND revision.workload_revision_hash = head.active_workload_revision_hash
+  WHERE revision.definition #>> '{source,semantic_join_index_name}' = materialize_semantic_join_index.index_name
+    AND revision.definition #>> '{source,kind}' = 'pair'
+  FOR UPDATE OF head;
 
   IF NOT FOUND THEN
     RAISE EXCEPTION 'otlet semantic join index % does not exist', materialize_semantic_join_index.index_name;
   END IF;
 
+  SELECT active.definition
+  INTO revision_definition
+  FROM otlet.active_workload_revision(index_row.task_name) active;
+  index_row.record_type := revision_definition #>> '{source,record_type}';
+  index_row.name := revision_definition #>> '{source,semantic_join_index_name}';
+
   input_query := format(
     $sql$
-        SELECT subject_id, input
-        FROM (
-          SELECT subject_id::text AS subject_id, input::jsonb AS input
-          FROM (%1$s) otlet_join_candidate
-          ORDER BY subject_id
-          LIMIT %2$s
-        ) otlet_join_input
+      SELECT subject_id, input
+      FROM otlet.semantic_join_candidate_rows(%1$L, %2$L)
     $sql$,
-    index_row.candidate_query,
-    index_row.max_candidate_rows
+    index_row.name,
+    active_revision_hash
   );
 
   refreshed := otlet.materialize_semantic_records(
@@ -333,18 +363,14 @@ BEGIN
     input_query
   );
 
-  UPDATE otlet.semantic_join_indexes
-  SET last_materialized_at = now(),
-      updated_at = now()
-  WHERE name = index_row.name;
-
   RETURN refreshed;
 END;
 $$;
 
 CREATE FUNCTION otlet.materialize_semantic_join_index_subject(
   index_name text,
-  subject_id text
+  subject_id text,
+  expected_workload_revision_hash text DEFAULT NULL
 ) RETURNS bigint
 LANGUAGE plpgsql
 AS $$
@@ -352,29 +378,45 @@ DECLARE
   index_row otlet.semantic_join_indexes%ROWTYPE;
   input_query text;
   refreshed bigint;
+  revision_definition jsonb;
+  active_revision_hash text;
 BEGIN
-  SELECT sji.name, sji.task_name, sji.record_type, sji.candidate_query, sji.max_candidate_rows
-  INTO index_row.name, index_row.task_name, index_row.record_type, index_row.candidate_query, index_row.max_candidate_rows
-  FROM otlet.semantic_join_indexes sji
-  WHERE sji.name = materialize_semantic_join_index_subject.index_name;
+  SELECT
+    revision.definition #>> '{source,semantic_join_index_name}',
+    revision.definition #>> '{task,name}',
+    head.active_workload_revision_hash
+  INTO index_row.name, index_row.task_name, active_revision_hash
+  FROM otlet.workload_revision_heads head
+  JOIN otlet.workload_revisions revision
+    ON revision.task_name = head.task_name
+   AND revision.workload_revision_hash = head.active_workload_revision_hash
+  WHERE revision.definition #>> '{source,semantic_join_index_name}' = materialize_semantic_join_index_subject.index_name
+    AND revision.definition #>> '{source,kind}' = 'pair'
+  FOR UPDATE OF head;
 
   IF NOT FOUND THEN
     RAISE EXCEPTION 'otlet semantic join index % does not exist', materialize_semantic_join_index_subject.index_name;
   END IF;
 
+  IF materialize_semantic_join_index_subject.expected_workload_revision_hash IS NOT NULL
+     AND materialize_semantic_join_index_subject.expected_workload_revision_hash IS DISTINCT FROM active_revision_hash THEN
+    RAISE EXCEPTION 'otlet workload revision changed during semantic materialization for index %', index_row.name;
+  END IF;
+
+  SELECT active.definition
+  INTO revision_definition
+  FROM otlet.active_workload_revision(index_row.task_name) active;
+  index_row.record_type := revision_definition #>> '{source,record_type}';
+  index_row.name := revision_definition #>> '{source,semantic_join_index_name}';
+
   input_query := format(
     $sql$
-        SELECT subject_id, input
-        FROM (
-          SELECT subject_id::text AS subject_id, input::jsonb AS input
-          FROM (%1$s) otlet_join_candidate
-          ORDER BY subject_id
-          LIMIT %2$s
-        ) otlet_join_input
-        WHERE subject_id = %3$L
+      SELECT subject_id, input
+      FROM otlet.semantic_join_candidate_rows(%1$L, %2$L)
+      WHERE subject_id = %3$L
     $sql$,
-    index_row.candidate_query,
-    index_row.max_candidate_rows,
+    index_row.name,
+    active_revision_hash,
     materialize_semantic_join_index_subject.subject_id
   );
 
@@ -384,13 +426,6 @@ BEGIN
     'otlet.semantic_join:' || index_row.name,
     input_query
   );
-
-  IF refreshed > 0 THEN
-    UPDATE otlet.semantic_join_indexes
-    SET last_materialized_at = now(),
-        updated_at = now()
-    WHERE name = index_row.name;
-  END IF;
 
   RETURN refreshed;
 END;
@@ -451,10 +486,10 @@ BEGIN
   END IF;
 
   BEGIN
-    PERFORM otlet.materialize_completed_semantic_job(
+    SELECT otlet.materialize_completed_semantic_job(
       complete_and_materialize_job.job_id
-    );
-    semantic_materialized := true;
+    ) > 0
+    INTO semantic_materialized;
   EXCEPTION WHEN OTHERS THEN
     materialization_error := SQLERRM;
     BEGIN

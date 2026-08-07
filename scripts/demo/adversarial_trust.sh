@@ -244,7 +244,7 @@ BEGIN
       raw_output => repeat('x', 33),
       actions => '[]'::jsonb,
       trace_summary => '{"schema_validation_status":"passed"}'::jsonb,
-      model_name => (SELECT model_name FROM adversarial_params),
+      model_name => (SELECT forged_model_name FROM adversarial_params),
       expected_claim_token => (SELECT claim_token FROM oversized_job)
     );
   EXCEPTION WHEN OTHERS THEN
@@ -515,7 +515,7 @@ expected_artifact_contract='artifact_malformed_smoke_task=model_artifact_malform
   echo "Expected adversarial artifact cases to fail closed, got $artifact_failure_contract" >&2
   exit 1
 }
-require_regex "$oversized_prompt_contract" '^failed\|true\|failed\|failed\|direct_attempt_failed\|failed\|prompt(_and_generation)?_exceed(s_context_window|_context_window)\|0\|ready\|ready$' "Expected adversarial oversized prompt to fail closed"
+require_regex "$oversized_prompt_contract" '^failed\|true\|failed\|failed\|direct_attempt_failed\|failed\|prompt(_and_generation)?_exceed(s_context_window|_context_window)\|otlet.failure.v1.runtime_configuration_rejected\|otlet.failure.v1.runtime_configuration_rejected\|admission\|after_owner_action\|repair_runtime_options\|database_owner_only\|true\|true\|0\|ready\|ready$' "Expected adversarial oversized prompt to fail closed"
 
 adversarial_trust_contract="$adversarial_sql_contract|malformed_artifact=rejected|oversized_prompt=rejected"
 echo "adversarial_trust_contract=$adversarial_trust_contract"

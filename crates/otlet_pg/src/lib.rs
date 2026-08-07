@@ -21,9 +21,14 @@ pgrx::extension_sql_file!(
     requires = ["schema"]
 );
 pgrx::extension_sql_file!(
+    "../sql/migrations/0044_source_query_contract.sql",
+    name = "source_query_contract",
+    requires = ["identity_contract"]
+);
+pgrx::extension_sql_file!(
     "../sql/migrations/0003_action_schema.sql",
     name = "action_schema",
-    requires = ["identity_contract"]
+    requires = ["source_query_contract"]
 );
 pgrx::extension_sql_file!(
     "../sql/migrations/0004_semantic_schema.sql",
@@ -181,9 +186,14 @@ pgrx::extension_sql_file!(
     requires = ["semantic_predicates"]
 );
 pgrx::extension_sql_file!(
+    "../sql/migrations/0045_watch_reconciliation.sql",
+    name = "watch_reconciliation",
+    requires = ["semantic_status_plan"]
+);
+pgrx::extension_sql_file!(
     "../sql/migrations/0035_queue_policy_status.sql",
     name = "queue_policy_status",
-    requires = ["semantic_status_plan"]
+    requires = ["watch_reconciliation"]
 );
 pgrx::extension_sql_file!(
     "../sql/migrations/0036_invariants.sql",
@@ -221,9 +231,224 @@ pgrx::extension_sql_file!(
     requires = ["audit_export"]
 );
 pgrx::extension_sql_file!(
+    "../sql/migrations/0046_definition_complexity.sql",
+    name = "definition_complexity",
+    requires = ["portable_permissions"]
+);
+pgrx::extension_sql_file!(
+    "../sql/migrations/0047_runtime_capabilities.sql",
+    name = "runtime_capabilities",
+    requires = ["definition_complexity"]
+);
+pgrx::extension_sql_file!(
+    "../sql/migrations/0048_application_invocation.sql",
+    name = "application_invocation",
+    requires = ["runtime_capabilities"]
+);
+pgrx::extension_sql_file!(
+    "../sql/migrations/0049_invocation_provenance.sql",
+    name = "invocation_provenance",
+    requires = ["application_invocation"]
+);
+pgrx::extension_sql_file!(
+    "../sql/migrations/0050_task_watch_operational_lifecycle.sql",
+    name = "task_watch_operational_lifecycle",
+    requires = ["invocation_provenance"]
+);
+pgrx::extension_sql_file!(
+    "../sql/migrations/0051_administrative_change_ledger.sql",
+    name = "administrative_change_ledger",
+    requires = ["task_watch_operational_lifecycle"]
+);
+pgrx::extension_sql_file!(
+    "../sql/migrations/0052_workload_acceptance_contract.sql",
+    name = "workload_acceptance_contract",
+    requires = ["administrative_change_ledger"]
+);
+pgrx::extension_sql_file!(
+    "../sql/migrations/0053_replayable_evaluation.sql",
+    name = "replayable_evaluation",
+    requires = ["workload_acceptance_contract"]
+);
+pgrx::extension_sql_file!(
+    "../sql/migrations/0054_evaluation_population_lineage.sql",
+    name = "evaluation_population_lineage",
+    requires = ["replayable_evaluation"]
+);
+pgrx::extension_sql_file!(
+    "../sql/migrations/0055_evaluation_slices_support.sql",
+    name = "evaluation_slices_support",
+    requires = ["evaluation_population_lineage"]
+);
+pgrx::extension_sql_file!(
+    "../sql/migrations/0056_label_provenance_quality.sql",
+    name = "label_provenance_quality",
+    requires = ["evaluation_slices_support"]
+);
+pgrx::extension_sql_file!(
+    "../sql/migrations/0057_production_model_qualification.sql",
+    name = "production_model_qualification",
+    requires = ["label_provenance_quality"]
+);
+pgrx::extension_sql_file!(
+    "../sql/migrations/0058_promotion_shadow_rollback.sql",
+    name = "promotion_shadow_rollback",
+    requires = ["production_model_qualification"]
+);
+pgrx::extension_sql_file!(
+    "../sql/migrations/0059_quality_data_drift.sql",
+    name = "quality_data_drift",
+    requires = ["promotion_shadow_rollback"]
+);
+pgrx::extension_sql_file!(
+    "../sql/migrations/0060_review_economics.sql",
+    name = "review_economics",
+    requires = ["quality_data_drift"]
+);
+pgrx::extension_sql_file!(
+    "../sql/migrations/0061_model_license_use_policy.sql",
+    name = "model_license_use_policy",
+    requires = ["review_economics"]
+);
+pgrx::extension_sql_file!(
+    "../sql/migrations/0062_model_artifact_lifecycle.sql",
+    name = "model_artifact_lifecycle",
+    requires = ["model_license_use_policy"]
+);
+pgrx::extension_sql_file!(
     "../sql/migrations/0043_permissions.sql",
     name = "permissions",
-    requires = ["portable_permissions"]
+    requires = ["model_artifact_lifecycle"]
+);
+pgrx::extension_sql_file!(
+    "../sql/migrations/0063_failure_retry_taxonomy.sql",
+    name = "failure_retry_taxonomy",
+    requires = ["permissions"]
+);
+pgrx::extension_sql_file!(
+    "../sql/migrations/0064_candidate_set_coverage.sql",
+    name = "candidate_set_coverage",
+    requires = ["failure_retry_taxonomy"]
+);
+pgrx::extension_sql_file!(
+    "../sql/migrations/0065_entity_resolution_quality.sql",
+    name = "entity_resolution_quality",
+    requires = ["candidate_set_coverage"]
+);
+pgrx::extension_sql_file!(
+    "../sql/migrations/0066_pair_constraint_ledger.sql",
+    name = "pair_constraint_ledger",
+    requires = ["entity_resolution_quality"]
+);
+pgrx::extension_sql_file!(
+    "../sql/migrations/0067_entity_graph_conflict_status.sql",
+    name = "entity_graph_conflict_status",
+    requires = ["pair_constraint_ledger"]
+);
+pgrx::extension_sql_file!(
+    "../sql/migrations/0068_authoritative_semantic_correction.sql",
+    name = "authoritative_semantic_correction",
+    requires = ["entity_graph_conflict_status"]
+);
+pgrx::extension_sql_file!(
+    "../sql/migrations/0069_evidence_linked_decisions.sql",
+    name = "evidence_linked_decisions",
+    requires = ["authoritative_semantic_correction"]
+);
+pgrx::extension_sql_file!(
+    "../sql/migrations/0070_review_sampling.sql",
+    name = "review_sampling",
+    requires = ["evidence_linked_decisions"]
+);
+pgrx::extension_sql_file!(
+    "../sql/migrations/0071_reviewer_rubric_calibration.sql",
+    name = "reviewer_rubric_calibration",
+    requires = ["review_sampling"]
+);
+pgrx::extension_sql_file!(
+    "../sql/migrations/0072_time_based_freshness.sql",
+    name = "time_based_freshness",
+    requires = ["reviewer_rubric_calibration"]
+);
+pgrx::extension_sql_file!(
+    "../sql/migrations/0073_minimal_bounded_backfill.sql",
+    name = "minimal_bounded_backfill",
+    requires = ["time_based_freshness"]
+);
+pgrx::extension_sql_file!(
+    "../sql/migrations/0074_workload_pack_promotion.sql",
+    name = "workload_pack_promotion",
+    requires = ["minimal_bounded_backfill"]
+);
+pgrx::extension_sql_file!(
+    "../sql/migrations/0075_job_origin_workload_budgets.sql",
+    name = "job_origin_workload_budgets",
+    requires = ["workload_pack_promotion"]
+);
+pgrx::extension_sql_file!(
+    "../sql/migrations/0076_interactive_async_service_quantum.sql",
+    name = "interactive_async_service_quantum",
+    requires = ["job_origin_workload_budgets"]
+);
+pgrx::extension_sql_file!(
+    "../sql/migrations/0077_workload_enablement_preflight.sql",
+    name = "workload_enablement_preflight",
+    requires = ["interactive_async_service_quantum"]
+);
+pgrx::extension_sql_file!(
+    "../sql/migrations/0078_semantic_planner_statistics.sql",
+    name = "semantic_planner_statistics",
+    requires = ["workload_enablement_preflight"]
+);
+pgrx::extension_sql_file!(
+    "../sql/migrations/0079_bounded_customscan_state.sql",
+    name = "bounded_customscan_state",
+    requires = ["semantic_planner_statistics"]
+);
+pgrx::extension_sql_file!(
+    "../sql/migrations/0080_model_bound_context_budgets.sql",
+    name = "model_bound_context_budgets",
+    requires = ["bounded_customscan_state"]
+);
+pgrx::extension_sql_file!(
+    "../sql/migrations/0081_native_cancellation_slo.sql",
+    name = "native_cancellation_slo",
+    requires = ["model_bound_context_budgets"]
+);
+pgrx::extension_sql_file!(
+    "../sql/migrations/0082_worker_database_operation_deadlines.sql",
+    name = "worker_database_operation_deadlines",
+    requires = ["native_cancellation_slo"]
+);
+pgrx::extension_sql_file!(
+    "../sql/migrations/0083_route_readiness_stranded_escalation.sql",
+    name = "route_readiness_stranded_escalation",
+    requires = ["worker_database_operation_deadlines"]
+);
+pgrx::extension_sql_file!(
+    "../sql/migrations/0084_bounded_maintenance_execution.sql",
+    name = "bounded_maintenance_execution",
+    requires = ["route_readiness_stranded_escalation"]
+);
+pgrx::extension_sql_file!(
+    "../sql/migrations/0085_versioned_observability_quality_status.sql",
+    name = "versioned_observability_quality_status",
+    requires = ["bounded_maintenance_execution"]
+);
+pgrx::extension_sql_file!(
+    "../sql/migrations/0086_access_policy_lifecycle.sql",
+    name = "access_policy_lifecycle",
+    requires = ["versioned_observability_quality_status"]
+);
+pgrx::extension_sql_file!(
+    "../sql/migrations/0087_complete_evidence_lifecycle.sql",
+    name = "complete_evidence_lifecycle",
+    requires = ["access_policy_lifecycle"]
+);
+pgrx::extension_sql_file!(
+    "../sql/migrations/0088_branch_review_corrections.sql",
+    name = "branch_review_corrections",
+    requires = ["complete_evidence_lifecycle"]
 );
 
 #[allow(non_snake_case)]

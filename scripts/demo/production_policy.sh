@@ -63,10 +63,10 @@ CROSS JOIN LATERAL otlet.renew_job_lease(claim.id, claim.claim_token) renewed;
 SELECT (SELECT count(*) FROM lease_claim)::text || '|' ||
        (SELECT count(*) FROM wrong_renew)::text || '|' ||
        COALESCE((SELECT status FROM current_renew), '') || '|' ||
-       COALESCE((SELECT (leased_until > now() + interval '30 seconds')::text FROM current_renew), 'false') || '|' ||
+       COALESCE((SELECT (leased_until > clock_timestamp() + interval '30 seconds')::text FROM current_renew), 'false') || '|' ||
        COALESCE((SELECT (
-         leased_until > now() + interval '31 seconds'
-         AND leased_until < now() + interval '33 seconds'
+         leased_until > clock_timestamp() + interval '31 seconds'
+         AND leased_until < clock_timestamp() + interval '33 seconds'
        )::text FROM current_renew), 'false');
 ROLLBACK;
 SQL
@@ -99,7 +99,9 @@ cleanup_policy_contract="$(psql_value -v model_name="$strong_model_name" <<'SQL'
 BEGIN;
 UPDATE otlet.production_policy
 SET worker_event_retention = interval '100 years',
-    failed_job_retention = interval '100 years'
+    failed_job_retention = interval '100 years',
+    successful_job_retention = NULL,
+    evidence_lifecycle_enabled = false
 WHERE name = 'default';
 INSERT INTO otlet.tasks (
   name,
@@ -148,11 +150,30 @@ SELECT
 FROM cleanup_contract_jobs;
 CREATE TEMP TABLE cleanup_contract_dry AS
 SELECT * FROM otlet.cleanup_policy_state(true);
+SELECT otlet.create_maintenance_run('cleanup') AS cleanup_contract_run_id \gset
 CREATE TEMP TABLE cleanup_contract_run AS
-SELECT * FROM otlet.cleanup_policy_state(false);
+SELECT * FROM otlet.run_maintenance_slice(:cleanup_contract_run_id, 0);
 SELECT (
-         (SELECT worker_events = 3 AND failed_canceled_jobs = 2 AND dry_run FROM cleanup_contract_dry)
-         AND (SELECT worker_events = 3 AND failed_canceled_jobs = 2 AND NOT dry_run FROM cleanup_contract_run)
+         (SELECT worker_events = 3 AND failed_canceled_jobs = 2 AND dry_run
+          FROM cleanup_contract_dry)
+         AND (SELECT control_state = 'complete'
+                     AND processed_items = 3
+                     AND changed_rows = 5
+              FROM cleanup_contract_run)
+         AND NOT EXISTS (
+           SELECT 1
+           FROM otlet.evidence_lifecycle_records lifecycle
+           JOIN cleanup_contract_jobs job ON job.id = lifecycle.job_id
+         )
+         AND NOT EXISTS (
+           SELECT 1
+           FROM otlet.jobs live_job
+           JOIN cleanup_contract_jobs job ON job.id = live_job.id
+           WHERE job.subject_id IN (
+             'failed-recent-event',
+             'failed-null-finished'
+           )
+         )
        )::text || '|' ||
        ((SELECT count(*) FROM otlet.jobs WHERE task_name = 'cleanup_policy_contract') = 3)::text || '|' ||
        ((SELECT count(*) FROM otlet.worker_events WHERE event_type = 'cleanup_policy_contract') = 2)::text || '|' ||
@@ -186,14 +207,14 @@ psql_exec \
   -v numeric_triage_watch="$numeric_triage_watch" \
   -v pair_strip_watch="$pair_strip_watch" \
   -v action_allowlist_watch="$action_allowlist_watch" >/dev/null <<'SQL'
-SELECT otlet.drop_watch(:'row_triage_watch');
-SELECT otlet.drop_watch(:'row_scoped_watch');
-SELECT otlet.drop_watch(:'row_customscan_watch');
-SELECT otlet.drop_watch(:'row_triage_policy_watch');
-SELECT otlet.drop_watch(:'numeric_triage_watch');
-SELECT otlet.drop_watch(:'pair_strip_watch');
-SELECT otlet.drop_watch(:'action_allowlist_watch');
-SELECT otlet.drop_watch(:'join_index_name');
+SELECT otlet.drop_watch_registry(:'row_triage_watch');
+SELECT otlet.drop_watch_registry(:'row_scoped_watch');
+SELECT otlet.drop_watch_registry(:'row_customscan_watch');
+SELECT otlet.drop_watch_registry(:'row_triage_policy_watch');
+SELECT otlet.drop_watch_registry(:'numeric_triage_watch');
+SELECT otlet.drop_watch_registry(:'pair_strip_watch');
+SELECT otlet.drop_watch_registry(:'action_allowlist_watch');
+SELECT otlet.drop_watch_registry(:'join_index_name');
 SQL
 cleanup_task "row_review_demo"
 cleanup_task "entity_hypothesis_demo"
@@ -222,13 +243,15 @@ cleanup_task "$entity_task"
 cleanup_task "$join_task"
 
 model_queue_status_contract="$(psql_exec -qAt -v model_name="$cheap_model_name" <<'SQL'
-SELECT queue_state || '|' || queued_jobs::text || '|' || running_jobs::text
+SELECT queue_state || '|' || queued_jobs::text || '|' || running_jobs::text || '|' ||
+       active_claimed_jobs::text || '|' || max_active_jobs::text || '|' ||
+       available_active_job_slots::text
 FROM otlet.model_queue_status
 WHERE model_name = :'model_name';
 SQL
 )"
 echo "model_queue_status_contract=$model_queue_status_contract"
-[ "$model_queue_status_contract" = "queue_accepting|0|0" ] || {
+[ "$model_queue_status_contract" = "queue_accepting|0|0|0|8|8" ] || {
   echo "Expected empty accepting model queue, got $model_queue_status_contract" >&2
   exit 1
 }
@@ -273,6 +296,133 @@ echo "queue_underfill_contract=$queue_underfill_contract"
   exit 1
 }
 
+scheduler_decision_contract="$(psql_value <<'SQL'
+BEGIN;
+SELECT 1
+FROM otlet.production_policy
+WHERE name = 'default'
+FOR UPDATE \g /dev/null
+LOCK TABLE otlet.jobs IN SHARE ROW EXCLUSIVE MODE;
+
+INSERT INTO otlet.models (name, artifact_path, artifact_hash, artifact_identity)
+VALUES
+  (
+    'scheduler_cold_model',
+    '/tmp/scheduler-cold.gguf',
+    repeat('1', 64),
+    jsonb_build_object('sha256', repeat('1', 64), 'bytes', 24, 'source', 'smoke', 'revision', 'v1', 'quantization', 'test', 'license', 'test')
+  ),
+  (
+    'scheduler_warm_model',
+    '/tmp/scheduler-warm.gguf',
+    repeat('2', 64),
+    jsonb_build_object('sha256', repeat('2', 64), 'bytes', 24, 'source', 'smoke', 'revision', 'v1', 'quantization', 'test', 'license', 'test')
+  );
+INSERT INTO otlet.runtime_slots (model_name, artifact_path, status)
+VALUES ('scheduler_warm_model', '/tmp/scheduler-warm.gguf', 'ready');
+INSERT INTO otlet.tasks (name, input_query, instruction, output_schema, model_name)
+VALUES
+  ('scheduler_a_retry', 'SELECT NULL::text AS subject_id, ''{}''::jsonb AS input WHERE false', 'Scheduler contract placeholder', '{"type":"object"}'::jsonb, 'scheduler_cold_model'),
+  ('scheduler_b_cancel', 'SELECT NULL::text AS subject_id, ''{}''::jsonb AS input WHERE false', 'Scheduler contract placeholder', '{"type":"object"}'::jsonb, 'scheduler_warm_model'),
+  ('scheduler_c_hot', 'SELECT NULL::text AS subject_id, ''{}''::jsonb AS input WHERE false', 'Scheduler contract placeholder', '{"type":"object"}'::jsonb, 'scheduler_cold_model'),
+  ('scheduler_d_victim', 'SELECT NULL::text AS subject_id, ''{}''::jsonb AS input WHERE false', 'Scheduler contract placeholder', '{"type":"object"}'::jsonb, 'scheduler_cold_model');
+UPDATE otlet.production_policy
+SET worker_claim_batch_size = 1,
+    worker_claim_task_cursor = '',
+    max_attempts = 3
+WHERE name = 'default';
+INSERT INTO otlet.jobs (
+  task_name,
+  subject_id,
+  input,
+  status,
+  attempts,
+  leased_until,
+  claim_token,
+  error,
+  started_at,
+  cancel_requested_at
+)
+VALUES
+  (
+    'scheduler_a_retry',
+    'retry',
+    '{}'::jsonb,
+    'running',
+    1,
+    now() - interval '1 minute',
+    'scheduler-retry-owner',
+    NULL,
+    now() - interval '2 minutes',
+    NULL
+  ),
+  (
+    'scheduler_b_cancel',
+    'cancel',
+    '{}'::jsonb,
+    'cancel_requested',
+    1,
+    now() - interval '1 minute',
+    'scheduler-cancel-owner',
+    'scheduler cancellation',
+    now() - interval '2 minutes',
+    now() - interval '90 seconds'
+  ),
+  ('scheduler_c_hot', 'hot-1', '{}'::jsonb, 'queued', 0, NULL, NULL, NULL, NULL, NULL),
+  ('scheduler_d_victim', 'victim', '{}'::jsonb, 'queued', 0, NULL, NULL, NULL, NULL, NULL);
+
+CREATE TEMP TABLE scheduler_decision_claims (
+  claim_no integer PRIMARY KEY,
+  job_id bigint NOT NULL,
+  subject_id text NOT NULL,
+  status text NOT NULL,
+  attempts integer NOT NULL,
+  claim_token text NOT NULL,
+  error text
+);
+
+INSERT INTO scheduler_decision_claims
+SELECT 1, id, subject_id, status, attempts, claim_token, error
+FROM otlet.claim_jobs(NULL, 1);
+DELETE FROM otlet.jobs
+WHERE id = (SELECT job_id FROM scheduler_decision_claims WHERE claim_no = 1);
+INSERT INTO scheduler_decision_claims
+SELECT 2, id, subject_id, status, attempts, claim_token, error
+FROM otlet.claim_jobs(NULL, 1);
+DELETE FROM otlet.jobs
+WHERE id = (SELECT job_id FROM scheduler_decision_claims WHERE claim_no = 2);
+INSERT INTO scheduler_decision_claims
+SELECT 3, id, subject_id, status, attempts, claim_token, error
+FROM otlet.claim_jobs(NULL, 1);
+DELETE FROM otlet.jobs
+WHERE id = (SELECT job_id FROM scheduler_decision_claims WHERE claim_no = 3);
+INSERT INTO otlet.jobs (task_name, subject_id, input)
+VALUES ('scheduler_c_hot', 'hot-2', '{}'::jsonb);
+INSERT INTO scheduler_decision_claims
+SELECT 4, id, subject_id, status, attempts, claim_token, error
+FROM otlet.claim_jobs(NULL, 1);
+DELETE FROM otlet.jobs
+WHERE id = (SELECT job_id FROM scheduler_decision_claims WHERE claim_no = 4);
+INSERT INTO scheduler_decision_claims
+SELECT 5, id, subject_id, status, attempts, claim_token, error
+FROM otlet.claim_jobs(NULL, 1);
+
+SELECT string_agg(subject_id, ',' ORDER BY claim_no) || '|' ||
+       (SELECT status || '|' || attempts::text || '|' || (claim_token <> 'scheduler-retry-owner')::text
+        FROM scheduler_decision_claims WHERE claim_no = 1) || '|' ||
+       (SELECT status || '|' || attempts::text || '|' || (claim_token <> 'scheduler-cancel-owner')::text || '|' || COALESCE(error = 'scheduler cancellation', false)::text
+        FROM scheduler_decision_claims WHERE claim_no = 2) || '|' ||
+       (SELECT worker_claim_task_cursor FROM otlet.production_policy WHERE name = 'default')
+FROM scheduler_decision_claims;
+ROLLBACK;
+SQL
+)"
+echo "scheduler_decision_contract=$scheduler_decision_contract"
+[ "$scheduler_decision_contract" = "retry,cancel,hot-1,victim,hot-2|running|2|true|cancel_requested|2|true|true|scheduler_c_hot" ] || {
+  echo "Expected measured scheduler order, reclaim, cancellation, cursor rotation, and starvation bounds, got $scheduler_decision_contract" >&2
+  exit 1
+}
+
 queue_fairness_big_task="queue_fairness_big_demo"
 queue_fairness_small_task="queue_fairness_small_demo"
 cleanup_task "$queue_fairness_big_task"
@@ -283,6 +433,13 @@ queue_fairness_output="$(
     -v big_task="$queue_fairness_big_task" \
     -v small_task="$queue_fairness_small_task" \
     -v model_name="$strong_model_name" <<'SQL'
+BEGIN;
+SELECT 1
+FROM otlet.production_policy
+WHERE name = 'default'
+FOR UPDATE \g /dev/null
+LOCK TABLE otlet.jobs IN SHARE ROW EXCLUSIVE MODE;
+
 CREATE TEMP TABLE queue_fairness_params (
   big_task text,
   small_task text,
@@ -429,6 +586,11 @@ SELECT (small_claimed = 4)::text || '|' ||
        cross_task_batch::text || '|' ||
        (has_big AND has_small)::text
 FROM summary, visible_batches;
+
+DELETE FROM otlet.jobs
+WHERE task_name IN (:'big_task', :'small_task')
+  AND status = 'queued';
+COMMIT;
 SQL
 )"
 queue_fairness_contract="$(tail -n 1 <<<"$queue_fairness_output")"

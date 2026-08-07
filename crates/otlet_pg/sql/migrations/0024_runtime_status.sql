@@ -136,6 +136,9 @@ LEFT JOIN LATERAL (
     r.model_load_allowed_additional_bytes
   FROM otlet.inference_receipt_trace_status r
   WHERE r.model_name = m.name
+    AND r.model_artifact_path = m.artifact_path
+    AND r.model_artifact_hash = m.artifact_hash
+    AND r.model_artifact_identity = m.artifact_identity
     AND r.runtime_name = 'linked_inproc'
     AND r.status = 'complete'
     AND r.schema_validation_status = 'passed'

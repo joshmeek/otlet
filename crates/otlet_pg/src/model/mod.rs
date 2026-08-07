@@ -80,6 +80,18 @@ pub(crate) struct ModelError {
 }
 
 impl ModelError {
+    fn trace_object(&mut self) -> &mut serde_json::Map<String, Value> {
+        if !self.trace_summary.as_ref().is_some_and(Value::is_object) {
+            self.trace_summary = Some(json!({
+                "trace_version": "otlet_generation_trace_v1"
+            }));
+        }
+        self.trace_summary
+            .as_mut()
+            .and_then(Value::as_object_mut)
+            .expect("model trace is an object")
+    }
+
     pub(crate) fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
@@ -158,10 +170,55 @@ impl ModelError {
         self
     }
 
+    fn with_runtime_evidence(
+        mut self,
+        runtime_options_status: &Value,
+        model_fingerprint_hash: &str,
+        runtime_fingerprint: &Value,
+        runtime_fingerprint_hash: &str,
+        runtime_output_contract_hash: &str,
+    ) -> Self {
+        let trace = self.trace_object();
+        trace.insert(
+            "runtime_options_status".to_owned(),
+            runtime_options_status.clone(),
+        );
+        trace.insert(
+            "model_fingerprint_hash".to_owned(),
+            Value::String(model_fingerprint_hash.to_owned()),
+        );
+        trace.insert(
+            "runtime_fingerprint_version".to_owned(),
+            Value::String(RUNTIME_FINGERPRINT_VERSION.to_owned()),
+        );
+        trace.insert(
+            "runtime_fingerprint_hash".to_owned(),
+            Value::String(runtime_fingerprint_hash.to_owned()),
+        );
+        trace.insert(
+            "runtime_output_contract_hash".to_owned(),
+            Value::String(runtime_output_contract_hash.to_owned()),
+        );
+        trace.insert(
+            "runtime_fingerprint".to_owned(),
+            runtime_fingerprint.clone(),
+        );
+        self
+    }
+
+    fn with_runtime_context(self, context: &RunContext) -> Self {
+        self.with_runtime_evidence(
+            &context.runtime_options_status,
+            context.model_fingerprint_hash.as_ref(),
+            &context.runtime_fingerprint,
+            &context.runtime_fingerprint_hash,
+            &context.runtime_output_contract_hash,
+        )
+    }
+
     fn with_memory_trace(mut self, memory_trace: Value) -> Self {
-        if let Some(Value::Object(trace)) = &mut self.trace_summary {
-            trace.insert("memory".to_owned(), memory_trace);
-        }
+        self.trace_object()
+            .insert("memory".to_owned(), memory_trace);
         self
     }
 }

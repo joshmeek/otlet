@@ -51,10 +51,11 @@ SET search_path = pg_catalog, otlet, pg_temp
 AS $$
 DECLARE
   action_row otlet.actions%ROWTYPE;
-  schema_row otlet.action_type_schemas%ROWTYPE;
   task_row otlet.tasks%ROWTYPE;
+  action_requires_approval boolean;
   output_body jsonb;
   receipt_trace jsonb;
+  job_input jsonb;
   saved_label otlet.eval_labels%ROWTYPE;
   answer_field text;
   confidence_field text;
@@ -77,20 +78,27 @@ BEGIN
     RETURN;
   END IF;
 
-  SELECT t.*
-  INTO task_row
+  SELECT
+    revision.definition #>> '{task,name}',
+    revision.definition #> '{task,output_schema}',
+    revision.definition #> '{task,decision_contract}',
+    COALESCE((revision.definition #>> ARRAY[
+      'action_policies', action_row.action_type, 'schema', 'requires_approval'
+    ])::boolean, false)
+  INTO task_row.name, task_row.output_schema, task_row.decision_contract, action_requires_approval
   FROM otlet.jobs j
-  JOIN otlet.tasks t ON t.name = j.task_name
+  JOIN otlet.workload_revisions revision
+    ON revision.workload_revision_hash = j.workload_revision_hash
   WHERE j.id = action_row.job_id;
 
   IF NOT FOUND THEN
     RAISE EXCEPTION 'otlet label_action could not find task for action %', action_row.id;
   END IF;
 
-  SELECT *
-  INTO schema_row
-  FROM otlet.action_type_schemas s
-  WHERE s.action_type = action_row.action_type;
+  SELECT j.input
+  INTO job_input
+  FROM otlet.jobs j
+  WHERE j.id = action_row.job_id;
 
   SELECT o.output
   INTO output_body
@@ -114,7 +122,7 @@ BEGIN
     FROM jsonb_array_elements_text(task_row.decision_contract -> 'abstain_values') AS abstain(value);
   END IF;
 
-  IF schema_row.requires_approval
+  IF action_requires_approval
      AND action_answer IS NOT NULL
      AND NOT action_answer = ANY(abstain_values)
      AND answer_values IS NOT NULL THEN
@@ -179,11 +187,7 @@ BEGIN
     action_row.receipt_id,
     COALESCE(action_row.source_table, receipt_trace #>> '{mvcc,table}'),
     COALESCE(action_row.subject_id, ''),
-    COALESCE(
-      action_row.source_hash,
-      receipt_trace #>> '{mvcc,source_hash}',
-      md5((receipt_trace -> 'mvcc')::text)
-    ),
+    COALESCE(action_row.source_hash, otlet.semantic_source_hash(job_input)),
     final_answer,
     final_confidence,
     final_action_type,
@@ -303,25 +307,41 @@ AS $$
   FROM otlet.eval_labels l
   LEFT JOIN otlet.actions a ON a.id = l.action_id
   LEFT JOIN otlet.jobs j ON j.id = a.job_id
-  LEFT JOIN otlet.tasks t ON t.name = j.task_name
+  LEFT JOIN otlet.workload_revisions revision
+    ON revision.workload_revision_hash = j.workload_revision_hash
   LEFT JOIN LATERAL (
     SELECT
-      COALESCE(NULLIF(t.decision_contract ->> 'answer_field', ''), 'match') AS answer_field,
+      COALESCE(
+        NULLIF(revision.definition #>> '{task,decision_contract,answer_field}', ''),
+        'match'
+      ) AS answer_field,
       COALESCE(
         (
           SELECT array_agg(value)
-          FROM jsonb_array_elements_text(COALESCE(t.decision_contract -> 'abstain_values', '[]'::jsonb)) AS abstain(value)
+          FROM jsonb_array_elements_text(COALESCE(
+            revision.definition #> '{task,decision_contract,abstain_values}',
+            '[]'::jsonb
+          )) AS abstain(value)
         ),
         ARRAY[]::text[]
       ) AS abstain_values,
       (
         SELECT value
-        FROM unnest(otlet.output_schema_enum_values(t.output_schema, COALESCE(NULLIF(t.decision_contract ->> 'answer_field', ''), 'match'))) WITH ORDINALITY AS answer(value, ord)
+        FROM unnest(otlet.output_schema_enum_values(
+          revision.definition #> '{task,output_schema}',
+          COALESCE(
+            NULLIF(revision.definition #>> '{task,decision_contract,answer_field}', ''),
+            'match'
+          )
+        )) WITH ORDINALITY AS answer(value, ord)
         WHERE NOT value = ANY(
           COALESCE(
             (
               SELECT array_agg(abstain_value)
-              FROM jsonb_array_elements_text(COALESCE(t.decision_contract -> 'abstain_values', '[]'::jsonb)) AS abstain(abstain_value)
+              FROM jsonb_array_elements_text(COALESCE(
+                revision.definition #> '{task,decision_contract,abstain_values}',
+                '[]'::jsonb
+              )) AS abstain(abstain_value)
             ),
             ARRAY[]::text[]
           )

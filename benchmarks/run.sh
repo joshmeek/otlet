@@ -592,7 +592,8 @@ SQL
   if [[ "$publish_report" = "1" ]]; then
     printf 'benchmark_published_report_dir=%s\n' "$publish_dir"
   fi
-  printf 'benchmark_cleanup_models_removed=%s\n' "$([[ "$keep_models" = "1" ]] && printf false || printf true)"
+  printf 'benchmark_cleanup_model_artifacts_removed=%s\n' "$([[ "$keep_models" = "1" ]] && printf false || printf true)"
+  printf 'benchmark_model_registrations_retained=true\n'
   printf 'benchmark_cleanup_sql_state_removed=%s\n' "$([[ "$keep_sql_state" = "1" ]] && printf false || printf true)"
   if [[ "$keep_models" != "1" ]]; then
     if docker exec "$container" sh -lc "test ! -d $(sh_quote "$scratch_dir")"; then

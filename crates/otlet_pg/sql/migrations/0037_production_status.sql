@@ -1,32 +1,63 @@
 CREATE VIEW otlet.production_status AS
 WITH queue AS (
   SELECT
-    count(*) FILTER (WHERE status = 'queued')::bigint AS queued_jobs,
-    COALESCE(sum(octet_length(input::text)) FILTER (WHERE status = 'queued'), 0)::bigint AS queued_input_bytes,
-    count(*) FILTER (WHERE status = 'running')::bigint AS running_jobs,
-    count(*) FILTER (WHERE status = 'cancel_requested')::bigint AS cancel_requested_jobs,
     count(*) FILTER (
-      WHERE status IN ('running', 'cancel_requested')
-        AND (leased_until IS NULL OR leased_until < now())
+      WHERE j.status = 'queued'
+        AND (
+          j.execution_mode = 'evaluation'
+          OR j.workload_revision_hash = head.active_workload_revision_hash
+        )
+    )::bigint AS queued_jobs,
+    COALESCE(sum(octet_length(j.input::text)) FILTER (
+      WHERE j.status = 'queued'
+        AND (
+          j.execution_mode = 'evaluation'
+          OR j.workload_revision_hash = head.active_workload_revision_hash
+        )
+    ), 0)::bigint AS queued_input_bytes,
+    count(*) FILTER (WHERE j.status = 'running')::bigint AS running_jobs,
+    count(*) FILTER (WHERE j.status = 'cancel_requested')::bigint AS cancel_requested_jobs,
+    count(*) FILTER (
+      WHERE j.status IN ('running', 'cancel_requested')
+        AND (j.leased_until IS NULL OR j.leased_until < now())
     )::bigint AS expired_running_jobs,
-    count(*) FILTER (WHERE status = 'failed')::bigint AS failed_jobs,
-    count(*) FILTER (WHERE status = 'canceled')::bigint AS canceled_jobs
-  FROM otlet.jobs
+    count(*) FILTER (
+      WHERE j.status = 'failed' AND j.execution_mode = 'production'
+    )::bigint AS failed_jobs,
+    count(*) FILTER (
+      WHERE j.status = 'canceled' AND j.execution_mode = 'production'
+    )::bigint AS canceled_jobs,
+    count(*) FILTER (
+      WHERE j.status = 'queued'
+        AND j.execution_mode = 'production'
+        AND j.workload_revision_hash IS DISTINCT FROM head.active_workload_revision_hash
+    )::bigint AS suspended_revision_queued_jobs
+  FROM otlet.jobs j
+  LEFT JOIN otlet.workload_revision_heads head ON head.task_name = j.task_name
 ),
 receipts AS (
   SELECT
     count(*)::bigint AS receipt_count,
-    count(*) FILTER (WHERE status IN ('complete', 'failed'))::bigint AS model_invocations,
-    COALESCE(sum(COALESCE(prompt_tokens, 0) + COALESCE(generated_tokens, 0)) FILTER (WHERE status IN ('complete', 'failed')), 0)::bigint AS model_processed_tokens,
-    count(*) FILTER (WHERE status = 'failed')::bigint AS failed_receipts,
-    count(*) FILTER (WHERE schema_validation_status = 'passed')::bigint AS schema_passed_receipts,
-    count(*) FILTER (WHERE schema_validation_status = 'failed')::bigint AS schema_failed_receipts,
-    count(*) FILTER (WHERE schema_validation_status IS DISTINCT FROM 'passed' AND status = 'complete')::bigint AS complete_without_schema_pass
-  FROM otlet.inference_receipts
+    count(*) FILTER (WHERE receipt.status IN ('complete', 'failed'))::bigint AS model_invocations,
+    COALESCE(sum(
+      COALESCE(receipt.prompt_tokens, 0) + COALESCE(receipt.generated_tokens, 0)
+    ) FILTER (WHERE receipt.status IN ('complete', 'failed')), 0)::bigint AS model_processed_tokens,
+    count(*) FILTER (WHERE receipt.status = 'failed')::bigint AS failed_receipts,
+    count(*) FILTER (WHERE receipt.schema_validation_status = 'passed')::bigint AS schema_passed_receipts,
+    count(*) FILTER (WHERE receipt.schema_validation_status = 'failed')::bigint AS schema_failed_receipts,
+    count(*) FILTER (
+      WHERE receipt.schema_validation_status IS DISTINCT FROM 'passed'
+        AND receipt.status = 'complete'
+    )::bigint AS complete_without_schema_pass
+  FROM otlet.inference_receipts receipt
+  JOIN otlet.jobs job ON job.id = receipt.job_id
+  WHERE job.execution_mode = 'production'
 ),
 trusted_output_rows AS (
   SELECT count(*)::bigint AS trusted_output_rows
-  FROM otlet.outputs
+  FROM otlet.outputs output
+  JOIN otlet.jobs job ON job.id = output.job_id
+  WHERE job.execution_mode = 'production'
 ),
 semantic_state AS (
   SELECT
@@ -46,11 +77,23 @@ runtime AS (
 ),
 trace AS (
   SELECT
-    receipt_count AS trace_receipt_count,
-    detailed_trace_receipts,
-    max_detailed_trace_tokens,
-    max_detailed_trace_top_k
-  FROM otlet.inference_visibility_status
+    count(*)::bigint AS trace_receipt_count,
+    count(*) FILTER (
+      WHERE receipt.trace_summary #>> '{detailed_trace,status}' = 'available'
+        AND receipt.trace_summary #>> '{detailed_trace,trace_contract}' =
+          'receipt_trace_v2_bounded_token_steps'
+    )::bigint AS detailed_trace_receipts,
+    COALESCE(max(CASE
+      WHEN jsonb_typeof(receipt.trace_summary #> '{detailed_trace,captured_tokens}') = 'number'
+        THEN (receipt.trace_summary #>> '{detailed_trace,captured_tokens}')::bigint
+    END), 0)::bigint AS max_detailed_trace_tokens,
+    COALESCE(max(CASE
+      WHEN jsonb_typeof(receipt.trace_summary #> '{detailed_trace,top_k}') = 'number'
+        THEN (receipt.trace_summary #>> '{detailed_trace,top_k}')::bigint
+    END), 0)::bigint AS max_detailed_trace_top_k
+  FROM otlet.inference_receipts receipt
+  JOIN otlet.jobs job ON job.id = receipt.job_id
+  WHERE job.execution_mode = 'production'
 ),
 materialization_failures AS (
   SELECT
@@ -139,7 +182,8 @@ SELECT
   (COALESCE(runtime.error_runtime_slots, 0) = 0) AS no_runtime_slot_errors,
   (COALESCE(runtime.cache_entries_within_cap, true) AND COALESCE(runtime.cache_bytes_within_cap, true)) AS cache_within_bounds,
   (COALESCE(trace.max_detailed_trace_tokens, 0) <= 256 AND COALESCE(trace.max_detailed_trace_top_k, 0) <= 16) AS trace_within_bounds,
-  now() AS checked_at
+  now() AS checked_at,
+  q.suspended_revision_queued_jobs
 FROM otlet.production_policy p
 CROSS JOIN queue q
 CROSS JOIN receipts r

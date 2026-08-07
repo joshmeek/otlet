@@ -6,7 +6,17 @@ AS $$
 DECLARE
   role_name text;
   rpc regprocedure;
+  old_revision_hash text;
 BEGIN
+  PERFORM pg_catalog.pg_advisory_xact_lock(
+    pg_catalog.hashtextextended(
+      'otlet_access_policy:' || grant_portable_worker_access.target_role::oid::text,
+      0
+    )
+  );
+  old_revision_hash := otlet.access_policy_revision(
+    grant_portable_worker_access.target_role
+  );
   SELECT rolname
   INTO role_name
   FROM pg_catalog.pg_roles
@@ -27,6 +37,7 @@ BEGIN
     JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
     WHERE n.nspname = 'otlet'
       AND p.proname IN (
+        'portable_start_worker',
         'portable_claim_jobs',
         'portable_renew_job',
         'portable_record_attempt',
@@ -39,5 +50,10 @@ BEGIN
   LOOP
     EXECUTE pg_catalog.format('GRANT EXECUTE ON FUNCTION %s TO %I', rpc, role_name);
   END LOOP;
+  PERFORM otlet.finish_access_policy_grant(
+    'portable_worker',
+    grant_portable_worker_access.target_role,
+    old_revision_hash
+  );
 END;
 $$;

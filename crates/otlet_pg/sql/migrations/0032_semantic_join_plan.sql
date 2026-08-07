@@ -1,6 +1,7 @@
 CREATE FUNCTION otlet.semantic_join_index_plan(
   index_name text,
-  exact boolean DEFAULT false
+  exact boolean DEFAULT false,
+  expected_workload_revision_hash text DEFAULT NULL
 ) RETURNS TABLE (
   selected_path text,
   reason text,
@@ -37,6 +38,7 @@ CREATE FUNCTION otlet.semantic_join_index_plan(
 )
 LANGUAGE plpgsql
 ROWS 1
+SET search_path = pg_catalog, pg_temp
 AS $$
 DECLARE
   index_row otlet.semantic_join_indexes%ROWTYPE;
@@ -49,47 +51,59 @@ DECLARE
   current_contract_hash text;
   current_input_shaping jsonb := '{}'::jsonb;
 BEGIN
-  SELECT *
-  INTO index_row
-  FROM otlet.semantic_join_indexes sji
-  WHERE sji.name = semantic_join_index_plan.index_name;
+  SELECT
+    revision.definition #>> '{source,semantic_join_index_name}',
+    revision.definition #>> '{task,name}',
+    revision.definition #>> '{source,record_type}',
+    revision.definition #>> '{models,direct,name}',
+    (revision.definition #>> '{source,max_candidate_rows}')::integer,
+    head.active_workload_revision_hash,
+    revision.definition #> '{task,input_shaping}'
+  INTO
+    index_row.name,
+    index_row.task_name,
+    index_row.record_type,
+    index_row.model_name,
+    index_row.max_candidate_rows,
+    current_contract_hash,
+    current_input_shaping
+  FROM otlet.workload_revision_heads head
+  JOIN otlet.workload_revisions revision
+    ON revision.task_name = head.task_name
+   AND revision.workload_revision_hash = head.active_workload_revision_hash
+  WHERE revision.definition #>> '{source,semantic_join_index_name}' = semantic_join_index_plan.index_name
+    AND revision.definition #>> '{source,kind}' = 'pair';
 
   IF NOT FOUND THEN
     RAISE EXCEPTION 'otlet semantic join index % does not exist', semantic_join_index_plan.index_name;
   END IF;
 
-  SELECT
-    otlet.task_contract_hash(
-      t.instruction,
-      t.output_schema,
-      t.model_name,
-      t.runtime_options,
-      t.input_shaping,
-      t.decision_contract
-    ),
-    t.input_shaping
-  INTO current_contract_hash, current_input_shaping
-  FROM otlet.tasks t
-  WHERE t.name = index_row.task_name;
+  IF semantic_join_index_plan.expected_workload_revision_hash IS NOT NULL
+     AND semantic_join_index_plan.expected_workload_revision_hash IS DISTINCT FROM current_contract_hash THEN
+    RAISE EXCEPTION 'otlet workload revision changed during semantic join plan for index %', index_row.name;
+  END IF;
+
+  IF NOT exact THEN
+    PERFORM otlet.require_workload_source_contract(
+      index_row.task_name,
+      current_contract_hash,
+      false
+    );
+  END IF;
 
   IF exact THEN
     EXECUTE format(
       $sql$
         WITH raw_inputs AS (
           SELECT subject_id, input
-          FROM (
-            SELECT subject_id::text AS subject_id, input::jsonb AS input
-            FROM (%1$s) otlet_join_candidate
-            ORDER BY subject_id
-            LIMIT %2$s
-          ) otlet_join_input
+          FROM otlet.semantic_join_candidate_rows(%1$L, %4$L, false)
         ),
         current_inputs AS (
           SELECT
             subject_id,
             input,
-            md5(input::text) AS source_hash,
-            otlet.semantic_content_hash(input, %6$L::jsonb) AS content_hash
+            otlet.semantic_source_hash(input) AS source_hash,
+            otlet.semantic_content_hash(input, %5$L::jsonb) AS content_hash
           FROM raw_inputs
         ),
         latest AS (
@@ -105,13 +119,14 @@ BEGIN
           FROM current_inputs ci
           JOIN otlet.semantic_materializations sm
             ON sm.subject_id = ci.subject_id
-          WHERE sm.task_name = %3$L
-            AND sm.record_type = %4$L
+          WHERE sm.task_name = %2$L
+            AND sm.record_type = %3$L
+            AND sm.contract_hash = %4$L
           ORDER BY
             sm.subject_id,
             (
               sm.content_hash IS NOT DISTINCT FROM ci.content_hash
-              AND sm.contract_hash IS NOT DISTINCT FROM %5$L
+              AND sm.contract_hash IS NOT DISTINCT FROM %4$L
             ) DESC,
             sm.updated_at DESC,
             sm.id DESC
@@ -132,7 +147,7 @@ BEGIN
             l.stale_reason,
             l.source_hash,
             ci.content_hash,
-            %5$L,
+            %4$L,
             ci.source_hash
           ) status ON l.subject_id IS NOT NULL
         )
@@ -155,8 +170,7 @@ BEGIN
           )
         FROM classified
       $sql$,
-      index_row.candidate_query,
-      index_row.max_candidate_rows,
+      index_row.name,
       index_row.task_name,
       index_row.record_type,
       current_contract_hash,
@@ -177,6 +191,7 @@ BEGIN
       FROM otlet.semantic_materializations sm
       WHERE sm.task_name = index_row.task_name
         AND sm.record_type = index_row.record_type
+        AND sm.contract_hash = current_contract_hash
       ORDER BY
         sm.subject_id,
         (

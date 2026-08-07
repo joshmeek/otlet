@@ -1,3 +1,5 @@
+demo_pgoptions="${OTLET_DEMO_PGOPTIONS:-}"
+
 log() {
   printf '[%s] %s\n' "$(date '+%H:%M:%S')" "$*"
 }
@@ -10,7 +12,8 @@ require_container() {
 }
 
 psql_exec() {
-  docker exec -i "$container" psql -U postgres -d "$database" -v ON_ERROR_STOP=1 "$@"
+  docker exec -e PGOPTIONS="$demo_pgoptions" -i "$container" \
+    psql -U postgres -d "$database" -v ON_ERROR_STOP=1 "$@"
 }
 
 psql_value() {
@@ -18,7 +21,7 @@ psql_value() {
 }
 
 psql_candidate_exec() {
-  docker exec -e PGOPTIONS='-c statement_timeout=2000ms' -i "$container" \
+  docker exec -e PGOPTIONS="-c statement_timeout=2000ms $demo_pgoptions" -i "$container" \
     psql -U postgres -d "$database" -v ON_ERROR_STOP=1 "$@"
 }
 
@@ -53,10 +56,17 @@ cleanup_task() {
   local task="$1"
 
   psql_exec -v task_name="$task" >/dev/null <<'SQL'
+BEGIN;
 DELETE FROM otlet.worker_events e
 USING otlet.jobs j
 WHERE e.job_id = j.id
   AND j.task_name = :'task_name';
+SELECT otlet.lock_eval_label_series(array_agg(label.id ORDER BY label.id))
+FROM otlet.eval_labels label
+JOIN otlet.actions action ON action.id = label.action_id
+JOIN otlet.jobs job ON job.id = action.job_id
+WHERE job.task_name = :'task_name';
+SELECT set_config('otlet.eval_label_cleanup', 'on', true);
 DELETE FROM otlet.eval_labels l
 USING otlet.actions a, otlet.jobs j
 WHERE l.action_id = a.id
@@ -86,7 +96,7 @@ USING otlet.jobs j
 WHERE r.job_id = j.id
   AND j.task_name = :'task_name';
 DELETE FROM otlet.jobs WHERE task_name = :'task_name';
-DELETE FROM otlet.tasks WHERE name = :'task_name';
+COMMIT;
 SQL
 }
 

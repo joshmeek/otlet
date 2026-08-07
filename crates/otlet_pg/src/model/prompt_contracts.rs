@@ -57,6 +57,7 @@ static LINKED_BACKEND: OnceLock<()> = OnceLock::new();
 static LINKED_CACHE: OnceLock<Mutex<Option<LinkedCache>>> = OnceLock::new();
 
 static INFERENCE_CACHE: OnceLock<Mutex<InferenceCache>> = OnceLock::new();
+static EVALUATION_INFERENCE_CACHE: OnceLock<Mutex<InferenceCache>> = OnceLock::new();
 
 const INFERENCE_CACHE_MAX_ENTRIES: usize = 512;
 const INFERENCE_CACHE_MAX_BYTES: usize = 8 * 1024 * 1024;
@@ -74,6 +75,7 @@ const LINKED_DECODE_CONSTRAINT: &str =
 const LINKED_DECODE_CONSTRAINT_REASON: &str =
     "balanced_json_stop_prevents_trailing_prose_schema_failures_stay_receipts_only";
 const LINKED_CONTEXT_WINDOW_TOKENS: u32 = 4096;
+const LINKED_CONTEXT_WINDOW_QUANTUM_TOKENS: u32 = 256;
 const LINKED_PROMPT_BATCH_TOKENS: usize = 512;
 const LINKED_PROMPT_UBATCH_TOKENS: usize = 512;
 const LINKED_DEFAULT_MAX_DECODE_THREADS: usize = 6;
@@ -128,8 +130,9 @@ fn shaped_model_prompt(input: &Value, prefix: &str) -> ShapedPrompt {
         let (bytes, original_bytes, input_truncated) = shaped_input_meta(input, buf.len());
         let prompt_hash = hash_text_parts(&[prefix, shaped_input, PROMPT_BODY_AFTER_INPUT]);
         let input_hash = hash_text(shaped_input);
-        let mut full =
-            String::with_capacity(prefix.len() + shaped_input.len() + PROMPT_BODY_AFTER_INPUT.len());
+        let mut full = String::with_capacity(
+            prefix.len() + shaped_input.len() + PROMPT_BODY_AFTER_INPUT.len(),
+        );
         full.push_str(prefix);
         full.push_str(shaped_input);
         full.push_str(PROMPT_BODY_AFTER_INPUT);
@@ -328,7 +331,6 @@ struct TaskContractDigests {
     runtime_options: Result<crate::runtime::RuntimeOptions, String>,
     output_schema_hash: String,
     runtime_options_hash: String,
-    runtime_options_status: Value,
     decision_contract_hash: String,
     decision_preset_name: String,
     decision_preset_contract_hash: String,
@@ -420,9 +422,11 @@ fn cached_prompt_prefix(
     instruction: &str,
     rendered_schema: &str,
 ) -> Arc<str> {
-    Arc::clone(digests.prompt_prefix.get_or_init(|| {
-        Arc::from(prompt_prefix(options, instruction, rendered_schema))
-    }))
+    Arc::clone(
+        digests
+            .prompt_prefix
+            .get_or_init(|| Arc::from(prompt_prefix(options, instruction, rendered_schema))),
+    )
 }
 
 fn task_contract_digests(job: &Job) -> Arc<TaskContractDigests> {
@@ -443,7 +447,6 @@ fn build_task_contract_digests(job: &Job) -> TaskContractDigests {
     let instruction_hash = hash_text(&instruction);
     let output_schema_hash = hash_json(&job.output_schema);
     let runtime_options_hash = hash_json(&job.runtime_options);
-    let runtime_options_status = runtime_option_status(&job.runtime_options);
     let input_shaping_hash = hash_json(&job.input_shaping);
     let decision_contract_hash = hash_json(&job.decision_contract);
     let decision_preset_name = job
@@ -471,7 +474,6 @@ fn build_task_contract_digests(job: &Job) -> TaskContractDigests {
         runtime_options,
         output_schema_hash,
         runtime_options_hash,
-        runtime_options_status,
         decision_contract_hash,
         decision_preset_name,
         decision_preset_contract_hash,

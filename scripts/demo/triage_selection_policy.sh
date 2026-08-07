@@ -72,7 +72,7 @@ echo "row_triage_policy_contract=$row_triage_policy_contract"
 }
 row_triage_preset_contract="$(psql_exec -qAt -v task_name="$row_triage_policy_task" <<'SQL'
 SELECT COALESCE(t.decision_contract ->> 'preset', '') || '|' ||
-       ((t.decision_contract ->> 'preset_contract_hash') ~ '^[0-9a-f]{32}$')::text || '|' ||
+       ((t.decision_contract ->> 'preset_contract_hash') ~ '^otlet:v1:sha256:[0-9a-f]{64}$')::text || '|' ||
        COALESCE(p.accept_field_checks ->> 'answer_field', '') || '|' ||
        (p.accept_field_checks -> 'abstain_values' ? 'unclear')::text || '|' ||
        (p.accept_field_checks -> 'accepted_confidence' ? 'medium')::text
@@ -111,7 +111,7 @@ echo "model_selection_shape_contract=rejected"
 row_triage_preset_trace_contract="$(psql_exec -qAt -v task_name="$row_triage_policy_task" <<'SQL'
 SELECT COALESCE(s.decision_preset_name, '') || '|' ||
        (s.decision_preset_contract_hash = t.decision_contract ->> 'preset_contract_hash')::text || '|' ||
-       (s.decision_preset_contract_hash = md5(otlet.semantic_canonical_jsonb(p.decision_contract)::text))::text
+       (s.decision_preset_contract_hash = otlet.identity_hash('decision_rule_preset', p.decision_contract))::text
 FROM otlet.inference_receipt_trace_status s
 JOIN otlet.tasks t ON t.name = s.task_name
 JOIN otlet.decision_rule_presets p ON p.name = s.decision_preset_name

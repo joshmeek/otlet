@@ -9,7 +9,7 @@ password="${POSTGRES_PASSWORD:-postgres}"
 database="${OTLET_DATABASE-postgres}"
 pgrx_features="${OTLET_PGRX_FEATURES:-pg18,native,openmp}"
 worker_count="${OTLET_WORKER_COUNT:-1}"
-max_worker_rss_bytes="${OTLET_MAX_WORKER_RSS_BYTES:-8589934592}"
+max_worker_rss_bytes="${OTLET_MAX_WORKER_RSS_BYTES:-0}"
 llama_threads="${OTLET_LLAMA_THREADS:-}"
 llama_batch_threads="${OTLET_LLAMA_BATCH_THREADS:-}"
 llama_batch_tokens="${OTLET_LLAMA_BATCH_TOKENS:-}"
@@ -196,7 +196,7 @@ ensure_model() {
       find -L "$1" "$2" -type f -name "$3" -print 2>/dev/null |
         while IFS= read -r path; do
           if [ "$(head -c 4 "$path" 2>/dev/null)" = GGUF ]; then
-            printf "%s\n" "$path"
+            readlink -f "$path"
             break
           fi
         done

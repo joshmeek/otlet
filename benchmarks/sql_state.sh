@@ -250,6 +250,19 @@ cleanup_sql_state() {
   local prefix
   prefix="$(task_prefix_like)"
   psql_exec -v prefix="$prefix" >/dev/null <<'SQL' || true
+BEGIN;
+SELECT otlet.lock_eval_label_series(array_agg(label.id ORDER BY label.id))
+FROM otlet.eval_labels label
+LEFT JOIN otlet.actions action ON action.id = label.action_id
+LEFT JOIN otlet.outputs output ON output.id = label.output_id
+LEFT JOIN otlet.inference_receipts receipt ON receipt.id = label.receipt_id
+LEFT JOIN otlet.jobs job ON job.id = COALESCE(
+  action.job_id,
+  output.job_id,
+  receipt.job_id
+)
+WHERE job.task_name LIKE :'prefix' ESCAPE '\';
+SELECT set_config('otlet.eval_label_cleanup', 'on', true);
 WITH bench_jobs AS (
   SELECT id
   FROM otlet.jobs
@@ -363,6 +376,7 @@ DELETE FROM otlet.tasks t
 WHERE t.name LIKE :'prefix' ESCAPE '\';
 
 DROP SCHEMA IF EXISTS otlet_bench_source CASCADE;
+COMMIT;
 SQL
 }
 
@@ -375,20 +389,14 @@ cleanup_models() {
   psql_exec -v model_names="$names" >/dev/null <<'SQL'
 WITH names AS (
   SELECT unnest(string_to_array(:'model_names', ',')) AS model_name
-),
-deleted_slots AS (
-  DELETE FROM otlet.runtime_slots s
-  USING names
-  WHERE s.model_name = names.model_name
-  RETURNING s.model_name
 )
-DELETE FROM otlet.models m
+DELETE FROM otlet.runtime_slots slot
 USING names
-WHERE m.name = names.model_name;
+WHERE slot.model_name = names.model_name;
 SQL
 }
 
-created_model_residue_count() {
+created_model_runtime_slot_residue_count() {
   local names
   if [[ ! -s "$created_models" ]]; then
     printf '0'
@@ -400,8 +408,7 @@ WITH names AS (
   SELECT unnest(string_to_array(:'model_names', ',')) AS model_name
 )
 SELECT
-  (SELECT count(*) FROM otlet.models m JOIN names ON names.model_name = m.name)
-  + (SELECT count(*) FROM otlet.runtime_slots s JOIN names ON names.model_name = s.model_name);
+  count(*) FROM otlet.runtime_slots slot JOIN names ON names.model_name = slot.model_name;
 SQL
 }
 
@@ -425,8 +432,13 @@ perform_cleanup() {
   local removed_bytes=0
   local scratch_removed=false
   local sql_removed=false
-  local models_removed=false
+  local runtime_slots_removed=false
   local model_residue=0
+  local cleanup_generation=0
+  local cleanup_result
+  local cleanup_run_id
+  local cleanup_slice
+  local cleanup_state
 
   if [[ "$keep_sql_state" = "1" ]]; then
     append_kv "$cleanup_tsv" sql_state_removed false
@@ -444,9 +456,9 @@ perform_cleanup() {
     removed_bytes="$(scratch_bytes)"
     docker exec "$container" sh -lc "rm -rf $(sh_quote "$scratch_dir")" >/dev/null || true
     removed_bytes=$((removed_bytes + artifact_bytes_removed_early))
-    model_residue="$(created_model_residue_count)"
+    model_residue="$(created_model_runtime_slot_residue_count)"
     if [[ "$model_residue" = "0" ]]; then
-      models_removed=true
+      runtime_slots_removed=true
     fi
     scratch_removed=true
     append_kv "$cleanup_tsv" model_artifacts_removed true
@@ -459,8 +471,52 @@ perform_cleanup() {
 UPDATE otlet.production_policy
 SET sensitive_evidence_mode = 'redacted'
 WHERE name = 'default';
-SELECT * FROM otlet.cleanup_policy_state(false);
 SQL
+    cleanup_run_id="$(psql_value -c "SELECT otlet.create_maintenance_run('cleanup');")"
+    for ((cleanup_slice = 0; cleanup_slice < 1024; cleanup_slice++)); do
+      cleanup_result="$(psql_value \
+        -v run_id="$cleanup_run_id" \
+        -v generation="$cleanup_generation" <<'SQL'
+SELECT slice.control_state || '|' || slice.generation
+FROM otlet.run_maintenance_slice(
+  :'run_id'::bigint,
+  :'generation'::bigint
+) slice;
+SQL
+)"
+      IFS='|' read -r cleanup_state cleanup_generation <<<"$cleanup_result"
+      [[ "$cleanup_state" = "complete" ]] && break
+      [[ "$cleanup_state" = "running" ]] || {
+        echo "Benchmark cleanup maintenance stopped in state $cleanup_state" >&2
+        return 1
+      }
+    done
+    [[ "$cleanup_state" = "complete" ]] || {
+      echo "Benchmark cleanup maintenance exceeded 1024 slices" >&2
+      return 1
+    }
+    cleanup_result="$(psql_value -v run_id="$cleanup_run_id" <<'SQL'
+SELECT generation || '|' || vacuum_handoff_required
+FROM otlet.maintenance_run_status
+WHERE maintenance_run_id = :'run_id'::bigint;
+SQL
+)"
+    IFS='|' read -r cleanup_generation cleanup_state <<<"$cleanup_result"
+    if [[ "$cleanup_state" = "true" ]]; then
+      psql_exec \
+        -v run_id="$cleanup_run_id" \
+        -v generation="$cleanup_generation" >/dev/null <<'SQL'
+SELECT unnest(vacuum_handoff_sql)
+FROM otlet.maintenance_run_status
+WHERE maintenance_run_id = :'run_id'::bigint
+\gexec
+SELECT otlet.acknowledge_maintenance_vacuum(
+  :'run_id'::bigint,
+  :'generation'::bigint,
+  'benchmark cleanup'
+);
+SQL
+    fi
     sensitive_mode_enabled=0
     append_kv "$cleanup_tsv" sensitive_evidence_mode_restored redacted
   fi
@@ -469,9 +525,10 @@ SQL
   append_kv "$cleanup_tsv" model_cleanup_policy "$keep_models"
   append_kv "$cleanup_tsv" downloaded_path_count "$(wc -l < "$downloaded_paths" | tr -d ' ')"
   append_kv "$cleanup_tsv" created_model_count "$(wc -l < "$created_models" | tr -d ' ')"
-  append_kv "$cleanup_tsv" created_model_residue_count "$model_residue"
+  append_kv "$cleanup_tsv" created_model_runtime_slot_residue_count "$model_residue"
+  append_kv "$cleanup_tsv" model_registrations_retained true
   append_kv "$cleanup_tsv" cleanup_complete true
   append_kv "$cleanup_tsv" scratch_removed "$scratch_removed"
   append_kv "$cleanup_tsv" sql_removed "$sql_removed"
-  append_kv "$cleanup_tsv" created_models_removed "$models_removed"
+  append_kv "$cleanup_tsv" created_model_runtime_slots_removed "$runtime_slots_removed"
 }

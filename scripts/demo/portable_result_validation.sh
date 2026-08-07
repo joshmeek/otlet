@@ -323,9 +323,9 @@ SELECT (
   r.schema_validation_status || '|' ||
   (r.trace_summary ->> 'schema_validation_status') || '|' ||
   (r.trace_summary #>> '{portable_validation,version}') || '|' ||
-  (length(r.task_identity_hash) = 64)::text || '|' ||
-  (length(r.source_identity_hash) = 64)::text || '|' ||
-  (length(r.model_identity_hash) = 64)::text || '|' ||
+  (r.task_identity_hash ~ '^otlet:v1:sha256:[0-9a-f]{64}$')::text || '|' ||
+  (r.source_identity_hash ~ '^otlet:v1:sha256:[0-9a-f]{64}$')::text || '|' ||
+  (r.model_identity_hash ~ '^otlet:v1:sha256:[0-9a-f]{64}$')::text || '|' ||
   (length(r.runtime_options_hash) = 64)::text || '|' ||
   (length(r.prompt_hash) = 64)::text || '|' ||
   (length(r.input_hash) = 64)::text || '|' ||
@@ -366,4 +366,8 @@ SQL
 cleanup_task "portable_validation_demo"
 cleanup_task "portable_unsupported_demo"
 cleanup_task "portable_stale_demo"
-psql_exec -qAt -c "DROP TABLE IF EXISTS public.otlet_demo_portable_source" >/dev/null
+psql_exec -qAt >/dev/null <<'SQL'
+DELETE FROM otlet.workload_revision_heads
+WHERE task_name = 'portable_stale_demo';
+DROP TABLE IF EXISTS public.otlet_demo_portable_source;
+SQL

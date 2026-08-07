@@ -1,7 +1,128 @@
+use pgrx::{IntoDatum, JsonB, pg_guard, pg_sys};
+
 const RUNTIME_FINGERPRINT_VERSION: &str = "otlet_runtime_fingerprint_v1";
 const PROMPT_TEMPLATE_NAME: &str = "otlet_raw_json_worker_v1";
 const LLAMA_CPP_SYS_VERSION: &str = "0.3.1";
 const LLAMA_CPP_REVISION: &str = "94a220cd6";
+
+static OTLET_LINKED_RUNTIME_CAPABILITIES_FINFO: pg_sys::Pg_finfo_record =
+    pg_sys::Pg_finfo_record { api_version: 1 };
+
+fn linked_runtime_capabilities() -> Value {
+    let batch_tokens = linked_prompt_batch_tokens();
+    json!({
+        "version": "otlet_runtime_capabilities_v1",
+        "supported_runtime_options": crate::runtime::SUPPORTED_RUNTIME_OPTIONS,
+        "schema_behavior": {
+            "input": "postgres_jsonb_shaped_snapshot",
+            "response": "json_object_output_actions_envelope",
+            "decode_constraint": LINKED_DECODE_CONSTRAINT,
+            "validation": "runtime_then_postgres_authoritative_json_schema_subset",
+            "unsupported_schema": "rejected_at_task_registration",
+            "supported_types": [
+                "object", "array", "string", "number", "integer", "boolean", "null"
+            ],
+            "supported_keywords": [
+                "$schema", "$id", "title", "description", "default", "examples",
+                "type", "enum", "const", "required", "properties",
+                "additionalProperties", "items", "minLength", "maxLength", "minimum",
+                "maximum", "exclusiveMinimum", "exclusiveMaximum", "minItems",
+                "maxItems", "minProperties", "maxProperties"
+            ],
+            "additional_properties": "boolean_only",
+            "items": "one_schema"
+        },
+        "context_limits": {
+            "context_window_tokens": LINKED_CONTEXT_WINDOW_TOKENS,
+            "physical_context_quantum_tokens": LINKED_CONTEXT_WINDOW_QUANTUM_TOKENS,
+            "model_context_window_source": "artifact_identity.context_window_tokens",
+            "task_context_window_option": "context_window_tokens_optional_lte_model_limit",
+            "batch_tokens": batch_tokens,
+            "ubatch_tokens": linked_prompt_ubatch_tokens(batch_tokens),
+            "max_generation_tokens": 4096
+        },
+        "cancellation": {
+            "policy": LINKED_CANCELLATION_POLICY,
+            "prompt_decode_boundary": LINKED_PROMPT_DECODE_CANCELLATION_BOUNDARY,
+            "observation_slice_ms": LINKED_CANCELLATION_SLICE_MS
+        },
+        "tracing": {
+            "summary": "otlet_generation_trace_v1",
+            "detailed": DETAILED_TRACE_CONTRACT,
+            "generation_trace": "optional",
+            "max_tokens": 256,
+            "max_top_k": 16,
+            "storage": DETAILED_TRACE_STORAGE_POLICY
+        },
+        "artifact_formats": {
+            "accepted": ["gguf"],
+            "verification": "sha256_verified_open_regular_file_descriptor",
+            "symlinks": "rejected"
+        },
+        "runtime_build": {
+            "engine": "llama.cpp",
+            "crate": "llama-cpp-sys-4",
+            "crate_version": LLAMA_CPP_SYS_VERSION,
+            "revision": LLAMA_CPP_REVISION,
+            "features": {
+                "native": cfg!(feature = "native"),
+                "openmp": cfg!(feature = "openmp")
+            }
+        },
+        "device_settings": {
+            "policy": LINKED_MODEL_DEVICE_POLICY,
+            "gpu_layers": 0,
+            "mmap": linked_env_bool("OTLET_LLAMA_MMAP", true),
+            "mlock": linked_env_bool("OTLET_LLAMA_MLOCK", false),
+            "flash_attention": fingerprint_flash_attention()
+        },
+        "resource_admission": {
+            "budget_option": "max_worker_rss_bytes",
+            "default_max_worker_rss_bytes": crate::runtime::DEFAULT_MAX_WORKER_RSS_BYTES,
+            "memory_accounting": LINKED_MEMORY_ACCOUNTING_POLICY,
+            "load_policy": "one_resident_model_preflight_before_tensor_allocation",
+            "request_projection_policy": "linked_prompt_token_output_piece_batch_prefix_state_projection_v1",
+            "request_projection_evidence": [
+                "prompt_tokens",
+                "max_generation_tokens",
+                "projected_prompt_bytes",
+                "projected_decode_bytes",
+                "projected_prompt_prefix_state_bytes",
+                "decision",
+                "reason"
+            ],
+            "required_evidence": [
+                "artifact_bytes",
+                "worker_rss",
+                "system_available_memory",
+                "cgroup_memory"
+            ]
+        },
+        "database_operations": {
+            "transaction_timeout_ms": crate::worker::DATABASE_TRANSACTION_TIMEOUT_MS,
+            "lock_timeout_ms": crate::worker::DATABASE_LOCK_TIMEOUT_MS,
+            "scope": "native_worker_session",
+            "covered_operations": [
+                "claim", "sweep", "renewal", "receipt", "completion", "materialization"
+            ],
+            "timeout_recovery": "transaction_rollback_worker_restart_lease_reclaim"
+        }
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C-unwind" fn pg_finfo_otlet_linked_runtime_capabilities()
+-> *const pg_sys::Pg_finfo_record {
+    &raw const OTLET_LINKED_RUNTIME_CAPABILITIES_FINFO
+}
+
+#[pg_guard]
+#[unsafe(no_mangle)]
+pub extern "C-unwind" fn otlet_linked_runtime_capabilities(
+    _fcinfo: pg_sys::FunctionCallInfo,
+) -> pg_sys::Datum {
+    JsonB(linked_runtime_capabilities()).into_datum().unwrap()
+}
 
 struct RuntimeFingerprint {
     document: Value,
@@ -12,7 +133,10 @@ struct RuntimeFingerprint {
 fn runtime_fingerprint(
     model: JobModelRef<'_>,
     model_fingerprint_hash: &str,
+    verified_artifact_sha256: &str,
+    verified_artifact_bytes: u64,
     options: &crate::runtime::RuntimeOptions,
+    context_budget: ModelContextBudget,
 ) -> RuntimeFingerprint {
     let batch_tokens = linked_prompt_batch_tokens();
     let ubatch_tokens = linked_prompt_ubatch_tokens(batch_tokens);
@@ -44,7 +168,11 @@ fn runtime_fingerprint(
             "target_arch": std::env::consts::ARCH
         },
         "context": {
-            "tokens": LINKED_CONTEXT_WINDOW_TOKENS,
+            "tokens": context_budget.tested,
+            "tested_context_window_tokens": context_budget.tested,
+            "requested_context_window_tokens": context_budget.requested,
+            "effective_context_window_tokens": context_budget.effective,
+            "physical_context_window_tokens": context_budget.physical,
             "batch_tokens": batch_tokens,
             "ubatch_tokens": ubatch_tokens,
             "kv_type_k": ggml_type_name(kv_type_k),
@@ -65,10 +193,10 @@ fn runtime_fingerprint(
         "output_contract": output_contract,
         "artifact": {
             "name": artifact_name,
-            "bytes": fs::metadata(model.artifact_path).map(|meta| meta.len()).unwrap_or(0),
-            "sha256": model.artifact_hash,
+            "bytes": verified_artifact_bytes,
+            "sha256": verified_artifact_sha256,
             "identity": model.artifact_identity,
-            "verification": "sha256_verified_before_model_load",
+            "verification": "sha256_verified_file_descriptor_load",
             "fingerprint_hash": model_fingerprint_hash,
             "quantization": model.artifact_identity
                 .get("quantization")
@@ -165,7 +293,8 @@ fn host_fingerprint() -> Value {
             "memory_bytes": meminfo_bytes("MemTotal"),
             "swap_bytes": meminfo_bytes("SwapTotal")
         })
-    }).clone()
+    })
+    .clone()
 }
 
 fn read_trimmed(path: &str) -> Value {
@@ -201,6 +330,51 @@ mod runtime_fingerprint_tests {
     use super::*;
 
     #[test]
+    fn capabilities_advertise_model_bound_context_and_request_projection() {
+        let capabilities = linked_runtime_capabilities();
+        assert_eq!(
+            capabilities["context_limits"]["model_context_window_source"],
+            "artifact_identity.context_window_tokens"
+        );
+        assert_eq!(
+            capabilities["context_limits"]["task_context_window_option"],
+            "context_window_tokens_optional_lte_model_limit"
+        );
+        assert_eq!(
+            capabilities["context_limits"]["physical_context_quantum_tokens"],
+            LINKED_CONTEXT_WINDOW_QUANTUM_TOKENS
+        );
+        assert_eq!(
+            capabilities["resource_admission"]["request_projection_policy"],
+            "linked_prompt_token_output_piece_batch_prefix_state_projection_v1"
+        );
+        assert_eq!(
+            capabilities["resource_admission"]["request_projection_evidence"],
+            json!([
+                "prompt_tokens",
+                "max_generation_tokens",
+                "projected_prompt_bytes",
+                "projected_decode_bytes",
+                "projected_prompt_prefix_state_bytes",
+                "decision",
+                "reason"
+            ])
+        );
+        assert_eq!(
+            capabilities["database_operations"],
+            json!({
+                "transaction_timeout_ms": 10_000,
+                "lock_timeout_ms": 1_000,
+                "scope": "native_worker_session",
+                "covered_operations": [
+                    "claim", "sweep", "renewal", "receipt", "completion", "materialization"
+                ],
+                "timeout_recovery": "transaction_rollback_worker_restart_lease_reclaim"
+            })
+        );
+    }
+
+    #[test]
     fn output_contract_hash_is_stable_and_scoped() {
         let identity = json!({
             "sha256": "1111111111111111111111111111111111111111111111111111111111111111",
@@ -217,14 +391,58 @@ mod runtime_fingerprint_tests {
             artifact_identity: &identity,
         };
         let options = crate::runtime::RuntimeOptions::default();
-        let first = runtime_fingerprint(model, "model-hash", &options);
-        let second = runtime_fingerprint(model, "model-hash", &options);
+        let context_budget = model_context_budget(&identity, &options)
+            .unwrap_or_else(|err| panic!("{}", err.message));
+        let first = runtime_fingerprint(
+            model,
+            "model-hash",
+            model.artifact_hash,
+            24,
+            &options,
+            context_budget,
+        );
+        let second = runtime_fingerprint(
+            model,
+            "model-hash",
+            model.artifact_hash,
+            24,
+            &options,
+            context_budget,
+        );
+        let narrowed_options = crate::runtime::RuntimeOptions {
+            context_window_tokens: Some(1024),
+            ..Default::default()
+        };
+        let narrowed_budget = model_context_budget(&identity, &narrowed_options)
+            .unwrap_or_else(|err| panic!("{}", err.message));
+        let narrowed = runtime_fingerprint(
+            model,
+            "model-hash",
+            model.artifact_hash,
+            24,
+            &narrowed_options,
+            narrowed_budget,
+        );
         let mut changed_options = crate::runtime::RuntimeOptions::default();
         changed_options.llama_threads = 2;
-        let changed = runtime_fingerprint(model, "model-hash", &changed_options);
+        let changed = runtime_fingerprint(
+            model,
+            "model-hash",
+            model.artifact_hash,
+            24,
+            &changed_options,
+            context_budget,
+        );
         let mut reasoning_on = crate::runtime::RuntimeOptions::default();
         reasoning_on.reasoning = "on";
-        let reasoning_on = runtime_fingerprint(model, "model-hash", &reasoning_on);
+        let reasoning_on = runtime_fingerprint(
+            model,
+            "model-hash",
+            model.artifact_hash,
+            24,
+            &reasoning_on,
+            context_budget,
+        );
         let mut changed_host = first.document.clone();
         changed_host["host"]["memory_bytes"] = json!(1);
         let changed_identity = json!({
@@ -237,15 +455,41 @@ mod runtime_fingerprint_tests {
         });
         let changed_artifact = runtime_fingerprint(
             JobModelRef {
-                artifact_hash: changed_identity.get("sha256").and_then(Value::as_str).unwrap(),
+                artifact_hash: changed_identity
+                    .get("sha256")
+                    .and_then(Value::as_str)
+                    .unwrap(),
                 artifact_identity: &changed_identity,
                 ..model
             },
             "changed-model-hash",
+            changed_identity
+                .get("sha256")
+                .and_then(Value::as_str)
+                .unwrap(),
+            24,
             &options,
+            context_budget,
         );
 
         assert_eq!(first.hash, second.hash);
+        assert_eq!(
+            first.document["output_contract"]["context"]["effective_context_window_tokens"],
+            LINKED_CONTEXT_WINDOW_TOKENS
+        );
+        assert_eq!(
+            narrowed.document["output_contract"]["context"]["requested_context_window_tokens"],
+            1024
+        );
+        assert_eq!(
+            narrowed.document["output_contract"]["context"]["effective_context_window_tokens"],
+            1024
+        );
+        assert_eq!(
+            narrowed.document["output_contract"]["context"]["physical_context_window_tokens"],
+            LINKED_CONTEXT_WINDOW_TOKENS
+        );
+        assert_ne!(first.output_contract_hash, narrowed.output_contract_hash);
         assert_eq!(first.output_contract_hash, second.output_contract_hash);
         assert_ne!(first.output_contract_hash, changed.output_contract_hash);
         assert_ne!(
@@ -263,7 +507,13 @@ mod runtime_fingerprint_tests {
     #[test]
     fn quantization_comes_from_common_gguf_names() {
         assert_eq!(artifact_quantization("Qwen3.5-4B-Q4_K_M.gguf"), "Q4_K_M");
-        assert_eq!(artifact_quantization("model-IQ4_XS-00001-of-00002.gguf"), "IQ4_XS");
-        assert_eq!(artifact_quantization("model.gguf"), "artifact_bound_unknown");
+        assert_eq!(
+            artifact_quantization("model-IQ4_XS-00001-of-00002.gguf"),
+            "IQ4_XS"
+        );
+        assert_eq!(
+            artifact_quantization("model.gguf"),
+            "artifact_bound_unknown"
+        );
     }
 }

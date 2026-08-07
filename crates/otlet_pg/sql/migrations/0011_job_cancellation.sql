@@ -20,6 +20,7 @@ DECLARE
   job_row otlet.jobs%ROWTYPE;
   task_row otlet.tasks%ROWTYPE;
   model_row otlet.models%ROWTYPE;
+  revision_definition jsonb;
   actual_request_hash text;
   actual_selection_role text;
 BEGIN
@@ -71,36 +72,23 @@ BEGIN
     RAISE EXCEPTION 'otlet job claim is stale';
   END IF;
 
-  SELECT t.model_name
-  INTO task_row.model_name
-  FROM otlet.tasks t
-  WHERE t.name = job_row.task_name;
+  SELECT revision.definition
+  INTO revision_definition
+  FROM otlet.workload_revisions revision
+  WHERE revision.workload_revision_hash = job_row.workload_revision_hash
+    AND revision.task_name = job_row.task_name;
   IF NOT FOUND THEN
-    RAISE EXCEPTION 'otlet task % does not exist', job_row.task_name;
+    RAISE EXCEPTION 'otlet job workload revision is missing';
   END IF;
-  SELECT m.name
-  INTO model_row.name
-  FROM otlet.models m
-  WHERE m.name = COALESCE(
+  task_row.model_name := revision_definition #>> '{models,direct,name}';
+  model_row.name := COALESCE(
     finish_canceled_job.model_name,
     job_row.routed_model_name,
     task_row.model_name
   );
-  IF NOT FOUND THEN
-    RAISE EXCEPTION 'otlet model % does not exist',
-      COALESCE(
-        finish_canceled_job.model_name,
-        job_row.routed_model_name,
-        task_row.model_name
-      );
-  END IF;
   actual_selection_role := CASE
     WHEN job_row.routed_model_name IS NOT NULL THEN 'strong'
-    WHEN EXISTS (
-      SELECT 1
-      FROM otlet.model_selection_policies selection
-      WHERE selection.task_name = job_row.task_name
-    ) THEN 'cheap'
+    WHEN jsonb_typeof(revision_definition -> 'selection') = 'object' THEN 'cheap'
     ELSE 'direct'
   END;
 
@@ -202,12 +190,15 @@ BEGIN
         jsonb_build_object(
           'task_name', job_row.task_name,
           'subject_id', job_row.subject_id,
-          'model_name', t.model_name,
+          'model_name', COALESCE(
+            job_row.routed_model_name,
+            revision.definition #>> '{models,direct,name}'
+          ),
           'reason', request_job_cancellation.reason
         )
       )
-      FROM otlet.tasks t
-      WHERE t.name = job_row.task_name;
+      FROM otlet.workload_revisions revision
+      WHERE revision.workload_revision_hash = job_row.workload_revision_hash;
     END IF;
 
     RETURN NEXT job_row;
@@ -218,19 +209,14 @@ BEGIN
     UPDATE otlet.jobs j
     SET status = 'cancel_requested',
         attempts = attempts + 1,
-        leased_until = now() + otlet.effective_job_lease_interval(
-          p.default_runtime_options || t.runtime_options,
-          p.max_attempt_ms,
-          p.job_lease_interval
-        ),
+        leased_until = now()
+          + (revision.definition #>> '{runtime,lease_ms}')::bigint * interval '1 millisecond',
         claim_token = gen_random_uuid()::text,
         error = request_job_cancellation.reason,
         cancel_requested_at = now()
-    FROM otlet.tasks t
-    CROSS JOIN otlet.production_policy p
+    FROM otlet.workload_revisions revision
     WHERE j.id = job_row.id
-      AND t.name = j.task_name
-      AND p.name = 'default'
+      AND revision.workload_revision_hash = j.workload_revision_hash
     RETURNING j.* INTO job_row;
 
     RETURN QUERY

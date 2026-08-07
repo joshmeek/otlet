@@ -1,6 +1,6 @@
 log "Running entity-resolution demo"
 psql_exec -v join_index_name="$join_index_name" >/dev/null <<'SQL'
-SELECT otlet.drop_watch(:'join_index_name');
+SELECT otlet.drop_watch_registry(:'join_index_name');
 SQL
 cleanup_task "$entity_task"
 cleanup_task "$join_task"
@@ -35,12 +35,19 @@ VALUES
   ('vendor-1001:vendor-77', 'vendor-1001', 'vendor-77'),
   ('vendor-1001:vendor-313', 'vendor-1001', 'vendor-313'),
   ('vendor-1001:vendor-314', 'vendor-1001', 'vendor-314');
-CREATE VIEW public.otlet_demo_vendor_pair_input AS
+CREATE VIEW public.otlet_demo_vendor_pair_input WITH (security_invoker = true) AS
 SELECT
   p.pair_id AS subject_id,
   jsonb_build_object(
     '_otlet_mvcc', jsonb_build_object(
       'table', 'public.otlet_demo_vendor_entity',
+      'source', CASE
+        WHEN p.pair_id IN (
+          'vendor-1001:vendor-42',
+          'vendor-1001:vendor-77'
+        ) THEN 'erp'
+        ELSE 'crm'
+      END,
       'subject_id', p.pair_id,
       'left_id', p.left_id,
       'right_id', p.right_id,
@@ -125,7 +132,7 @@ SQL
 
 source_rows_before="$(psql_exec -qAt <<'SQL'
 SELECT count(*)::text || '|' ||
-       md5(string_agg(to_jsonb(v)::text, ',' ORDER BY v.id))
+       otlet.portable_json_hash(jsonb_agg(to_jsonb(v) - 'updated_at' ORDER BY v.id))
 FROM public.otlet_demo_vendor_entity v;
 SQL
 )"

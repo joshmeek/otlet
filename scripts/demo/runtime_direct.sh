@@ -35,7 +35,8 @@ SELECT 'direct_ask_receipt_contract=' || s.model_name || '|' || s.status || '|' 
        s.schema_validation_status || '|' || s.detailed_trace_captured_tokens::text || '|' ||
        COALESCE(s.schema_force, '') || '|' || COALESCE(s.decode_constraint, '') || '|' ||
        COALESCE(s.decode_constraint_reason, '') || '|' ||
-       COALESCE(jsonb_extract_path_text(s.trace_summary, 'probability_summary', 'method'), '')
+       COALESCE(jsonb_extract_path_text(s.trace_summary, 'probability_summary', 'method'), '') || '|' ||
+       s.job_origin
 FROM otlet.inference_receipt_trace_status s
 WHERE s.receipt_id = :'direct_ask_receipt_id'::bigint;
 SELECT 'direct_ask_cache_contract=' || s.inference_cache_hit::text || '|' ||
@@ -45,6 +46,13 @@ SELECT 'direct_ask_cache_contract=' || s.inference_cache_hit::text || '|' ||
        COALESCE(s.inference_cache_eviction_reason, '')
 FROM otlet.inference_receipt_trace_status s
 WHERE s.receipt_id = :'direct_ask_receipt_id'::bigint;
+SELECT 'direct_ask_administrative_contract=' || NOT EXISTS (
+  SELECT 1
+  FROM otlet.administrative_change_events event
+  JOIN otlet.jobs job ON job.id = :'direct_ask_job_id'::bigint
+  WHERE event.object_type = 'task'
+    AND event.object_name = job.task_name
+);
 SELECT 'direct_ask_runtime_fingerprint_contract=' ||
        s.runtime_fingerprint_version || '|' ||
        (s.runtime_fingerprint_hash = rs.runtime_fingerprint_hash)::text || '|' ||
@@ -68,14 +76,19 @@ printf '%s\n' "$direct_ask_output"
 direct_ask_contract="$(sed -n 's/^direct_ask_contract=//p' <<<"$direct_ask_output")"
 direct_ask_receipt_contract="$(sed -n 's/^direct_ask_receipt_contract=//p' <<<"$direct_ask_output")"
 direct_ask_cache_contract="$(sed -n 's/^direct_ask_cache_contract=//p' <<<"$direct_ask_output")"
+direct_ask_administrative_contract="$(sed -n 's/^direct_ask_administrative_contract=//p' <<<"$direct_ask_output")"
 direct_ask_runtime_fingerprint_contract="$(sed -n 's/^direct_ask_runtime_fingerprint_contract=//p' <<<"$direct_ask_output")"
 require_regex "$direct_ask_contract" '^review_payment\|[1-9][0-9]*\|[1-9][0-9]*$' "Expected direct ask to return review_payment with job and receipt ids"
-require_regex "$direct_ask_receipt_contract" "^$strong_model_name\\|complete\\|passed\\|[1-9][0-9]*\\|postgres_portable_json_schema_validation\\|greedy_with_balanced_json_object_stop_post_generation_schema_check\\|balanced_json_stop_prevents_trailing_prose_schema_failures_stay_receipts_only\\|chosen_token_softmax_from_llama_logits$" "Expected direct ask decode and validation evidence"
+require_regex "$direct_ask_receipt_contract" "^$strong_model_name\\|complete\\|passed\\|[1-9][0-9]*\\|postgres_portable_json_schema_validation\\|greedy_with_balanced_json_object_stop_post_generation_schema_check\\|balanced_json_stop_prevents_trailing_prose_schema_failures_stay_receipts_only\\|chosen_token_softmax_from_llama_logits\\|direct_ask$" "Expected direct ask decode, validation, and origin evidence"
 [ "$direct_ask_cache_contract" = "false|disabled_for_generation_trace|content_hash_contract_hash_runtime_output_contract_hash_model_fingerprint|true|none" ] || {
   echo "Expected direct ask trace to make cache-disabled-under-generation-trace explicit, got $direct_ask_cache_contract" >&2
   exit 1
 }
-require_regex "$direct_ask_runtime_fingerprint_contract" '^otlet_runtime_fingerprint_v1\|true\|true\|true\|true\|true\|true\|sha256_verified_before_model_load\|Q4_K_M\|otlet_raw_json_worker_v1\|94a220cd6\|512\|[1-9][0-9]*$' "Expected receipt and runtime status to share one verified model identity and complete runtime fingerprint"
+[ "$direct_ask_administrative_contract" = "true" ] || {
+  echo "Expected deterministic inline task synthesis to stay outside administrative history" >&2
+  exit 1
+}
+require_regex "$direct_ask_runtime_fingerprint_contract" '^otlet_runtime_fingerprint_v1\|true\|true\|true\|true\|true\|true\|sha256_verified_file_descriptor_load\|Q4_K_M\|otlet_raw_json_worker_v1\|94a220cd6\|512\|[1-9][0-9]*$' "Expected receipt and runtime status to share one verified model identity and complete runtime fingerprint"
 
 log "Checking opt-in direct decision contract gate"
 direct_gate_jobs_completed_before="$(psql_value -v model_name="$strong_model_name" <<'SQL'
@@ -397,6 +410,8 @@ echo "input_shape_sql_contract=$input_shape_sql_contract"
 }
 
 psql_exec >/dev/null <<'SQL'
+DELETE FROM otlet.workload_revision_heads
+WHERE task_name = 'direct_decision_gate_demo';
 DROP TABLE IF EXISTS public.readme_vendor_note;
 DROP TABLE IF EXISTS public.otlet_demo_direct_gate;
 SQL

@@ -1,88 +1,66 @@
-require_regex "$oversized_prompt_contract" '^failed\|true\|failed\|failed\|direct_attempt_failed\|failed\|prompt(_and_generation)?_exceed(s_context_window|_context_window)\|0\|ready\|ready$' "Expected oversized prompt to produce a clean failed receipt and healthy worker"
+require_regex "$oversized_prompt_contract" '^failed\|true\|failed\|failed\|direct_attempt_failed\|failed\|prompt(_and_generation)?_exceed(s_context_window|_context_window)\|otlet.failure.v1.runtime_configuration_rejected\|otlet.failure.v1.runtime_configuration_rejected\|admission\|after_owner_action\|repair_runtime_options\|database_owner_only\|true\|true\|0\|ready\|ready$' "Expected oversized prompt to produce a classified failure and healthy worker"
 
-cancel_decode_task="cancel_decode_worker_demo"
-cleanup_task "$cancel_decode_task"
-psql_exec -v task_name="$cancel_decode_task" -v model_name="$strong_model_name" >/dev/null <<'SQL'
-SELECT otlet.create_task(
-  :'task_name',
-  $source$
-    SELECT 'cancel-decode-1'::text AS subject_id,
-           jsonb_build_object('payload', repeat('cancel decode ', 1000)) AS input
-  $source$::text,
-  'Return JSON only: {"output":{"status":"ok"},"actions":[]}',
-  '{"type":"object","required":["status"],"additionalProperties":false,"properties":{"status":{"enum":["ok"]}}}'::jsonb,
-  :'model_name',
-  '{"max_tokens":512,"reasoning":"off","inference_cache":false}'::jsonb,
-  '{"source_fields":["payload"]}'::jsonb
-);
-SELECT otlet.run_task(:'task_name');
-SQL
-cancel_decode_job_id=""
-for _ in $(seq 1 300); do
-  cancel_decode_job_id="$(psql_exec -qAt -v task_name="$cancel_decode_task" <<'SQL'
-SELECT id FROM otlet.jobs
-WHERE task_name = :'task_name' AND status = 'running'
-ORDER BY id DESC LIMIT 1;
-SQL
-)"
-  if [ -n "$cancel_decode_job_id" ]; then
-    psql_exec -qAt -v job_id="$cancel_decode_job_id" >/dev/null <<'SQL'
-SELECT count(*) FROM otlet.request_job_cancellation(:'job_id'::bigint, 'demo cancel mid-decode');
-SQL
-    break
-  fi
-  cancel_decode_terminal="$(psql_exec -qAt -v task_name="$cancel_decode_task" <<'SQL'
-SELECT COALESCE(max(status), '') FROM otlet.jobs
-WHERE task_name = :'task_name'
-  AND status IN ('complete','failed','canceled');
-SQL
-)"
-  if [ -n "$cancel_decode_terminal" ]; then
-    echo "Expected cancel smoke to reach running state before terminal status, got $cancel_decode_terminal" >&2
-    exit 1
-  fi
-  sleep 0.2
-done
-[ -n "$cancel_decode_job_id" ] || {
-  echo "Timed out waiting for cancel smoke job to run" >&2
-  exit 1
-}
-wait_task_failed "$cancel_decode_task" 1 240 1
-cancel_decode_contract="$(psql_exec -qAt \
-  -v task_name="$cancel_decode_task" \
-  -v model_name="$strong_model_name" <<'SQL'
-WITH job_row AS (
-  SELECT id, status, error
-  FROM otlet.jobs
-  WHERE task_name = :'task_name'
-  ORDER BY id DESC
-  LIMIT 1
-),
-receipt_row AS (
-  SELECT status, selection_status, selection_reason, schema_validation_status
-  FROM otlet.inference_receipts
-  WHERE job_id = (SELECT id FROM job_row)
-  ORDER BY id DESC
-  LIMIT 1
+sql_failure_taxonomy_contract="$(psql_exec -qAt -v model_name="$strong_model_name" <<'SQL'
+BEGIN;
+\o /dev/null
+SELECT otlet.register_model(
+  'failure_taxonomy_sql_model',
+  model.artifact_path,
+  model.artifact_hash,
+  model.artifact_identity
 )
-SELECT j.status || '|' ||
-       (j.error = 'demo cancel mid-decode')::text || '|' ||
-       r.status || '|' ||
-       r.selection_status || '|' ||
-       r.selection_reason || '|' ||
-       COALESCE(r.schema_validation_status, '') || '|' ||
-       (SELECT count(*) FROM otlet.outputs WHERE job_id = j.id)::text || '|' ||
-       COALESCE(rs.runtime_status, '') || '|' ||
-       COALESCE(rs.slot_state, '')
-FROM job_row j
-CROSS JOIN receipt_row r
-JOIN otlet.runtime_status rs
-  ON rs.model_name = :'model_name';
+FROM otlet.models model
+WHERE model.name = :'model_name';
+SELECT otlet.create_task(
+  'failure_taxonomy_sql_task',
+  NULL,
+  'SQL failure taxonomy proof',
+  '{"type":"object"}'::jsonb,
+  'failure_taxonomy_sql_model',
+  input_shaping => '{"source_fields":["approved"]}'::jsonb
+);
+\o
+INSERT INTO otlet.jobs (task_name, subject_id, input)
+VALUES (
+  'failure_taxonomy_sql_task',
+  'sql-failure',
+  '{"approved":"ok"}'::jsonb
+);
+UPDATE otlet.jobs
+SET status = 'failed',
+    error = 'source field allowlist violation',
+    finished_at = now()
+WHERE task_name = 'failure_taxonomy_sql_task';
+UPDATE otlet.jobs
+SET failure_reason_code = 'otlet.failure.v1.decision_rejected'
+WHERE task_name = 'failure_taxonomy_sql_task';
+SELECT concat_ws('|',
+  job.status,
+  job.error,
+  job.failure_reason_code,
+  failure.execution_path,
+  failure.stage,
+  failure.retryability,
+  failure.owner_action,
+  failure.recommended_retry_mode,
+  failure.raw_detail_visibility,
+  failure.raw_detail_available,
+  model.lifecycle_state,
+  (SELECT count(*) FROM otlet.inference_receipts receipt WHERE receipt.job_id = job.id),
+  (SELECT count(*) FROM otlet.verify_invariants())
+)
+FROM otlet.jobs job
+JOIN otlet.failure_retry_status failure
+  ON failure.failure_scope = 'job'
+ AND failure.job_id = job.id
+JOIN otlet.models model ON model.name = 'failure_taxonomy_sql_model'
+WHERE job.task_name = 'failure_taxonomy_sql_task';
+ROLLBACK;
 SQL
 )"
-echo "cancel_decode_worker_contract=$cancel_decode_contract"
-[ "$cancel_decode_contract" = "canceled|true|canceled|failed|canceled|not_run|0|ready|ready" ] || {
-  echo "Expected mid-decode cancel to produce a clean canceled receipt and healthy worker, got $cancel_decode_contract" >&2
+echo "sql_failure_taxonomy_contract=$sql_failure_taxonomy_contract"
+[ "$sql_failure_taxonomy_contract" = "failed|source field allowlist violation|otlet.failure.v1.source_contract_rejected|sql|admission|after_owner_action|repair_workload|latest_source|database_owner_only|t|active|0|0" ] || {
+  echo "Expected SQL failure classification without a receipt, got $sql_failure_taxonomy_contract" >&2
   exit 1
 }
 
@@ -128,14 +106,14 @@ FROM invalid_json_claim;
 SQL
 invalid_json_contract="$(psql_exec -qAt -v task_name="$invalid_json_task" <<'SQL'
 WITH job_row AS (
-  SELECT id, status, error
+  SELECT id, status, error, failure_reason_code
   FROM otlet.jobs
   WHERE task_name = :'task_name'
   ORDER BY id DESC
   LIMIT 1
 ),
 receipt_row AS (
-  SELECT status, selection_status, schema_validation_status
+  SELECT status, selection_status, schema_validation_status, failure_reason_code
   FROM otlet.inference_receipts
   WHERE job_id = (SELECT id FROM job_row)
   ORDER BY id DESC
@@ -153,15 +131,22 @@ SELECT j.status || '|' ||
        r.status || '|' ||
        r.selection_status || '|' ||
        r.schema_validation_status || '|' ||
+       j.failure_reason_code || '|' ||
+       r.failure_reason_code || '|' ||
+       taxonomy.stage || '|' ||
+       taxonomy.owner_action || '|' ||
+       taxonomy.raw_detail_visibility || '|' ||
        (SELECT count(*) FROM otlet.outputs WHERE job_id = j.id)::text || '|' ||
        (SELECT count(*) FROM otlet.actions WHERE job_id = j.id)::text || '|' ||
        (SELECT materialization_count FROM materialized)::text
 FROM job_row j
-CROSS JOIN receipt_row r;
+CROSS JOIN receipt_row r
+JOIN otlet.failure_taxonomy taxonomy
+  ON taxonomy.failure_reason_code = j.failure_reason_code;
 SQL
 )"
 echo "invalid_json_safety_contract=$invalid_json_contract"
-[ "$invalid_json_contract" = "failed|true|failed|failed|failed|0|0|0" ] || {
+[ "$invalid_json_contract" = "failed|true|failed|failed|failed|otlet.failure.v1.output_validation_failed|otlet.failure.v1.output_validation_failed|output_validation|inspect_model_and_contract|database_owner_only|0|0|0" ] || {
   echo "Expected invalid JSON to leave only a failed receipt, got $invalid_json_contract" >&2
   exit 1
 }

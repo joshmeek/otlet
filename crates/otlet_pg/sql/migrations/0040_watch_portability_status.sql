@@ -97,6 +97,7 @@ DECLARE
   input_columns text[];
   saved otlet.watches%ROWTYPE;
 BEGIN
+  PERFORM otlet.workload_definition_complexity_guard(import_watch.definition);
   IF jsonb_typeof(import_watch.definition) IS DISTINCT FROM 'object' THEN
     RAISE EXCEPTION 'otlet watch definition must be a JSON object';
   END IF;
@@ -274,68 +275,201 @@ BEGIN
 END;
 $$;
 
+CREATE VIEW otlet.source_query_dependency_status AS
+SELECT
+  head.task_name,
+  head.active_workload_revision_hash AS workload_revision_hash,
+  revision.definition #> '{source,query_contract,query}' AS query_identity,
+  revision.definition #> '{source,query_contract,identity}' AS execution_identity,
+  revision.definition #> '{source,query_contract,search_path}' AS search_path_identity,
+  jsonb_array_length(COALESCE(
+    revision.definition #> '{source,query_contract,relations}',
+    '[]'::jsonb
+  ))::integer AS relation_dependencies,
+  jsonb_array_length(COALESCE(
+    revision.definition #> '{source,query_contract,functions}',
+    '[]'::jsonb
+  ))::integer AS function_dependencies,
+  CASE WHEN dependency.error IS NULL THEN 'ready' ELSE 'suspended' END AS dependency_status,
+  dependency.error AS dependency_error,
+  now() AS checked_at
+FROM otlet.workload_revision_heads head
+JOIN otlet.workload_revisions revision
+  ON revision.task_name = head.task_name
+ AND revision.workload_revision_hash = head.active_workload_revision_hash
+LEFT JOIN LATERAL (
+  SELECT otlet.source_query_contract_error(
+    revision.definition #> '{source,query_contract}'
+  ) AS error
+) dependency ON true;
+
+CREATE VIEW otlet.workload_revision_status AS
+SELECT
+  task.name AS task_name,
+  head.active_workload_revision_hash,
+  head.previous_workload_revision_hash,
+  configured.workload_revision_hash AS configured_workload_revision_hash,
+  configured.workload_revision_hash IS DISTINCT FROM head.active_workload_revision_hash AS configured_drift,
+  CASE WHEN dependency.error IS NULL THEN 'ready' ELSE 'suspended' END AS source_dependency_status,
+  dependency.error AS source_dependency_error,
+  head.promoted_at,
+  active.created_at AS active_revision_created_at,
+  COALESCE(materialization.fresh_materializations, 0)::bigint AS fresh_materializations,
+  COALESCE(materialization.contract_changed_materializations, 0)::bigint AS contract_changed_materializations,
+  COALESCE(action.suspended_actions, 0)::bigint AS suspended_actions,
+  COALESCE(queue.suspended_revision_queued_jobs, 0)::bigint AS suspended_revision_queued_jobs
+FROM otlet.tasks task
+LEFT JOIN otlet.workload_revision_heads head ON head.task_name = task.name
+LEFT JOIN otlet.workload_revisions active
+  ON active.task_name = head.task_name
+ AND active.workload_revision_hash = head.active_workload_revision_hash
+LEFT JOIN LATERAL (
+  SELECT otlet.source_query_contract_error(
+    active.definition #> '{source,query_contract}'
+  ) AS error
+) dependency ON true
+LEFT JOIN LATERAL (
+  SELECT otlet.identity_hash(
+    'workload_revision',
+    otlet.current_workload_revision_definition(task.name)
+  ) AS workload_revision_hash
+) configured ON true
+LEFT JOIN LATERAL (
+  SELECT
+    count(*) FILTER (
+      WHERE NOT materialization.stale
+        AND materialization.contract_hash = head.active_workload_revision_hash
+    )::bigint AS fresh_materializations,
+    count(*) FILTER (
+      WHERE materialization.stale_reason = 'contract_changed'
+    )::bigint AS contract_changed_materializations
+  FROM otlet.semantic_materializations materialization
+  WHERE materialization.task_name = task.name
+) materialization ON true
+LEFT JOIN LATERAL (
+  SELECT count(*)::bigint AS suspended_revision_queued_jobs
+  FROM otlet.jobs job
+  WHERE job.task_name = task.name
+    AND job.status = 'queued'
+    AND job.execution_mode = 'production'
+    AND (
+      job.workload_revision_hash IS DISTINCT FROM head.active_workload_revision_hash
+      OR dependency.error IS NOT NULL
+    )
+) queue ON true
+LEFT JOIN LATERAL (
+  SELECT count(*)::bigint AS suspended_actions
+  FROM otlet.actions action_row
+  JOIN otlet.jobs job ON job.id = action_row.job_id
+  WHERE job.task_name = task.name
+    AND job.execution_mode = 'production'
+    AND (
+      job.workload_revision_hash IS DISTINCT FROM head.active_workload_revision_hash
+      OR dependency.error IS NOT NULL
+    )
+    AND action_row.status <> 'applied'
+) action ON true;
+
 CREATE VIEW otlet.watch_status AS
 WITH watch_sources AS (
   SELECT
-    COALESCE(w.name, si.name) AS watch_name,
-    'row'::text AS kind,
-    si.task_name,
-    si.name AS semantic_index_name,
-    NULL::text AS semantic_join_index_name,
-    si.source_table,
-    si.subject_column,
-    si.input_columns,
-    '[]'::jsonb AS pair_sources,
-    si.record_type,
-    si.model_name,
-    NULL::jsonb AS candidate_plan,
-    NULL::numeric AS candidate_plan_cost,
-    NULL::timestamptz AS candidate_preflight_at,
+    COALESCE(
+      revision.definition #>> '{source,watch_name}',
+      revision.definition #>> '{source,semantic_index_name}',
+      revision.definition #>> '{source,semantic_join_index_name}'
+    ) AS watch_name,
+    revision.definition #>> '{source,kind}' AS kind,
+    head.task_name,
+    revision.definition #>> '{source,semantic_index_name}' AS semantic_index_name,
+    revision.definition #>> '{source,semantic_join_index_name}' AS semantic_join_index_name,
+    revision.definition #>> '{source,source_table}' AS source_table,
+    revision.definition #>> '{source,subject_column}' AS subject_column,
+    CASE
+      WHEN revision.definition #> '{source,input_columns}' IS NULL THEN NULL::text[]
+      ELSE ARRAY(
+        SELECT value
+        FROM jsonb_array_elements_text(revision.definition #> '{source,input_columns}') value
+      )
+    END AS input_columns,
+    head.active_workload_revision_hash AS workload_revision_hash,
+    COALESCE(revision.definition #> '{source,pair_sources}', '[]'::jsonb) AS pair_sources,
+    revision.definition #>> '{source,record_type}' AS record_type,
+    revision.definition #>> '{models,direct,name}' AS model_name,
+    revision.candidate_plan,
+    revision.candidate_plan_cost,
+    revision.candidate_preflight_at,
+    current_preflight.candidate_plan AS current_candidate_plan,
+    current_preflight.candidate_plan_cost AS current_candidate_plan_cost,
+    current_preflight.candidate_preflight_at AS current_candidate_preflight_at,
+    CASE
+      WHEN revision.candidate_plan IS NULL OR current_preflight.candidate_plan IS NULL THEN false
+      ELSE revision.candidate_plan IS DISTINCT FROM current_preflight.candidate_plan
+    END AS candidate_plan_drift,
+    CASE
+      WHEN revision.definition #>> '{source,kind}' <> 'pair' THEN NULL
+      WHEN dependency.error IS NOT NULL THEN 'suspended'
+      ELSE current_preflight.candidate_preflight_status
+    END AS candidate_preflight_status,
+    COALESCE(
+      dependency.error,
+      current_preflight.candidate_preflight_error
+    ) AS candidate_preflight_error,
+    dependency.error AS source_dependency_error,
     COALESCE(w.stale_policy, 'refresh_then_fail_closed') AS stale_policy,
     COALESCE(w.trigger_policy, '{"on_change":"mark_stale"}'::jsonb) AS trigger_policy,
     COALESCE(w.selection_policy, '{}'::jsonb) AS selection_policy
-  FROM otlet.semantic_indexes si
-  LEFT JOIN otlet.watches w ON w.semantic_index_name = si.name
-  UNION ALL
-  SELECT
-    COALESCE(w.name, ji.name) AS watch_name,
-    'pair'::text AS kind,
-    ji.task_name,
-    NULL::text AS semantic_index_name,
-    ji.name AS semantic_join_index_name,
-    NULL::text AS source_table,
-    NULL::text AS subject_column,
-    NULL::text[] AS input_columns,
-    COALESCE(w.pair_sources, '[]'::jsonb) AS pair_sources,
-    ji.record_type,
-    ji.model_name,
-    ji.candidate_plan,
-    ji.candidate_plan_cost,
-    ji.candidate_preflight_at,
-    COALESCE(w.stale_policy, 'refresh_then_fail_closed') AS stale_policy,
-    COALESCE(w.trigger_policy, '{"on_change":"mark_stale"}'::jsonb) AS trigger_policy,
-    COALESCE(w.selection_policy, '{}'::jsonb) AS selection_policy
-  FROM otlet.semantic_join_indexes ji
-  LEFT JOIN otlet.watches w ON w.semantic_join_index_name = ji.name
+  FROM otlet.workload_revision_heads head
+  JOIN otlet.workload_revisions revision
+    ON revision.task_name = head.task_name
+   AND revision.workload_revision_hash = head.active_workload_revision_hash
+  LEFT JOIN otlet.watches w
+    ON w.task_name = head.task_name
+   AND w.name = revision.definition #>> '{source,watch_name}'
+  LEFT JOIN LATERAL (
+    SELECT otlet.source_query_contract_error(
+      revision.definition #> '{source,query_contract}'
+    ) AS error
+  ) dependency ON true
+  LEFT JOIN LATERAL otlet.preflight_candidate_query(
+    revision.definition #>> '{source,candidate_query}',
+    false,
+    false,
+    revision.definition #> '{source,query_contract}'
+  ) current_preflight
+    ON revision.definition #>> '{source,kind}' = 'pair'
+  WHERE revision.definition #>> '{source,kind}' IN ('row', 'pair')
 ), watch_plans AS (
   SELECT w.watch_name, p.*
   FROM (
     SELECT *
     FROM watch_sources
     WHERE kind = 'row'
+      AND source_dependency_error IS NULL
   ) w
-  JOIN LATERAL otlet.semantic_index_plan(w.semantic_index_name) p ON true
+  JOIN LATERAL otlet.semantic_index_plan(
+    w.semantic_index_name,
+    false,
+    w.workload_revision_hash
+  ) p ON true
   UNION ALL
   SELECT w.watch_name, p.*
   FROM (
     SELECT *
     FROM watch_sources
     WHERE kind = 'pair'
+      AND source_dependency_error IS NULL
+      AND candidate_preflight_status = 'ready'
   ) w
-  JOIN LATERAL otlet.semantic_join_index_plan(w.semantic_join_index_name) p ON true
-), watch_tasks AS (
-  SELECT DISTINCT task_name
-  FROM watch_sources
+  JOIN LATERAL otlet.semantic_join_index_plan(
+    w.semantic_join_index_name,
+    false,
+    w.workload_revision_hash
+  ) p ON true
+), watch_revisions AS (
+  SELECT
+    head.task_name,
+    head.active_workload_revision_hash AS workload_revision_hash
+  FROM otlet.workload_revision_heads head
 ), watch_materialization_keys AS (
   SELECT DISTINCT task_name, record_type
   FROM watch_sources
@@ -347,7 +481,10 @@ WITH watch_sources AS (
     count(*) FILTER (WHERE j.status = 'complete')::bigint AS complete_jobs,
     count(*) FILTER (WHERE j.status IN ('failed', 'canceled'))::bigint AS failed_jobs
   FROM otlet.jobs j
-  JOIN watch_tasks USING (task_name)
+  JOIN watch_revisions revision
+    ON revision.task_name = j.task_name
+   AND revision.workload_revision_hash = j.workload_revision_hash
+  WHERE j.execution_mode = 'production'
   GROUP BY j.task_name
 ), action_counts AS (
   SELECT
@@ -357,7 +494,10 @@ WITH watch_sources AS (
     count(*) FILTER (WHERE a.status = 'rejected')::bigint AS rejected_actions
   FROM otlet.actions a
   JOIN otlet.jobs j ON j.id = a.job_id
-  JOIN watch_tasks USING (task_name)
+  JOIN watch_revisions revision
+    ON revision.task_name = j.task_name
+   AND revision.workload_revision_hash = j.workload_revision_hash
+  WHERE j.execution_mode = 'production'
   GROUP BY j.task_name
 ), suppression AS (
   SELECT
@@ -365,10 +505,21 @@ WITH watch_sources AS (
     count(*)::bigint AS suppressed_events,
     max(e.created_at) AS last_suppressed_at
   FROM otlet.worker_events e
-  JOIN watch_tasks ON watch_tasks.task_name = e.detail ->> 'task_name'
+  JOIN watch_revisions revision
+    ON revision.task_name = e.detail ->> 'task_name'
+   AND revision.workload_revision_hash = e.detail ->> 'workload_revision_hash'
   WHERE e.event_type = 'queue_admission_suppressed'
     AND e.detail ? 'task_name'
   GROUP BY e.detail ->> 'task_name'
+), reconciliation AS (
+  SELECT
+    pending.watch_name,
+    count(*) FILTER (WHERE pending.state = 'pending')::bigint AS pending_subjects,
+    count(*) FILTER (WHERE pending.state = 'exhausted')::bigint AS exhausted_subjects,
+    min(pending.first_dirty_at) FILTER (WHERE pending.state = 'pending') AS oldest_pending_at,
+    min(pending.next_attempt_at) FILTER (WHERE pending.state = 'pending') AS next_attempt_at
+  FROM otlet.watch_reconciliation pending
+  GROUP BY pending.watch_name
 ), materialized AS (
   SELECT
     sm.task_name,
@@ -377,12 +528,16 @@ WITH watch_sources AS (
     count(*) FILTER (WHERE sm.freshness_basis = 'revalidated_after_benign_update')::bigint AS revalidated_materializations
   FROM otlet.semantic_materializations sm
   JOIN watch_materialization_keys USING (task_name, record_type)
+  JOIN watch_revisions revision
+    ON revision.task_name = sm.task_name
+   AND revision.workload_revision_hash = sm.contract_hash
   GROUP BY sm.task_name, sm.record_type
 )
 SELECT
   w.watch_name,
   w.kind,
   w.task_name,
+  revision.workload_revision_hash,
   w.semantic_index_name,
   w.semantic_join_index_name,
   w.source_table,
@@ -394,9 +549,17 @@ SELECT
   w.candidate_plan,
   w.candidate_plan_cost,
   w.candidate_preflight_at,
+  w.current_candidate_plan,
+  w.current_candidate_plan_cost,
+  w.current_candidate_preflight_at,
+  w.candidate_plan_drift,
+  w.candidate_preflight_status,
+  w.candidate_preflight_error,
   w.stale_policy,
   w.trigger_policy,
   w.selection_policy,
+  CASE WHEN w.source_dependency_error IS NULL THEN 'ready' ELSE 'suspended' END AS source_dependency_status,
+  w.source_dependency_error,
   COALESCE(plan.total_subjects, 0)::bigint AS total_subjects,
   COALESCE(plan.fresh_subjects, 0)::bigint AS fresh_subjects,
   COALESCE(plan.stale_subjects, 0)::bigint AS stale_subjects,
@@ -404,8 +567,13 @@ SELECT
   COALESCE(plan.inflight_subjects, 0)::bigint AS inflight_subjects,
   COALESCE(plan.queue_subjects, 0)::bigint AS queue_subjects,
   COALESCE(plan.fail_closed_subjects, 0)::bigint AS fail_closed_subjects,
-  plan.selected_path,
-  plan.reason,
+  CASE
+    WHEN w.source_dependency_error IS NULL
+     AND COALESCE(w.candidate_preflight_status, 'ready') = 'ready'
+      THEN plan.selected_path
+    ELSE 'suspended'
+  END AS selected_path,
+  COALESCE(w.source_dependency_error, w.candidate_preflight_error, plan.reason) AS reason,
   COALESCE(plan.stale_reasons, '{}'::jsonb) AS stale_reasons,
   COALESCE(plan.freshness, 0)::numeric AS freshness,
   COALESCE(plan.worker_queue_depth, 0)::bigint AS worker_queue_depth,
@@ -420,18 +588,22 @@ SELECT
   COALESCE(action_counts.rejected_actions, 0)::bigint AS rejected_actions,
   COALESCE(suppression.suppressed_events, 0)::bigint AS queue_admission_suppressed_events,
   suppression.last_suppressed_at AS queue_admission_last_suppressed_at,
-  COALESCE(row_index.last_refresh_at, join_index.last_refresh_at) AS last_refresh_at,
-  COALESCE(row_index.last_lookup_at, join_index.last_lookup_at) AS last_lookup_at,
-  join_index.last_materialized_at AS last_join_materialized_at,
+  COALESCE(reconciliation.pending_subjects, 0)::bigint AS reconciliation_pending_subjects,
+  COALESCE(reconciliation.exhausted_subjects, 0)::bigint AS reconciliation_exhausted_subjects,
+  CASE
+    WHEN reconciliation.oldest_pending_at IS NULL THEN NULL
+    ELSE GREATEST(clock_timestamp() - reconciliation.oldest_pending_at, interval '0')
+  END AS reconciliation_oldest_pending_age,
+  reconciliation.next_attempt_at AS reconciliation_next_attempt_at,
   materialized.last_materialized_at,
   COALESCE(materialized.revalidated_materializations, 0)::bigint AS revalidated_materializations,
   COALESCE(plan.checked_at, now()) AS checked_at
 FROM watch_sources w
-LEFT JOIN otlet.semantic_indexes row_index ON row_index.name = w.semantic_index_name
-LEFT JOIN otlet.semantic_join_indexes join_index ON join_index.name = w.semantic_join_index_name
+JOIN watch_revisions revision ON revision.task_name = w.task_name
 LEFT JOIN watch_plans plan ON plan.watch_name = w.watch_name
 LEFT JOIN job_counts ON job_counts.task_name = w.task_name
 LEFT JOIN action_counts ON action_counts.task_name = w.task_name
 LEFT JOIN suppression ON suppression.task_name = w.task_name
+LEFT JOIN reconciliation ON reconciliation.watch_name = w.watch_name
 LEFT JOIN materialized ON materialized.task_name = w.task_name
   AND materialized.record_type = w.record_type;

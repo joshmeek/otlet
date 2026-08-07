@@ -45,11 +45,19 @@ Entity resolution uses a cheap local model for the first pass and a stronger loc
 Rerunning setup reuses the PostgreSQL volume and model artifacts while rebuilding Otlet extension state; user tables stay in place. When the container or image changes, setup clears persisted preload state before reinstalling the extension
 
 ```sql
+BEGIN;
 SELECT name
-FROM otlet.register_model('qwen3_1_7b', '/var/lib/postgresql/otlet-models/Qwen3-1.7B-Q8_0.gguf')
+FROM otlet.register_model(
+  'qwen3_1_7b',
+  '/var/lib/postgresql/otlet-models/Qwen3-1.7B-Q8_0.gguf'
+)
 UNION ALL
 SELECT name
-FROM otlet.register_model('qwen35_4b', '/var/lib/postgresql/otlet-models/Qwen3.5-4B-Q4_K_M.gguf');
+FROM otlet.register_model(
+  'qwen35_4b',
+  '/var/lib/postgresql/otlet-models/Qwen3.5-4B-Q4_K_M.gguf'
+);
+COMMIT;
 ```
 
 ```text
@@ -60,9 +68,10 @@ FROM otlet.register_model('qwen35_4b', '/var/lib/postgresql/otlet-models/Qwen3.5
 (2 rows)
 ```
 
-An Otlet task reads any SQL query that returns `subject_id` and row-shaped `input`. The [entity-resolution walkthrough](docs/entity-resolution-walkthrough.md) builds `public.otlet_demo_vendor_pair_input` from two application tables. The shortened task call includes the SQL API, output contract, trace settings, input shaping, and decision preset:
+An Otlet task reads any SQL query that returns `subject_id` and row-shaped `input`. The full demo's `scripts/demo/entity_resolution_jobs.sh` builds `public.otlet_demo_vendor_pair_input` from two application tables. The shortened task call below is a contract excerpt for that fresh fixture; use the [entity-resolution walkthrough](docs/entity-resolution-walkthrough.md) for standalone source setup. It includes the SQL API, output contract, trace settings, input shaping, and decision preset:
 
 ```sql
+BEGIN;
 SELECT name, model_name
 FROM otlet.create_task(
   task_name => 'entity_resolution_demo',
@@ -84,7 +93,7 @@ FROM otlet.create_task(
   }',
   model_name => 'qwen3_1_7b',
   runtime_options => '{"max_tokens":256,"reasoning":"off","inference_cache":true,"generation_trace":true,"generation_trace_max_tokens":16,"generation_trace_top_k":3}',
-  input_shaping => '{"evidence_fields":["candidate_evidence"],"action_id_fields":{"left_id":"left_id","right_id":"right_id"}}',
+  input_shaping => '{"source_fields":["_otlet_mvcc","action_ids","candidate_evidence","evidence_counts"],"evidence_fields":["candidate_evidence"],"action_id_fields":{"left_id":"left_id","right_id":"right_id"}}',
   decision_contract => '{"preset":"entity_resolution_evidence_v1"}'
 );
 
@@ -94,6 +103,7 @@ FROM otlet.set_model_selection_policy(
 );
 
 SELECT otlet.run_task('entity_resolution_demo') AS queued_jobs;
+COMMIT;
 ```
 
 ```text
@@ -161,9 +171,9 @@ ORDER BY attempt_index;
 (2 rows)
 ```
 
-Otlet records both attempts and creates `merge_candidate` from the accepted output. The action requires operator approval. The source vendor rows remain unchanged
+Otlet records both attempts and creates `merge_candidate` from the accepted output. The full demo later approves and dry-runs the action. The source vendor rows remain unchanged
 
-The full demo checks row and pair watches, candidate drift, CustomScan freshness, portable watch definitions, and bounded `update_row`. It covers receipt redaction, role grants, cancellation, model-load admission, memory pressure, cache bounds, prompt and runtime fingerprints, invariants, and Docker crash logs
+The full demo checks row and pair watches, candidate drift, CustomScan and time-based freshness, bounded backfill, workload enablement preflight, immutable job-origin attribution, per-task queue and claim budgets, native infer-now and queued service under saturation, portable watch definitions, workload-pack promotion and rollback, and bounded `update_row`. It covers blinded reviewer calibration, role separation, receipt redaction, cancellation, model-load admission, memory pressure, cache bounds, prompt and runtime fingerprints, invariants, and Docker crash logs
 
 ## Docs
 

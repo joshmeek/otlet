@@ -1,13 +1,11 @@
 use serde_json::{Value, json};
 
-#[cfg(target_os = "linux")]
-const DEFAULT_MAX_WORKER_RSS_BYTES: u64 = 8 * 1024 * 1024 * 1024;
-#[cfg(not(target_os = "linux"))]
-const DEFAULT_MAX_WORKER_RSS_BYTES: u64 = 0;
+pub(crate) const DEFAULT_MAX_WORKER_RSS_BYTES: u64 = 0;
 
-const SUPPORTED_RUNTIME_OPTIONS: &[&str] = &[
+pub(crate) const SUPPORTED_RUNTIME_OPTIONS: &[&str] = &[
     "reasoning",
     "max_tokens",
+    "context_window_tokens",
     "max_attempt_ms",
     "inference_cache",
     "max_worker_rss_bytes",
@@ -21,6 +19,7 @@ const SUPPORTED_RUNTIME_OPTIONS: &[&str] = &[
 pub(crate) struct RuntimeOptions {
     pub(crate) reasoning: &'static str,
     pub(crate) max_tokens: u64,
+    pub(crate) context_window_tokens: Option<u64>,
     pub(crate) inference_cache: bool,
     pub(crate) max_worker_rss_bytes: u64,
     pub(crate) generation_trace: bool,
@@ -35,6 +34,7 @@ impl Default for RuntimeOptions {
         Self {
             reasoning: "off",
             max_tokens: 512,
+            context_window_tokens: None,
             inference_cache: true,
             max_worker_rss_bytes: DEFAULT_MAX_WORKER_RSS_BYTES,
             generation_trace: false,
@@ -77,6 +77,18 @@ pub(crate) fn parse_runtime_options(value: &Value) -> Result<RuntimeOptions, Str
             return Err("runtime_options.max_tokens must be between 1 and 4096".to_owned());
         }
         options.max_tokens = max_tokens;
+    }
+
+    if let Some(value) = object.get("context_window_tokens") {
+        let context_window_tokens = value
+            .as_u64()
+            .ok_or("runtime_options.context_window_tokens must be an integer")?;
+        if !(1..=4096).contains(&context_window_tokens) {
+            return Err(
+                "runtime_options.context_window_tokens must be between 1 and 4096".to_owned(),
+            );
+        }
+        options.context_window_tokens = Some(context_window_tokens);
     }
 
     if let Some(value) = object.get("max_attempt_ms") {
@@ -168,7 +180,11 @@ pub(crate) fn parse_runtime_options(value: &Value) -> Result<RuntimeOptions, Str
     Ok(options)
 }
 
-pub(crate) fn runtime_option_status(value: &Value) -> Value {
+pub(crate) fn runtime_option_status(
+    value: &Value,
+    tested_context_window_tokens: u64,
+    effective_context_window_tokens: u64,
+) -> Value {
     let Some(object) = value.as_object() else {
         return json!({
             "policy": "runtime_options_must_be_json_object",
@@ -179,8 +195,15 @@ pub(crate) fn runtime_option_status(value: &Value) -> Value {
     };
     let mut honored = Vec::with_capacity(SUPPORTED_RUNTIME_OPTIONS.len());
     let mut defaulted = Vec::with_capacity(SUPPORTED_RUNTIME_OPTIONS.len());
+    let mut rejected = Vec::new();
+    let context_rejected = object
+        .get("context_window_tokens")
+        .and_then(Value::as_u64)
+        .is_some_and(|requested| requested > tested_context_window_tokens);
     for key in SUPPORTED_RUNTIME_OPTIONS {
-        if object.contains_key(*key) {
+        if *key == "context_window_tokens" && context_rejected {
+            rejected.push(*key);
+        } else if object.contains_key(*key) {
             honored.push(*key);
         } else {
             defaulted.push(*key);
@@ -190,8 +213,14 @@ pub(crate) fn runtime_option_status(value: &Value) -> Value {
         "policy": "linked_runtime_rejects_unsupported_non_default_options_no_silent_ignore",
         "honored": honored,
         "defaulted": defaulted,
+        "rejected": rejected,
         "unsupported": ["temperature", "connect_timeout_ms", "request_timeout_ms"],
-        "ignored": []
+        "ignored": [],
+        "context_window": {
+            "tested_context_window_tokens": tested_context_window_tokens,
+            "requested_context_window_tokens": object.get("context_window_tokens"),
+            "effective_context_window_tokens": effective_context_window_tokens
+        }
     })
 }
 
@@ -200,12 +229,47 @@ mod tests {
     use super::*;
 
     #[test]
-    fn worker_memory_has_a_bounded_default_and_explicit_disable() {
+    fn worker_memory_defaults_disabled_and_accepts_a_bound() {
         let defaults = parse_runtime_options(&json!({})).expect("default options must parse");
-        assert_eq!(defaults.max_worker_rss_bytes, DEFAULT_MAX_WORKER_RSS_BYTES);
+        assert_eq!(defaults.max_worker_rss_bytes, 0);
 
-        let disabled = parse_runtime_options(&json!({"max_worker_rss_bytes": 0}))
-            .expect("explicit disable must parse");
-        assert_eq!(disabled.max_worker_rss_bytes, 0);
+        let bounded = parse_runtime_options(&json!({"max_worker_rss_bytes": 1024}))
+            .expect("explicit bound must parse");
+        assert_eq!(bounded.max_worker_rss_bytes, 1024);
+    }
+
+    #[test]
+    fn context_window_is_optional_and_bounded() {
+        assert_eq!(
+            parse_runtime_options(&json!({}))
+                .expect("default options must parse")
+                .context_window_tokens,
+            None
+        );
+        assert_eq!(
+            parse_runtime_options(&json!({"context_window_tokens": 1024}))
+                .expect("smaller context must parse")
+                .context_window_tokens,
+            Some(1024)
+        );
+        let status = runtime_option_status(&json!({"context_window_tokens": 1024}), 2048, 1024);
+        assert_eq!(
+            status["context_window"],
+            json!({
+                "tested_context_window_tokens": 2048,
+                "requested_context_window_tokens": 1024,
+                "effective_context_window_tokens": 1024
+            })
+        );
+        assert!(parse_runtime_options(&json!({"context_window_tokens": 0})).is_err());
+        assert!(parse_runtime_options(&json!({"context_window_tokens": 4097})).is_err());
+
+        let rejected = runtime_option_status(&json!({"context_window_tokens": 2049}), 2048, 2048);
+        assert_eq!(rejected["honored"], json!([]));
+        assert_eq!(rejected["rejected"], json!(["context_window_tokens"]));
+        assert_eq!(
+            rejected["context_window"]["effective_context_window_tokens"],
+            2048
+        );
     }
 }

@@ -111,33 +111,169 @@ echo "row_scoped_sql_contract=$row_scoped_subject_rows|$row_scoped_plan|$row_emp
   exit 1
 }
 require_regex "$row_scoped_plan" '^semantic_lookup\|1\|1\|0\|0\|' "Expected row scoped SQL plan lookup with one fresh subject"
-psql_exec >/dev/null <<'SQL'
+row_schema_read_only_customscan_plan="$(
+  psql_exec -P border=2 -P null='' -v watch_name="$row_scoped_watch" <<'SQL'
+PREPARE otlet_schema_drift_customscan(text) AS
+SELECT id
+FROM public.otlet_demo_scoped_signal
+WHERE otlet.semantic_matches_auto($1, id, '{"decision":"pass"}'::jsonb);
+EXECUTE otlet_schema_drift_customscan(:'watch_name');
+
 ALTER TABLE public.otlet_demo_scoped_signal
-DROP COLUMN signal;
-SQL
-row_schema_drift_contract="$(psql_exec -qAt \
-  -v watch_name="$row_scoped_watch" \
-  -v task_name="$row_scoped_task" <<'SQL'
-SELECT count(*)::text
-FROM otlet.semantic_index_current_rows(:'watch_name', true);
-SELECT (count(*) FILTER (WHERE stale AND stale_reason = 'schema_drift') >= 1)::text
-FROM otlet.semantic_materializations
-WHERE task_name = :'task_name'
-  AND subject_id = 'scoped-1';
-SELECT COALESCE(stale_reasons->>'schema_drift', '0')
-FROM otlet.semantic_index_plan(:'watch_name');
-SELECT COALESCE(stale_reasons->>'schema_drift', '0')
-FROM otlet.semantic_index_status
-WHERE name = :'watch_name';
+  DROP COLUMN signal,
+  ADD COLUMN signal text;
+
+BEGIN READ ONLY;
+SELECT 'read_only_customscan_before=' || concat_ws('|',
+  current_setting('transaction_read_only'),
+  pg_my_temp_schema() = 0
+);
+EXPLAIN (ANALYZE, VERBOSE, COSTS, SUMMARY OFF, TIMING OFF)
+EXECUTE otlet_schema_drift_customscan(:'watch_name');
+SELECT 'read_only_customscan_after=' || concat_ws('|',
+  current_setting('transaction_read_only'),
+  pg_my_temp_schema() = 0
+);
+COMMIT;
+DEALLOCATE otlet_schema_drift_customscan;
 SQL
 )"
-row_schema_drift_fresh="$(head -n 1 <<<"$row_schema_drift_contract")"
-row_schema_drift_reason="$(sed -n '2p' <<<"$row_schema_drift_contract")"
-row_schema_drift_plan_reason="$(sed -n '3p' <<<"$row_schema_drift_contract")"
-row_schema_drift_status_reason="$(tail -n 1 <<<"$row_schema_drift_contract")"
-echo "row_schema_drift_contract=$row_schema_drift_fresh|$row_schema_drift_reason|$row_schema_drift_plan_reason|$row_schema_drift_status_reason"
-[ "$row_schema_drift_fresh|$row_schema_drift_reason|$row_schema_drift_plan_reason|$row_schema_drift_status_reason" = "0|true|1|1" ] || {
-  echo "Expected dropped scoped input column to write schema_drift and expose it in plan/status, got $row_schema_drift_fresh|$row_schema_drift_reason|$row_schema_drift_plan_reason|$row_schema_drift_status_reason" >&2
+printf '%s\n' "$row_schema_read_only_customscan_plan"
+require_contains "$row_schema_read_only_customscan_plan" "read_only_customscan_before=on|t" "Expected read-only CustomScan transaction without a temp schema"
+require_contains "$row_schema_read_only_customscan_plan" "Otlet Node: Semantic Source CustomScan" "Expected read-only CustomScan explain details"
+require_contains "$row_schema_read_only_customscan_plan" "Refresh Policy: fail_closed_no_refresh" "Expected read-only CustomScan refresh suppression"
+require_contains "$row_schema_read_only_customscan_plan" "Worker Handoff: none_for_fail_closed_lookup" "Expected read-only CustomScan to avoid worker handoff"
+require_contains "$row_schema_read_only_customscan_plan" "Infer Now Timeout Ms: 0" "Expected read-only CustomScan infer timeout to be disabled"
+require_contains "$row_schema_read_only_customscan_plan" "Infer Now Max Rows: 0" "Expected read-only CustomScan infer rows to be disabled"
+require_contains "$row_schema_read_only_customscan_plan" "Planner Selected Path: lookup_fail_closed" "Expected read-only CustomScan fail-closed path"
+require_contains "$row_schema_read_only_customscan_plan" "schema_drift" "Expected read-only CustomScan schema drift reason"
+require_contains "$row_schema_read_only_customscan_plan" "Actual Fail Closed Rows: 1" "Expected read-only CustomScan fail-closed row"
+require_contains "$row_schema_read_only_customscan_plan" "Queued Refreshes: 0" "Expected read-only CustomScan to queue no refreshes"
+require_contains "$row_schema_read_only_customscan_plan" "Infer Now Batches: 0" "Expected read-only CustomScan to run no inference"
+require_contains "$row_schema_read_only_customscan_plan" "Rows Returned: 0" "Expected read-only CustomScan to return no rows"
+require_contains "$row_schema_read_only_customscan_plan" "read_only_customscan_after=on|t" "Expected read-only CustomScan to leave no temp schema"
+row_schema_execution_before="$(psql_exec -qAt -v task_name="$row_scoped_task" <<'SQL'
+SELECT concat_ws('|',
+  (SELECT count(*) FROM otlet.jobs WHERE task_name = :'task_name'),
+  (
+    SELECT count(*)
+    FROM otlet.inference_receipts receipt
+    JOIN otlet.jobs job ON job.id = receipt.job_id
+    WHERE job.task_name = :'task_name'
+  ),
+  (
+    SELECT count(*)
+    FROM otlet.outputs output
+    JOIN otlet.jobs job ON job.id = output.job_id
+    WHERE job.task_name = :'task_name'
+  ),
+  (SELECT count(*) FROM otlet.semantic_materializations WHERE task_name = :'task_name')
+);
+SQL
+)"
+set +e
+row_schema_execution_output="$(psql_exec -qAt -v task_name="$row_scoped_task" 2>&1 <<'SQL'
+SELECT otlet.run_task(:'task_name');
+SQL
+)"
+row_schema_execution_status=$?
+set -e
+if [ "$row_schema_execution_status" -eq 0 ]; then
+  echo "Expected schema drift to suspend task execution" >&2
+  exit 1
+fi
+require_contains "$row_schema_execution_output" "semantic source column contract drifted" "Expected schema drift execution rejection"
+row_schema_execution_after="$(psql_exec -qAt -v task_name="$row_scoped_task" <<'SQL'
+SELECT concat_ws('|',
+  (SELECT count(*) FROM otlet.jobs WHERE task_name = :'task_name'),
+  (
+    SELECT count(*)
+    FROM otlet.inference_receipts receipt
+    JOIN otlet.jobs job ON job.id = receipt.job_id
+    WHERE job.task_name = :'task_name'
+  ),
+  (
+    SELECT count(*)
+    FROM otlet.outputs output
+    JOIN otlet.jobs job ON job.id = output.job_id
+    WHERE job.task_name = :'task_name'
+  ),
+  (SELECT count(*) FROM otlet.semantic_materializations WHERE task_name = :'task_name')
+);
+SQL
+)"
+row_schema_execution_contract="$([ "$row_schema_execution_before" = "$row_schema_execution_after" ] && echo true || echo false)|$row_schema_execution_before"
+echo "row_schema_execution_contract=$row_schema_execution_contract"
+require_regex "$row_schema_execution_contract" '^true\|' "Expected schema drift rejection to preserve jobs, receipts, outputs, and materializations"
+row_schema_read_only_contract="$(psql_exec -qAt \
+  -v watch_name="$row_scoped_watch" \
+  -v task_name="$row_scoped_task" <<'SQL'
+BEGIN READ ONLY;
+WITH plan AS MATERIALIZED (
+  SELECT *
+  FROM otlet.semantic_index_plan(:'watch_name', true)
+), status AS MATERIALIZED (
+  SELECT *
+  FROM otlet.semantic_index_status
+  WHERE name = :'watch_name'
+), watch AS MATERIALIZED (
+  SELECT *
+  FROM otlet.watch_status
+  WHERE watch_name = :'watch_name'
+)
+SELECT concat_ws('|',
+  current_setting('transaction_read_only'),
+  pg_my_temp_schema() = 0,
+  (SELECT count(*) FROM otlet.semantic_index_current_rows(:'watch_name', true)),
+  otlet.semantic_matches(:'watch_name', 'scoped-1', '{"decision":"pass"}'::jsonb),
+  (SELECT selected_path FROM plan),
+  (SELECT stale_subjects FROM plan),
+  (SELECT COALESCE(stale_reasons->>'schema_drift', '0') FROM plan),
+  (SELECT wait_subjects FROM plan),
+  (SELECT infer_now_subjects FROM plan),
+  (SELECT queue_subjects FROM plan),
+  (SELECT fail_closed_subjects FROM plan),
+  (SELECT selected_path FROM status),
+  (SELECT COALESCE(stale_reasons->>'schema_drift', '0') FROM status),
+  (SELECT selected_path FROM watch),
+  (SELECT COALESCE(stale_reasons->>'schema_drift', '0') FROM watch),
+  EXISTS (
+    SELECT 1
+    FROM otlet.semantic_materializations
+    WHERE task_name = :'task_name'
+      AND subject_id = 'scoped-1'
+      AND stale_reason = 'schema_drift'
+  ),
+  pg_my_temp_schema() = 0
+);
+COMMIT;
+SQL
+)"
+echo "row_schema_read_only_contract=$row_schema_read_only_contract"
+[ "$row_schema_read_only_contract" = "on|t|0|f|lookup_fail_closed|1|1|0|0|0|1|lookup_fail_closed|1|lookup_fail_closed|1|f|t" ] || {
+  echo "Expected read-only row reads to detect schema drift, fail closed, and leave durable state untouched, got $row_schema_read_only_contract" >&2
+  exit 1
+}
+row_schema_maintenance_marked="$(psql_exec -qAt \
+  -v watch_name="$row_scoped_watch" <<'SQL'
+SELECT otlet.mark_semantic_schema_drift(:'watch_name');
+SQL
+)"
+row_schema_maintenance_recorded="$(psql_exec -qAt \
+  -v task_name="$row_scoped_task" <<'SQL'
+SELECT EXISTS (
+  SELECT 1
+  FROM otlet.semantic_materializations
+  WHERE task_name = :'task_name'
+    AND subject_id = 'scoped-1'
+    AND stale_reason = 'schema_drift'
+)::text;
+SQL
+)"
+row_schema_maintenance_contract="$row_schema_maintenance_marked|$row_schema_maintenance_recorded"
+echo "row_schema_maintenance_contract=$row_schema_maintenance_contract"
+[ "$row_schema_maintenance_contract" = "1|true" ] || {
+  echo "Expected explicit schema maintenance to record one drifted materialization, got $row_schema_maintenance_contract" >&2
   exit 1
 }
 row_schema_sql_plan="$(psql_exec -qAt -v watch_name="$row_scoped_watch" <<'SQL'
@@ -147,27 +283,110 @@ SQL
 )"
 echo "row_schema_sql_plan_contract=$row_schema_sql_plan"
 require_contains "$row_schema_sql_plan" "schema_drift" "Expected SQL plan stale reason to include schema_drift"
-row_schema_customscan_plan="$(
-  psql_exec -P border=2 -P null='' -v watch_name="$row_scoped_watch" <<'SQL'
-EXPLAIN (ANALYZE, VERBOSE, COSTS, SUMMARY OFF, TIMING OFF)
-SELECT id
-FROM public.otlet_demo_scoped_signal
-WHERE otlet.semantic_matches(:'watch_name', id, '{"decision":"pass"}'::jsonb);
+row_schema_revisions="$(psql_exec -qAt -v task_name="$row_scoped_task" <<'SQL'
+WITH active AS MATERIALIZED (
+  SELECT active_workload_revision_hash AS revision_hash
+  FROM otlet.workload_revision_heads
+  WHERE task_name = :'task_name'
+)
+SELECT active.revision_hash || '|' || otlet.repair_source_query_contract(
+  :'task_name',
+  active.revision_hash
+)
+FROM active;
 SQL
 )"
-printf '%s\n' "$row_schema_customscan_plan"
-require_contains "$row_schema_customscan_plan" "Otlet Node: Semantic Source CustomScan" "Expected CustomScan explain details"
-require_contains "$row_schema_customscan_plan" "Planner Selected Path: lookup_fail_closed" "Expected stale CustomScan fail-closed path"
-require_contains "$row_schema_customscan_plan" "Planner Reason: fail closed" "Expected stale CustomScan fail-closed reason"
-require_contains "$row_schema_customscan_plan" "Planner Stale Reasons:" "Expected CustomScan stale reason breakdown"
-require_contains "$row_schema_customscan_plan" "schema_drift" "Expected CustomScan stale reason to include schema_drift"
-require_contains "$row_schema_customscan_plan" "Count Basis: exact" "Expected stale CustomScan exact count basis"
-require_contains "$row_schema_customscan_plan" "Model Cost Source:" "Expected stale CustomScan model cost source"
-require_contains "$row_schema_customscan_plan" "Planner Fail Closed Subjects: 1" "Expected stale CustomScan planned fail-closed count"
-require_contains "$row_schema_customscan_plan" "Preloaded Fresh Subjects / Basis:" "Expected stale CustomScan preload count and basis"
-require_contains "$row_schema_customscan_plan" "Actual Fail Closed Rows: 1" "Expected stale CustomScan actual fail-closed count"
-require_contains "$row_schema_customscan_plan" "Actual Stale Subjects: 1" "Expected stale CustomScan actual stale count"
-require_contains "$row_schema_customscan_plan" "Rows Returned: 0" "Expected stale CustomScan to return no rows"
+IFS='|' read -r row_schema_old_revision row_schema_new_revision <<<"$row_schema_revisions"
+row_schema_repair_contract="$(psql_exec -qAt \
+  -v watch_name="$row_scoped_watch" \
+  -v task_name="$row_scoped_task" \
+  -v old_revision="$row_schema_old_revision" \
+  -v new_revision="$row_schema_new_revision" <<'SQL'
+SELECT concat_ws('|',
+  :'new_revision' <> :'old_revision',
+  EXISTS (
+    SELECT 1
+    FROM otlet.workload_revision_heads
+    WHERE task_name = :'task_name'
+      AND active_workload_revision_hash = :'new_revision'
+  ),
+  (
+    SELECT otlet.semantic_schema_drift_error(definition) IS NULL
+    FROM otlet.workload_revisions
+    WHERE workload_revision_hash = :'new_revision'
+  ),
+  EXISTS (
+    SELECT 1
+    FROM otlet.watch_status
+    WHERE watch_name = :'watch_name'
+      AND source_dependency_status = 'ready'
+  ),
+  EXISTS (
+    SELECT 1
+    FROM otlet.semantic_materializations
+    WHERE task_name = :'task_name'
+      AND contract_hash = :'old_revision'
+      AND stale_reason = 'contract_changed'
+  ),
+  EXISTS (
+    SELECT 1
+    FROM pg_trigger trigger_row
+    WHERE trigger_row.tgrelid = 'public.otlet_demo_scoped_signal'::regclass
+      AND NOT trigger_row.tgisinternal
+      AND trigger_row.tgfoid = 'otlet.mark_semantic_stale_trigger()'::regprocedure
+  )
+);
+SQL
+)"
+echo "row_schema_repair_contract=$row_schema_repair_contract"
+[ "$row_schema_repair_contract" = "t|t|t|t|t|t" ] || {
+  echo "Expected schema repair to promote the replacement-column contract and restore the watch, got $row_schema_repair_contract" >&2
+  exit 1
+}
+row_schema_repair_job_id="$(psql_exec -qAt \
+  -v task_name="$row_scoped_task" <<'SQL'
+UPDATE public.otlet_demo_scoped_signal
+SET signal = 'approve'
+WHERE id = 'scoped-1';
+SELECT otlet.run_task(:'task_name') \g /dev/null
+SELECT id
+FROM otlet.jobs
+WHERE task_name = :'task_name'
+ORDER BY id DESC
+LIMIT 1;
+SQL
+)"
+wait_task_complete "$row_scoped_task" 2 900 1
+row_schema_repair_execution_contract="$(psql_exec -qAt \
+  -v task_name="$row_scoped_task" \
+  -v job_id="$row_schema_repair_job_id" \
+  -v revision_hash="$row_schema_new_revision" \
+  -v watch_name="$row_scoped_watch" <<'SQL'
+SELECT concat_ws('|',
+  EXISTS (
+    SELECT 1
+    FROM otlet.jobs
+    WHERE id = :'job_id'::bigint
+      AND task_name = :'task_name'
+      AND workload_revision_hash = :'revision_hash'
+      AND status = 'complete'
+  ),
+  EXISTS (
+    SELECT 1
+    FROM otlet.outputs output
+    JOIN otlet.jobs job ON job.id = output.job_id
+    WHERE job.id = :'job_id'::bigint
+      AND job.workload_revision_hash = :'revision_hash'
+  ),
+  (SELECT count(*) = 1 FROM otlet.semantic_index_current_rows(:'watch_name', true))
+);
+SQL
+)"
+echo "row_schema_repair_execution_contract=$row_schema_repair_execution_contract"
+[ "$row_schema_repair_execution_contract" = "t|t|t" ] || {
+  echo "Expected schema repair to restore task execution and current semantic reads, got $row_schema_repair_execution_contract" >&2
+  exit 1
+}
 
 log "Checking CustomScan bounded infer-now"
 psql_exec \
@@ -218,6 +437,119 @@ SET signal = 'pass';
 SELECT otlet.run_task(:'row_customscan_watch' || '_task');
 SQL
 wait_task_complete "$row_customscan_task" 4 900 1
+
+customscan_preload_policy_contract="$(psql_exec -qAt <<'SQL'
+SELECT customscan_preload_max_rows::text || '|' ||
+       customscan_preload_max_bytes::text || '|' ||
+       customscan_preload_max_ms::text
+FROM otlet.production_policy_status;
+SQL
+)"
+echo "customscan_preload_policy_contract=$customscan_preload_policy_contract"
+[ "$customscan_preload_policy_contract" = "100000|67108864|30000" ] || {
+  echo "Expected default CustomScan preload policy, got $customscan_preload_policy_contract" >&2
+  exit 1
+}
+
+customscan_preload_decline_plan="$(psql_exec -P border=2 -P null='' \
+  -v watch_name="$row_customscan_watch" <<'SQL'
+BEGIN;
+UPDATE otlet.production_policy
+SET customscan_preload_max_rows = 1
+WHERE name = 'default';
+EXPLAIN (VERBOSE, COSTS, SUMMARY OFF)
+SELECT id
+FROM public.otlet_demo_customscan_signal
+WHERE otlet.semantic_matches(:'watch_name', id, '{}'::jsonb);
+ROLLBACK;
+SQL
+)"
+require_contains "$customscan_preload_decline_plan" \
+  "Seq Scan on public.otlet_demo_customscan_signal" \
+  "Expected preload policy to leave the standard Postgres plan"
+if [[ "$customscan_preload_decline_plan" == *"Otlet Semantic Source CustomScan"* ]]; then
+  echo "Preload estimate above policy unexpectedly added a CustomPath" >&2
+  exit 1
+fi
+
+customscan_preload_hard_cap_contract="$(psql_exec -qAt -v ON_ERROR_STOP=0 \
+  -v watch_name="$row_customscan_watch" 2>&1 <<'SQL'
+BEGIN;
+SET LOCAL plan_cache_mode = force_generic_plan;
+UPDATE otlet.production_policy
+SET customscan_preload_max_rows = 2
+WHERE name = 'default';
+PREPARE customscan_preload_cap AS
+SELECT id
+FROM public.otlet_demo_customscan_signal
+WHERE otlet.semantic_matches(:'watch_name', id, '{}'::jsonb);
+\o /dev/null
+EXPLAIN (VERBOSE, COSTS OFF) EXECUTE customscan_preload_cap;
+\o
+UPDATE otlet.production_policy
+SET customscan_preload_max_rows = 1
+WHERE name = 'default';
+EXECUTE customscan_preload_cap;
+ROLLBACK;
+SQL
+)"
+echo "customscan_preload_hard_cap_contract=$customscan_preload_hard_cap_contract"
+require_contains "$customscan_preload_hard_cap_contract" \
+  "preload hard cap exceeded: dimension=rows actual=2 limit=1" \
+  "Expected a cached CustomScan plan to enforce the current executor row cap"
+
+psql_exec -qAt >/dev/null <<'SQL' &
+SET application_name = 'otlet-customscan-preload-lock';
+BEGIN;
+LOCK TABLE otlet.semantic_materializations IN ACCESS EXCLUSIVE MODE;
+SELECT pg_sleep(1);
+COMMIT;
+SQL
+customscan_preload_lock_pid="$!"
+customscan_preload_lock_ready=false
+for _ in {1..100}; do
+  if [ "$(psql_value <<'SQL'
+SELECT EXISTS (
+  SELECT 1
+  FROM pg_catalog.pg_locks lock
+  JOIN pg_catalog.pg_stat_activity activity ON activity.pid = lock.pid
+  WHERE activity.application_name = 'otlet-customscan-preload-lock'
+    AND lock.relation = 'otlet.semantic_materializations'::regclass
+    AND lock.mode = 'AccessExclusiveLock'
+    AND lock.granted
+);
+SQL
+)" = "t" ]; then
+    customscan_preload_lock_ready=true
+    break
+  fi
+  sleep 0.02
+done
+if [ "$customscan_preload_lock_ready" != true ]; then
+  wait "$customscan_preload_lock_pid" || true
+  echo "CustomScan preload lock fixture did not acquire its table lock" >&2
+  exit 1
+fi
+customscan_preload_timeout_contract="$(psql_exec -qAt -v ON_ERROR_STOP=0 \
+  -v watch_name="$row_customscan_watch" 2>&1 <<'SQL'
+BEGIN;
+SET LOCAL statement_timeout = '5s';
+UPDATE otlet.production_policy
+SET customscan_preload_max_ms = 100
+WHERE name = 'default';
+SELECT id
+FROM public.otlet_demo_customscan_signal
+WHERE otlet.semantic_matches(:'watch_name', id, '{}'::jsonb);
+ROLLBACK;
+SQL
+)"
+if ! wait "$customscan_preload_lock_pid"; then
+  echo "CustomScan preload lock fixture failed" >&2
+  exit 1
+fi
+require_contains "$customscan_preload_timeout_contract" \
+  "canceling statement due to statement timeout" \
+  "Expected blocked CustomScan preload to enforce its own elapsed deadline"
 
 correlated_customscan_plan="$(psql_exec -P border=2 -P null='' -v watch_name="$row_customscan_watch" <<'SQL'
 EXPLAIN (ANALYZE, VERBOSE, COSTS, SUMMARY OFF, TIMING OFF)
@@ -274,6 +606,83 @@ SET stale_policy = 'lookup_only_fail_closed',
     semantic_auto_max_rows = 1
 WHERE name = 'default';
 SQL
+row_customscan_read_only_plan="$(
+  psql_exec -P border=2 -P null='' -v watch_name="$row_customscan_watch" <<'SQL'
+BEGIN READ ONLY;
+SELECT 'read_only_auto_before=' || concat_ws('|',
+  current_setting('transaction_read_only'),
+  pg_my_temp_schema() = 0
+);
+EXPLAIN (ANALYZE, VERBOSE, COSTS, SUMMARY OFF, TIMING OFF)
+SELECT id
+FROM public.otlet_demo_customscan_signal
+WHERE otlet.semantic_matches_auto(:'watch_name', id, '{}'::jsonb);
+SELECT 'read_only_auto_after=' || concat_ws('|',
+  current_setting('transaction_read_only'),
+  pg_my_temp_schema() = 0
+);
+COMMIT;
+SQL
+)"
+printf '%s\n' "$row_customscan_read_only_plan"
+require_contains "$row_customscan_read_only_plan" "read_only_auto_before=on|t" "Expected schema-current auto CustomScan to start read-only"
+require_contains "$row_customscan_read_only_plan" "Otlet Node: Semantic Source CustomScan" "Expected schema-current read-only CustomScan node"
+require_contains "$row_customscan_read_only_plan" "Refresh Policy: fail_closed_no_refresh" "Expected read-only auto refresh suppression"
+require_contains "$row_customscan_read_only_plan" "Worker Handoff: none_for_fail_closed_lookup" "Expected read-only auto worker suppression"
+require_contains "$row_customscan_read_only_plan" "Infer Now Timeout Ms: 0" "Expected read-only auto infer timeout to be disabled"
+require_contains "$row_customscan_read_only_plan" "Infer Now Max Rows: 0" "Expected read-only auto infer rows to be disabled"
+require_contains "$row_customscan_read_only_plan" "Planner Selected Path: lookup_fail_closed" "Expected schema-current read-only fail-closed path"
+require_contains "$row_customscan_read_only_plan" "Actual Fail Closed Rows: 2" "Expected read-only auto scan to fail closed for both rows"
+require_contains "$row_customscan_read_only_plan" "Queued Refreshes: 0" "Expected read-only auto scan to queue no refreshes"
+require_contains "$row_customscan_read_only_plan" "Infer Now Batches: 0" "Expected read-only auto scan to run no inference"
+require_contains "$row_customscan_read_only_plan" "Rows Returned: 0" "Expected read-only auto scan to return no rows"
+require_contains "$row_customscan_read_only_plan" "read_only_auto_after=on|t" "Expected schema-current auto CustomScan to leave no temp schema"
+row_customscan_read_only_plan_only="$(
+  psql_exec -P border=2 -P null='' -v watch_name="$row_customscan_watch" <<'SQL'
+BEGIN READ ONLY;
+EXPLAIN (VERBOSE, COSTS, SUMMARY OFF)
+SELECT id
+FROM public.otlet_demo_customscan_signal
+WHERE otlet.semantic_matches_auto(:'watch_name', id, '{}'::jsonb);
+COMMIT;
+SQL
+)"
+require_contains "$row_customscan_read_only_plan_only" "Planner Selected Path: lookup_fail_closed" "Expected plan-only read-only CustomScan fail-closed path"
+require_contains "$row_customscan_read_only_plan_only" "Planner Infer Now Subjects: 0" "Expected plan-only read-only CustomScan to disable infer decisions"
+require_contains "$row_customscan_read_only_plan_only" "Planner Fail Closed Subjects: 2" "Expected plan-only read-only CustomScan to retain maintained unresolved counts"
+require_contains "$row_customscan_read_only_plan_only" "Executor Evidence: not collected for plan-only EXPLAIN" "Expected plan-only read-only CustomScan to skip executor evidence"
+if [[ "$row_customscan_read_only_plan_only" == *"Preloaded Predicate Matches:"* ]]; then
+  echo "Plan-only read-only CustomScan unexpectedly preloaded predicate evidence" >&2
+  exit 1
+fi
+row_customscan_queue_origin_contract="$(
+  psql_exec -qAt \
+    -v watch_name="$row_customscan_watch" \
+    -v task_name="$row_customscan_task" <<'SQL' | tail -n 1
+BEGIN;
+UPDATE otlet.production_policy
+SET stale_policy = 'refresh_then_fail_closed',
+    semantic_auto_wait_ms = 0,
+    semantic_auto_infer_ms = 0,
+    semantic_auto_max_rows = 0
+WHERE name = 'default';
+\o /dev/null
+SELECT id
+FROM public.otlet_demo_customscan_signal
+WHERE otlet.semantic_matches_auto(:'watch_name', id, '{}'::jsonb);
+\o
+SELECT count(*)::text || '|' || bool_and(job_origin = 'customscan')::text
+FROM otlet.jobs
+WHERE task_name = :'task_name'
+  AND status = 'queued';
+ROLLBACK;
+SQL
+)"
+echo "row_customscan_queue_origin_contract=$row_customscan_queue_origin_contract"
+[ "$row_customscan_queue_origin_contract" = "2|true" ] || {
+  echo "Expected CustomScan to queue two customscan-origin jobs, got $row_customscan_queue_origin_contract" >&2
+  exit 1
+}
 row_customscan_sql_plan_contract="$(psql_exec -qAt -v watch_name="$row_customscan_watch" <<'SQL'
 SELECT selected_path || '|' ||
        infer_now_subjects::text || '|' ||
@@ -306,7 +715,7 @@ echo "row_customscan_sql_plan_contract=$row_customscan_sql_plan_contract"
   exit 1
 }
 require_contains "$row_customscan_infer_plan" "Planner Selected Path: bounded_infer_now" "Expected CustomScan bounded infer-now path"
-require_contains "$row_customscan_infer_plan" "Count Basis: exact" "Expected infer CustomScan exact count basis"
+require_contains "$row_customscan_infer_plan" "Count Basis: maintained" "Expected infer CustomScan maintained count basis"
 require_contains "$row_customscan_infer_plan" "Model Cost Source:" "Expected infer CustomScan model cost source"
 require_contains "$row_customscan_infer_plan" "Planner Infer Now Subjects: 1" "Expected planned infer-now count"
 require_contains "$row_customscan_infer_plan" "Planner Fail Closed Subjects: 1" "Expected planned fail-closed count"
@@ -321,6 +730,122 @@ require_contains "$row_customscan_infer_plan" "Infer Now Receipts: 1" "Expected 
 require_contains "$row_customscan_infer_plan" "Infer Now Runtime Fingerprint Hash:" "Expected infer-now EXPLAIN to identify the receipt runtime"
 require_contains "$row_customscan_infer_plan" "Infer Now Trace Receipt Id:" "Expected infer-now receipt pointer"
 require_contains "$row_customscan_infer_plan" "Rows Returned: 1" "Expected one inferred row returned after bounded infer-now"
+
+row_customscan_infer_origin_contract="$(psql_value -v task_name="$row_customscan_task" <<'SQL'
+SELECT job_origin
+FROM otlet.inference_receipt_trace_status
+WHERE task_name = :'task_name'
+  AND executor_origin = 'customscan_infer_now'
+ORDER BY receipt_id DESC
+LIMIT 1;
+SQL
+)"
+echo "row_customscan_infer_origin_contract=$row_customscan_infer_origin_contract"
+[ "$row_customscan_infer_origin_contract" = "customscan" ] || {
+  echo "Expected CustomScan infer-now receipt origin, got $row_customscan_infer_origin_contract" >&2
+  exit 1
+}
+
+customscan_index_only_decline_plan="$(
+  psql_exec -P border=2 -P null='' -v watch_name="$row_customscan_watch" <<'SQL'
+BEGIN READ ONLY;
+SET LOCAL enable_seqscan = off;
+SET LOCAL enable_bitmapscan = off;
+EXPLAIN (ANALYZE, VERBOSE, COSTS OFF, SUMMARY OFF, TIMING OFF)
+SELECT id
+FROM public.otlet_demo_customscan_signal
+WHERE otlet.semantic_matches_auto(:'watch_name', id, '{}'::jsonb);
+ROLLBACK;
+SQL
+)"
+require_contains "$customscan_index_only_decline_plan" \
+  "Otlet Node: Semantic Source CustomScan" \
+  "Expected CustomScan after declining an index-only source path"
+require_contains "$customscan_index_only_decline_plan" \
+  "Seq Scan on public.otlet_demo_customscan_signal" \
+  "Expected a heap-backed fallback after declining an index-only source path"
+
+customscan_failed_batch_job_floor="$(psql_value -v task_name="$row_customscan_task" <<'SQL'
+SELECT COALESCE(max(id), 0)
+FROM otlet.jobs
+WHERE task_name = :'task_name';
+SQL
+)"
+psql_exec >/dev/null <<'SQL'
+UPDATE public.otlet_demo_customscan_signal
+SET signal = CASE id
+  WHEN 'customscan-1' THEN 'bounded failed batch'
+  ELSE repeat('x', 9000)
+END;
+UPDATE otlet.production_policy
+SET stale_policy = 'lookup_only_fail_closed',
+    semantic_auto_wait_ms = 0,
+    semantic_auto_infer_ms = 1,
+    semantic_auto_max_rows = 2
+WHERE name = 'default';
+SQL
+customscan_failed_batch_plan="$(
+  psql_exec -P border=2 -P null='' -v watch_name="$row_customscan_watch" <<'SQL'
+BEGIN;
+SET LOCAL enable_seqscan = off;
+SET LOCAL enable_bitmapscan = off;
+EXPLAIN (ANALYZE, VERBOSE, COSTS, SUMMARY OFF, TIMING OFF)
+SELECT id, signal
+FROM public.otlet_demo_customscan_signal
+WHERE otlet.semantic_matches_auto(:'watch_name', id, '{}'::jsonb)
+ORDER BY id;
+COMMIT;
+SQL
+)"
+printf '%s\n' "$customscan_failed_batch_plan"
+require_contains "$customscan_failed_batch_plan" \
+  "Infer Now Batches: 1" \
+  "Expected one accepted request to consume the failed-batch row budget"
+require_contains "$customscan_failed_batch_plan" \
+  "Actual Fail Closed Rows: 2" \
+  "Expected both failed-batch rows to fail closed"
+require_contains "$customscan_failed_batch_plan" \
+  "Infer Now Last Error: infer-now input exceeds 8192 byte cap" \
+  "Expected the oversized later row to report its bounded input rejection"
+require_contains "$customscan_failed_batch_plan" \
+  "Index Scan using otlet_demo_customscan_signal_pkey" \
+  "Expected ordered heap-backed input for the mixed failed batch"
+customscan_failed_batch_drained=false
+for _ in {1..200}; do
+  if [ "$(psql_value -c \
+    "SELECT otlet.worker_infer_now_state() ->> 'queue_depth';")" = "0" ]; then
+    customscan_failed_batch_drained=true
+    break
+  fi
+  sleep 0.05
+done
+[ "$customscan_failed_batch_drained" = true ] || {
+  echo "CustomScan failed batch left an infer-now slot occupied" >&2
+  exit 1
+}
+customscan_failed_batch_contract="$(psql_value \
+  -v task_name="$row_customscan_task" \
+  -v job_floor="$customscan_failed_batch_job_floor" <<'SQL'
+SELECT count(*) = 1
+   AND COALESCE(bool_and(subject_id = 'customscan-1' AND job_origin = 'customscan'), false)
+FROM otlet.jobs
+WHERE task_name = :'task_name'
+  AND id > :'job_floor'::bigint;
+SQL
+)"
+echo "customscan_failed_batch_contract=$customscan_failed_batch_contract"
+[ "$customscan_failed_batch_contract" = "t" ] || {
+  echo "CustomScan failed batch did not submit only the ordered small subject" >&2
+  exit 1
+}
+psql_exec >/dev/null <<'SQL'
+UPDATE otlet.production_policy
+SET stale_policy = 'refresh_then_fail_closed',
+    semantic_auto_wait_ms = 10000,
+    semantic_auto_infer_ms = 15000,
+    semantic_auto_max_rows = 1
+WHERE name = 'default';
+SQL
 
 queue_suppression_output="$(psql_exec -qAt -v model_name="$strong_model_name" <<'SQL'
 BEGIN;
@@ -355,12 +880,20 @@ VALUES
   ('flood-2', 'second flood row'),
   ('flood-3', 'third flood row');
 
+SELECT otlet.reconcile_watch_subject('row_queue_flood_demo', 'flood-1', true);
+SELECT otlet.reconcile_watch_subject('row_queue_flood_demo', 'flood-2', true);
+
 SELECT (
     SELECT count(*)
     FROM otlet.jobs
     WHERE task_name = 'row_queue_flood_demo_task'
       AND status = 'queued'
   )::text || '|' ||
+  (
+    SELECT count(*)::text || '|' || COALESCE(sum(attempts), 0)::text
+    FROM otlet.watch_reconciliation
+    WHERE watch_name = 'row_queue_flood_demo'
+  ) || '|' ||
   (
     SELECT count(*)::text || '|' ||
            (count(*) = 1)::text || '|' ||
@@ -379,7 +912,9 @@ SQL
 )"
 queue_suppression_contract="$(tail -n 1 <<<"$queue_suppression_output")"
 echo "queue_suppression_contract=$queue_suppression_contract"
-[ "$queue_suppression_contract" = "1|1|true|true|true" ] || {
-  echo "Expected queue suppression contract 1|1|true|true|true, got $queue_suppression_contract" >&2
+[ "$queue_suppression_contract" = "1|2|1|1|true|true|true" ] || {
+  echo "Expected durable queue suppression contract 1|2|1|1|true|true|true, got $queue_suppression_contract" >&2
   exit 1
 }
+
+source "$demo_dir/planner_shape_conformance.sh"

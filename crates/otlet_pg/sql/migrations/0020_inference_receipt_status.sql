@@ -2,31 +2,56 @@ CREATE VIEW otlet.output_reliability_status AS
 WITH receipt_counts AS (
   SELECT
     count(*)::bigint AS receipt_count,
-    count(*) FILTER (WHERE status = 'complete' AND schema_validation_status = 'passed')::bigint AS schema_passed_receipts,
-    count(*) FILTER (WHERE schema_validation_status = 'failed')::bigint AS schema_failed_receipts,
-    count(*) FILTER (WHERE error LIKE 'invalid model JSON:%')::bigint AS json_parse_failed_receipts,
-    count(*) FILTER (WHERE selection_role = 'cheap' AND selection_status = 'rejected')::bigint AS cheap_rejected_receipts,
-    count(*) FILTER (WHERE selection_role = 'strong' AND selection_status = 'accepted')::bigint AS strong_accepted_receipts,
-    count(*) FILTER (WHERE trace_summary ->> 'decode_constraint' IS NOT NULL)::bigint AS decode_constraint_receipts,
-    count(DISTINCT job_id) FILTER (WHERE selection_role = 'strong')::bigint AS escalated_jobs
-  FROM otlet.inference_receipts
+    count(*) FILTER (
+      WHERE receipt.status = 'complete' AND receipt.schema_validation_status = 'passed'
+    )::bigint AS schema_passed_receipts,
+    count(*) FILTER (
+      WHERE receipt.schema_validation_status = 'failed'
+    )::bigint AS schema_failed_receipts,
+    count(*) FILTER (
+      WHERE receipt.error LIKE 'invalid model JSON:%'
+    )::bigint AS json_parse_failed_receipts,
+    count(*) FILTER (
+      WHERE receipt.selection_role = 'cheap' AND receipt.selection_status = 'rejected'
+    )::bigint AS cheap_rejected_receipts,
+    count(*) FILTER (
+      WHERE receipt.selection_role = 'strong' AND receipt.selection_status = 'accepted'
+    )::bigint AS strong_accepted_receipts,
+    count(*) FILTER (
+      WHERE receipt.trace_summary ->> 'decode_constraint' IS NOT NULL
+    )::bigint AS decode_constraint_receipts,
+    count(DISTINCT receipt.job_id) FILTER (
+      WHERE receipt.selection_role = 'strong'
+    )::bigint AS escalated_jobs
+  FROM otlet.inference_receipts receipt
+  JOIN otlet.jobs job ON job.id = receipt.job_id
+  WHERE job.execution_mode = 'production'
 ),
 output_counts AS (
   SELECT
     count(*) FILTER (
-      WHERE COALESCE(t.decision_contract -> 'abstain_values', '["unclear"]'::jsonb)
-        ? (o.output ->> COALESCE(NULLIF(t.decision_contract ->> 'answer_field', ''), 'match'))
+      WHERE COALESCE(
+        revision.definition #> '{task,decision_contract,abstain_values}',
+        '["unclear"]'::jsonb
+      ) ? (o.output ->> COALESCE(
+        NULLIF(revision.definition #>> '{task,decision_contract,answer_field}', ''),
+        'match'
+      ))
     )::bigint AS abstained_outputs,
     count(*)::bigint AS trusted_outputs
   FROM otlet.outputs o
   JOIN otlet.jobs j ON j.id = o.job_id
-  JOIN otlet.tasks t ON t.name = j.task_name
+  JOIN otlet.workload_revisions revision
+    ON revision.workload_revision_hash = j.workload_revision_hash
+  WHERE j.execution_mode = 'production'
 ),
 action_counts AS (
   SELECT
     count(*) FILTER (WHERE a.status = 'rejected')::bigint AS rejected_actions,
     count(*) FILTER (WHERE a.error = 'unsupported action type')::bigint AS unknown_action_rejections
   FROM otlet.actions a
+  JOIN otlet.jobs job ON job.id = a.job_id
+  WHERE job.execution_mode = 'production'
 ),
 label_counts AS (
   SELECT count(*)::bigint AS eval_labels
@@ -58,6 +83,7 @@ WITH latest_materialization AS (
 SELECT
   r.id AS receipt_id,
   r.job_id,
+  r.workload_revision_hash,
   r.task_name,
   r.subject_id,
   r.attempt_index,
@@ -415,6 +441,9 @@ SELECT
   COALESCE(trace.summary #>> '{cache,invalidation_reason}', trace.summary ->> 'inference_cache_invalidation_reason') AS inference_cache_reason,
   r.finished_at AS receipt_finished_at
 FROM otlet.inference_receipts r
+JOIN otlet.jobs job
+  ON job.id = r.job_id
+ AND job.execution_mode = 'production'
 CROSS JOIN LATERAL (
   -- Expand the toasted object once and keep the projection from being pulled up
   SELECT r.trace_summary || '{}'::jsonb AS summary

@@ -8,7 +8,8 @@ WITH operator_functions(oid) AS (
     'otlet.defer_action(bigint,text)'::regprocedure::oid,
     'otlet.abstain_review(bigint,text)'::regprocedure::oid,
     'otlet.dry_run_action(bigint)'::regprocedure::oid,
-    'otlet.apply_action(bigint)'::regprocedure::oid
+    'otlet.apply_action(bigint)'::regprocedure::oid,
+    'otlet.application_retry_job(bigint,text)'::regprocedure::oid
   ])
 ),
 operator_status AS (
@@ -32,6 +33,7 @@ portable_status AS (
   JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
   WHERE n.nspname = 'otlet'
     AND p.proname IN (
+      'portable_start_worker',
       'portable_claim_jobs',
       'portable_renew_job',
       'portable_record_attempt',
@@ -96,7 +98,17 @@ SET search_path = pg_catalog, otlet, pg_temp
 AS $$
 DECLARE
   role_name text;
+  old_revision_hash text;
 BEGIN
+  PERFORM pg_catalog.pg_advisory_xact_lock(
+    pg_catalog.hashtextextended(
+      'otlet_access_policy:' || grant_auditor_access.target_role::oid::text,
+      0
+    )
+  );
+  old_revision_hash := otlet.access_policy_revision(
+    grant_auditor_access.target_role
+  );
   SELECT rolname
   INTO role_name
   FROM pg_catalog.pg_roles
@@ -121,6 +133,7 @@ BEGIN
     'otlet.operational_event_log, '
     'otlet.worker_batch_timing_status, '
     'otlet.portable_protocol_status, '
+    'otlet.runtime_capability_status, '
     'otlet.portable_worker_status, '
     'otlet.portable_claim_status, '
     'otlet.portable_receipt_status TO %I',
@@ -129,9 +142,31 @@ BEGIN
   EXECUTE pg_catalog.format(
     'GRANT EXECUTE ON FUNCTION '
     'otlet.semantic_canonical_jsonb(jsonb), '
+    'otlet.portable_canonical_json_text(jsonb), '
+    'otlet.portable_text_hash(text), '
+    'otlet.portable_json_hash(jsonb), '
+    'otlet.linked_runtime_capabilities(), '
+    'otlet.identity_hash(text, jsonb), '
+    'otlet.identity_text_hash(text, text), '
+    'otlet.semantic_source_hash(jsonb), '
     'otlet.semantic_shaped_input(jsonb, jsonb), '
-    'otlet.semantic_content_hash(jsonb, jsonb) TO %I',
+    'otlet.semantic_content_hash(jsonb, jsonb), '
+    'otlet.action_execution_role_oid(), '
+    'otlet.bounded_action_target_contract(text), '
+    'otlet.action_target_contract_hash(text), '
+    'otlet.action_target_validation_error(text), '
+    'otlet.action_workflow_policy_error(text, text, text, text, text, boolean), '
+    'otlet.source_role_descriptor(oid), '
+    'otlet.source_relation_descriptor(oid, oid, jsonb), '
+    'otlet.source_function_descriptor(oid, oid), '
+    'otlet.source_query_binding_descriptor(jsonb, jsonb, jsonb, jsonb), '
+    'otlet.source_query_contract_error(jsonb, boolean) TO %I',
     role_name
+  );
+  PERFORM otlet.finish_access_policy_grant(
+    'auditor',
+    grant_auditor_access.target_role,
+    old_revision_hash
   );
 END;
 $$;
@@ -143,7 +178,14 @@ SET search_path = pg_catalog, otlet, pg_temp
 AS $$
 DECLARE
   role_name text;
+  old_revision_hash text;
 BEGIN
+  PERFORM pg_catalog.pg_advisory_xact_lock(
+    pg_catalog.hashtextextended(
+      'otlet_access_policy:' || grant_operator_access.target_role::oid::text,
+      0
+    )
+  );
   SELECT rolname
   INTO role_name
   FROM pg_catalog.pg_roles
@@ -154,6 +196,9 @@ BEGIN
   END IF;
 
   PERFORM otlet.grant_auditor_access(grant_operator_access.target_role);
+  old_revision_hash := otlet.access_policy_revision(
+    grant_operator_access.target_role
+  );
   EXECUTE pg_catalog.format(
     'GRANT USAGE ON TYPE otlet.actions, otlet.eval_labels, otlet.review_events TO %I',
     role_name
@@ -167,8 +212,14 @@ BEGIN
     'otlet.defer_action(bigint, text), '
     'otlet.abstain_review(bigint, text), '
     'otlet.dry_run_action(bigint), '
-    'otlet.apply_action(bigint) TO %I',
+    'otlet.apply_action(bigint), '
+    'otlet.application_retry_job(bigint, text) TO %I',
     role_name
+  );
+  PERFORM otlet.finish_access_policy_grant(
+    'operator',
+    grant_operator_access.target_role,
+    old_revision_hash
   );
 END;
 $$;

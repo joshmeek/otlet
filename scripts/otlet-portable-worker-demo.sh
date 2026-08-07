@@ -27,6 +27,8 @@ worker_log="$(mktemp)"
 recovery_log="$(mktemp)"
 recovery_container="otlet-portable-recovery-worker"
 canary="RECOVERY_RAW_EVIDENCE_CANARY"
+swap_artifact_dir="/var/lib/postgresql/otlet-portable-artifact-swap-$$"
+swap_artifact="$swap_artifact_dir/model.gguf"
 
 cleanup() {
   if docker container inspect "$recovery_container" >/dev/null 2>&1; then
@@ -36,6 +38,7 @@ cleanup() {
     docker start "$container" >/dev/null 2>&1 || true
   fi
   rm -f "$worker_log" "$recovery_log"
+  docker exec "$container" rm -rf "$swap_artifact_dir" >/dev/null 2>&1 || true
   docker exec "$container" dropdb -U postgres --if-exists "$portable_database" >/dev/null 2>&1 || true
   docker exec -i "$container" psql -U postgres -d postgres -X -qAt -v ON_ERROR_STOP=1 \
     -v worker_role="$worker_role" \
@@ -61,6 +64,7 @@ start_recovery_worker() {
     --user 10001:10001 \
     --entrypoint /target/release/otlet_worker \
     -e "OTLET_DATABASE_URL=$external_database_url" \
+    -e "PGPASSWORD=$worker_password" \
     -e "OTLET_PORTABLE_WORKER_ID=$worker_id" \
     -e OTLET_PORTABLE_PROTOCOL_VERSION=1 \
     -e "OTLET_PORTABLE_RUNTIME_IDENTITY_HASH=$runtime_identity_hash" \
@@ -145,14 +149,17 @@ SQL
 run_worker_once_for() {
   local active_worker_id="$1"
   local active_database_url="$2"
-  local active_model_name="$3"
-  local active_model_artifact="$4"
-  local active_model_sha256="$5"
-  local expected_event="$6"
+  local active_database_password="$3"
+  local active_model_name="$4"
+  local active_model_artifact="$5"
+  local active_model_sha256="$6"
+  local expected_event="$7"
+  local renew_ms="${8:-1000}"
 
   : >"$worker_log"
   if ! docker exec \
     -e "OTLET_DATABASE_URL=$active_database_url" \
+    -e "PGPASSWORD=$active_database_password" \
     -e "OTLET_PORTABLE_WORKER_ID=$active_worker_id" \
     -e OTLET_PORTABLE_PROTOCOL_VERSION=1 \
     -e "OTLET_PORTABLE_RUNTIME_IDENTITY_HASH=$runtime_identity_hash" \
@@ -161,6 +168,7 @@ run_worker_once_for() {
     -e "OTLET_MODEL_SHA256=$active_model_sha256" \
     -e OTLET_PORTABLE_REQUIRE_TLS=0 \
     -e OTLET_PORTABLE_ONCE=1 \
+    -e "OTLET_PORTABLE_RENEW_MS=$renew_ms" \
     -e "OTLET_LLAMA_THREADS=${OTLET_LLAMA_THREADS:-4}" \
     "$container" /target/release/otlet_worker --once >"$worker_log" 2>&1; then
     tail -n 120 "$worker_log" >&2
@@ -178,6 +186,7 @@ run_worker_once() {
   run_worker_once_for \
     "$worker_id" \
     "$worker_database_url" \
+    "$worker_password" \
     "$model_name" \
     "$model_artifact" \
     "$model_sha256" \
@@ -192,10 +201,16 @@ fi
 cleanup
 
 if [ -z "$model_artifact" ]; then
-  model_artifact="$(docker exec "$container" find /var/lib/postgresql -name "$model_file" -type f -print -quit)"
+  model_artifact="$(docker exec "$container" find -L /var/lib/postgresql -type f -name "$model_file" -print -quit)"
 fi
 if [ -z "$cheap_model_artifact" ]; then
-  cheap_model_artifact="$(docker exec "$container" find /var/lib/postgresql -name "$cheap_model_file" -type f -print -quit)"
+  cheap_model_artifact="$(docker exec "$container" find -L /var/lib/postgresql -type f -name "$cheap_model_file" -print -quit)"
+fi
+if [ -n "$model_artifact" ]; then
+  model_artifact="$(docker exec "$container" readlink -f "$model_artifact" 2>/dev/null || true)"
+fi
+if [ -n "$cheap_model_artifact" ]; then
+  cheap_model_artifact="$(docker exec "$container" readlink -f "$cheap_model_artifact" 2>/dev/null || true)"
 fi
 if [ -z "$model_artifact" ] || ! docker exec "$container" test -f "$model_artifact"; then
   echo "Missing model artifact. Set OTLET_STRONG_MODEL_ARTIFACT or run ./scripts/otlet-setup.sh first" >&2
@@ -317,6 +332,16 @@ SELECT otlet.create_task(
   '{"reasoning":"off","max_tokens":48,"inference_cache":false}'::jsonb,
   '{"source_fields":["signal"]}'::jsonb
 );
+SELECT otlet.create_task(
+  'aaa_portable_runtime_incompatible',
+  NULL,
+  'Return decision keep',
+  '{"type":"object","required":["decision"],"additionalProperties":false,"properties":{"decision":{"const":"keep"}}}'::jsonb,
+  :'model_name',
+  '{"reasoning":"off","max_tokens":48,"inference_cache":false,"max_worker_rss_bytes":1,"n_gpu_layers":1}'::jsonb
+);
+INSERT INTO otlet.jobs (task_name, subject_id, input)
+VALUES ('aaa_portable_runtime_incompatible', 'runtime-incompatible', '{}'::jsonb);
 CREATE TABLE public.otlet_portable_routing_source (
   subject_id text PRIMARY KEY,
   input jsonb NOT NULL
@@ -461,23 +486,50 @@ if [ "$admission_contract" != "true" ]; then
   exit 1
 fi
 
-async_job_id="$(
+async_ask_result="$(
   docker exec -i "$container" psql -U postgres -d "$portable_database" \
     -X -qAt -v ON_ERROR_STOP=1 -v model_name="$model_name" <<'SQL'
 BEGIN;
+SET LOCAL otlet.administrative_reason = '';
+SET LOCAL otlet.administrative_ticket = '';
 SELECT otlet.enqueue_ask(
   :'model_name',
   'Return decision keep',
   '{"signal":"retain"}'::jsonb,
   '{"type":"object","required":["decision"],"additionalProperties":false,"properties":{"decision":{"const":"keep"}}}'::jsonb,
-  '{"reasoning":"off","max_tokens":48,"inference_cache":false}'::jsonb
+  '{"reasoning":"off","max_tokens":48,"context_window_tokens":4096,"inference_cache":false,"llama_threads":2,"llama_batch_threads":3}'::jsonb
 ) AS async_job_id \gset
+SELECT concat_ws('|',
+  :'async_job_id',
+  (current_setting('otlet.administrative_suppress', true) IS DISTINCT FROM 'on')::text
+);
 COMMIT;
-SELECT :'async_job_id';
 SQL
 )"
+async_job_id="${async_ask_result%%|*}"
 if [[ ! "$async_job_id" =~ ^[1-9][0-9]*$ ]]; then
   echo "Expected enqueue_ask to return a positive job ID, got $async_job_id" >&2
+  exit 1
+fi
+if [ "$async_ask_result" != "$async_job_id|true" ]; then
+  echo "Expected enqueue_ask to restore administrative suppression, got $async_ask_result" >&2
+  exit 1
+fi
+
+async_administrative_contract="$(
+  docker exec -i "$container" psql -U postgres -d "$portable_database" \
+    -X -qAt -v ON_ERROR_STOP=1 -v async_job_id="$async_job_id" <<'SQL'
+SELECT (NOT EXISTS (
+  SELECT 1
+  FROM otlet.administrative_change_events event
+  JOIN otlet.jobs job ON job.task_name = event.object_name
+  WHERE job.id = :'async_job_id'::bigint
+    AND event.object_type = 'task'
+))::text;
+SQL
+)"
+if [ "$async_administrative_contract" != "true" ]; then
+  echo "Expected queued ask task synthesis to stay outside administrative history" >&2
   exit 1
 fi
 
@@ -488,13 +540,14 @@ SELECT concat_ws('|',
   status,
   (output IS NULL)::text,
   (receipt_id IS NULL)::text,
-  (task_name LIKE 'ask_%')::text
+  (task_name LIKE 'ask_%')::text,
+  job_origin
 )
 FROM otlet.runs
 WHERE job_id = :'async_job_id'::bigint;
 SQL
 )"
-if [ "$async_queued_contract" != "queued|true|true|true" ]; then
+if [ "$async_queued_contract" != "queued|true|true|true|direct_ask" ]; then
   echo "Expected queued asynchronous ask state, got $async_queued_contract" >&2
   exit 1
 fi
@@ -508,8 +561,98 @@ WHERE worker_id = :'worker_id';
 SQL
 )"
 
-worker_database_url="postgresql://${worker_role}:${worker_password}@127.0.0.1:5432/${portable_database}"
-cheap_worker_database_url="postgresql://${cheap_worker_role}:${cheap_worker_password}@127.0.0.1:5432/${portable_database}"
+worker_database_url="postgresql://${worker_role}@127.0.0.1:5432/${portable_database}"
+cheap_worker_database_url="postgresql://${cheap_worker_role}@127.0.0.1:5432/${portable_database}"
+
+docker exec "$container" mkdir -p "$swap_artifact_dir"
+docker exec "$container" ln "$model_artifact" "$swap_artifact"
+docker exec -i "$container" psql -U postgres -d "$portable_database" \
+  -X -qAt -v ON_ERROR_STOP=1 <<'SQL' >/dev/null
+CREATE FUNCTION public.portable_artifact_swap_delay() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+  PERFORM pg_sleep(5);
+  RETURN NEW;
+END;
+$$;
+CREATE TRIGGER portable_artifact_swap_delay
+BEFORE UPDATE ON otlet.portable_workers
+FOR EACH ROW
+WHEN (OLD.incarnation_nonce_hash IS DISTINCT FROM NEW.incarnation_nonce_hash)
+EXECUTE FUNCTION public.portable_artifact_swap_delay();
+SQL
+
+: >"$worker_log"
+docker exec \
+  -e "OTLET_DATABASE_URL=$worker_database_url" \
+  -e "PGPASSWORD=$worker_password" \
+  -e "OTLET_PORTABLE_WORKER_ID=$worker_id" \
+  -e OTLET_PORTABLE_PROTOCOL_VERSION=1 \
+  -e "OTLET_PORTABLE_RUNTIME_IDENTITY_HASH=$runtime_identity_hash" \
+  -e "OTLET_MODEL_NAME=$model_name" \
+  -e "OTLET_MODEL_PATH=$swap_artifact" \
+  -e "OTLET_MODEL_SHA256=$model_sha256" \
+  -e OTLET_PORTABLE_REQUIRE_TLS=0 \
+  -e OTLET_PORTABLE_ONCE=1 \
+  "$container" /target/release/otlet_worker --once >"$worker_log" 2>&1 &
+swap_worker_pid=$!
+
+swap_waiting="false"
+for _ in {1..100}; do
+  swap_waiting="$(
+    docker exec "$container" psql -U postgres -d "$portable_database" -X -qAt \
+      -c "SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE datname = '$portable_database' AND wait_event = 'PgSleep' AND query LIKE '%portable_start_worker%')"
+  )"
+  [ "$swap_waiting" = "t" ] && break
+  sleep 0.05
+done
+if [ "$swap_waiting" != "t" ]; then
+  wait "$swap_worker_pid" || true
+  tail -n 120 "$worker_log" >&2
+  echo "Portable artifact swap did not reach the load window" >&2
+  exit 1
+fi
+docker exec "$container" sh -c 'rm -f "$1" && ln -s "$2" "$1"' sh "$swap_artifact" "$model_artifact"
+set +e
+wait "$swap_worker_pid"
+swap_worker_status=$?
+set -e
+if [ "$swap_worker_status" = "0" ] || ! grep -q '"reason":"model_artifact_path_replaced"' "$worker_log"; then
+  tail -n 120 "$worker_log" >&2
+  echo "Expected portable load-window replacement to fail closed" >&2
+  exit 1
+fi
+
+portable_artifact_swap_contract="$(
+  docker exec -i "$container" psql -U postgres -d "$portable_database" \
+    -X -qAt -v ON_ERROR_STOP=1 -v worker_id="$worker_id" -v async_job_id="$async_job_id" <<'SQL'
+SELECT concat_ws('|',
+  worker.reported_state,
+  worker.model_status,
+  worker.last_error_code,
+  job.status,
+  (SELECT count(*) FROM otlet.portable_claims claim WHERE claim.job_id = job.id),
+  (SELECT count(*) FROM otlet.inference_receipts receipt WHERE receipt.job_id = job.id),
+  (SELECT count(*) FROM otlet.outputs output_row WHERE output_row.job_id = job.id)
+)
+FROM otlet.portable_workers worker
+CROSS JOIN otlet.jobs job
+WHERE worker.worker_id = :'worker_id'
+  AND job.id = :'async_job_id'::bigint;
+SQL
+)"
+if [ "$portable_artifact_swap_contract" != "error|error|model_artifact_path_replaced|queued|0|0|0" ]; then
+  echo "Expected SQL-visible portable artifact replacement failure, got $portable_artifact_swap_contract" >&2
+  exit 1
+fi
+echo "portable_artifact_swap_contract=$portable_artifact_swap_contract"
+docker exec -i "$container" psql -U postgres -d "$portable_database" \
+  -X -qAt -v ON_ERROR_STOP=1 <<'SQL' >/dev/null
+DROP TRIGGER portable_artifact_swap_delay ON otlet.portable_workers;
+DROP FUNCTION public.portable_artifact_swap_delay();
+SQL
+docker exec "$container" rm -rf "$swap_artifact_dir"
+
 run_worker_once
 
 contract="$(
@@ -562,6 +705,236 @@ if [ "$contract" != "$expected" ]; then
   exit 1
 fi
 
+portable_runtime_contract_query() {
+  docker exec -i "$container" psql -U postgres -d "$portable_database" \
+    -X -qAt -v ON_ERROR_STOP=1 \
+    -v model_sha256="$model_sha256" \
+    -v model_bytes="$model_bytes" \
+    -v async_job_id="$async_job_id" <<'SQL'
+WITH receipt_contract AS (
+  SELECT
+    receipt.trace_summary,
+    receipt.trace_summary -> 'runtime_options_status' AS option_status,
+    claim.runtime_options_status AS claim_option_status
+  FROM otlet.inference_receipts receipt
+  JOIN otlet.portable_receipt_links link ON link.receipt_id = receipt.id
+  JOIN otlet.portable_claims claim ON claim.id = link.claim_id
+  WHERE receipt.job_id = :'async_job_id'::bigint
+), incompatible_state AS (
+  SELECT
+    job.status,
+    job.attempts,
+    (SELECT count(*) FROM otlet.portable_claims claim WHERE claim.job_id = job.id) AS claims,
+    (SELECT count(*) FROM otlet.inference_receipts receipt WHERE receipt.job_id = job.id) AS receipts
+  FROM otlet.jobs job
+  WHERE job.task_name = 'aaa_portable_runtime_incompatible'
+    AND job.subject_id = 'runtime-incompatible'
+)
+SELECT concat_ws('|',
+  contract.option_status ->> 'version',
+  (
+    contract.option_status ->> 'compatible' = 'true'
+    AND contract.option_status = contract.claim_option_status
+  )::text,
+  (
+    contract.option_status -> 'requested' =
+      '{"reasoning":"off","max_tokens":48,"context_window_tokens":4096,"inference_cache":false,"llama_threads":2,"llama_batch_threads":3}'::jsonb
+    AND contract.option_status -> 'honored' =
+      '{"reasoning":"off","max_tokens":48,"context_window_tokens":4096,"inference_cache":false,"llama_threads":2,"llama_batch_threads":3}'::jsonb
+  )::text,
+  (
+    contract.option_status -> 'defaulted' ?&
+      ARRAY['max_attempt_ms','max_worker_rss_bytes','generation_trace']
+    AND (SELECT count(*) FROM jsonb_object_keys(contract.option_status -> 'defaulted')) = 3
+    AND (contract.option_status #>> '{defaulted,max_attempt_ms}')::bigint > 0
+    AND (contract.option_status #>> '{defaulted,max_worker_rss_bytes}')::bigint = 0
+    AND contract.option_status #> '{defaulted,generation_trace}' = 'false'::jsonb
+    AND contract.option_status -> 'rejected' = '{}'::jsonb
+    AND contract.option_status -> 'effective' =
+      (contract.option_status -> 'honored') || (contract.option_status -> 'defaulted')
+  )::text,
+  (
+    contract.option_status #>> '{envelope,model_artifact_hash}' = :'model_sha256'
+    AND (contract.option_status #>> '{envelope,model_artifact_bytes}')::bigint = :'model_bytes'::bigint
+    AND (contract.option_status #>> '{envelope,tested_context_window_tokens}')::integer = 4096
+    AND (contract.option_status #>> '{envelope,requested_context_window_tokens}')::integer = 4096
+    AND (contract.option_status #>> '{envelope,effective_context_window_tokens}')::integer = 4096
+    AND (contract.option_status #>> '{envelope,context_window_tokens}')::integer = 4096
+    AND (contract.option_status #>> '{envelope,batch_tokens}')::integer = 512
+    AND (contract.option_status #>> '{envelope,ubatch_tokens}')::integer = 128
+    AND contract.option_status #>> '{envelope,load_policy}' = 'eager_single_resident_model'
+    AND contract.option_status #>> '{envelope,device_policy}' = 'cpu_only_n_gpu_layers_0'
+    AND contract.option_status #>> '{envelope,rss_policy}' = 'linux_proc_status_vmrss_fail_closed'
+  )::text,
+  (
+    (contract.option_status #>> '{envelope,max_worker_rss_bytes}')::bigint = 0
+    AND (contract.option_status #>> '{envelope,current_rss_bytes}')::bigint > 0
+    AND contract.trace_summary #>> '{memory,claim,process_rss_bytes}' =
+      contract.option_status #>> '{envelope,current_rss_bytes}'
+    AND (contract.trace_summary #>> '{memory,after,process_rss_bytes}')::bigint > 0
+    AND contract.trace_summary #> '{memory,worker_memory_budget_bytes}' = 'null'::jsonb
+    AND contract.trace_summary #>> '{memory,admission,decision}' = 'not_evaluated'
+    AND contract.trace_summary #>> '{memory,admission,reason}' =
+      'worker_memory_budget_disabled'
+    AND contract.trace_summary #>> '{memory,request_admission,decision}' = 'allowed'
+    AND contract.trace_summary #>> '{memory,request_admission,reason}' =
+      'worker_memory_budget_disabled'
+    AND (contract.trace_summary #>> '{memory,request_admission,prompt_tokens}')::integer > 0
+    AND (contract.trace_summary #>> '{memory,request_admission,max_generation_tokens}')::integer = 48
+    AND (contract.trace_summary #>> '{memory,request_admission,projected_prompt_bytes}')::bigint > 0
+    AND (contract.trace_summary #>> '{memory,request_admission,projected_decode_bytes}')::bigint > 0
+    AND contract.trace_summary #>> '{memory,post_inference_enforcement,decision}' =
+      'not_evaluated'
+    AND contract.trace_summary #>> '{memory,post_inference_enforcement,reason}' =
+      'worker_memory_budget_disabled'
+  )::text,
+  (
+    contract.trace_summary #>> '{runtime_fingerprint,artifact,sha256}' = :'model_sha256'
+    AND (contract.trace_summary #>> '{runtime_fingerprint,artifact,bytes}')::bigint = :'model_bytes'::bigint
+    AND contract.trace_summary #>> '{runtime_fingerprint,artifact,verification}' = 'sha256_verified_file_descriptor_load'
+    AND (contract.trace_summary #>> '{runtime_fingerprint,context,tokens}')::integer = 4096
+    AND (contract.trace_summary #>> '{runtime_fingerprint,context,tested_context_window_tokens}')::integer = 4096
+    AND (contract.trace_summary #>> '{runtime_fingerprint,context,requested_context_window_tokens}')::integer = 4096
+    AND (contract.trace_summary #>> '{runtime_fingerprint,context,effective_context_window_tokens}')::integer = 4096
+    AND (contract.trace_summary #>> '{runtime_fingerprint,context,batch_tokens}')::integer = 512
+    AND (contract.trace_summary #>> '{runtime_fingerprint,context,ubatch_tokens}')::integer = 128
+    AND contract.trace_summary #>> '{runtime_fingerprint,runtime,load_policy}' = 'eager_single_resident_model'
+    AND contract.trace_summary #>> '{runtime_fingerprint,runtime,device_policy}' = 'cpu_only_n_gpu_layers_0'
+    AND contract.trace_summary #>> '{runtime_fingerprint,runtime,rss_policy}' = 'linux_proc_status_vmrss_fail_closed'
+    AND contract.trace_summary ->> 'model_cache_hit' = 'true'
+    AND contract.trace_summary ->> 'inference_cache_hit' = 'false'
+  )::text,
+  (
+    (contract.option_status #>> '{effective,llama_threads}')::integer = 2
+    AND (contract.option_status #>> '{effective,llama_batch_threads}')::integer = 3
+    AND (contract.trace_summary ->> 'effective_llama_threads')::integer = 2
+    AND (contract.trace_summary ->> 'effective_llama_batch_threads')::integer = 3
+    AND (contract.trace_summary #>> '{runtime_fingerprint,context,decode_threads}')::integer = 2
+    AND (contract.trace_summary #>> '{runtime_fingerprint,context,batch_threads}')::integer = 3
+  )::text,
+  incompatible.status,
+  incompatible.attempts,
+  incompatible.claims,
+  incompatible.receipts
+)
+FROM receipt_contract contract
+CROSS JOIN incompatible_state incompatible;
+SQL
+}
+portable_runtime_contract="$(portable_runtime_contract_query)"
+expected_portable_runtime_contract="otlet_portable_runtime_options_status_v1|true|true|true|true|true|true|true|queued|0|0|0"
+if [ "$portable_runtime_contract" != "$expected_portable_runtime_contract" ]; then
+  echo "Expected portable runtime contract $expected_portable_runtime_contract, got $portable_runtime_contract" >&2
+  exit 1
+fi
+echo "portable_runtime_contract=$portable_runtime_contract"
+docker exec -i "$container" psql -U postgres -d "$portable_database" \
+  -X -qAt -v ON_ERROR_STOP=1 <<'SQL' >/dev/null
+DELETE FROM otlet.jobs
+WHERE task_name = 'aaa_portable_runtime_incompatible'
+  AND subject_id = 'runtime-incompatible';
+SQL
+
+portable_context_overflow_job_id="$(
+  docker exec -i "$container" psql -U postgres -d "$portable_database" \
+    -X -qAt -v ON_ERROR_STOP=1 -v model_name="$model_name" <<'SQL'
+SELECT otlet.enqueue_ask(
+  :'model_name',
+  'Return decision keep',
+  '{"signal":"retain"}'::jsonb,
+  '{"type":"object","required":["decision"],"additionalProperties":false,"properties":{"decision":{"const":"keep"}}}'::jsonb,
+  '{"reasoning":"off","max_tokens":48,"context_window_tokens":64,"inference_cache":false}'::jsonb
+);
+SQL
+)"
+run_worker_once_for \
+  "$worker_id" \
+  "$worker_database_url" \
+  "$worker_password" \
+  "$model_name" \
+  "$model_artifact" \
+  "$model_sha256" \
+  job_failed
+portable_context_overflow_contract="$(
+  docker exec -i "$container" psql -U postgres -d "$portable_database" \
+    -X -qAt -v ON_ERROR_STOP=1 \
+    -v job_id="$portable_context_overflow_job_id" <<'SQL'
+WITH evidence AS (
+  SELECT
+    job.id,
+    job.status,
+    job.failure_reason_code,
+    receipt.status AS receipt_status,
+    receipt.failure_reason_code AS receipt_failure_reason_code,
+    receipt.trace_summary
+  FROM otlet.jobs job
+  JOIN otlet.inference_receipts receipt ON receipt.job_id = job.id
+  WHERE job.id = :'job_id'::bigint
+)
+SELECT concat_ws('|',
+  evidence.status,
+  evidence.receipt_status,
+  (evidence.trace_summary ->> 'stop_reason' IN (
+    'prompt_exceeds_context_window',
+    'prompt_and_generation_exceed_context_window'
+  ))::text,
+  (evidence.failure_reason_code = 'otlet.failure.v1.runtime_configuration_rejected')::text,
+  (evidence.receipt_failure_reason_code = 'otlet.failure.v1.runtime_configuration_rejected')::text,
+  jsonb_extract_path_text(
+    evidence.trace_summary,
+    'runtime_options_status', 'envelope', 'tested_context_window_tokens'
+  ),
+  jsonb_extract_path_text(
+    evidence.trace_summary,
+    'runtime_options_status', 'envelope', 'requested_context_window_tokens'
+  ),
+  jsonb_extract_path_text(
+    evidence.trace_summary,
+    'runtime_options_status', 'envelope', 'effective_context_window_tokens'
+  ),
+  jsonb_extract_path_text(
+    evidence.trace_summary,
+    'runtime_fingerprint', 'context', 'tested_context_window_tokens'
+  ),
+  jsonb_extract_path_text(
+    evidence.trace_summary,
+    'runtime_fingerprint', 'context', 'requested_context_window_tokens'
+  ),
+  jsonb_extract_path_text(
+    evidence.trace_summary,
+    'runtime_fingerprint', 'context', 'effective_context_window_tokens'
+  ),
+  jsonb_extract_path_text(
+    evidence.trace_summary, 'memory', 'request_admission', 'decision'
+  ),
+  (jsonb_extract_path_text(
+    evidence.trace_summary, 'memory', 'request_admission', 'reason'
+  ) IN (
+    'prompt_exceeds_context_window',
+    'prompt_and_generation_exceed_context_window'
+  ))::text,
+  (jsonb_extract_path_text(
+    evidence.trace_summary, 'memory', 'request_admission', 'prompt_tokens'
+  )::integer > 0)::text,
+  (jsonb_extract_path_text(
+    evidence.trace_summary, 'memory', 'request_admission', 'projected_prompt_bytes'
+  )::bigint > 0)::text,
+  (jsonb_extract_path_text(
+    evidence.trace_summary, 'memory', 'request_admission', 'projected_decode_bytes'
+  )::bigint > 0)::text,
+  (SELECT count(*) FROM otlet.outputs output WHERE output.job_id = evidence.id),
+  (SELECT count(*) FROM otlet.verify_invariants())
+)
+FROM evidence;
+SQL
+)"
+expected_portable_context_overflow="failed|failed|true|true|true|4096|64|64|4096|64|64|rejected|true|true|true|true|0|0"
+if [ "$portable_context_overflow_contract" != "$expected_portable_context_overflow" ]; then
+  echo "Expected portable context overflow contract $expected_portable_context_overflow, got $portable_context_overflow_contract" >&2
+  exit 1
+fi
+echo "portable_context_overflow_contract=$portable_context_overflow_contract"
+
 async_result_contract="$(
   docker exec -i "$container" psql -U postgres -d "$portable_database" \
     -X -qAt -v ON_ERROR_STOP=1 -v async_job_id="$async_job_id" <<'SQL'
@@ -596,9 +969,97 @@ if [ "$non_watch_scalar_contract" != "true" ]; then
   exit 1
 fi
 
+deadline_job_id="$(
+  docker exec -i "$container" psql -U postgres -d "$portable_database" \
+    -X -qAt -v ON_ERROR_STOP=1 -v model_name="$model_name" <<'SQL'
+SELECT otlet.create_task(
+  'portable_attempt_deadline_demo',
+  NULL,
+  'Read the full signal and return decision keep',
+  '{"type":"object","required":["decision"],"additionalProperties":false,"properties":{"decision":{"const":"keep"}}}'::jsonb,
+  :'model_name',
+  '{"reasoning":"off","max_tokens":512,"max_attempt_ms":1000,"inference_cache":false}'::jsonb,
+  '{"source_fields":["signal"]}'::jsonb
+) \g /dev/null
+INSERT INTO otlet.jobs (task_name, subject_id, input)
+VALUES (
+  'portable_attempt_deadline_demo',
+  'deadline',
+  jsonb_build_object('signal', repeat('bounded portable deadline input ', 400))
+)
+RETURNING id;
+SQL
+)"
+if [[ ! "$deadline_job_id" =~ ^[1-9][0-9]*$ ]]; then
+  echo "Expected portable deadline job ID, got $deadline_job_id" >&2
+  exit 1
+fi
+
+run_worker_once_for \
+  "$worker_id" \
+  "$worker_database_url" \
+  "$worker_password" \
+  "$model_name" \
+  "$model_artifact" \
+  "$model_sha256" \
+  job_failed \
+  250
+
+if ! grep -q '"reason":"attempt_timeout"' "$worker_log"; then
+  tail -n 120 "$worker_log" >&2
+  echo "Portable deadline worker did not report attempt_timeout" >&2
+  exit 1
+fi
+
+portable_deadline_contract="$(
+  docker exec -i "$container" psql -U postgres -d "$portable_database" \
+    -X -qAt -v ON_ERROR_STOP=1 -v job_id="$deadline_job_id" <<'SQL'
+SELECT concat_ws('|',
+  job.status,
+  job.error,
+  receipt.selection_reason,
+  receipt.trace_summary ->> 'stop_reason',
+  receipt.schema_validation_status,
+  job.failure_reason_code,
+  receipt.failure_reason_code,
+  taxonomy.stage,
+  taxonomy.retryability,
+  taxonomy.owner_action,
+  taxonomy.recommended_retry_mode,
+  taxonomy.raw_detail_visibility,
+  (failure.execution_path = 'portable' AND failure.raw_detail_available)::text,
+  (model.lifecycle_state = 'active' AND worker.enabled)::text,
+  claim.status,
+  (claim.last_renewed_at IS NOT NULL)::text,
+  (claim.last_renewed_at < status.attempt_deadline_at)::text,
+  (SELECT count(*) FROM otlet.inference_receipts r WHERE r.job_id = job.id),
+  (SELECT count(*) FROM otlet.outputs output WHERE output.job_id = job.id)
+)
+FROM otlet.jobs job
+JOIN otlet.portable_claims claim ON claim.job_id = job.id
+JOIN otlet.portable_claim_status status ON status.claim_id = claim.id
+JOIN otlet.inference_receipts receipt ON receipt.job_id = job.id
+JOIN otlet.failure_taxonomy taxonomy
+  ON taxonomy.failure_reason_code = job.failure_reason_code
+JOIN otlet.failure_retry_status failure
+  ON failure.failure_scope = 'job'
+ AND failure.job_id = job.id
+JOIN otlet.models model ON model.name = receipt.model_name
+JOIN otlet.portable_workers worker ON worker.worker_id = claim.worker_id
+WHERE job.id = :'job_id'::bigint;
+SQL
+)"
+expected_portable_deadline_contract="failed|attempt_timeout|attempt_timeout|attempt_timeout|failed|otlet.failure.v1.attempt_timeout|otlet.failure.v1.attempt_timeout|inference|manual_retry|application_retry_job|original_snapshot|database_owner_only|true|true|failed|true|true|1|0"
+if [ "$portable_deadline_contract" != "$expected_portable_deadline_contract" ]; then
+  echo "Expected portable deadline contract $expected_portable_deadline_contract, got $portable_deadline_contract" >&2
+  exit 1
+fi
+echo "portable_deadline_contract=$portable_deadline_contract"
+
 run_worker_once_for \
   "$cheap_worker_id" \
   "$cheap_worker_database_url" \
+  "$cheap_worker_password" \
   "$cheap_model_name" \
   "$cheap_model_artifact" \
   "$cheap_model_sha256" \
@@ -688,6 +1149,7 @@ SQL
 run_worker_once_for \
   "$cheap_worker_id" \
   "$cheap_worker_database_url" \
+  "$cheap_worker_password" \
   "$cheap_model_name" \
   "$cheap_model_artifact" \
   "$cheap_model_sha256" \
@@ -708,7 +1170,21 @@ SELECT concat_ws('|',
       AND r.selection_status = 'accepted'
       AND r.model_name = :'cheap_model_name'
   ),
-  count(c.id) FILTER (WHERE c.status = 'complete')
+  count(c.id) FILTER (WHERE c.status = 'complete'),
+  bool_and(
+    jsonb_extract_path(
+      r.trace_summary,
+      'runtime_fingerprint', 'context', 'requested_context_window_tokens'
+    ) = 'null'::jsonb
+    AND jsonb_extract_path_text(
+      r.trace_summary,
+      'runtime_fingerprint', 'context', 'tested_context_window_tokens'
+    ) = '4096'
+    AND jsonb_extract_path_text(
+      r.trace_summary,
+      'runtime_fingerprint', 'context', 'effective_context_window_tokens'
+    ) = '4096'
+  )
 )
 FROM otlet.jobs j
 JOIN otlet.outputs o ON o.job_id = j.id
@@ -720,7 +1196,7 @@ WHERE j.task_name = 'portable_routing_accept_demo'
 GROUP BY j.id, o.id;
 SQL
 )"
-if [ "$routing_accept_contract" != "complete|keep|1|t|1|1|1" ]; then
+if [ "$routing_accept_contract" != "complete|keep|1|t|1|1|1|t" ]; then
   echo "Expected a portable cheap result to complete without escalation, got $routing_accept_contract" >&2
   exit 1
 fi
@@ -737,6 +1213,18 @@ claim_metadata_contract="$(
     "$container" \
     psql -h 127.0.0.1 -U "$cheap_worker_role" -d "$portable_database" \
     -X -qAt -v ON_ERROR_STOP=1 <<'SQL'
+BEGIN;
+SELECT pg_catalog.set_config(
+  'otlet.probe_incarnation',
+  started.incarnation_nonce,
+  true
+)
+FROM otlet.portable_start_worker(
+  current_setting('otlet.probe_worker_id'),
+  1,
+  current_setting('otlet.probe_runtime_hash')
+) started
+\g /dev/null
 DO $$
 DECLARE
   claim_row record;
@@ -748,6 +1236,9 @@ BEGIN
     current_setting('otlet.probe_worker_id'),
     1,
     current_setting('otlet.probe_runtime_hash'),
+    current_setting('otlet.probe_incarnation'),
+    1048576,
+    6,
     1
   );
   IF claim_row.selection_role IS DISTINCT FROM 'cheap'
@@ -761,6 +1252,7 @@ BEGIN
     current_setting('otlet.probe_worker_id'),
     1,
     current_setting('otlet.probe_runtime_hash'),
+    current_setting('otlet.probe_incarnation'),
     claim_row.job_id,
     claim_row.claim_token,
     'claim metadata probe cleanup',
@@ -772,6 +1264,7 @@ BEGIN
 END;
 $$;
 SELECT 'cheap|' || current_setting('otlet.probe_cheap_model') || '|queued';
+COMMIT;
 SQL
 )"
 claim_metadata_contract+="|$(
@@ -831,6 +1324,18 @@ routing_failure_contract="$(
     "$container" \
     psql -h 127.0.0.1 -U "$cheap_worker_role" -d "$portable_database" \
     -X -qAt -v ON_ERROR_STOP=1 <<'SQL'
+BEGIN;
+SELECT pg_catalog.set_config(
+  'otlet.probe_incarnation',
+  started.incarnation_nonce,
+  true
+)
+FROM otlet.portable_start_worker(
+  current_setting('otlet.probe_worker_id'),
+  1,
+  current_setting('otlet.probe_runtime_hash')
+) started
+\g /dev/null
 DO $$
 DECLARE
   claim_row record;
@@ -842,6 +1347,9 @@ BEGIN
     current_setting('otlet.probe_worker_id'),
     1,
     current_setting('otlet.probe_runtime_hash'),
+    current_setting('otlet.probe_incarnation'),
+    1048576,
+    6,
     1
   );
   SELECT job_status
@@ -850,6 +1358,7 @@ BEGIN
     current_setting('otlet.probe_worker_id'),
     1,
     current_setting('otlet.probe_runtime_hash'),
+    current_setting('otlet.probe_incarnation'),
     claim_row.job_id,
     claim_row.claim_token,
     'cheap runtime failure'
@@ -861,6 +1370,7 @@ BEGIN
 END;
 $$;
 SELECT 'runtime=failed';
+COMMIT;
 SQL
 )"
 if [ "$routing_failure_contract" != "runtime=failed" ]; then
@@ -929,6 +1439,11 @@ watch_insert_job_id="$(
 BEGIN;
 INSERT INTO public.otlet_portable_watch_source
 VALUES ('watch-live', 'retain');
+SELECT otlet.reconcile_watch_subject(
+  'portable_row_watch',
+  'watch-live',
+  true
+) AS watch_insert_replay \gset
 SELECT j.id AS watch_insert_job_id
 FROM otlet.jobs j
 JOIN otlet.watches w ON w.task_name = j.task_name
@@ -1001,6 +1516,35 @@ if [ "$watch_insert_contract" != "$expected_watch_insert" ]; then
   exit 1
 fi
 
+portable_row_read_only_contract="$(
+  docker exec -i "$container" psql -U postgres -d "$portable_database" \
+    -X -qAt -v ON_ERROR_STOP=1 <<'SQL'
+BEGIN READ ONLY;
+SELECT concat_ws('|',
+  current_setting('transaction_read_only'),
+  pg_my_temp_schema() = 0,
+  (SELECT count(*) = 1 FROM otlet.semantic_index_current_rows('portable_row_watch', true)),
+  (SELECT count_basis = 'maintained' FROM otlet.semantic_index_plan('portable_row_watch')),
+  (SELECT count_basis = 'exact' FROM otlet.semantic_index_plan('portable_row_watch', true)),
+  EXISTS (SELECT 1 FROM otlet.semantic_index_status WHERE name = 'portable_row_watch'),
+  otlet.semantic_matches('portable_row_watch', 'watch-live', '{"decision":"keep"}'::jsonb),
+  EXISTS (
+    SELECT 1
+    FROM otlet.watch_status
+    WHERE watch_name = 'portable_row_watch'
+      AND source_dependency_status = 'ready'
+  ),
+  pg_my_temp_schema() = 0
+);
+COMMIT;
+SQL
+)"
+if [ "$portable_row_read_only_contract" != "on|t|t|t|t|t|t|t|t" ]; then
+  echo "Expected portable row status, plan, current-row, and predicate reads to remain read-only, got $portable_row_read_only_contract" >&2
+  exit 1
+fi
+echo "portable_row_read_only_contract=$portable_row_read_only_contract"
+
 watch_update_job_id="$(
   docker exec -i "$container" psql -U postgres -d "$portable_database" \
     -X -qAt -v ON_ERROR_STOP=1 <<'SQL'
@@ -1008,6 +1552,11 @@ BEGIN;
 UPDATE public.otlet_portable_watch_source
 SET signal = 'retain updated'
 WHERE subject_id = 'watch-live';
+SELECT otlet.reconcile_watch_subject(
+  'portable_row_watch',
+  'watch-live',
+  true
+) AS watch_update_replay \gset
 SELECT j.id AS watch_update_job_id
 FROM otlet.jobs j
 JOIN otlet.watches w ON w.task_name = j.task_name
@@ -1057,6 +1606,11 @@ docker exec -i "$container" psql -U postgres -d "$portable_database" \
   -X -qAt -v ON_ERROR_STOP=1 <<'SQL' >/dev/null
 DELETE FROM public.otlet_portable_watch_source
 WHERE subject_id = 'watch-live';
+SELECT otlet.reconcile_watch_subject(
+  'portable_row_watch',
+  'watch-live',
+  true
+);
 SQL
 
 watch_delete_contract="$(
@@ -1140,6 +1694,36 @@ if [ "$pair_insert_contract" != "complete|keep|false|1|1" ]; then
   exit 1
 fi
 
+portable_pair_read_only_contract="$(
+  docker exec -i "$container" psql -U postgres -d "$portable_database" \
+    -X -qAt -v ON_ERROR_STOP=1 <<'SQL'
+BEGIN READ ONLY;
+SELECT concat_ws('|',
+  current_setting('transaction_read_only'),
+  pg_my_temp_schema() = 0,
+  (SELECT count(*) = 1 FROM otlet.semantic_join_index_current_rows('portable_pair_watch', true)),
+  (SELECT count_basis = 'maintained' FROM otlet.semantic_join_index_plan('portable_pair_watch')),
+  (SELECT count_basis = 'exact' FROM otlet.semantic_join_index_plan('portable_pair_watch', true)),
+  otlet.semantic_join_matches('portable_pair_watch', 'pair-left:pair-right', '{"decision":"keep"}'::jsonb),
+  EXISTS (
+    SELECT 1
+    FROM otlet.watch_status
+    WHERE watch_name = 'portable_pair_watch'
+      AND source_dependency_status = 'ready'
+      AND candidate_preflight_status = 'ready'
+  ),
+  (SELECT count(*) >= 0 FROM otlet.verify_invariants()),
+  pg_my_temp_schema() = 0
+);
+COMMIT;
+SQL
+)"
+if [ "$portable_pair_read_only_contract" != "on|t|t|t|t|t|t|t|t" ]; then
+  echo "Expected portable pair status, plan, current-row, predicate, and invariant reads to remain read-only, got $portable_pair_read_only_contract" >&2
+  exit 1
+fi
+echo "portable_pair_read_only_contract=$portable_pair_read_only_contract"
+
 pair_update_contract="$(
   docker exec -i "$container" psql -U postgres -d "$portable_database" \
     -X -qAt -v ON_ERROR_STOP=1 <<'SQL'
@@ -1161,7 +1745,7 @@ SELECT concat_ws('|',
 COMMIT;
 SQL
 )"
-if [ "$pair_update_contract" != "true|content_revalidation_pending|1" ]; then
+if [ "$pair_update_contract" != "true|source_update|1" ]; then
   echo "Expected a stale portable pair replacement, got $pair_update_contract" >&2
   exit 1
 fi
@@ -1218,6 +1802,11 @@ watch_cancel_contract="$(
     -X -qAt -v ON_ERROR_STOP=1 <<'SQL'
 INSERT INTO public.otlet_portable_watch_source
 VALUES ('watch-cancel', 'retain');
+SELECT otlet.reconcile_watch_subject(
+  'portable_row_watch',
+  'watch-cancel',
+  true
+) AS watch_cancel_replay \gset
 WITH target AS (
   SELECT j.id
   FROM otlet.jobs j
@@ -1271,7 +1860,7 @@ fi
 worker_image="$(docker inspect -f '{{.Config.Image}}' "$container")"
 postgres_volume="$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/var/lib/postgresql"}}{{.Name}}{{end}}{{end}}' "$container")"
 target_volume="$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/target"}}{{.Name}}{{end}}{{end}}' "$container")"
-external_database_url="postgresql://${worker_role}:${worker_password}@host.docker.internal:${OTLET_PG_PORT:-55432}/${portable_database}"
+external_database_url="postgresql://${worker_role}@host.docker.internal:${OTLET_PG_PORT:-55432}/${portable_database}"
 
 docker exec -i "$container" psql -U postgres -d "$portable_database" -X -qAt \
   -v ON_ERROR_STOP=1 -v worker_id="$worker_id" <<'SQL' >/dev/null
@@ -1335,6 +1924,78 @@ SQL
 start_recovery_worker
 wait_for_job_status recovery-worker-loss complete
 
+docker exec -i "$container" psql -U postgres -d "$portable_database" -X -qAt \
+  -v ON_ERROR_STOP=1 -v worker_id="$worker_id" <<'SQL' >/dev/null
+SELECT otlet.set_portable_worker_control(:'worker_id', 'paused');
+SQL
+wait_for_worker_state paused
+IFS='|' read -r watch_reconciliation_queue_cap watch_reconciliation_base_delay_ms <<<"$(
+  docker exec -i "$container" psql -U postgres -d "$portable_database" \
+    -X -qAt -v ON_ERROR_STOP=1 \
+    -c "SELECT max_queued_jobs_per_model || '|' || watch_reconciliation_base_delay_ms FROM otlet.production_policy WHERE name = 'default'"
+)"
+docker exec -i "$container" psql -U postgres -d "$portable_database" \
+  -X -qAt -v ON_ERROR_STOP=1 <<'SQL' >/dev/null
+UPDATE otlet.production_policy
+SET max_queued_jobs_per_model = 1,
+    watch_reconciliation_base_delay_ms = 5000
+WHERE name = 'default';
+INSERT INTO otlet.jobs (task_name, subject_id, input)
+VALUES ('aaa_portable_runtime_incompatible', 'watch-reconciliation-blocker', '{}'::jsonb);
+INSERT INTO public.otlet_portable_watch_source
+VALUES ('watch-restart', 'retain old');
+UPDATE public.otlet_portable_watch_source
+SET signal = 'retain newer'
+WHERE subject_id = 'watch-restart';
+UPDATE public.otlet_portable_watch_source
+SET signal = 'retain newest'
+WHERE subject_id = 'watch-restart';
+SELECT otlet.reconcile_watch_subject(
+  'portable_row_watch',
+  'watch-restart',
+  true
+);
+SQL
+watch_reconciliation_before_restart="$(
+  docker exec -i "$container" psql -U postgres -d "$portable_database" \
+    -X -qAt -v ON_ERROR_STOP=1 <<'SQL'
+SELECT concat_ws('|',
+  count(*),
+  max(reconciliation.generation),
+  max(reconciliation.state),
+  bool_and(
+    reconciliation.attempts >= 1
+    AND reconciliation.attempts < reconciliation.attempt_limit
+    AND reconciliation.last_error = 'queue admission rejected watch reconciliation'
+  ),
+  bool_and(reconciliation.source_identity = (
+    SELECT otlet.semantic_source_hash(otlet.task_subject_input(
+      revision.definition #>> '{task,input_query}',
+      reconciliation.subject_id,
+      revision.definition
+    ))
+    FROM otlet.workload_revisions revision
+    WHERE revision.task_name = 'portable_row_watch_task'
+      AND revision.workload_revision_hash = reconciliation.workload_revision_hash
+  )),
+  (SELECT count(*) FROM otlet.jobs WHERE subject_id = 'watch-restart')
+)
+FROM otlet.watch_reconciliation reconciliation
+WHERE reconciliation.watch_name = 'portable_row_watch'
+  AND reconciliation.subject_id = 'watch-restart';
+SQL
+)"
+if [[ ! "$watch_reconciliation_before_restart" =~ ^1\|[1-9][0-9]*\|pending\|t\|t\|0$ ]]; then
+  echo "Expected one coalesced watch reconciliation before restart, got $watch_reconciliation_before_restart" >&2
+  exit 1
+fi
+watch_reconciliation_generation="$(cut -d '|' -f 2 <<<"$watch_reconciliation_before_restart")"
+docker exec -i "$container" psql -U postgres -d "$portable_database" -X -qAt \
+  -v ON_ERROR_STOP=1 -v worker_id="$worker_id" <<'SQL' >/dev/null
+SELECT otlet.set_portable_worker_control(:'worker_id', 'running');
+SQL
+wait_for_worker_state idle
+
 docker stop "$container" >/dev/null
 for _ in {1..100}; do
   if docker logs "$recovery_container" 2>&1 | grep -q '"event":"database_unavailable"'; then
@@ -1351,10 +2012,53 @@ if ! docker exec "$container" pg_isready -U postgres -d "$portable_database" >/d
   echo "Portable recovery database did not restart" >&2
   exit 1
 fi
+watch_reconciliation_after_restart="$(
+  docker exec -i "$container" psql -U postgres -d "$portable_database" \
+    -X -qAt -v ON_ERROR_STOP=1 <<'SQL'
+SELECT concat_ws('|',
+  count(*),
+  max(reconciliation.generation),
+  max(reconciliation.state),
+  bool_and(
+    reconciliation.attempts >= 1
+    AND reconciliation.attempts < reconciliation.attempt_limit
+    AND reconciliation.last_error = 'queue admission rejected watch reconciliation'
+  ),
+  bool_and(reconciliation.source_identity = (
+    SELECT otlet.semantic_source_hash(otlet.task_subject_input(
+      revision.definition #>> '{task,input_query}',
+      reconciliation.subject_id,
+      revision.definition
+    ))
+    FROM otlet.workload_revisions revision
+    WHERE revision.task_name = 'portable_row_watch_task'
+      AND revision.workload_revision_hash = reconciliation.workload_revision_hash
+  )),
+  (SELECT count(*) FROM otlet.jobs WHERE subject_id = 'watch-restart')
+)
+FROM otlet.watch_reconciliation reconciliation
+WHERE reconciliation.watch_name = 'portable_row_watch'
+  AND reconciliation.subject_id = 'watch-restart';
+SQL
+)"
+if [ "$watch_reconciliation_after_restart" != "1|$watch_reconciliation_generation|pending|t|t|0" ]; then
+  echo "Watch reconciliation changed across database restart: $watch_reconciliation_after_restart" >&2
+  exit 1
+fi
 docker exec -i "$container" psql -U postgres -d "$portable_database" \
-  -X -qAt -v ON_ERROR_STOP=1 <<'SQL' >/dev/null
-INSERT INTO public.otlet_portable_watch_source
-VALUES ('watch-restart', 'retain');
+  -X -qAt -v ON_ERROR_STOP=1 \
+  -v queue_cap="$watch_reconciliation_queue_cap" \
+  -v base_delay_ms="$watch_reconciliation_base_delay_ms" <<'SQL' >/dev/null
+SELECT otlet.request_job_cancellation(id, 'portable reconciliation capacity fixture')
+FROM otlet.jobs
+WHERE task_name = 'aaa_portable_runtime_incompatible'
+  AND subject_id = 'watch-reconciliation-blocker'
+ORDER BY id DESC
+LIMIT 1;
+UPDATE otlet.production_policy
+SET max_queued_jobs_per_model = :'queue_cap'::integer,
+    watch_reconciliation_base_delay_ms = :'base_delay_ms'::integer
+WHERE name = 'default';
 SQL
 wait_for_job_status watch-restart complete
 
@@ -1367,6 +2071,12 @@ SELECT concat_ws('|',
    WHERE subject_id = 'watch-restart'
    ORDER BY id DESC
    LIMIT 1),
+  (SELECT input #>> '{row,signal}'
+   FROM otlet.jobs
+   WHERE task_name = 'portable_row_watch_task'
+     AND subject_id = 'watch-restart'
+   ORDER BY id DESC
+   LIMIT 1),
   (SELECT body ->> 'decision'
    FROM otlet.semantic_index_current_rows('portable_row_watch')
    WHERE subject_id = 'watch-restart'),
@@ -1375,26 +2085,123 @@ SELECT concat_ws('|',
    WHERE subject_id = 'watch-restart'),
   (SELECT count(*)
    FROM otlet.semantic_materializations
-   WHERE subject_id = 'watch-restart')
+   WHERE subject_id = 'watch-restart'),
+  (SELECT count(*)
+   FROM otlet.watch_reconciliation
+   WHERE watch_name = 'portable_row_watch'
+     AND subject_id = 'watch-restart'),
+  (SELECT status
+   FROM otlet.jobs
+   WHERE task_name = 'aaa_portable_runtime_incompatible'
+     AND subject_id = 'watch-reconciliation-blocker'
+   ORDER BY id DESC
+   LIMIT 1)
 );
 SQL
 )"
-if [ "$watch_restart_contract" != "complete|keep|false|1" ]; then
-  echo "Expected row-watch materialization after database restart, got $watch_restart_contract" >&2
+if [ "$watch_restart_contract" != "complete|retain newest|keep|false|1|0|canceled" ]; then
+  echo "Expected durable row-watch replay after database restart, got $watch_restart_contract" >&2
   exit 1
 fi
 
 docker exec -i "$container" psql -U postgres -d "$portable_database" -X -qAt \
-  -v ON_ERROR_STOP=1 -v worker_id="$worker_id" <<'SQL' >/dev/null
-SELECT otlet.set_portable_worker_control(:'worker_id', 'draining');
+  -v ON_ERROR_STOP=1 -v model_name="$model_name" <<'SQL' >/dev/null
+CREATE SEQUENCE public.portable_release_ack_attempts;
+CREATE FUNCTION public.delay_first_portable_release_ack() RETURNS trigger
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, public
+AS $$
+BEGIN
+  IF NEW.reported_state = 'drained'
+     AND OLD.reported_state IS DISTINCT FROM NEW.reported_state
+     AND nextval('public.portable_release_ack_attempts') = 1 THEN
+    PERFORM pg_sleep(5);
+  END IF;
+  RETURN NEW;
+END;
+$$;
+CREATE TRIGGER delay_first_portable_release_ack
+BEFORE UPDATE OF reported_state ON otlet.portable_workers
+FOR EACH ROW EXECUTE FUNCTION public.delay_first_portable_release_ack();
+SELECT otlet.set_model_lifecycle(
+  :'model_name',
+  'draining',
+  NULL,
+  NULL,
+  'portable model release proof',
+  NULL
+);
 SQL
+release_ack_waiting=false
+for _ in {1..100}; do
+  release_ack_waiting="$(
+    docker exec "$container" psql -U postgres -d "$portable_database" -X -qAt \
+      -c "SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE datname = '$portable_database' AND wait_event = 'PgSleep' AND query LIKE '%portable_worker_heartbeat%' AND pid <> pg_backend_pid())"
+  )"
+  [ "$release_ack_waiting" = "t" ] && break
+  sleep 0.05
+done
+if [ "$release_ack_waiting" != "t" ]; then
+  docker logs --tail 120 "$recovery_container" >&2 || true
+  echo "Portable model release did not reach the acknowledgement retry proof" >&2
+  exit 1
+fi
+docker exec "$container" psql -U postgres -d "$portable_database" -X -qAt \
+  -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '$portable_database' AND wait_event = 'PgSleep' AND query LIKE '%portable_worker_heartbeat%' AND pid <> pg_backend_pid()" \
+  >/dev/null
 for _ in {1..400}; do
   [ "$(docker inspect -f '{{.State.Running}}' "$recovery_container")" = "false" ] && break
   sleep 0.1
 done
 wait_for_worker_state drained
+portable_model_release_contract="$(
+  docker exec -i "$container" psql -U postgres -d "$portable_database" \
+    -X -qAt -v ON_ERROR_STOP=1 -v worker_id="$worker_id" \
+    -v model_name="$model_name" <<'SQL'
+SELECT concat_ws('|',
+  model.lifecycle_state,
+  worker.desired_state,
+  worker.reported_state,
+  worker.model_status,
+  otlet.model_artifact_release_requested(model.name),
+  NOT dependency.blocks_pruning,
+  (SELECT last_value >= 2 FROM public.portable_release_ack_attempts)
+)
+FROM otlet.models model
+JOIN otlet.portable_workers worker ON worker.model_name = model.name
+JOIN otlet.model_artifact_dependency_status dependency
+  ON dependency.model_name = model.name
+ AND dependency.dependency_type = 'portable_worker'
+ AND dependency.dependency_key = worker.worker_id
+WHERE model.name = :'model_name'
+  AND worker.worker_id = :'worker_id';
+SQL
+)"
+if [ "$portable_model_release_contract" != \
+  "draining|draining|drained|unverified|t|t|t" ]; then
+  echo "Expected portable model release contract, got $portable_model_release_contract" >&2
+  exit 1
+fi
+docker exec -i "$container" psql -U postgres -d "$portable_database" \
+  -X -qAt -v ON_ERROR_STOP=1 <<'SQL' >/dev/null
+DROP TRIGGER delay_first_portable_release_ack ON otlet.portable_workers;
+DROP FUNCTION public.delay_first_portable_release_ack();
+DROP SEQUENCE public.portable_release_ack_attempts;
+SQL
 archive_recovery_worker
 
+for secret in \
+  "$worker_password" \
+  "$cheap_worker_password" \
+  "$worker_database_url" \
+  "$cheap_worker_database_url" \
+  "$external_database_url"; do
+  if grep -Fq -- "$secret" "$worker_log" "$recovery_log"; then
+    echo "Portable worker logs exposed a database credential" >&2
+    exit 1
+  fi
+done
 if grep -Fq "$canary" "$recovery_log"; then
   echo "Portable worker logs exposed raw source evidence" >&2
   exit 1
@@ -1455,7 +2262,7 @@ fi
 
 portable_parity_contract="$(
   docker exec -i "$container" psql -U postgres -d "$portable_database" \
-    -X -qAt -v ON_ERROR_STOP=1 <<'SQL'
+    -X -qAt -v ON_ERROR_STOP=1 -v runtime_identity="$runtime_identity" <<'SQL'
 SELECT concat_ws('|',
   (SELECT count(*) FROM otlet.verify_invariants()),
   (SELECT count(*)
@@ -1469,20 +2276,28 @@ SELECT concat_ws('|',
   (SELECT count(*)
    FROM unnest(ARRAY[
      'otlet.runtime_status',
+     'otlet.runtime_capability_status',
      'otlet.production_status',
      'otlet.watch_status',
      'otlet.audit_receipt_export'
    ]) relation_name
-   WHERE to_regclass(relation_name) IS NOT NULL)
+   WHERE to_regclass(relation_name) IS NOT NULL),
+  (SELECT count(*) = 2
+      AND bool_and(
+        runtime_identity_hash = otlet.portable_json_hash(:'runtime_identity'::jsonb)
+        AND capability_version = 'otlet_runtime_capabilities_v1'
+        AND runtime_build = :'runtime_identity'::jsonb #> '{runtime_contract,runtime_build}'
+      )
+    FROM otlet.runtime_capability_status)
 );
 SQL
 )"
-if [ "$portable_parity_contract" != "0|4|4" ]; then
+if [ "$portable_parity_contract" != "0|4|5|t" ]; then
   echo "Expected complete portable SQL parity surfaces and zero invariant violations, got $portable_parity_contract" >&2
   exit 1
 fi
 
-echo "portable_async_inference_contract=$async_queued_contract|$async_result_contract|admission=closed|input=validated|scalar_non_watch=accepted"
+echo "portable_async_inference_contract=$async_queued_contract|$async_result_contract|admission=closed|input=validated|scalar_non_watch=accepted|administrative=$async_administrative_contract"
 echo "portable_model_routing_contract=$routing_handoff_contract|$routing_complete_contract|$routing_accept_contract"
 echo "portable_claim_metadata_contract=$claim_metadata_contract"
 echo "portable_selection_failure_contract=$routing_failure_contract"
@@ -1491,4 +2306,5 @@ echo "portable_row_watch_contract=$watch_queued_contract|$watch_insert_contract|
 echo "portable_pair_watch_contract=$pair_refresh_contract|$pair_insert_contract|$pair_update_contract|$pair_replacement_contract|$(tr '\n' ':' <<<"$pair_delete_contract")"
 echo "portable_external_worker_contract=$contract|source_access=denied|protocol=1"
 echo "portable_recovery_contract=$recovery_contract|logs=structured_redacted|duplicate=covered_by_protocol"
+echo "portable_model_release_contract=$portable_model_release_contract"
 echo "portable_parity_contract=$portable_parity_contract"

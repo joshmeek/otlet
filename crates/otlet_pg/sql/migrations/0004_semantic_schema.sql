@@ -5,13 +5,13 @@ CREATE TABLE otlet.semantic_materializations (
   source_table text,
   subject_id text,
   source_dependencies jsonb NOT NULL DEFAULT '[]'::jsonb CHECK (jsonb_typeof(source_dependencies) = 'array'),
-  task_name text NOT NULL,
+  task_name text NOT NULL REFERENCES otlet.tasks(name),
   model_name text NOT NULL,
   body jsonb NOT NULL,
   stale boolean NOT NULL DEFAULT false,
   source_hash text,
   content_hash text,
-  contract_hash text,
+  contract_hash text NOT NULL,
   stale_reason text CHECK (stale_reason IN (
     'source_update',
     'source_delete',
@@ -28,7 +28,12 @@ CREATE TABLE otlet.semantic_materializations (
     'revalidated_after_benign_update'
   )),
   created_at timestamptz NOT NULL DEFAULT now(),
-  updated_at timestamptz NOT NULL DEFAULT now()
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  CHECK (source_hash IS NULL OR source_hash ~ '^otlet:v1:sha256:[0-9a-f]{64}$'),
+  CHECK (content_hash IS NULL OR content_hash ~ '^otlet:v1:sha256:[0-9a-f]{64}$'),
+  CHECK (contract_hash ~ '^otlet:v1:sha256:[0-9a-f]{64}$'),
+  FOREIGN KEY (task_name, contract_hash)
+    REFERENCES otlet.workload_revisions(task_name, workload_revision_hash)
 );
 
 CREATE INDEX semantic_materializations_lookup_idx
@@ -56,9 +61,7 @@ CREATE TABLE otlet.semantic_indexes (
   record_type text NOT NULL,
   model_name text NOT NULL REFERENCES otlet.models(name),
   created_at timestamptz NOT NULL DEFAULT now(),
-  updated_at timestamptz NOT NULL DEFAULT now(),
-  last_refresh_at timestamptz,
-  last_lookup_at timestamptz
+  updated_at timestamptz NOT NULL DEFAULT now()
 );
 
 CREATE TABLE otlet.semantic_join_indexes (
@@ -72,10 +75,7 @@ CREATE TABLE otlet.semantic_join_indexes (
   candidate_plan_cost numeric NOT NULL CHECK (candidate_plan_cost >= 0),
   candidate_preflight_at timestamptz NOT NULL,
   created_at timestamptz NOT NULL DEFAULT now(),
-  updated_at timestamptz NOT NULL DEFAULT now(),
-  last_refresh_at timestamptz,
-  last_lookup_at timestamptz,
-  last_materialized_at timestamptz
+  updated_at timestamptz NOT NULL DEFAULT now()
 );
 
 CREATE TABLE otlet.watches (
@@ -234,11 +234,16 @@ BEGIN
       validate_source_input := NEW.task_name IS DISTINCT FROM OLD.task_name
         OR NEW.input IS DISTINCT FROM OLD.input;
     END IF;
-    IF validate_source_input THEN
-      SELECT t.input_shaping
+    IF validate_source_input AND NEW.execution_mode = 'production' THEN
+      SELECT revision.definition #> '{task,input_shaping}'
       INTO task_input_shaping
-      FROM otlet.tasks t
-      WHERE t.name = NEW.task_name;
+      FROM otlet.workload_revisions revision
+      WHERE revision.task_name = NEW.task_name
+        AND revision.workload_revision_hash = NEW.workload_revision_hash;
+
+      IF NOT FOUND THEN
+        RAISE EXCEPTION 'otlet job workload revision is missing';
+      END IF;
 
       IF NOT otlet.source_fields_are_allowed(NEW.input, task_input_shaping) THEN
         RAISE EXCEPTION 'otlet job input contains a field outside the task source-field allowlist';

@@ -163,6 +163,8 @@ struct InferenceCacheEntry {
     content_key: u64,
     contract_key: u64,
     model_key: u64,
+    artifact_sha256: Arc<str>,
+    artifact_bytes: u64,
     raw_output: Arc<str>,
     bytes: usize,
     last_access: u64,
@@ -175,11 +177,15 @@ impl InferenceCacheEntry {
         content_key: u64,
         contract_key: u64,
         model_key: u64,
+        artifact_sha256: &str,
+        artifact_bytes: u64,
     ) -> bool {
         self.row_key == row_key
             && self.content_key == content_key
             && self.contract_key == contract_key
             && self.model_key == model_key
+            && self.artifact_sha256.as_ref() == artifact_sha256
+            && self.artifact_bytes == artifact_bytes
     }
 }
 
@@ -200,6 +206,13 @@ struct InferenceCache {
     evictions: i64,
     last_eviction_reason: &'static str,
     access_clock: u64,
+}
+
+fn inference_cache_for(execution_mode: &str) -> &'static Mutex<InferenceCache> {
+    match execution_mode {
+        "production" => INFERENCE_CACHE.get_or_init(|| Mutex::new(InferenceCache::default())),
+        _ => EVALUATION_INFERENCE_CACHE.get_or_init(|| Mutex::new(InferenceCache::default())),
+    }
 }
 
 impl Default for InferenceCache {
@@ -295,13 +308,16 @@ impl InferenceCache {
 }
 
 fn inference_cache_get(
+    execution_mode: &str,
     key: u64,
     row_key: u64,
     content_key: u64,
     contract_key: u64,
     model_key: u64,
+    artifact_sha256: &str,
+    artifact_bytes: u64,
 ) -> CacheLookup {
-    let cache = INFERENCE_CACHE.get_or_init(|| Mutex::new(InferenceCache::default()));
+    let cache = inference_cache_for(execution_mode);
     let Ok(mut cache) = cache.lock() else {
         return CacheLookup {
             raw_output: None,
@@ -312,7 +328,14 @@ fn inference_cache_get(
 
     let access = cache.next_access();
     if let Some(entry) = cache.entries.get_mut(&key)
-        && entry.matches_identity(row_key, content_key, contract_key, model_key)
+        && entry.matches_identity(
+            row_key,
+            content_key,
+            contract_key,
+            model_key,
+            artifact_sha256,
+            artifact_bytes,
+        )
     {
         entry.last_access = access;
         let raw_output = Arc::clone(&entry.raw_output);
@@ -342,19 +365,22 @@ fn inference_cache_get(
 }
 
 fn inference_cache_put(
+    execution_mode: &str,
     key: u64,
     row_key: u64,
     content_key: u64,
     contract_key: u64,
     model_key: u64,
+    artifact_sha256: &str,
+    artifact_bytes: u64,
     raw_output: String,
 ) -> InferenceCacheStats {
-    let cache = INFERENCE_CACHE.get_or_init(|| Mutex::new(InferenceCache::default()));
+    let cache = inference_cache_for(execution_mode);
     let Ok(mut cache) = cache.lock() else {
         return InferenceCacheStats::default();
     };
 
-    let bytes = 5 * std::mem::size_of::<u64>() + raw_output.len();
+    let bytes = 6 * std::mem::size_of::<u64>() + artifact_sha256.len() + raw_output.len();
     if bytes > INFERENCE_CACHE_MAX_BYTES {
         cache.last_eviction_reason = "entry_too_large";
         return cache.stats();
@@ -370,6 +396,8 @@ fn inference_cache_put(
         content_key,
         contract_key,
         model_key,
+        artifact_sha256: Arc::from(artifact_sha256),
+        artifact_bytes,
         raw_output,
         bytes,
         last_access,

@@ -44,6 +44,18 @@ unsafe extern "C-unwind" fn otlet_set_rel_pathlist(
         {
             return;
         }
+        if preload_cap_violation(
+            predicate.planner_stats.preload_estimated_rows,
+            predicate.planner_stats.preload_estimated_bytes,
+            predicate.planner_stats.preload_estimated_ms,
+            predicate.preload_max_rows,
+            predicate.preload_max_bytes,
+            predicate.preload_max_ms,
+        )
+        .is_some()
+        {
+            return;
+        }
         let child_path = if predicate.index_kind == SemanticIndexKind::Join {
             sanitized_subquery_child_path(
                 root,
@@ -189,6 +201,7 @@ fn planner_stats_with_reason(reason: &'static str) -> SemanticPlannerStats {
         selected_path: "semantic_lookup".to_owned(),
         reason: reason.to_owned(),
         source_rows: 0,
+        fresh_rows: 0,
         fresh_matches: 0,
         fresh_non_matches: 0,
         stale_rows: 0,
@@ -202,6 +215,89 @@ fn planner_stats_with_reason(reason: &'static str) -> SemanticPlannerStats {
         path_cost: 1.0,
         stale_reasons: "{}".to_owned(),
         count_basis: "unknown".to_owned(),
+        preload_estimated_rows: 0,
+        preload_estimated_bytes: 0,
+        preload_estimated_ms: 0,
+        preload_estimate_basis: "unavailable".to_owned(),
+        preload_max_rows: 0,
+        preload_max_bytes: 0,
+        preload_max_ms: 0,
+    }
+}
+
+fn apply_preload_estimate(
+    stats: &mut SemanticPlannerStats,
+    preload_max_rows: u64,
+    preload_max_bytes: u64,
+    preload_max_ms: u64,
+) {
+    stats.preload_estimated_rows = stats.source_rows;
+    stats.preload_estimated_bytes = stats
+        .source_rows
+        .saturating_mul(CUSTOM_SCAN_PRELOAD_ESTIMATED_BYTES_PER_ROW);
+    stats.preload_estimated_ms = 1_u64.saturating_add(
+        stats
+            .source_rows
+            .saturating_add(CUSTOM_SCAN_PRELOAD_ESTIMATED_ROWS_PER_MS - 1)
+            / CUSTOM_SCAN_PRELOAD_ESTIMATED_ROWS_PER_MS,
+    );
+    stats.preload_estimate_basis =
+        "maintained_subjects_256_bytes_per_row_20_rows_per_ms_plus_1ms".to_owned();
+    stats.preload_max_rows = preload_max_rows;
+    stats.preload_max_bytes = preload_max_bytes;
+    stats.preload_max_ms = preload_max_ms;
+}
+
+fn preload_cap_violation(
+    rows: u64,
+    bytes: u64,
+    elapsed_ms: u64,
+    max_rows: u64,
+    max_bytes: u64,
+    max_ms: u64,
+) -> Option<(&'static str, u64, u64)> {
+    [
+        ("rows", rows, max_rows),
+        ("bytes", bytes, max_bytes),
+        ("elapsed_ms", elapsed_ms, max_ms),
+    ]
+    .into_iter()
+    .find(|(_, actual, limit)| actual > limit)
+}
+
+#[cfg(test)]
+mod preload_tests {
+    use super::*;
+
+    #[test]
+    fn preload_caps_accept_boundaries_and_reject_one_over() {
+        assert!(preload_cap_violation(2, 512, 1, 2, 512, 1).is_none());
+        for expected in ["rows", "bytes", "elapsed_ms"] {
+            let violation = match expected {
+                "rows" => preload_cap_violation(3, 512, 1, 2, 512, 1),
+                "bytes" => preload_cap_violation(2, 513, 1, 2, 512, 1),
+                _ => preload_cap_violation(2, 512, 2, 2, 512, 1),
+            };
+            assert_eq!(violation.map(|value| value.0), Some(expected));
+        }
+    }
+
+    #[test]
+    fn preload_estimates_saturate() {
+        let mut stats = planner_stats_with_reason("test");
+        stats.source_rows = u64::MAX;
+        apply_preload_estimate(&mut stats, u64::MAX, u64::MAX, u64::MAX);
+        assert_eq!(stats.preload_estimated_rows, u64::MAX);
+        assert_eq!(stats.preload_estimated_bytes, u64::MAX);
+        assert!(stats.preload_estimated_ms > 0);
+    }
+
+    #[test]
+    fn preload_timeout_preserves_a_stricter_statement_deadline() {
+        assert_eq!(effective_preload_timeout_ms(500, None), 500);
+        assert_eq!(effective_preload_timeout_ms(500, Some(200)), 200);
+        assert_eq!(effective_preload_timeout_ms(100, Some(200)), 100);
+        assert_eq!(effective_preload_timeout_ms(0, Some(0)), 1);
     }
 }
 
@@ -218,7 +314,7 @@ fn finish_planner_stats(
         .saturating_add(stats.missing_rows)
         .saturating_add(stats.inflight_rows);
     let base_scan = stats.source_rows.max(1) as f64 * 0.02 + 1.0;
-    let lookup_cost = stats.fresh_matches.saturating_add(stats.fresh_non_matches) as f64 * 0.05;
+    let lookup_cost = stats.fresh_rows as f64 * 0.05;
     let model_cost = planner_model_cost_unit(stats.model_ms, infer_ms);
     stats.infer_decision_rows = 0;
     stats.fail_closed_decision_rows = 0;
@@ -257,12 +353,12 @@ fn finish_planner_stats(
         if unresolved > 0 {
             stats.reason = format!(
                 "auto semantic policy: fresh={} wait={} infer={} queue={} fail_closed={}",
-                stats.fresh_matches, waited_rows, bounded_infer_rows, queued_rows, fail_closed_rows
+                stats.fresh_rows, waited_rows, bounded_infer_rows, queued_rows, fail_closed_rows
             );
         } else {
             stats.reason = format!(
                 "auto semantic policy: all source rows resolved from fresh semantic state; fresh={}",
-                stats.fresh_matches
+                stats.fresh_rows
             );
         }
     } else if infer_ms > 0 && infer_max_rows > 0 && unresolved > 0 {
@@ -278,7 +374,7 @@ fn finish_planner_stats(
         stats.selected_path = "bounded_infer_now".to_owned();
         stats.reason = format!(
             "bounded infer-now over {bounded_infer_rows} unresolved rows; fresh={} stale={} missing={} in_flight={}",
-            stats.fresh_matches, stats.stale_rows, stats.missing_rows, stats.inflight_rows
+            stats.fresh_rows, stats.stale_rows, stats.missing_rows, stats.inflight_rows
         );
     } else if wait_ms > 0 && stats.inflight_rows > 0 {
         stats.fail_closed_decision_rows = unresolved.saturating_sub(stats.inflight_rows);
@@ -287,14 +383,14 @@ fn finish_planner_stats(
         stats.selected_path = "wait_for_refresh".to_owned();
         stats.reason = format!(
             "bounded wait for {} in-flight rows; fresh={} stale={} missing={}",
-            stats.inflight_rows, stats.fresh_matches, stats.stale_rows, stats.missing_rows
+            stats.inflight_rows, stats.fresh_rows, stats.stale_rows, stats.missing_rows
         );
     } else if allow_refresh && unresolved > 0 {
         stats.path_cost = base_scan + lookup_cost + unresolved as f64 * 0.50;
         stats.selected_path = "queue_refresh".to_owned();
         stats.reason = format!(
             "queue refresh and fail closed for {unresolved} unresolved rows; fresh={}",
-            stats.fresh_matches
+            stats.fresh_rows
         );
     } else if unresolved > 0 {
         stats.fail_closed_decision_rows = unresolved;
@@ -302,14 +398,14 @@ fn finish_planner_stats(
         stats.selected_path = "lookup_fail_closed".to_owned();
         stats.reason = format!(
             "fail closed for {unresolved} unresolved rows; fresh={}",
-            stats.fresh_matches
+            stats.fresh_rows
         );
     } else {
         stats.path_cost = base_scan + lookup_cost;
         stats.selected_path = "semantic_lookup".to_owned();
         stats.reason = format!(
             "all source rows resolved from fresh semantic state; fresh={}",
-            stats.fresh_matches
+            stats.fresh_rows
         );
     }
 }
@@ -360,7 +456,9 @@ fn planner_bounded_infer_cost(
 const PLANNER_CACHE_HIT_COST_UNIT: f64 = 0.05;
 
 fn estimated_result_rows(stats: &SemanticPlannerStats, predicate: &SemanticMatchPredicate) -> f64 {
-    let mut rows = stats.fresh_matches;
+    // PostgreSQL owns predicate selectivity
+    // Semantic statistics only cap current executor coverage
+    let mut rows = stats.fresh_rows;
     if predicate.auto_policy {
         if predicate.wait_ms > 0 {
             rows = rows.saturating_add(stats.inflight_rows);

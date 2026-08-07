@@ -1,4 +1,87 @@
 log "Checking watch definition portability"
+read_only_semantic_contract="$(psql_exec -qAt \
+  -v row_watch="$numeric_triage_watch" \
+  -v pair_watch="$join_index_name" <<'SQL'
+BEGIN READ ONLY;
+WITH row_estimated AS MATERIALIZED (
+  SELECT * FROM otlet.semantic_index_plan(:'row_watch')
+), row_exact AS MATERIALIZED (
+  SELECT * FROM otlet.semantic_index_plan(:'row_watch', true)
+), pair_estimated AS MATERIALIZED (
+  SELECT * FROM otlet.semantic_join_index_plan(:'pair_watch')
+), pair_exact AS MATERIALIZED (
+  SELECT * FROM otlet.semantic_join_index_plan(:'pair_watch', true)
+)
+SELECT concat_ws('|',
+  current_setting('transaction_read_only'),
+  pg_my_temp_schema() = 0,
+  (SELECT count(*) > 0 FROM otlet.semantic_index_current_rows(:'row_watch', true)),
+  (SELECT count_basis = 'maintained' FROM row_estimated),
+  (SELECT count_basis = 'exact' FROM row_exact),
+  EXISTS (
+    SELECT 1
+    FROM otlet.semantic_index_status
+    WHERE name = :'row_watch'
+  ),
+  EXISTS (
+    SELECT 1
+    FROM public.otlet_demo_numeric_triage source
+    WHERE source.id = 'numeric-1'
+      AND otlet.semantic_matches_auto(:'row_watch', source.id, '{"decision":"flag"}'::jsonb)
+  ),
+  (SELECT count(*) > 0 FROM otlet.semantic_join_index_current_rows(:'pair_watch', true)),
+  (SELECT count_basis = 'maintained' FROM pair_estimated),
+  (SELECT count_basis = 'exact' FROM pair_exact),
+  otlet.semantic_join_matches(:'pair_watch', 'vendor-1001:vendor-42', '{"match":"same_entity"}'::jsonb),
+  NOT otlet.semantic_join_matches(:'pair_watch', 'vendor-1001:vendor-77', '{"match":"same_entity"}'::jsonb),
+  (
+    SELECT count(*) = 2 AND bool_and(source_dependency_status = 'ready')
+    FROM otlet.watch_status
+    WHERE watch_name IN (:'row_watch', :'pair_watch')
+  ),
+  (SELECT count(*) >= 0 FROM otlet.verify_invariants()),
+  pg_my_temp_schema() = 0
+);
+COMMIT;
+SQL
+)"
+echo "read_only_semantic_contract=$read_only_semantic_contract"
+[ "$read_only_semantic_contract" = "on|t|t|t|t|t|t|t|t|t|t|t|t|t|t" ] || {
+  echo "Expected healthy row and pair semantic reads to remain pure in a read-only transaction, got $read_only_semantic_contract" >&2
+  exit 1
+}
+read_only_shadow_contract="$(psql_exec -qAt \
+  -v row_watch="$numeric_triage_watch" \
+  -v pair_watch="$join_index_name" <<'SQL'
+CREATE DOMAIN pg_temp.text AS pg_catalog.text CHECK (false);
+BEGIN READ ONLY;
+SELECT concat_ws('|',
+  current_setting('transaction_read_only'),
+  pg_my_temp_schema() <> 0,
+  (SELECT count(*) > 0 FROM otlet.semantic_index_current_rows(:'row_watch', true)),
+  (SELECT selected_path = 'semantic_lookup' FROM otlet.semantic_index_plan(:'row_watch', true)),
+  otlet.semantic_matches(:'row_watch', 'numeric-1', '{"decision":"flag"}'::jsonb),
+  EXISTS (
+    SELECT 1
+    FROM public.otlet_demo_numeric_triage source
+    WHERE source.id = 'numeric-1'
+      AND otlet.semantic_matches_auto(:'row_watch', source.id, '{"decision":"flag"}'::jsonb)
+  ),
+  (SELECT count(*) > 0 FROM otlet.semantic_join_index_current_rows(:'pair_watch', true)),
+  (SELECT selected_path = 'semantic_join_lookup' FROM otlet.semantic_join_index_plan(:'pair_watch', true)),
+  otlet.semantic_join_matches(:'pair_watch', 'vendor-1001:vendor-42', '{"match":"same_entity"}'::jsonb),
+  (SELECT count(*) >= 0 FROM otlet.verify_invariants()),
+  pg_my_temp_schema() <> 0
+);
+COMMIT;
+DROP DOMAIN pg_temp.text;
+SQL
+)"
+echo "read_only_shadow_contract=$read_only_shadow_contract"
+[ "$read_only_shadow_contract" = "on|t|t|t|t|t|t|t|t|t|t" ] || {
+  echo "Expected read-only row and pair reads to ignore a pre-existing temporary type shadow, got $read_only_shadow_contract" >&2
+  exit 1
+}
 watch_replace_contract="$(psql_exec -qAt \
   -v row_watch="$numeric_triage_watch" \
   -v pair_watch="$join_index_name" <<'SQL'
@@ -68,7 +151,7 @@ DO $body$
 DECLARE item record;
 BEGIN
   FOR item IN SELECT * FROM watch_round_trip_definitions ORDER BY name LOOP
-    PERFORM otlet.drop_watch(item.name);
+    PERFORM otlet.drop_watch_registry(item.name);
     PERFORM otlet.import_watch(item.definition);
   END LOOP;
 END
@@ -125,7 +208,9 @@ WITH definitions AS (
   UNION ALL SELECT pg_temp.expect_watch_import_error(jsonb_set(row_definition, '{model_artifact_identity,sha256}', to_jsonb(repeat('0', 64))), true, 'model artifact identity does not match') FROM definitions
   UNION ALL SELECT pg_temp.expect_watch_import_error(row_definition || '{"table_name":"public.missing_table"}', true, 'table public.missing_table does not exist') FROM definitions
   UNION ALL SELECT pg_temp.expect_watch_import_error(row_definition || '{"subject_column":"missing_column"}', true, 'subject column missing_column does not exist') FROM definitions
+  UNION ALL SELECT pg_temp.expect_watch_import_error(row_definition || '{"name":"watch_import_missing_column_probe","subject_column":"missing_column"}', false, 'subject column missing_column does not exist') FROM definitions
   UNION ALL SELECT pg_temp.expect_watch_import_error(pair_definition || jsonb_build_object('candidate_query', 'SELECT broken'), true, 'column "broken" does not exist') FROM definitions
+  UNION ALL SELECT pg_temp.expect_watch_import_error(pair_definition || jsonb_build_object('name', 'watch_import_broken_query_probe', 'candidate_query', 'SELECT broken'), false, 'column "broken" does not exist') FROM definitions
   UNION ALL SELECT pg_temp.expect_watch_import_error(row_definition, false, 'already exists') FROM definitions
 )
 SELECT count(*)::text || '|' || bool_and(ok)::text FROM checks;
@@ -133,8 +218,8 @@ ROLLBACK;
 SQL
 )"
 echo "watch_import_failure_contract=$watch_import_failure_contract"
-[ "$watch_import_failure_contract" = "10|true" ] || {
-  echo "Expected ten watch import failures to roll back cleanly, got $watch_import_failure_contract" >&2
+[ "$watch_import_failure_contract" = "12|true" ] || {
+  echo "Expected twelve watch import failures to roll back cleanly, got $watch_import_failure_contract" >&2
   exit 1
 }
 
@@ -154,15 +239,86 @@ printf '%s\n' "$join_customscan_plan"
 require_contains "$join_customscan_plan" "Otlet Node: Semantic Source CustomScan" "Expected join CustomScan explain details"
 require_contains "$join_customscan_plan" "Semantic Index Kind: join" "Expected join CustomScan index kind"
 require_contains "$join_customscan_plan" "Planner Selected Path: semantic_join_lookup" "Expected join CustomScan lookup path"
-require_contains "$join_customscan_plan" "Count Basis: estimated" "Expected join CustomScan estimated count basis"
+require_contains "$join_customscan_plan" "Count Basis: maintained" "Expected join CustomScan maintained count basis"
 require_contains "$join_customscan_plan" "Model Cost Source:" "Expected join CustomScan model cost source"
+require_contains "$join_customscan_plan" "Estimated Preload Rows: 4" "Expected four estimated join preload rows"
+require_regex "$join_customscan_plan" 'Estimated Preload Bytes: [1-9][0-9]*' "Expected an estimated join preload byte count"
+require_regex "$join_customscan_plan" 'Estimated Preload Elapsed Ms: [1-9][0-9]*' "Expected an estimated join preload time"
+require_contains "$join_customscan_plan" "Actual Preload Rows: 4" "Expected four actual join preload rows"
+require_regex "$join_customscan_plan" 'Actual Preload Bytes: [1-9][0-9]*' "Expected an actual join preload byte count"
+require_regex "$join_customscan_plan" 'Actual Preload Elapsed Ms: [0-9]+' "Expected an actual join preload time"
 require_contains "$join_customscan_plan" "Preloaded Fresh Subjects / Basis: 4" "Expected join CustomScan preload count and basis"
+require_contains "$join_customscan_plan" "Preloaded Predicate Matches:" "Expected join CustomScan predicate match preload count"
+require_contains "$join_customscan_plan" "Preloaded Predicate Non Matches:" "Expected join CustomScan predicate non-match preload count"
 require_contains "$join_customscan_plan" "Emitted Freshness Basis:" "Expected join CustomScan emitted freshness basis breakdown"
 require_contains "$join_customscan_plan" "Actual Fresh Subjects: 4" "Expected join CustomScan fresh count"
+require_contains "$join_customscan_plan" "Actual Predicate Matches:" "Expected join CustomScan predicate match count"
+require_contains "$join_customscan_plan" "Actual Predicate Non Matches:" "Expected join CustomScan predicate non-match count"
 require_contains "$join_customscan_plan" "Actual Stale Subjects: 0" "Expected join CustomScan stale count"
 require_contains "$join_customscan_plan" "Actual Lookup Rows: 4" "Expected join CustomScan lookup rows"
 require_contains "$join_customscan_plan" "Infer Now Batches: 0" "Expected join CustomScan zero infer-now"
 require_contains "$join_customscan_plan" "Child Plan Source Rows: 4" "Expected join CustomScan child rows"
+
+join_preload_growth_before="$(psql_exec -qAt -v task_name="$join_task" <<'SQL'
+SELECT concat_ws('|',
+  (SELECT count(*) FROM public.otlet_demo_vendor_pair),
+  (SELECT count(*) FROM otlet.jobs WHERE task_name = :'task_name'),
+  (SELECT count(*) FROM otlet.inference_receipts receipt
+   JOIN otlet.jobs job ON job.id = receipt.job_id
+   WHERE job.task_name = :'task_name'),
+  (SELECT count(*) FROM otlet.semantic_materializations WHERE task_name = :'task_name')
+);
+SQL
+)"
+join_preload_growth_contract="$(psql_exec -qAt -v ON_ERROR_STOP=0 \
+  -v index_name="$join_index_name" 2>&1 <<'SQL'
+BEGIN;
+SET LOCAL plan_cache_mode = force_generic_plan;
+UPDATE otlet.production_policy
+SET customscan_preload_max_rows = 4,
+    semantic_auto_wait_ms = 0,
+    semantic_auto_infer_ms = 0,
+    semantic_auto_max_rows = 0,
+    stale_policy = 'refresh_then_fail_closed'
+WHERE name = 'default';
+PREPARE join_preload_growth AS
+SELECT subject_id
+FROM (
+  SELECT subject_id
+  FROM public.otlet_demo_vendor_pair_input
+  OFFSET 0
+) pair_subjects
+WHERE otlet.semantic_join_matches_auto(
+  :'index_name', subject_id, '{"match":"same_entity"}'::jsonb
+);
+EXPLAIN (VERBOSE, COSTS OFF) EXECUTE join_preload_growth;
+INSERT INTO public.otlet_demo_vendor_pair (pair_id, left_id, right_id)
+VALUES ('vendor-42:vendor-77', 'vendor-42', 'vendor-77');
+EXECUTE join_preload_growth;
+ROLLBACK;
+SQL
+)"
+require_contains "$join_preload_growth_contract" \
+  "Otlet Semantic Source CustomScan" \
+  "Expected the cached join fixture to establish a CustomScan"
+require_contains "$join_preload_growth_contract" \
+  "preload hard cap exceeded: dimension=rows actual=5 limit=4" \
+  "Expected a new missing join subject to hit the retained-state cap"
+join_preload_growth_after="$(psql_exec -qAt -v task_name="$join_task" <<'SQL'
+SELECT concat_ws('|',
+  (SELECT count(*) FROM public.otlet_demo_vendor_pair),
+  (SELECT count(*) FROM otlet.jobs WHERE task_name = :'task_name'),
+  (SELECT count(*) FROM otlet.inference_receipts receipt
+   JOIN otlet.jobs job ON job.id = receipt.job_id
+   WHERE job.task_name = :'task_name'),
+  (SELECT count(*) FROM otlet.semantic_materializations WHERE task_name = :'task_name')
+);
+SQL
+)"
+[ "$join_preload_growth_after" = "$join_preload_growth_before" ] || {
+  echo "Join preload cap changed pair or semantic evidence state: $join_preload_growth_before -> $join_preload_growth_after" >&2
+  exit 1
+}
 
 join_current_row_contract="$(psql_exec -qAt -v index_name="$join_index_name" <<'SQL'
 SELECT count(*)::text

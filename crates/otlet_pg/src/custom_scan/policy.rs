@@ -10,7 +10,9 @@ const fn refresh_policy_from_parts(
     wait_ms: u32,
     infer_ms: u32,
 ) -> &'static str {
-    if auto_policy {
+    if !allow_refresh && wait_ms == 0 && infer_ms == 0 {
+        "fail_closed_no_refresh"
+    } else if auto_policy {
         "auto_lookup_wait_infer_refresh_fail_closed"
     } else if allow_refresh {
         "queue_refresh_and_fail_closed"
@@ -29,7 +31,9 @@ const fn worker_handoff_from_parts(
     wait_ms: u32,
     infer_ms: u32,
 ) -> &'static str {
-    if auto_policy {
+    if !allow_refresh && wait_ms == 0 && infer_ms == 0 {
+        "none_for_fail_closed_lookup"
+    } else if auto_policy {
         "auto_resident_worker_wait_infer_or_commit_latch"
     } else if infer_ms > 0 {
         "shared_memory_immediate_latch_resident_worker_infer_now"
@@ -75,6 +79,7 @@ fn freeze_infer_now_executor_context_json(runtime: &RuntimeState) -> String {
         ),
         "semantic_index_kind": runtime.index_kind.as_str(),
         "semantic_index_name": runtime.index_name,
+        "workload_revision_hash": runtime.workload_revision_hash,
     })
     .to_string()
 }

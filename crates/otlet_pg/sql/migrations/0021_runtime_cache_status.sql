@@ -70,6 +70,7 @@ stage_totals AS (
       + COALESCE(a.materialize_ms, 0) AS accounted_worker_ms
   FROM otlet.jobs j
   LEFT JOIN attempt_timing a ON a.job_id = j.id
+  WHERE j.execution_mode = 'production'
 )
 SELECT
   s.*,
@@ -94,9 +95,9 @@ FROM stage_totals s;
 CREATE VIEW otlet.task_inference_cache_status AS
 WITH receipt_cache AS MATERIALIZED (
   SELECT
-    task_name,
-    id AS receipt_id,
-    selection_status,
+    r.task_name,
+    r.id AS receipt_id,
+    r.selection_status,
     COALESCE(trace.summary ->> 'inference_cache_hit', 'false')::boolean AS inference_cache_hit,
     COALESCE(
       trace.summary #>> '{cache,key_basis}',
@@ -106,7 +107,7 @@ WITH receipt_cache AS MATERIALIZED (
       trace.summary #>> '{cache,invalidation_reason}',
       trace.summary ->> 'inference_cache_invalidation_reason'
     ) AS inference_cache_reason,
-    finished_at AS receipt_finished_at,
+    r.finished_at AS receipt_finished_at,
     (
       COALESCE(
         trace.summary #>> '{cache,invalidation_reason}',
@@ -118,6 +119,9 @@ WITH receipt_cache AS MATERIALIZED (
       ) NOT IN ('disabled', 'disabled_for_generation_trace')
     ) AS cache_enabled
   FROM otlet.inference_receipts r
+  JOIN otlet.jobs job
+    ON job.id = r.job_id
+   AND job.execution_mode = 'production'
   CROSS JOIN LATERAL (
     -- Expand the toasted object once and keep the projection from being pulled up
     SELECT r.trace_summary || '{}'::jsonb AS summary

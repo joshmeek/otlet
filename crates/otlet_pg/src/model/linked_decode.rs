@@ -1,6 +1,7 @@
 fn run_linked(
     job: &Job,
     job_model: JobModelRef<'_>,
+    verified_artifact: VerifiedArtifact,
     prompt: &str,
     prompt_prefix: &str,
     options: &crate::runtime::RuntimeOptions,
@@ -8,18 +9,82 @@ fn run_linked(
 ) -> Result<LinkedRun, ModelError> {
     let attempt_start = Instant::now();
     let attempt_deadline = linked_attempt_deadline(attempt_start, job.max_attempt_ms);
+    let context_budget = model_context_budget(job_model.artifact_identity, options)?;
+    validate_model_context_budget(context_budget)?;
     let cache = LINKED_CACHE.get_or_init(|| Mutex::new(None));
     let mut cache = cache
         .lock()
         .map_err(|_| ModelError::new("linked llama.cpp cache lock poisoned"))?;
-    let load = ensure_linked_model(&mut cache, job_model, options, model_fingerprint_hash)?;
-    let cache_hit = load.cache_hit;
-    let memory_before = load.memory_before;
-    let memory_admission = load.memory_admission;
-
+    let load = ensure_linked_model(
+        &mut cache,
+        job_model,
+        verified_artifact,
+        options,
+        model_fingerprint_hash,
+        context_budget,
+    )?;
+    if linked_cancel_requested(job, "model_load")? {
+        return Err(ModelError::new("canceled"));
+    }
     let cache = cache
         .as_mut()
         .ok_or_else(|| ModelError::new("linked llama.cpp cache did not initialize"))?;
+    let result = run_loaded_linked(
+        job,
+        cache,
+        prompt,
+        prompt_prefix,
+        options,
+        attempt_deadline,
+        &load,
+    );
+    cache.verified_artifact.ensure_unchanged()?;
+    match result {
+        Err(err) if !load.cache_hit => {
+            let worker_memory = process_memory_sample();
+            let request_admission = err
+                .trace_summary
+                .as_ref()
+                .and_then(|trace| trace.get("memory"))
+                .and_then(|memory| memory.get("request_admission"))
+                .cloned();
+            let mut memory_trace = build_memory_trace(
+                &load.memory_before,
+                &worker_memory,
+                &load.memory_admission,
+                options.max_worker_rss_bytes,
+            );
+            if let (Some(request_admission), Value::Object(memory)) =
+                (request_admission, &mut memory_trace)
+            {
+                memory.insert("request_admission".to_owned(), request_admission);
+            }
+            Err(err
+                .with_memory_trace(memory_trace.clone())
+                .with_metrics(linked_residency_metrics(
+                    cache,
+                    false,
+                    &worker_memory,
+                    memory_trace,
+                    options,
+                )))
+        }
+        result => result,
+    }
+}
+
+fn run_loaded_linked(
+    job: &Job,
+    cache: &mut LinkedCache,
+    prompt: &str,
+    prompt_prefix: &str,
+    options: &crate::runtime::RuntimeOptions,
+    attempt_deadline: Option<Instant>,
+    load: &LinkedLoadEvidence,
+) -> Result<LinkedRun, ModelError> {
+    let cache_hit = load.cache_hit;
+    let memory_before = &load.memory_before;
+    let memory_admission = &load.memory_admission;
     let decode_threads = linked_decode_threads(options);
     let batch_threads = linked_batch_threads(options, decode_threads);
     unsafe {
@@ -45,26 +110,82 @@ fn run_linked(
     };
     let tokenize_ms = elapsed_ms(tokenize_start);
     if tokens.is_empty() {
-        return Err(ModelError::new("linked llama.cpp prompt produced no tokens"));
+        return Err(ModelError::new(
+            "linked llama.cpp prompt produced no tokens",
+        ));
     }
 
-    validate_linked_token_budget(tokens.len(), options.max_tokens, cache.context_window_tokens)?;
-
-    if options.max_worker_rss_bytes > 0 {
-        let resident_memory = process_memory_sample();
-        if let Err(err) =
-            enforce_worker_rss_budget(&resident_memory, options.max_worker_rss_bytes)
+    let prefix_reusable = linked_prompt_prefix_reusable(&tokens, &prompt_prefix_tokens);
+    let projected_prompt_prefix_state_bytes = if prefix_reusable {
+        LINKED_PROMPT_PREFIX_STATE_MAX_BYTES
+    } else {
+        0
+    };
+    let request_memory = process_memory_sample();
+    let mut request_admission = RequestMemoryAdmission::new(
+        prompt.len(),
+        tokens.len(),
+        options.max_tokens,
+        projected_prompt_prefix_state_bytes,
+        &request_memory,
+        options.max_worker_rss_bytes,
+    );
+    if let Err(err) = validate_linked_token_budget(
+        tokens.len(),
+        options.max_tokens,
+        i64::from(load.context_budget.effective),
+    ) {
+        request_admission.decision = "rejected";
+        request_admission.reason = match err
+            .trace_summary
+            .as_ref()
+            .and_then(|trace| trace.get("stop_reason"))
+            .and_then(Value::as_str)
         {
-            return Err(err.with_memory_trace(build_memory_trace(
-                &memory_before,
-                &resident_memory,
-                &memory_admission,
+            Some("prompt_exceeds_context_window") => "prompt_exceeds_context_window",
+            Some("prompt_and_generation_exceed_context_window") => {
+                "prompt_and_generation_exceed_context_window"
+            }
+            _ => "context_window_rejected",
+        };
+        return Err(err.with_memory_trace(with_request_memory_admission(
+            build_memory_trace(
+                memory_before,
+                &request_memory,
+                memory_admission,
                 options.max_worker_rss_bytes,
-            )));
-        }
+            ),
+            &request_admission,
+        )));
+    }
+    if request_admission.rejected() {
+        let memory_trace = with_request_memory_admission(
+            build_memory_trace(
+                memory_before,
+                &request_memory,
+                memory_admission,
+                options.max_worker_rss_bytes,
+            ),
+            &request_admission,
+        );
+        return Err(ModelError::clean_failure(
+            format!(
+                "linked request memory admission rejected: reason={} prompt_tokens={} max_generation_tokens={} projected_prompt_bytes={} projected_decode_bytes={} projected_prompt_prefix_state_bytes={}",
+                request_admission.reason,
+                request_admission.prompt_tokens,
+                request_admission.max_generation_tokens,
+                request_admission.projected_prompt_bytes,
+                request_admission.projected_decode_bytes,
+                request_admission.projected_prompt_prefix_state_bytes
+            ),
+            "request_memory_admission_before_decode",
+            "request_memory_admission_rejected",
+        )
+        .with_memory_trace(memory_trace));
     }
 
-    if linked_cancel_requested(job.id)? {
+    let result = (|| -> Result<LinkedRun, ModelError> {
+    if linked_cancel_requested(job, "prompt_decode")? {
         return Err(ModelError::new("canceled"));
     }
     let mut cancel_probe = CancelProbe::new();
@@ -93,7 +214,6 @@ fn run_linked(
     let mut prompt_decoded_tokens = tokens.len();
     let mut prompt_reuse_strategy: &'static str = "full_prompt_decode";
     let mut prompt_prefix_state_bytes = 0_i64;
-    let prefix_reusable = linked_prompt_prefix_reusable(&tokens, &prompt_prefix_tokens);
     if prefix_reusable {
         let prompt_prefix_hash = prompt_prefix_hash
             .as_deref()
@@ -196,7 +316,7 @@ fn run_linked(
         return Err(ModelError::attempt_timeout());
     }
     for _ in 0..options.max_tokens {
-        if cancel_probe.due() && linked_cancel_requested(job.id)? {
+        if cancel_probe.due() && linked_cancel_requested(job, "generation")? {
             return Err(ModelError::new("canceled"));
         }
         let token =
@@ -275,18 +395,24 @@ fn run_linked(
     };
     let worker_memory = process_memory_sample();
     if let Err(err) = enforce_worker_rss_budget(&worker_memory, options.max_worker_rss_bytes) {
-        return Err(err.with_memory_trace(build_memory_trace(
-            &memory_before,
-            &worker_memory,
-            &memory_admission,
-            options.max_worker_rss_bytes,
+        return Err(err.with_memory_trace(with_request_memory_admission(
+            build_memory_trace(
+                memory_before,
+                &worker_memory,
+                memory_admission,
+                options.max_worker_rss_bytes,
+            ),
+            &request_admission,
         )));
     }
-    let memory_trace = build_memory_trace(
-        &memory_before,
-        &worker_memory,
-        &memory_admission,
-        options.max_worker_rss_bytes,
+    let memory_trace = with_request_memory_admission(
+        build_memory_trace(
+            memory_before,
+            &worker_memory,
+            memory_admission,
+            options.max_worker_rss_bytes,
+        ),
+        &request_admission,
     );
     let output = String::from_utf8(output).map_err(|err| {
         ModelError::new(format!(
@@ -299,19 +425,6 @@ fn run_linked(
     Ok(LinkedRun {
         raw_output: output,
         metrics: ModelMetrics {
-            artifact_path: cache.artifact_path.clone(),
-            load_ms: cache.load_ms,
-            ctx_ms: cache.ctx_ms,
-            model_memory_bytes: cache.model_memory_bytes,
-            model_parameters: cache.model_parameters,
-            context_window_tokens: cache.context_window_tokens,
-            model_device_policy: cache.model_device_policy,
-            memory_accounting_policy: cache.memory_accounting_policy,
-            worker_process_rss_bytes: worker_memory.rss_bytes,
-            worker_process_virtual_bytes: worker_memory.virtual_bytes,
-            worker_memory_sample_policy: worker_memory.policy,
-            worker_memory_budget_bytes: u64_to_i64_saturating(options.max_worker_rss_bytes),
-            memory_trace,
             prompt_tokens: usize_to_i64_saturating(tokens.len()),
             prompt_cached_tokens_before: usize_to_i64_saturating(prompt_cached_tokens_before),
             prompt_reused_tokens: usize_to_i64_saturating(prompt_reused_tokens),
@@ -319,33 +432,92 @@ fn run_linked(
             prompt_reuse_strategy,
             prompt_prefix_state_bytes,
             prompt_prefix_cache_entries: usize_to_i64_saturating(cache.prompt_prefix_states.len()),
-            prompt_prefix_cache_bytes: usize_to_i64_saturating(
-                linked_prompt_prefix_cache_bytes(&cache.prompt_prefix_states),
-            ),
+            prompt_prefix_cache_bytes: usize_to_i64_saturating(linked_prompt_prefix_cache_bytes(
+                &cache.prompt_prefix_states,
+            )),
             effective_llama_threads: i64::from(decode_threads),
             effective_llama_batch_threads: i64::from(batch_threads),
             generated_tokens,
-            runtime_prepare_ms: 0,
             tokenize_ms,
             prompt_decode_ms,
             first_token_ms,
             ttft_ms,
             generate_ms,
-            postprocess_ms: 0,
-            cache_hit,
-            inference_cache_hit: false,
-            inference_cache_entries: 0,
-            inference_cache_bytes: 0,
-            inference_cache_max_entries: inference_cache_max_entries(),
-            inference_cache_max_bytes: inference_cache_max_bytes(),
-            inference_cache_evictions: 0,
-            inference_cache_eviction_reason: "none",
-            inference_cache_invalidation_reason: "miss",
             probability_summary: probability_trace.summary(),
             detailed_trace: detailed_trace.summary(stop_reason),
             stop_reason,
+            ..linked_residency_metrics(cache, cache_hit, &worker_memory, memory_trace, options)
         },
     })
+    })();
+    result.map_err(|err| {
+        let worker_memory = process_memory_sample();
+        err.with_memory_trace(with_request_memory_admission(
+            build_memory_trace(
+                memory_before,
+                &worker_memory,
+                memory_admission,
+                options.max_worker_rss_bytes,
+            ),
+            &request_admission,
+        ))
+    })
+}
+
+fn linked_residency_metrics(
+    cache: &LinkedCache,
+    cache_hit: bool,
+    worker_memory: &ProcessMemorySample,
+    memory_trace: Value,
+    options: &crate::runtime::RuntimeOptions,
+) -> ModelMetrics {
+    ModelMetrics {
+        artifact_path: cache.artifact_path.clone(),
+        load_ms: cache.load_ms,
+        ctx_ms: cache.ctx_ms,
+        model_memory_bytes: cache.model_memory_bytes,
+        model_parameters: cache.model_parameters,
+        context_window_tokens: cache.context_window_tokens,
+        model_device_policy: cache.model_device_policy,
+        memory_accounting_policy: cache.memory_accounting_policy,
+        worker_process_rss_bytes: worker_memory.rss_bytes,
+        worker_process_virtual_bytes: worker_memory.virtual_bytes,
+        worker_memory_sample_policy: worker_memory.policy,
+        worker_memory_budget_bytes: u64_to_i64_saturating(options.max_worker_rss_bytes),
+        memory_trace,
+        prompt_tokens: 0,
+        prompt_cached_tokens_before: 0,
+        prompt_reused_tokens: 0,
+        prompt_decoded_tokens: 0,
+        prompt_reuse_strategy: "attempt_failed_after_model_load",
+        prompt_prefix_state_bytes: 0,
+        prompt_prefix_cache_entries: usize_to_i64_saturating(cache.prompt_prefix_states.len()),
+        prompt_prefix_cache_bytes: usize_to_i64_saturating(linked_prompt_prefix_cache_bytes(
+            &cache.prompt_prefix_states,
+        )),
+        effective_llama_threads: 0,
+        effective_llama_batch_threads: 0,
+        generated_tokens: 0,
+        runtime_prepare_ms: 0,
+        tokenize_ms: 0,
+        prompt_decode_ms: 0,
+        first_token_ms: 0,
+        ttft_ms: 0,
+        generate_ms: 0,
+        postprocess_ms: 0,
+        cache_hit,
+        inference_cache_hit: false,
+        inference_cache_entries: 0,
+        inference_cache_bytes: 0,
+        inference_cache_max_entries: inference_cache_max_entries(),
+        inference_cache_max_bytes: inference_cache_max_bytes(),
+        inference_cache_evictions: 0,
+        inference_cache_eviction_reason: "none",
+        inference_cache_invalidation_reason: "miss",
+        probability_summary: probability_unavailable("attempt_failed_after_model_load"),
+        detailed_trace: detailed_trace_unavailable("attempt_failed_after_model_load", options),
+        stop_reason: "attempt_failed_after_model_load",
+    }
 }
 
 fn linked_decode_prompt_tokens(
@@ -372,7 +544,7 @@ fn linked_decode_prompt_tokens(
                 final_logits && decoded_tokens + chunk_index + 1 == tokens.len(),
             )?;
         }
-        if cancel_probe.due() && linked_cancel_requested(job.id)? {
+        if cancel_probe.due() && linked_cancel_requested(job, "prompt_decode")? {
             return Err(ModelError::new("canceled"));
         }
         let decode_status = unsafe { llama_cpp_sys_4::llama_decode(context, batch.value) };
@@ -425,4 +597,3 @@ fn validate_linked_token_budget(
 
     Ok(())
 }
-

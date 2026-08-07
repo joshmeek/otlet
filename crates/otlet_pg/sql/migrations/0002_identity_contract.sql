@@ -4,6 +4,7 @@ CREATE FUNCTION otlet.semantic_canonical_jsonb(
 LANGUAGE sql
 IMMUTABLE
 STRICT
+PARALLEL SAFE
 AS $$
   SELECT CASE jsonb_typeof($1)
     WHEN 'object' THEN COALESCE(
@@ -23,6 +24,78 @@ AS $$
     WHEN 'number' THEN to_jsonb(trim_scale(($1 #>> '{}')::numeric))
     ELSE $1
   END;
+$$;
+
+CREATE FUNCTION otlet.portable_canonical_json_text(input jsonb) RETURNS text
+LANGUAGE sql
+IMMUTABLE
+STRICT
+PARALLEL SAFE
+AS $$
+  SELECT CASE jsonb_typeof(portable_canonical_json_text.input)
+    WHEN 'object' THEN '{' || COALESCE((
+      SELECT string_agg(
+        to_jsonb(entry.key)::text || ':' || otlet.portable_canonical_json_text(entry.value),
+        ',' ORDER BY entry.key COLLATE "C"
+      )
+      FROM jsonb_each(portable_canonical_json_text.input) entry
+    ), '') || '}'
+    WHEN 'array' THEN '[' || COALESCE((
+      SELECT string_agg(
+        otlet.portable_canonical_json_text(item.value),
+        ',' ORDER BY item.ordinality
+      )
+      FROM jsonb_array_elements(portable_canonical_json_text.input)
+        WITH ORDINALITY item(value, ordinality)
+    ), '') || ']'
+    ELSE portable_canonical_json_text.input::text
+  END
+$$;
+
+CREATE FUNCTION otlet.portable_text_hash(input text) RETURNS text
+LANGUAGE sql
+IMMUTABLE
+STRICT
+PARALLEL SAFE
+AS $$
+  SELECT encode(sha256(convert_to(portable_text_hash.input, 'UTF8')), 'hex')
+$$;
+
+CREATE FUNCTION otlet.portable_json_hash(input jsonb) RETURNS text
+LANGUAGE sql
+IMMUTABLE
+STRICT
+PARALLEL SAFE
+AS $$
+  SELECT otlet.portable_text_hash(otlet.portable_canonical_json_text(portable_json_hash.input))
+$$;
+
+CREATE FUNCTION otlet.identity_hash(kind text, value jsonb) RETURNS text
+LANGUAGE plpgsql
+IMMUTABLE
+STRICT
+PARALLEL SAFE
+AS $$
+BEGIN
+  IF identity_hash.kind !~ '^[a-z0-9][a-z0-9_.-]{0,127}$' THEN
+    RAISE EXCEPTION 'otlet identity kind is invalid';
+  END IF;
+
+  RETURN 'otlet:v1:sha256:' || otlet.portable_json_hash(jsonb_build_object(
+    'format', 'otlet.identity.v1',
+    'kind', identity_hash.kind,
+    'value', otlet.semantic_canonical_jsonb(identity_hash.value)
+  ));
+END;
+$$;
+
+CREATE FUNCTION otlet.identity_text_hash(kind text, value text) RETURNS text
+LANGUAGE sql
+IMMUTABLE
+STRICT
+PARALLEL SAFE
+AS $$
+  SELECT otlet.identity_hash(identity_text_hash.kind, to_jsonb(identity_text_hash.value))
 $$;
 
 CREATE FUNCTION otlet.semantic_shaped_input(
@@ -123,8 +196,20 @@ CREATE FUNCTION otlet.semantic_content_hash(
 LANGUAGE sql
 IMMUTABLE
 STRICT
+BEGIN ATOMIC
+  SELECT otlet.identity_hash(
+    'semantic_content',
+    otlet.semantic_shaped_input(input, input_shaping)
+  );
+END;
+
+CREATE FUNCTION otlet.semantic_source_hash(input jsonb) RETURNS text
+LANGUAGE sql
+IMMUTABLE
+STRICT
+PARALLEL SAFE
 AS $$
-  SELECT md5(otlet.semantic_canonical_jsonb(otlet.semantic_shaped_input($1, $2))::text);
+  SELECT otlet.identity_hash('semantic_source', semantic_source_hash.input)
 $$;
 
 CREATE FUNCTION otlet.semantic_project_row(
@@ -133,19 +218,19 @@ CREATE FUNCTION otlet.semantic_project_row(
 ) RETURNS jsonb
 LANGUAGE sql
 IMMUTABLE
-AS $$
+BEGIN ATOMIC
   SELECT CASE
-    WHEN $2 IS NULL THEN COALESCE($1, '{}'::jsonb)
+    WHEN input_columns IS NULL THEN COALESCE(row_data, '{}'::jsonb)
     ELSE COALESCE(
       (
         SELECT jsonb_object_agg(key, value ORDER BY key)
-        FROM jsonb_each(COALESCE($1, '{}'::jsonb))
-        WHERE key = ANY($2)
+        FROM jsonb_each(COALESCE(row_data, '{}'::jsonb))
+        WHERE key = ANY(input_columns)
       ),
       '{}'::jsonb
     )
   END;
-$$;
+END;
 
 CREATE FUNCTION otlet.task_contract_hash(
   instruction text,
@@ -158,14 +243,14 @@ CREATE FUNCTION otlet.task_contract_hash(
 LANGUAGE sql
 IMMUTABLE
 AS $$
-  SELECT md5(jsonb_build_object(
+  SELECT otlet.identity_hash('task_contract', jsonb_build_object(
     'instruction', COALESCE($1, ''),
     'output_schema', COALESCE($2, '{}'::jsonb),
     'model_name', COALESCE($3, ''),
     'runtime_options', COALESCE($4, '{}'::jsonb),
     'input_shaping', COALESCE($5, '{}'::jsonb),
     'decision_contract', COALESCE($6, '{}'::jsonb)
-  )::text);
+  ));
 $$;
 
 -- Truth table for semantic freshness:

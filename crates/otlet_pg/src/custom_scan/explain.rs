@@ -56,8 +56,23 @@ unsafe extern "C-unwind" fn explain_semantic_custom_scan(
                 runtime.planner_fail_closed_decision_rows,
                 es,
             );
+            explain_preload_estimate(
+                runtime.planner_preload_estimated_rows,
+                runtime.planner_preload_estimated_bytes,
+                runtime.planner_preload_estimated_ms,
+                &runtime.planner_preload_estimate_basis,
+                runtime.preload_max_rows,
+                runtime.preload_max_bytes,
+                runtime.preload_max_ms,
+                es,
+            );
             explain_text("Source Relation", &runtime.source_table, es);
             explain_text("Task", &runtime.task_name, es);
+            explain_text(
+                "Workload Revision Hash",
+                &runtime.workload_revision_hash,
+                es,
+            );
             explain_text("Record Type", &runtime.record_type, es);
             explain_counter(
                 "Known Semantic Subjects",
@@ -72,6 +87,16 @@ unsafe extern "C-unwind" fn explain_semantic_custom_scan(
                         .saturating_add(runtime.preloaded_fresh_non_matches),
                     &runtime.preloaded_freshness_basis,
                 ),
+                es,
+            );
+            explain_counter(
+                "Preloaded Predicate Matches",
+                runtime.preloaded_fresh_matches,
+                es,
+            );
+            explain_counter(
+                "Preloaded Predicate Non Matches",
+                runtime.preloaded_fresh_non_matches,
                 es,
             );
             explain_optional_text(
@@ -181,11 +206,34 @@ unsafe extern "C-unwind" fn explain_semantic_custom_scan(
                     planner_stats.fail_closed_decision_rows,
                     es,
                 );
+                explain_preload_estimate(
+                    planner_stats.preload_estimated_rows,
+                    planner_stats.preload_estimated_bytes,
+                    planner_stats.preload_estimated_ms,
+                    &planner_stats.preload_estimate_basis,
+                    planner_stats.preload_max_rows,
+                    planner_stats.preload_max_bytes,
+                    planner_stats.preload_max_ms,
+                    es,
+                );
                 model_ms = planner_stats.model_ms;
                 infer_decision_rows = planner_stats.infer_decision_rows;
             }
+            if !(*es).analyze {
+                explain_text(
+                    "Executor Evidence",
+                    "not collected for plan-only EXPLAIN",
+                    es,
+                );
+                return;
+            }
             explain_pg_cstr("Source Relation", (*state).source_table, es);
             explain_pg_cstr("Task", (*state).task_name, es);
+            explain_text(
+                "Workload Revision Hash",
+                &private.workload_revision_hash,
+                es,
+            );
             explain_pg_cstr("Record Type", (*state).record_type, es);
             explain_counter("Known Semantic Subjects", (*state).known_subjects, es);
             let preloaded_fresh = (*state)
@@ -197,6 +245,16 @@ unsafe extern "C-unwind" fn explain_semantic_custom_scan(
                     preloaded_fresh,
                     pg_cstr_str((*state).preloaded_freshness_basis).unwrap_or(""),
                 ),
+                es,
+            );
+            explain_counter(
+                "Preloaded Predicate Matches",
+                (*state).preloaded_fresh_matches,
+                es,
+            );
+            explain_counter(
+                "Preloaded Predicate Non Matches",
+                (*state).preloaded_fresh_non_matches,
                 es,
             );
             explain_optional_text(
@@ -276,7 +334,44 @@ unsafe fn explain_planner_from_state(
             (*state).planner_fail_closed_decision_rows,
             es,
         );
+        explain_preload_estimate(
+            (*state).planner_preload_estimated_rows,
+            (*state).planner_preload_estimated_bytes,
+            (*state).planner_preload_estimated_ms,
+            pg_cstr_str((*state).planner_preload_estimate_basis).unwrap_or("unavailable"),
+            (*state).preload_max_rows,
+            (*state).preload_max_bytes,
+            (*state).preload_max_ms,
+            es,
+        );
         true
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn explain_preload_estimate(
+    rows: u64,
+    bytes: u64,
+    elapsed_ms: u64,
+    basis: &str,
+    max_rows: u64,
+    max_bytes: u64,
+    max_ms: u64,
+    es: *mut pg_sys::ExplainState,
+) {
+    unsafe {
+        explain_counter("Estimated Preload Rows", rows, es);
+        explain_counter("Estimated Preload Bytes", bytes, es);
+        explain_counter("Estimated Preload Elapsed Ms", elapsed_ms, es);
+        explain_text("Preload Estimate Basis", basis, es);
+        explain_counter("Preload Hard Max Rows", max_rows, es);
+        explain_counter("Preload Hard Max Bytes", max_bytes, es);
+        explain_counter("Preload Hard Max Elapsed Ms", max_ms, es);
+        explain_text(
+            "Preload Byte Accounting",
+            "logical_subject_state_not_heap_or_rss",
+            es,
+        );
     }
 }
 

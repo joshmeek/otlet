@@ -121,38 +121,36 @@ fn nonnegative_count(value: i64) -> u64 {
     value.max(0).cast_unsigned()
 }
 
-#[allow(clippy::too_many_arguments)]
 fn validate_semantic_index_source(
-    index_name: &str,
+    predicate: &SemanticMatchPredicate,
     relid: pg_sys::Oid,
     subject_attno: i16,
-    expected_json: &str,
-    allow_refresh: bool,
-    wait_ms: u32,
-    infer_ms: u32,
-    infer_max_rows: u32,
-    auto_policy: bool,
-) -> Option<SemanticPlannerStats> {
+) -> Option<(SemanticPlannerStats, String)> {
     match pgrx::Spi::connect(|client| {
-        // One SELECT: metadata + plan/current_rows stats (same fail-closed gates).
         let args = [
-            index_name.into(),
+            predicate.index_name.as_str().into(),
             i64::from(relid.to_u32()).into(),
-            expected_json.into(),
         ];
         let table = client
             .select(
                 "WITH meta AS ( \
                    SELECT \
-                     si.source_table, \
-                     si.subject_column \
-                   FROM otlet.semantic_indexes si \
-                   WHERE si.name = $1 AND si.source_table::regclass = $2::oid \
+                     revision.definition #>> '{source,source_table}' AS source_table, \
+                     revision.definition #>> '{source,subject_column}' AS subject_column, \
+                     head.active_workload_revision_hash AS workload_revision_hash \
+                   FROM otlet.workload_revision_heads head \
+                   JOIN otlet.workload_revisions revision \
+                     ON revision.task_name = head.task_name \
+                    AND revision.workload_revision_hash = head.active_workload_revision_hash \
+                   WHERE revision.definition #>> '{source,semantic_index_name}' = $1 \
+                     AND revision.definition #>> '{source,kind}' = 'row' \
+                     AND (revision.definition #>> '{source,source_table}')::pg_catalog.regclass = $2::pg_catalog.oid \
                    LIMIT 1 \
                  ), \
                  plan AS ( \
                    SELECT \
                      total_subjects, \
+                     fresh_subjects, \
                      stale_subjects, \
                      missing_subjects, \
                      inflight_subjects, \
@@ -160,55 +158,58 @@ fn validate_semantic_index_source(
                      model_cost_source, \
                      count_basis, \
                      stale_reasons \
-                   FROM otlet.semantic_index_plan($1, true) \
-                   WHERE EXISTS (SELECT 1 FROM meta) \
-                 ), \
-                 current_rows AS ( \
-                   SELECT subject_id, body, stale \
-                   FROM otlet.semantic_index_current_rows($1, false) \
-                   WHERE EXISTS (SELECT 1 FROM meta) \
+                   FROM meta m \
+                   CROSS JOIN LATERAL otlet.semantic_index_plan( \
+                     $1, false, m.workload_revision_hash \
+                   ) \
                  ) \
                  SELECT \
                    (SELECT source_table FROM meta) AS source_table, \
                    (SELECT subject_column FROM meta) AS subject_column, \
-                   COALESCE((SELECT total_subjects FROM plan), 0)::bigint AS source_rows, \
-                   (SELECT count(*) FROM current_rows WHERE stale = false AND body @> $3::jsonb)::bigint AS fresh_matches, \
-                   (SELECT count(*) FROM current_rows WHERE stale = false AND NOT (body @> $3::jsonb))::bigint AS fresh_non_matches, \
-                   COALESCE((SELECT stale_subjects FROM plan), 0)::bigint AS stale_rows, \
-                   COALESCE((SELECT missing_subjects FROM plan), 0)::bigint AS missing_rows, \
-                   COALESCE((SELECT inflight_subjects FROM plan), 0)::bigint AS inflight_rows, \
-                   0::bigint AS cache_reusable_rows, \
-                   COALESCE((SELECT model_ms FROM plan), 2500)::float8 AS model_ms, \
-                   COALESCE((SELECT model_cost_source FROM plan), 'static_fallback')::text AS model_cost_source, \
-                   COALESCE((SELECT count_basis FROM plan), 'exact')::text AS count_basis, \
-                   COALESCE((SELECT stale_reasons::text FROM plan), '{}'::text) AS stale_reasons",
+                   (SELECT workload_revision_hash FROM meta) AS workload_revision_hash, \
+                   COALESCE((SELECT total_subjects FROM plan), 0)::pg_catalog.int8 AS source_rows, \
+                   COALESCE((SELECT fresh_subjects FROM plan), 0)::pg_catalog.int8 AS fresh_rows, \
+                   COALESCE((SELECT stale_subjects FROM plan), 0)::pg_catalog.int8 AS stale_rows, \
+                   COALESCE((SELECT missing_subjects FROM plan), 0)::pg_catalog.int8 AS missing_rows, \
+                   COALESCE((SELECT inflight_subjects FROM plan), 0)::pg_catalog.int8 AS inflight_rows, \
+                   0::pg_catalog.int8 AS cache_reusable_rows, \
+                   COALESCE((SELECT model_ms FROM plan), 2500)::pg_catalog.float8 AS model_ms, \
+                   COALESCE((SELECT model_cost_source FROM plan), 'static_fallback')::pg_catalog.text AS model_cost_source, \
+                   COALESCE((SELECT count_basis FROM plan), 'maintained_missing')::pg_catalog.text AS count_basis, \
+                   COALESCE((SELECT stale_reasons::pg_catalog.text FROM plan), '{}'::pg_catalog.text) AS stale_reasons",
                 Some(1),
                 &args,
             )
             .map_err(to_string)?;
         if table.is_empty() {
-            return Ok::<Option<SemanticPlannerStats>, String>(None);
+            return Ok::<Option<(SemanticPlannerStats, String)>, String>(None);
         }
         let row = table.first();
         let Some(source_table) = row
             .get_by_name::<String, _>("source_table")
             .map_err(to_string)?
         else {
-            return Ok::<Option<SemanticPlannerStats>, String>(None);
+            return Ok::<Option<(SemanticPlannerStats, String)>, String>(None);
         };
         let Some(subject_column) = row
             .get_by_name::<String, _>("subject_column")
             .map_err(to_string)?
         else {
-            return Ok::<Option<SemanticPlannerStats>, String>(None);
+            return Ok::<Option<(SemanticPlannerStats, String)>, String>(None);
         };
         if source_table.is_empty() || subject_column.is_empty() {
-            return Ok::<Option<SemanticPlannerStats>, String>(None);
+            return Ok::<Option<(SemanticPlannerStats, String)>, String>(None);
         }
+        let Some(workload_revision_hash) = row
+            .get_by_name::<String, _>("workload_revision_hash")
+            .map_err(to_string)?
+        else {
+            return Ok::<Option<(SemanticPlannerStats, String)>, String>(None);
+        };
         let subject_column_cstr = CString::new(subject_column.as_str()).map_err(to_string)?;
         let indexed_attno = unsafe { pg_sys::get_attnum(relid, subject_column_cstr.as_ptr()) };
         if indexed_attno != subject_attno {
-            return Ok::<Option<SemanticPlannerStats>, String>(None);
+            return Ok::<Option<(SemanticPlannerStats, String)>, String>(None);
         }
 
         let mut stats = SemanticPlannerStats {
@@ -218,14 +219,12 @@ fn validate_semantic_index_source(
                 .get_by_name::<i64, _>("source_rows")
                 .map_err(to_string)?
                 .map_or(0, nonnegative_count),
-            fresh_matches: row
-                .get_by_name::<i64, _>("fresh_matches")
+            fresh_rows: row
+                .get_by_name::<i64, _>("fresh_rows")
                 .map_err(to_string)?
                 .map_or(0, nonnegative_count),
-            fresh_non_matches: row
-                .get_by_name::<i64, _>("fresh_non_matches")
-                .map_err(to_string)?
-                .map_or(0, nonnegative_count),
+            fresh_matches: 0,
+            fresh_non_matches: 0,
             stale_rows: row
                 .get_by_name::<i64, _>("stale_rows")
                 .map_err(to_string)?
@@ -261,17 +260,33 @@ fn validate_semantic_index_source(
             count_basis: row
                 .get_by_name::<String, _>("count_basis")
                 .map_err(to_string)?
-                .unwrap_or_else(|| "exact".to_owned()),
+                .unwrap_or_else(|| "maintained_missing".to_owned()),
+            preload_estimated_rows: 0,
+            preload_estimated_bytes: 0,
+            preload_estimated_ms: 0,
+            preload_estimate_basis: String::new(),
+            preload_max_rows: predicate.preload_max_rows,
+            preload_max_bytes: predicate.preload_max_bytes,
+            preload_max_ms: predicate.preload_max_ms,
         };
         finish_planner_stats(
             &mut stats,
-            allow_refresh,
-            wait_ms,
-            infer_ms,
-            infer_max_rows,
-            auto_policy,
+            predicate.allow_refresh,
+            predicate.wait_ms,
+            predicate.infer_ms,
+            predicate.infer_max_rows,
+            predicate.auto_policy,
         );
-        Ok::<Option<SemanticPlannerStats>, String>(Some(stats))
+        apply_preload_estimate(
+            &mut stats,
+            predicate.preload_max_rows,
+            predicate.preload_max_bytes,
+            predicate.preload_max_ms,
+        );
+        Ok::<Option<(SemanticPlannerStats, String)>, String>(Some((
+            stats,
+            workload_revision_hash,
+        )))
     }) {
         Ok(stats) => stats,
         Err(err) => {
@@ -282,27 +297,28 @@ fn validate_semantic_index_source(
 }
 
 fn validate_semantic_join_index_source(
-    index_name: &str,
-    expected_json: &str,
-    allow_refresh: bool,
-    wait_ms: u32,
-    infer_ms: u32,
-    infer_max_rows: u32,
-    auto_policy: bool,
-) -> Option<SemanticPlannerStats> {
+    predicate: &SemanticMatchPredicate,
+) -> Option<(SemanticPlannerStats, String)> {
     match pgrx::Spi::connect(|client| {
-        let stats_args = [index_name.into(), expected_json.into()];
+        let stats_args = [predicate.index_name.as_str().into()];
         let stats_table = client
             .select(
                  "WITH meta AS ( \
-                   SELECT true AS ok \
-                   FROM otlet.semantic_join_indexes sji \
-                   WHERE sji.name = $1 \
+                   SELECT \
+                     true AS ok, \
+                     head.active_workload_revision_hash AS workload_revision_hash \
+                   FROM otlet.workload_revision_heads head \
+                   JOIN otlet.workload_revisions revision \
+                     ON revision.task_name = head.task_name \
+                    AND revision.workload_revision_hash = head.active_workload_revision_hash \
+                   WHERE revision.definition #>> '{source,semantic_join_index_name}' = $1 \
+                     AND revision.definition #>> '{source,kind}' = 'pair' \
                    LIMIT 1 \
                  ), \
                  plan AS ( \
                    SELECT \
                      total_subjects, \
+                     fresh_subjects, \
                      stale_subjects, \
                      missing_subjects, \
                      inflight_subjects, \
@@ -310,33 +326,30 @@ fn validate_semantic_join_index_source(
                      model_cost_source, \
                      count_basis, \
                      stale_reasons \
-                   FROM otlet.semantic_join_index_plan($1) \
-                   WHERE EXISTS (SELECT 1 FROM meta) \
-                 ), \
-                 current_rows AS ( \
-                   SELECT subject_id, body, stale \
-                   FROM otlet.semantic_join_index_current_rows($1, false) \
-                   WHERE EXISTS (SELECT 1 FROM meta) \
+                   FROM meta m \
+                   CROSS JOIN LATERAL otlet.semantic_join_index_plan( \
+                     $1, false, m.workload_revision_hash \
+                   ) \
                  ) \
                  SELECT \
                    (SELECT ok FROM meta) AS meta_ok, \
-                   COALESCE((SELECT total_subjects FROM plan), 0)::bigint AS source_rows, \
-                   (SELECT count(*) FROM current_rows WHERE stale = false AND body @> $2::jsonb)::bigint AS fresh_matches, \
-                   (SELECT count(*) FROM current_rows WHERE stale = false AND NOT (body @> $2::jsonb))::bigint AS fresh_non_matches, \
-                   COALESCE((SELECT stale_subjects FROM plan), 0)::bigint AS stale_rows, \
-                   COALESCE((SELECT missing_subjects FROM plan), 0)::bigint AS missing_rows, \
-                   COALESCE((SELECT inflight_subjects FROM plan), 0)::bigint AS inflight_rows, \
-                   0::bigint AS cache_reusable_rows, \
-                   COALESCE((SELECT model_ms FROM plan), 2500)::float8 AS model_ms, \
-                   COALESCE((SELECT model_cost_source FROM plan), 'static_fallback')::text AS model_cost_source, \
-                   COALESCE((SELECT count_basis FROM plan), 'estimated')::text AS count_basis, \
-                   COALESCE((SELECT stale_reasons::text FROM plan), '{}'::text) AS stale_reasons",
+                   (SELECT workload_revision_hash FROM meta) AS workload_revision_hash, \
+                   COALESCE((SELECT total_subjects FROM plan), 0)::pg_catalog.int8 AS source_rows, \
+                   COALESCE((SELECT fresh_subjects FROM plan), 0)::pg_catalog.int8 AS fresh_rows, \
+                   COALESCE((SELECT stale_subjects FROM plan), 0)::pg_catalog.int8 AS stale_rows, \
+                   COALESCE((SELECT missing_subjects FROM plan), 0)::pg_catalog.int8 AS missing_rows, \
+                   COALESCE((SELECT inflight_subjects FROM plan), 0)::pg_catalog.int8 AS inflight_rows, \
+                   0::pg_catalog.int8 AS cache_reusable_rows, \
+                   COALESCE((SELECT model_ms FROM plan), 2500)::pg_catalog.float8 AS model_ms, \
+                   COALESCE((SELECT model_cost_source FROM plan), 'static_fallback')::pg_catalog.text AS model_cost_source, \
+                   COALESCE((SELECT count_basis FROM plan), 'maintained_missing')::pg_catalog.text AS count_basis, \
+                   COALESCE((SELECT stale_reasons::pg_catalog.text FROM plan), '{}'::pg_catalog.text) AS stale_reasons",
                 Some(1),
                 &stats_args,
             )
             .map_err(to_string)?;
         if stats_table.is_empty() {
-            return Ok::<Option<SemanticPlannerStats>, String>(None);
+            return Ok::<Option<(SemanticPlannerStats, String)>, String>(None);
         }
         let row = stats_table.first();
         if row
@@ -344,8 +357,14 @@ fn validate_semantic_join_index_source(
             .map_err(to_string)?
             .is_none()
         {
-            return Ok::<Option<SemanticPlannerStats>, String>(None);
+            return Ok::<Option<(SemanticPlannerStats, String)>, String>(None);
         }
+        let Some(workload_revision_hash) = row
+            .get_by_name::<String, _>("workload_revision_hash")
+            .map_err(to_string)?
+        else {
+            return Ok::<Option<(SemanticPlannerStats, String)>, String>(None);
+        };
         let mut stats = SemanticPlannerStats {
             selected_path: "semantic_lookup".to_owned(),
             reason: String::new(),
@@ -353,14 +372,12 @@ fn validate_semantic_join_index_source(
                 .get_by_name::<i64, _>("source_rows")
                 .map_err(to_string)?
                 .map_or(0, nonnegative_count),
-            fresh_matches: row
-                .get_by_name::<i64, _>("fresh_matches")
+            fresh_rows: row
+                .get_by_name::<i64, _>("fresh_rows")
                 .map_err(to_string)?
                 .map_or(0, nonnegative_count),
-            fresh_non_matches: row
-                .get_by_name::<i64, _>("fresh_non_matches")
-                .map_err(to_string)?
-                .map_or(0, nonnegative_count),
+            fresh_matches: 0,
+            fresh_non_matches: 0,
             stale_rows: row
                 .get_by_name::<i64, _>("stale_rows")
                 .map_err(to_string)?
@@ -396,21 +413,37 @@ fn validate_semantic_join_index_source(
             count_basis: row
                 .get_by_name::<String, _>("count_basis")
                 .map_err(to_string)?
-                .unwrap_or_else(|| "estimated".to_owned()),
+                .unwrap_or_else(|| "maintained_missing".to_owned()),
+            preload_estimated_rows: 0,
+            preload_estimated_bytes: 0,
+            preload_estimated_ms: 0,
+            preload_estimate_basis: String::new(),
+            preload_max_rows: predicate.preload_max_rows,
+            preload_max_bytes: predicate.preload_max_bytes,
+            preload_max_ms: predicate.preload_max_ms,
         };
         finish_planner_stats(
             &mut stats,
-            allow_refresh,
-            wait_ms,
-            infer_ms,
-            infer_max_rows,
-            auto_policy,
+            predicate.allow_refresh,
+            predicate.wait_ms,
+            predicate.infer_ms,
+            predicate.infer_max_rows,
+            predicate.auto_policy,
+        );
+        apply_preload_estimate(
+            &mut stats,
+            predicate.preload_max_rows,
+            predicate.preload_max_bytes,
+            predicate.preload_max_ms,
         );
         if stats.selected_path == "semantic_lookup" {
             stats.selected_path = "semantic_join_lookup".to_owned();
         }
         stats.reason = format!("semantic join candidate row-source: {}", stats.reason);
-        Ok::<Option<SemanticPlannerStats>, String>(Some(stats))
+        Ok::<Option<(SemanticPlannerStats, String)>, String>(Some((
+            stats,
+            workload_revision_hash,
+        )))
     }) {
         Ok(stats) => stats,
         Err(err) => {

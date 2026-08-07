@@ -1,6 +1,7 @@
 CREATE FUNCTION otlet.current_task_subject_content_hash(
   task_name text,
-  subject_id text
+  subject_id text,
+  workload_revision_hash text DEFAULT NULL
 ) RETURNS text
 LANGUAGE plpgsql
 VOLATILE
@@ -8,46 +9,103 @@ AS $$
 DECLARE
   task_row otlet.tasks%ROWTYPE;
   index_row otlet.semantic_indexes%ROWTYPE;
+  revision_definition jsonb;
+  source_kind text;
+  current_input_query text;
   current_input jsonb;
+  active_revision_hash text;
 BEGIN
-  SELECT t.name, t.input_shaping, t.input_query
-  INTO task_row.name, task_row.input_shaping, task_row.input_query
-  FROM otlet.tasks t
-  WHERE t.name = current_task_subject_content_hash.task_name;
+  IF current_task_subject_content_hash.workload_revision_hash IS NULL THEN
+    SELECT t.name, t.input_shaping, t.input_query, t.source_query_contract
+    INTO task_row.name, task_row.input_shaping, task_row.input_query, task_row.source_query_contract
+    FROM otlet.tasks t
+    WHERE t.name = current_task_subject_content_hash.task_name;
+    revision_definition := otlet.current_workload_revision_definition(
+      current_task_subject_content_hash.task_name
+    );
+  ELSE
+    SELECT revision.definition
+    INTO revision_definition
+    FROM otlet.workload_revisions revision
+    WHERE revision.task_name = current_task_subject_content_hash.task_name
+      AND revision.workload_revision_hash = current_task_subject_content_hash.workload_revision_hash;
 
-  IF NOT FOUND THEN
+    task_row.name := revision_definition #>> '{task,name}';
+    task_row.input_shaping := revision_definition #> '{task,input_shaping}';
+    task_row.input_query := revision_definition #>> '{task,input_query}';
+    source_kind := revision_definition #>> '{source,kind}';
+    IF source_kind = 'row' THEN
+      index_row.subject_column := (revision_definition #>> '{source,subject_column}')::name;
+      index_row.source_table := revision_definition #>> '{source,source_table}';
+      SELECT array_agg(field_name)
+      INTO index_row.input_columns
+      FROM jsonb_array_elements_text(
+        COALESCE(revision_definition #> '{source,input_columns}', '[]'::jsonb)
+      ) field(field_name);
+    ELSIF source_kind = 'pair' THEN
+      task_row.input_query := format(
+        'SELECT subject_id, input FROM otlet.semantic_join_candidate_rows(%L, %L)',
+        revision_definition #>> '{source,semantic_join_index_name}',
+        current_task_subject_content_hash.workload_revision_hash
+      );
+    END IF;
+  END IF;
+
+  IF task_row.name IS NULL THEN
     RETURN NULL;
   END IF;
 
-  SELECT si.subject_column, si.source_table, si.input_columns
-  INTO index_row.subject_column, index_row.source_table, index_row.input_columns
-  FROM otlet.semantic_indexes si
-  WHERE si.task_name = task_row.name;
+  IF current_task_subject_content_hash.workload_revision_hash IS NULL THEN
+    SELECT join_index.name, head.active_workload_revision_hash
+    INTO index_row.name, active_revision_hash
+    FROM otlet.semantic_join_indexes join_index
+    JOIN otlet.workload_revision_heads head ON head.task_name = join_index.task_name
+    WHERE join_index.task_name = task_row.name;
+    IF FOUND THEN
+      source_kind := 'pair';
+      task_row.input_query := format(
+        'SELECT subject_id, input FROM otlet.semantic_join_candidate_rows(%L, %L)',
+        index_row.name,
+        active_revision_hash
+      );
+    END IF;
+  END IF;
 
-  IF FOUND THEN
-    EXECUTE format(
+  IF current_task_subject_content_hash.workload_revision_hash IS NULL
+     AND source_kind IS NULL THEN
+    SELECT si.subject_column, si.source_table, si.input_columns
+    INTO index_row.subject_column, index_row.source_table, index_row.input_columns
+    FROM otlet.semantic_indexes si
+    WHERE si.task_name = task_row.name;
+  END IF;
+
+  IF index_row.source_table IS NOT NULL THEN
+    current_input_query := format(
       $sql$
-        SELECT jsonb_build_object(
-          '_otlet_mvcc', jsonb_build_object(
+        SELECT
+          (src.%1$I)::text AS subject_id,
+          jsonb_build_object(
+            '_otlet_mvcc', jsonb_build_object(
+              'table', %2$L,
+              'subject_id', (src.%1$I)::text,
+              'ctid', src.ctid::text,
+              'xmin', src.xmin::text
+            ),
             'table', %2$L,
-            'subject_id', (src.%1$I)::text,
-            'ctid', src.ctid::text,
-            'xmin', src.xmin::text
-          ),
-          'table', %2$L,
-          'row', otlet.semantic_project_row(to_jsonb(src), %4$L::text[])
-        )
+            'row', otlet.semantic_project_row(to_jsonb(src), %4$L::text[])
+          ) AS input
         FROM %3$s AS src
-        WHERE (src.%1$I)::text = $1
-        LIMIT 1
       $sql$,
       index_row.subject_column,
       index_row.source_table,
       index_row.source_table,
       index_row.input_columns
-    )
-    INTO current_input
-    USING current_task_subject_content_hash.subject_id;
+    );
+    current_input := otlet.task_subject_input(
+      current_input_query,
+      current_task_subject_content_hash.subject_id,
+      revision_definition
+    );
 
     IF current_input IS NULL THEN
       RETURN NULL;
@@ -60,12 +118,11 @@ BEGIN
     RETURN NULL;
   END IF;
 
-  EXECUTE format(
-    'SELECT q.input FROM (%s) AS q WHERE q.subject_id = $1 LIMIT 1',
-    task_row.input_query
-  )
-  INTO current_input
-  USING current_task_subject_content_hash.subject_id;
+  current_input := otlet.task_subject_input(
+    task_row.input_query,
+    current_task_subject_content_hash.subject_id,
+    revision_definition
+  );
 
   IF current_input IS NULL THEN
     RETURN NULL;
@@ -101,6 +158,7 @@ DECLARE
   saved_job otlet.jobs%ROWTYPE;
   task_row otlet.tasks%ROWTYPE;
   model_row otlet.models%ROWTYPE;
+  revision_definition jsonb;
   saved_receipt_id bigint;
   finish_started timestamptz := clock_timestamp();
   request_hash text;
@@ -156,29 +214,20 @@ BEGIN
     RAISE EXCEPTION 'otlet job claim is stale';
   END IF;
 
-  SELECT t.model_name
-  INTO task_row.model_name
-  FROM otlet.tasks t
-  WHERE t.name = saved_job.task_name;
+  SELECT revision.definition
+  INTO revision_definition
+  FROM otlet.workload_revisions revision
+  WHERE revision.workload_revision_hash = saved_job.workload_revision_hash
+    AND revision.task_name = saved_job.task_name;
   IF NOT FOUND THEN
-    RAISE EXCEPTION 'otlet task % does not exist', saved_job.task_name;
+    RAISE EXCEPTION 'otlet job workload revision is missing';
   END IF;
-  SELECT m.name
-  INTO model_row.name
-  FROM otlet.models m
-  WHERE m.name = COALESCE(
+  task_row.model_name := revision_definition #>> '{models,direct,name}';
+  model_row.name := COALESCE(
     fail_job.model_name,
     saved_job.routed_model_name,
     task_row.model_name
   );
-  IF NOT FOUND THEN
-    RAISE EXCEPTION 'otlet model % does not exist',
-      COALESCE(
-        fail_job.model_name,
-        saved_job.routed_model_name,
-        task_row.model_name
-      );
-  END IF;
 
   IF jsonb_typeof(COALESCE(fail_job.trace_summary, '{}'::jsonb)) IS DISTINCT FROM 'object' THEN
     RAISE EXCEPTION 'otlet fail_job trace_summary must be a JSON object';
@@ -293,51 +342,70 @@ DECLARE
   job_row otlet.jobs%ROWTYPE;
   task_row otlet.tasks%ROWTYPE;
   model_row otlet.models%ROWTYPE;
+  revision_definition jsonb;
+  policy_max_attempts integer;
+  inactive_revision boolean;
+  portable_runtime boolean;
   swept bigint := 0;
   canceled_swept bigint := 0;
 BEGIN
+  SELECT p.max_attempts
+  INTO policy_max_attempts
+  FROM otlet.production_policy p
+  WHERE p.name = 'default';
+
   FOR job_row IN
     SELECT j.*
     FROM otlet.jobs j
-    CROSS JOIN otlet.production_policy p
-    WHERE p.name = 'default'
-      AND j.status = 'running'
+    WHERE j.status = 'running'
       AND (j.leased_until IS NULL OR j.leased_until < now())
-      AND j.attempts >= p.max_attempts
+      AND (
+        j.attempts >= policy_max_attempts
+        OR (
+          j.execution_mode = 'production'
+          AND NOT EXISTS (
+            SELECT 1
+            FROM otlet.workload_revision_heads head
+            WHERE head.task_name = j.task_name
+              AND head.active_workload_revision_hash = j.workload_revision_hash
+          )
+        )
+      )
     ORDER BY j.id
     FOR UPDATE OF j
   LOOP
-    SELECT COALESCE(job_row.routed_model_name, t.model_name)
-    INTO task_row.model_name
-    FROM otlet.tasks t
-    WHERE t.name = job_row.task_name;
-    IF NOT FOUND THEN
-      -- Unclaimable orphan: terminalize without receipt/slot noise.
-      UPDATE otlet.jobs
-      SET status = 'failed',
-          leased_until = NULL,
-          claim_token = NULL,
-          error = 'orphan job: missing task',
-          finished_at = now()
-      WHERE id = job_row.id;
-      swept := swept + 1;
+    SELECT job_row.execution_mode = 'production'
+      AND NOT EXISTS (
+        SELECT 1
+        FROM otlet.workload_revision_heads head
+        WHERE head.task_name = job_row.task_name
+          AND head.active_workload_revision_hash = job_row.workload_revision_hash
+      )
+    INTO inactive_revision;
+    IF NOT inactive_revision AND job_row.attempts < policy_max_attempts THEN
       CONTINUE;
     END IF;
-    SELECT m.name
-    INTO model_row.name
-    FROM otlet.models m
-    WHERE m.name = task_row.model_name;
+
+    SELECT revision.definition
+    INTO revision_definition
+    FROM otlet.workload_revisions revision
+    WHERE revision.workload_revision_hash = job_row.workload_revision_hash;
     IF NOT FOUND THEN
       UPDATE otlet.jobs
       SET status = 'failed',
           leased_until = NULL,
           claim_token = NULL,
-          error = 'orphan job: missing model',
+          error = 'orphan job: missing workload revision',
           finished_at = now()
       WHERE id = job_row.id;
       swept := swept + 1;
       CONTINUE;
     END IF;
+    task_row.model_name := COALESCE(
+      job_row.routed_model_name,
+      revision_definition #>> '{models,direct,name}'
+    );
+    model_row.name := task_row.model_name;
 
     UPDATE otlet.jobs
     SET leased_until = now() + interval '1 minute',
@@ -345,9 +413,20 @@ BEGIN
     WHERE id = job_row.id
     RETURNING * INTO job_row;
 
+    SELECT EXISTS (
+      SELECT 1
+      FROM otlet.portable_claims claim
+      WHERE claim.job_id = job_row.id
+        AND claim.attempt_index = job_row.attempts
+        AND claim.status IN ('claimed', 'renewed')
+    ) INTO portable_runtime;
+
     PERFORM otlet.fail_job(
       job_row.id,
-      'job lease expired after max attempts',
+      CASE
+        WHEN inactive_revision THEN 'job lease expired after workload revision changed'
+        ELSE 'job lease expired after max attempts'
+      END,
       raw_output_hash => otlet.portable_text_hash(''),
       trace_summary => jsonb_build_object('schema_validation_status', 'not_run'),
       schema_validation_status => 'not_run',
@@ -355,66 +434,80 @@ BEGIN
       model_name => model_row.name,
       selection_role => CASE
         WHEN job_row.routed_model_name IS NOT NULL THEN 'strong'
-        WHEN EXISTS (
-          SELECT 1
-          FROM otlet.model_selection_policies selection
-          WHERE selection.task_name = job_row.task_name
-        ) THEN 'cheap'
+        WHEN jsonb_typeof(revision_definition -> 'selection') = 'object' THEN 'cheap'
         ELSE 'direct'
       END,
       selection_status => 'failed',
-      selection_reason => 'job_lease_expired_after_max_attempts',
-      expected_claim_token => job_row.claim_token
+      selection_reason => CASE
+        WHEN inactive_revision THEN 'workload_revision_changed_after_lease_expired'
+        ELSE 'job_lease_expired_after_max_attempts'
+      END,
+      expected_claim_token => job_row.claim_token,
+      runtime_name => CASE
+        WHEN portable_runtime THEN 'portable:control'
+        ELSE 'linked_inproc'
+      END,
+      runtime_endpoint => CASE
+        WHEN portable_runtime THEN 'postgres_rpc'
+        ELSE 'linked'
+      END
     );
 
     swept := swept + 1;
   END LOOP;
 
-  -- Symmetric terminalization for cancel_requested rows that exhausted attempts
-  -- and lost their lease (prevents infinite reclaim under nested SPI failure).
   FOR job_row IN
     SELECT j.*
     FROM otlet.jobs j
-    CROSS JOIN otlet.production_policy p
-    WHERE p.name = 'default'
-      AND j.status = 'cancel_requested'
+    WHERE j.status = 'cancel_requested'
       AND (j.leased_until IS NULL OR j.leased_until < now())
-      AND j.attempts >= p.max_attempts
+      AND (
+        j.attempts >= policy_max_attempts
+        OR (
+          j.execution_mode = 'production'
+          AND NOT EXISTS (
+            SELECT 1
+            FROM otlet.workload_revision_heads head
+            WHERE head.task_name = j.task_name
+              AND head.active_workload_revision_hash = j.workload_revision_hash
+          )
+        )
+      )
     ORDER BY j.id
     FOR UPDATE OF j
   LOOP
-    -- finish_canceled_job fail-closes on missing task/model; terminalize orphans
-    -- without a receipt so one corrupt row cannot abort the whole sweep.
-    SELECT COALESCE(job_row.routed_model_name, t.model_name)
-    INTO task_row.model_name
-    FROM otlet.tasks t
-    WHERE t.name = job_row.task_name;
+    SELECT job_row.execution_mode = 'production'
+      AND NOT EXISTS (
+        SELECT 1
+        FROM otlet.workload_revision_heads head
+        WHERE head.task_name = job_row.task_name
+          AND head.active_workload_revision_hash = job_row.workload_revision_hash
+      )
+    INTO inactive_revision;
+    IF NOT inactive_revision AND job_row.attempts < policy_max_attempts THEN
+      CONTINUE;
+    END IF;
+
+    SELECT revision.definition
+    INTO revision_definition
+    FROM otlet.workload_revisions revision
+    WHERE revision.workload_revision_hash = job_row.workload_revision_hash;
     IF NOT FOUND THEN
       UPDATE otlet.jobs
       SET status = 'canceled',
           leased_until = NULL,
           claim_token = NULL,
-          error = COALESCE(job_row.error, 'orphan job: missing task'),
+          error = COALESCE(job_row.error, 'orphan job: missing workload revision'),
           finished_at = now()
       WHERE id = job_row.id;
       canceled_swept := canceled_swept + 1;
       CONTINUE;
     END IF;
-    SELECT m.name
-    INTO model_row.name
-    FROM otlet.models m
-    WHERE m.name = task_row.model_name;
-    IF NOT FOUND THEN
-      UPDATE otlet.jobs
-      SET status = 'canceled',
-          leased_until = NULL,
-          claim_token = NULL,
-          error = COALESCE(job_row.error, 'orphan job: missing model'),
-          finished_at = now()
-      WHERE id = job_row.id;
-      canceled_swept := canceled_swept + 1;
-      CONTINUE;
-    END IF;
+    task_row.model_name := COALESCE(
+      job_row.routed_model_name,
+      revision_definition #>> '{models,direct,name}'
+    );
+    model_row.name := task_row.model_name;
 
     UPDATE otlet.jobs
     SET leased_until = now() + interval '1 minute',
@@ -422,10 +515,26 @@ BEGIN
     WHERE id = job_row.id
     RETURNING * INTO job_row;
 
+    SELECT EXISTS (
+      SELECT 1
+      FROM otlet.portable_claims claim
+      WHERE claim.job_id = job_row.id
+        AND claim.attempt_index = job_row.attempts
+        AND claim.status IN ('claimed', 'renewed')
+    ) INTO portable_runtime;
+
     PERFORM otlet.finish_canceled_job(
       job_row.id,
       release_runtime => true,
-      expected_claim_token => job_row.claim_token
+      expected_claim_token => job_row.claim_token,
+      runtime_name => CASE
+        WHEN portable_runtime THEN 'portable:control'
+        ELSE 'linked_inproc'
+      END,
+      runtime_endpoint => CASE
+        WHEN portable_runtime THEN 'postgres_rpc'
+        ELSE 'linked'
+      END
     );
     canceled_swept := canceled_swept + 1;
   END LOOP;
@@ -435,7 +544,7 @@ BEGIN
       'expired_job_sweep',
       NULL,
       NULL,
-      'otlet expired running jobs failed after max attempts',
+      'otlet expired running jobs terminalized',
       jsonb_build_object('failed_jobs', swept)
     );
   END IF;
@@ -445,7 +554,7 @@ BEGIN
       'expired_cancel_requested_sweep',
       NULL,
       NULL,
-      'otlet expired cancel_requested jobs finished after max attempts',
+      'otlet expired cancel_requested jobs terminalized',
       jsonb_build_object('canceled_jobs', canceled_swept)
     );
   END IF;

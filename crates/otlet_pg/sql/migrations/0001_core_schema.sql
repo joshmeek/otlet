@@ -21,7 +21,7 @@ CREATE TABLE otlet.production_policy (
   max_receipt_bytes bigint NOT NULL DEFAULT 4194304,
   max_attempts integer NOT NULL DEFAULT 3,
   max_attempt_ms integer NOT NULL DEFAULT 300000,
-  default_runtime_options jsonb NOT NULL DEFAULT '{"max_worker_rss_bytes":8589934592}'::jsonb,
+  default_runtime_options jsonb NOT NULL DEFAULT '{"max_worker_rss_bytes":0}'::jsonb,
   preload_model_name text,
   semantic_auto_wait_ms integer NOT NULL DEFAULT 10000,
   semantic_auto_infer_ms integer NOT NULL DEFAULT 15000,
@@ -90,7 +90,10 @@ CREATE TABLE otlet.models (
     AND NULLIF(artifact_identity ->> 'source', '') IS NOT NULL
     AND NULLIF(artifact_identity ->> 'revision', '') IS NOT NULL
     AND NULLIF(artifact_identity ->> 'quantization', '') IS NOT NULL
+    AND jsonb_typeof(artifact_identity -> 'license') = 'string'
     AND NULLIF(artifact_identity ->> 'license', '') IS NOT NULL
+    AND artifact_identity ->> 'license' = btrim(artifact_identity ->> 'license')
+    AND octet_length(artifact_identity ->> 'license') <= 512
   ),
   max_active_jobs int NOT NULL DEFAULT 1 CHECK (max_active_jobs BETWEEN 1 AND 1024),
   last_used_at timestamptz,
@@ -118,6 +121,12 @@ FOR EACH ROW EXECUTE FUNCTION otlet.reject_decision_rule_preset_update();
 CREATE TABLE otlet.tasks (
   name text PRIMARY KEY CHECK (name ~ '^[a-z0-9][a-z0-9_-]*$'),
   input_query text,
+  source_relations jsonb CHECK (
+    source_relations IS NULL OR jsonb_typeof(source_relations) = 'array'
+  ),
+  source_query_contract jsonb CHECK (
+    source_query_contract IS NULL OR jsonb_typeof(source_query_contract) = 'object'
+  ),
   instruction text NOT NULL,
   output_schema jsonb NOT NULL,
   model_name text NOT NULL REFERENCES otlet.models(name),
@@ -142,6 +151,56 @@ CREATE TABLE otlet.model_selection_policies (
   created_at timestamptz NOT NULL DEFAULT now(),
   updated_at timestamptz NOT NULL DEFAULT now(),
   CHECK (cheap_model_name <> strong_model_name)
+);
+
+CREATE TABLE otlet.workload_revisions (
+  workload_revision_hash text PRIMARY KEY CHECK (
+    workload_revision_hash ~ '^otlet:v1:sha256:[0-9a-f]{64}$'
+  ),
+  task_name text NOT NULL REFERENCES otlet.tasks(name),
+  definition jsonb NOT NULL CHECK (jsonb_typeof(definition) = 'object'),
+  candidate_plan jsonb CHECK (
+    candidate_plan IS NULL OR jsonb_typeof(candidate_plan) = 'array'
+  ),
+  candidate_plan_cost numeric CHECK (
+    candidate_plan_cost IS NULL OR candidate_plan_cost >= 0
+  ),
+  candidate_preflight_at timestamptz,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  CHECK (
+    (
+      definition #>> '{source,kind}' = 'pair'
+      AND candidate_plan IS NOT NULL
+      AND candidate_plan_cost IS NOT NULL
+      AND candidate_preflight_at IS NOT NULL
+    )
+    OR
+    (
+      definition #>> '{source,kind}' IS DISTINCT FROM 'pair'
+      AND candidate_plan IS NULL
+      AND candidate_plan_cost IS NULL
+      AND candidate_preflight_at IS NULL
+    )
+  ),
+  UNIQUE (task_name, workload_revision_hash)
+);
+
+CREATE INDEX workload_revisions_task_created_idx
+ON otlet.workload_revisions (task_name, created_at DESC, workload_revision_hash);
+
+CREATE TABLE otlet.workload_revision_heads (
+  task_name text PRIMARY KEY REFERENCES otlet.tasks(name),
+  active_workload_revision_hash text NOT NULL,
+  previous_workload_revision_hash text,
+  promoted_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+  CHECK (
+    previous_workload_revision_hash IS NULL
+    OR previous_workload_revision_hash <> active_workload_revision_hash
+  ),
+  FOREIGN KEY (task_name, active_workload_revision_hash)
+    REFERENCES otlet.workload_revisions(task_name, workload_revision_hash),
+  FOREIGN KEY (task_name, previous_workload_revision_hash)
+    REFERENCES otlet.workload_revisions(task_name, workload_revision_hash)
 );
 
 CREATE TABLE otlet.runtime_slots (
@@ -185,8 +244,10 @@ CREATE TABLE otlet.runtime_slots (
 CREATE TABLE otlet.jobs (
   id bigserial PRIMARY KEY,
   task_name text NOT NULL REFERENCES otlet.tasks(name),
+  workload_revision_hash text NOT NULL,
   subject_id text NOT NULL,
   input jsonb NOT NULL,
+  execution_mode text NOT NULL DEFAULT 'production',
   routed_model_name text REFERENCES otlet.models(name),
   status text NOT NULL DEFAULT 'queued',
   attempts int NOT NULL DEFAULT 0,
@@ -199,15 +260,21 @@ CREATE TABLE otlet.jobs (
   started_at timestamptz,
   finished_at timestamptz,
   cancel_requested_at timestamptz,
+  CHECK (execution_mode IN ('production', 'evaluation')),
   CHECK (status IN ('queued', 'running', 'complete', 'failed', 'canceled', 'cancel_requested')),
   CHECK ((status IN ('running', 'cancel_requested')) = (claim_token IS NOT NULL)),
   CHECK ((terminal_claim_token IS NULL) = (terminal_request_hash IS NULL)),
-  CHECK (terminal_claim_token IS NULL OR status IN ('complete', 'failed', 'canceled'))
+  CHECK (terminal_claim_token IS NULL OR status IN ('complete', 'failed', 'canceled')),
+  CHECK (terminal_request_hash IS NULL OR terminal_request_hash ~ '^otlet:v1:sha256:[0-9a-f]{64}$'),
+  FOREIGN KEY (task_name, workload_revision_hash)
+    REFERENCES otlet.workload_revisions(task_name, workload_revision_hash),
+  UNIQUE (id, workload_revision_hash)
 );
 
 CREATE UNIQUE INDEX jobs_active_subject_idx
-ON otlet.jobs (task_name, subject_id)
-WHERE status IN ('queued', 'running', 'cancel_requested');
+ON otlet.jobs (task_name, workload_revision_hash, subject_id)
+WHERE execution_mode = 'production'
+  AND status IN ('queued', 'running', 'cancel_requested');
 
 CREATE INDEX jobs_task_status_idx
 ON otlet.jobs (task_name, status);
@@ -226,7 +293,8 @@ WHERE status = 'complete';
 
 CREATE TABLE otlet.inference_receipts (
   id bigserial PRIMARY KEY,
-  job_id bigint NOT NULL REFERENCES otlet.jobs(id),
+  job_id bigint NOT NULL,
+  workload_revision_hash text NOT NULL,
   attempt_index int NOT NULL,
   selection_role text NOT NULL DEFAULT 'direct',
   selection_status text NOT NULL DEFAULT 'accepted',
@@ -267,7 +335,12 @@ CREATE TABLE otlet.inference_receipts (
   CHECK (attempt_index > 0),
   CHECK (selection_role IN ('direct', 'cheap', 'strong')),
   CHECK (selection_status IN ('accepted', 'rejected', 'failed')),
-  CHECK (candidate_output IS NULL OR jsonb_typeof(candidate_output) = 'object')
+  CHECK (candidate_output IS NULL OR jsonb_typeof(candidate_output) = 'object'),
+  CHECK (task_identity_hash IS NULL OR task_identity_hash ~ '^otlet:v1:sha256:[0-9a-f]{64}$'),
+  CHECK (source_identity_hash IS NULL OR source_identity_hash ~ '^otlet:v1:sha256:[0-9a-f]{64}$'),
+  CHECK (model_identity_hash IS NULL OR model_identity_hash ~ '^otlet:v1:sha256:[0-9a-f]{64}$'),
+  FOREIGN KEY (job_id, workload_revision_hash)
+    REFERENCES otlet.jobs(id, workload_revision_hash)
 );
 
 CREATE INDEX inference_receipts_task_model_role_finished_idx

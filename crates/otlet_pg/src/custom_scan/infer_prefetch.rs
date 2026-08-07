@@ -11,13 +11,21 @@ unsafe fn prefetch_infer_now_batch(
     }
 
     let mut rows = Vec::with_capacity(target_infer_count.saturating_mul(2).max(4));
-    if !submit_prefetched_infer_row(runtime, current_subject_id, current_slot, &mut rows)? {
-        runtime.fail_closed_rows = runtime.fail_closed_rows.saturating_add(1);
-        return Ok(());
+    match submit_prefetched_infer_row(runtime, current_subject_id, current_slot, &mut rows) {
+        Ok(true) => {}
+        Ok(false) => {
+            runtime.fail_closed_rows = runtime.fail_closed_rows.saturating_add(1);
+            return Ok(());
+        }
+        Err(err) => {
+            runtime.fail_closed_rows = runtime.fail_closed_rows.saturating_add(1);
+            return Err(err);
+        }
     }
 
     let mut prefetched_infers = 1usize;
     let mut prefetched_source_rows = 1usize;
+    let mut deferred_error = None;
     loop {
         if prefetched_infers >= target_infer_count {
             break;
@@ -44,6 +52,14 @@ unsafe fn prefetch_infer_now_batch(
         let Some(subject_id) = (unsafe { datum_to_text(value, runtime.subject_typid) }) else {
             continue;
         };
+        if !runtime.semantic_states.contains_key(&subject_id) {
+            retain_runtime_semantic_state(
+                runtime,
+                &subject_id,
+                SubjectSemanticState::Missing,
+            )
+            .unwrap_or_else(|err| pgrx::error!("{err}"));
+        }
         let semantic_state = runtime
             .semantic_states
             .get(&subject_id)
@@ -54,7 +70,14 @@ unsafe fn prefetch_infer_now_batch(
                 runtime.fresh_matches = runtime.fresh_matches.saturating_add(1);
                 runtime.lookup_rows = runtime.lookup_rows.saturating_add(1);
                 record_emitted_freshness_basis(runtime, &subject_id);
-                rows.push(PrefetchedRow::Ready(unsafe { copy_slot_buffer(slot)? }));
+                match unsafe { copy_slot_buffer(slot) } {
+                    Ok(tuple) => rows.push(PrefetchedRow::Ready(tuple)),
+                    Err(err) => {
+                        runtime.fail_closed_rows = runtime.fail_closed_rows.saturating_add(1);
+                        deferred_error = Some(err);
+                        break;
+                    }
+                }
             }
             SubjectSemanticState::FreshNonMatch => {
                 runtime.fresh_non_matches = runtime.fresh_non_matches.saturating_add(1);
@@ -66,11 +89,19 @@ unsafe fn prefetch_infer_now_batch(
                 } else {
                     runtime.missing_rows = runtime.missing_rows.saturating_add(1);
                 }
-                if prefetched_infers < target_infer_count
-                    && submit_prefetched_infer_row(runtime, &subject_id, slot, &mut rows)?
-                {
-                    prefetched_infers = prefetched_infers.saturating_add(1);
-                    continue;
+                if prefetched_infers < target_infer_count {
+                    match submit_prefetched_infer_row(runtime, &subject_id, slot, &mut rows) {
+                        Ok(true) => {
+                            prefetched_infers = prefetched_infers.saturating_add(1);
+                            continue;
+                        }
+                        Ok(false) => {}
+                        Err(err) => {
+                            runtime.fail_closed_rows = runtime.fail_closed_rows.saturating_add(1);
+                            deferred_error = Some(err);
+                            break;
+                        }
+                    }
                 }
                 runtime.fail_closed_rows = runtime.fail_closed_rows.saturating_add(1);
             }
@@ -83,7 +114,7 @@ unsafe fn prefetch_infer_now_batch(
 
     crate::infer_now::signal_infer_now_worker();
     resolve_prefetched_rows(runtime, rows);
-    Ok(())
+    deferred_error.map_or(Ok(()), Err)
 }
 
 fn remaining_infer_capacity(runtime: &RuntimeState) -> usize {
@@ -94,7 +125,7 @@ fn remaining_infer_capacity(runtime: &RuntimeState) -> usize {
 }
 
 fn submit_prefetched_infer_row(
-    runtime: &RuntimeState,
+    runtime: &mut RuntimeState,
     subject_id: &str,
     slot: *mut pg_sys::TupleTableSlot,
     rows: &mut Vec<PrefetchedRow>,
@@ -102,24 +133,35 @@ fn submit_prefetched_infer_row(
     if runtime.infer_ms == 0 || runtime.infer_now_batches >= u64::from(runtime.infer_max_rows) {
         return Ok(false);
     }
-    with_semantic_slot_input_bytes(runtime, subject_id, slot, |input_bytes| {
-        let submitted_at = unsafe { pg_sys::GetCurrentTimestamp() };
-        let snapshot_before = crate::infer_now::snapshot();
-        let Some(submitted) =
-            crate::infer_now::submit_infer_now_bytes(&runtime.task_name, subject_id, input_bytes)?
-        else {
+    let buffered_slot = unsafe { copy_slot_buffer(slot)? };
+    let submitted_at = unsafe { pg_sys::GetCurrentTimestamp() };
+    let result = with_semantic_slot_input_bytes(runtime, subject_id, slot, |input_bytes| {
+        crate::infer_now::submit_infer_now_bytes(
+            &runtime.task_name,
+            subject_id,
+            &runtime.workload_revision_hash,
+            input_bytes,
+        )
+    });
+    let submitted = match result {
+        Ok(Some(submitted)) => submitted,
+        Ok(None) => {
+            unsafe { pg_sys::ExecDropSingleTupleTableSlot(buffered_slot) };
             return Ok(false);
-        };
-        let buffered_slot = unsafe { copy_slot_buffer(slot)? };
-        rows.push(PrefetchedRow::Infer(PendingInferNowRow {
-            subject_id: subject_id.to_owned(),
-            slot: buffered_slot,
-            submitted,
-            submitted_at,
-            snapshot_before,
-        }));
-        Ok(true)
-    })
+        }
+        Err(err) => {
+            unsafe { pg_sys::ExecDropSingleTupleTableSlot(buffered_slot) };
+            return Err(err);
+        }
+    };
+    runtime.infer_now_batches = runtime.infer_now_batches.saturating_add(1);
+    rows.push(PrefetchedRow::Infer(PendingInferNowRow {
+        subject_id: subject_id.to_owned(),
+        slot: buffered_slot,
+        submitted,
+        submitted_at,
+    }));
+    Ok(true)
 }
 
 fn resolve_prefetched_rows(runtime: &mut RuntimeState, rows: Vec<PrefetchedRow>) {
@@ -170,7 +212,10 @@ fn wait_for_prefetched_infer_row(
     runtime: &mut RuntimeState,
     pending: &PendingInferNowRow,
 ) -> Result<SemanticResolution, String> {
-    match crate::infer_now::wait_for_submitted_infer_now(&pending.submitted, runtime.infer_ms) {
+    match crate::infer_now::wait_for_submitted_infer_now_detailed(
+        &pending.submitted,
+        runtime.infer_ms,
+    ) {
         Ok(Some(completed)) => {
             finish_infer_now_success(
                 runtime,
@@ -180,37 +225,21 @@ fn wait_for_prefetched_infer_row(
             )
         }
         Ok(None) => {
-            let infer_state_after = crate::infer_now::snapshot();
-            record_infer_now_timeout_deltas(runtime, pending.snapshot_before, infer_state_after);
+            runtime.infer_now_timeouts = runtime.infer_now_timeouts.saturating_add(1);
             runtime.infer_now_ms = runtime
                 .infer_now_ms
                 .saturating_add(wait_elapsed_ms(pending.submitted_at));
             Ok(SemanticResolution::Unresolved)
         }
-        Err(err) => {
-            let infer_state_after = crate::infer_now::snapshot();
-            if infer_state_after.last_job_id > 0
-                && infer_state_after.last_job_id != pending.snapshot_before.last_job_id
-            {
-                record_infer_now_failed_provenance(runtime, infer_state_after.last_job_id)?;
+        Err(failure) => {
+            if failure.job_id > 0 {
+                record_infer_now_failed_provenance(runtime, failure.job_id)?;
             }
             runtime.infer_now_ms = runtime
                 .infer_now_ms
                 .saturating_add(wait_elapsed_ms(pending.submitted_at));
-            Err(err)
+            Err(failure.error)
         }
-    }
-}
-
-const fn record_infer_now_timeout_deltas(
-    runtime: &mut RuntimeState,
-    before: crate::infer_now::InferNowSnapshot,
-    after: crate::infer_now::InferNowSnapshot,
-) {
-    if after.timeouts > before.timeouts {
-        runtime.infer_now_timeouts = runtime
-            .infer_now_timeouts
-            .saturating_add(after.timeouts.saturating_sub(before.timeouts));
     }
 }
 
@@ -274,9 +303,13 @@ fn infer_now_if_allowed(
     }
 
     let start = unsafe { pg_sys::GetCurrentTimestamp() };
-    let infer_state_before = crate::infer_now::snapshot();
     let submitted = match with_semantic_slot_input_bytes(runtime, subject_id, slot, |input_bytes| {
-        crate::infer_now::submit_infer_now_bytes(&runtime.task_name, subject_id, input_bytes)
+        crate::infer_now::submit_infer_now_bytes(
+            &runtime.task_name,
+            subject_id,
+            &runtime.workload_revision_hash,
+            input_bytes,
+        )
     }) {
         Ok(Some(submitted)) => submitted,
         Ok(None) => {
@@ -288,25 +321,25 @@ fn infer_now_if_allowed(
             return Err(err);
         }
     };
+    runtime.infer_now_batches = runtime.infer_now_batches.saturating_add(1);
     crate::infer_now::signal_infer_now_worker();
     let completed =
-        match crate::infer_now::wait_for_submitted_infer_now(&submitted, runtime.infer_ms) {
+        match crate::infer_now::wait_for_submitted_infer_now_detailed(
+            &submitted,
+            runtime.infer_ms,
+        ) {
             Ok(Some(completed)) => completed,
             Ok(None) => {
-                let infer_state_after = crate::infer_now::snapshot();
-                record_infer_now_timeout_deltas(runtime, infer_state_before, infer_state_after);
+                runtime.infer_now_timeouts = runtime.infer_now_timeouts.saturating_add(1);
                 runtime.infer_now_ms = runtime.infer_now_ms.saturating_add(wait_elapsed_ms(start));
                 return Ok(SemanticResolution::Unresolved);
             }
-            Err(err) => {
-                let infer_state_after = crate::infer_now::snapshot();
-                if infer_state_after.last_job_id > 0
-                    && infer_state_after.last_job_id != infer_state_before.last_job_id
-                {
-                    record_infer_now_failed_provenance(runtime, infer_state_after.last_job_id)?;
+            Err(failure) => {
+                if failure.job_id > 0 {
+                    record_infer_now_failed_provenance(runtime, failure.job_id)?;
                 }
                 runtime.infer_now_ms = runtime.infer_now_ms.saturating_add(wait_elapsed_ms(start));
-                return Err(err);
+                return Err(failure.error);
             }
         };
 
@@ -323,7 +356,6 @@ fn finish_infer_now_success(
         runtime.infer_now_ms = runtime.infer_now_ms.saturating_add(wait_elapsed_ms(start));
         return Ok(SemanticResolution::Unresolved);
     }
-    runtime.infer_now_batches += 1;
     // One SPI session: stamp executor context, read provenance, refresh subject.
     let state = with_latest_snapshot(|| {
         finish_infer_now_success_spi(runtime, subject_id, job_id)
@@ -352,6 +384,7 @@ fn finish_infer_now_success_spi(
         let update_args = [
             job_id.into(),
             runtime.infer_now_executor_context_json.as_str().into(),
+            runtime.workload_revision_hash.as_str().into(),
         ];
         client
             .update(INFER_NOW_STAMP_EXECUTOR_CONTEXT_SQL, None, &update_args)
@@ -363,6 +396,7 @@ fn finish_infer_now_success_spi(
                 runtime.expected_json.as_str().into(),
                 runtime.task_name.as_str().into(),
                 runtime.record_type.as_str().into(),
+                runtime.workload_revision_hash.as_str().into(),
             ],
             SemanticIndexKind::Join => vec![
                 job_id.into(),
@@ -370,6 +404,8 @@ fn finish_infer_now_success_spi(
                 subject_id.into(),
                 runtime.expected_json.as_str().into(),
                 runtime.task_name.as_str().into(),
+                runtime.workload_revision_hash.as_str().into(),
+                runtime.record_type.as_str().into(),
             ],
         };
         let fused_table = client
@@ -401,8 +437,6 @@ fn finish_infer_now_success_spi(
     runtime.infer_trace_detailed_status = provenance.detailed_trace_status;
     runtime.infer_trace_detailed_captured_tokens = provenance.detailed_trace_captured_tokens;
     runtime.infer_trace_detailed_top_k = provenance.detailed_trace_top_k;
-    runtime
-        .semantic_states
-        .insert(subject_id.to_owned(), state);
+    retain_runtime_semantic_state(runtime, subject_id, state)?;
     Ok(state)
 }

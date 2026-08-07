@@ -1,5 +1,10 @@
 fn process_direct_job(job: &Job) -> JobProcessResult {
-    if let Some(result) = guard_job_lease(job, job.model_name.as_str(), "direct") {
+    if let Some(result) = guard_job_lease(
+        job,
+        job.model_name.as_str(),
+        "direct",
+        "model_load",
+    ) {
         return result;
     }
     match run_job(job) {
@@ -14,16 +19,15 @@ fn process_direct_job(job: &Job) -> JobProcessResult {
                 let (accepted, _) =
                     accepted_by_direct_decision(&run.output, &job.decision_contract);
                 if !accepted {
-                    result.completed =
-                        reject_direct_attempt(job, run, "direct_rejected_by_decision_contract");
-                    if !result.completed {
-                        result.failure_message =
-                            Some("direct_rejected_by_decision_contract".to_owned());
-                    }
+                    result.failure_message = Some(reject_direct_attempt(
+                        job,
+                        run,
+                        "direct_rejected_by_decision_contract",
+                    ));
                     return result;
                 }
             }
-            let (completed, semantic_materialized) = accept_attempt_with_model(
+            let (completed, semantic_materialized, failure_message) = accept_attempt_with_model(
                 job,
                 job.model_name.as_str(),
                 run,
@@ -32,9 +36,7 @@ fn process_direct_job(job: &Job) -> JobProcessResult {
             );
             result.completed = completed;
             result.semantic_materialized = semantic_materialized;
-            if !result.completed {
-                result.failure_message = Some("complete_job_produced_no_output".to_owned());
-            }
+            result.failure_message = failure_message;
             result
         }
         Err(err) => {
@@ -120,7 +122,7 @@ fn value_string_array_contains(items: &Value, expected: &str) -> bool {
 fn process_selected_job(job: &Job, policy: &ModelSelectionPolicy) -> JobProcessResult {
     // Run cheap model without cloning the full Job; SPI helpers take model_name.
     let cheap_name = policy.cheap.name.as_str();
-    if let Some(result) = guard_job_lease(job, cheap_name, "cheap") {
+    if let Some(result) = guard_job_lease(job, cheap_name, "cheap", "model_load") {
         return result;
     }
     match run_job_with_model(job, &policy.cheap) {
@@ -128,13 +130,11 @@ fn process_selected_job(job: &Job, policy: &ModelSelectionPolicy) -> JobProcessR
             let (accepted, reason) = accepted_by_policy(&run.output, &policy.accept_field_checks);
             if accepted {
                 let mut result = JobProcessResult::from_run(false, &run);
-                let (completed, semantic_materialized) =
+                let (completed, semantic_materialized, failure_message) =
                     accept_attempt_with_model(job, cheap_name, run, "cheap", reason);
                 result.completed = completed;
                 result.semantic_materialized = semantic_materialized;
-                if !result.completed {
-                    result.failure_message = Some("complete_job_produced_no_output".to_owned());
-                }
+                result.failure_message = failure_message;
                 return result;
             }
             let mut result = JobProcessResult::from_run(false, &run);
@@ -186,19 +186,22 @@ fn run_strong_attempt_with_model(
     strong: &crate::job::JobModel,
     reason: &str,
 ) -> JobProcessResult {
-    if let Some(result) = guard_job_lease(job, strong.name.as_str(), "strong") {
+    if let Some(result) = guard_job_lease(
+        job,
+        strong.name.as_str(),
+        "strong",
+        "strong_fallback",
+    ) {
         return result;
     }
     match run_job_with_model(job, strong) {
         Ok(run) => {
             let mut result = JobProcessResult::from_run(false, &run);
-            let (completed, semantic_materialized) =
+            let (completed, semantic_materialized, failure_message) =
                 accept_attempt_with_model(job, strong.name.as_str(), run, "strong", reason);
             result.completed = completed;
             result.semantic_materialized = semantic_materialized;
-            if !result.completed {
-                result.failure_message = Some("complete_job_produced_no_output".to_owned());
-            }
+            result.failure_message = failure_message;
             result
         }
         Err(err) => {
@@ -214,17 +217,33 @@ fn run_strong_attempt_with_model(
     }
 }
 
-fn guard_job_lease(job: &Job, model_name: &str, selection_role: &str) -> Option<JobProcessResult> {
+fn guard_job_lease(
+    job: &Job,
+    model_name: &str,
+    selection_role: &str,
+    cancellation_phase: &str,
+) -> Option<JobProcessResult> {
     match renew_job_lease(job) {
         Ok(false) => None,
         Ok(true) => {
-            let err = ModelError::new("canceled");
+            let err = match linked_cancel_requested(job, cancellation_phase) {
+                Ok(true) => ModelError::new("canceled"),
+                Ok(false) => ModelError::new(
+                    "job cancellation state changed after lease renewal",
+                ),
+                Err(err) => err,
+            };
+            let reason = if err.message == "canceled" {
+                "canceled"
+            } else {
+                "cancellation_observation_failed"
+            };
             Some(fail_attempt_result_with_model(
                 job,
                 model_name,
                 &err,
                 selection_role,
-                "canceled",
+                reason,
             ))
         }
         Err(message) => {

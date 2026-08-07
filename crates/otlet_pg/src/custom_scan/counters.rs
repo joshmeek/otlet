@@ -8,6 +8,9 @@ fn planner_stats_from_loaded_state(
     // custom_private stash; overlay exact preload subject counts for EXPLAIN.
     if let Some(mut stats) = stashed_stats {
         stats.source_rows = loaded_state.subjects.len() as u64;
+        stats.fresh_rows = counts
+            .fresh_matches
+            .saturating_add(counts.fresh_non_matches);
         stats.fresh_matches = counts.fresh_matches;
         stats.fresh_non_matches = counts.fresh_non_matches;
         stats.stale_rows = counts.stale;
@@ -36,6 +39,9 @@ fn planner_stats_from_loaded_state(
         selected_path: "semantic_lookup".to_owned(),
         reason: "derived_from_begin_scan_preload".to_owned(),
         source_rows: loaded_state.subjects.len() as u64,
+        fresh_rows: counts
+            .fresh_matches
+            .saturating_add(counts.fresh_non_matches),
         fresh_matches: counts.fresh_matches,
         fresh_non_matches: counts.fresh_non_matches,
         stale_rows: counts.stale,
@@ -48,12 +54,14 @@ fn planner_stats_from_loaded_state(
         model_cost_source: std::mem::take(&mut loaded_state.model_cost_source),
         path_cost: 1.0,
         stale_reasons: std::mem::take(&mut loaded_state.stale_reasons),
-        // Join SQL plans use estimated candidate coverage; row preload is exact.
-        count_basis: if private.index_kind == SemanticIndexKind::Join {
-            "estimated".to_owned()
-        } else {
-            "exact".to_owned()
-        },
+        count_basis: "executor_exact".to_owned(),
+        preload_estimated_rows: 0,
+        preload_estimated_bytes: 0,
+        preload_estimated_ms: 0,
+        preload_estimate_basis: "unavailable".to_owned(),
+        preload_max_rows: 0,
+        preload_max_bytes: 0,
+        preload_max_ms: 0,
     };
     finish_planner_stats(
         &mut stats,
@@ -137,6 +145,12 @@ unsafe fn snapshot_runtime_counters(
             runtime.infer_trace_detailed_captured_tokens;
         (*state).infer_trace_detailed_top_k = runtime.infer_trace_detailed_top_k;
         (*state).child_plan_rows = runtime.child_plan_rows;
+        (*state).actual_preload_rows = runtime.actual_preload_rows;
+        (*state).actual_preload_bytes = runtime.actual_preload_bytes;
+        (*state).actual_preload_ms = runtime.actual_preload_ms;
+        (*state).preload_max_rows = runtime.preload_max_rows;
+        (*state).preload_max_bytes = runtime.preload_max_bytes;
+        (*state).preload_max_ms = runtime.preload_max_ms;
         (*state).has_child_plan = !runtime.child_plan.is_null() || runtime.owns_child_plan;
         (*state).emitted_freshness_basis =
             pg_cstr(&emitted_freshness_counts_json(&runtime.emitted_freshness_basis));

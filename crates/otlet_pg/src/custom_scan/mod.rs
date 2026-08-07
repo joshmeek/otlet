@@ -2,7 +2,7 @@ use pgrx::{FromDatum, JsonB, direct_function_call, pg_sys};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::cell::RefCell;
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::ffi::{CStr, CString, c_char};
 use std::mem::size_of;
 use std::ptr;
@@ -10,6 +10,10 @@ use std::ptr;
 const CUSTOM_SCAN_NAME: &[u8] = b"Otlet Semantic Source CustomScan\0";
 const CUSTOM_PRIVATE_MARKER: &str = "__otlet_semantic_source_custom_scan_json_v1__";
 const CUSTOM_SCAN_REFRESH_BATCH_SIZE: usize = 64;
+const CUSTOM_SCAN_PRELOAD_ESTIMATED_BYTES_PER_ROW: u64 = 256;
+const CUSTOM_SCAN_PRELOAD_ESTIMATED_ROWS_PER_MS: u64 = 20;
+const CUSTOM_SCAN_PRELOAD_ROW_ACCOUNTED_BYTES: u64 = 128;
+const CUSTOM_SCAN_PRELOAD_FRESHNESS_ACCOUNTED_BYTES: u64 = 64;
 macro_rules! explain_scan_counters {
     ($source:expr, $last_error:expr, $estimated_model_cost_ms:expr, $es:expr) => {{
         let source = $source;
@@ -32,6 +36,12 @@ macro_rules! explain_scan_counters {
             source
                 .fresh_matches
                 .saturating_add(source.fresh_non_matches),
+            $es,
+        );
+        explain_counter("Actual Predicate Matches", source.fresh_matches, $es);
+        explain_counter(
+            "Actual Predicate Non Matches",
+            source.fresh_non_matches,
             $es,
         );
         explain_counter("Actual Stale Subjects", source.stale_rows, $es);
@@ -58,6 +68,9 @@ macro_rules! explain_scan_counters {
             $es,
         );
         explain_counter("Child Plan Source Rows", source.child_plan_rows, $es);
+        explain_counter("Actual Preload Rows", source.actual_preload_rows, $es);
+        explain_counter("Actual Preload Bytes", source.actual_preload_bytes, $es);
+        explain_counter("Actual Preload Elapsed Ms", source.actual_preload_ms, $es);
         explain_counter("Estimated Model Cost Ms", $estimated_model_cost_ms, $es);
         explain_counter("Actual Model Cost Ms", source.infer_trace_generate_ms, $es);
     }};

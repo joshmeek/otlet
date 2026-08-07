@@ -7,6 +7,9 @@ SELECT
   p.max_input_bytes_per_job,
   p.max_queued_input_bytes_per_model,
   p.max_queued_input_bytes_total,
+  p.watch_reconciliation_max_attempts,
+  p.watch_reconciliation_base_delay_ms,
+  p.watch_reconciliation_max_delay_ms,
   p.max_candidate_query_cost,
   p.candidate_query_statement_timeout_ms,
   p.max_raw_output_bytes,
@@ -41,13 +44,27 @@ WHERE p.name = 'default';
 CREATE VIEW otlet.model_queue_status AS
 SELECT
   'linked_inproc'::text AS runtime_name,
-  m.name AS model_name,
+  m.model_name,
   m.max_active_jobs,
+  m.active_claimed_jobs,
+  m.available_active_job_slots,
   p.max_queued_jobs_per_model,
   p.max_queued_input_bytes_per_model,
   p.max_queued_input_bytes_total,
-  count(j.id) FILTER (WHERE j.status = 'queued')::bigint AS queued_jobs,
-  COALESCE(sum(octet_length(j.input::text)) FILTER (WHERE j.status = 'queued'), 0)::bigint AS queued_input_bytes,
+  count(j.id) FILTER (
+    WHERE j.status = 'queued'
+      AND CASE j.execution_mode
+        WHEN 'evaluation' THEN true
+        ELSE j.workload_revision_hash = head.active_workload_revision_hash
+      END
+  )::bigint AS queued_jobs,
+  COALESCE(sum(octet_length(j.input::text)) FILTER (
+    WHERE j.status = 'queued'
+      AND CASE j.execution_mode
+        WHEN 'evaluation' THEN true
+        ELSE j.workload_revision_hash = head.active_workload_revision_hash
+      END
+  ), 0)::bigint AS queued_input_bytes,
   total_queue.queued_input_bytes AS total_queued_input_bytes,
   count(j.id) FILTER (WHERE j.status = 'running')::bigint AS running_jobs,
   count(j.id) FILTER (WHERE j.status = 'cancel_requested')::bigint AS cancel_requested_jobs,
@@ -57,12 +74,24 @@ SELECT
   )::bigint AS expired_running_jobs,
   GREATEST(
     p.max_queued_jobs_per_model::bigint
-      - count(j.id) FILTER (WHERE j.status = 'queued'),
+      - count(j.id) FILTER (
+        WHERE j.status = 'queued'
+          AND CASE j.execution_mode
+            WHEN 'evaluation' THEN true
+            ELSE j.workload_revision_hash = head.active_workload_revision_hash
+          END
+      ),
     0
   ) AS available_queue_slots,
   GREATEST(
     p.max_queued_input_bytes_per_model
-      - COALESCE(sum(octet_length(j.input::text)) FILTER (WHERE j.status = 'queued'), 0),
+      - COALESCE(sum(octet_length(j.input::text)) FILTER (
+        WHERE j.status = 'queued'
+          AND CASE j.execution_mode
+            WHEN 'evaluation' THEN true
+            ELSE j.workload_revision_hash = head.active_workload_revision_hash
+          END
+      ), 0),
     0
   )::bigint AS available_model_queue_input_bytes,
   GREATEST(
@@ -70,25 +99,52 @@ SELECT
     0
   )::bigint AS available_total_queue_input_bytes,
   CASE
-    WHEN count(j.id) FILTER (WHERE j.status = 'queued') >= p.max_queued_jobs_per_model
-      OR COALESCE(sum(octet_length(j.input::text)) FILTER (WHERE j.status = 'queued'), 0) >= p.max_queued_input_bytes_per_model
+    WHEN count(j.id) FILTER (
+      WHERE j.status = 'queued'
+        AND CASE j.execution_mode
+          WHEN 'evaluation' THEN true
+          ELSE j.workload_revision_hash = head.active_workload_revision_hash
+        END
+    ) >= p.max_queued_jobs_per_model
+      OR COALESCE(sum(octet_length(j.input::text)) FILTER (
+        WHERE j.status = 'queued'
+          AND CASE j.execution_mode
+            WHEN 'evaluation' THEN true
+            ELSE j.workload_revision_hash = head.active_workload_revision_hash
+          END
+      ), 0) >= p.max_queued_input_bytes_per_model
       OR total_queue.queued_input_bytes >= p.max_queued_input_bytes_total
     THEN 'queue_full'
     ELSE 'queue_accepting'
   END AS queue_state,
   COALESCE(suppressed.suppressed_events, 0)::bigint AS queue_admission_suppressed_events,
-  suppressed.last_suppressed_at AS queue_admission_last_suppressed_at
-FROM otlet.models m
+  suppressed.last_suppressed_at AS queue_admission_last_suppressed_at,
+  count(j.id) FILTER (
+    WHERE j.status = 'queued'
+      AND j.execution_mode = 'production'
+      AND j.workload_revision_hash IS DISTINCT FROM head.active_workload_revision_hash
+  )::bigint AS suspended_revision_queued_jobs
+FROM otlet.model_claim_capacity m
 CROSS JOIN otlet.production_policy p
-LEFT JOIN otlet.tasks t ON true
+LEFT JOIN otlet.workload_revisions revision ON true
 LEFT JOIN otlet.jobs j
-  ON j.task_name = t.name
- AND COALESCE(j.routed_model_name, t.model_name) = m.name
+  ON j.workload_revision_hash = revision.workload_revision_hash
+ AND COALESCE(
+   j.routed_model_name,
+   revision.definition #>> '{models,direct,name}'
+ ) = m.model_name
  AND j.status IN ('queued', 'running', 'cancel_requested')
+LEFT JOIN otlet.workload_revision_heads head ON head.task_name = j.task_name
 LEFT JOIN LATERAL (
   SELECT COALESCE(sum(octet_length(queued.input::text)), 0)::bigint AS queued_input_bytes
   FROM otlet.jobs queued
+  LEFT JOIN otlet.workload_revision_heads queued_head
+    ON queued_head.task_name = queued.task_name
   WHERE queued.status = 'queued'
+    AND CASE queued.execution_mode
+      WHEN 'evaluation' THEN true
+      ELSE queued_head.active_workload_revision_hash = queued.workload_revision_hash
+    END
 ) total_queue ON true
 LEFT JOIN LATERAL (
   SELECT
@@ -97,12 +153,14 @@ LEFT JOIN LATERAL (
   FROM otlet.worker_events e
   WHERE e.event_type = 'queue_admission_suppressed'
     AND e.detail ? 'model_name'
-    AND e.detail ->> 'model_name' = m.name
+    AND e.detail ->> 'model_name' = m.model_name
 ) suppressed ON true
 WHERE p.name = 'default'
 GROUP BY
-  m.name,
+  m.model_name,
   m.max_active_jobs,
+  m.active_claimed_jobs,
+  m.available_active_job_slots,
   p.max_queued_jobs_per_model,
   p.max_queued_input_bytes_per_model,
   p.max_queued_input_bytes_total,
@@ -118,6 +176,8 @@ SELECT
   COALESCE(q.queued_jobs, 0) AS queued_jobs,
   COALESCE(q.running_jobs, 0) AS running_jobs,
   COALESCE(q.cancel_requested_jobs, 0) AS cancel_requested_jobs,
+  COALESCE(q.active_claimed_jobs, 0) AS active_claimed_jobs,
+  COALESCE(q.available_active_job_slots, m.max_active_jobs) AS available_active_job_slots,
   COALESCE(q.available_queue_slots, 0) AS available_queue_slots,
   COALESCE((last_batch.detail ->> 'job_count')::bigint, 0) AS last_batch_jobs,
   COALESCE((last_batch.detail ->> 'completed_jobs')::bigint, 0) AS last_batch_completed_jobs,
@@ -179,6 +239,8 @@ GROUP BY
   q.queued_jobs,
   q.running_jobs,
   q.cancel_requested_jobs,
+  q.active_claimed_jobs,
+  q.available_active_job_slots,
   q.available_queue_slots,
   last_batch.detail,
   last_batch.created_at,
@@ -219,18 +281,29 @@ LEFT JOIN otlet.model_queue_status cheap_q ON cheap_q.model_name = p.cheap_model
 WHERE policy.name = 'default';
 
 CREATE VIEW otlet.model_selection_status AS
-WITH job_counts AS (
+WITH selection_revisions AS (
+  SELECT DISTINCT j.task_name, j.workload_revision_hash
+  FROM otlet.jobs j
+  JOIN otlet.workload_revisions revision
+    ON revision.workload_revision_hash = j.workload_revision_hash
+  WHERE j.execution_mode = 'production'
+    AND jsonb_typeof(revision.definition -> 'selection') = 'object'
+),
+job_counts AS (
   SELECT
     j.task_name,
+    j.workload_revision_hash,
     count(*)::bigint AS total_jobs,
     count(*) FILTER (WHERE j.status = 'complete')::bigint AS complete_jobs,
     count(*) FILTER (WHERE j.status = 'failed')::bigint AS failed_jobs
   FROM otlet.jobs j
-  GROUP BY j.task_name
+  WHERE j.execution_mode = 'production'
+  GROUP BY j.task_name, j.workload_revision_hash
 ),
 attempt_counts AS (
   SELECT
     r.task_name,
+    r.workload_revision_hash,
     count(*) FILTER (WHERE r.selection_role = 'cheap')::bigint AS cheap_attempts,
     count(*) FILTER (
       WHERE r.selection_role = 'cheap'
@@ -255,10 +328,13 @@ attempt_counts AS (
     )::bigint AS strong_failed,
     count(DISTINCT r.job_id) FILTER (WHERE r.selection_role = 'strong')::bigint AS escalated_jobs
   FROM otlet.inference_receipts r
-  GROUP BY r.task_name
+  JOIN otlet.jobs j ON j.id = r.job_id
+  WHERE j.execution_mode = 'production'
+  GROUP BY r.task_name, r.workload_revision_hash
 )
 SELECT
-  p.task_name,
+  revision.task_name,
+  revision.workload_revision_hash,
   COALESCE(j.total_jobs, 0)::bigint AS total_jobs,
   COALESCE(j.complete_jobs, 0)::bigint AS complete_jobs,
   COALESCE(j.failed_jobs, 0)::bigint AS failed_jobs,
@@ -270,6 +346,10 @@ SELECT
   COALESCE(a.strong_accepted, 0)::bigint AS strong_accepted,
   COALESCE(a.strong_failed, 0)::bigint AS strong_failed,
   COALESCE(a.escalated_jobs, 0)::bigint AS escalated_jobs
-FROM otlet.model_selection_policies p
-LEFT JOIN job_counts j ON j.task_name = p.task_name
-LEFT JOIN attempt_counts a ON a.task_name = p.task_name;
+FROM selection_revisions revision
+LEFT JOIN job_counts j
+  ON j.task_name = revision.task_name
+ AND j.workload_revision_hash = revision.workload_revision_hash
+LEFT JOIN attempt_counts a
+  ON a.task_name = revision.task_name
+ AND a.workload_revision_hash = revision.workload_revision_hash;

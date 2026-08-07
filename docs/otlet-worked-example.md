@@ -6,7 +6,7 @@ Follow one Docker-backed Otlet entity-resolution loop: leave vendor rows in Post
 
 The output blocks are validated with `./scripts/otlet-setup.sh` and `./scripts/otlet-demo.sh`. Job IDs, receipt IDs, hashes, timestamps, token counts, timings, and token rates are representative and vary by machine and cache state
 
-This walkthrough runs as the extension owner because it registers models and tasks, reads raw attempt state, and administers watches. Production auditors use the redacted `otlet.audit_*` views. Reviewers receive `otlet.grant_operator_access(...)` before calling approval, correction, dry-run, or apply functions. See [production-contract.md](production-contract.md) for the exact grants
+This walkthrough runs as the extension owner because it registers models and tasks, reads raw attempt state, and administers watches. Production auditors use the redacted `otlet.audit_*` views. Deployments that delegate review or operations register the matching access-policy capabilities. Reviewers need calibration only when a workload declares a review rubric. See [production-contract.md](production-contract.md) for the exact lifecycle calls and grants
 
 The default storage policy keeps assembled prompts in worker memory and removes raw model text and token text before receipt insertion. The examples inspect hashes, structured output, and numeric trace state
 
@@ -39,7 +39,7 @@ Setup prints:
 postgres_url=postgres://postgres:postgres@127.0.0.1:55432/postgres
 database=postgres
 worker_count=1
-max_worker_rss_bytes=8589934592
+max_worker_rss_bytes=0
 cheap_model_artifact=/var/lib/postgresql/otlet-models/Qwen3-1.7B-Q8_0.gguf
 strong_model_artifact=/var/lib/postgresql/otlet-models/Qwen3.5-4B-Q4_K_M.gguf
 cheap_model_sha256=<64 lowercase hex characters>
@@ -48,7 +48,7 @@ cheap_model_bytes=<positive byte count>
 strong_model_bytes=<positive byte count>
 ```
 
-The setup installs the extension and starts one resident worker. Set `OTLET_DATABASE` to use another database and `OTLET_MAX_WORKER_RSS_BYTES` to override the default 8 GiB worker RSS budget. The demo registers both models, creates its fixtures and tasks, waits for the model work, and checks each contract
+The setup installs the extension and starts one resident worker. Set `OTLET_DATABASE` to use another database. RSS enforcement is off by default; set `OTLET_MAX_WORKER_RSS_BYTES` to a positive byte limit to enable it. The demo registers both models, creates its fixtures and tasks, waits for the model work, and checks each contract
 
 Open `psql` to inspect the completed run:
 
@@ -194,7 +194,7 @@ action_approve_contract=approved|approved|demo approval reason
 action_dry_run_contract=approved|approved|passed
 action_apply_contract=approved|approved|not_applicable|action type has no apply path
 action_reject_contract=rejected|rejected
-source_write_contract=5|fa7672627cd7ab2a22aba2d9d7035815|5|fa7672627cd7ab2a22aba2d9d7035815
+source_write_contract=5|9cec87d344fe2bcd631df2b59afcf2276b55ce8d68c66f7ef6586e11269d55dc|5|9cec87d344fe2bcd631df2b59afcf2276b55ce8d68c66f7ef6586e11269d55dc
 ```
 
 Otlet stores trusted actions. The application still owns merge authority
@@ -208,7 +208,10 @@ bounded_queue_contract=4|1
 bounded_execution_contract=approved|bounded apply|1|DO_NOT_TOUCH_SENTINEL|pending||0|DO_NOT_TOUCH_SENTINEL|1|2|2|0
 action_authority_contract=true|true|true|true|true|true|true|true|true|true
 review_provenance_contract=true|true|true|true|true|true|true|true|true|true|true
-permission_contract=public=0/0/0|auditor=15/3|operator=15/11|definer=18/18|portable=7/7/7|positive=7|denied=61
+action_target_drift_contract=true|true|true|true|true|true|true|true|true|true|true|true|true|true|true|true|true
+administrative_change_ledger_contract=t|t|t|t|t|t|t|t|t|t|t|t|t|t|t|t|t|t|t
+administrative_access_race_contract=t|t
+permission_contract=public=0/0/0|auditor=32/31|operator=32/34|reviewer=3/11|definer=45/45|application=3/3/3|operator_rpc=3/3/3|reviewer_rpc=8/8/8|portable=8/8/8|positive=7|denied=116
 ```
 
 Otlet changes `row-1` once and preserves its protected sentinel. `row-3` stays unchanged. The authority proof rejects a forged destination, recommendation-only policy, unevaluated and adversarial policies, missing approval, and stale source state before proving one bounded mutation
@@ -218,19 +221,19 @@ Otlet changes `row-1` once and preserves its protected sentinel. `row-3` stays u
 After the direct task works, check semantic joins, portable watch definitions, stale rows, receipts, and production status:
 
 ```text
-semantic_join_auto_records=4|4
+semantic_join_auto_records=4|4|true
 semantic_join_auto_materialized=4
 semantic_join_lookup_contract=4|1|3
 semantic_join_match_contract=true|true
 watch_replace_contract=true|true|true|true|true|true|true|true|true|true
 watch_round_trip_contract=true|true|true|true|true
-watch_import_failure_contract=10|true
+watch_import_failure_contract=12|true
 candidate_removed_contract=0|true|candidate_removed|0|0|false|
 candidate_changed_contract=1|true|candidate_changed|0
 semantic_join_stale_contract=4|0|fresh_after_lookup=0|receipts=8|8
 receipt_trace_contract=8|8|8|8
 inference_visibility_status=true|true|true|true|true
-direct_ask_runtime_fingerprint_contract=otlet_runtime_fingerprint_v1|true|true|true|true|true|true|sha256_verified_before_model_load|Q4_K_M|otlet_raw_json_worker_v1|94a220cd6|512|8217751552
+direct_ask_runtime_fingerprint_contract=otlet_runtime_fingerprint_v1|true|true|true|true|true|true|sha256_verified_file_descriptor_load|Q4_K_M|otlet_raw_json_worker_v1|94a220cd6|512|8217751552
 preload_admission_contract=failed|model_load_admission_rejected|rejected|true|true|true|true|0|true|true|true|true
 requester_timeout_contract=canceled|true|canceled|canceled|0|0|true|true|true|1|ready|ready
 redaction_status_contract=redacted|0|0|0|0|0|true

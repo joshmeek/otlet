@@ -1,8 +1,10 @@
 use crate::job::{
-    Job, ModelSelectionPolicy, claim_jobs, insert_infer_now_job, model_selection_policy,
+    InferNowJobAdmission, Job, ModelSelectionPolicy, claim_jobs, insert_infer_now_job,
+    model_selection_policy, replay_watch_reconciliation,
 };
 use crate::model::{
-    ModelError, ModelMetrics, ModelPreload, ModelRun, preload_model, run_job, run_job_with_model,
+    ModelError, ModelMetrics, ModelPreload, ModelRun, linked_cancel_requested,
+    linked_resident_model_name, preload_model, release_linked_model, run_job, run_job_with_model,
 };
 use pgrx::JsonB;
 use pgrx::bgworkers::{BackgroundWorker, SignalWakeFlags};
@@ -19,6 +21,9 @@ const EXPIRED_JOB_SWEEP_INTERVAL: Duration = Duration::from_secs(30);
 /// next probe, claim errors, or after productive drain.
 const SCHEMA_READY_PROBE_INTERVAL: Duration = Duration::from_secs(30);
 
+pub(crate) const DATABASE_TRANSACTION_TIMEOUT_MS: i64 = 10_000;
+pub(crate) const DATABASE_LOCK_TIMEOUT_MS: i64 = 1_000;
+
 #[pgrx::pg_guard]
 #[unsafe(no_mangle)]
 pub extern "C-unwind" fn otlet_worker_main(_arg: pgrx::pg_sys::Datum) {
@@ -29,6 +34,9 @@ pub extern "C-unwind" fn otlet_worker_main(_arg: pgrx::pg_sys::Datum) {
     };
     pgrx::log!("otlet worker connecting database={database}");
     BackgroundWorker::connect_worker_to_spi(Some(&database), None);
+    if let Err(error) = BackgroundWorker::transaction(configure_database_deadlines) {
+        pgrx::error!("otlet worker database deadline setup failed: {error}");
+    }
 
     crate::wake::register_worker_latch();
     pgrx::log!("otlet worker started database={database}");
@@ -41,12 +49,15 @@ pub extern "C-unwind" fn otlet_worker_main(_arg: pgrx::pg_sys::Datum) {
         .checked_sub(SCHEMA_READY_PROBE_INTERVAL)
         .unwrap_or_else(Instant::now);
     let mut schema_probe_due = true;
+    let mut worker_identity_set = false;
     let mut startup_recorded = false;
     let mut startup_probe_due = true;
     let mut last_startup_probe = Instant::now()
         .checked_sub(SCHEMA_READY_PROBE_INTERVAL)
         .unwrap_or_else(Instant::now);
     let mut preload_checked = false;
+    let mut prefer_infer_now = true;
+    let mut infer_now_recovery_due = true;
 
     while BackgroundWorker::wait_latch(Some(recovery_interval)) {
         if schema_probe_due || last_schema_probe.elapsed() >= SCHEMA_READY_PROBE_INTERVAL {
@@ -64,6 +75,53 @@ pub extern "C-unwind" fn otlet_worker_main(_arg: pgrx::pg_sys::Datum) {
                 continue;
             }
             schema_probe_due = false;
+        }
+
+        if !worker_identity_set {
+            match BackgroundWorker::transaction(configure_worker_identity) {
+                Ok(()) => worker_identity_set = true,
+                Err(err) => {
+                    pgrx::warning!("otlet worker identity setup failed: {err}");
+                    schema_probe_due = true;
+                    continue;
+                }
+            }
+        }
+
+        if infer_now_recovery_due {
+            infer_now_recovery_due = false;
+            if let Err(error) = BackgroundWorker::transaction(recover_orphaned_infer_now_jobs) {
+                infer_now_recovery_due = true;
+                pgrx::warning!("otlet infer-now durable recovery failed: {error}");
+            }
+            if !infer_now_recovery_due {
+                for orphaned in crate::infer_now::recover_requests_after_worker_restart() {
+                    let recovered = if orphaned.job_id > 0 {
+                        crate::infer_now::resolve_orphaned_request(orphaned.job_id)
+                    } else {
+                        Ok(false)
+                    };
+                    match recovered {
+                        Ok(true) => crate::infer_now::finish_request(
+                            orphaned.request_id,
+                            orphaned.job_id,
+                            None,
+                        ),
+                        Ok(false) => crate::infer_now::finish_request(
+                            orphaned.request_id,
+                            orphaned.job_id,
+                            Some("infer-now worker restarted before requester delivery"),
+                        ),
+                        Err(error) => {
+                            infer_now_recovery_due = true;
+                            pgrx::warning!("{error}");
+                        }
+                    }
+                }
+            }
+            if infer_now_recovery_due {
+                continue;
+            }
         }
 
         if !startup_recorded
@@ -105,11 +163,6 @@ pub extern "C-unwind" fn otlet_worker_main(_arg: pgrx::pg_sys::Datum) {
             }
         }
 
-        while let Some(request) = crate::infer_now::take_request() {
-            process_infer_now_request(request);
-            schema_probe_due = true;
-        }
-
         if last_expired_sweep.elapsed() >= EXPIRED_JOB_SWEEP_INTERVAL {
             let sweep_result: pgrx::spi::Result<()> = BackgroundWorker::transaction(|| {
                 pgrx::Spi::connect_mut(|client| {
@@ -126,30 +179,55 @@ pub extern "C-unwind" fn otlet_worker_main(_arg: pgrx::pg_sys::Datum) {
 
         let mut drained = 0;
         loop {
+            if prefer_infer_now && let Some(request) = crate::infer_now::take_request() {
+                process_infer_now_request(request);
+                schema_probe_due = true;
+                prefer_infer_now = false;
+                continue;
+            }
+            if let Err(err) = BackgroundWorker::transaction(replay_watch_reconciliation) {
+                pgrx::warning!("otlet watch reconciliation failed: {err}");
+                schema_probe_due = true;
+            }
             let jobs = match BackgroundWorker::transaction(claim_jobs) {
-                Ok(jobs) if jobs.is_empty() => break,
                 Ok(jobs) => jobs,
                 Err(err) => {
                     pgrx::warning!("otlet worker claim failed: {err}");
                     schema_probe_due = true;
+                    prefer_infer_now = true;
                     break;
                 }
             };
 
-            let batch_owned = jobs.first().filter(|_| jobs.len() > 1).map(|job| {
-                let mut task_names = jobs
-                    .iter()
-                    .map(|job| job.task_name.clone())
-                    .collect::<Vec<_>>();
-                task_names.sort_unstable();
-                task_names.dedup();
-                (
-                    job.task_name.clone(),
-                    task_names,
-                    job.model_name.clone(),
-                    i64::try_from(jobs.len()).unwrap_or(i64::MAX),
-                )
-            });
+            if jobs.is_empty() {
+                if let Some(request) = crate::infer_now::take_request() {
+                    process_infer_now_request(request);
+                    schema_probe_due = true;
+                    prefer_infer_now = false;
+                    continue;
+                }
+                break;
+            }
+
+            let batch_owned = jobs
+                .first()
+                .filter(|_| {
+                    jobs.len() > 1 && jobs.iter().all(|job| job.execution_mode == "production")
+                })
+                .map(|job| {
+                    let mut task_names = jobs
+                        .iter()
+                        .map(|job| job.task_name.clone())
+                        .collect::<Vec<_>>();
+                    task_names.sort_unstable();
+                    task_names.dedup();
+                    (
+                        job.task_name.clone(),
+                        task_names,
+                        job.model_name.clone(),
+                        i64::try_from(jobs.len()).unwrap_or(i64::MAX),
+                    )
+                });
 
             let batch_start = Instant::now();
             let batch_result = process_job_batch(jobs);
@@ -170,8 +248,11 @@ pub extern "C-unwind" fn otlet_worker_main(_arg: pgrx::pg_sys::Datum) {
             } else {
                 drained += u64::try_from(batch_result.completed + batch_result.failed).unwrap_or(0);
             }
+            release_requested_resident_model();
+            prefer_infer_now = true;
         }
         crate::wake::record_worker_drain(drained);
+        release_requested_resident_model();
         if drained > 0 {
             // After productive work, reclaim expired leases and re-check schema promptly.
             last_expired_sweep = Instant::now()
@@ -222,21 +303,154 @@ fn startup_runtime_options() -> pgrx::spi::Result<Value> {
     .ok_or(pgrx::spi::SpiError::InvalidPosition)
 }
 
+fn recover_orphaned_infer_now_jobs() -> pgrx::spi::Result<()> {
+    pgrx::Spi::run("SELECT otlet.recover_orphaned_infer_now_jobs(true)")
+}
+
+fn configure_database_deadlines() -> pgrx::spi::Result<()> {
+    let transaction_timeout = format!("{DATABASE_TRANSACTION_TIMEOUT_MS}ms");
+    let lock_timeout = format!("{DATABASE_LOCK_TIMEOUT_MS}ms");
+    pgrx::Spi::connect_mut(|client| {
+        client.select(
+            "SELECT pg_catalog.set_config('transaction_timeout', $1, false), \
+                    pg_catalog.set_config('lock_timeout', $2, false)",
+            Some(1),
+            &[
+                transaction_timeout.as_str().into(),
+                lock_timeout.as_str().into(),
+            ],
+        )?;
+        Ok(())
+    })
+}
+
+fn configure_worker_identity() -> pgrx::spi::Result<()> {
+    pgrx::Spi::connect_mut(|client| {
+        client.update(
+            "SELECT pg_catalog.set_config(\
+               'otlet.worker_identity_hash', \
+               otlet.identity_hash(\
+                 'native_worker_process', \
+                 jsonb_build_object(\
+                   'database', current_database(), \
+                   'postmaster_started_at', pg_postmaster_start_time(), \
+                   'backend_pid', pg_backend_pid(), \
+                   'registered_at', clock_timestamp())), \
+               false)",
+            Some(1),
+            &[],
+        )?;
+        Ok(())
+    })
+}
+
 fn record_worker_started(max_worker_rss_bytes: u64) -> pgrx::spi::Result<()> {
     pgrx::Spi::connect_mut(|client| {
         let max_worker_rss_bytes = i64::try_from(max_worker_rss_bytes).unwrap_or(i64::MAX);
+        clear_runtime_slot_residency(client, None)?;
         client.update(
             "SELECT otlet.record_worker_event(\
                'worker_started', NULL, 'linked_inproc', 'otlet worker connected', \
                jsonb_build_object(\
                  'database', current_database(), \
+                 'backend_pid', pg_backend_pid(), \
                  'role', current_user, \
-                 'default_max_worker_rss_bytes', $1))",
+                 'default_max_worker_rss_bytes', $1, \
+                 'database_transaction_timeout_ms', $2, \
+                 'database_lock_timeout_ms', $3))",
             Some(1),
-            &[max_worker_rss_bytes.into()],
+            &[
+                max_worker_rss_bytes.into(),
+                DATABASE_TRANSACTION_TIMEOUT_MS.into(),
+                DATABASE_LOCK_TIMEOUT_MS.into(),
+            ],
         )?;
         Ok(())
     })
+}
+
+fn clear_runtime_slot_residency(
+    client: &mut pgrx::spi::SpiClient<'_>,
+    resident_model_name: Option<&str>,
+) -> pgrx::spi::Result<()> {
+    client.update(
+        "UPDATE otlet.runtime_slots \
+         SET artifact_path=NULL, status='cold', active_jobs=0, loaded_at=NULL, \
+             model_memory_bytes=0, model_parameters=0, context_window_tokens=0, \
+             model_device_policy=NULL, resident_memory_tracked_bytes=0, \
+             memory_accounting_policy=NULL, worker_process_rss_bytes=0, \
+             worker_process_virtual_bytes=0, worker_memory_sample_policy=NULL \
+         WHERE ($1::text IS NULL OR model_name <> $1) \
+           AND (status='ready' OR artifact_path IS NOT NULL \
+                OR model_memory_bytes > 0 OR resident_memory_tracked_bytes > 0)",
+        None,
+        &[resident_model_name.into()],
+    )?;
+    Ok(())
+}
+
+fn release_requested_resident_model() {
+    let model_name = match linked_resident_model_name() {
+        Ok(Some(model_name)) => model_name,
+        Ok(None) => {
+            let result = BackgroundWorker::transaction(|| {
+                pgrx::Spi::connect_mut(|client| clear_runtime_slot_residency(client, None))
+            });
+            if let Err(error) = result {
+                pgrx::warning!("otlet stale runtime residency cleanup failed: {error}");
+            }
+            return;
+        }
+        Err(error) => {
+            pgrx::warning!("otlet resident model lookup failed: {}", error.message);
+            return;
+        }
+    };
+    let requested = BackgroundWorker::transaction(|| {
+        pgrx::Spi::get_one_with_args::<bool>(
+            "SELECT otlet.model_artifact_release_requested($1)",
+            &[model_name.as_str().into()],
+        )
+    });
+    match requested {
+        Ok(Some(true)) => {}
+        Ok(_) => return,
+        Err(error) => {
+            pgrx::warning!("otlet resident model release check failed: {error}");
+            return;
+        }
+    }
+    match release_linked_model(&model_name) {
+        Ok(true) => {}
+        Ok(false) => {
+            pgrx::warning!("otlet resident model changed before release");
+            return;
+        }
+        Err(error) => {
+            pgrx::warning!("otlet resident model unload failed: {}", error.message);
+            return;
+        }
+    }
+    let acknowledged: pgrx::spi::Result<()> = BackgroundWorker::transaction(|| {
+        pgrx::Spi::connect_mut(|client| {
+            let args = [model_name.as_str().into()];
+            clear_runtime_slot_residency(client, None)?;
+            client.update(
+                "SELECT otlet.record_worker_event(\
+                   'model_unloaded', NULL, 'linked_inproc', 'model artifact released', \
+                   jsonb_build_object('model_name', $1))",
+                Some(1),
+                &args,
+            )?;
+            Ok(())
+        })
+    });
+    match acknowledged {
+        Ok(()) => pgrx::log!("otlet worker unloaded model {model_name}"),
+        Err(error) => {
+            pgrx::warning!("otlet resident model unload acknowledgement failed: {error}")
+        }
+    }
 }
 
 fn record_worker_startup_failure(error: &str) {
@@ -245,7 +459,11 @@ fn record_worker_startup_failure(error: &str) {
             client.update(
                 "SELECT otlet.record_worker_event(\
                    'worker_startup_failed', NULL, 'linked_inproc', 'otlet worker startup preflight failed', \
-                   jsonb_build_object('database', current_database(), 'role', current_user, 'error', $1))",
+                   jsonb_build_object(\
+                     'database', current_database(), \
+                     'backend_pid', pg_backend_pid(), \
+                     'role', current_user, \
+                     'error', $1))",
                 Some(1),
                 &[error.into()],
             )?;
@@ -266,7 +484,7 @@ struct StartupPreload {
 fn startup_preload_config() -> pgrx::spi::Result<Option<StartupPreload>> {
     pgrx::Spi::connect(|client| {
         let rows = client.select(
-            "SELECT p.preload_model_name, m.artifact_path, m.artifact_hash, m.artifact_identity, p.default_runtime_options FROM otlet.production_policy p LEFT JOIN otlet.models m ON m.name = p.preload_model_name WHERE p.name = 'default' AND p.preload_model_name IS NOT NULL LIMIT 1",
+            "SELECT p.preload_model_name, m.artifact_path, m.artifact_hash, m.artifact_identity, p.default_runtime_options FROM otlet.production_policy p JOIN otlet.models m ON m.name = p.preload_model_name WHERE p.name = 'default' AND m.lifecycle_state IN ('active','deprecated') AND otlet.model_artifact_ready(m.name) LIMIT 1",
             Some(1),
             &[],
         )?;
@@ -344,6 +562,7 @@ fn record_model_preload_success(model_name: &str, preload: &ModelPreload) {
                 Some(1),
                 &args,
             )?;
+            clear_runtime_slot_residency(client, Some(model_name))?;
             Ok(())
         })
     });
@@ -399,17 +618,51 @@ fn process_infer_now_request(request: crate::infer_now::InferNowRequest) {
 
     let crate::infer_now::InferNowRequest {
         id,
+        customscan_origin,
         task_name,
         subject_id,
+        expected_workload_revision_hash,
         input_json,
         ..
     } = request;
     let job = match BackgroundWorker::transaction(|| {
-        insert_infer_now_job(&task_name, &subject_id, &input_json)
+        insert_infer_now_job(
+            &task_name,
+            &subject_id,
+            expected_workload_revision_hash.as_deref(),
+            &input_json,
+            if customscan_origin {
+                "customscan"
+            } else {
+                "direct_ask"
+            },
+        )
     }) {
-        Ok(Some(job)) => job,
-        Ok(None) => {
-            crate::infer_now::finish_request(id, 0, Some("infer-now active job already exists"));
+        Ok(InferNowJobAdmission::Inserted(job)) => job,
+        Ok(InferNowJobAdmission::Active) => {
+            crate::infer_now::finish_request(
+                id,
+                0,
+                Some("infer-now active job exists or workload revision changed"),
+            );
+            return;
+        }
+        Ok(InferNowJobAdmission::Capacity) => {
+            crate::infer_now::finish_request(
+                id,
+                0,
+                Some("infer-now task or model active-job capacity exhausted"),
+            );
+            return;
+        }
+        Ok(InferNowJobAdmission::Conflict) => {
+            crate::infer_now::finish_request(
+                id,
+                0,
+                Some(&format!(
+                    "input relation conflicts with active input for subject {subject_id}"
+                )),
+            );
             return;
         }
         Err(err) => {
@@ -423,6 +676,7 @@ fn process_infer_now_request(request: crate::infer_now::InferNowRequest) {
     };
 
     let job_id = job.id;
+    let workload_revision_hash = job.workload_revision_hash.clone();
     // Reuse request-owned strings; insert_infer_now_job stores them verbatim.
     crate::infer_now::mark_request_job_started(id, job_id);
     let mut process_result = process_job(job);
@@ -441,7 +695,8 @@ fn process_infer_now_request(request: crate::infer_now::InferNowRequest) {
     // Skip the follow-up subject materialize when that SPI succeeded; keep the
     // fallback when it failed so infer-now still fail-closes on missing state.
     if !process_result.semantic_materialized
-        && let Err(err) = materialize_infer_now_subject(&task_name, &subject_id)
+        && let Err(err) =
+            materialize_infer_now_subject(&task_name, &subject_id, &workload_revision_hash)
     {
         crate::infer_now::finish_request(
             id,
@@ -465,7 +720,10 @@ fn ensure_inline_task(request: &crate::infer_now::InferNowRequest) -> Result<(),
             // Keeps slot text as `$2::jsonb` — no Rust Value→JsonB round-trip.
             let args = [request.task_name.as_str().into(), inline_task_json.into()];
             let rows = client.select(
-                "WITH src AS ( \
+                "WITH administrative_context AS ( \
+                   SELECT set_config('otlet.administrative_suppress', 'on', true) AS value \
+                 ), \
+                 src AS ( \
                    SELECT COALESCE($2::jsonb, '{}'::jsonb) AS t \
                  ), \
                  model_ok AS ( \
@@ -475,7 +733,8 @@ fn ensure_inline_task(request: &crate::infer_now::InferNowRequest) -> Result<(),
                  ) \
                  SELECT \
                    CASE \
-                     WHEN (SELECT ok FROM model_ok) THEN ( \
+                     WHEN (SELECT ok FROM model_ok) \
+                          AND (SELECT value = 'on' FROM administrative_context) THEN ( \
                        SELECT otlet.create_task( \
                          $1, \
                          NULL::text, \
@@ -531,21 +790,37 @@ fn infer_now_job_error(job_id: i64) -> String {
     }
 }
 
-fn materialize_infer_now_subject(task_name: &str, subject_id: &str) -> pgrx::spi::Result<i64> {
+fn materialize_infer_now_subject(
+    task_name: &str,
+    subject_id: &str,
+    workload_revision_hash: &str,
+) -> pgrx::spi::Result<i64> {
     BackgroundWorker::transaction(|| {
         pgrx::Spi::connect_mut(|client| {
-            let args = [task_name.into(), subject_id.into()];
+            let args = [
+                task_name.into(),
+                subject_id.into(),
+                workload_revision_hash.into(),
+            ];
             // Match materialize_completed_semantic_job: refresh both row and join indexes.
             let rows = client.select(
                 "SELECT COALESCE(sum(refreshed), 0)::bigint AS materialized \
                  FROM ( \
-                   SELECT otlet.materialize_semantic_index_subject(si.name, $2) AS refreshed \
-                   FROM otlet.semantic_indexes si \
-                   WHERE si.task_name = $1 \
+                   SELECT otlet.materialize_semantic_index_subject( \
+                     revision.definition #>> '{source,semantic_index_name}', $2, $3 \
+                   ) AS refreshed \
+                   FROM otlet.workload_revisions revision \
+                   WHERE revision.task_name = $1 \
+                     AND revision.workload_revision_hash = $3 \
+                     AND revision.definition #>> '{source,kind}' = 'row' \
                    UNION ALL \
-                   SELECT otlet.materialize_semantic_join_index_subject(sji.name, $2) AS refreshed \
-                   FROM otlet.semantic_join_indexes sji \
-                   WHERE sji.task_name = $1 \
+                   SELECT otlet.materialize_semantic_join_index_subject( \
+                     revision.definition #>> '{source,semantic_join_index_name}', $2, $3 \
+                   ) AS refreshed \
+                   FROM otlet.workload_revisions revision \
+                   WHERE revision.task_name = $1 \
+                     AND revision.workload_revision_hash = $3 \
+                     AND revision.definition #>> '{source,kind}' = 'pair' \
                  ) m",
                 Some(1),
                 &args,
@@ -558,7 +833,7 @@ fn materialize_infer_now_subject(task_name: &str, subject_id: &str) -> pgrx::spi
 fn otlet_schema_ready() -> pgrx::spi::Result<bool> {
     pgrx::Spi::connect(|client| {
         let rows = client.select(
-            "SELECT to_regprocedure('otlet.claim_jobs(text,integer)') IS NOT NULL AND to_regprocedure('otlet.materialize_completed_semantic_job(bigint)') IS NOT NULL AND to_regprocedure('otlet.complete_and_materialize_job(bigint,jsonb,text,jsonb,text,text,text,text,jsonb,text,text,text,text)') IS NOT NULL",
+            "SELECT to_regprocedure('otlet.claim_jobs(text,integer,jsonb)') IS NOT NULL AND to_regprocedure('otlet.replay_watch_reconciliation(boolean)') IS NOT NULL AND to_regprocedure('otlet.materialize_completed_semantic_job(bigint)') IS NOT NULL AND to_regprocedure('otlet.complete_and_materialize_job(bigint,jsonb,text,jsonb,text,text,text,text,jsonb,text,text,text,text)') IS NOT NULL AND to_regprocedure('otlet.model_artifact_release_requested(text)') IS NOT NULL AND to_regprocedure('otlet.recover_orphaned_infer_now_jobs(boolean)') IS NOT NULL",
             Some(1),
             &[],
         )?;

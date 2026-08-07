@@ -1,5 +1,5 @@
 [ "$requester_timeout_contract" = "canceled|true|canceled|canceled|0|0|true|true|true|1|ready|ready" ] || {
-  echo "Expected requester timeout to leave no late output and one healthy worker, got $requester_timeout_contract" >&2
+  echo "Expected marker-first requester timeout to cancel without output and keep one healthy worker, got $requester_timeout_contract" >&2
   exit 1
 }
 
@@ -67,37 +67,57 @@ rss_budget_contract="$(psql_exec -qAt \
   -v task_name="$rss_budget_task" \
   -v model_name="$strong_model_name" <<'SQL'
 WITH job_row AS (
-  SELECT id, status, error
+  SELECT id, status, error, failure_reason_code
   FROM otlet.jobs
   WHERE task_name = :'task_name'
   ORDER BY id DESC
   LIMIT 1
 ),
 receipt_row AS (
-  SELECT status, selection_status, selection_reason, schema_validation_status, trace_summary
+  SELECT
+    status,
+    selection_status,
+    selection_reason,
+    schema_validation_status,
+    trace_summary,
+    failure_reason_code
   FROM otlet.inference_receipts
   WHERE job_id = (SELECT id FROM job_row)
   ORDER BY id DESC
   LIMIT 1
 )
 SELECT j.status || '|' ||
-       (j.error LIKE 'linked worker RSS budget%')::text || '|' ||
+       (j.error LIKE 'linked request memory admission rejected:%')::text || '|' ||
        r.status || '|' ||
        r.selection_status || '|' ||
        r.selection_reason || '|' ||
        r.schema_validation_status || '|' ||
        COALESCE(r.trace_summary ->> 'stop_reason', '') || '|' ||
+       j.failure_reason_code || '|' ||
+       r.failure_reason_code || '|' ||
+       taxonomy.stage || '|' ||
+       taxonomy.retryability || '|' ||
+       taxonomy.owner_action || '|' ||
+       taxonomy.raw_detail_visibility || '|' ||
+       (failure.execution_path = 'native' AND failure.raw_detail_available)::text || '|' ||
+       (model.lifecycle_state = 'active')::text || '|' ||
        (SELECT count(*) FROM otlet.outputs WHERE job_id = j.id)::text || '|' ||
        COALESCE(rs.runtime_status, '') || '|' ||
        COALESCE(rs.slot_state, '')
 FROM job_row j
 CROSS JOIN receipt_row r
+JOIN otlet.failure_taxonomy taxonomy
+  ON taxonomy.failure_reason_code = j.failure_reason_code
+JOIN otlet.failure_retry_status failure
+  ON failure.failure_scope = 'job'
+ AND failure.job_id = j.id
+JOIN otlet.models model ON model.name = :'model_name'
 JOIN otlet.runtime_status rs
   ON rs.model_name = :'model_name';
 SQL
 )"
 echo "rss_budget_worker_contract=$rss_budget_contract"
-[ "$rss_budget_contract" = "failed|true|failed|failed|direct_attempt_failed|failed|worker_rss_budget_exceeded|0|ready|ready" ] || {
+[ "$rss_budget_contract" = "failed|true|failed|failed|direct_attempt_failed|failed|request_memory_admission_rejected|otlet.failure.v1.resource_admission_rejected|otlet.failure.v1.resource_admission_rejected|admission|after_owner_action|repair_runtime_capacity|database_owner_only|true|true|0|ready|ready" ] || {
   echo "Expected RSS budget hit to produce a clean failed receipt and healthy worker, got $rss_budget_contract" >&2
   exit 1
 }
@@ -134,7 +154,7 @@ SELECT otlet.create_task(
   :'instruction',
   :'output_schema'::jsonb,
   :'model_name',
-  '{"max_tokens":32,"reasoning":"off","inference_cache":false,"max_worker_rss_bytes":7200000000}'::jsonb
+  '{"max_tokens":32,"reasoning":"off","inference_cache":false,"max_worker_rss_bytes":5500000000}'::jsonb
 );
 SELECT otlet.run_task(:'task_name');
 SQL
@@ -152,8 +172,20 @@ WITH evidence AS (
 SELECT job_status || '|' ||
        COALESCE(stop_reason, '') || '|' ||
        COALESCE(model_load_admission_decision, '') || '|' ||
-       (model_load_admission_reason = 'llama_projected_model_kv_batch_exceeds_headroom')::text || '|' ||
-       (model_load_allowed_additional_bytes < jsonb_extract_path_text(memory_evidence, 'admission', 'projected_total_bytes')::bigint)::text || '|' ||
+       (model_load_admission_reason IN (
+         'current_worker_rss_meets_or_exceeds_budget',
+         'artifact_floor_exceeds_available_headroom',
+         'replacement_anonymous_projection_exceeds_headroom',
+         'llama_projected_model_kv_batch_exceeds_headroom'
+       ))::text || '|' ||
+       (COALESCE(
+         jsonb_extract_path_text(
+           memory_evidence,
+           'admission',
+           'llama_projected_fit'
+         )::boolean,
+         false
+       ) IS FALSE)::text || '|' ||
        (worker_process_rss_bytes > 0)::text || '|' ||
        (system_memory_available_bytes > 0)::text || '|' ||
        (SELECT count(*) FROM otlet.outputs WHERE job_id = evidence.job_id)::text
@@ -216,14 +248,20 @@ oversized_prompt_contract="$(psql_exec -qAt \
   -v task_name="$oversized_prompt_task" \
   -v model_name="$strong_model_name" <<'SQL'
 WITH job_row AS (
-  SELECT id, status, error
+  SELECT id, status, error, failure_reason_code
   FROM otlet.jobs
   WHERE task_name = :'task_name'
   ORDER BY id DESC
   LIMIT 1
 ),
 receipt_row AS (
-  SELECT status, selection_status, selection_reason, schema_validation_status, trace_summary
+  SELECT
+    status,
+    selection_status,
+    selection_reason,
+    schema_validation_status,
+    trace_summary,
+    failure_reason_code
   FROM otlet.inference_receipts
   WHERE job_id = (SELECT id FROM job_row)
   ORDER BY id DESC
@@ -236,13 +274,57 @@ SELECT j.status || '|' ||
        r.selection_reason || '|' ||
        r.schema_validation_status || '|' ||
        COALESCE(r.trace_summary ->> 'stop_reason', '') || '|' ||
+       j.failure_reason_code || '|' ||
+       r.failure_reason_code || '|' ||
+       taxonomy.stage || '|' ||
+       taxonomy.retryability || '|' ||
+       taxonomy.owner_action || '|' ||
+       taxonomy.raw_detail_visibility || '|' ||
+       (failure.execution_path = 'native' AND failure.raw_detail_available)::text || '|' ||
+       (model.lifecycle_state = 'active')::text || '|' ||
        (SELECT count(*) FROM otlet.outputs WHERE job_id = j.id)::text || '|' ||
        COALESCE(rs.runtime_status, '') || '|' ||
        COALESCE(rs.slot_state, '')
 FROM job_row j
 CROSS JOIN receipt_row r
+JOIN otlet.failure_taxonomy taxonomy
+  ON taxonomy.failure_reason_code = j.failure_reason_code
+JOIN otlet.failure_retry_status failure
+  ON failure.failure_scope = 'job'
+ AND failure.job_id = j.id
+JOIN otlet.models model ON model.name = :'model_name'
 JOIN otlet.runtime_status rs
   ON rs.model_name = :'model_name';
 SQL
 )"
 echo "oversized_prompt_worker_contract=$oversized_prompt_contract"
+oversized_prompt_swap_contract="$(psql_exec -qAt \
+  -v task_name="$oversized_prompt_task" \
+  -v model_name="$strong_model_name" <<'SQL'
+WITH job_row AS (
+  SELECT id
+  FROM otlet.jobs
+  WHERE task_name = :'task_name'
+  ORDER BY id DESC
+  LIMIT 1
+)
+SELECT count(*)::text || '|' ||
+       COALESCE(bool_and(e.detail ->> 'model_name' = :'model_name'), false)::text || '|' ||
+       COALESCE(bool_and((e.detail ->> 'model_memory_bytes')::bigint > 0), false)::text || '|' ||
+       COALESCE(bool_and((e.detail ->> 'worker_process_rss_bytes')::bigint > 0), false)::text || '|' ||
+       COALESCE(bool_and(
+         jsonb_extract_path_text(e.detail, 'memory', 'admission', 'decision') IN (
+           'allowed',
+           'not_required'
+         )
+       ), false)::text
+FROM otlet.worker_events e
+WHERE e.job_id = (SELECT id FROM job_row)
+  AND e.event_type = 'model_swap';
+SQL
+)"
+echo "oversized_prompt_swap_contract=$oversized_prompt_swap_contract"
+[ "$oversized_prompt_swap_contract" = "1|true|true|true|true" ] || {
+  echo "Expected failed post-load attempt to record strong-model residency, got $oversized_prompt_swap_contract" >&2
+  exit 1
+}

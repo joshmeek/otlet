@@ -233,7 +233,7 @@ echo "posthoc_output_rule_contract=$posthoc_output_rule_contract"
 
 source_rows_after="$(psql_exec -qAt <<'SQL'
 SELECT count(*)::text || '|' ||
-       md5(string_agg(to_jsonb(v)::text, ',' ORDER BY v.id))
+       otlet.portable_json_hash(jsonb_agg(to_jsonb(v) - 'updated_at' ORDER BY v.id))
 FROM public.otlet_demo_vendor_entity v;
 SQL
 )"
@@ -266,13 +266,20 @@ SELECT count(*)::text || '|' ||
        COALESCE(max(labels.expected_answer) FILTER (WHERE labels.action_id = :'merge_action_id'::bigint), '') || '|' ||
        COALESCE(max(exported.case_kind) FILTER (WHERE exported.action_id = :'merge_action_id'::bigint), '') || '|' ||
        COALESCE(max(labels.expected_answer) FILTER (WHERE labels.action_id = :'new_entity_action_id'::bigint), '') || '|' ||
-       COALESCE(max(exported.case_kind) FILTER (WHERE exported.action_id = :'new_entity_action_id'::bigint), '')
+       COALESCE(max(exported.case_kind) FILTER (WHERE exported.action_id = :'new_entity_action_id'::bigint), '') || '|' ||
+       bool_and(labels.subject_id = job.subject_id)::text || '|' ||
+       bool_and(labels.source_hash = otlet.semantic_source_hash(job.input))::text || '|' ||
+       bool_and(labels.source_table IS NULL)::text || '|' ||
+       bool_and(quality.source_revision_current)::text
 FROM labels
-JOIN exported USING (action_id);
+JOIN exported USING (action_id)
+JOIN otlet.actions action ON action.id = labels.action_id
+JOIN otlet.jobs job ON job.id = action.job_id
+JOIN otlet.eval_label_quality_status quality ON quality.label_id = labels.id;
 SQL
 )"
 echo "er_eval_label_contract=$er_eval_label_contract"
-[ "$er_eval_label_contract" = "2|same_entity|positive|different_entity|hard_negative" ] || {
+[ "$er_eval_label_contract" = "2|same_entity|positive|different_entity|hard_negative|true|true|true|true" ] || {
   echo "Expected ER eval export parity after expected_answer rename, got $er_eval_label_contract" >&2
   exit 1
 }

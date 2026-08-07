@@ -4,6 +4,9 @@ WITH trace_steps AS MATERIALIZED (
     r.id AS receipt_id,
     step.value
   FROM otlet.inference_receipts r
+  JOIN otlet.jobs job
+    ON job.id = r.job_id
+   AND job.execution_mode = 'production'
   CROSS JOIN LATERAL jsonb_array_elements(
     CASE
       WHEN jsonb_typeof(r.trace_summary #> '{detailed_trace,steps}') = 'array'
@@ -105,6 +108,9 @@ per_receipt AS (
     (action_jobs.job_id IS NOT NULL) AS has_action,
     (materialized_subjects.task_name IS NOT NULL) AS has_materialization_source_hash
   FROM otlet.inference_receipts r
+  JOIN otlet.jobs job
+    ON job.id = r.job_id
+   AND job.execution_mode = 'production'
   CROSS JOIN LATERAL (
     -- Expand the toasted object once and keep the projection from being pulled up
     SELECT r.trace_summary || '{}'::jsonb AS summary

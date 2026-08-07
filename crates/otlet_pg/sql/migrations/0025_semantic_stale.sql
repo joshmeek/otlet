@@ -84,13 +84,22 @@ BEGIN
   SET stale = true,
       stale_reason = CASE
         WHEN targets.exact_match THEN COALESCE(mark_semantic_stale.stale_reason, 'manual')
+        WHEN COALESCE(mark_semantic_stale.stale_reason, 'manual') = 'source_update'
+             AND mark_semantic_stale.source_table IS NOT NULL
+             AND mark_semantic_stale.subject_id IS NOT NULL
+             AND sm.source_dependencies @> jsonb_build_array(jsonb_build_object(
+               'table', mark_semantic_stale.source_table,
+               'subject_id', mark_semantic_stale.subject_id,
+               'field', 'subject_id'
+             )) THEN 'source_update'
         WHEN COALESCE(mark_semantic_stale.stale_reason, 'manual') = 'source_update' THEN 'content_revalidation_pending'
         ELSE COALESCE(mark_semantic_stale.stale_reason, 'manual')
       END,
       updated_at = now()
   FROM targets
   WHERE sm.id = targets.id
-    AND (targets.exact_match OR targets.dependency_match);
+    AND (targets.exact_match OR targets.dependency_match)
+    AND sm.stale_reason IS DISTINCT FROM 'contract_changed';
 
   GET DIAGNOSTICS marked = ROW_COUNT;
   RETURN marked;
@@ -131,7 +140,9 @@ CREATE FUNCTION otlet.watch_semantic_stale(
 LANGUAGE plpgsql
 AS $$
 DECLARE
-  trigger_name text := 'otlet_stale_' || substr(md5(table_name::text || ':' || subject_column), 1, 16);
+  trigger_name text := 'otlet_stale_v1_' || substr(right(otlet.identity_text_hash(
+    'semantic_stale_trigger', subject_column
+  ), 64), 1, 16);
 BEGIN
   IF NOT EXISTS (
     SELECT 1

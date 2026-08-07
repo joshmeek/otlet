@@ -43,6 +43,15 @@ pub(crate) fn register_worker_latch() {
     let mut state = WAKE_STATE.exclusive();
     let worker_latch = unsafe { pg_sys::MyLatch as usize };
     let worker_pid = unsafe { pg_sys::MyProcPid };
+    for index in 0..WORKER_LATCH_SLOTS {
+        let latch = state.worker_latches[index];
+        let pid = state.worker_pids[index];
+        if latch == 0 || pid == 0 || unsafe { (*(latch as *const pg_sys::Latch)).owner_pid } != pid
+        {
+            state.worker_latches[index] = 0;
+            state.worker_pids[index] = 0;
+        }
+    }
     if let Some(index) = state
         .worker_pids
         .iter()
@@ -129,7 +138,7 @@ pub extern "C-unwind" fn otlet_worker_wake_state(
         "worker_pids": state.worker_pids.iter().copied().filter(|pid| *pid != 0).collect::<Vec<_>>(),
         "registered_workers": registered_workers,
         "worker_registrations": state.worker_registrations,
-        "worker_lifecycle_policy": "clear_latch_on_clean_stop_and_reregister_on_postmaster_restart",
+        "worker_lifecycle_policy": "clear_clean_stop_reclaim_stale_restart_latch",
         "wake_requests": state.wake_requests,
         "wake_commits": state.wake_commits,
         "wake_successes": state.wake_successes,

@@ -2,7 +2,141 @@
 
 Use this after the entity-resolution walkthrough queues work. It inspects model selection, receipts, runtime status, trace visibility, retries, cancellation, and failed-run evidence
 
-These diagnostic queries run as the extension owner because they expose receipt, structured output, error, and numeric token state. Raw model output and token text appear when the owner enables bounded diagnostic storage. Auditors use `otlet.audit_receipt_export` and the other redacted exports granted by `otlet.grant_auditor_access(...)`
+These diagnostic queries run as the extension owner because they expose receipt, structured output, error, and numeric token state. Raw model output and token text appear when the owner enables bounded diagnostic storage. Auditors use `otlet.audit_receipt_export` and the other redacted exports after the owner registers their role with the `auditor` access-policy capability. Later grant repair uses `otlet.reconcile_access_policy_role(...)`
+
+## Discover Runtime Capabilities
+
+`otlet.runtime_capability_status` declares what each installed runtime can do before a model runs. The native row comes from the loaded extension build. Each portable row comes from the exact registered worker identity, so a changed declaration produces a different identity and an incompatible contract is rejected at registration
+
+```sql
+SELECT runtime_id,
+       runtime_kind,
+       runtime_name,
+       runtime_version,
+       supported_runtime_options,
+       schema_behavior,
+       context_limits,
+       cancellation,
+       tracing,
+       artifact_formats,
+       runtime_build,
+       device_settings,
+       resource_admission,
+       database_operations
+FROM otlet.runtime_capability_status
+ORDER BY runtime_id;
+```
+
+Use this view to choose a compatible runtime. The native worker declares its 10-second transaction and 1-second lock deadlines here and records the applied values in each `worker_started` event. PostgreSQL rolls a timed-out transaction back, restarts the worker, and leaves fenced leases for retry or reclaim. The portable worker keeps its separate process deadlines. Use `otlet.runtime_status` and the portable status views for observed residency, health, memory, claims, and receipts
+
+## Inspect Route Readiness
+
+Auditors and operators with delegated access can inspect each configured direct, cheap, and strong route before queued work relies on it:
+
+```sql
+SELECT task_name,
+       workload_revision_hash,
+       selection_role,
+       model_name,
+       registration_state,
+       native_eligible_workers,
+       portable_eligible_workers,
+       route_ready,
+       readiness_reason
+FROM otlet.route_readiness_status
+ORDER BY task_name, selection_role;
+```
+
+The view keeps direct and cheap as separate routes even when both use the same model. A native route needs a live worker in the current database whose latest startup event belongs to that backend and records success, supported runtime options, a claim-ready exact artifact, and no errored model slot. A startup failure closes readiness while the worker process remains alive. A portable route also needs an active protocol, the complete eight-RPC worker grant, current incarnation, matching artifact, claim-reported RSS compatible with the workload, ready model, and heartbeat no older than two minutes. Busy workers remain ready
+
+Portable cheap-to-strong handoffs stay on the same job. When their strong route is not ready, `otlet.stranded_escalation_status` reports the job immediately without a minimum retry age:
+
+```sql
+SELECT job_id,
+       task_name,
+       workload_revision_hash,
+       strong_model_name,
+       escalated_at,
+       escalation_age,
+       escalation_reason,
+       stranded_reason
+FROM otlet.stranded_escalation_status
+ORDER BY escalated_at, job_id;
+```
+
+`escalated_at` comes from the latest cheap receipt and falls back to job creation only for an invalid handoff with no cheap receipt. Active heads and every revision with queued work remain visible, including paused direct work and non-head evaluation jobs. Non-head evaluation work can be ready while non-head production work reports `workload_revision_inactive`. The grant helpers expose both views to auditors and operators while `PUBLIC` remains closed
+
+## Inspect Versioned Operational Status
+
+`otlet.operational_observability_status` gives auditors and operators one tall status surface. Durable queue, run, failure, and schema evidence uses closed 15-minute, 1-hour, and 24-hour windows. Mutable backlog, route, heartbeat, liveness, cleanup, and pressure rows use `window_name = 'current'`. Native liveness counts current backend processes whose latest lifecycle event records startup success
+
+```sql
+SELECT window_name,
+       observability_schema,
+       metric_name,
+       task_name,
+       workload_revision_hash,
+       worker_identity_hash,
+       category,
+       sample_count,
+       denominator,
+       value_numeric,
+       p50,
+       p95,
+       p99,
+       maximum,
+       unit,
+       status
+FROM otlet.operational_observability_status
+ORDER BY metric_name, window_name, task_name, category;
+```
+
+Failure categories are `<scope>:<reason_code>`, so a failed job and its failed receipt remain two named evidence rows instead of one implied incident. Timing, failure, and schema-rejection windows include production attempts only; labeled evaluation evidence stays in the quality view. Pressure categories name the measured limit: task queued bytes, task queue age, task active claims, model queued bytes, model queued jobs, or total queued bytes. A pressured row compares its displayed value with its displayed maximum
+
+`otlet.operational_event_log` exposes `otlet.observability.event.v1`. Unknown event types and runtime names become `other`; portable runtime names become `portable`; raw message and detail values stay withheld. New job events retain their claim attempt and hash, matching portable claim, receipt, action, revision, route, and worker-process identities when those identities exist. Native startup success and failure share the process hash, and a model-swap event requires the live claim that produced it. Client-supplied claim or worker fields are ignored. Batch events retain only registered task names from the bounded task list
+
+```sql
+SELECT event_id,
+       event_schema,
+       event_version,
+       created_at,
+       event_type,
+       event_class,
+       severity,
+       runtime_name,
+       task_names,
+       job_id,
+       workload_revision_hash,
+       claim_attempt_index,
+       claim_identity_hash,
+       portable_claim_id,
+       receipt_ids,
+       worker_identity_hash,
+       action_ids,
+       selection_role
+FROM otlet.operational_event_log
+ORDER BY event_id DESC
+LIMIT 50;
+```
+
+Labeled quality stays out of the operational view. `otlet.labeled_quality_status` exposes the seven non-authoritative entity-resolution metrics with their exact numerator, denominator, evidence state, observation bounds, and lag from the observation end to the latest source report
+
+```sql
+SELECT metric,
+       quality_schema,
+       eligible_count,
+       numerator,
+       denominator,
+       rate,
+       evidence_kind,
+       evidence_ready,
+       observation_started_at,
+       observation_ended_at,
+       observed_at,
+       observation_lag_ms
+FROM otlet.labeled_quality_status
+ORDER BY contract_hash, metric;
+```
 
 ## Step 1 - Inspect Model Selection Attempts
 
@@ -56,7 +190,7 @@ Representative output:
 receipt_attempt_contract=8|4|4|4
 ```
 
-A receipt records evidence for one model run. A candidate pair can have multiple receipts when model selection escalates
+A receipt records one inference attempt, including terminal attempts that stop before model execution. A candidate pair can have multiple receipts when model selection escalates
 
 Each accepted receipt links PostgreSQL-recomputed SHA-256 identities for the task, source snapshot, model, effective runtime options, prompt, input, output schema, raw output, structured output, and actions. It also records verified artifact provenance, the detailed runtime fingerprint, validation status, timing, token counts, memory summary, and trace summary. Otlet does not persist the assembled prompt
 
@@ -89,7 +223,28 @@ SELECT * FROM otlet.portable_claim_status ORDER BY claim_id DESC;
 SELECT * FROM otlet.portable_receipt_status ORDER BY receipt_id DESC;
 ```
 
-The [reference external worker](../crates/otlet_worker/README.md) runs the same database-built prompt with one local GGUF when the PostgreSQL host cannot load the native extension worker. It renews the lease during decode and interrupts work after cancellation, claim loss, or database disconnect. PostgreSQL still parses the returned envelope and owns every validation and trusted-state write
+`incarnation_nonce_hash` links each active worker, claim, and receipt without exposing the raw process nonce. Starting a replacement process under the same registered worker identity marks the old process claims replaced and rejects its heartbeat, claim, renewal, attempt, completion, failure, and cancellation calls
+
+PostgreSQL authors the portable option status before claim mutation and copies it from the claim into the linked receipt. `requested`, `honored`, `defaulted`, `rejected`, and `effective` distinguish task input from the settings the worker must execute. `envelope` binds the registered artifact, fixed context and batch shape, eager CPU-only load, current RSS, memory budget, and worker thread default
+
+```sql
+SELECT receipt_id,
+       runtime_options_status -> 'requested' AS requested,
+       runtime_options_status -> 'honored' AS honored,
+       runtime_options_status -> 'defaulted' AS defaulted,
+       runtime_options_status -> 'rejected' AS rejected,
+       runtime_options_status -> 'effective' AS effective,
+       runtime_options_status -> 'envelope' AS envelope,
+       model_cache_hit,
+       inference_cache_hit,
+       worker_process_rss_bytes,
+       worker_memory_budget_bytes
+FROM otlet.inference_receipt_trace_status
+WHERE runtime_name LIKE 'portable:%'
+ORDER BY receipt_id DESC;
+```
+
+The [reference external worker](../crates/otlet_worker/README.md) runs the same database-built prompt with one local GGUF when the PostgreSQL host cannot load the native extension worker. It rejects unknown options before claim, uses the database-normalized token and thread limits, keeps inference caching and generation tracing off, and enforces Linux VmRSS before and after inference when `max_worker_rss_bytes` is positive. A zero budget disables enforcement and makes sampling best effort; a missing or invalid options envelope is reported as unavailable, not disabled. It starts one monotonic clock before the claim RPC, converts the returned `max_attempt_ms` to a deadline anchored at that start, and shares the deadline across prompt decode, generation, renewal, and the llama abort callback. PostgreSQL exposes the claim-time attempt deadline and rejects renewal after it. Timeout records `attempt_timeout` in the job, receipt selection reason, and trace with no accepted output. Cancellation, pre-deadline claim loss, a fenced process incarnation, and database disconnect still interrupt work. The worker permits one `psql` child, caps request, stdout, stderr, and parsed-result bytes, and turns fixed operation deadlines into statement and lock timeouts. It kills and reaps a child that outlives its deadline. The worker rejects a connection URI containing a password, passes the passwordless URI to `psql`, and leaves credentials to libpq sources such as `PGPASSFILE`. No credential appears in process arguments or logs, and logs omit connection data. PostgreSQL parses every returned envelope and owns validation and trusted-state writes
 
 Receipt timing splits runtime preparation, model load, context creation, tokenization, prompt decode, generation, validation and post-processing, finish SQL, and semantic materialization. `otlet.runtime_stage_timing_status` aggregates every attempt for a job and leaves unmeasured worker work in `worker_overhead_ms`:
 
@@ -137,6 +292,46 @@ The worker keeps the local model/context warm across jobs. SQL can see the slot 
 
 `otlet.runtime_status` also reports the latest infer-now request split as start latency, worker time, and requester delivery time through `infer_now_last_start_latency_ms`, `infer_now_last_worker_run_ms`, and `infer_now_last_delivery_ms`
 
+The native dispatcher gives one service turn to the oldest infer-now request, then one turn to the existing bounded queued batch. Its cursor survives latch wakes, and an empty class leaves the other running. Inspect the declared contract and targets; latest-request fields remain per-request observations:
+
+```sql
+SELECT interactive_queue_age_p99_target_ms,
+       asynchronous_queue_age_p99_target_ms,
+       cancellation_observation_p99_target_ms
+FROM otlet.production_policy_status;
+
+SELECT state ->> 'queue_policy' AS queue_policy,
+       state ->> 'service_policy' AS service_policy,
+       state ->> 'infer_now_request_quantum' AS infer_now_request_quantum,
+       state ->> 'queued_claim_batch_quantum' AS queued_claim_batch_quantum,
+       state ->> 'priority_classes' AS priority_classes,
+       state ->> 'service_measurement_status' AS measurement_status
+FROM (SELECT otlet.worker_infer_now_state() AS state) current;
+
+SELECT phase,
+       observation_samples,
+       stop_samples,
+       request_to_observation_p95_ms,
+       request_to_observation_p99_ms,
+       cancel_to_stop_p95_ms,
+       cancel_to_stop_p99_ms,
+       cancellation_observation_p99_target_ms,
+       minimum_observation_samples,
+       measurement_status,
+       active_unobserved_cancellations,
+       active_observed_not_stopped,
+       overdue_unobserved_cancellations,
+       finer_preemption_required
+FROM otlet.native_cancellation_slo_status
+ORDER BY phase = 'all' DESC, phase;
+```
+
+The interactive and asynchronous queue targets remain declared but unmeasured. Native cancellation starts at `jobs.cancel_requested_at`, observes at the first active-claim runtime boundary, stops at `jobs.native_cancel_stopped_at` after native work unwinds, and terminalizes later at `jobs.finished_at`. `jobs.started_at` is batch claim time and is not used as the claimed-wait endpoint
+
+The status has one overall row and one row for each observation phase. It exposes p95 and p99 as soon as samples exist, but target compliance stays `collecting` until 100 observations can resolve a one-percent tail. `finer_preemption_required` changes only when that measured p99 exceeds `cancellation_observation_p99_target_ms`; the current 250 ms prompt-decode and generation checks remain in place until then. Active unobserved, observed-but-not-stopped, and overdue counts stay separate from completed percentiles
+
+Only the linked native worker writes this observation evidence. SQL-only installations expose the same empty status shape for inspection, while portable cancellation keeps its existing claim and receipt contract
+
 The full fingerprint describes the artifact, linked build, effective generation settings, CPU placement, and host capacity. The prompt-template hash covers the exact reasoning prefix and static prompt body. Its output-contract hash omits observational host fields and joins content, task contract, and model identity in the inference-cache key:
 
 ```sql
@@ -155,6 +350,35 @@ LIMIT 1;
 SQL shows whether the model loaded, is busy, failed, cached, or went over budget
 
 Generated runs record `memory_evidence` before and after the model path. Typed receipt and runtime-status columns expose process RSS and swap, system available memory and swap, major-fault and file-read deltas, PSI totals, supported cgroup-v2 usage and events, and the model-load admission decision. With an explicit RSS budget, a cache miss loads llama.cpp metadata without tensor allocation and projects model, KV, and prompt-decode workspace bytes. Otlet rejects the load when that total exceeds worker-budget, system, or finite cgroup headroom. The current resident model stays usable
+
+Every request also records its artifact-tested, task-requested, and effective context ceilings in the database-authored option status and runtime fingerprint. `memory.request_admission` reports prompt tokens, declared generation tokens, projected prompt and decode bytes, decision, and reason. Context rejection happens before decode, stores no output, and keeps the stable reason in `stop_reason` and the `otlet.failure.v1.runtime_configuration_rejected` taxonomy
+
+```sql
+SELECT receipt_id,
+       COALESCE(
+         trace_summary #>> '{runtime_options_status,context_window,tested_context_window_tokens}',
+         trace_summary #>> '{runtime_options_status,envelope,tested_context_window_tokens}'
+       ) AS tested_tokens,
+       COALESCE(
+         trace_summary #>> '{runtime_options_status,context_window,requested_context_window_tokens}',
+         trace_summary #>> '{runtime_options_status,envelope,requested_context_window_tokens}'
+       ) AS requested_tokens,
+       COALESCE(
+         trace_summary #>> '{runtime_options_status,context_window,effective_context_window_tokens}',
+         trace_summary #>> '{runtime_options_status,envelope,effective_context_window_tokens}'
+       ) AS effective_tokens,
+       trace_summary #>> '{memory,request_admission,prompt_tokens}' AS prompt_tokens,
+       trace_summary #>> '{memory,request_admission,max_generation_tokens}' AS max_generation_tokens,
+       trace_summary #>> '{memory,request_admission,projected_prompt_bytes}' AS projected_prompt_bytes,
+       trace_summary #>> '{memory,request_admission,projected_decode_bytes}' AS projected_decode_bytes,
+       trace_summary #>> '{memory,request_admission,projected_prompt_prefix_state_bytes}' AS projected_prompt_prefix_state_bytes,
+       trace_summary #>> '{memory,request_admission,decision}' AS request_admission,
+       trace_summary #>> '{memory,request_admission,reason}' AS request_admission_reason,
+       trace_summary ->> 'stop_reason' AS stop_reason
+FROM otlet.inference_receipt_trace_status
+ORDER BY receipt_id DESC
+LIMIT 1;
+```
 
 ```sql
 SELECT model_load_admission_decision,
@@ -371,9 +595,9 @@ Representative output:
 (1 row)
 ```
 
-Otlet records a receipt for canceled work and preserves model-run evidence
+Otlet records cancellation evidence for queued work. When cancellation follows an attempted run, the receipt also preserves its model and runtime evidence
 
-A synchronous infer-now caller can time out while the worker decodes. The requester records a shared abort marker and calls `otlet.request_job_cancellation`; the worker then closes the job with its live claim token before it can accept output. The caller's failed transaction cannot roll back that worker-owned cancellation
+A synchronous infer-now caller can time out while the worker decodes. The requester and worker arbitrate the cancel marker against output acceptance under one shared lock. A marker that wins makes the worker close the job with its live claim token. Output acceptance that wins may commit after the caller detaches. Worker startup cancels marked synchronous jobs left by a prior worker or postmaster, and lease recovery never reclaims them as asynchronous work. Jobs created through asynchronous ask or queued/asynchronous CustomScan paths keep their retry behavior
 
 The demo requires the canceled job and receipt, zero outputs and actions, a recorded timeout and abort, the canceled job ID, and one healthy worker:
 
@@ -385,12 +609,13 @@ requester_timeout_contract=canceled|true|canceled|canceled|0|0|true|true|true|1|
 
 Otlet leaves failed jobs visible. A failed job is terminal, so you can requeue that task and subject
 
-The partial unique index blocks duplicate active work and leaves terminal history reusable:
+The partial unique index blocks duplicate active production work for one task revision and subject while leaving evaluation work and terminal history reusable:
 
 ```sql
 CREATE UNIQUE INDEX jobs_active_subject_idx
-ON otlet.jobs (task_name, subject_id)
-WHERE status IN ('queued', 'running', 'cancel_requested');
+ON otlet.jobs (task_name, workload_revision_hash, subject_id)
+WHERE execution_mode = 'production'
+  AND status IN ('queued', 'running', 'cancel_requested');
 ```
 
 The example creates one synthetic failed job, then lets `run_task` enqueue a second job for that subject
@@ -438,9 +663,9 @@ Failure records a raw-output hash, a non-sensitive error, and an attempt receipt
 
 ## Step 10 - Check Worker Events And Receipt Statuses
 
-Events show worker behavior. Receipts show model behavior
+Events show worker behavior. Receipts show attempt and validation evidence
 
-The portable worker emits one `preflight_passed` event before model load or claims. A failed explicit `--preflight` emits `preflight_failed` with one stable dependency code and no connection string, credential, prompt, or source value
+The portable worker checks all eight RPC grants, rejects symlink artifacts, and binds the verified open file through llama.cpp load. It emits one `preflight_passed` event before starting an incarnation, loading a model, or claiming work. A failed explicit `--preflight` emits `preflight_failed` with one stable dependency code and no connection string, credential, prompt, or source value
 
 ```sql
 SELECT event_type, count(*)
@@ -474,4 +699,4 @@ Representative output:
 (2 rows)
 ```
 
-Use events for worker behavior and receipts for model behavior
+Use events for worker behavior and receipts for attempt and validation evidence

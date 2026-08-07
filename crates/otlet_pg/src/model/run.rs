@@ -28,6 +28,64 @@ struct RunContext {
     input_shaping_applied: bool,
 }
 
+#[derive(Clone, Copy)]
+struct ModelContextBudget {
+    tested: u32,
+    requested: Option<u32>,
+    effective: u32,
+    physical: u32,
+}
+
+fn linked_physical_context_window_tokens(tested: u32) -> u32 {
+    tested.div_ceil(LINKED_CONTEXT_WINDOW_QUANTUM_TOKENS)
+        * LINKED_CONTEXT_WINDOW_QUANTUM_TOKENS
+}
+
+fn model_context_budget(
+    artifact_identity: &Value,
+    options: &crate::runtime::RuntimeOptions,
+) -> Result<ModelContextBudget, ModelError> {
+    let tested = match artifact_identity.get("context_window_tokens") {
+        None => LINKED_CONTEXT_WINDOW_TOKENS,
+        Some(value) => value
+            .as_u64()
+            .filter(|value| (1..=u64::from(LINKED_CONTEXT_WINDOW_TOKENS)).contains(value))
+            .and_then(|value| u32::try_from(value).ok())
+            .ok_or_else(|| {
+                ModelError::clean_failure(
+                    "model artifact context_window_tokens must be between 1 and 4096",
+                    "model_context_window_before_runtime",
+                    "invalid_model_context_window",
+                )
+            })?,
+    };
+    let requested = options.context_window_tokens.map(|value| {
+        u32::try_from(value).expect("runtime context_window_tokens is bounded by parser")
+    });
+    Ok(ModelContextBudget {
+        tested,
+        requested,
+        effective: requested.filter(|value| *value <= tested).unwrap_or(tested),
+        physical: linked_physical_context_window_tokens(tested),
+    })
+}
+
+fn validate_model_context_budget(context_budget: ModelContextBudget) -> Result<(), ModelError> {
+    if let Some(requested) = context_budget.requested
+        && requested > context_budget.tested
+    {
+        return Err(ModelError::clean_failure(
+            format!(
+                "requested context window {requested} exceeds model tested limit {}",
+                context_budget.tested
+            ),
+            "model_context_window_before_runtime",
+            "requested_context_window_exceeds_model_limit",
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) fn run_job(job: &Job) -> Result<ModelRun, ModelError> {
     run_job_with_model_ref(
         job,
@@ -55,14 +113,27 @@ pub(crate) fn run_job_with_model(job: &Job, model: &JobModel) -> Result<ModelRun
 
 fn run_job_with_model_ref(job: &Job, model: JobModelRef<'_>) -> Result<ModelRun, ModelError> {
     let prepare_started = Instant::now();
-    verify_model_artifact(model)?;
+    let verified_artifact = verify_model_artifact(model)?;
+    if linked_cancel_requested(job, "model_load")? {
+        return Err(ModelError::new("canceled"));
+    }
     let digests = task_contract_digests(job);
     let options = digests
         .runtime_options
         .as_ref()
         .map_err(|err| ModelError::new(err.clone()))?;
+    let context_budget = model_context_budget(model.artifact_identity, options)?;
     let model_fingerprint_hash = model_fingerprint_hash(model);
-    let runtime_fingerprint = runtime_fingerprint(model, &model_fingerprint_hash, options);
+    let verified_artifact_sha256 = Arc::<str>::from(verified_artifact.sha256());
+    let verified_artifact_bytes = verified_artifact.bytes();
+    let runtime_fingerprint = runtime_fingerprint(
+        model,
+        &model_fingerprint_hash,
+        &verified_artifact_sha256,
+        verified_artifact_bytes,
+        options,
+        context_budget,
+    );
     // Cache keys use content/contract/model digests only — look up before
     // allocating shaped JSON or prompt strings. Hits stream the same hashes.
     let cache_probe = RunContext {
@@ -70,7 +141,11 @@ fn run_job_with_model_ref(job: &Job, model: JobModelRef<'_>) -> Result<ModelRun,
         input_hash: String::new(),
         output_schema_hash: digests.output_schema_hash.clone(),
         runtime_options_hash: digests.runtime_options_hash.clone(),
-        runtime_options_status: digests.runtime_options_status.clone(),
+        runtime_options_status: runtime_option_status(
+            &job.runtime_options,
+            u64::from(context_budget.tested),
+            u64::from(context_budget.effective),
+        ),
         model_fingerprint_hash: Arc::clone(&model_fingerprint_hash),
         runtime_fingerprint: runtime_fingerprint.document,
         runtime_fingerprint_hash: runtime_fingerprint.hash,
@@ -98,6 +173,8 @@ fn run_job_with_model_ref(job: &Job, model: JobModelRef<'_>) -> Result<ModelRun,
         input_truncated: false,
         input_shaping_applied: true,
     };
+    validate_model_context_budget(context_budget)
+        .map_err(|err| err.with_runtime_context(&cache_probe))?;
     let content_cache_key = inference_cache_content_key(job, &cache_probe);
     let contract_cache_key = inference_cache_contract_key(&cache_probe);
     let row_cache_key = inference_cache_row_key(job);
@@ -106,11 +183,14 @@ fn run_job_with_model_ref(job: &Job, model: JobModelRef<'_>) -> Result<ModelRun,
 
     let cache_lookup = if options.inference_cache && !options.generation_trace {
         inference_cache_get(
+            &job.execution_mode,
             cache_key,
             row_cache_key,
             content_cache_key,
             contract_cache_key,
             model_cache_key,
+            &verified_artifact_sha256,
+            verified_artifact_bytes,
         )
     } else if options.generation_trace {
         CacheLookup::disabled_for("disabled_for_generation_trace")
@@ -143,7 +223,7 @@ fn run_job_with_model_ref(job: &Job, model: JobModelRef<'_>) -> Result<ModelRun,
         cache_lookup.raw_output
     {
         // Trusted cache entry already passed schema validation when stored.
-        if linked_cancel_requested(job.id)? {
+        if linked_cancel_requested(job, "inference_cache_hit")? {
             return Err(ModelError::new("canceled"));
         }
         let (prompt_hash, input_hash, shaped_bytes, original_bytes, input_truncated) =
@@ -195,7 +275,7 @@ fn run_job_with_model_ref(job: &Job, model: JobModelRef<'_>) -> Result<ModelRun,
                 ctx_ms: 0,
                 model_memory_bytes: 0,
                 model_parameters: 0,
-                context_window_tokens: 0,
+                context_window_tokens: i64::from(context_budget.physical),
                 model_device_policy: "preserve_existing_on_inference_cache_hit",
                 memory_accounting_policy: LINKED_MEMORY_ACCOUNTING_POLICY,
                 worker_process_rss_bytes: worker_memory.rss_bytes,
@@ -280,6 +360,7 @@ fn run_job_with_model_ref(job: &Job, model: JobModelRef<'_>) -> Result<ModelRun,
         let linked = run_linked(
             job,
             model,
+            verified_artifact,
             &prompt.full,
             &prompt.prefix,
             options,
@@ -289,7 +370,7 @@ fn run_job_with_model_ref(job: &Job, model: JobModelRef<'_>) -> Result<ModelRun,
             err.prompt_hash = Some(context.prompt_hash.clone());
             err.input_hash = Some(context.input_hash.clone());
             err.output_schema_hash = Some(context.output_schema_hash.clone());
-            err
+            err.with_runtime_context(&context)
         })?;
         let mut metrics = linked.metrics;
         metrics.inference_cache_hit = false;
@@ -347,11 +428,14 @@ fn run_job_with_model_ref(job: &Job, model: JobModelRef<'_>) -> Result<ModelRun,
     }
     if cache_enabled && !metrics.inference_cache_hit {
         let stats = inference_cache_put(
+            &job.execution_mode,
             context.cache_key,
             context.row_cache_key,
             context.content_cache_key,
             context.contract_cache_key,
             context.model_cache_key,
+            &verified_artifact_sha256,
+            verified_artifact_bytes,
             raw_output.into_owned(),
         );
         metrics.inference_cache_entries = stats.entries;

@@ -2,14 +2,29 @@ CREATE FUNCTION otlet.watch_change_trigger() RETURNS trigger
 LANGUAGE plpgsql
 AS $$
 DECLARE
-  watch_task_name text;
   watch_on_change text;
+  watch_input_columns text[];
+  watch_revision_hash text;
+  source_table text;
   row_input jsonb;
+  reconciliation_input jsonb;
   subject_id text;
+  old_subject_id text;
+  row_ctid text;
+  row_xmin text;
 BEGIN
-  SELECT w.task_name, COALESCE(w.trigger_policy ->> 'on_change', 'mark_stale')
-  INTO watch_task_name, watch_on_change
+  SELECT
+    COALESCE(w.trigger_policy ->> 'on_change', 'mark_stale'),
+    w.input_columns,
+    head.active_workload_revision_hash,
+    w.source_table
+  INTO
+    watch_on_change,
+    watch_input_columns,
+    watch_revision_hash,
+    source_table
   FROM otlet.watches w
+  JOIN otlet.workload_revision_heads head ON head.task_name = w.task_name
   WHERE w.name = TG_ARGV[1]
     AND w.kind = 'row';
 
@@ -22,21 +37,70 @@ BEGIN
 
   IF TG_OP = 'DELETE' THEN
     row_input := to_jsonb(OLD);
+    row_ctid := OLD.ctid::text;
+    row_xmin := OLD.xmin::text;
   ELSE
     row_input := to_jsonb(NEW);
+    row_ctid := NEW.ctid::text;
+    row_xmin := NEW.xmin::text;
   END IF;
 
   subject_id := row_input ->> TG_ARGV[0];
+  IF TG_OP = 'UPDATE' THEN
+    old_subject_id := to_jsonb(OLD) ->> TG_ARGV[0];
+    IF old_subject_id IS DISTINCT FROM subject_id
+       AND old_subject_id IS NOT NULL THEN
+      PERFORM otlet.mark_semantic_stale(
+        format('%I.%I', TG_TABLE_SCHEMA, TG_TABLE_NAME),
+        old_subject_id,
+        'source_delete'
+      );
+      IF watch_on_change = 'mark_stale_and_enqueue' THEN
+        PERFORM otlet.record_watch_reconciliation(
+          TG_ARGV[1],
+          old_subject_id,
+          watch_revision_hash,
+          otlet.watch_source_delete_identity(TG_ARGV[1], old_subject_id),
+          true
+        );
+      END IF;
+    END IF;
+  END IF;
   PERFORM otlet.mark_semantic_stale(
     format('%I.%I', TG_TABLE_SCHEMA, TG_TABLE_NAME),
     subject_id,
     CASE WHEN TG_OP = 'DELETE' THEN 'source_delete' ELSE 'source_update' END
   );
 
-  IF TG_OP <> 'DELETE'
-     AND watch_on_change = 'mark_stale_and_enqueue'
+  IF watch_on_change = 'mark_stale_and_enqueue'
      AND subject_id IS NOT NULL THEN
-    PERFORM otlet.run_task_subject(watch_task_name, subject_id);
+    IF TG_OP = 'DELETE' THEN
+      PERFORM otlet.record_watch_reconciliation(
+        TG_ARGV[1],
+        subject_id,
+        watch_revision_hash,
+        otlet.watch_source_delete_identity(TG_ARGV[1], subject_id),
+        true
+      );
+    ELSE
+      reconciliation_input := jsonb_build_object(
+        '_otlet_mvcc', jsonb_build_object(
+          'table', source_table,
+          'subject_id', subject_id,
+          'ctid', row_ctid,
+          'xmin', row_xmin
+        ),
+        'table', source_table,
+        'row', otlet.semantic_project_row(row_input, watch_input_columns)
+      );
+      PERFORM otlet.record_watch_reconciliation(
+        TG_ARGV[1],
+        subject_id,
+        watch_revision_hash,
+        otlet.semantic_source_hash(reconciliation_input),
+        false
+      );
+    END IF;
   END IF;
 
   IF TG_OP = 'DELETE' THEN
@@ -54,7 +118,10 @@ CREATE FUNCTION otlet.watch_semantic_change(
 LANGUAGE plpgsql
 AS $$
 DECLARE
-  trigger_name text := 'otlet_watch_' || substr(md5(table_name::text || ':' || subject_column || ':' || COALESCE(watch_name, '')), 1, 16);
+  trigger_name text := 'otlet_watch_v1_' || substr(right(otlet.identity_text_hash(
+    'watch_trigger',
+    subject_column || ':' || COALESCE(watch_name, '')
+  ), 64), 1, 16);
 BEGIN
   IF watch_name IS NULL OR watch_name = '' THEN
     RAISE EXCEPTION 'otlet watch name is required';
@@ -105,12 +172,36 @@ BEGIN
     RETURN false;
   END IF;
 
+  PERFORM 1
+  FROM otlet.production_policy policy
+  WHERE policy.name = 'default'
+  FOR UPDATE;
+  PERFORM pg_advisory_xact_lock(
+    hashtextextended('otlet_workload_revision:' || watch_row.task_name, 0)
+  );
+
+  SELECT *
+  INTO watch_row
+  FROM otlet.watches w
+  WHERE w.name = drop_watch.watch_name
+  FOR UPDATE;
+
+  IF NOT FOUND THEN
+    RETURN false;
+  END IF;
+
   IF watch_row.kind = 'row'
      AND watch_row.source_table IS NOT NULL
      AND to_regclass(watch_row.source_table) IS NOT NULL THEN
-    trigger_name := 'otlet_watch_' || substr(md5(to_regclass(watch_row.source_table)::text || ':' || watch_row.subject_column || ':' || watch_row.name), 1, 16);
+    trigger_name := 'otlet_watch_v1_' || substr(right(otlet.identity_text_hash(
+      'watch_trigger',
+      watch_row.subject_column || ':' || watch_row.name
+    ), 64), 1, 16);
     EXECUTE format('DROP TRIGGER IF EXISTS %I ON %s', trigger_name, watch_row.source_table);
   END IF;
+
+  DELETE FROM otlet.watch_reconciliation reconciliation
+  WHERE reconciliation.watch_name = watch_row.name;
 
   DELETE FROM otlet.watches w
   WHERE w.name = watch_row.name;
@@ -144,15 +235,17 @@ BEGIN
            WHERE source.value ->> 'table' = pair_source_table
              AND COALESCE(NULLIF(source.value ->> 'subject_column', ''), 'id') = pair_source_subject_column
          ) THEN
-        trigger_name := 'otlet_stale_' || substr(
-          md5(pair_source_table::regclass::text || ':' || pair_source_subject_column),
-          1,
-          16
-        );
+        trigger_name := 'otlet_stale_v1_' || substr(right(otlet.identity_text_hash(
+          'semantic_stale_trigger',
+          pair_source_subject_column
+        ), 64), 1, 16);
         EXECUTE format('DROP TRIGGER IF EXISTS %I ON %s', trigger_name, pair_source_table);
       END IF;
     END LOOP;
   END IF;
+
+  DELETE FROM otlet.workload_revision_heads head
+  WHERE head.task_name = watch_row.task_name;
 
   RETURN true;
 END;
@@ -208,6 +301,30 @@ DECLARE
   cheap_model_name text;
   strong_model_name text;
 BEGIN
+  IF COALESCE(cardinality(actual_action_types), 0) > (
+       SELECT max_identifiers FROM otlet.definition_complexity_limits
+     )
+     OR COALESCE(cardinality(create_watch.input_columns), 0) > (
+       SELECT max_identifiers FROM otlet.definition_complexity_limits
+     ) THEN
+    RAISE EXCEPTION 'otlet definition complexity rejected: identifier count exceeds %',
+      (SELECT max_identifiers FROM otlet.definition_complexity_limits);
+  END IF;
+  PERFORM otlet.task_definition_complexity_guard(
+    create_watch.candidate_query,
+    create_watch.instruction,
+    create_watch.output_schema,
+    actual_runtime_options,
+    actual_input_shaping,
+    actual_decision_contract,
+    jsonb_build_object(
+      'selection_policy', actual_selection_policy,
+      'trigger_policy', actual_trigger_policy,
+      'action_types', to_jsonb(actual_action_types),
+      'input_columns', to_jsonb(create_watch.input_columns),
+      'pair_sources', actual_pair_sources
+    )
+  );
   IF create_watch.watch_name !~ '^[a-z0-9][a-z0-9_-]*$' THEN
     RAISE EXCEPTION 'otlet watch name % must be a simple identifier', create_watch.watch_name;
   END IF;
@@ -252,6 +369,15 @@ BEGIN
     '{action_types}',
     to_jsonb(actual_action_types),
     true
+  );
+
+  task_name := create_watch.watch_name || '_task';
+  PERFORM 1
+  FROM otlet.production_policy policy
+  WHERE policy.name = 'default'
+  FOR UPDATE;
+  PERFORM pg_advisory_xact_lock(
+    hashtextextended('otlet_workload_revision:' || task_name, 0)
   );
 
   IF actual_kind = 'row' THEN
@@ -375,7 +501,8 @@ BEGIN
       runtime_options => actual_runtime_options,
       max_candidate_rows => actual_max_candidate_rows,
       input_shaping => actual_input_shaping,
-      decision_contract => actual_decision_contract
+      decision_contract => actual_decision_contract,
+      pair_sources => actual_pair_sources
     );
     task_name := join_index.task_name;
   END IF;
@@ -480,7 +607,10 @@ BEGIN
     IF COALESCE(saved.trigger_policy ->> 'on_change', 'mark_stale') = 'mark_stale_and_enqueue' THEN
       PERFORM otlet.watch_semantic_change(create_watch.table_name, saved.subject_column, saved.name);
     ELSIF saved.source_table IS NOT NULL AND to_regclass(saved.source_table) IS NOT NULL THEN
-      watch_trigger_name := 'otlet_watch_' || substr(md5(to_regclass(saved.source_table)::text || ':' || saved.subject_column || ':' || saved.name), 1, 16);
+      watch_trigger_name := 'otlet_watch_v1_' || substr(right(otlet.identity_text_hash(
+        'watch_trigger',
+        saved.subject_column || ':' || saved.name
+      ), 64), 1, 16);
       EXECUTE format('DROP TRIGGER IF EXISTS %I ON %s', watch_trigger_name, saved.source_table);
     END IF;
   ELSIF saved.kind = 'pair' THEN
@@ -495,6 +625,13 @@ BEGIN
     END LOOP;
   END IF;
 
+  IF saved.kind <> 'row'
+     OR COALESCE(saved.trigger_policy ->> 'on_change', 'mark_stale') <> 'mark_stale_and_enqueue' THEN
+    DELETE FROM otlet.watch_reconciliation reconciliation
+    WHERE reconciliation.watch_name = saved.name;
+  END IF;
+
+  PERFORM otlet.promote_configured_workload_revision(saved.task_name);
   RETURN saved;
 END;
 $$;
