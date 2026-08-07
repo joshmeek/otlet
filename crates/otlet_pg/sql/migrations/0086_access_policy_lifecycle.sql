@@ -602,7 +602,7 @@ SELECT * FROM otlet.access_policy_role_status_rows();
 CREATE FUNCTION otlet.register_access_policy_capability(
   target_role regrole,
   capability text,
-  reason text,
+  reason text DEFAULT NULL,
   ticket text DEFAULT NULL
 ) RETURNS void
 LANGUAGE plpgsql
@@ -733,7 +733,7 @@ $$;
 
 CREATE FUNCTION otlet.reconcile_access_policy_role(
   target_role regrole,
-  reason text,
+  reason text DEFAULT NULL,
   ticket text DEFAULT NULL
 ) RETURNS void
 LANGUAGE plpgsql
@@ -833,7 +833,7 @@ $$;
 CREATE FUNCTION otlet.revoke_access_policy_capability(
   target_role regrole,
   capability text,
-  reason text,
+  reason text DEFAULT NULL,
   ticket text DEFAULT NULL
 ) RETURNS void
 LANGUAGE plpgsql

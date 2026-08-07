@@ -1,67 +1,145 @@
 log "Proving administrative change ledger"
 
 ledger_suffix="$$"
-ledger_missing_model="administrative_missing_${ledger_suffix}"
-ledger_autocommit_model="administrative_autocommit_${ledger_suffix}"
 ledger_access_race_role="otlet_administrative_access_race_${ledger_suffix}"
 
-set +e
-missing_context_output="$(
-  psql_exec -X -qAt \
-    -v model_name="$ledger_missing_model" <<'SQL' 2>&1
-SET otlet.administrative_reason = '';
-SET otlet.administrative_ticket = '';
+administrative_context_contract="$(
+  psql_exec -X -qAt <<'SQL'
+BEGIN;
+SELECT otlet.set_administrative_change_context(NULL, NULL) \g /dev/null
+SELECT set_config('otlet.strict_update_rejected', 'off', true) \g /dev/null
+SELECT set_config('otlet.strict_context_rejected', 'off', true) \g /dev/null
+SELECT set_config('otlet.strict_disable_rejected', 'off', true) \g /dev/null
 SELECT otlet.register_model(
-  :'model_name',
-  '/tmp/administrative-missing.gguf',
+  'administrative_context_probe',
+  '/tmp/administrative-context.gguf',
   repeat('1', 64),
   jsonb_build_object(
     'sha256', repeat('1', 64),
     'bytes', 1,
     'source', 'administrative-proof',
-    'revision', 'missing',
+    'revision', 'context',
     'quantization', 'test',
     'license', 'test'
-  )
-);
-SQL
-)"
-missing_context_status=$?
-
-autocommit_context_output="$(
-  psql_exec -X -qAt \
-    -v model_name="$ledger_autocommit_model" <<'SQL' 2>&1
-SET otlet.administrative_reason = '';
-SET otlet.administrative_ticket = '';
-SELECT otlet.set_administrative_change_context('autocommit context', NULL);
+  ),
+  1
+) \g /dev/null
 SELECT otlet.register_model(
-  :'model_name',
-  '/tmp/administrative-autocommit.gguf',
-  repeat('2', 64),
+  'administrative_context_probe',
+  '/tmp/administrative-context.gguf',
+  repeat('1', 64),
   jsonb_build_object(
-    'sha256', repeat('2', 64),
+    'sha256', repeat('1', 64),
     'bytes', 1,
     'source', 'administrative-proof',
-    'revision', 'autocommit',
+    'revision', 'context',
     'quantization', 'test',
     'license', 'test'
+  ),
+  2
+) \g /dev/null
+SELECT otlet.set_administrative_change_context(
+  'Enable strict governance proof'
+) \g /dev/null
+UPDATE otlet.production_policy
+SET governance_enforced = true
+WHERE name = 'default';
+SET LOCAL otlet.administrative_reason = '';
+SET LOCAL otlet.administrative_ticket = '';
+DO $proof$
+DECLARE
+  missing_context_message constant text :=
+    'otlet administrative change requires SET LOCAL otlet.administrative_reason or otlet.administrative_ticket';
+BEGIN
+  BEGIN
+    PERFORM otlet.register_model(
+      'administrative_context_probe',
+      '/tmp/administrative-context.gguf',
+      repeat('1', 64),
+      jsonb_build_object(
+        'sha256', repeat('1', 64),
+        'bytes', 1,
+        'source', 'administrative-proof',
+        'revision', 'context',
+        'quantization', 'test',
+        'license', 'test'
+      ),
+      3
+    );
+    RAISE EXCEPTION 'strict administrative update accepted missing context';
+  EXCEPTION WHEN raise_exception THEN
+    IF SQLERRM IS DISTINCT FROM missing_context_message THEN
+      RAISE;
+    END IF;
+    PERFORM set_config('otlet.strict_update_rejected', 'on', true);
+  END;
+
+  BEGIN
+    PERFORM otlet.set_administrative_change_context(NULL, NULL);
+    RAISE EXCEPTION 'strict administrative context accepted empty values';
+  EXCEPTION WHEN raise_exception THEN
+    IF SQLERRM IS DISTINCT FROM
+       'otlet administrative change requires a reason or ticket' THEN
+      RAISE;
+    END IF;
+    PERFORM set_config('otlet.strict_context_rejected', 'on', true);
+  END;
+
+  BEGIN
+    UPDATE otlet.production_policy
+    SET governance_enforced = false
+    WHERE name = 'default';
+    RAISE EXCEPTION 'strict governance was disabled without context';
+  EXCEPTION WHEN raise_exception THEN
+    IF SQLERRM IS DISTINCT FROM missing_context_message THEN
+      RAISE;
+    END IF;
+    PERFORM set_config('otlet.strict_disable_rejected', 'on', true);
+  END;
+END;
+$proof$;
+SELECT concat_ws('|',
+  (SELECT governance_enforced
+   FROM otlet.production_policy
+   WHERE name = 'default'),
+  (SELECT max_active_jobs = 2
+   FROM otlet.models
+   WHERE name = 'administrative_context_probe'),
+  (SELECT count(*) = 2
+    FROM otlet.administrative_change_events
+    WHERE object_type = 'model'
+      AND object_name = 'administrative_context_probe'
+      AND actor_name = session_user
+      AND active_role_name = session_user
+      AND reason IS NULL
+      AND ticket IS NULL
+      AND operation IN ('insert', 'update')
+  ),
+  current_setting('otlet.strict_update_rejected', true) = 'on',
+  current_setting('otlet.strict_context_rejected', true) = 'on',
+  current_setting('otlet.strict_disable_rejected', true) = 'on',
+  NOT EXISTS (
+    SELECT 1
+    FROM otlet.administrative_change_events
+    WHERE object_type = 'model'
+      AND object_name = 'administrative_context_probe'
+      AND new_revision_hash = otlet.administrative_state_hash(
+        'model',
+        (SELECT to_jsonb(model) - ARRAY['created_at', 'last_used_at']
+         FROM otlet.models model
+         WHERE model.name = 'administrative_context_probe')
+      )
+      AND operation = 'update'
+      AND reason IS NOT NULL
   )
 );
+ROLLBACK;
 SQL
 )"
-autocommit_context_status=$?
-set -e
-
-if [ "$missing_context_status" -eq 0 ] \
-   || [[ "$missing_context_output" != *"administrative change requires SET LOCAL"* ]]; then
-  echo "Administrative mutation did not reject missing context" >&2
+[ "$administrative_context_contract" = "t|t|t|t|t|t|t" ] || {
+  echo "Administrative context contract failed: $administrative_context_contract" >&2
   exit 1
-fi
-if [ "$autocommit_context_status" -eq 0 ] \
-   || [[ "$autocommit_context_output" != *"administrative change requires SET LOCAL"* ]]; then
-  echo "Autocommit administrative context leaked into a later statement" >&2
-  exit 1
-fi
+}
 
 psql_exec -X -q -v role_name="$ledger_access_race_role" <<'SQL' >/dev/null
 SELECT format('CREATE ROLE %I NOLOGIN', :'role_name') \gexec
@@ -720,8 +798,7 @@ WITH model_chain AS (
     NOT EXISTS (
       SELECT 1
       FROM otlet.administrative_change_events event
-      WHERE num_nonnulls(event.reason, event.ticket) = 0
-         OR num_nonnulls(event.old_revision_hash, event.new_revision_hash) = 0
+      WHERE num_nonnulls(event.old_revision_hash, event.new_revision_hash) = 0
          OR event.old_revision_hash IS NOT DISTINCT FROM event.new_revision_hash
          OR COALESCE(event.old_revision_hash, event.new_revision_hash)
            !~ '^otlet:v1:sha256:[0-9a-f]{64}$'
@@ -739,16 +816,6 @@ SQL
 expected_administrative_change_ledger_contract="administrative_change_ledger_contract=t|t|t|t|t|t|t|t|t|t|t|t|t|t|t|t|t|t|t"
 if [ "$administrative_change_ledger_contract" != "$expected_administrative_change_ledger_contract" ]; then
   echo "Administrative change ledger contract failed: $administrative_change_ledger_contract" >&2
-  exit 1
-fi
-
-if [ "$(psql_value -v missing_model="$ledger_missing_model" -v autocommit_model="$ledger_autocommit_model" <<'SQL'
-SELECT count(*)
-FROM otlet.models
-WHERE name IN (:'missing_model', :'autocommit_model');
-SQL
-)" != "0" ]; then
-  echo "Rejected administrative context probes left model state" >&2
   exit 1
 fi
 

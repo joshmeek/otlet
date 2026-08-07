@@ -152,7 +152,22 @@ WITH base_definition AS (
       ),
       '{runtime,effective_options,context_window_tokens}',
       '3072'::jsonb
-    ) AS overflow
+    ) AS overflow,
+    jsonb_set(
+      jsonb_set(
+        smaller #- '{task,runtime_options,inference_cache}'
+                #- '{runtime,effective_options,inference_cache}',
+        '{task,runtime_options,max_worker_rss_bytes}',
+        '0'::jsonb
+      ),
+      '{runtime,effective_options,max_worker_rss_bytes}',
+      '0'::jsonb
+    ) AS portable_defaults,
+    jsonb_set(
+      smaller #- '{task,runtime_options,inference_cache}',
+      '{runtime,effective_options,inference_cache}',
+      'true'::jsonb
+    ) AS incompatible_default
   FROM base_definition
 ), statuses AS (
   SELECT
@@ -222,7 +237,49 @@ WITH base_definition AS (
         'current_rss_bytes', 1,
         'default_llama_threads', 1
       )
-    ) AS mismatch
+    ) AS mismatch,
+    otlet.portable_runtime_option_status(
+      definitions.portable_defaults,
+      jsonb_extract_path(definitions.portable_defaults, 'models', 'direct'),
+      jsonb_build_object(
+        'runtime_contract', otlet.portable_reference_runtime_contract(),
+        'model_artifact_hash',
+          jsonb_extract_path_text(
+            definitions.portable_defaults, 'models', 'direct', 'artifact_hash'
+          ),
+        'model_artifact_bytes',
+          jsonb_extract_path_text(
+            definitions.portable_defaults,
+            'models',
+            'direct',
+            'artifact_identity',
+            'bytes'
+          )::bigint,
+        'current_rss_bytes', 999999999,
+        'default_llama_threads', 1
+      )
+    ) AS portable_defaults,
+    otlet.portable_runtime_option_status(
+      definitions.incompatible_default,
+      jsonb_extract_path(definitions.incompatible_default, 'models', 'direct'),
+      jsonb_build_object(
+        'runtime_contract', otlet.portable_reference_runtime_contract(),
+        'model_artifact_hash',
+          jsonb_extract_path_text(
+            definitions.incompatible_default, 'models', 'direct', 'artifact_hash'
+          ),
+        'model_artifact_bytes',
+          jsonb_extract_path_text(
+            definitions.incompatible_default,
+            'models',
+            'direct',
+            'artifact_identity',
+            'bytes'
+          )::bigint,
+        'current_rss_bytes', 1,
+        'default_llama_threads', 1
+      )
+    ) AS incompatible_default
   FROM definitions
 )
 SELECT concat_ws('|',
@@ -276,6 +333,16 @@ SELECT concat_ws('|',
   jsonb_extract_path_text(
     statuses.mismatch, 'rejected', 'model_context_window_tokens'
   ),
+  statuses.portable_defaults ->> 'compatible',
+  jsonb_extract_path_text(
+    statuses.portable_defaults, 'defaulted', 'inference_cache'
+  ),
+  jsonb_extract_path_text(
+    statuses.portable_defaults, 'effective', 'max_worker_rss_bytes'
+  ),
+  jsonb_extract_path_text(
+    statuses.incompatible_default, 'rejected', 'inference_cache'
+  ),
   otlet.classify_failure_reason(
     'failed', NULL, NULL, NULL,
     '{"stop_reason":"requested_context_window_exceeds_model_limit"}'::jsonb
@@ -292,7 +359,7 @@ SQL
 )
 
 [ "$model_bound_context_contract" = \
-  "4096|2048|4096|2048|4096|2048|t|t|t|t|t|2048|1024|1024|2048|1024|1024|true|requested_context_window_exceeds_model_limit|2048|3072|2048|model_context_window_tokens_must_match_artifact_identity|otlet.failure.v1.runtime_configuration_rejected|otlet.failure.v1.resource_admission_rejected|0" ] || {
+  "4096|2048|4096|2048|4096|2048|t|t|t|t|t|2048|1024|1024|2048|1024|1024|true|requested_context_window_exceeds_model_limit|2048|3072|2048|model_context_window_tokens_must_match_artifact_identity|true|false|0|inference_cache_must_be_false|otlet.failure.v1.runtime_configuration_rejected|otlet.failure.v1.resource_admission_rejected|0" ] || {
   echo "Model-bound context budget contract mismatch: $model_bound_context_contract" >&2
   exit 1
 }

@@ -110,14 +110,6 @@ SQL
 cleanup
 prove_legacy_upgrade_rejection
 docker exec "$container" createdb -U postgres "$database"
-docker exec -i "$container" psql -U postgres -d postgres \
-  -X -q -v ON_ERROR_STOP=1 -v database="$database" <<'SQL' >/dev/null
-SELECT format(
-  'ALTER DATABASE %I SET otlet.administrative_reason = %L',
-  :'database',
-  'portable upgrade executable proof'
-) \gexec
-SQL
 install_portable_through_79
 
 docker exec -i "$container" psql -U postgres -d "$database" \
@@ -141,6 +133,7 @@ CREATE TABLE public.portable_upgrade_sentinel (
   legacy_materialization_id bigint,
   legacy_workload_pack_hash text,
   legacy_evidence_job_id bigint,
+  legacy_failed_job_id bigint,
   legacy_evidence_archive_kind text,
   legacy_evidence_delete_kind text,
   maintenance_cleanup_step_oid oid,
@@ -444,8 +437,7 @@ SELECT otlet.register_access_policy_capability(
 ) \g /dev/null
 SELECT otlet.register_access_policy_capability(
   :'application_role'::regrole,
-  'application',
-  'Adopt upgraded application role'
+  'application'
 ) \g /dev/null
 SELECT otlet.register_access_policy_capability(
   :'portable_worker_role'::regrole,
@@ -484,6 +476,15 @@ SELECT concat_ws('|',
     :'operator_role',
     'otlet.access_policy_status',
     'SELECT'
+  ),
+  EXISTS (
+    SELECT 1
+    FROM otlet.administrative_change_events event
+    WHERE event.object_type = 'access_policy'
+      AND event.object_name = :'application_role'
+      AND event.operation = 'register_capability'
+      AND event.reason IS NULL
+      AND event.ticket IS NULL
   )
 ) \gset
 BEGIN;
@@ -516,7 +517,7 @@ SELECT :'concat_ws' || '|' ||
 SQL
 )"
 [ "$portable_access_policy_migration_contract" = \
-  "4|3|1|1|t|t|t|reconciled|0" ] || {
+  "4|3|1|1|t|t|t|t|reconciled|0" ] || {
   echo "Portable access-policy migration contract mismatch: $portable_access_policy_migration_contract" >&2
   exit 1
 }
@@ -605,6 +606,40 @@ SQL
 portable_evidence_lifecycle_default_contract="$(
   docker exec -i "$container" psql -U postgres -d "$database" \
     -X -qAt -v ON_ERROR_STOP=1 <<'SQL'
+UPDATE otlet.production_policy
+SET successful_job_retention = interval '1 minute',
+    failed_job_retention = interval '1 day'
+WHERE name = 'default';
+WITH inserted AS (
+  INSERT INTO otlet.jobs (
+    task_name,
+    subject_id,
+    input,
+    status,
+    attempts,
+    error,
+    created_at,
+    finished_at
+  ) VALUES (
+    'model_concurrency_probe',
+    'post-0087-failed',
+    '{"value":"legacy failed cleanup"}'::jsonb,
+    'failed',
+    1,
+    'Legacy failed cleanup',
+    clock_timestamp() - interval '3 days',
+    clock_timestamp() - interval '2 days'
+  )
+  RETURNING id
+)
+UPDATE public.portable_upgrade_sentinel sentinel
+SET legacy_failed_job_id = inserted.id
+FROM inserted
+WHERE sentinel.id = 1;
+CREATE TEMP TABLE disabled_evidence_step AS
+SELECT * FROM otlet.maintenance_evidence_lifecycle_step();
+CREATE TEMP TABLE legacy_cleanup_step AS
+SELECT * FROM otlet.maintenance_cleanup_step();
 SELECT concat_ws('|',
   EXISTS (
     SELECT 1
@@ -621,9 +656,24 @@ SELECT concat_ws('|',
       ON sentinel.legacy_evidence_job_id = lifecycle.job_id
     WHERE sentinel.id = 1
   ),
-  (SELECT successful_job_retention IS NULL
+  (SELECT successful_job_retention = interval '1 minute'
+      AND failed_job_retention = interval '1 day'
+      AND NOT evidence_lifecycle_enabled
+      AND NOT governance_enforced
    FROM otlet.production_policy
    WHERE name = 'default'),
+  (SELECT NOT item_found FROM disabled_evidence_step),
+  (SELECT item_found AND item_kind = 'failed_canceled_job'
+      AND affected_rows = 1
+   FROM legacy_cleanup_step)
+    AND NOT EXISTS (
+      SELECT 1 FROM otlet.jobs job
+      WHERE job.id = sentinel_state.legacy_failed_job_id
+    )
+    AND NOT EXISTS (
+      SELECT 1 FROM otlet.evidence_lifecycle_records lifecycle
+      WHERE lifecycle.job_id = sentinel_state.legacy_failed_job_id
+    ),
   (SELECT max(version) = 88 AND count(*) = 88
    FROM otlet.portable_schema_migrations),
   NOT EXISTS (SELECT 1 FROM otlet.verify_invariants()),
@@ -665,17 +715,13 @@ WHERE sentinel_state.id = 1;
 SQL
 )"
 [ "$portable_evidence_lifecycle_default_contract" = \
-  "t|t|t|t|t|t|t|t|t|t|t" ] || {
+  "t|t|t|t|t|t|t|t|t|t|t|t|t" ] || {
   echo "Portable evidence-lifecycle default contract mismatch: $portable_evidence_lifecycle_default_contract" >&2
   exit 1
 }
 
 docker exec -i "$container" psql -U postgres -d "$database" \
   -X -q -v ON_ERROR_STOP=1 <<'SQL' >/dev/null
-UPDATE otlet.production_policy
-SET successful_job_retention = interval '1 minute'
-WHERE name = 'default';
-
 SELECT otlet.request_evidence_lifecycle(
   sentinel.legacy_evidence_job_id,
   false,
@@ -919,6 +965,18 @@ SELECT concat_ws('|',
     ) LIKE '%policy.successful_job_retention IS NOT NULL%'
     AND pg_catalog.pg_get_functiondef(
       'otlet.evidence_lifecycle_manages_job(bigint)'::regprocedure
+    ) LIKE '%policy.evidence_lifecycle_enabled%'
+    AND pg_catalog.pg_get_functiondef(
+      'otlet.evidence_lifecycle_maintenance_pending()'::regprocedure
+    ) LIKE '%policy.evidence_lifecycle_enabled%'
+    AND pg_catalog.pg_get_functiondef(
+      'otlet.maintenance_cleanup_step_before_evidence()'::regprocedure
+    ) LIKE '%NOT policy.evidence_lifecycle_enabled%'
+    AND pg_catalog.pg_get_functiondef(
+      'otlet.maintenance_cleanup_pending_before_evidence()'::regprocedure
+    ) LIKE '%NOT policy.evidence_lifecycle_enabled%'
+    AND pg_catalog.pg_get_functiondef(
+      'otlet.evidence_lifecycle_manages_job(bigint)'::regprocedure
     ) LIKE '%COALESCE(job.finished_at, job.created_at)%'
     AND pg_catalog.pg_get_functiondef(
       'otlet.evidence_lifecycle_manages_job(bigint)'::regprocedure
@@ -945,6 +1003,9 @@ SELECT concat_ws('|',
     AND pg_catalog.pg_get_functiondef(
       'otlet.maintenance_evidence_lifecycle_step()'::regprocedure
     ) LIKE '%''evidence_request''::text%'
+    AND pg_catalog.pg_get_functiondef(
+      'otlet.maintenance_evidence_lifecycle_step()'::regprocedure
+    ) LIKE '%policy.evidence_lifecycle_enabled%'
     AND pg_catalog.pg_get_functiondef(
       'otlet.maintenance_evidence_lifecycle_step()'::regprocedure
     ) LIKE '%candidate_job_id IS NULL OR record.job_id = candidate_job_id%'
@@ -2305,6 +2366,14 @@ SELECT concat_ws('|',
       FROM otlet.operational_observability_status
       WHERE observability_schema <> 'otlet.observability.status.v1'
     )
+    AND EXISTS (
+      SELECT 1
+      FROM otlet.operational_observability_status
+      WHERE category = 'task_queue_age_ms'
+        AND denominator IS NULL
+        AND maximum IS NULL
+        AND status = 'disabled'
+    )
     AND NOT EXISTS (
       SELECT 1
       FROM otlet.labeled_quality_status
@@ -2693,7 +2762,21 @@ SELECT concat_ws('|',
     'public',
     'otlet.drop_watch_registry(text)',
     'EXECUTE'
-  ),
+  )
+    AND pg_catalog.pg_get_functiondef(
+      'otlet.drop_watch(text)'::regprocedure
+    ) LIKE '%governance_enforced%FOR UPDATE%otlet_workload_revision:%'
+    AND pg_catalog.pg_get_functiondef(
+      'otlet.drop_watch_registry(text)'::regprocedure
+    ) LIKE '%otlet_queue_admission%lock_task_source_relations%has unfinished work or reconciliation%'
+    AND EXISTS (
+      SELECT 1
+      FROM pg_catalog.pg_constraint constraint_row
+      WHERE constraint_row.conrelid = 'otlet.watch_reconciliation'::regclass
+        AND constraint_row.confrelid = 'otlet.watches'::regclass
+        AND constraint_row.contype = 'f'
+        AND constraint_row.confdeltype = 'c'
+    ),
   to_regprocedure('otlet.watch_source_relation_drift(text,text)') IS NOT NULL
     AND to_regprocedure('otlet.lock_task_source_relations(text)') IS NOT NULL
     AND to_regprocedure('otlet.repair_source_query_contract(text,text)') IS NOT NULL
@@ -2742,6 +2825,94 @@ administrative_migration_contract="$(
   docker exec -i "$container" psql -U postgres -d "$database" \
     -X -qAt -v ON_ERROR_STOP=1 -v operator_role="$operator_role" <<'SQL' | tail -n 1
 BEGIN;
+SET LOCAL otlet.administrative_reason = '';
+SET LOCAL otlet.administrative_ticket = '';
+SELECT set_config('otlet.portable_administrative_update_rejected', 'off', true) \g /dev/null
+SELECT set_config('otlet.portable_administrative_disable_rejected', 'off', true) \g /dev/null
+SELECT otlet.register_model(
+  'portable_administrative_bootstrap_probe',
+  '/tmp/portable-administrative-bootstrap.gguf',
+  repeat('9', 64),
+  jsonb_build_object(
+    'sha256', repeat('9', 64),
+    'bytes', 1,
+    'source', 'portable-upgrade-demo',
+    'revision', 'administrative-bootstrap',
+    'quantization', 'test',
+    'license', 'test'
+  ),
+  1
+) \g /dev/null
+SELECT otlet.register_model(
+  'portable_administrative_bootstrap_probe',
+  '/tmp/portable-administrative-bootstrap.gguf',
+  repeat('9', 64),
+  jsonb_build_object(
+    'sha256', repeat('9', 64),
+    'bytes', 1,
+    'source', 'portable-upgrade-demo',
+    'revision', 'administrative-bootstrap',
+    'quantization', 'test',
+    'license', 'test'
+  ),
+  2
+) \g /dev/null
+SELECT otlet.set_administrative_change_context(
+  'enable portable strict governance proof'
+) \g /dev/null
+UPDATE otlet.production_policy
+SET governance_enforced = true
+WHERE name = 'default';
+SET LOCAL otlet.administrative_reason = '';
+SET LOCAL otlet.administrative_ticket = '';
+DO $proof$
+BEGIN
+  BEGIN
+    PERFORM otlet.register_model(
+      'portable_administrative_bootstrap_probe',
+      '/tmp/portable-administrative-bootstrap.gguf',
+      repeat('9', 64),
+      jsonb_build_object(
+        'sha256', repeat('9', 64),
+        'bytes', 1,
+        'source', 'portable-upgrade-demo',
+        'revision', 'administrative-bootstrap',
+        'quantization', 'test',
+        'license', 'test'
+      ),
+      3
+    );
+    RAISE EXCEPTION 'portable administrative update accepted missing context';
+  EXCEPTION WHEN raise_exception THEN
+    IF SQLERRM IS DISTINCT FROM
+       'otlet administrative change requires SET LOCAL otlet.administrative_reason or otlet.administrative_ticket' THEN
+      RAISE;
+    END IF;
+    PERFORM set_config(
+      'otlet.portable_administrative_update_rejected',
+      'on',
+      true
+    );
+  END;
+
+  BEGIN
+    UPDATE otlet.production_policy
+    SET governance_enforced = false
+    WHERE name = 'default';
+    RAISE EXCEPTION 'portable strict governance was disabled without context';
+  EXCEPTION WHEN raise_exception THEN
+    IF SQLERRM IS DISTINCT FROM
+       'otlet administrative change requires SET LOCAL otlet.administrative_reason or otlet.administrative_ticket' THEN
+      RAISE;
+    END IF;
+    PERFORM set_config(
+      'otlet.portable_administrative_disable_rejected',
+      'on',
+      true
+    );
+  END;
+END;
+$proof$;
 SELECT otlet.set_administrative_change_context(
   'portable administrative ledger proof'
 ) \g /dev/null
@@ -2783,7 +2954,29 @@ SELECT concat_ws('|',
     AND to_regprocedure('otlet.append_administrative_change(text,text,text,text,text)') IS NOT NULL
     AND to_regprocedure('otlet.record_administrative_row_change()') IS NOT NULL
     AND to_regprocedure('otlet.access_policy_revision(regrole)') IS NOT NULL
-    AND to_regclass('otlet.audit_administrative_change_export') IS NOT NULL,
+    AND to_regclass('otlet.audit_administrative_change_export') IS NOT NULL
+    AND current_setting(
+      'otlet.portable_administrative_update_rejected',
+      true
+    ) = 'on'
+    AND current_setting(
+      'otlet.portable_administrative_disable_rejected',
+      true
+    ) = 'on'
+    AND (
+      SELECT max_active_jobs = 2
+      FROM otlet.models
+      WHERE name = 'portable_administrative_bootstrap_probe'
+    )
+    AND (
+      SELECT count(*) = 2
+      FROM otlet.administrative_change_events
+      WHERE object_type = 'model'
+        AND object_name = 'portable_administrative_bootstrap_probe'
+        AND reason IS NULL
+        AND ticket IS NULL
+        AND operation IN ('insert', 'update')
+    ),
   (SELECT count(*) = 2
           AND count(DISTINCT object_name) = 2
           AND bool_and(
@@ -4506,6 +4699,18 @@ SELECT concat_ws('|',
   ) LIKE '%source,candidate_query%source,max_candidate_rows%task,decision_contract%task,output_schema%measure_candidate_set_coverage%current passing candidate-set coverage report%'
     AND pg_catalog.pg_get_functiondef(
       'otlet.guard_candidate_set_coverage_promotion()'::regprocedure
+    ) LIKE '%contract.baseline_workload_revision_hash =%OLD.active_workload_revision_hash%'
+    AND pg_catalog.pg_get_functiondef(
+      'otlet.guard_candidate_set_coverage_promotion()'::regprocedure
+    ) LIKE '%contract.candidate_workload_revision_hash =%NEW.active_workload_revision_hash%'
+    AND pg_catalog.pg_get_functiondef(
+      'otlet.guard_candidate_set_coverage_promotion()'::regprocedure
+    ) LIKE '%contract.definition #> ''{population,rule,candidate_coverage}''%'
+    AND pg_catalog.pg_get_functiondef(
+      'otlet.guard_candidate_set_coverage_promotion()'::regprocedure
+    ) LIKE '%successor.supersedes_contract_hash = contract.contract_hash%'
+    AND pg_catalog.pg_get_functiondef(
+      'otlet.guard_candidate_set_coverage_promotion()'::regprocedure
     ) NOT LIKE '%source,query_contract%',
   pg_catalog.pg_get_functiondef(
     'otlet.rollback_workload_revision(text,text,text)'::regprocedure
@@ -4831,6 +5036,11 @@ SELECT concat_ws('|',
      AND trigger.tgfoid = expected.function_oid
      AND trigger.tgtype = expected.trigger_type
      AND NOT trigger.tgisinternal
+  ) AND (
+    SELECT position('governance_enforced' IN function.prosrc) > 0
+    FROM pg_catalog.pg_proc function
+    WHERE function.oid =
+      'otlet.guard_entity_graph_promotion()'::regprocedure
   ),
   (
     SELECT count(*) = 8
@@ -6333,6 +6543,12 @@ SELECT otlet.create_watch(
   candidate_query => 'SELECT ''one''::text AS subject_id, ''{}''::jsonb AS input',
   max_candidate_rows => 1
 ) \g /dev/null
+SELECT otlet.set_administrative_change_context(
+  'Prove strict portable watch replacement'
+) \g /dev/null
+UPDATE otlet.production_policy
+SET governance_enforced = true
+WHERE name = 'default';
 DO $proof$
 BEGIN
   BEGIN
@@ -6355,6 +6571,9 @@ BEGIN
   RAISE EXCEPTION 'watch identity change unexpectedly succeeded';
 END
 $proof$;
+UPDATE otlet.production_policy
+SET governance_enforced = false
+WHERE name = 'default';
 INSERT INTO otlet.jobs (task_name, subject_id, input)
 VALUES ('model_concurrency_probe', 'lifecycle-queued', '{"value":0}'::jsonb);
 SELECT otlet.set_task_lifecycle(

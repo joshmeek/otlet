@@ -1,7 +1,7 @@
 ALTER TABLE otlet.production_policy
 ADD COLUMN max_active_jobs_per_task integer NOT NULL DEFAULT 8,
 ADD COLUMN max_queued_input_bytes_per_task bigint,
-ADD COLUMN max_queue_age interval NOT NULL DEFAULT interval '1 day';
+ADD COLUMN max_queue_age interval;
 
 UPDATE otlet.production_policy
 SET max_queued_input_bytes_per_task = LEAST(
@@ -22,7 +22,8 @@ ADD CONSTRAINT production_policy_task_queue_bytes_global_bound CHECK (
   max_queued_input_bytes_per_task <= max_queued_input_bytes_total
 ),
 ADD CONSTRAINT production_policy_task_queue_age_bound CHECK (
-  max_queue_age BETWEEN interval '1 second' AND interval '30 days'
+  max_queue_age IS NULL
+  OR max_queue_age BETWEEN interval '1 second' AND interval '30 days'
 );
 
 ALTER TABLE otlet.jobs
@@ -191,8 +192,11 @@ SELECT
   capacity.max_queued_input_bytes_per_task,
   capacity.available_queued_input_bytes,
   capacity.max_queue_age,
-  origin.oldest_queued_at + capacity.max_queue_age
-    <= statement_timestamp() AS origin_queue_age_exceeded,
+  COALESCE(
+    origin.oldest_queued_at + capacity.max_queue_age
+      <= statement_timestamp(),
+    false
+  ) AS origin_queue_age_exceeded,
   capacity.queue_age_exceeded AS task_queue_age_exceeded,
   capacity.queue_bytes_exhausted
 FROM origin_queue origin

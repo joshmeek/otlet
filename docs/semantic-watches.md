@@ -4,7 +4,7 @@ Use this guide to extend the direct entity-resolution walkthrough into reusable 
 
 The vendor-pair demo covers the end-to-end path. Smaller learning tables isolate each transfer pattern
 
-This administrative walkthrough runs as the extension owner because it creates watches, reads raw status and receipt views, and changes source fixtures. Auditors use the redacted exports. Calibrated reviewers receive the bounded review capability, while operators receive dry-run, apply, and retry authority described in [production-contract.md](production-contract.md)
+This administrative walkthrough runs as the extension owner because it creates watches, reads raw status and receipt views, and changes source fixtures. Auditors use the redacted exports. Registered reviewers receive the bounded review capability; a declared review rubric also requires calibration. Operators receive dry-run, apply, and retry authority described in [production-contract.md](production-contract.md)
 
 Watch jobs keep active source input owner-only. Derived receipts follow the same redacted storage policy as direct jobs: hashes and numeric traces remain, while assembled prompts, raw model text, and token text stay out of production storage
 
@@ -90,13 +90,11 @@ The source table remains application-owned. The watch stores model-derived state
 
 A row watch wraps a source table with an Otlet task, materialized records, stale tracking, trigger policy, and current-row SQL reads
 
-This creation example uses the native worker because it enables inference caching. Portable deployments set `inference_cache` to `false`, commit refresh jobs for the external worker, and read accepted state through `semantic_index_current_rows(...)`
+This creation example uses the native worker because it enables inference caching. Portable deployments omit `inference_cache` or set it to `false`, commit refresh jobs for the external worker, and read accepted state through `semantic_index_current_rows(...)`
 
 The creation shape is:
 
 ```sql
-SET otlet.administrative_reason = 'Semantic watches walkthrough';
-
 SELECT otlet.create_watch(
   'demo_semantic_vendor_idx',
   'row',
@@ -165,7 +163,7 @@ Contract output:
 semantic_index_refresh_queued=3
 ```
 
-Before the first refresh of a large row or pair watch, run `otlet.workload_enablement_preflight(...)` against the active watch task revision with `requested_enablement_kind => 'watch'`. The report uses `EXPLAIN` and current semantic state without executing candidates or requiring the pair-refresh statement timeout. Exact refresh still revalidates the source and enforces its normal timeout and admission limits. See [workload admission](workload-admission.md#enablement-preflight) for the call and field contract
+For a large row or pair watch, use `otlet.workload_enablement_preflight(...)` when you want sizing evidence before the first refresh. Call it against the active watch task revision with `requested_enablement_kind => 'watch'`. The report uses `EXPLAIN` and current semantic state without executing candidates or requiring the pair-refresh statement timeout. Exact refresh still revalidates the source and enforces its normal timeout and admission limits. See [workload admission](workload-admission.md#enablement-preflight) for the call and field contract
 
 Once materialized, the index has planner-visible status:
 
@@ -677,7 +675,7 @@ FROM otlet.import_watch(
 );
 ```
 
-Import validates `otlet.watch.v1`, resolves database dependencies, and calls `otlet.create_watch(...)`. A failed import rolls back its statement and leaves an existing watch unchanged. Identity changes require a new watch name
+Import validates `otlet.watch.v1`, resolves database dependencies, and calls `otlet.create_watch(...)`. A failed import rolls back its statement and leaves an existing watch unchanged. In advisory governance mode, an idle watch with no reconciliation backlog may be replaced under the same name. Strict governance requires retirement and pinned deletion before an identity change
 
 ## Promote A Workload Pack
 

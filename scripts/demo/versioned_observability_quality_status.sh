@@ -1118,6 +1118,16 @@ BEGIN
     WHERE task_name = 'versioned_observability_probe'
       AND workload_revision_hash = revision_hash
       AND metric_name = 'resource_pressure'
+      AND category = 'task_queue_age_ms'
+      AND denominator IS NULL
+      AND maximum IS NULL
+      AND status = 'disabled'
+  ) OR NOT EXISTS (
+    SELECT 1
+    FROM observability_final_status
+    WHERE task_name = 'versioned_observability_probe'
+      AND workload_revision_hash = revision_hash
+      AND metric_name = 'resource_pressure'
       AND category = 'task_active_claims'
       AND value_numeric = maximum
       AND unit = 'jobs'

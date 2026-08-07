@@ -20,7 +20,7 @@ The install transaction runs the current SQL contract as migrations `0001` throu
 
 The database keeps zero `otlet` extension objects and zero C-language Otlet functions
 
-Model, task, watch, selection, action-policy, workload-pack, Otlet access-grant, and retention changes require a reason or ticket in the same transaction. Both native and SQL-only installs append those changes to `otlet.audit_administrative_change_export`
+Both native and SQL-only installs append administrative changes to `otlet.audit_administrative_change_export`. Reasons and tickets are optional by default; set `production_policy.governance_enforced = true` to require one in the same transaction for every logged change
 
 Deterministic task synthesis inside `otlet.enqueue_ask` is runtime bookkeeping. It appends no administrative event and restores the caller's suppression state
 
@@ -73,9 +73,11 @@ otlet_worker
 
 Store `database.example:5432:app:otlet_worker:replace-me` in the mounted password file and make it readable only by the worker user. `OTLET_DATABASE_URL` must be a PostgreSQL URI without a password; the worker passes that URI to `psql` while libpq reads the credential from `PGPASSFILE`. No credential enters a process argument or log, and logs omit the connection string
 
+For a disposable local database, keep the URL passwordless, set `PGPASSWORD`, and set `OTLET_PORTABLE_REQUIRE_TLS=0`. Use `PGPASSFILE` and verified TLS for a deployed worker
+
 The process runs deployment preflight before it can claim work, rejects symlinks, hashes one open regular GGUF, and loads that verified file descriptor once at startup. Keep the model in a deployment-owned read-only mount. The reference runtime uses a fixed 4,096-token physical context, 512-token batches, 128-token microbatches, and zero GPU layers. Each artifact registration sets a tested ceiling from 1 to 4,096 tokens; an existing registration without the field retains the prior 4,096-token limit. A task may request only a smaller logical ceiling. It samples Linux VmRSS before claim, before inference, and after inference. A missing sample or budget overage fails the claim or attempt without trusted output
 
-Portable admission accepts `reasoning`, `max_tokens`, `max_attempt_ms`, `context_window_tokens`, `inference_cache`, `max_worker_rss_bytes`, `generation_trace`, `llama_threads`, and `llama_batch_threads`. Each task must set `inference_cache` to `false`. Tasks may omit `generation_trace` or set it to `false`. PostgreSQL rejects other options before it changes claim state, resolves missing or zero thread counts to the worker default, and returns the normalized settings for execution. The default production policy supplies a nonzero RSS budget
+Portable admission accepts `reasoning`, `max_tokens`, `max_attempt_ms`, `context_window_tokens`, `inference_cache`, `max_worker_rss_bytes`, `generation_trace`, `llama_threads`, and `llama_batch_threads`. Omitting `inference_cache` defaults it to `false`; explicit `true` remains incompatible. Tasks may omit `generation_trace` or set it to `false`. PostgreSQL rejects other options before it changes claim state, resolves missing or zero thread counts to the worker default, and returns the normalized settings for execution. The default production policy supplies a nonzero RSS budget; `max_worker_rss_bytes = 0` disables that budget
 
 PostgreSQL assembles the exact prompt from the shaped snapshot and immutable task contract, then recomputes and validates the terminal identities, schema result, output, actions, and receipt lineage. It stores the database-authored requested, honored, defaulted, rejected, effective, artifact, context, thread, and RSS evidence on the claim and linked receipt. The worker checks prompt tokens and prompt plus declared generation tokens against the effective ceiling before decode, projects prompt and bounded decode buffers against the job RSS budget, and records the inputs, decision, and stable reason. Rejection stores no output
 
@@ -150,7 +152,6 @@ Register cheap and strong model workers, then use the normal selection policy:
 
 ```sql
 BEGIN;
-SELECT otlet.set_administrative_change_context('Route the vendor summary task');
 SELECT otlet.set_model_selection_policy(
   'vendor_summary_task',
   'qwen3_1_7b',
@@ -168,7 +169,6 @@ Create a row watch with durable automatic catch-up, then commit source changes b
 
 ```sql
 BEGIN;
-SELECT otlet.set_administrative_change_context('Create the vendor note watch');
 CREATE TABLE vendor_notes (
   vendor_id text PRIMARY KEY,
   note text NOT NULL
@@ -182,7 +182,7 @@ SELECT otlet.create_watch(
   model_name => 'qwen35_4b',
   table_name => 'vendor_notes'::regclass,
   subject_column => 'vendor_id',
-  runtime_options => '{"reasoning":"off","max_tokens":256,"inference_cache":false}'::jsonb,
+  runtime_options => '{"reasoning":"off","max_tokens":256}'::jsonb,
   trigger_policy => '{"on_change":"mark_stale_and_enqueue"}'::jsonb,
   input_columns => ARRAY['note']::text[]
 );
@@ -271,10 +271,10 @@ It rejects an unsupported pre-`0044` ledger without changing its state, then ins
 
 ```text
 portable_legacy_upgrade_contract=43|43|preserved
-portable_upgrade_contract=88|88|t|t|preserved|t|4096|t|t|t|t|0|t|t|t|t|t|t|t|t|t|t|t|t|t|t|t|t|t
+portable_upgrade_contract=88|88|t|t|preserved|t|4096|t|t|t|t|0|t|t|t|t|t|t|t|t|t|t|t|t|t|t|t|t|t|t
 portable_access_policy_column_repair_contract=true|true|true
-portable_access_policy_migration_contract=4|3|1|1|t|t|t|reconciled|0
-portable_evidence_lifecycle_default_contract=t|t|t|t|t|t|t|t|t|t|t
+portable_access_policy_migration_contract=4|3|1|1|t|t|t|t|reconciled|0
+portable_evidence_lifecycle_default_contract=t|t|t|t|t|t|t|t|t|t|t|t|t
 portable_evidence_lifecycle_migration_contract=evidence_archive|evidence_delete|t|deleted|complete|complete|t|t|t|t|t|t|t|t|t|t|t|t|t|t|t|t|t|t
 portable_job_origin_workload_budget_contract=4|2|1|t|t|t|t
 ```

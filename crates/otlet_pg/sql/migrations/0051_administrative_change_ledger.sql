@@ -1,3 +1,38 @@
+ALTER TABLE otlet.production_policy
+ADD COLUMN governance_enforced boolean NOT NULL DEFAULT false;
+
+CREATE OR REPLACE FUNCTION otlet.drop_watch(watch_name text) RETURNS boolean
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  watch_task_name text;
+  governance_enforced boolean;
+BEGIN
+  SELECT watch.task_name
+  INTO watch_task_name
+  FROM otlet.watches watch
+  WHERE watch.name = drop_watch.watch_name;
+  IF NOT FOUND THEN
+    RETURN false;
+  END IF;
+
+  SELECT policy.governance_enforced
+  INTO governance_enforced
+  FROM otlet.production_policy policy
+  WHERE policy.name = 'default'
+  FOR UPDATE;
+  PERFORM pg_advisory_xact_lock(
+    hashtextextended('otlet_workload_revision:' || watch_task_name, 0)
+  );
+
+  IF governance_enforced THEN
+    RAISE EXCEPTION 'otlet watch % identity change requires retirement and pinned deletion',
+      drop_watch.watch_name;
+  END IF;
+  RETURN otlet.drop_watch_registry(drop_watch.watch_name);
+END;
+$$;
+
 CREATE TABLE otlet.administrative_change_events (
   event_id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
   object_type text NOT NULL CHECK (object_type IN (
@@ -42,7 +77,6 @@ CREATE TABLE otlet.administrative_change_events (
     OR new_revision_hash ~ '^otlet:v1:sha256:[0-9a-f]{64}$'
   ),
   changed_at timestamptz NOT NULL DEFAULT clock_timestamp(),
-  CHECK (num_nonnulls(reason, ticket) >= 1),
   CHECK (num_nonnulls(old_revision_hash, new_revision_hash) >= 1),
   CHECK (old_revision_hash IS DISTINCT FROM new_revision_hash)
 );
@@ -87,7 +121,13 @@ DECLARE
   actual_reason text := NULLIF(btrim(set_administrative_change_context.reason), '');
   actual_ticket text := NULLIF(btrim(set_administrative_change_context.ticket), '');
 BEGIN
-  IF actual_reason IS NULL AND actual_ticket IS NULL THEN
+  IF actual_reason IS NULL
+     AND actual_ticket IS NULL
+     AND (
+       SELECT policy.governance_enforced
+       FROM otlet.production_policy policy
+       WHERE policy.name = 'default'
+     ) THEN
     RAISE EXCEPTION 'otlet administrative change requires a reason or ticket';
   END IF;
   IF octet_length(COALESCE(actual_reason, '')) > 4096 THEN
@@ -149,7 +189,13 @@ BEGIN
     RAISE EXCEPTION 'otlet administrative object type % is unsupported',
       append_administrative_change.object_type;
   END IF;
-  IF actual_reason IS NULL AND actual_ticket IS NULL THEN
+  IF actual_reason IS NULL
+     AND actual_ticket IS NULL
+     AND (
+       SELECT policy.governance_enforced
+       FROM otlet.production_policy policy
+       WHERE policy.name = 'default'
+     ) THEN
     RAISE EXCEPTION 'otlet administrative change requires SET LOCAL otlet.administrative_reason or otlet.administrative_ticket';
   END IF;
   IF octet_length(COALESCE(actual_reason, '')) > 4096 THEN
@@ -248,6 +294,12 @@ BEGIN
   IF TG_OP <> 'DELETE' THEN
     new_state := to_jsonb(NEW);
   END IF;
+  IF TG_TABLE_NAME = 'production_policy'
+     AND COALESCE((old_state ->> 'governance_enforced')::boolean, false)
+     AND NULLIF(btrim(current_setting('otlet.administrative_reason', true)), '') IS NULL
+     AND NULLIF(btrim(current_setting('otlet.administrative_ticket', true)), '') IS NULL THEN
+    RAISE EXCEPTION 'otlet administrative change requires SET LOCAL otlet.administrative_reason or otlet.administrative_ticket';
+  END IF;
 
   CASE TG_TABLE_NAME
     WHEN 'models' THEN
@@ -320,7 +372,8 @@ BEGIN
           'delete_stale_materialization_retention', old_state -> 'delete_stale_materialization_retention',
           'sensitive_evidence_mode', old_state -> 'sensitive_evidence_mode',
           'sensitive_evidence_retention', old_state -> 'sensitive_evidence_retention',
-          'failed_job_retention', old_state -> 'failed_job_retention'
+          'failed_job_retention', old_state -> 'failed_job_retention',
+          'governance_enforced', old_state -> 'governance_enforced'
         );
       END IF;
       IF new_state IS NOT NULL THEN
@@ -331,7 +384,8 @@ BEGIN
           'delete_stale_materialization_retention', new_state -> 'delete_stale_materialization_retention',
           'sensitive_evidence_mode', new_state -> 'sensitive_evidence_mode',
           'sensitive_evidence_retention', new_state -> 'sensitive_evidence_retention',
-          'failed_job_retention', new_state -> 'failed_job_retention'
+          'failed_job_retention', new_state -> 'failed_job_retention',
+          'governance_enforced', new_state -> 'governance_enforced'
         );
       END IF;
     ELSE
@@ -387,7 +441,7 @@ CREATE TRIGGER production_policy_retention_administrative_change
 AFTER INSERT OR DELETE OR UPDATE OF worker_event_retention, trace_detail_retention,
   eval_label_retention, delete_stale_materialization_retention,
   sensitive_evidence_mode, sensitive_evidence_retention,
-  failed_job_retention ON otlet.production_policy
+  failed_job_retention, governance_enforced ON otlet.production_policy
 FOR EACH ROW EXECUTE FUNCTION otlet.record_administrative_row_change();
 
 CREATE FUNCTION otlet.access_policy_descriptor(target_role regrole) RETURNS jsonb

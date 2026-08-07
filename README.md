@@ -44,11 +44,8 @@ Entity resolution uses a cheap local model for the first pass and a stronger loc
 
 Rerunning setup reuses the PostgreSQL volume and model artifacts while rebuilding Otlet extension state; user tables stay in place. When the container or image changes, setup clears persisted preload state before reinstalling the extension
 
-Administrative changes require a reason or ticket in the same transaction so PostgreSQL can append their actor, active role, and before-and-after identities
-
 ```sql
 BEGIN;
-SELECT otlet.set_administrative_change_context('Register the example models');
 SELECT name
 FROM otlet.register_model(
   'qwen3_1_7b',
@@ -79,7 +76,6 @@ An Otlet task reads any SQL query that returns `subject_id` and row-shaped `inpu
 
 ```sql
 BEGIN;
-SELECT otlet.set_administrative_change_context('Create the entity-resolution example');
 SELECT name, model_name
 FROM otlet.create_task(
   task_name => 'entity_resolution_demo',

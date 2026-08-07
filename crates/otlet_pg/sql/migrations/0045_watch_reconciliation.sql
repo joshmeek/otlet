@@ -14,7 +14,7 @@ ALTER TABLE otlet.production_policy
 CREATE SEQUENCE otlet.watch_reconciliation_generation_seq AS bigint;
 
 CREATE TABLE otlet.watch_reconciliation (
-  watch_name text NOT NULL,
+  watch_name text NOT NULL REFERENCES otlet.watches(name) ON DELETE CASCADE,
   subject_id text NOT NULL,
   workload_revision_hash text NOT NULL REFERENCES otlet.workload_revisions(workload_revision_hash),
   source_identity text NOT NULL CHECK (

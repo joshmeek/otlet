@@ -31,10 +31,10 @@ CREATE TEMP TABLE candidate_set_coverage_proof (
   first_label_id bigint,
   second_label_id bigint,
   thresholds jsonb,
-  unmeasured_blocked boolean NOT NULL DEFAULT false,
+  undeclared_allowed boolean NOT NULL DEFAULT false,
   failed_report_blocked boolean NOT NULL DEFAULT false,
   invalid_rank_blocked boolean NOT NULL DEFAULT false,
-  decision_unmeasured_blocked boolean NOT NULL DEFAULT false,
+  decision_undeclared_allowed boolean NOT NULL DEFAULT false,
   duplicate_labels_blocked boolean NOT NULL DEFAULT false,
   stale_label_blocked boolean NOT NULL DEFAULT false,
   source_drift_blocked boolean NOT NULL DEFAULT false,
@@ -381,12 +381,19 @@ BEGIN
       proof.bad_hash,
       proof.baseline_hash
     );
-    RAISE EXCEPTION 'unmeasured candidate revision unexpectedly promoted';
+    IF NOT EXISTS (
+      SELECT 1 FROM otlet.workload_revision_heads head
+      WHERE head.task_name = proof.task_name
+        AND head.active_workload_revision_hash = proof.bad_hash
+    ) THEN
+      RAISE EXCEPTION 'undeclared candidate coverage did not allow promotion';
+    END IF;
+    RAISE EXCEPTION 'undeclared candidate coverage proof rollback';
   EXCEPTION WHEN OTHERS THEN
-    IF SQLERRM <> 'otlet pair workload promotion requires a current passing candidate-set coverage report' THEN
+    IF SQLERRM <> 'undeclared candidate coverage proof rollback' THEN
       RAISE;
     END IF;
-    UPDATE candidate_set_coverage_proof SET unmeasured_blocked = true;
+    UPDATE candidate_set_coverage_proof SET undeclared_allowed = true;
   END;
 END;
 $$;
@@ -671,13 +678,20 @@ BEGIN
       proof.decision_hash,
       proof.good_hash
     );
-    RAISE EXCEPTION 'unmeasured decision contract unexpectedly promoted';
+    IF NOT EXISTS (
+      SELECT 1 FROM otlet.workload_revision_heads head
+      WHERE head.task_name = proof.task_name
+        AND head.active_workload_revision_hash = proof.decision_hash
+    ) THEN
+      RAISE EXCEPTION 'undeclared decision coverage did not allow promotion';
+    END IF;
+    RAISE EXCEPTION 'undeclared decision coverage proof rollback';
   EXCEPTION WHEN OTHERS THEN
-    IF SQLERRM <> 'otlet pair workload promotion requires a current passing candidate-set coverage report' THEN
+    IF SQLERRM <> 'undeclared decision coverage proof rollback' THEN
       RAISE;
     END IF;
     UPDATE candidate_set_coverage_proof
-    SET decision_unmeasured_blocked = true;
+    SET decision_undeclared_allowed = true;
   END;
 END;
 $$;
@@ -960,10 +974,10 @@ $$;
 
 WITH contract AS (
   SELECT concat_ws('|',
-    proof.unmeasured_blocked,
+    proof.undeclared_allowed,
     proof.failed_report_blocked,
     proof.invalid_rank_blocked,
-    proof.decision_unmeasured_blocked,
+    proof.decision_undeclared_allowed,
     proof.duplicate_labels_blocked,
     proof.stale_label_blocked,
     proof.source_drift_blocked,

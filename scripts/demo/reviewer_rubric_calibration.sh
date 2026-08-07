@@ -39,6 +39,7 @@ CREATE TEMP TABLE reviewer_calibration_proof (
   approved_action_id bigint,
   error_action_id bigint,
   blocked_action_id bigint,
+  optional_action_id bigint,
   same_rubric_action_id bigint,
   changed_action_id bigint,
   final_action_id bigint,
@@ -99,6 +100,7 @@ FROM unnest(ARRAY[
   'review-pass',
   'review-error',
   'review-blocked',
+  'review-optional',
   'review-same-rubric',
   'review-changed',
   'review-final',
@@ -161,7 +163,8 @@ SET original_revision_hash = (
 
 CREATE FUNCTION pg_temp.make_reviewer_action(
   subject_id text,
-  workload_revision_hash text
+  workload_revision_hash text,
+  task_name text DEFAULT 'reviewer_calibration_probe_task'
 ) RETURNS bigint
 LANGUAGE plpgsql
 AS $function$
@@ -208,7 +211,7 @@ BEGIN
     leased_until,
     claim_token
   ) VALUES (
-    'reviewer_calibration_probe_task',
+    make_reviewer_action.task_name,
     make_reviewer_action.workload_revision_hash,
     make_reviewer_action.subject_id,
     job_input,
@@ -331,6 +334,95 @@ SELECT otlet.grant_reviewer_access(:'reviewer_role'::regrole) \g /dev/null
 UPDATE reviewer_calibration_proof
 SET reviewer_oid = :'reviewer_login'::regrole::oid,
     other_reviewer_oid = :'other_reviewer_login'::regrole::oid;
+
+SELECT otlet.create_watch(
+  watch_name => 'reviewer_calibration_optional_probe',
+  kind => 'row',
+  instruction => 'Return approve or reject with high confidence and one update_row recommendation',
+  output_schema => '{
+    "type":"object",
+    "required":["decision","confidence"],
+    "additionalProperties":false,
+    "properties":{
+      "decision":{"enum":["approve","reject"]},
+      "confidence":{"enum":["high"]}
+    }
+  }'::jsonb,
+  model_name => 'reviewer_calibration_model',
+  table_name => 'public.otlet_demo_reviewer_calibration'::regclass,
+  subject_column => 'id',
+  runtime_options => '{"max_tokens":16,"reasoning":"off"}'::jsonb,
+  trigger_policy => '{"on_change":"mark_stale"}'::jsonb,
+  action_types => ARRAY['update_row'],
+  decision_contract => '{
+    "answer_field":"decision",
+    "abstain_values":[],
+    "confidence_field":"confidence",
+    "accepted_confidence":["high"]
+  }'::jsonb
+) \g /dev/null
+SELECT otlet.register_action_workflow_policy(
+  'reviewer_calibration_optional_probe_task',
+  'update_row',
+  'reviewer_calibration_target',
+  'bounded_mutation',
+  'evaluated'
+) \g /dev/null
+UPDATE reviewer_calibration_proof proof
+SET optional_action_id = pg_temp.make_reviewer_action(
+  'review-optional',
+  otlet.ensure_active_workload_revision(
+    'reviewer_calibration_optional_probe_task'
+  ),
+  'reviewer_calibration_optional_probe_task'
+);
+SELECT * FROM otlet.dry_run_action(
+  (SELECT optional_action_id FROM reviewer_calibration_proof)
+) \g /dev/null
+SELECT pg_temp.assert_true(
+  authority.authority_error IS NULL
+    AND authority.rubric_hash IS NULL
+    AND authority.calibration_hash IS NULL,
+  'reviewer calibration was required without a declared rubric'
+)
+FROM otlet.reviewer_authority(
+  'reviewer_calibration_optional_probe_task',
+  otlet.ensure_active_workload_revision(
+    'reviewer_calibration_optional_probe_task'
+  ),
+  (SELECT reviewer_oid FROM reviewer_calibration_proof)
+) authority;
+
+SELECT format('SET SESSION AUTHORIZATION %I', :'reviewer_login') \gexec
+SELECT pg_temp.assert_true(
+  EXISTS (
+    SELECT 1
+    FROM otlet.reviewer_review_queue queue
+    WHERE queue.task_name = 'reviewer_calibration_optional_probe_task'
+      AND queue.action_id = (
+        SELECT optional_action_id FROM reviewer_calibration_proof
+      )
+      AND queue.review_rubric IS NULL
+  ),
+  'reviewer queue hid work without a declared rubric'
+);
+SELECT * FROM otlet.approve_action(
+  (SELECT optional_action_id FROM reviewer_calibration_proof),
+  'Optional-rubric reviewer approval'
+) \g /dev/null
+RESET SESSION AUTHORIZATION;
+SELECT pg_temp.assert_true(
+  EXISTS (
+    SELECT 1
+    FROM otlet.review_events event
+    WHERE event.action_id = (
+      SELECT optional_action_id FROM reviewer_calibration_proof
+    )
+      AND event.reviewer_rubric_hash IS NULL
+      AND event.reviewer_calibration_hash IS NULL
+  ),
+  'review without a declared rubric stored calibration provenance'
+);
 
 SELECT format('GRANT USAGE ON SCHEMA otlet TO %I', :'gold_reader_role') \gexec
 SELECT format(

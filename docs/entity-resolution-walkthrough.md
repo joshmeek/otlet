@@ -4,8 +4,8 @@ Use this SQL walkthrough to build the entity-resolution path from `docs/otlet-wo
 
 ```sh
 docker exec -it otlet-postgres sh -lc '
-  cheap_model_artifact="$(find /var/lib/postgresql -name Qwen3-1.7B-Q8_0.gguf -print -quit)"
-  strong_model_artifact="$(find /var/lib/postgresql -name Qwen3.5-4B-Q4_K_M.gguf -print -quit)"
+  cheap_model_artifact="$(find -L /var/lib/postgresql -type f -name Qwen3-1.7B-Q8_0.gguf -exec readlink -f {} \; -quit)"
+  strong_model_artifact="$(find -L /var/lib/postgresql -type f -name Qwen3.5-4B-Q4_K_M.gguf -exec readlink -f {} \; -quit)"
   cheap_model_sha256="$(sha256sum "$cheap_model_artifact" | cut -d " " -f 1)"
   strong_model_sha256="$(sha256sum "$strong_model_artifact" | cut -d " " -f 1)"
   psql -U postgres -d postgres \
@@ -20,7 +20,7 @@ docker exec -it otlet-postgres sh -lc '
 
 Run the sections in order before adapting them. Each section names the state it creates and the output to inspect. Follow-up checks live in [runtime-and-traces.md](runtime-and-traces.md), [semantic-watches.md](semantic-watches.md), and [production-contract.md](production-contract.md)
 
-All SQL shown here runs as the extension owner. The first block sets one administrative reason for the interactive `psql` session. Production deployments register reviewer and operator access-policy capabilities, calibrate reviewers, and use the delegated reviewer and operator RPCs instead of the owner-only calls shown here. Auditors read `otlet.audit_review_export` and `otlet.audit_review_event_export`; raw `otlet.review_queue`, task configuration, receipts, and trace state remain owner-only
+All SQL shown here runs as the extension owner. The first block sets optional administrative context for the interactive `psql` session. Deployments that delegate review or operations register the matching access-policy capabilities, calibrate reviewers when a workload declares a rubric, and use the delegated RPCs instead of the owner-only calls shown here. Auditors read `otlet.audit_review_export` and `otlet.audit_review_event_export`; raw `otlet.review_queue`, task configuration, receipts, and trace state remain owner-only
 
 Receipts keep prompt and raw-output hashes under the default storage policy. Accepted output and rejected structured candidates remain available without persisting the assembled prompt or raw model text
 
@@ -163,7 +163,7 @@ WHERE task_name = 'entity_resolution_demo';
 COMMIT;
 ```
 
-This disposable-fixture cleanup removes mutable job-chain rows only when no evidence-lifecycle request manages them. It preserves immutable review, administrative, and revision history. Use the evidence lifecycle for production evidence. `create_task` updates the active definition and captures a new revision when work is admitted. A retired task remains a durable archive, so use a new task name after retirement
+This disposable-fixture cleanup removes mutable job-chain rows only when no evidence-lifecycle request manages them. It preserves immutable review, administrative, and revision history. Deployments that need governed archive, export, and deletion can opt a chain into the evidence lifecycle. `create_task` updates the active definition and captures a new revision when work is admitted. A retired task remains a durable archive, so use a new task name after retirement
 
 ## Step 4 - Create The Task
 

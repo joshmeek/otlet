@@ -48,10 +48,7 @@ SELECT policy.interactive_queue_age_p99_target_ms::text || '|' ||
        (state.value ->> 'queued_claim_batch_quantum') || '|' ||
        (state.value ->> 'priority_classes') || '|' ||
        (state.value ->> 'service_measurement_status') || '|' ||
-       (
-         policy.asynchronous_queue_age_p99_target_ms
-           <= EXTRACT(epoch FROM policy.max_queue_age) * 1000
-       )::text || '|' ||
+       (policy.max_queue_age IS NULL)::text || '|' ||
        pg_temp.reject_invalid_service_targets()::text
 FROM otlet.production_policy_status policy
 CROSS JOIN LATERAL (SELECT otlet.worker_infer_now_state()) state(value);

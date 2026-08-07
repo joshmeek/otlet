@@ -40,7 +40,8 @@ END;
 $$;
 
 UPDATE otlet.production_policy
-SET successful_job_retention = NULL,
+SET evidence_lifecycle_enabled = false,
+    successful_job_retention = interval '100 years',
     failed_job_retention = interval '1000 years',
     evidence_max_chain_rows = 1000,
     worker_event_retention = interval '100 years',
@@ -505,6 +506,9 @@ SELECT pg_temp.assert_true(
     FROM otlet.evidence_lifecycle_records
     WHERE job_id = :lifecycle_job_id
   )
+    AND NOT (SELECT evidence_lifecycle_enabled
+             FROM otlet.production_policy
+             WHERE name = 'default')
     AND NOT EXISTS (SELECT 1 FROM lifecycle_step WHERE item_found),
   'disabled successful-job retention adopted legacy evidence'
 );
@@ -735,6 +739,29 @@ SET created_at = clock_timestamp() - interval '200 years'
 WHERE id IN (:lifecycle_label_id, :lifecycle_cleanup_label_id);
 ALTER TABLE otlet.eval_labels ENABLE TRIGGER eval_labels_c_adjudication;
 
+INSERT INTO otlet.jobs (
+  task_name,
+  workload_revision_hash,
+  subject_id,
+  input,
+  status,
+  attempts,
+  error,
+  created_at,
+  finished_at
+) VALUES (
+  'complete_evidence_cleanup_control_watch_task',
+  :'lifecycle_cleanup_revision_hash',
+  'legacy-failed-cleanup',
+  '{}'::jsonb,
+  'failed',
+  1,
+  'Legacy cleanup control',
+  clock_timestamp() - interval '2000 years',
+  clock_timestamp() - interval '2000 years'
+)
+RETURNING id AS lifecycle_cleanup_failed_job_id \gset
+
 SELECT pg_temp.assert_true(
   worker_events = 1
     AND token_trace_rows = 1
@@ -745,7 +772,7 @@ SELECT pg_temp.assert_true(
     AND sensitive_chosen_texts = 1
     AND sensitive_token_texts = 1
     AND sensitive_alternative_token_texts = 1
-    AND failed_canceled_jobs = 0
+    AND failed_canceled_jobs = 1
     AND dry_run,
   'cleanup preview counted active lifecycle evidence'
 )
@@ -768,11 +795,13 @@ INSERT INTO lifecycle_legacy_cleanup_steps
 SELECT 4, step.* FROM otlet.maintenance_cleanup_step_before_evidence() step;
 INSERT INTO lifecycle_legacy_cleanup_steps
 SELECT 5, step.* FROM otlet.maintenance_cleanup_step_before_evidence() step;
+INSERT INTO lifecycle_legacy_cleanup_steps
+SELECT 6, step.* FROM otlet.maintenance_cleanup_step_before_evidence() step;
 CREATE TEMP TABLE lifecycle_legacy_cleanup_idle AS
 SELECT * FROM otlet.maintenance_cleanup_step_before_evidence();
 SELECT pg_temp.assert_true(
   (SELECT string_agg(item_kind, '|' ORDER BY ordinal) =
-      'worker_event|trace_detail|eval_label_series|delete_stale_materialization|sensitive_evidence'
+      'failed_canceled_job|worker_event|trace_detail|eval_label_series|delete_stale_materialization|sensitive_evidence'
      AND bool_and(item_found AND affected_rows = 1)
    FROM lifecycle_legacy_cleanup_steps)
     AND NOT EXISTS (
@@ -816,6 +845,14 @@ SELECT pg_temp.assert_true(
     AND NOT EXISTS (
       SELECT 1 FROM otlet.semantic_materializations
       WHERE id = :lifecycle_cleanup_materialization_id
+    )
+    AND NOT EXISTS (
+      SELECT 1 FROM otlet.jobs
+      WHERE id = :lifecycle_cleanup_failed_job_id
+    )
+    AND NOT EXISTS (
+      SELECT 1 FROM otlet.evidence_lifecycle_records
+      WHERE job_id = :lifecycle_cleanup_failed_job_id
     ),
   'legacy cleanup did not fence active evidence and clean controls'
 );
@@ -1541,7 +1578,8 @@ SELECT otlet.ensure_active_workload_revision(
 ) AS lifecycle_workload_revision_hash \gset
 
 UPDATE otlet.production_policy
-SET evidence_max_chain_rows = 1
+SET evidence_lifecycle_enabled = true,
+    evidence_max_chain_rows = 1
 WHERE name = 'default';
 INSERT INTO otlet.jobs (
   task_name,
@@ -1649,7 +1687,8 @@ JOIN otlet.jobs job ON job.id = record.job_id
 WHERE record.job_id = :lifecycle_null_finished_job_id;
 
 UPDATE otlet.production_policy
-SET successful_job_retention = NULL,
+SET evidence_lifecycle_enabled = false,
+    successful_job_retention = NULL,
     failed_job_retention = interval '1000 years',
     evidence_max_chain_rows = 1000
 WHERE name = 'default';

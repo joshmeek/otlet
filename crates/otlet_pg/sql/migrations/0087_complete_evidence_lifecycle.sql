@@ -1,4 +1,5 @@
 ALTER TABLE otlet.production_policy
+ADD COLUMN evidence_lifecycle_enabled boolean NOT NULL DEFAULT false,
 ADD COLUMN successful_job_retention interval,
 ADD COLUMN evidence_max_chain_rows integer NOT NULL DEFAULT 1000,
 ADD CONSTRAINT production_policy_successful_job_retention_bound CHECK (
@@ -11,6 +12,8 @@ ADD CONSTRAINT production_policy_evidence_chain_rows_bound CHECK (
 
 COMMENT ON COLUMN otlet.production_policy.successful_job_retention IS
 'Retention for complete production jobs; null disables automatic adoption';
+COMMENT ON COLUMN otlet.production_policy.evidence_lifecycle_enabled IS
+'Whether retention automatically adopts terminal jobs into governed export and deletion';
 COMMENT ON COLUMN otlet.production_policy.evidence_max_chain_rows IS
 'Maximum rows in one atomically archived and deleted evidence chain';
 
@@ -27,6 +30,8 @@ BEGIN
   old_fragment := $old$    maintenance_max_time_ms
    FROM otlet.production_policy p$old$;
   new_fragment := $new$    maintenance_max_time_ms,
+    governance_enforced,
+    evidence_lifecycle_enabled,
     successful_job_retention,
     evidence_max_chain_rows
    FROM otlet.production_policy p$new$;
@@ -46,25 +51,27 @@ BEGIN
     'otlet.record_administrative_row_change()'::regprocedure
   );
   IF position(
-    $old$'failed_job_retention', old_state -> 'failed_job_retention'$old$
+    $old$'governance_enforced', old_state -> 'governance_enforced'$old$
     IN definition
   ) = 0 OR position(
-    $old$'failed_job_retention', new_state -> 'failed_job_retention'$old$
+    $old$'governance_enforced', new_state -> 'governance_enforced'$old$
     IN definition
   ) = 0 THEN
     RAISE EXCEPTION 'otlet evidence retention ledger rewrite is incomplete';
   END IF;
   definition := pg_catalog.replace(
     definition,
-    $old$'failed_job_retention', old_state -> 'failed_job_retention'$old$,
-    $new$'failed_job_retention', old_state -> 'failed_job_retention',
+    $old$'governance_enforced', old_state -> 'governance_enforced'$old$,
+    $new$'governance_enforced', old_state -> 'governance_enforced',
+          'evidence_lifecycle_enabled', old_state -> 'evidence_lifecycle_enabled',
           'successful_job_retention', old_state -> 'successful_job_retention',
           'evidence_max_chain_rows', old_state -> 'evidence_max_chain_rows'$new$
   );
   EXECUTE pg_catalog.replace(
     definition,
-    $old$'failed_job_retention', new_state -> 'failed_job_retention'$old$,
-    $new$'failed_job_retention', new_state -> 'failed_job_retention',
+    $old$'governance_enforced', new_state -> 'governance_enforced'$old$,
+    $new$'governance_enforced', new_state -> 'governance_enforced',
+          'evidence_lifecycle_enabled', new_state -> 'evidence_lifecycle_enabled',
           'successful_job_retention', new_state -> 'successful_job_retention',
           'evidence_max_chain_rows', new_state -> 'evidence_max_chain_rows'$new$
   );
@@ -79,6 +86,7 @@ AFTER INSERT OR DELETE OR UPDATE OF worker_event_retention,
   trace_detail_retention, eval_label_retention,
   delete_stale_materialization_retention, sensitive_evidence_mode,
   sensitive_evidence_retention, failed_job_retention,
+  governance_enforced, evidence_lifecycle_enabled,
   successful_job_retention, evidence_max_chain_rows
 ON otlet.production_policy
 FOR EACH ROW EXECUTE FUNCTION otlet.record_administrative_row_change();
@@ -512,6 +520,7 @@ AS $$
       CROSS JOIN otlet.production_policy policy
       WHERE job.id = requested_job_id
         AND policy.name = 'default'
+        AND policy.evidence_lifecycle_enabled
         AND job.execution_mode = 'production'
         AND job.status IN ('complete', 'failed', 'canceled')
         AND (
@@ -1771,6 +1780,7 @@ AS $$
     FROM otlet.jobs job
     CROSS JOIN policy
     WHERE job.execution_mode = 'production'
+      AND policy.evidence_lifecycle_enabled
       AND job.status IN ('complete', 'failed', 'canceled')
       AND NOT EXISTS (
         SELECT 1 FROM otlet.evidence_lifecycle_records record
@@ -1864,6 +1874,7 @@ BEGIN
   SELECT candidate.* INTO job
   FROM otlet.jobs candidate
   WHERE candidate.execution_mode = 'production'
+    AND policy.evidence_lifecycle_enabled
     AND candidate.status IN ('complete', 'failed', 'canceled')
     AND NOT EXISTS (
       SELECT 1
@@ -2282,22 +2293,20 @@ $migration$;
 DO $migration$
 DECLARE
   definition text;
-  start_position integer;
-  end_position integer;
+  old_fragment text;
+  new_fragment text;
 BEGIN
   definition := pg_catalog.pg_get_functiondef(
     'otlet.maintenance_cleanup_step_before_evidence()'::regprocedure
   );
-  start_position := position(
-    E'  SELECT job.id\n  INTO candidate_job_id\n  FROM otlet.jobs job\n'
-    IN definition
-  );
-  end_position := position(E'  SELECT event.id\n' IN definition);
-  IF start_position = 0 OR end_position <= start_position THEN
+  old_fragment := $old$  WHERE job.status IN ('failed', 'canceled')$old$;
+  new_fragment := $new$  WHERE NOT policy.evidence_lifecycle_enabled
+    AND NOT otlet.evidence_lifecycle_manages_job(job.id)
+    AND job.status IN ('failed', 'canceled')$new$;
+  IF position(old_fragment IN definition) = 0 THEN
     RAISE EXCEPTION 'otlet legacy job cleanup rewrite is incomplete';
   END IF;
-  EXECUTE substring(definition FROM 1 FOR start_position - 1)
-    || substring(definition FROM end_position);
+  EXECUTE pg_catalog.replace(definition, old_fragment, new_fragment);
 END;
 $migration$;
 
@@ -2424,24 +2433,20 @@ $migration$;
 DO $migration$
 DECLARE
   definition text;
-  start_position integer;
-  next_position integer;
-  next_marker text := E'    ) OR EXISTS (\n      SELECT 1\n      FROM otlet.worker_events event';
+  old_fragment text;
+  new_fragment text;
 BEGIN
   definition := pg_catalog.pg_get_functiondef(
     'otlet.maintenance_cleanup_pending_before_evidence()'::regprocedure
   );
-  start_position := position(
-    E'  SELECT EXISTS (\n      SELECT 1\n      FROM otlet.jobs job\n'
-    IN definition
-  );
-  next_position := position(next_marker IN definition);
-  IF start_position = 0 OR next_position <= start_position THEN
+  old_fragment := $old$      WHERE job.status IN ('failed', 'canceled')$old$;
+  new_fragment := $new$      WHERE NOT policy.evidence_lifecycle_enabled
+        AND NOT otlet.evidence_lifecycle_manages_job(job.id)
+        AND job.status IN ('failed', 'canceled')$new$;
+  IF position(old_fragment IN definition) = 0 THEN
     RAISE EXCEPTION 'otlet legacy job cleanup pending rewrite is incomplete';
   END IF;
-  EXECUTE substring(definition FROM 1 FOR start_position - 1)
-    || E'  SELECT EXISTS (\n      SELECT 1\n      FROM otlet.worker_events event'
-    || substring(definition FROM next_position + length(next_marker));
+  EXECUTE pg_catalog.replace(definition, old_fragment, new_fragment);
 END;
 $migration$;
 

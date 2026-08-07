@@ -196,7 +196,7 @@ ensure_model() {
       find -L "$1" "$2" -type f -name "$3" -print 2>/dev/null |
         while IFS= read -r path; do
           if [ "$(head -c 4 "$path" 2>/dev/null)" = GGUF ]; then
-            printf "%s\n" "$path"
+            readlink -f "$path"
             break
           fi
         done

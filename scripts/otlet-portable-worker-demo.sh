@@ -201,10 +201,16 @@ fi
 cleanup
 
 if [ -z "$model_artifact" ]; then
-  model_artifact="$(docker exec "$container" find /var/lib/postgresql -name "$model_file" -type f -print -quit)"
+  model_artifact="$(docker exec "$container" find -L /var/lib/postgresql -type f -name "$model_file" -print -quit)"
 fi
 if [ -z "$cheap_model_artifact" ]; then
-  cheap_model_artifact="$(docker exec "$container" find /var/lib/postgresql -name "$cheap_model_file" -type f -print -quit)"
+  cheap_model_artifact="$(docker exec "$container" find -L /var/lib/postgresql -type f -name "$cheap_model_file" -print -quit)"
+fi
+if [ -n "$model_artifact" ]; then
+  model_artifact="$(docker exec "$container" readlink -f "$model_artifact" 2>/dev/null || true)"
+fi
+if [ -n "$cheap_model_artifact" ]; then
+  cheap_model_artifact="$(docker exec "$container" readlink -f "$cheap_model_artifact" 2>/dev/null || true)"
 fi
 if [ -z "$model_artifact" ] || ! docker exec "$container" test -f "$model_artifact"; then
   echo "Missing model artifact. Set OTLET_STRONG_MODEL_ARTIFACT or run ./scripts/otlet-setup.sh first" >&2
@@ -225,14 +231,6 @@ docker exec -e CARGO_TARGET_DIR=/target -w /work "$container" \
 runtime_identity="$(docker exec "$container" /target/release/otlet_worker --print-runtime-identity)"
 
 docker exec "$container" createdb -U postgres "$portable_database"
-docker exec -i "$container" psql -U postgres -d postgres \
-  -X -q -v ON_ERROR_STOP=1 -v database="$portable_database" <<'SQL' >/dev/null
-SELECT format(
-  'ALTER DATABASE %I SET otlet.administrative_reason = %L',
-  :'database',
-  'portable worker executable proof'
-) \gexec
-SQL
 docker exec -w /work "$container" psql -U postgres -d "$portable_database" \
   -X -q -v ON_ERROR_STOP=1 -f crates/otlet_worker/sql/install.sql
 

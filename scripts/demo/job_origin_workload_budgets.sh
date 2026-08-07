@@ -38,11 +38,9 @@ $function$;
 
 SELECT pg_temp.assert_true(
   (
-    SELECT (
-      max_active_jobs_per_task,
-      max_queued_input_bytes_per_task,
-      max_queue_age
-    ) = (8, 67108864::bigint, interval '1 day')
+    SELECT max_active_jobs_per_task = 8
+      AND max_queued_input_bytes_per_task = 67108864
+      AND max_queue_age IS NULL
     FROM otlet.production_policy_status
   ),
   'default task workload budgets changed'
@@ -309,6 +307,20 @@ SELECT pg_temp.assert_true(
       AND status = 'queued'
   ),
   'queue age status or non-expiring backlog contract changed'
+);
+UPDATE otlet.production_policy
+SET max_queue_age = NULL
+WHERE name = 'default';
+SELECT pg_temp.assert_true(
+  otlet.admit_task_input_with_origin(
+    'job_origin_budget_a', 'age-cap-disabled', '{}', NULL, 'task_run'
+  )
+  AND (
+    SELECT max_queue_age IS NULL AND NOT queue_age_exceeded
+    FROM otlet.task_queue_capacity
+    WHERE task_name = 'job_origin_budget_a'
+  ),
+  'disabled task queue age cap blocked admission'
 );
 
 CREATE TEMP TABLE job_origin_age_claims ON COMMIT DROP AS

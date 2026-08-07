@@ -15,6 +15,7 @@ CREATE TEMP TABLE pair_constraint_proof (
   conflict_detected boolean NOT NULL DEFAULT false,
   review_routed boolean NOT NULL DEFAULT false,
   approval_blocked boolean NOT NULL DEFAULT false,
+  advisory_promotion_allowed boolean NOT NULL DEFAULT false,
   promotion_blocked boolean NOT NULL DEFAULT false,
   head_insert_blocked boolean NOT NULL DEFAULT false,
   export_blocked boolean NOT NULL DEFAULT false,
@@ -568,6 +569,32 @@ EXCEPTION WHEN OTHERS THEN
 END;
 $function$;
 
+SAVEPOINT entity_graph_advisory_promotion;
+SELECT head.active_workload_revision_hash AS advisory_before_hash
+FROM otlet.workload_revision_heads head
+WHERE head.task_name = :'task_name'
+\gset
+
+SELECT pg_temp.entity_graph_promotion_blocked(:'task_name') AS advisory_blocked
+\gset
+
+SELECT head.active_workload_revision_hash AS advisory_after_hash
+FROM otlet.workload_revision_heads head
+WHERE head.task_name = :'task_name'
+\gset
+ROLLBACK TO SAVEPOINT entity_graph_advisory_promotion;
+
+UPDATE pair_constraint_proof
+SET advisory_promotion_allowed = NOT :'advisory_blocked'::boolean
+  AND :'advisory_before_hash' <> :'advisory_after_hash';
+
+SELECT otlet.set_administrative_change_context(
+  'Prove strict entity graph promotion'
+) \g /dev/null
+UPDATE otlet.production_policy
+SET governance_enforced = true
+WHERE name = 'default';
+
 UPDATE pair_constraint_proof proof
 SET promotion_blocked = pg_temp.entity_graph_promotion_blocked(
       proof.task_name
@@ -576,6 +603,15 @@ SET promotion_blocked = pg_temp.entity_graph_promotion_blocked(
       proof.task_name
     ),
     export_blocked = pg_temp.entity_graph_export_blocked();
+
+SELECT otlet.set_administrative_change_context(
+  'Restore advisory entity graph promotion'
+) \g /dev/null
+UPDATE otlet.production_policy
+SET governance_enforced = false
+WHERE name = 'default';
+SET LOCAL otlet.administrative_reason = '';
+SET LOCAL otlet.administrative_ticket = '';
 
 SAVEPOINT entity_graph_analysis_limit;
 CREATE TEMP TABLE entity_graph_limit_events
@@ -1034,6 +1070,7 @@ SELECT concat_ws('|',
   proof.conflict_detected,
   proof.review_routed,
   proof.approval_blocked,
+  proof.advisory_promotion_allowed,
   proof.promotion_blocked,
   proof.head_insert_blocked,
   proof.export_blocked,
@@ -1104,7 +1141,7 @@ ROLLBACK;
 SQL
 )"
 echo "pair_constraint_ledger_contract=$pair_constraint_contract"
-[ "$pair_constraint_contract" = "t|t|t|t|t|t|t|t|t|t|t|t|t|t|t|t|t|t|t|t|t" ] || {
+[ "$pair_constraint_contract" = "t|t|t|t|t|t|t|t|t|t|t|t|t|t|t|t|t|t|t|t|t|t" ] || {
   echo "Pair constraint ledger contract mismatch: $pair_constraint_contract" >&2
   exit 1
 }

@@ -240,6 +240,12 @@ SELECT otlet.create_watch(
   input_columns => ARRAY['id', 'payload'],
   trigger_policy => '{"on_change":"mark_stale_and_enqueue"}'::jsonb
 ) \g /dev/null
+SELECT otlet.set_administrative_change_context(
+  'Prove strict watch replacement governance'
+) \g /dev/null
+UPDATE otlet.production_policy
+SET governance_enforced = true
+WHERE name = 'default';
 SELECT pg_temp.expect_error(
   $statement$
     SELECT otlet.create_watch(
@@ -256,6 +262,38 @@ SELECT pg_temp.expect_error(
     )
   $statement$,
   'requires retirement and pinned deletion'
+) \g /dev/null
+UPDATE otlet.production_policy
+SET governance_enforced = false
+WHERE name = 'default';
+SELECT otlet.create_watch(
+  watch_name => 'task_watch_lifecycle_demo',
+  kind => 'row',
+  instruction => 'Return an empty object',
+  output_schema => '{"type":"object"}'::jsonb,
+  model_name => 'task_watch_lifecycle_model',
+  table_name => 'public.otlet_task_watch_lifecycle_source'::regclass,
+  subject_column => 'id',
+  input_columns => ARRAY['id', 'payload'],
+  record_type => 'different_identity',
+  trigger_policy => '{"on_change":"mark_stale_and_enqueue"}'::jsonb
+) \g /dev/null
+SELECT pg_temp.assert_true(
+  (SELECT record_type = 'different_identity'
+   FROM otlet.watches
+   WHERE name = 'task_watch_lifecycle_demo'),
+  'advisory watch replacement did not change identity'
+) \g /dev/null
+SELECT otlet.create_watch(
+  watch_name => 'task_watch_lifecycle_demo',
+  kind => 'row',
+  instruction => 'Return an empty object',
+  output_schema => '{"type":"object"}'::jsonb,
+  model_name => 'task_watch_lifecycle_model',
+  table_name => 'public.otlet_task_watch_lifecycle_source'::regclass,
+  subject_column => 'id',
+  input_columns => ARRAY['id', 'payload'],
+  trigger_policy => '{"on_change":"mark_stale_and_enqueue"}'::jsonb
 ) \g /dev/null
 
 CREATE TEMP TABLE task_watch_revision AS
@@ -333,6 +371,10 @@ SELECT pg_temp.assert_true(
   )
   AND otlet.replay_watch_reconciliation(false) = 'idle',
   'paused watch did not coalesce a dormant reconciliation backlog'
+) \g /dev/null
+SELECT pg_temp.expect_error(
+  $$SELECT otlet.drop_watch('task_watch_lifecycle_demo')$$,
+  'has unfinished work or reconciliation'
 ) \g /dev/null
 SELECT pg_temp.expect_error(
   $$SELECT *

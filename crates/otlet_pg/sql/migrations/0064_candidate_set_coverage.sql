@@ -1125,6 +1125,26 @@ BEGIN
     RETURN NEW;
   END IF;
 
+  IF NOT EXISTS (
+    SELECT 1
+    FROM otlet.workload_acceptance_contracts contract
+    WHERE contract.task_name = NEW.task_name
+      AND contract.baseline_workload_revision_hash =
+        OLD.active_workload_revision_hash
+      AND contract.candidate_workload_revision_hash =
+        NEW.active_workload_revision_hash
+      AND contract.definition #> '{population,rule,candidate_coverage}'
+        IS NOT NULL
+      AND NOT EXISTS (
+        SELECT 1
+        FROM otlet.workload_acceptance_contracts successor
+        WHERE successor.task_name = contract.task_name
+          AND successor.supersedes_contract_hash = contract.contract_hash
+      )
+  ) THEN
+    RETURN NEW;
+  END IF;
+
   PERFORM otlet.require_workload_source_contract(
     NEW.task_name,
     NEW.active_workload_revision_hash

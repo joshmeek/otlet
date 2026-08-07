@@ -684,18 +684,28 @@ BEGIN
       'max_attempt_ms_must_be_non_negative_integer'
     );
   END IF;
-  IF NOT requested ? 'inference_cache'
-     OR jsonb_typeof(requested -> 'inference_cache') IS DISTINCT FROM 'boolean'
-     OR requested -> 'inference_cache' <> 'false'::jsonb
-     OR supplied_effective -> 'inference_cache' IS DISTINCT FROM 'false'::jsonb THEN
+  IF (
+       requested ? 'inference_cache'
+       AND (
+         jsonb_typeof(requested -> 'inference_cache') IS DISTINCT FROM 'boolean'
+         OR requested -> 'inference_cache' <> 'false'::jsonb
+       )
+     ) OR (
+       supplied_effective ? 'inference_cache'
+       AND (
+         jsonb_typeof(supplied_effective -> 'inference_cache')
+           IS DISTINCT FROM 'boolean'
+         OR supplied_effective -> 'inference_cache' <> 'false'::jsonb
+       )
+     ) THEN
     rejected := rejected || jsonb_build_object(
       'inference_cache',
-      'inference_cache_must_be_explicitly_false'
+      'inference_cache_must_be_false'
     );
   END IF;
   max_worker_rss_valid := supplied_effective ? 'max_worker_rss_bytes'
     AND jsonb_typeof(supplied_effective -> 'max_worker_rss_bytes') = 'number'
-    AND supplied_effective ->> 'max_worker_rss_bytes' ~ '^[1-9][0-9]{0,13}$';
+    AND supplied_effective ->> 'max_worker_rss_bytes' ~ '^[0-9]{1,14}$';
   IF max_worker_rss_valid
      AND length(supplied_effective ->> 'max_worker_rss_bytes') = 14 THEN
     max_worker_rss_valid :=
@@ -704,9 +714,10 @@ BEGIN
   IF NOT max_worker_rss_valid THEN
     rejected := rejected || jsonb_build_object(
       'max_worker_rss_bytes',
-      'max_worker_rss_bytes_must_be_integer_1_to_70368744177664'
+      'max_worker_rss_bytes_must_be_integer_0_to_70368744177664'
     );
-  ELSIF current_rss_valid THEN
+  ELSIF current_rss_valid
+        AND (supplied_effective ->> 'max_worker_rss_bytes')::bigint > 0 THEN
     IF current_rss_text::bigint >
          (supplied_effective ->> 'max_worker_rss_bytes')::bigint THEN
       rejected := rejected || jsonb_build_object(
@@ -818,10 +829,7 @@ BEGIN
       WHEN effective_attempt_valid THEN to_jsonb(effective_attempt_text::bigint)
       ELSE '0'::jsonb
     END,
-    'inference_cache', COALESCE(
-      supplied_effective -> 'inference_cache',
-      'false'::jsonb
-    ),
+    'inference_cache', 'false'::jsonb,
     'max_worker_rss_bytes', COALESCE(
       supplied_effective -> 'max_worker_rss_bytes',
       '0'::jsonb

@@ -100,8 +100,7 @@ CREATE ROLE "$access_policy_quoted_login_role" LOGIN;
 CREATE ROLE $access_policy_managed_role NOLOGIN;
 SELECT otlet.register_access_policy_capability(
   '$access_policy_application_role'::regrole,
-  'application',
-  'Register demo application role'
+  'application'
 );
 SELECT otlet.register_access_policy_capability(
   '$access_policy_auditor_role'::regrole,
@@ -138,12 +137,21 @@ SELECT count(*)::text || '|' ||
        sum(unexpected_privilege_count)::text || '|' ||
        count(*) FILTER (
          WHERE capabilities = ARRAY['administrator']::text[]
-       )::text
+       )::text || '|' ||
+       (EXISTS (
+         SELECT 1
+         FROM otlet.administrative_change_events event
+         WHERE event.object_type = 'access_policy'
+           AND event.object_name = '$access_policy_application_role'
+           AND event.operation = 'register_capability'
+           AND event.reason IS NULL
+           AND event.ticket IS NULL
+       ))::text
 FROM otlet.access_policy_role_status;
 SQL
 )"
 echo "access_policy_registration_contract=$access_policy_registration_contract"
-[ "$access_policy_registration_contract" = "6|6|0|0|1" ] || {
+[ "$access_policy_registration_contract" = "6|6|0|0|1|true" ] || {
   echo "Expected six exact registered access policies, got $access_policy_registration_contract" >&2
   exit 1
 }

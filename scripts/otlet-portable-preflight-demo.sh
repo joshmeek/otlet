@@ -168,14 +168,6 @@ if ! docker exec "$database_container" pg_isready -h 127.0.0.1 -U postgres >/dev
 fi
 
 docker exec "$database_container" createdb -h 127.0.0.1 -U postgres "$database"
-docker exec -i "$database_container" psql -h 127.0.0.1 -U postgres -d postgres \
-  -X -q -v ON_ERROR_STOP=1 -v database="$database" <<'SQL' >/dev/null
-SELECT format(
-  'ALTER DATABASE %I SET otlet.administrative_reason = %L',
-  :'database',
-  'portable preflight executable proof'
-) \gexec
-SQL
 docker exec -w /work "$database_container" psql -h 127.0.0.1 -U postgres -d "$database" \
   -X -q -v ON_ERROR_STOP=1 -f crates/otlet_worker/sql/install.sql
 runtime_identity="$(docker run --rm "$worker_image" --print-runtime-identity)"

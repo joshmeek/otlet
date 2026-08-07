@@ -1261,7 +1261,7 @@ BEGIN
     RETURN NEXT;
     RETURN;
   END IF;
-  IF target_definition IS NULL OR rubric_hash IS NULL THEN
+  IF target_definition IS NULL THEN
     authority_error := 'reviewer_rubric_missing';
     RETURN NEXT;
     RETURN;
@@ -1272,6 +1272,12 @@ BEGIN
   WHERE role.oid = reviewer_authority.reviewer_oid;
   IF resolved_reviewer_name IS NULL THEN
     authority_error := 'reviewer_identity_invalid';
+    RETURN NEXT;
+    RETURN;
+  END IF;
+  IF rubric_hash IS NULL THEN
+    calibration_hash := NULL;
+    authority_error := NULL;
     RETURN NEXT;
     RETURN;
   END IF;

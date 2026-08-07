@@ -13,7 +13,7 @@ The default production policy sets these limits:
 | Queued input bytes per task | 64 MiB |
 | Total queued input bytes | 256 MiB |
 | Active claimed jobs per task | 8 |
-| Maximum queue age per task | 1 day |
+| Maximum queue age per task | Disabled |
 | Native interactive queue-age p99 target | 30,000 ms |
 | Native asynchronous queue-age p99 target | 30,000 ms |
 | Native cancellation-observation p99 target | 1,000 ms |
@@ -44,9 +44,9 @@ Definition authoring uses fixed platform limits rather than production-policy se
 
 Each model registration sets `max_active_jobs`, with a default of one. The production policy also sets `max_active_jobs_per_task`, from 1 through 1,024. Both limits count live claimed leases across native, portable, and infer-now execution. A `running` or `cancel_requested` job consumes a slot while its lease is live. Queued, terminal, null-lease, and expired-lease jobs consume none. A claim needs both a model slot and a task slot
 
-The singleton production policy applies task limits separately to each task. `max_queued_input_bytes_per_task` accepts 1 byte through 1 GiB and cannot exceed `max_queued_input_bytes_total`. `max_queue_age` accepts 1 second through 30 days. Otlet has no per-task or per-origin override
+The singleton production policy applies task limits separately to each task. `max_queued_input_bytes_per_task` accepts 1 byte through 1 GiB and cannot exceed `max_queued_input_bytes_total`. `max_queue_age` defaults to null, which disables queue-age admission backpressure. A configured value accepts 1 second through 30 days. Otlet has no per-task or per-origin override
 
-Operators set three positive bounded native p99 targets. The interactive and asynchronous queue targets remain declared and unmeasured, while `native_cancellation_slo_status` measures the cancellation target. Admission backpressure continues to use `max_queue_age`
+Operators set three positive bounded native p99 targets. The interactive and asynchronous queue targets remain declared and unmeasured, while `native_cancellation_slo_status` measures the cancellation target. Those SLO declarations do not enable queue-age admission backpressure; configure `max_queue_age` separately when needed
 
 PostgreSQL assigns one immutable origin at admission:
 
@@ -64,7 +64,7 @@ Foreground adoption of a deferred backfill job keeps `backfill`. Public task adm
 
 `otlet.model_queue_status`, `otlet.production_policy_status`, and `otlet.production_status` expose current limits and queue bytes. `otlet.task_queue_status` groups queued rows, bytes, and oldest age by task and origin and repeats the task-wide byte and age headroom. `otlet.task_resource_status` groups live claims by task and origin and reports task-wide slots. Model and worker status expose model slots. `otlet.runs`, `otlet.inference_receipt_trace_status`, `otlet.portable_receipt_status`, and `otlet.audit_receipt_export` expose the stored origin. `otlet.verify_invariants()` checks live model claims, queue depth, per-job bytes, per-model bytes, and total bytes; migration 0075 adds no task-budget invariant
 
-Queue bytes count evaluation work plus production work under each active task revision, matching global admission accounting. Queue age starts at the oldest counted queued job's `created_at`. An exceeded age or byte limit rejects new work for that task with `task_queue_age_cap` or `task_queued_input_byte_cap`; other tasks continue independently. Existing jobs remain queued and claimable. Fallback requeue can temporarily put stored bytes above an admission cap, so byte and age limits are admission backpressure rather than expiry or hard queue-state invariants
+Queue bytes count evaluation work plus production work under each active task revision, matching global admission accounting. Queue age starts at the oldest counted queued job's `created_at`. A configured and exceeded age limit or an exceeded byte limit rejects new work for that task with `task_queue_age_cap` or `task_queued_input_byte_cap`; other tasks continue independently. Existing jobs remain queued and claimable. Fallback requeue can temporarily put stored bytes above an admission cap, so byte and configured age limits are admission backpressure rather than expiry or hard queue-state invariants
 
 Admission also requires an active task revision. Pausing a task removes its revision head after leased work drains, so direct, application, native, portable, and watch admission reject new work and claims leave existing queued jobs untouched. Exact-pin resume restores that queue under the same revision. Retirement requires an empty queue and watch-reconciliation backlog, locks the pinned source identities, and is terminal. `task_lifecycle_status` exposes the state, pin, queue and reconciliation counts, source identity drift, and transition blockers
 

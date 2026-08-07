@@ -39,39 +39,34 @@ SELECT otlet.create_watch(
   trigger_policy => '{"on_change":"mark_stale_and_enqueue"}'::jsonb
 ) \g /dev/null
 
-INSERT INTO otlet.watch_reconciliation (
-  watch_name,
-  subject_id,
-  workload_revision_hash,
-  source_identity,
-  source_deleted,
-  attempt_limit
-)
-SELECT
-  'watch_reconciliation_missing',
-  'orphan',
-  head.active_workload_revision_hash,
-  otlet.watch_source_delete_identity('watch_reconciliation_missing', 'orphan'),
-  true,
-  policy.watch_reconciliation_max_attempts
-FROM otlet.workload_revision_heads head
-CROSS JOIN otlet.production_policy policy
-WHERE head.task_name = 'watch_reconciliation_demo_task'
-  AND policy.name = 'default';
 DO $proof$
-DECLARE
-  replay_result text;
 BEGIN
-  replay_result := otlet.replay_watch_reconciliation(true);
-  IF replay_result <> 'missing'
-     OR EXISTS (
-       SELECT 1
-       FROM otlet.watch_reconciliation
-       WHERE watch_name = 'watch_reconciliation_missing'
-         AND subject_id = 'orphan'
-     ) THEN
-    RAISE EXCEPTION 'watch replay did not prune an orphaned reconciliation row: %', replay_result;
-  END IF;
+  BEGIN
+    INSERT INTO otlet.watch_reconciliation (
+      watch_name,
+      subject_id,
+      workload_revision_hash,
+      source_identity,
+      source_deleted,
+      attempt_limit
+    )
+    SELECT
+      'watch_reconciliation_missing',
+      'orphan',
+      head.active_workload_revision_hash,
+      otlet.watch_source_delete_identity('watch_reconciliation_missing', 'orphan'),
+      true,
+      policy.watch_reconciliation_max_attempts
+    FROM otlet.workload_revision_heads head
+    CROSS JOIN otlet.production_policy policy
+    WHERE head.task_name = 'watch_reconciliation_demo_task'
+      AND policy.name = 'default';
+    RAISE EXCEPTION 'orphaned watch reconciliation was accepted';
+  EXCEPTION WHEN foreign_key_violation THEN
+    IF position('watch_reconciliation_watch_name_fkey' IN SQLERRM) = 0 THEN
+      RAISE;
+    END IF;
+  END;
 END;
 $proof$;
 
@@ -417,13 +412,13 @@ BEGIN
 END;
 $proof$;
 
-SELECT 'orphan_pruned|coalesced|backoff|exhausted|snapshot_fenced|subject_rename|replayed|acknowledged|source_deleted|invariants_clean';
+SELECT 'orphan_rejected|coalesced|backoff|exhausted|snapshot_fenced|subject_rename|replayed|acknowledged|source_deleted|invariants_clean';
 ROLLBACK;
 SQL
 )"
 
 echo "watch_reconciliation_contract=$watch_reconciliation_contract"
-[ "$watch_reconciliation_contract" = "orphan_pruned|coalesced|backoff|exhausted|snapshot_fenced|subject_rename|replayed|acknowledged|source_deleted|invariants_clean" ] || {
+[ "$watch_reconciliation_contract" = "orphan_rejected|coalesced|backoff|exhausted|snapshot_fenced|subject_rename|replayed|acknowledged|source_deleted|invariants_clean" ] || {
   echo "Expected durable watch reconciliation contract, got $watch_reconciliation_contract" >&2
   exit 1
 }
@@ -503,6 +498,16 @@ if [ "$watch_runtime_status|$watch_create_status" != "0|0" ]; then
   exit 1
 fi
 
+psql_exec -qAt <<'SQL' >/dev/null
+SELECT otlet.set_task_lifecycle(
+  head.task_name,
+  'paused',
+  head.active_workload_revision_hash
+)
+FROM otlet.workload_revision_heads head
+WHERE head.task_name = 'watch_reconciliation_drop_race_task';
+SQL
+
 docker exec -e PGOPTIONS="$demo_pgoptions" -i "$container" \
   psql -U postgres -d "$database" -X -qAt -v ON_ERROR_STOP=1 <<'SQL' >/dev/null &
 BEGIN;
@@ -515,9 +520,19 @@ watch_source_pid=$!
 sleep 0.2
 docker exec -e PGAPPNAME=otlet-watch-reconciliation-drop \
   -e PGOPTIONS="$demo_pgoptions" -i "$container" \
-  psql -U postgres -d "$database" -X -qAt -v ON_ERROR_STOP=1 \
-  -c "SET statement_timeout = '8s'; SELECT otlet.drop_watch_registry('watch_reconciliation_drop_race')" \
-  >/dev/null &
+  psql -U postgres -d "$database" -X -qAt -v ON_ERROR_STOP=1 <<'SQL' >/dev/null &
+SET statement_timeout = '8s';
+DO $proof$
+BEGIN
+  PERFORM otlet.drop_watch_registry('watch_reconciliation_drop_race');
+  RAISE EXCEPTION 'concurrent watch drop unexpectedly succeeded';
+EXCEPTION WHEN OTHERS THEN
+  IF position('has unfinished work or reconciliation' IN SQLERRM) = 0 THEN
+    RAISE;
+  END IF;
+END
+$proof$;
+SQL
 watch_drop_pid=$!
 
 watch_drop_waiting=false
@@ -550,15 +565,15 @@ fi
 
 watch_drop_contract="$(psql_value <<'SQL'
 SELECT concat_ws('|',
-  NOT EXISTS (
+  EXISTS (
     SELECT 1 FROM otlet.watches
     WHERE name = 'watch_reconciliation_drop_race'
   ),
-  NOT EXISTS (
+  EXISTS (
     SELECT 1 FROM otlet.watch_reconciliation
     WHERE watch_name = 'watch_reconciliation_drop_race'
   ),
-  NOT EXISTS (
+  EXISTS (
     SELECT 1 FROM pg_trigger
     WHERE tgrelid = 'public.otlet_watch_reconciliation_drop_race'::regclass
       AND tgname LIKE 'otlet_watch_v1_%'
@@ -570,10 +585,13 @@ SQL
 )"
 echo "watch_reconciliation_drop_contract=$watch_drop_contract"
 if [ "$watch_drop_contract" != "t|t|t|t" ]; then
-  echo "Expected watch drop to clean reconciliation state, got $watch_drop_contract" >&2
+  echo "Expected concurrent watch drop to preserve unfinished reconciliation, got $watch_drop_contract" >&2
   exit 1
 fi
 
 psql_exec -qAt <<'SQL' >/dev/null
+DELETE FROM otlet.watch_reconciliation
+WHERE watch_name = 'watch_reconciliation_drop_race';
+SELECT otlet.drop_watch_registry('watch_reconciliation_drop_race');
 DROP TABLE public.otlet_watch_reconciliation_drop_race;
 SQL

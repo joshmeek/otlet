@@ -950,7 +950,11 @@ SELECT
   NULL,
   extract(epoch FROM queue.max_queue_age) * 1000,
   'milliseconds',
-  CASE WHEN queue.queue_age_exceeded THEN 'pressured' ELSE 'available' END
+  CASE
+    WHEN queue.max_queue_age IS NULL THEN 'disabled'
+    WHEN queue.queue_age_exceeded THEN 'pressured'
+    ELSE 'available'
+  END
 FROM otlet.task_queue_capacity queue
 JOIN otlet.workload_revision_heads head ON head.task_name = queue.task_name
 CROSS JOIN observation observed

@@ -837,6 +837,11 @@ BEGIN
     RAISE EXCEPTION 'revision B re-promotion did not restore invalidation';
   END IF;
 
+  PERFORM *
+  FROM otlet.request_job_cancellation(
+    proof.queued_job_id,
+    'Revision invalidation watch cleanup'
+  );
   PERFORM otlet.drop_watch_registry('revision_invalidation_probe');
   IF EXISTS (
     SELECT 1

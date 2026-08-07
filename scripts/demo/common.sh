@@ -1,4 +1,4 @@
-demo_pgoptions="${OTLET_DEMO_PGOPTIONS:--c otlet.administrative_reason=repository-demo}"
+demo_pgoptions="${OTLET_DEMO_PGOPTIONS:-}"
 
 log() {
   printf '[%s] %s\n' "$(date '+%H:%M:%S')" "$*"

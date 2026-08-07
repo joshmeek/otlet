@@ -172,14 +172,14 @@ impl RuntimeOptions {
             }
         }
         match object.get("inference_cache") {
-            Some(Value::Bool(false)) => {}
-            Some(Value::Bool(true)) | None => {
+            Some(Value::Bool(false)) | None => {}
+            Some(Value::Bool(true)) => {
                 return Err("runtime_options.inference_cache must be false".to_owned());
             }
             Some(_) => return Err("runtime_options.inference_cache must be a boolean".to_owned()),
         }
         let max_worker_rss_bytes =
-            required_runtime_integer(object, "max_worker_rss_bytes", 1, 70_368_744_177_664)?;
+            required_runtime_integer(object, "max_worker_rss_bytes", 0, 70_368_744_177_664)?;
         let context_window_tokens = object
             .contains_key("context_window_tokens")
             .then(|| {
@@ -324,6 +324,8 @@ fn request_admission(
         ("rejected", "prompt_exceeds_context_window")
     } else if prompt_tokens.saturating_add(options.max_tokens) > context_window.effective as usize {
         ("rejected", "prompt_and_generation_exceed_context_window")
+    } else if options.max_worker_rss_bytes == 0 {
+        ("allowed", "worker_memory_budget_disabled")
     } else if current_rss_bytes
         .saturating_add(projected_prompt_bytes)
         .saturating_add(projected_decode_bytes)
@@ -1821,6 +1823,28 @@ fn token_to_piece(
     Ok(())
 }
 
+fn worker_memory_budget_trace(
+    options: Option<&RuntimeOptions>,
+) -> (Option<u64>, &'static str, &'static str) {
+    match options {
+        None => (
+            None,
+            "max_worker_rss_bytes_unavailable",
+            "worker_memory_budget_unavailable",
+        ),
+        Some(options) if options.max_worker_rss_bytes == 0 => (
+            None,
+            "max_worker_rss_bytes_disabled",
+            "worker_memory_budget_disabled",
+        ),
+        Some(options) => (
+            Some(options.max_worker_rss_bytes),
+            "max_worker_rss_bytes_fail_closed",
+            "worker_memory_budget_not_evaluated",
+        ),
+    }
+}
+
 fn runtime_trace(
     claim: &Claim,
     model: &LocalModel,
@@ -1830,7 +1854,7 @@ fn runtime_trace(
     rss_after: Option<u64>,
     inference: Option<&Inference>,
 ) -> Value {
-    let budget = options.map(|options| options.max_worker_rss_bytes);
+    let (budget, budget_policy, no_budget_reason) = worker_memory_budget_trace(options);
     let final_rss = rss_after.or(rss_before).unwrap_or(claim.claim_rss_bytes);
     let admission_rss = claim.claim_rss_bytes.max(rss_before.unwrap_or(0));
     let (admission, admission_reason) = match (budget, rss_before) {
@@ -1839,7 +1863,7 @@ fn runtime_trace(
         }
         (Some(_), Some(_)) => ("rejected", "observed_worker_rss_exceeds_job_budget"),
         (Some(_), None) => ("not_evaluated", "pre_inference_rss_not_recorded"),
-        (None, _) => ("not_evaluated", "worker_memory_budget_unavailable"),
+        (None, _) => ("not_evaluated", no_budget_reason),
     };
     let (post_enforcement, post_enforcement_reason) = match (budget, rss_after) {
         (Some(budget), Some(rss)) if rss <= budget => {
@@ -1847,7 +1871,7 @@ fn runtime_trace(
         }
         (Some(_), Some(_)) => ("rejected", "post_inference_rss_exceeds_job_budget"),
         (Some(_), None) => ("not_evaluated", "post_inference_rss_not_recorded"),
-        (None, _) => ("not_evaluated", "worker_memory_budget_unavailable"),
+        (None, _) => ("not_evaluated", no_budget_reason),
     };
     let request_admission_trace = json!({
         "prompt_tokens": request.map(|request| request.prompt_tokens),
@@ -1883,7 +1907,7 @@ fn runtime_trace(
     let memory = json!({
         "worker_memory_sample_policy": RSS_POLICY,
         "worker_memory_budget_bytes": budget,
-        "worker_memory_budget_policy": "max_worker_rss_bytes_fail_closed",
+        "worker_memory_budget_policy": budget_policy,
         "claim": { "process_rss_bytes": claim.claim_rss_bytes },
         "before": rss_before.map(|rss| json!({ "process_rss_bytes": rss })).unwrap_or_else(|| json!({})),
         "after": rss_after.map(|rss| json!({ "process_rss_bytes": rss })).unwrap_or_else(|| json!({})),
@@ -1896,7 +1920,7 @@ fn runtime_trace(
         "post_inference_enforcement": {
             "decision": post_enforcement,
             "reason": post_enforcement_reason,
-            "policy": "max_worker_rss_bytes_fail_closed"
+            "policy": budget_policy
         }
     });
     json!({
@@ -2735,7 +2759,7 @@ fn process_rss_bytes_from(status: &str) -> Option<u64> {
 }
 
 fn enforce_worker_rss_budget(rss_bytes: u64, max_worker_rss_bytes: u64) -> Result<(), String> {
-    if rss_bytes > max_worker_rss_bytes {
+    if max_worker_rss_bytes > 0 && rss_bytes > max_worker_rss_bytes {
         return Err("portable_worker_rss_budget_exceeded".to_owned());
     }
     Ok(())
@@ -3494,7 +3518,7 @@ esac
 
         let required = options.as_object_mut().expect("options are an object");
         required.remove("inference_cache");
-        assert!(RuntimeOptions::parse(&options).is_err());
+        assert!(RuntimeOptions::parse(&options).is_ok());
         options = valid_options();
         options
             .as_object_mut()
@@ -3510,7 +3534,6 @@ esac
 
         for (key, value) in [
             ("inference_cache", json!(true)),
-            ("max_worker_rss_bytes", json!(0)),
             ("context_window_tokens", json!(0)),
             ("context_window_tokens", json!(4097)),
             ("generation_trace", json!(true)),
@@ -3521,6 +3544,14 @@ esac
             options[key] = value;
             assert!(RuntimeOptions::parse(&options).is_err());
         }
+        options = valid_options();
+        options["max_worker_rss_bytes"] = json!(0);
+        assert_eq!(
+            RuntimeOptions::parse(&options)
+                .unwrap()
+                .max_worker_rss_bytes,
+            0
+        );
         options = valid_options();
         options["generation_trace_top_k"] = json!(5);
         assert!(RuntimeOptions::parse(&options).is_err());
@@ -3623,6 +3654,41 @@ esac
             request_admission(10, 14, max_output_bytes, &options, context_window, 100).reason,
             "portable_worker_rss_budget_exceeded"
         );
+        options.max_worker_rss_bytes = 0;
+        assert_eq!(
+            request_admission(10, 14, max_output_bytes, &options, context_window, u64::MAX).reason,
+            "worker_memory_budget_disabled"
+        );
+        assert!(enforce_worker_rss_budget(u64::MAX, 0).is_ok());
+    }
+
+    #[test]
+    fn portable_memory_trace_distinguishes_unavailable_and_disabled_budgets() {
+        let mut options = RuntimeOptions {
+            max_tokens: 1,
+            max_worker_rss_bytes: 0,
+            context_window_tokens: Some(1),
+            llama_threads: 1,
+            llama_batch_threads: 1,
+        };
+        assert_eq!(
+            worker_memory_budget_trace(None),
+            (
+                None,
+                "max_worker_rss_bytes_unavailable",
+                "worker_memory_budget_unavailable"
+            )
+        );
+        assert_eq!(
+            worker_memory_budget_trace(Some(&options)),
+            (
+                None,
+                "max_worker_rss_bytes_disabled",
+                "worker_memory_budget_disabled"
+            )
+        );
+        options.max_worker_rss_bytes = 1;
+        assert_eq!(worker_memory_budget_trace(Some(&options)).0, Some(1));
     }
 
     #[test]

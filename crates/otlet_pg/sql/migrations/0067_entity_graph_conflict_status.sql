@@ -349,14 +349,22 @@ LANGUAGE plpgsql
 SET search_path = pg_catalog, otlet, pg_temp
 AS $$
 BEGIN
-  IF TG_OP = 'INSERT'
-     OR NEW.active_workload_revision_hash IS DISTINCT FROM
+  IF TG_OP <> 'INSERT'
+     AND NEW.active_workload_revision_hash IS NOT DISTINCT FROM
        OLD.active_workload_revision_hash THEN
-    PERFORM otlet.require_entity_graph_clear(
-      NEW.task_name,
-      'workload promotion'
-    );
+    RETURN NEW;
   END IF;
+  IF NOT COALESCE((
+    SELECT policy.governance_enforced
+    FROM otlet.production_policy policy
+    WHERE policy.name = 'default'
+  ), false) THEN
+    RETURN NEW;
+  END IF;
+  PERFORM otlet.require_entity_graph_clear(
+    NEW.task_name,
+    'workload promotion'
+  );
   RETURN NEW;
 END;
 $$;

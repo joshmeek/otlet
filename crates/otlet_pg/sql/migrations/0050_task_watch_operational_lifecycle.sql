@@ -888,8 +888,7 @@ CREATE OR REPLACE FUNCTION otlet.drop_watch(watch_name text) RETURNS boolean
 LANGUAGE plpgsql
 AS $$
 BEGIN
-  RAISE EXCEPTION 'otlet watch % identity change requires retirement and pinned deletion',
-    drop_watch.watch_name;
+  RETURN otlet.drop_watch_registry(drop_watch.watch_name);
 END;
 $$;
 
@@ -921,7 +920,9 @@ BEGIN
   PERFORM pg_advisory_xact_lock(
     hashtextextended('otlet_workload_revision:' || watch_row.task_name, 0)
   );
+  PERFORM pg_advisory_xact_lock(hashtext('otlet_queue_admission'));
 
+  PERFORM otlet.lock_task_source_relations(watch_row.task_name);
   SELECT *
   INTO watch_row
   FROM otlet.watches watch
@@ -932,7 +933,19 @@ BEGIN
     RETURN false;
   END IF;
 
-  PERFORM otlet.lock_task_source_relations(watch_row.task_name);
+  IF EXISTS (
+       SELECT 1
+       FROM otlet.jobs job
+       WHERE job.task_name = watch_row.task_name
+         AND job.status IN ('queued', 'running', 'cancel_requested')
+     ) OR EXISTS (
+       SELECT 1
+       FROM otlet.watch_reconciliation reconciliation
+       WHERE reconciliation.watch_name = watch_row.name
+     ) THEN
+    RAISE EXCEPTION 'otlet watch % has unfinished work or reconciliation',
+      watch_row.name;
+  END IF;
   IF watch_row.kind = 'row'
      AND otlet.watch_source_relation_drift(
        watch_row.task_name,

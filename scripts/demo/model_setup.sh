@@ -25,7 +25,10 @@ resolve_model_artifact() {
   local model_file="$4"
 
   if [ -z "$artifact" ]; then
-    artifact="$(docker exec "$container" find /var/lib/postgresql -name "$model_file" -print -quit 2>/dev/null || true)"
+    artifact="$(docker exec "$container" find -L /var/lib/postgresql -type f -name "$model_file" -print -quit 2>/dev/null || true)"
+  fi
+  if [ -n "$artifact" ]; then
+    artifact="$(docker exec "$container" readlink -f "$artifact" 2>/dev/null || true)"
   fi
 
   if [ -z "$artifact" ]; then
@@ -43,6 +46,8 @@ resolve_model_artifact() {
 
 register_models() {
   ensure_model_artifacts
+  local cheap_model_file="${OTLET_CHEAP_MODEL_FILE:-Qwen3-1.7B-Q8_0.gguf}"
+  local strong_model_file="${OTLET_STRONG_MODEL_FILE:-Qwen3.5-4B-Q4_K_M.gguf}"
   local cheap_model_sha256 strong_model_sha256 cheap_model_bytes strong_model_bytes
   local cheap_model_source strong_model_source cheap_model_revision strong_model_revision
   local cheap_model_quantization strong_model_quantization cheap_model_license strong_model_license
@@ -55,8 +60,8 @@ register_models() {
   strong_model_source="${OTLET_STRONG_MODEL_SOURCE:-https://huggingface.co/unsloth/Qwen3.5-4B-GGUF/resolve/main/Qwen3.5-4B-Q4_K_M.gguf}"
   cheap_model_revision="${OTLET_CHEAP_MODEL_REVISION:-main}"
   strong_model_revision="${OTLET_STRONG_MODEL_REVISION:-main}"
-  cheap_model_quantization="${OTLET_CHEAP_MODEL_QUANTIZATION:-${cheap_model_artifact##*-}}"
-  strong_model_quantization="${OTLET_STRONG_MODEL_QUANTIZATION:-${strong_model_artifact##*-}}"
+  cheap_model_quantization="${OTLET_CHEAP_MODEL_QUANTIZATION:-${cheap_model_file##*-}}"
+  strong_model_quantization="${OTLET_STRONG_MODEL_QUANTIZATION:-${strong_model_file##*-}}"
   cheap_model_quantization="${cheap_model_quantization%.gguf}"
   strong_model_quantization="${strong_model_quantization%.gguf}"
   cheap_model_license="${OTLET_CHEAP_MODEL_LICENSE:-unknown}"

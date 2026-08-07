@@ -636,7 +636,7 @@ $body$;
 RESET ROLE;
 
 UPDATE otlet.jobs job
-SET leased_until = clock_timestamp() - interval '1 second'
+SET leased_until = transaction_timestamp() - interval '1 second'
 WHERE job.id = (SELECT job_id FROM portable_fence_claim_a);
 SET LOCAL ROLE :worker_role;
 CREATE TEMP TABLE portable_fence_claim_b ON COMMIT DROP AS
