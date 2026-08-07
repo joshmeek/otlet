@@ -20,7 +20,7 @@ docker exec -it otlet-postgres sh -lc '
 
 Run the sections in order before adapting them. Each section names the state it creates and the output to inspect. Follow-up checks live in [runtime-and-traces.md](runtime-and-traces.md), [semantic-watches.md](semantic-watches.md), and [production-contract.md](production-contract.md)
 
-The setup and inspection sections run as the extension owner. The first SQL block sets one administrative reason for this interactive `psql` session. The owner calls `otlet.grant_reviewer_access(...)` for a delegated reviewer and registers a successful calibration before that reviewer uses the action review functions. A separate operator receives `otlet.grant_operator_access(...)` for dry run and apply. Auditors read `otlet.audit_review_export` and `otlet.audit_review_event_export`; raw `otlet.review_queue`, task configuration, receipts, and trace state remain owner-only
+All SQL shown here runs as the extension owner. The first block sets one administrative reason for the interactive `psql` session. Production deployments register reviewer and operator access-policy capabilities, calibrate reviewers, and use the delegated reviewer and operator RPCs instead of the owner-only calls shown here. Auditors read `otlet.audit_review_export` and `otlet.audit_review_event_export`; raw `otlet.review_queue`, task configuration, receipts, and trace state remain owner-only
 
 Receipts keep prompt and raw-output hashes under the default storage policy. Accepted output and rejected structured candidates remain available without persisting the assembled prompt or raw model text
 
@@ -163,7 +163,7 @@ WHERE task_name = 'entity_resolution_demo';
 COMMIT;
 ```
 
-Delete prior demo evidence to make the active example rerunnable. `create_task` updates the active definition and captures a new revision when work is admitted. A retired task remains a durable archive, so use a new task name after retirement
+This disposable-fixture cleanup removes mutable job-chain rows only when no evidence-lifecycle request manages them. It preserves immutable review, administrative, and revision history. Use the evidence lifecycle for production evidence. `create_task` updates the active definition and captures a new revision when work is admitted. A retired task remains a durable archive, so use a new task name after retirement
 
 ## Step 4 - Create The Task
 
@@ -652,6 +652,8 @@ Representative output:
 Otlet enforces write authority through the task contract and action catalog. Each task has an `action_types` allowlist. Presets and watches set it for tasks that expect actions; an omitted allowlist rejects every model action. `create_record`, `note`, and the decision actions remain recommendation state inside Otlet. Only `update_row` exposes an application-table write path. `otlet.action_status` shows its authority, approval, dry-run, and apply state
 
 Otlet exposes one source-table write action: `update_row`. The extension owner registers one ordinary table, its sole primary key, and the columns Otlet may update:
+
+The remaining fragments are contract sketches, not standalone continuation SQL. They assume an application-owned `app.review_items` table, a registered row-watch task named `review_items_watch_task`, a generated `update_row` action, and its ID in the `action_id` psql variable. The complete executable fixture and failure cases live in `scripts/demo/bounded_actions.sh`
 
 ```sql
 SELECT otlet.register_action_target(

@@ -6,7 +6,7 @@ Follow one Docker-backed Otlet entity-resolution loop: leave vendor rows in Post
 
 The output blocks are validated with `./scripts/otlet-setup.sh` and `./scripts/otlet-demo.sh`. Job IDs, receipt IDs, hashes, timestamps, token counts, timings, and token rates are representative and vary by machine and cache state
 
-This walkthrough runs as the extension owner because it registers models and tasks, reads raw attempt state, and administers watches. Production auditors use the redacted `otlet.audit_*` views. The owner calls `otlet.grant_reviewer_access(...)` for reviewers and registers a successful calibration before they approve or correct work. A separate operator receives `otlet.grant_operator_access(...)` for dry run and apply. See [production-contract.md](production-contract.md) for the exact grants
+This walkthrough runs as the extension owner because it registers models and tasks, reads raw attempt state, and administers watches. Production auditors use the redacted `otlet.audit_*` views. The owner registers reviewer and operator access-policy capabilities, then calibrates reviewers before they approve or correct work. See [production-contract.md](production-contract.md) for the exact lifecycle calls and grants
 
 The default storage policy keeps assembled prompts in worker memory and removes raw model text and token text before receipt insertion. The examples inspect hashes, structured output, and numeric trace state
 
@@ -221,13 +221,13 @@ Otlet changes `row-1` once and preserves its protected sentinel. `row-3` stays u
 After the direct task works, check semantic joins, portable watch definitions, stale rows, receipts, and production status:
 
 ```text
-semantic_join_auto_records=4|4
+semantic_join_auto_records=4|4|true
 semantic_join_auto_materialized=4
 semantic_join_lookup_contract=4|1|3
 semantic_join_match_contract=true|true
 watch_replace_contract=true|true|true|true|true|true|true|true|true|true
 watch_round_trip_contract=true|true|true|true|true
-watch_import_failure_contract=10|true
+watch_import_failure_contract=12|true
 candidate_removed_contract=0|true|candidate_removed|0|0|false|
 candidate_changed_contract=1|true|candidate_changed|0
 semantic_join_stale_contract=4|0|fresh_after_lookup=0|receipts=8|8

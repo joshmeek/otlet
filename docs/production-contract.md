@@ -118,7 +118,7 @@ FROM otlet.audit_administrative_change_export
 ORDER BY event_id DESC;
 ```
 
-Otlet records changes from migration installation forward and leaves earlier history absent. Registered access policies record lifecycle changes and report raw owner `GRANT` or `REVOKE` statements as manifest drift. The database or extension owner can disable or replace database guards; the planned signed-checkpoint work covers that stronger boundary. Repository demo connections and disposable SQL-only databases supply a generic proof reason. Production sessions should supply a specific reason or ticket
+Otlet records changes from migration installation forward and leaves earlier history absent. Registered access policies record lifecycle changes and report raw owner `GRANT` or `REVOKE` statements as manifest drift. The database or extension owner can disable or replace database guards. Conditional signed audit checkpoints could let an external consumer detect later rewriting, but cannot prevent owner or superuser changes. Repository demo connections and disposable SQL-only databases supply a generic proof reason. Production sessions should supply a specific reason or ticket
 
 Workload packs are owner-only administrative changes for an existing active watch. `prepare_workload_pack(...)` stores one immutable canonical candidate against the expected configured spec and active workload revision; `apply_workload_pack(...)` rechecks both and changes the task, watch, selection, and action-policy configuration in one transaction. A governed candidate must cite the current promotion decision so Otlet reuses the existing activation gate. `rollback_workload_pack(...)` restores only the exact predecessor of the latest application and records both pack and administrative lineage. Pack status reports configured drift and rollback readiness without creating work
 
@@ -279,7 +279,7 @@ PostgreSQL validates accepted results again before it stores a receipt, output, 
 
 Completion parses the raw envelope and requires it to match the submitted output and actions. PostgreSQL recomputes SHA-256 identities for the task, input, source snapshot, prompt, schema, registered model, effective runtime options, raw output, structured output, and actions. It rejects mismatched worker hashes, malformed output, schema violations, and stale MVCC-backed source data. Worker-submitted validation status is diagnostic input only; the receipt stores PostgreSQL's result. Existing action contracts recheck workflow policy and target allowlists, so unauthorized proposals remain rejected evidence and cannot become records
 
-Portable protocol `otlet.portable.worker.v1` uses exact-version compatibility and an owner-registered runtime identity bound to one database role. `grant_portable_worker_access(...)` grants that dedicated role one compatibility view and eight fixed-search-path `SECURITY DEFINER` RPCs for startup, heartbeat, claim, renewal, attempt, completion, failure, and cancellation. It grants no source or Otlet table access
+Portable protocol `otlet.portable.worker.v1` uses exact-version compatibility and an owner-registered runtime identity bound to one database role. Registering the role with the `portable_worker` access-policy capability grants one compatibility view and eight fixed-search-path `SECURITY DEFINER` RPCs for startup, heartbeat, claim, renewal, attempt, completion, failure, and cancellation. It grants no source or Otlet table access
 
 Application callers use `application_submit_task_subject(...)` to queue one subject from a configured task with an active revision. The fixed-path function reuses the task's bound source query, immutable revision, input-relation checks, plan preflight, and queue limits. PostgreSQL stores the authenticated `session_user` role as owner and authenticated actor, plus the active `SET ROLE` role in a distinct provenance field
 
@@ -309,7 +309,7 @@ PostgreSQL stores a database-authored `runtime_options_status` on each portable 
 
 Each model registration stores a tested `context_window_tokens` ceiling from 1 to 4,096. Existing registrations without the field keep their artifact identity and use the prior 4,096-token ceiling. A task may omit `context_window_tokens` or request a smaller value; direct, cheap, and strong routes reject a larger value with `requested_context_window_exceeds_model_limit` before work can queue. Native and portable execution record the tested, requested, and effective ceilings in option status and runtime fingerprints. They reject a prompt that fills the effective window or a prompt plus declared `max_tokens` that crosses it, emit `prompt_exceeds_context_window` or `prompt_and_generation_exceed_context_window`, and store no output. Both paths project prompt and bounded decode buffers in the request-level RSS admission check before decode. Native admission also includes the bounded prompt-prefix state
 
-The owner sets a worker to `running`, `paused`, or `draining`. The heartbeat returns that desired state with the snapshotted model digest and byte size, records process and model health, and does not grant owner controls to the worker role. Pause and drain block new claims. The reference worker starts a monotonic deadline before the claim RPC, uses the database-issued duration for prompt decode and generation, and stops renewal when that deadline arrives. PostgreSQL uses `clock_timestamp()` at claim time and refuses renewal after the same immutable budget; a renewal that crosses the deadline rolls back. Timeout uses the native `attempt_timeout` job error, receipt selection reason, failed schema status, and trace stop reason. The live lease retains completion grace for a result that finished before the worker deadline. Cancellation and pre-deadline claim loss remain authoritative
+The owner sets a worker to `running`, `paused`, or `draining`. The heartbeat returns that desired state with the snapshotted model digest and byte size, records process and model health, and does not grant owner controls to the worker role. Pause and drain block new claims. The reference worker starts one monotonic clock before the claim RPC, anchors the returned duration at that start, and stops renewal when the resulting deadline arrives. PostgreSQL uses `clock_timestamp()` at claim time and refuses renewal after the same immutable budget; a renewal that crosses the deadline rolls back. Timeout uses the native `attempt_timeout` job error, receipt selection reason, failed schema status, and trace stop reason. The live lease retains completion grace for a result that finished before the worker deadline. Cancellation and pre-deadline claim loss remain authoritative
 
 `portable_worker_status`, `portable_claim_status`, and `portable_receipt_status` expose the registered artifact and runtime contract, current RSS, normalized option status, desired and reported state, model health, queue depth, claim health, deadlines, terminal state, receipt attribution, and incarnation hashes without exposing raw nonces or claim tokens. Exact duplicate terminal delivery returns the prior result; PostgreSQL rejects a changed retry
 
@@ -496,7 +496,7 @@ FROM otlet.production_status;
 Representative demo output:
 
 ```text
-performance_ratio_contract=40|49|1.225|16548|413.700
+performance_ratio_contract=51|61|1.196|20666|405.216
 ```
 
 ### Step 3c - Materialization Failure Visibility
@@ -525,7 +525,7 @@ SELECT count(*) FROM otlet.verify_invariants();
 
 Contract: `0` (demo prints `invariant_contract=0`). The suite fails closed on expired or NULL leases for `running` and `cancel_requested` jobs, complete receipts without schema pass, sensitive evidence that violates the active storage policy, materializations missing `source_hash`, and error runtime slots. `production_status` and `verify_invariants` name the receipt invariant `complete_receipts_are_schema_validated`; throughput views use `completed_jobs` and `last_batch_completed_jobs`. Step 6 of `docs/semantic-watches.md` anchors the planner vocabulary for `selected_path` / `Planner Selected Path` and `freshness_basis`
 
-Auditors and operators query redacted, read-only projections through `otlet.audit_receipt_export`, `otlet.audit_review_sample_export`, `otlet.audit_review_export`, `otlet.audit_review_event_export`, `otlet.audit_reviewer_calibration_export`, `otlet.audit_action_execution_export`, `otlet.audit_eval_label_export`, `otlet.audit_administrative_change_export`, `otlet.audit_decision_evidence_export`, `otlet.semantic_dependency_audit`, `otlet.operational_event_log`, `otlet.operational_observability_status`, `otlet.labeled_quality_status`, `otlet.worker_batch_timing_status`, `otlet.task_queue_status`, `otlet.task_resource_status`, `otlet.access_policy_role_status`, and `otlet.failure_retry_status`. Redaction policy version 8 adds the observability, quality, and registered access-policy exports and names worker-event message and detail as withheld. `otlet.failure_retry_status` exposes whether raw error detail exists without exposing the detail
+Auditors and operators query redacted, read-only projections through `otlet.audit_receipt_export`, `otlet.audit_review_sample_export`, `otlet.audit_review_export`, `otlet.audit_review_event_export`, `otlet.audit_reviewer_calibration_export`, `otlet.audit_action_execution_export`, `otlet.audit_eval_label_export`, `otlet.audit_administrative_change_export`, `otlet.audit_decision_evidence_export`, `otlet.semantic_dependency_audit`, `otlet.operational_event_log`, `otlet.operational_observability_status`, `otlet.labeled_quality_status`, `otlet.worker_batch_timing_status`, `otlet.task_queue_status`, `otlet.task_resource_status`, `otlet.access_policy_role_status`, and `otlet.failure_retry_status`. Redaction policy version 7 adds the observability and quality exports. The current version 8 also adds registered access-policy status and names worker-event message and detail as withheld. `otlet.failure_retry_status` exposes whether raw error detail exists without exposing the detail
 
 ## Step 4 - Register Role-Scoped Access
 
@@ -622,6 +622,13 @@ The SQL-only install exposes the same application, auditor, operator, reviewer, 
 One role may hold several non-administrator capabilities. Revocation preserves the others:
 
 ```sql
+SELECT otlet.register_access_policy_capability(
+  'app_otlet_operator'::regrole,
+  'application',
+  'Add application submission to the operator role',
+  'ACCESS-43'
+);
+
 SELECT otlet.revoke_access_policy_capability(
   'app_otlet_operator'::regrole,
   'application',

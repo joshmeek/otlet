@@ -2,7 +2,7 @@
 
 Use this after the entity-resolution walkthrough queues work. It inspects model selection, receipts, runtime status, trace visibility, retries, cancellation, and failed-run evidence
 
-These diagnostic queries run as the extension owner because they expose receipt, structured output, error, and numeric token state. Raw model output and token text appear when the owner enables bounded diagnostic storage. Auditors use `otlet.audit_receipt_export` and the other redacted exports granted by `otlet.grant_auditor_access(...)`
+These diagnostic queries run as the extension owner because they expose receipt, structured output, error, and numeric token state. Raw model output and token text appear when the owner enables bounded diagnostic storage. Auditors use `otlet.audit_receipt_export` and the other redacted exports after the owner registers their role with the `auditor` access-policy capability. Later grant repair uses `otlet.reconcile_access_policy_role(...)`
 
 ## Discover Runtime Capabilities
 
@@ -72,6 +72,7 @@ ORDER BY escalated_at, job_id;
 
 ```sql
 SELECT window_name,
+       observability_schema,
        metric_name,
        task_name,
        workload_revision_hash,
@@ -96,6 +97,8 @@ Failure categories are `<scope>:<reason_code>`, so a failed job and its failed r
 
 ```sql
 SELECT event_id,
+       event_schema,
+       event_version,
        created_at,
        event_type,
        event_class,
@@ -120,6 +123,7 @@ Labeled quality stays out of the operational view. `otlet.labeled_quality_status
 
 ```sql
 SELECT metric,
+       quality_schema,
        eligible_count,
        numerator,
        denominator,
@@ -186,7 +190,7 @@ Representative output:
 receipt_attempt_contract=8|4|4|4
 ```
 
-A receipt records evidence for one model run. A candidate pair can have multiple receipts when model selection escalates
+A receipt records one inference attempt, including terminal attempts that stop before model execution. A candidate pair can have multiple receipts when model selection escalates
 
 Each accepted receipt links PostgreSQL-recomputed SHA-256 identities for the task, source snapshot, model, effective runtime options, prompt, input, output schema, raw output, structured output, and actions. It also records verified artifact provenance, the detailed runtime fingerprint, validation status, timing, token counts, memory summary, and trace summary. Otlet does not persist the assembled prompt
 
@@ -240,7 +244,7 @@ WHERE runtime_name LIKE 'portable:%'
 ORDER BY receipt_id DESC;
 ```
 
-The [reference external worker](../crates/otlet_worker/README.md) runs the same database-built prompt with one local GGUF when the PostgreSQL host cannot load the native extension worker. It rejects unknown options before claim, uses the database-normalized token and thread limits, keeps inference caching and generation tracing off, and enforces Linux VmRSS before and after inference. It converts the database-issued `max_attempt_ms` to one monotonic deadline before the claim RPC and shares it across prompt decode, generation, renewal, and the llama abort callback. PostgreSQL exposes the claim-time attempt deadline and rejects renewal after it. Timeout records `attempt_timeout` in the job, receipt selection reason, and trace with no accepted output. Cancellation, pre-deadline claim loss, a fenced process incarnation, and database disconnect still interrupt work. The worker permits one `psql` child, caps request, stdout, stderr, and parsed-result bytes, and turns fixed operation deadlines into statement and lock timeouts. It kills and reaps a child that outlives its deadline. The worker rejects a connection URI containing a password, passes the passwordless URI to `psql`, and leaves credentials to libpq sources such as `PGPASSFILE`. No credential appears in process arguments or logs, and logs omit connection data. PostgreSQL parses every returned envelope and owns validation and trusted-state writes
+The [reference external worker](../crates/otlet_worker/README.md) runs the same database-built prompt with one local GGUF when the PostgreSQL host cannot load the native extension worker. It rejects unknown options before claim, uses the database-normalized token and thread limits, keeps inference caching and generation tracing off, and enforces Linux VmRSS before and after inference. It starts one monotonic clock before the claim RPC, converts the returned `max_attempt_ms` to a deadline anchored at that start, and shares the deadline across prompt decode, generation, renewal, and the llama abort callback. PostgreSQL exposes the claim-time attempt deadline and rejects renewal after it. Timeout records `attempt_timeout` in the job, receipt selection reason, and trace with no accepted output. Cancellation, pre-deadline claim loss, a fenced process incarnation, and database disconnect still interrupt work. The worker permits one `psql` child, caps request, stdout, stderr, and parsed-result bytes, and turns fixed operation deadlines into statement and lock timeouts. It kills and reaps a child that outlives its deadline. The worker rejects a connection URI containing a password, passes the passwordless URI to `psql`, and leaves credentials to libpq sources such as `PGPASSFILE`. No credential appears in process arguments or logs, and logs omit connection data. PostgreSQL parses every returned envelope and owns validation and trusted-state writes
 
 Receipt timing splits runtime preparation, model load, context creation, tokenization, prompt decode, generation, validation and post-processing, finish SQL, and semantic materialization. `otlet.runtime_stage_timing_status` aggregates every attempt for a job and leaves unmeasured worker work in `worker_overhead_ms`:
 
@@ -595,7 +599,7 @@ Representative output:
 (1 row)
 ```
 
-Otlet records a receipt for canceled work and preserves model-run evidence
+Otlet records cancellation evidence for queued work. When cancellation follows an attempted run, the receipt also preserves its model and runtime evidence
 
 A synchronous infer-now caller can time out while the worker decodes. The requester and worker arbitrate the cancel marker against output acceptance under one shared lock. A marker that wins makes the worker close the job with its live claim token. Output acceptance that wins may commit after the caller detaches. Worker startup cancels marked synchronous jobs left by a prior worker or postmaster, and lease recovery never reclaims them as asynchronous work. Jobs created through asynchronous ask or queued/asynchronous CustomScan paths keep their retry behavior
 
@@ -609,12 +613,13 @@ requester_timeout_contract=canceled|true|canceled|canceled|0|0|true|true|true|1|
 
 Otlet leaves failed jobs visible. A failed job is terminal, so you can requeue that task and subject
 
-The partial unique index blocks duplicate active work for one task revision and subject while leaving terminal history reusable:
+The partial unique index blocks duplicate active production work for one task revision and subject while leaving evaluation work and terminal history reusable:
 
 ```sql
 CREATE UNIQUE INDEX jobs_active_subject_idx
 ON otlet.jobs (task_name, workload_revision_hash, subject_id)
-WHERE status IN ('queued', 'running', 'cancel_requested');
+WHERE execution_mode = 'production'
+  AND status IN ('queued', 'running', 'cancel_requested');
 ```
 
 The example creates one synthetic failed job, then lets `run_task` enqueue a second job for that subject
@@ -662,7 +667,7 @@ Failure records a raw-output hash, a non-sensitive error, and an attempt receipt
 
 ## Step 10 - Check Worker Events And Receipt Statuses
 
-Events show worker behavior. Receipts show model behavior
+Events show worker behavior. Receipts show attempt and validation evidence
 
 The portable worker checks all eight RPC grants, rejects symlink artifacts, and binds the verified open file through llama.cpp load. It emits one `preflight_passed` event before starting an incarnation, loading a model, or claiming work. A failed explicit `--preflight` emits `preflight_failed` with one stable dependency code and no connection string, credential, prompt, or source value
 
@@ -698,4 +703,4 @@ Representative output:
 (2 rows)
 ```
 
-Use events for worker behavior and receipts for model behavior
+Use events for worker behavior and receipts for attempt and validation evidence

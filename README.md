@@ -50,10 +50,20 @@ Administrative changes require a reason or ticket in the same transaction so Pos
 BEGIN;
 SELECT otlet.set_administrative_change_context('Register the example models');
 SELECT name
-FROM otlet.register_model('qwen3_1_7b', '/var/lib/postgresql/otlet-models/Qwen3-1.7B-Q8_0.gguf')
+FROM otlet.register_model(
+  'qwen3_1_7b',
+  '/var/lib/postgresql/otlet-models/Qwen3-1.7B-Q8_0.gguf',
+  '061b54daade076b5d3362dac252678d17da8c68f07560be70818cace6590cb1a',
+  '{"sha256":"061b54daade076b5d3362dac252678d17da8c68f07560be70818cace6590cb1a","bytes":1834426016,"source":"https://huggingface.co/Qwen/Qwen3-1.7B-GGUF/resolve/main/Qwen3-1.7B-Q8_0.gguf","revision":"main","quantization":"Q8_0","license":"unknown"}'::jsonb
+)
 UNION ALL
 SELECT name
-FROM otlet.register_model('qwen35_4b', '/var/lib/postgresql/otlet-models/Qwen3.5-4B-Q4_K_M.gguf');
+FROM otlet.register_model(
+  'qwen35_4b',
+  '/var/lib/postgresql/otlet-models/Qwen3.5-4B-Q4_K_M.gguf',
+  '00fe7986ff5f6b463e62455821146049db6f9313603938a70800d1fb69ef11a4',
+  '{"sha256":"00fe7986ff5f6b463e62455821146049db6f9313603938a70800d1fb69ef11a4","bytes":2740937888,"source":"https://huggingface.co/unsloth/Qwen3.5-4B-GGUF/resolve/main/Qwen3.5-4B-Q4_K_M.gguf","revision":"main","quantization":"Q4_K_M","license":"unknown"}'::jsonb
+);
 COMMIT;
 ```
 
@@ -65,7 +75,7 @@ COMMIT;
 (2 rows)
 ```
 
-An Otlet task reads any SQL query that returns `subject_id` and row-shaped `input`. The [entity-resolution walkthrough](docs/entity-resolution-walkthrough.md) builds `public.otlet_demo_vendor_pair_input` from two application tables. The shortened task call includes the SQL API, output contract, trace settings, input shaping, and decision preset:
+An Otlet task reads any SQL query that returns `subject_id` and row-shaped `input`. The full demo's `scripts/demo/entity_resolution_jobs.sh` builds `public.otlet_demo_vendor_pair_input` from two application tables. The shortened task call below is a contract excerpt for that fresh fixture; use the [entity-resolution walkthrough](docs/entity-resolution-walkthrough.md) for standalone source setup. It includes the SQL API, output contract, trace settings, input shaping, and decision preset:
 
 ```sql
 BEGIN;
@@ -91,7 +101,7 @@ FROM otlet.create_task(
   }',
   model_name => 'qwen3_1_7b',
   runtime_options => '{"max_tokens":256,"reasoning":"off","inference_cache":true,"generation_trace":true,"generation_trace_max_tokens":16,"generation_trace_top_k":3}',
-  input_shaping => '{"evidence_fields":["candidate_evidence"],"action_id_fields":{"left_id":"left_id","right_id":"right_id"}}',
+  input_shaping => '{"source_fields":["_otlet_mvcc","action_ids","candidate_evidence","evidence_counts"],"evidence_fields":["candidate_evidence"],"action_id_fields":{"left_id":"left_id","right_id":"right_id"}}',
   decision_contract => '{"preset":"entity_resolution_evidence_v1"}'
 );
 
@@ -169,7 +179,7 @@ ORDER BY attempt_index;
 (2 rows)
 ```
 
-Otlet records both attempts and creates `merge_candidate` from the accepted output. The action remains pending for review. The source vendor rows remain unchanged
+Otlet records both attempts and creates `merge_candidate` from the accepted output. The full demo later approves and dry-runs the action. The source vendor rows remain unchanged
 
 The full demo checks row and pair watches, candidate drift, CustomScan and time-based freshness, bounded backfill, workload enablement preflight, immutable job-origin attribution, per-task queue and claim budgets, native infer-now and queued service under saturation, portable watch definitions, workload-pack promotion and rollback, and bounded `update_row`. It covers blinded reviewer calibration, role separation, receipt redaction, cancellation, model-load admission, memory pressure, cache bounds, prompt and runtime fingerprints, invariants, and Docker crash logs
 

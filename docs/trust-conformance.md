@@ -70,13 +70,25 @@ revision_invalidation_contract=ok
 revision_claim_serialization_contract=true|true
 ```
 
+## Task And Watch Lifecycle Contract
+
 `./scripts/demo/task_watch_lifecycle.sh` removes execution authority at pause, keeps queued work dormant until exact-pin resume, leaves paused task edits as unpromoted drafts, rejects concurrent definition writes for retry, rejects watch reconfiguration and retirement with unfinished work, and coalesces source changes without retrying them. It fences renamed or replaced source identities, preserves cleanup after a source deletion, and serializes pause with action-target registration, workflow-policy changes, and source-query repair. Its source race proves concurrent work blocks retirement without losing the backlog, then resumes, drains, retires, and removes the watch-owned registry state, indexes, reconciliation, and triggers. The task, revision, canceled job, and other evidence remain. `./scripts/otlet-portable-upgrade-demo.sh` repeats the task-state contract through the SQL-only install and checks the migration-local `PUBLIC` fence
+
+```text
+task_watch_lifecycle_contract=pin_conflict|pause_fenced|live_claim_fenced|unfinished_fenced|draft_unpromoted|watch_reconfig_fenced|resume_pinned|retire_fenced|watch_backlog|backlog_retire_fenced|watch_resume|rename_retire_fenced|name_reuse_fenced|rename_drop_fenced|drop_pin_fenced|archive_retained|exact_drop|path_independent_cleanup|shared_trigger_preserved|shared_trigger_released|invariants_clean
+task_watch_lifecycle_race_contract=definition_write_fenced|action_policy_serialized|repair_serialized|retirement_serialized|backlog_preserved|resume_queued|queue_canceled|repaused|source_missing|status_closed|retired|exact_drop|archive_retained|registry_removed|index_removed|reconciliation_removed|invariants_clean
+portable_task_lifecycle_contract=t|t|t|t|t|t|t|t|t|t|t
+```
+
+## Bounded Maintenance Contract
 
 `./scripts/demo/bounded_maintenance.sh` proves owner-driven cleanup, archive, reconciliation, and repair slices with fixed primary-item, cluster-WAL, and elapsed-time budgets. It checks persisted progress and partial-slice retry; generation-fenced pause, resume, cancellation, and stale callers; due and future-backoff reconciliation; exhausted retry; time-refresh seeding; failed archive retry with retained evidence; missing-statistics repair; a two-session `SKIP LOCKED` cleanup; cascaded and trigger-updated vacuum handoffs with write-once acknowledgement; owner-only APIs; zero invariants; and clean logs
 
 ```text
 bounded_maintenance_contract=budgets|cleanup|progress|partial_retry|pause_resume_cancel|wal|time|archive_retry|reconciliation_due_backoff_exhausted_seeded|repair|vacuum|cascade_vacuum|public_closed|invariants_clean|live_lifecycle_retained|skip_locked
 ```
+
+## Complete Evidence Lifecycle Contract
 
 `./scripts/demo/complete_evidence_lifecycle.sh` proves disabled successful-job retention, explicit and automatic adoption, bounded full-chain archives, fixed-UTC manifests, claim-token omission, generation-fenced history, hold and export changes, stale export refresh, named reference blockers, atomic deletion, hash-only lifecycle and action replay tombstones, fail-closed target rebinding, null completion timestamps, mutation-barrier contention, legacy-cleanup fencing, `PUBLIC` closure, zero invariants, and clean logs. The SQL-only upgrade applies all 88 migrations, preserves dependent function OIDs and legacy complete jobs under the disabled default, then proves archive, export, deletion, repeat installation, and the same closure and invariant contract
 
@@ -86,6 +98,8 @@ evidence_mutation_barrier_contract=55P03|true
 evidence_shared_barrier_contract=true|true|55P03|55P03
 ```
 
+## Versioned Observability And Quality Status Contract
+
 `./scripts/demo/versioned_observability_quality_status.sh` proves closed 15-minute, 1-hour, and 24-hour windows, future-row and evaluation exclusion, scoped failure occurrences, schema-rejection denominators, current backlog ages, route and heartbeat transitions, cleanup lag, dimension-matched pressure, and retry-stable event correlation. It checks registered batch task sets, unknown event and runtime redaction, ignored caller-supplied identities, native startup success and failure identities, stale model-swap claim fencing, one portable worker hash, executable auditor access, partial and `PUBLIC` closure, redaction policy version 8 with event message and detail withheld plus registered access-policy status, and zero invariants. The SQL-only upgrade keeps one legacy event and proves its versioned redacted projection with null legacy correlation fields
 
 `./scripts/demo/entity_resolution_quality.sql` independently binds labeled-quality observation time and lag to the latest candidate-coverage, evaluation-slice, and review-economics source report
@@ -93,12 +107,6 @@ evidence_shared_barrier_contract=true|true|55P03|55P03
 ```text
 versioned_observability_contract=windows|failures|backlogs|routes|heartbeats|cleanup|pressure|events|acl|invariants
 labeled_quality_status_contract=7|denominators|lag|public_closed
-```
-
-```text
-task_watch_lifecycle_contract=pin_conflict|pause_fenced|live_claim_fenced|unfinished_fenced|draft_unpromoted|watch_reconfig_fenced|resume_pinned|retire_fenced|watch_backlog|backlog_retire_fenced|watch_resume|rename_retire_fenced|name_reuse_fenced|rename_drop_fenced|drop_pin_fenced|archive_retained|exact_drop|path_independent_cleanup|shared_trigger_preserved|shared_trigger_released|invariants_clean
-task_watch_lifecycle_race_contract=definition_write_fenced|action_policy_serialized|repair_serialized|retirement_serialized|backlog_preserved|resume_queued|queue_canceled|repaused|source_missing|status_closed|retired|exact_drop|archive_retained|registry_removed|index_removed|reconciliation_removed|invariants_clean
-portable_task_lifecycle_contract=t|t|t|t|t|t|t|t|t|t|t
 ```
 
 ## Workload Pack Promotion Contract
@@ -154,7 +162,15 @@ evaluation_population_lineage_contract=t|t|t|t|t|t|t|t|t
 portable_population_lineage_migration_contract=t|t|t|t|t
 ```
 
-Otlet records events from installation forward and leaves earlier history absent. Raw database-owner `GRANT` or `REVOKE` statements remain outside lifecycle RPC attribution but appear as desired-versus-installed drift for registered roles. A database or extension owner can replace or disable the guards; the planned signed checkpoints cover that stronger boundary
+## Access Policy Lifecycle Contract
+
+`./scripts/demo/access_policy_lifecycle.sh` registers all six capabilities, adopts existing roles, revokes one capability from a multi-capability role, repairs object, column, and manifest drift, and closes role identity, membership, administrator, and `PUBLIC` boundaries
+
+```text
+access_policy_contract=roles=6/6|revoke=auditor_preserved|drift=1/2_to_0/0|manifest=closed|membership=closed|rename=closed|admin=narrow|public=closed|invariants=0
+```
+
+Otlet records events from installation forward and leaves earlier history absent. Raw database-owner `GRANT` or `REVOKE` statements remain outside lifecycle RPC attribution but appear as desired-versus-installed drift for registered roles. A database or extension owner can replace or disable the guards. Conditional signed audit checkpoints could let an external consumer detect later rewriting, but cannot prevent owner or superuser changes
 
 ## Native Threats
 

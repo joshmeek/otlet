@@ -47,11 +47,11 @@ Representative output:
 ```text
  otlet_base_tables
 -------------------
-                30
+                63
 (1 row)
 ```
 
-Group the base tables by role:
+Some key base tables by role:
 
 - `models` and `runtime_slots` describe the local resident model runtime
 - `tasks`, `decision_rule_presets`, `model_selection_policies`, `workload_revisions`, `workload_revision_heads`, and `jobs` describe durable work and cheap-first escalation policy
@@ -89,6 +89,8 @@ The source table remains application-owned. The watch stores model-derived state
 ## Step 4 - Build A Row Watch
 
 A row watch wraps a source table with an Otlet task, materialized records, stale tracking, trigger policy, and current-row SQL reads
+
+This creation example uses the native worker because it enables inference caching. Portable deployments set `inference_cache` to `false`, commit refresh jobs for the external worker, and read accepted state through `semantic_index_current_rows(...)`
 
 The creation shape is:
 
@@ -312,6 +314,8 @@ FROM otlet.semantic_predicate_counts(
 The diagnostic reports `count_basis=exact_predicate_diagnostic` and does not change the maintained snapshot
 
 ## Step 7 - Use CustomScan For Source-Row Predicates
+
+CustomScan and `semantic_matches_auto(...)` are native-only because they require extension planner hooks and in-process infer-now. Portable deployments use committed refresh jobs and `semantic_index_current_rows(...)`
 
 Use a CustomScan to evaluate an Otlet semantic predicate against the source table
 
@@ -621,7 +625,7 @@ The extension owner can export a row or pair watch as configuration-only JSONB:
 SELECT jsonb_pretty(otlet.export_watch('learning_entity_pair_idx'));
 ```
 
-`otlet.watch.v1` uses the same fields as `otlet.create_watch(...)`. The shortened values below show the key and type contract; export keeps the full instruction, schema, and candidate query
+`otlet.watch.v1` mirrors the watch configuration and adds the immutable model artifact identity used to fence import. The shortened values below show the key and type contract; export keeps the full instruction, schema, and candidate query
 
 ```json
 {
@@ -631,6 +635,15 @@ SELECT jsonb_pretty(otlet.export_watch('learning_entity_pair_idx'));
   "instruction": "Compare one candidate pair",
   "output_schema": {},
   "model_name": "qwen3_1_7b",
+  "model_artifact_identity": {
+    "bytes": 1834426016,
+    "context_window_tokens": 4096,
+    "license": "unknown",
+    "quantization": "Q8_0",
+    "revision": "main",
+    "sha256": "061b54daade076b5d3362dac252678d17da8c68f07560be70818cace6590cb1a",
+    "source": "https://huggingface.co/Qwen/Qwen3-1.7B-GGUF/resolve/main/Qwen3-1.7B-Q8_0.gguf"
+  },
   "table_name": null,
   "subject_column": null,
   "candidate_query": "SELECT subject_id, input FROM public.learning_entity_pair_input",
@@ -729,7 +742,7 @@ SELECT otlet.rollback_workload_pack(
 );
 ```
 
-Packs refer to existing models, source relations, and action targets; they do not create those dependencies. Source rows, jobs, results, receipts, actions, labels, stored credentials, model files, local artifact paths and bytes, runtime state, timestamps, and access policy remain outside the pack. Operators must not embed secrets in instructions, candidate SQL, schemas, policies, or runtime options
+Packs refer to existing models, source relations, and action targets; they do not create those dependencies. Source rows, jobs, results, receipts, actions, labels, stored credentials, model files, local artifact paths and file contents, runtime state, timestamps, and access policy remain outside the pack. Operators must not embed secrets in instructions, candidate SQL, schemas, policies, or runtime options
 
 ## Pause Or Retire A Watch
 
@@ -797,10 +810,10 @@ FROM otlet.set_task_lifecycle(
 SELECT otlet.drop_watch('learning_entity_pair_idx', :'revision_hash');
 ```
 
-The Docker demo proves same-identity replacement, fixture round trip, lookup preservation, trigger preservation, and ten rejected documents. The lifecycle proof covers the production exact-pin deletion path:
+The Docker demo proves same-identity replacement, fixture round trip, lookup preservation, trigger preservation, and twelve rejected documents. The lifecycle proof covers the production exact-pin deletion path:
 
 ```text
 watch_replace_contract=true|true|true|true|true|true|true|true|true|true
-watch_import_failure_contract=10|true
+watch_import_failure_contract=12|true
 watch_round_trip_contract=true|true|true|true|true
 ```

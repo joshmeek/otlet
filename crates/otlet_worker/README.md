@@ -93,8 +93,11 @@ The database owner configures and activates the task, then grants the applicatio
 
 ```sql
 BEGIN;
-SELECT otlet.set_administrative_change_context('Grant the application capability');
-SELECT otlet.grant_application_access('app_otlet_application'::regrole);
+SELECT otlet.register_access_policy_capability(
+  'app_otlet_application'::regrole,
+  'application',
+  'Grant the application capability'
+);
 COMMIT;
 ```
 
@@ -225,7 +228,7 @@ SELECT otlet.set_portable_worker_control('customer-vpc-worker', 'draining');
 
 Pause lets the current claim finish and blocks the next claim. Drain also lets the current claim finish, records `drained`, and exits the process. After preflight, PostgreSQL issues the process a nonce and stores only its hash. Starting a replacement under the same worker ID marks the prior process claims replaced and rejects its next heartbeat, claim, renewal, attempt, completion, failure, or cancellation RPC
 
-The worker converts the database-issued `max_attempt_ms` to one monotonic deadline before the claim RPC. Prompt decode, generation, the llama abort callback, and renewal share it. PostgreSQL refuses renewal after its claim-time deadline, and a timeout records `attempt_timeout` in the job, receipt selection reason, failed schema status, and trace. The redacted status reports `otlet.failure.v1.attempt_timeout` and keeps raw detail database-owner-only. Cancellation interrupts decode and finishes through the fenced cancel RPC. A renewal rejected before the deadline, a fenced incarnation, or a database disconnect interrupts decode without a terminal write, leaving the lease available for safe reclaim. Exact terminal requests retry three times inside one bounded deadline, and PostgreSQL returns the stored terminal result for duplicate delivery
+The worker starts one monotonic clock before the claim RPC and converts the returned `max_attempt_ms` to a deadline anchored at that start. Prompt decode, generation, the llama abort callback, and renewal share it. PostgreSQL refuses renewal after its claim-time deadline, and a timeout records `attempt_timeout` in the job, receipt selection reason, failed schema status, and trace. The redacted status reports `otlet.failure.v1.attempt_timeout` and keeps raw detail database-owner-only. Cancellation interrupts decode and finishes through the fenced cancel RPC. A renewal rejected before the deadline, a fenced incarnation, or a database disconnect interrupts decode without a terminal write, leaving the lease available for safe reclaim. Exact terminal requests retry three times inside one bounded deadline, and PostgreSQL returns the stored terminal result for duplicate delivery
 
 The continuous process reconnects after PostgreSQL restarts. `--once` fails on a database disconnect so batch callers receive a nonzero exit instead of an indefinite wait
 
@@ -269,6 +272,7 @@ It rejects an unsupported pre-`0044` ledger without changing its state, then ins
 ```text
 portable_legacy_upgrade_contract=43|43|preserved
 portable_upgrade_contract=88|88|t|t|preserved|t|4096|t|t|t|t|0|t|t|t|t|t|t|t|t|t|t|t|t|t|t|t|t|t
+portable_access_policy_column_repair_contract=true|true|true
 portable_access_policy_migration_contract=4|3|1|1|t|t|t|reconciled|0
 portable_evidence_lifecycle_default_contract=t|t|t|t|t|t|t|t|t|t|t
 portable_evidence_lifecycle_migration_contract=evidence_archive|evidence_delete|t|deleted|complete|complete|t|t|t|t|t|t|t|t|t|t|t|t|t|t|t|t|t|t
