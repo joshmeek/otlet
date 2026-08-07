@@ -99,7 +99,8 @@ cleanup_policy_contract="$(psql_value -v model_name="$strong_model_name" <<'SQL'
 BEGIN;
 UPDATE otlet.production_policy
 SET worker_event_retention = interval '100 years',
-    failed_job_retention = interval '100 years'
+    failed_job_retention = interval '100 years',
+    successful_job_retention = NULL
 WHERE name = 'default';
 INSERT INTO otlet.tasks (
   name,
@@ -152,15 +153,41 @@ SELECT otlet.create_maintenance_run('cleanup') AS cleanup_contract_run_id \gset
 CREATE TEMP TABLE cleanup_contract_run AS
 SELECT * FROM otlet.run_maintenance_slice(:cleanup_contract_run_id, 0);
 SELECT (
-         (SELECT worker_events = 3 AND failed_canceled_jobs = 2 AND dry_run
+         (SELECT worker_events = 1 AND failed_canceled_jobs = 0 AND dry_run
           FROM cleanup_contract_dry)
          AND (SELECT control_state = 'complete'
                      AND processed_items = 3
                      AND changed_rows = 5
               FROM cleanup_contract_run)
+         AND EXISTS (
+           SELECT 1
+           FROM otlet.evidence_lifecycle_records lifecycle
+           JOIN cleanup_contract_jobs job ON job.id = lifecycle.job_id
+           WHERE job.subject_id = 'failed-recent-event'
+             AND lifecycle.lifecycle_state = 'archived'
+             AND lifecycle.export_state = 'pending'
+             AND lifecycle.archive_row_count = 2
+         )
+         AND EXISTS (
+           SELECT 1
+           FROM otlet.evidence_lifecycle_records lifecycle
+           JOIN cleanup_contract_jobs job ON job.id = lifecycle.job_id
+           JOIN otlet.jobs live_job ON live_job.id = job.id
+           WHERE job.subject_id = 'failed-null-finished'
+             AND lifecycle.lifecycle_state = 'archived'
+             AND lifecycle.export_state = 'pending'
+             AND lifecycle.archive_row_count = 2
+             AND lifecycle.terminal_at = live_job.created_at
+         )
+         AND NOT EXISTS (
+           SELECT 1
+           FROM otlet.evidence_lifecycle_records lifecycle
+           JOIN cleanup_contract_jobs job ON job.id = lifecycle.job_id
+           WHERE job.subject_id = 'complete-old-event'
+         )
        )::text || '|' ||
-       ((SELECT count(*) FROM otlet.jobs WHERE task_name = 'cleanup_policy_contract') = 3)::text || '|' ||
-       ((SELECT count(*) FROM otlet.worker_events WHERE event_type = 'cleanup_policy_contract') = 2)::text || '|' ||
+       ((SELECT count(*) FROM otlet.jobs WHERE task_name = 'cleanup_policy_contract') = 5)::text || '|' ||
+       ((SELECT count(*) FROM otlet.worker_events WHERE event_type = 'cleanup_policy_contract') = 4)::text || '|' ||
        EXISTS (
          SELECT 1
          FROM otlet.worker_events e

@@ -440,6 +440,11 @@ pgrx::extension_sql_file!(
     name = "access_policy_lifecycle",
     requires = ["versioned_observability_quality_status"]
 );
+pgrx::extension_sql_file!(
+    "../sql/migrations/0087_complete_evidence_lifecycle.sql",
+    name = "complete_evidence_lifecycle",
+    requires = ["access_policy_lifecycle"]
+);
 
 #[allow(non_snake_case)]
 #[pgrx::pg_guard]

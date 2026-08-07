@@ -16,7 +16,7 @@ Run the installer as the database owner from the repository checkout:
 psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f crates/otlet_worker/sql/install.sql
 ```
 
-The install transaction runs the current SQL contract as migrations `0001` through `0086`. Re-running it skips recorded migrations and preserves existing data. This greenfield path rejects older unversioned `otlet` schemas instead of converting them
+The install transaction runs the current SQL contract as migrations `0001` through `0087`. Re-running it skips recorded migrations and preserves existing data. This greenfield path rejects older unversioned `otlet` schemas instead of converting them
 
 The database keeps zero `otlet` extension objects and zero C-language Otlet functions
 
@@ -255,10 +255,12 @@ Run the repeat-install proof:
 ./scripts/otlet-portable-upgrade-demo.sh
 ```
 
-It installs through migration `0079`, lowers the per-job input, task, model, total queue-byte, and CustomScan preload caps, grants existing operator, application, reviewer, partial audit, and preflight roles, applies `0080` through `0086`, and repeats the current install. The proof checks all 86 migrations, explicit access-policy adoption and drift repair without expanding a partial role, executable delegated observability and quality status, versioned redacted event fields, owner-only bounded maintenance state, auditor-readable route readiness and stranded-escalation status, preserved legacy model identities with the 4,096-token generated ceiling, revision-pinned maintained semantic counts, bounded CustomScan policy defaults and validation, lower-cap preservation, read-only exact predicate diagnostics, subject move, delete-reinsert, and truncate behavior, pair invalidation and bounded maintenance, read-only workload sizing, source-check limits, runtime fallback, capacity reserves, declared native service targets, immutable job-origin attribution, per-task queue and claim budgets, existing data and grants, blinded reviewer calibration, review sampling, evidence-linked decisions, time freshness, bounded backfill, workload-pack promotion and rollback, lifecycle, administrative-ledger, workload-acceptance and candidate-set promotion fences, entity-resolution quality decomposition, pair constraints, entity-graph conflict status and gates, bounded validators, queued ask behavior, `PUBLIC` closure, and invariants
+It installs through migration `0079`, lowers the per-job input, task, model, total queue-byte, and CustomScan preload caps, grants existing operator, application, reviewer, partial audit, and preflight roles, applies `0080` through `0087`, and repeats the current install. The proof checks all 87 migrations, explicit access-policy adoption and drift repair without expanding a partial role, executable delegated observability and quality status, versioned redacted event fields, owner-only bounded maintenance and complete evidence-lifecycle state, auditor-readable route readiness and stranded-escalation status, preserved legacy complete jobs under the disabled successful-retention default, preserved legacy model identities with the 4,096-token generated ceiling, revision-pinned maintained semantic counts, bounded CustomScan policy defaults and validation, lower-cap preservation, read-only exact predicate diagnostics, subject move, delete-reinsert, and truncate behavior, pair invalidation and bounded maintenance, read-only workload sizing, source-check limits, runtime fallback, capacity reserves, declared native service targets, immutable job-origin attribution, per-task queue and claim budgets, existing data and grants, blinded reviewer calibration, review sampling, evidence-linked decisions, time freshness, bounded backfill, workload-pack promotion and rollback, lifecycle, administrative-ledger, workload-acceptance and candidate-set promotion fences, entity-resolution quality decomposition, pair constraints, entity-graph conflict status and gates, bounded validators, queued ask behavior, `PUBLIC` closure, and invariants
 
 ```text
-portable_upgrade_contract=86|86|t|t|preserved|t|4096|t|t|t|t|0|t|t|t|t|t|t|t|t|t|t|t|t|t|t|t|t|t
+portable_upgrade_contract=87|87|t|t|preserved|t|4096|t|t|t|t|0|t|t|t|t|t|t|t|t|t|t|t|t|t|t|t|t|t
 portable_access_policy_migration_contract=4|3|1|1|t|t|t|reconciled|0
+portable_evidence_lifecycle_default_contract=t|t|t|t|t|t|t|t|t|t|t
+portable_evidence_lifecycle_migration_contract=evidence_archive|evidence_delete|t|deleted|complete|complete|t|t|t|t|t|t|t|t|t|t|t|t|t|t|t|t|t|t
 portable_job_origin_workload_budget_contract=4|2|1|t|t|t|t
 ```

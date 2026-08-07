@@ -282,3 +282,6 @@ $$;
 
 \set portable_migration_file ../../../otlet_pg/sql/migrations/0086_access_policy_lifecycle.sql
 \ir migrations/apply.sql
+
+\set portable_migration_file ../../../otlet_pg/sql/migrations/0087_complete_evidence_lifecycle.sql
+\ir migrations/apply.sql

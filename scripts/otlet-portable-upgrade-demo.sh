@@ -32,6 +32,13 @@ install_portable_through_79() {
       psql -U postgres -d "$database" -X -q -v ON_ERROR_STOP=1 --single-transaction
 }
 
+install_portable_through_86() {
+  docker exec -w /work/crates/otlet_worker/sql "$container" \
+    sed '/0087_complete_evidence_lifecycle.sql/,$d' migrate.sql |
+    docker exec -i -w /work/crates/otlet_worker/sql "$container" \
+      psql -U postgres -d "$database" -X -q -v ON_ERROR_STOP=1 --single-transaction
+}
+
 claim_probe_jobs() {
   docker exec "$container" psql -U postgres -d "$database" \
     -X -qAt -v ON_ERROR_STOP=1 \
@@ -88,7 +95,14 @@ CREATE TABLE public.portable_upgrade_sentinel (
   planner_statistics_refreshed_at timestamptz,
   legacy_watch_revision_hash text,
   legacy_materialization_id bigint,
-  legacy_workload_pack_hash text
+  legacy_workload_pack_hash text,
+  legacy_evidence_job_id bigint,
+  legacy_evidence_archive_kind text,
+  legacy_evidence_delete_kind text,
+  maintenance_cleanup_step_oid oid,
+  maintenance_cleanup_pending_oid oid,
+  verify_invariants_oid oid,
+  apply_action_oid oid
 );
 INSERT INTO public.portable_upgrade_sentinel VALUES (1, 'preserved');
 SQL
@@ -347,7 +361,7 @@ SELECT otlet.record_worker_event(
 );
 SQL
 
-install_portable
+install_portable_through_86
 
 portable_access_policy_migration_contract="$(
   docker exec -i "$container" psql -U postgres -d "$database" \
@@ -460,6 +474,514 @@ SQL
 [ "$portable_access_policy_migration_contract" = \
   "4|3|1|1|t|t|t|reconciled|0" ] || {
   echo "Portable access-policy migration contract mismatch: $portable_access_policy_migration_contract" >&2
+  exit 1
+}
+
+docker exec -i "$container" psql -U postgres -d "$database" \
+  -X -q -v ON_ERROR_STOP=1 <<'SQL' >/dev/null
+UPDATE public.portable_upgrade_sentinel
+SET maintenance_cleanup_step_oid =
+      'otlet.maintenance_cleanup_step()'::regprocedure::oid,
+    maintenance_cleanup_pending_oid =
+      'otlet.maintenance_cleanup_pending()'::regprocedure::oid,
+    verify_invariants_oid =
+      'otlet.verify_invariants(integer)'::regprocedure::oid,
+    apply_action_oid = 'otlet.apply_action(bigint)'::regprocedure::oid
+WHERE id = 1;
+
+WITH inserted AS (
+  INSERT INTO otlet.jobs (
+    task_name,
+    subject_id,
+    input,
+    status,
+    attempts,
+    created_at,
+    finished_at
+  ) VALUES (
+    'model_concurrency_probe',
+    'pre-0087-complete',
+    '{"value":"legacy complete evidence"}'::jsonb,
+    'complete',
+    1,
+    clock_timestamp() - interval '3 minutes',
+    clock_timestamp() - interval '2 minutes'
+  )
+  RETURNING id
+)
+UPDATE public.portable_upgrade_sentinel sentinel
+SET legacy_evidence_job_id = inserted.id
+FROM inserted
+WHERE sentinel.id = 1;
+SQL
+
+install_portable
+
+portable_evidence_lifecycle_default_contract="$(
+  docker exec -i "$container" psql -U postgres -d "$database" \
+    -X -qAt -v ON_ERROR_STOP=1 <<'SQL'
+SELECT concat_ws('|',
+  EXISTS (
+    SELECT 1
+    FROM otlet.jobs job
+    JOIN public.portable_upgrade_sentinel sentinel
+      ON sentinel.legacy_evidence_job_id = job.id
+    WHERE sentinel.id = 1
+      AND job.status = 'complete'
+  ),
+  NOT EXISTS (
+    SELECT 1
+    FROM otlet.evidence_lifecycle_records lifecycle
+    JOIN public.portable_upgrade_sentinel sentinel
+      ON sentinel.legacy_evidence_job_id = lifecycle.job_id
+    WHERE sentinel.id = 1
+  ),
+  (SELECT successful_job_retention IS NULL
+   FROM otlet.production_policy
+   WHERE name = 'default'),
+  (SELECT max(version) = 87 AND count(*) = 87
+   FROM otlet.portable_schema_migrations),
+  NOT EXISTS (SELECT 1 FROM otlet.verify_invariants()),
+  'otlet.maintenance_cleanup_step()'::regprocedure::oid =
+    sentinel_state.maintenance_cleanup_step_oid,
+  'otlet.maintenance_cleanup_pending()'::regprocedure::oid =
+    sentinel_state.maintenance_cleanup_pending_oid,
+  'otlet.verify_invariants(integer)'::regprocedure::oid =
+    sentinel_state.verify_invariants_oid,
+  'otlet.apply_action(bigint)'::regprocedure::oid =
+    sentinel_state.apply_action_oid,
+  EXISTS (
+    SELECT 1
+    FROM pg_catalog.pg_rewrite rewrite
+    JOIN pg_catalog.pg_depend dependency
+      ON dependency.classid = 'pg_catalog.pg_rewrite'::regclass
+     AND dependency.objid = rewrite.oid
+     AND dependency.refclassid = 'pg_catalog.pg_proc'::regclass
+    WHERE rewrite.ev_class =
+        'otlet.operational_observability_status_internal'::regclass
+      AND dependency.refobjid =
+        sentinel_state.maintenance_cleanup_pending_oid
+  ),
+  NOT EXISTS (
+    SELECT 1
+    FROM pg_catalog.pg_rewrite rewrite
+    JOIN pg_catalog.pg_depend dependency
+      ON dependency.classid = 'pg_catalog.pg_rewrite'::regclass
+     AND dependency.objid = rewrite.oid
+     AND dependency.refclassid = 'pg_catalog.pg_proc'::regclass
+    WHERE rewrite.ev_class =
+        'otlet.operational_observability_status_internal'::regclass
+      AND dependency.refobjid =
+        'otlet.maintenance_cleanup_pending_before_evidence()'::regprocedure::oid
+  )
+)
+FROM public.portable_upgrade_sentinel sentinel_state
+WHERE sentinel_state.id = 1;
+SQL
+)"
+[ "$portable_evidence_lifecycle_default_contract" = \
+  "t|t|t|t|t|t|t|t|t|t|t" ] || {
+  echo "Portable evidence-lifecycle default contract mismatch: $portable_evidence_lifecycle_default_contract" >&2
+  exit 1
+}
+
+docker exec -i "$container" psql -U postgres -d "$database" \
+  -X -q -v ON_ERROR_STOP=1 <<'SQL' >/dev/null
+UPDATE otlet.production_policy
+SET successful_job_retention = interval '1 minute'
+WHERE name = 'default';
+
+SELECT otlet.request_evidence_lifecycle(
+  sentinel.legacy_evidence_job_id,
+  false,
+  'Adopt legacy complete evidence'
+)
+FROM public.portable_upgrade_sentinel sentinel
+WHERE sentinel.id = 1 \g /dev/null
+
+UPDATE public.portable_upgrade_sentinel sentinel
+SET legacy_evidence_archive_kind = step.item_kind
+FROM otlet.maintenance_evidence_lifecycle_step() step
+WHERE sentinel.id = 1
+  AND step.item_found
+  AND step.item_kind = 'evidence_archive';
+
+SELECT otlet.record_evidence_export(
+  lifecycle.job_id,
+  lifecycle.generation,
+  lifecycle.archive_manifest_hash,
+  otlet.identity_hash(
+    'evidence_export_reference',
+    jsonb_build_object(
+      'manifest_hash', lifecycle.archive_manifest_hash,
+      'receipt', 'portable-upgrade-evidence-archive'
+    )
+  ),
+  true,
+  'Archive legacy complete evidence'
+)
+FROM otlet.evidence_lifecycle_records lifecycle
+JOIN public.portable_upgrade_sentinel sentinel
+  ON sentinel.legacy_evidence_job_id = lifecycle.job_id
+WHERE sentinel.id = 1 \g /dev/null
+
+UPDATE public.portable_upgrade_sentinel sentinel
+SET legacy_evidence_delete_kind = step.item_kind
+FROM otlet.maintenance_evidence_lifecycle_step() step
+WHERE sentinel.id = 1
+  AND step.item_found
+  AND step.item_kind = 'evidence_delete';
+SQL
+
+install_portable
+
+portable_evidence_lifecycle_migration_contract="$(
+  docker exec -i "$container" psql -U postgres -d "$database" \
+    -X -qAt -v ON_ERROR_STOP=1 <<'SQL'
+SELECT concat_ws('|',
+  sentinel.legacy_evidence_archive_kind,
+  sentinel.legacy_evidence_delete_kind,
+  NOT EXISTS (
+    SELECT 1 FROM otlet.jobs job
+    WHERE job.id = sentinel.legacy_evidence_job_id
+  ),
+  lifecycle.lifecycle_state,
+  lifecycle.terminal_status,
+  lifecycle.export_state,
+  lifecycle.archive_row_counts = lifecycle.deleted_row_counts,
+  lifecycle.tombstone_hash IS NOT NULL,
+  lifecycle.export_reference_hash = otlet.identity_hash(
+    'evidence_export_reference',
+    jsonb_build_object(
+      'manifest_hash', lifecycle.archive_manifest_hash,
+      'receipt', 'portable-upgrade-evidence-archive'
+    )
+  ),
+  NOT pg_catalog.has_table_privilege(
+    'public', 'otlet.evidence_lifecycle_records', 'SELECT'
+  )
+    AND NOT pg_catalog.has_table_privilege(
+      'public',
+      'otlet.action_idempotency_tombstones',
+      'SELECT,INSERT,UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER'
+  ),
+  NOT pg_catalog.has_table_privilege(
+    'public', 'otlet.evidence_lifecycle_status', 'SELECT'
+  ),
+  NOT EXISTS (
+    SELECT 1
+    FROM pg_catalog.unnest(ARRAY[
+      'otlet.evidence_archive_rows(bigint)',
+      'otlet.evidence_archive_manifest(bigint)',
+      'otlet.evidence_delete_blockers(bigint)',
+      'otlet.evidence_lifecycle_manages_job(bigint)',
+      'otlet.evidence_lifecycle_manages_label_series(text,text,text)',
+      'otlet.evidence_lifecycle_manages_materialization(bigint)',
+      'otlet.acquire_evidence_mutation_barrier()',
+      'otlet.evidence_lifecycle_maintenance_pending()',
+      'otlet.request_evidence_lifecycle(bigint,boolean,text,text)',
+      'otlet.set_evidence_history_retention(bigint,bigint,boolean,text,text)',
+      'otlet.set_evidence_hold(bigint,bigint,boolean,text,text)',
+      'otlet.record_evidence_export(bigint,bigint,text,text,boolean,text,text)',
+      'otlet.maintenance_evidence_lifecycle_step()'
+    ]) api(signature)
+    WHERE pg_catalog.has_function_privilege(
+      'public', api.signature, 'EXECUTE'
+    )
+  ),
+  pg_catalog.to_regprocedure(
+    'otlet.record_evidence_export(bigint,bigint,text,text,boolean,text,text)'
+  ) IS NOT NULL,
+  pg_catalog.to_regprocedure(
+    'otlet.record_evidence_export(bigint,bigint,text,boolean,text,text)'
+  ) IS NULL,
+  pg_catalog.to_regclass('otlet.action_idempotency_tombstones') IS NOT NULL
+    AND (
+      SELECT count(*) = 8
+      FROM information_schema.columns
+      WHERE table_schema = 'otlet'
+        AND table_name = 'action_idempotency_tombstones'
+        AND column_name IN (
+          'idempotency_key',
+          'source_job_id',
+          'source_job_identity_hash',
+          'before_hash',
+          'result_hash',
+          'replay_metadata_hash',
+          'tombstone_hash',
+          'created_at'
+        )
+    )
+    AND EXISTS (
+      SELECT 1
+      FROM information_schema.columns
+      WHERE table_schema = 'otlet'
+        AND table_name = 'action_execution_receipts'
+        AND column_name = 'replay_of_tombstone_hash'
+        AND data_type = 'text'
+    ),
+  EXISTS (
+    SELECT 1
+    FROM pg_catalog.pg_constraint constraint_row
+    WHERE constraint_row.conrelid =
+        'otlet.action_execution_receipts'::regclass
+      AND constraint_row.conname =
+        'action_execution_receipts_replay_reference_check'
+      AND pg_catalog.pg_get_constraintdef(constraint_row.oid)
+        LIKE '%replayed%num_nonnulls(replay_of_receipt_id, replay_of_tombstone_hash) = 1%'
+  )
+    AND EXISTS (
+      SELECT 1
+      FROM pg_catalog.pg_constraint constraint_row
+      WHERE constraint_row.conrelid =
+          'otlet.action_execution_receipts'::regclass
+        AND constraint_row.confrelid =
+          'otlet.action_idempotency_tombstones'::regclass
+        AND constraint_row.contype = 'f'
+        AND pg_catalog.pg_get_constraintdef(constraint_row.oid)
+          LIKE '%(replay_of_tombstone_hash)%action_idempotency_tombstones(tombstone_hash)%'
+    ),
+  (
+    SELECT count(*) = 5
+    FROM (VALUES
+      (
+        'action_idempotency_tombstones_source_idx',
+        'otlet.action_idempotency_tombstones'::regclass,
+        '%(source_job_id, tombstone_hash)',
+        false
+      ),
+      (
+        'action_execution_receipts_replay_source_idx',
+        'otlet.action_execution_receipts'::regclass,
+        '%(replay_of_receipt_id) WHERE (replay_of_receipt_id IS NOT NULL)',
+        true
+      ),
+      (
+        'portable_claims_evidence_job_idx',
+        'otlet.portable_claims'::regclass,
+        '%(job_id)',
+        false
+      ),
+      (
+        'watch_time_freshness_materialization_idx',
+        'otlet.watch_time_freshness'::regclass,
+        '%(materialization_id)',
+        false
+      ),
+      (
+        'task_backfill_subjects_covered_job_idx',
+        'otlet.task_backfill_subjects'::regclass,
+        '%(covered_job_id) WHERE (covered_job_id IS NOT NULL)',
+        true
+      )
+    ) expected(index_name, relation_oid, definition_pattern, partial)
+    JOIN pg_catalog.pg_class index_relation
+      ON index_relation.relname = expected.index_name
+    JOIN pg_catalog.pg_namespace namespace
+      ON namespace.oid = index_relation.relnamespace
+     AND namespace.nspname = 'otlet'
+    JOIN pg_catalog.pg_index index_row
+      ON index_row.indexrelid = index_relation.oid
+     AND index_row.indrelid = expected.relation_oid
+    WHERE pg_catalog.pg_get_indexdef(index_relation.oid)
+        LIKE expected.definition_pattern
+      AND (index_row.indpred IS NOT NULL) = expected.partial
+  ),
+  pg_catalog.to_regprocedure(
+    'otlet.evidence_lifecycle_manages_job(bigint)'
+  ) IS NOT NULL
+    AND pg_catalog.to_regprocedure(
+      'otlet.evidence_lifecycle_manages_label_series(text,text,text)'
+    ) IS NOT NULL
+    AND pg_catalog.to_regprocedure(
+      'otlet.evidence_lifecycle_manages_materialization(bigint)'
+    ) IS NOT NULL
+    AND pg_catalog.to_regprocedure(
+      'otlet.evidence_lifecycle_maintenance_pending()'
+    ) IS NOT NULL
+    AND pg_catalog.pg_get_functiondef(
+      'otlet.maintenance_cleanup_step_before_evidence()'::regprocedure
+    ) LIKE '%evidence_lifecycle_manages_job%'
+    AND pg_catalog.pg_get_functiondef(
+      'otlet.maintenance_cleanup_step_before_evidence()'::regprocedure
+    ) LIKE '%evidence_lifecycle_manages_label_series%'
+    AND pg_catalog.pg_get_functiondef(
+      'otlet.maintenance_cleanup_step_before_evidence()'::regprocedure
+    ) LIKE '%evidence_lifecycle_manages_materialization%'
+    AND pg_catalog.pg_get_functiondef(
+      'otlet.cleanup_policy_state_without_label_quality(boolean)'::regprocedure
+    ) LIKE '%evidence_lifecycle_manages_job%'
+    AND pg_catalog.pg_get_functiondef(
+      'otlet.cleanup_policy_state_without_label_quality(boolean)'::regprocedure
+    ) LIKE '%evidence_lifecycle_manages_materialization%'
+    AND pg_catalog.pg_get_functiondef(
+      'otlet.cleanup_eval_label_series(timestamptz,boolean)'::regprocedure
+    ) LIKE '%evidence_lifecycle_manages_label_series%'
+    AND pg_catalog.pg_get_functiondef(
+      'otlet.evidence_lifecycle_manages_label_series(text,text,text)'::regprocedure
+    ) LIKE '%evidence_lifecycle_manages_job(action.job_id)%'
+    AND pg_catalog.pg_get_functiondef(
+      'otlet.evidence_lifecycle_manages_label_series(text,text,text)'::regprocedure
+    ) LIKE '%evidence_lifecycle_manages_job(output.job_id)%'
+    AND pg_catalog.pg_get_functiondef(
+      'otlet.evidence_lifecycle_manages_label_series(text,text,text)'::regprocedure
+    ) LIKE '%evidence_lifecycle_manages_job(receipt.job_id)%'
+    AND pg_catalog.pg_get_functiondef(
+      'otlet.evidence_lifecycle_manages_materialization(bigint)'::regprocedure
+    ) LIKE '%evidence_lifecycle_manages_job(action.job_id)%'
+    AND pg_catalog.pg_get_functiondef(
+      'otlet.evidence_lifecycle_manages_job(bigint)'::regprocedure
+    ) LIKE '%policy.successful_job_retention IS NOT NULL%'
+    AND pg_catalog.pg_get_functiondef(
+      'otlet.evidence_lifecycle_manages_job(bigint)'::regprocedure
+    ) LIKE '%COALESCE(job.finished_at, job.created_at)%'
+    AND pg_catalog.pg_get_functiondef(
+      'otlet.evidence_lifecycle_manages_job(bigint)'::regprocedure
+    ) LIKE '%statement_timestamp() - policy.successful_job_retention%'
+    AND pg_catalog.pg_get_functiondef(
+      'otlet.evidence_lifecycle_manages_job(bigint)'::regprocedure
+    ) LIKE '%statement_timestamp() - policy.failed_job_retention%'
+    AND pg_catalog.pg_get_functiondef(
+      'otlet.maintenance_cleanup_pending()'::regprocedure
+    ) LIKE '%evidence_lifecycle_maintenance_pending()%'
+    AND pg_catalog.pg_get_functiondef(
+      'otlet.evidence_lifecycle_maintenance_pending()'::regprocedure
+    ) LIKE '%statement_timestamp() - policy.successful_job_retention%'
+    AND pg_catalog.pg_get_functiondef(
+      'otlet.evidence_lifecycle_maintenance_pending()'::regprocedure
+    ) LIKE '%statement_timestamp() - policy.failed_job_retention%',
+  (
+    SELECT function.prorettype = 'boolean'::regtype
+      AND function.prosrc LIKE '%pg_try_advisory_xact_lock(%'
+    FROM pg_catalog.pg_proc function
+    WHERE function.oid =
+      'otlet.acquire_evidence_mutation_barrier()'::regprocedure
+  )
+    AND pg_catalog.pg_get_functiondef(
+      'otlet.maintenance_evidence_lifecycle_step()'::regprocedure
+    ) LIKE '%''evidence_request''::text%'
+    AND pg_catalog.pg_get_functiondef(
+      'otlet.maintenance_evidence_lifecycle_step()'::regprocedure
+    ) LIKE '%candidate_job_id IS NULL OR record.job_id = candidate_job_id%'
+    AND pg_catalog.pg_get_functiondef(
+      'otlet.maintenance_evidence_lifecycle_step()'::regprocedure
+    ) LIKE '%CASE WHEN adopted_job THEN 2 ELSE 1 END::bigint%'
+    AND pg_catalog.pg_get_functiondef(
+      'otlet.maintenance_evidence_lifecycle_step()'::regprocedure
+    ) LIKE '%IF NOT otlet.acquire_evidence_mutation_barrier() THEN%RETURN QUERY SELECT false, NULL::text, 0::bigint, ARRAY[]::text[];%'
+    AND pg_catalog.pg_get_functiondef(
+      'otlet.maintenance_evidence_lifecycle_step()'::regprocedure
+    ) LIKE '%IF NOT otlet.evidence_lifecycle_maintenance_pending() THEN%IF NOT otlet.acquire_evidence_mutation_barrier() THEN%IF NOT otlet.evidence_lifecycle_maintenance_pending() THEN%'
+    AND pg_catalog.pg_get_functiondef(
+      'otlet.maintenance_evidence_lifecycle_step()'::regprocedure
+    ) LIKE '%statement_timestamp() - policy.successful_job_retention%'
+    AND pg_catalog.pg_get_functiondef(
+      'otlet.maintenance_evidence_lifecycle_step()'::regprocedure
+    ) LIKE '%statement_timestamp() - policy.failed_job_retention%'
+    AND pg_catalog.pg_get_functiondef(
+      'otlet.evidence_delete_blockers(bigint)'::regprocedure
+    ) LIKE '%lifecycle.terminal_at + retention > statement_timestamp()%'
+    AND pg_catalog.pg_get_functiondef(
+      'otlet.record_evidence_export(bigint,bigint,text,text,boolean,text,text)'::regprocedure
+    ) LIKE '%otlet evidence lifecycle mutation is active%'
+    AND pg_catalog.pg_get_functiondef(
+      'otlet.record_evidence_export(bigint,bigint,text,text,boolean,text,text)'::regprocedure
+    ) LIKE '%55P03%',
+  pg_catalog.pg_get_functiondef(
+    'otlet.apply_action(bigint)'::regprocedure
+  ) LIKE '%otlet.action_idempotency_tombstones%'
+    AND pg_catalog.pg_get_functiondef(
+      'otlet.apply_action(bigint)'::regprocedure
+    ) LIKE '%replay_of_tombstone_hash%'
+    AND pg_catalog.pg_get_functiondef(
+      'otlet.apply_action(bigint)'::regprocedure
+    ) LIKE '%replay_metadata_hash%'
+    AND pg_catalog.pg_get_functiondef(
+      'otlet.apply_action(bigint)'::regprocedure
+    ) LIKE '%action replay metadata changed after evidence deletion%',
+  pg_catalog.pg_get_functiondef(
+    'otlet.evidence_delete_blockers(bigint)'::regprocedure
+  ) LIKE '%COALESCE(job.finished_at, job.created_at)%'
+    AND pg_catalog.pg_get_functiondef(
+      'otlet.request_evidence_lifecycle(bigint,boolean,text,text)'::regprocedure
+    ) LIKE '%COALESCE(job.finished_at, job.created_at)%'
+    AND pg_catalog.pg_get_functiondef(
+      'otlet.maintenance_evidence_lifecycle_step()'::regprocedure
+    ) LIKE '%COALESCE(candidate.finished_at, candidate.created_at)%'
+    AND pg_catalog.pg_get_functiondef(
+      'otlet.evidence_lifecycle_maintenance_pending()'::regprocedure
+    ) LIKE '%COALESCE(job.finished_at, job.created_at)%'
+    AND pg_catalog.pg_get_functiondef(
+      'otlet.verify_invariants(integer)'::regprocedure
+    ) LIKE '%COALESCE(job.finished_at, job.created_at)%'
+    AND pg_catalog.pg_get_functiondef(
+      'otlet.verify_invariants(integer)'::regprocedure
+    ) LIKE '%JOIN otlet.action_idempotency_tombstones idempotency%'
+    AND pg_catalog.pg_get_functiondef(
+      'otlet.verify_invariants(integer)'::regprocedure
+    ) LIKE '%idempotency.tombstone_hash = receipt.replay_of_tombstone_hash%'
+    AND pg_catalog.pg_get_functiondef(
+      'otlet.verify_invariants(integer)'::regprocedure
+    ) LIKE '%receipt.idempotency_key IS DISTINCT FROM idempotency.idempotency_key%'
+    AND pg_catalog.pg_get_functiondef(
+      'otlet.verify_invariants(integer)'::regprocedure
+    ) LIKE '%idempotency.replay_metadata_hash IS DISTINCT FROM otlet.identity_hash%',
+  (
+    SELECT count(*) = 26
+      AND array_agg(relation.relname::text ORDER BY relation.relname) = ARRAY[
+        'action_execution_receipts',
+        'action_idempotency_tombstones',
+        'actions',
+        'eval_labels',
+        'evaluation_cases',
+        'evaluation_executions',
+        'evaluation_results',
+        'evidence_lifecycle_records',
+        'inference_receipts',
+        'jobs',
+        'outputs',
+        'pair_constraint_facts',
+        'portable_claims',
+        'portable_receipt_links',
+        'production_model_cancellation_probes',
+        'production_model_database_samples',
+        'production_policy',
+        'records',
+        'review_events',
+        'review_samples',
+        'reviewer_review_errors',
+        'semantic_correction_overrides',
+        'semantic_materializations',
+        'task_backfill_subjects',
+        'watch_time_freshness',
+        'worker_events'
+      ]
+      AND bool_and(
+        trigger.tgfoid =
+          'otlet.guard_evidence_mutation_barrier()'::regprocedure::oid
+        AND trigger.tgtype = 62
+      )
+    FROM pg_catalog.pg_trigger trigger
+    JOIN pg_catalog.pg_class relation ON relation.oid = trigger.tgrelid
+    JOIN pg_catalog.pg_namespace namespace
+      ON namespace.oid = relation.relnamespace
+    WHERE namespace.nspname = 'otlet'
+      AND trigger.tgname = 'evidence_mutation_barrier'
+      AND NOT trigger.tgisinternal
+  ),
+  (SELECT max(version) = 87 AND count(*) = 87
+   FROM otlet.portable_schema_migrations),
+  NOT EXISTS (SELECT 1 FROM otlet.verify_invariants())
+)
+FROM public.portable_upgrade_sentinel sentinel
+JOIN otlet.evidence_lifecycle_records lifecycle
+  ON lifecycle.job_id = sentinel.legacy_evidence_job_id
+WHERE sentinel.id = 1;
+SQL
+)"
+[ "$portable_evidence_lifecycle_migration_contract" = \
+  "evidence_archive|evidence_delete|t|deleted|complete|complete|t|t|t|t|t|t|t|t|t|t|t|t|t|t|t|t|t|t" ] || {
+  echo "Portable evidence-lifecycle migration contract mismatch: $portable_evidence_lifecycle_migration_contract" >&2
   exit 1
 }
 
@@ -1009,7 +1531,7 @@ RESET ROLE;
 SELECT concat_ws('|',
   max(version),
   count(*),
-  array_agg(version ORDER BY version) = ARRAY(SELECT generate_series(1, 86)),
+  array_agg(version ORDER BY version) = ARRAY(SELECT generate_series(1, 87)),
   bool_and(file ~ ('(^|/)' || lpad(version::text, 4, '0') || '_')),
   (SELECT value FROM public.portable_upgrade_sentinel),
   (
@@ -1686,7 +2208,7 @@ SELECT concat_ws('|',
 FROM otlet.portable_schema_migrations;
 SQL
 )"
-[ "$contract" = "86|86|t|t|preserved|t|4096|t|t|t|t|0|t|t|t|t|t|t|t|t|t|t|t|t|t|t|t|t|t" ] || {
+[ "$contract" = "87|87|t|t|preserved|t|4096|t|t|t|t|0|t|t|t|t|t|t|t|t|t|t|t|t|t|t|t|t|t" ] || {
   echo "Portable repeat-install contract mismatch: $contract" >&2
   exit 1
 }
@@ -2781,7 +3303,8 @@ SELECT concat_ws('|',
        'otlet.production_model_database_samples'::regclass,
        'otlet.production_model_cancellation_probes'::regclass
      )
-     AND NOT trigger.tgisinternal)
+     AND NOT trigger.tgisinternal
+     AND trigger.tgname <> 'evidence_mutation_barrier')
     AND pg_get_functiondef('otlet.stamp_job_wall_clock()'::regprocedure)
       LIKE '%cancel_requested_at := clock_timestamp()%',
   NOT EXISTS (
@@ -5926,6 +6449,8 @@ renewal_race_contract="$renewal_race_claims|$(model_capacity_contract)"
 
 echo "portable_upgrade_contract=$contract"
 echo "portable_access_policy_migration_contract=$portable_access_policy_migration_contract"
+echo "portable_evidence_lifecycle_default_contract=$portable_evidence_lifecycle_default_contract"
+echo "portable_evidence_lifecycle_migration_contract=$portable_evidence_lifecycle_migration_contract"
 echo "portable_identity_vector_contract=$identity_vector_contract"
 echo "portable_application_migration_contract=$application_migration_contract"
 echo "portable_lifecycle_migration_contract=$lifecycle_migration_contract"
