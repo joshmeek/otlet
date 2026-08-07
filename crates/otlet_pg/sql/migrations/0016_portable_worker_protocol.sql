@@ -58,7 +58,7 @@ CREATE TABLE otlet.portable_workers (
   last_seen_at timestamptz,
   last_heartbeat_at timestamptz,
   last_claimed_at timestamptz,
-  current_rss_bytes bigint CHECK (current_rss_bytes > 0),
+  current_rss_bytes bigint CHECK (current_rss_bytes >= 0),
   process_started_at timestamptz,
   created_at timestamptz NOT NULL DEFAULT now(),
   updated_at timestamptz NOT NULL DEFAULT now()
@@ -728,8 +728,8 @@ DECLARE
   claim_selection_role text;
 BEGIN
   IF portable_claim_jobs.requested_current_rss_bytes IS NULL
-     OR portable_claim_jobs.requested_current_rss_bytes <= 0 THEN
-    RAISE EXCEPTION 'otlet portable current RSS bytes must be positive';
+     OR portable_claim_jobs.requested_current_rss_bytes < 0 THEN
+    RAISE EXCEPTION 'otlet portable current RSS bytes must be non-negative';
   END IF;
   IF portable_claim_jobs.requested_default_llama_threads IS NULL
      OR portable_claim_jobs.requested_default_llama_threads NOT BETWEEN 1 AND 1024 THEN

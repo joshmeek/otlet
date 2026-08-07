@@ -234,7 +234,7 @@ BEGIN
   IF artifact_bytes_valid AND length(artifact_bytes_text) = 19 THEN
     artifact_bytes_valid := artifact_bytes_text <= '9223372036854775807';
   END IF;
-  current_rss_valid := COALESCE(current_rss_text ~ '^[1-9][0-9]{0,18}$', false);
+  current_rss_valid := COALESCE(current_rss_text ~ '^[0-9]{1,19}$', false);
   IF current_rss_valid AND length(current_rss_text) = 19 THEN
     current_rss_valid := current_rss_text <= '9223372036854775807';
   END IF;
@@ -259,7 +259,7 @@ BEGIN
     rejected := rejected || jsonb_build_object('model_artifact', 'model_artifact_identity_mismatch');
   END IF;
   IF NOT current_rss_valid THEN
-    rejected := rejected || jsonb_build_object('current_rss_bytes', 'current_rss_bytes_must_be_positive_integer');
+    rejected := rejected || jsonb_build_object('current_rss_bytes', 'current_rss_bytes_must_be_non_negative_integer');
   END IF;
   IF NOT default_llama_threads_valid THEN
     rejected := rejected || jsonb_build_object(
@@ -319,15 +319,18 @@ BEGIN
   END IF;
   max_worker_rss_valid := supplied_effective ? 'max_worker_rss_bytes'
     AND jsonb_typeof(supplied_effective -> 'max_worker_rss_bytes') = 'number'
-    AND supplied_effective ->> 'max_worker_rss_bytes' ~ '^[1-9][0-9]{0,13}$';
+    AND supplied_effective ->> 'max_worker_rss_bytes' ~ '^[0-9]{1,14}$';
   IF max_worker_rss_valid
      AND length(supplied_effective ->> 'max_worker_rss_bytes') = 14 THEN
     max_worker_rss_valid := supplied_effective ->> 'max_worker_rss_bytes' <= '70368744177664';
   END IF;
   IF NOT max_worker_rss_valid THEN
-    rejected := rejected || jsonb_build_object('max_worker_rss_bytes', 'max_worker_rss_bytes_must_be_integer_1_to_70368744177664');
-  ELSIF current_rss_valid THEN
-    IF current_rss_text::bigint > (supplied_effective ->> 'max_worker_rss_bytes')::bigint THEN
+    rejected := rejected || jsonb_build_object('max_worker_rss_bytes', 'max_worker_rss_bytes_must_be_integer_0_to_70368744177664');
+  ELSIF current_rss_valid
+        AND (supplied_effective ->> 'max_worker_rss_bytes')::bigint > 0 THEN
+    IF current_rss_text::bigint = 0 THEN
+      rejected := rejected || jsonb_build_object('current_rss_bytes', 'current_rss_bytes_required_for_positive_budget');
+    ELSIF current_rss_text::bigint > (supplied_effective ->> 'max_worker_rss_bytes')::bigint THEN
       rejected := rejected || jsonb_build_object('max_worker_rss_bytes', 'current_rss_exceeds_max_worker_rss_bytes');
     ELSIF artifact_bytes_valid THEN
       IF artifact_bytes_text::bigint > (supplied_effective ->> 'max_worker_rss_bytes')::bigint THEN

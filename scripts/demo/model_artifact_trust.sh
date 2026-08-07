@@ -34,9 +34,7 @@ psql_exec \
   -v unreadable_artifact="$unreadable_artifact" >/dev/null <<'SQL'
 SELECT otlet.register_model(
   'artifact_parser_malformed_smoke',
-  :'parser_malformed_artifact',
-  :'parser_malformed_sha256',
-  jsonb_build_object('sha256', :'parser_malformed_sha256', 'bytes', 24, 'source', 'smoke', 'revision', 'v1', 'quantization', 'test', 'license', 'test')
+  :'parser_malformed_artifact'
 );
 SELECT otlet.register_model(
   'artifact_truncated_smoke',
@@ -74,7 +72,8 @@ SELECT otlet.create_task(
   'SELECT ''parser-malformed''::text AS subject_id, ''{}''::jsonb AS input',
   'Return JSON only',
   '{"type":"object"}'::jsonb,
-  'artifact_parser_malformed_smoke'
+  'artifact_parser_malformed_smoke',
+  '{"max_worker_rss_bytes":7500000000}'::jsonb
 );
 SELECT otlet.create_task(
   'artifact_truncated_smoke_task',
@@ -118,6 +117,34 @@ SELECT otlet.run_task('artifact_parser_malformed_smoke_task');
 SELECT otlet.run_task('artifact_symlink_smoke_task');
 SELECT otlet.run_task('artifact_unreadable_smoke_task');
 SQL
+
+short_model_registration_contract="$(psql_value \
+  -v parser_malformed_artifact="$parser_malformed_artifact" <<'SQL'
+SELECT (artifact_hash = artifact_identity ->> 'sha256')::text || '|' ||
+       (artifact_identity ->> 'bytes') || '|' ||
+       (artifact_identity ->> 'source' = :'parser_malformed_artifact')::text || '|' ||
+       (artifact_identity ->> 'revision' = artifact_hash)::text || '|' ||
+       (artifact_identity ->> 'license') || '|' ||
+       tested_context_window_tokens::text || '|' ||
+       (NOT pg_catalog.has_function_privilege(
+         'public',
+         'otlet.register_model(text,text,integer)'::regprocedure,
+         'EXECUTE'
+       ))::text || '|' ||
+       (NOT pg_catalog.has_function_privilege(
+         'public',
+         'otlet.model_artifact_identity_from_path(text)'::regprocedure,
+         'EXECUTE'
+       ))::text
+FROM otlet.models
+WHERE name = 'artifact_parser_malformed_smoke';
+SQL
+)"
+echo "short_model_registration_contract=$short_model_registration_contract"
+[ "$short_model_registration_contract" = "true|24|true|true|unknown|4096|true|true" ] || {
+  echo "Expected two-argument model registration to derive local artifact identity, got $short_model_registration_contract" >&2
+  exit 1
+}
 
 wait_task_failed artifact_malformed_smoke_task 1 60 1
 wait_task_failed artifact_tampered_smoke_task 1 60 1

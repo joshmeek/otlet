@@ -560,7 +560,7 @@ BEGIN
     artifact_bytes_valid := artifact_bytes_text <= '9223372036854775807';
   END IF;
   current_rss_valid := COALESCE(
-    current_rss_text ~ '^[1-9][0-9]{0,18}$',
+    current_rss_text ~ '^[0-9]{1,19}$',
     false
   );
   IF current_rss_valid AND length(current_rss_text) = 19 THEN
@@ -619,7 +619,7 @@ BEGIN
   IF NOT current_rss_valid THEN
     rejected := rejected || jsonb_build_object(
       'current_rss_bytes',
-      'current_rss_bytes_must_be_positive_integer'
+      'current_rss_bytes_must_be_non_negative_integer'
     );
   END IF;
   IF NOT default_llama_threads_valid THEN
@@ -718,7 +718,12 @@ BEGIN
     );
   ELSIF current_rss_valid
         AND (supplied_effective ->> 'max_worker_rss_bytes')::bigint > 0 THEN
-    IF current_rss_text::bigint >
+    IF current_rss_text::bigint = 0 THEN
+      rejected := rejected || jsonb_build_object(
+        'current_rss_bytes',
+        'current_rss_bytes_required_for_positive_budget'
+      );
+    ELSIF current_rss_text::bigint >
          (supplied_effective ->> 'max_worker_rss_bytes')::bigint THEN
       rejected := rejected || jsonb_build_object(
         'max_worker_rss_bytes',

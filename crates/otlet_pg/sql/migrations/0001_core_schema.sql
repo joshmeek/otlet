@@ -21,7 +21,7 @@ CREATE TABLE otlet.production_policy (
   max_receipt_bytes bigint NOT NULL DEFAULT 4194304,
   max_attempts integer NOT NULL DEFAULT 3,
   max_attempt_ms integer NOT NULL DEFAULT 300000,
-  default_runtime_options jsonb NOT NULL DEFAULT '{"max_worker_rss_bytes":8589934592}'::jsonb,
+  default_runtime_options jsonb NOT NULL DEFAULT '{"max_worker_rss_bytes":0}'::jsonb,
   preload_model_name text,
   semantic_auto_wait_ms integer NOT NULL DEFAULT 10000,
   semantic_auto_infer_ms integer NOT NULL DEFAULT 15000,

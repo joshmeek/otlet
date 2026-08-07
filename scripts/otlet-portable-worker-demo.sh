@@ -747,7 +747,7 @@ SELECT concat_ws('|',
       ARRAY['max_attempt_ms','max_worker_rss_bytes','generation_trace']
     AND (SELECT count(*) FROM jsonb_object_keys(contract.option_status -> 'defaulted')) = 3
     AND (contract.option_status #>> '{defaulted,max_attempt_ms}')::bigint > 0
-    AND (contract.option_status #>> '{defaulted,max_worker_rss_bytes}')::bigint > 0
+    AND (contract.option_status #>> '{defaulted,max_worker_rss_bytes}')::bigint = 0
     AND contract.option_status #> '{defaulted,generation_trace}' = 'false'::jsonb
     AND contract.option_status -> 'rejected' = '{}'::jsonb
     AND contract.option_status -> 'effective' =
@@ -767,26 +767,26 @@ SELECT concat_ws('|',
     AND contract.option_status #>> '{envelope,rss_policy}' = 'linux_proc_status_vmrss_fail_closed'
   )::text,
   (
-    (contract.option_status #>> '{envelope,max_worker_rss_bytes}')::bigint > 0
+    (contract.option_status #>> '{envelope,max_worker_rss_bytes}')::bigint = 0
     AND (contract.option_status #>> '{envelope,current_rss_bytes}')::bigint > 0
-    AND (contract.option_status #>> '{envelope,current_rss_bytes}')::bigint <=
-      (contract.option_status #>> '{envelope,max_worker_rss_bytes}')::bigint
     AND contract.trace_summary #>> '{memory,claim,process_rss_bytes}' =
       contract.option_status #>> '{envelope,current_rss_bytes}'
     AND (contract.trace_summary #>> '{memory,after,process_rss_bytes}')::bigint > 0
-    AND (contract.trace_summary #>> '{memory,after,process_rss_bytes}')::bigint <=
-      (contract.option_status #>> '{envelope,max_worker_rss_bytes}')::bigint
-    AND contract.trace_summary #>> '{memory,worker_memory_budget_bytes}' =
-      contract.option_status #>> '{envelope,max_worker_rss_bytes}'
-    AND contract.trace_summary #>> '{memory,admission,decision}' = 'allowed'
+    AND contract.trace_summary #> '{memory,worker_memory_budget_bytes}' = 'null'::jsonb
+    AND contract.trace_summary #>> '{memory,admission,decision}' = 'not_evaluated'
+    AND contract.trace_summary #>> '{memory,admission,reason}' =
+      'worker_memory_budget_disabled'
     AND contract.trace_summary #>> '{memory,request_admission,decision}' = 'allowed'
     AND contract.trace_summary #>> '{memory,request_admission,reason}' =
-      'projected_request_memory_within_job_budget'
+      'worker_memory_budget_disabled'
     AND (contract.trace_summary #>> '{memory,request_admission,prompt_tokens}')::integer > 0
     AND (contract.trace_summary #>> '{memory,request_admission,max_generation_tokens}')::integer = 48
     AND (contract.trace_summary #>> '{memory,request_admission,projected_prompt_bytes}')::bigint > 0
     AND (contract.trace_summary #>> '{memory,request_admission,projected_decode_bytes}')::bigint > 0
-    AND contract.trace_summary #>> '{memory,post_inference_enforcement,decision}' = 'allowed'
+    AND contract.trace_summary #>> '{memory,post_inference_enforcement,decision}' =
+      'not_evaluated'
+    AND contract.trace_summary #>> '{memory,post_inference_enforcement,reason}' =
+      'worker_memory_budget_disabled'
   )::text,
   (
     contract.trace_summary #>> '{runtime_fingerprint,artifact,sha256}' = :'model_sha256'

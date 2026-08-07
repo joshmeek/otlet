@@ -272,6 +272,85 @@ fn sha256_gguf(file: &mut fs::File) -> Result<String, ModelError> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
+fn model_artifact_identity_from_path(path: &str) -> Result<Value, ModelError> {
+    let path_stamp = regular_artifact_stamp(path)?;
+    let mut file = open_artifact(path).map_err(|error| {
+        artifact_failure(
+            format!("model artifact is unreadable: {error}"),
+            "model_artifact_unreadable",
+        )
+    })?;
+    let stamp = file
+        .metadata()
+        .map(|metadata| artifact_stamp(&metadata))
+        .map_err(|error| {
+            artifact_failure(
+                format!("model artifact metadata failed: {error}"),
+                "model_artifact_unreadable",
+            )
+        })?;
+    if stamp != path_stamp || regular_artifact_stamp(path)? != stamp {
+        return Err(artifact_failure(
+            "model artifact path changed while opening",
+            "model_artifact_path_replaced",
+        ));
+    }
+
+    let sha256 = sha256_gguf(&mut file)?;
+    if file
+        .metadata()
+        .map(|metadata| artifact_stamp(&metadata))
+        .map_err(|error| {
+            artifact_failure(
+                format!("model artifact metadata failed: {error}"),
+                "model_artifact_unreadable",
+            )
+        })?
+        != stamp
+        || regular_artifact_stamp(path)? != stamp
+    {
+        return Err(artifact_failure(
+            "model artifact changed while hashing",
+            "model_artifact_changed_after_verification",
+        ));
+    }
+
+    let artifact_name = std::path::Path::new(path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(path);
+    Ok(json!({
+        "sha256": sha256,
+        "bytes": stamp.bytes,
+        "source": path,
+        "revision": sha256,
+        "quantization": artifact_quantization(artifact_name),
+        "license": "unknown",
+        "context_window_tokens": 4096
+    }))
+}
+
+static OTLET_MODEL_ARTIFACT_IDENTITY_FROM_PATH_FINFO: pgrx::pg_sys::Pg_finfo_record =
+    pgrx::pg_sys::Pg_finfo_record { api_version: 1 };
+
+#[unsafe(no_mangle)]
+pub extern "C-unwind" fn pg_finfo_otlet_model_artifact_identity_from_path()
+-> *const pgrx::pg_sys::Pg_finfo_record {
+    &raw const OTLET_MODEL_ARTIFACT_IDENTITY_FROM_PATH_FINFO
+}
+
+#[pgrx::pg_guard]
+#[unsafe(no_mangle)]
+pub extern "C-unwind" fn otlet_model_artifact_identity_from_path(
+    fcinfo: pgrx::pg_sys::FunctionCallInfo,
+) -> pgrx::pg_sys::Datum {
+    let path = unsafe { pgrx::pg_getarg::<String>(fcinfo, 0) }.unwrap_or_default();
+    match model_artifact_identity_from_path(&path) {
+        Ok(identity) => pgrx::IntoDatum::into_datum(pgrx::JsonB(identity)).unwrap(),
+        Err(error) => pgrx::error!("{}", error.message),
+    }
+}
+
 fn artifact_stamp(metadata: &fs::Metadata) -> ArtifactStamp {
     #[cfg(unix)]
     use std::os::unix::fs::MetadataExt;
@@ -324,6 +403,15 @@ mod artifact_tests {
             artifact_identity: &identity,
         };
         assert!(verify_model_artifact(model).is_ok());
+        let derived = model_artifact_identity_from_path(valid_path.to_str().unwrap())
+            .ok()
+            .expect("valid artifact identity should derive");
+        assert_eq!(derived["sha256"], identity["sha256"]);
+        assert_eq!(derived["bytes"], 24);
+        assert_eq!(derived["source"], valid_path.to_str().unwrap());
+        assert_eq!(derived["revision"], identity["sha256"]);
+        assert_eq!(derived["license"], "unknown");
+        assert_eq!(derived["context_window_tokens"], 4096);
 
         let malformed_path = std::env::temp_dir().join(format!(
             "otlet-artifact-{}-malformed.gguf",

@@ -255,10 +255,31 @@ WITH base_definition AS (
             'artifact_identity',
             'bytes'
           )::bigint,
-        'current_rss_bytes', 999999999,
+        'current_rss_bytes', 0,
         'default_llama_threads', 1
       )
     ) AS portable_defaults,
+    otlet.portable_runtime_option_status(
+      definitions.smaller,
+      jsonb_extract_path(definitions.smaller, 'models', 'direct'),
+      jsonb_build_object(
+        'runtime_contract', otlet.portable_reference_runtime_contract(),
+        'model_artifact_hash',
+          jsonb_extract_path_text(
+            definitions.smaller, 'models', 'direct', 'artifact_hash'
+          ),
+        'model_artifact_bytes',
+          jsonb_extract_path_text(
+            definitions.smaller,
+            'models',
+            'direct',
+            'artifact_identity',
+            'bytes'
+          )::bigint,
+        'current_rss_bytes', 0,
+        'default_llama_threads', 1
+      )
+    ) AS missing_required_rss,
     otlet.portable_runtime_option_status(
       definitions.incompatible_default,
       jsonb_extract_path(definitions.incompatible_default, 'models', 'direct'),
@@ -341,6 +362,9 @@ SELECT concat_ws('|',
     statuses.portable_defaults, 'effective', 'max_worker_rss_bytes'
   ),
   jsonb_extract_path_text(
+    statuses.missing_required_rss, 'rejected', 'current_rss_bytes'
+  ),
+  jsonb_extract_path_text(
     statuses.incompatible_default, 'rejected', 'inference_cache'
   ),
   otlet.classify_failure_reason(
@@ -359,7 +383,7 @@ SQL
 )
 
 [ "$model_bound_context_contract" = \
-  "4096|2048|4096|2048|4096|2048|t|t|t|t|t|2048|1024|1024|2048|1024|1024|true|requested_context_window_exceeds_model_limit|2048|3072|2048|model_context_window_tokens_must_match_artifact_identity|true|false|0|inference_cache_must_be_false|otlet.failure.v1.runtime_configuration_rejected|otlet.failure.v1.resource_admission_rejected|0" ] || {
+  "4096|2048|4096|2048|4096|2048|t|t|t|t|t|2048|1024|1024|2048|1024|1024|true|requested_context_window_exceeds_model_limit|2048|3072|2048|model_context_window_tokens_must_match_artifact_identity|true|false|0|current_rss_bytes_required_for_positive_budget|inference_cache_must_be_false|otlet.failure.v1.runtime_configuration_rejected|otlet.failure.v1.resource_admission_rejected|0" ] || {
   echo "Model-bound context budget contract mismatch: $model_bound_context_contract" >&2
   exit 1
 }

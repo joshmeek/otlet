@@ -1,8 +1,5 @@
 use serde_json::{Value, json};
 
-#[cfg(target_os = "linux")]
-pub(crate) const DEFAULT_MAX_WORKER_RSS_BYTES: u64 = 8 * 1024 * 1024 * 1024;
-#[cfg(not(target_os = "linux"))]
 pub(crate) const DEFAULT_MAX_WORKER_RSS_BYTES: u64 = 0;
 
 pub(crate) const SUPPORTED_RUNTIME_OPTIONS: &[&str] = &[
@@ -232,13 +229,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn worker_memory_has_a_bounded_default_and_explicit_disable() {
+    fn worker_memory_defaults_disabled_and_accepts_a_bound() {
         let defaults = parse_runtime_options(&json!({})).expect("default options must parse");
-        assert_eq!(defaults.max_worker_rss_bytes, DEFAULT_MAX_WORKER_RSS_BYTES);
+        assert_eq!(defaults.max_worker_rss_bytes, 0);
 
-        let disabled = parse_runtime_options(&json!({"max_worker_rss_bytes": 0}))
-            .expect("explicit disable must parse");
-        assert_eq!(disabled.max_worker_rss_bytes, 0);
+        let bounded = parse_runtime_options(&json!({"max_worker_rss_bytes": 1024}))
+            .expect("explicit bound must parse");
+        assert_eq!(bounded.max_worker_rss_bytes, 1024);
     }
 
     #[test]

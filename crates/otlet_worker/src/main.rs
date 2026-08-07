@@ -703,7 +703,7 @@ impl Database {
 
     fn claim(&self, config: &Config, default_llama_threads: i32) -> Result<Vec<Claim>, String> {
         let attempt_start = Instant::now();
-        let claim_rss_bytes = process_rss_bytes()?;
+        let claim_rss_bytes = process_rss_bytes().unwrap_or(0);
         let sql = format!(
             "SELECT jsonb_build_object(\
                'job_id', c.job_id, \
@@ -2074,7 +2074,8 @@ fn process_claim(
         .unwrap_or(1024 * 1024)
         .clamp(1, 16 * 1024 * 1024);
     let max_output_bytes = usize::try_from(max_output_bytes).unwrap_or(16 * 1024 * 1024);
-    let rss_before = match process_rss_bytes() {
+    let rss_before = match rss_sample_for_budget(process_rss_bytes(), options.max_worker_rss_bytes)
+    {
         Ok(rss) => rss,
         Err(_) => {
             let trace = runtime_trace(claim, model, Some(&options), None, None, None, None);
@@ -2101,7 +2102,7 @@ fn process_claim(
             max_output_bytes,
             &options,
             context_window,
-            rss_before,
+            rss_before.unwrap_or(claim.claim_rss_bytes),
         );
         request = Some(admission);
         if admission.decision == "rejected" {
@@ -2144,7 +2145,7 @@ fn process_claim(
                 model,
                 Some(&options),
                 request.as_ref(),
-                Some(rss_before),
+                rss_before,
                 None,
                 None,
             );
@@ -2158,7 +2159,7 @@ fn process_claim(
         Ok(()) => inference,
         Err(error) => Err(error),
     };
-    let rss_after = match process_rss_bytes() {
+    let rss_after = match rss_sample_for_budget(process_rss_bytes(), options.max_worker_rss_bytes) {
         Ok(rss) => rss,
         Err(_) => {
             let trace = runtime_trace(
@@ -2166,7 +2167,7 @@ fn process_claim(
                 model,
                 Some(&options),
                 request.as_ref(),
-                Some(rss_before),
+                rss_before,
                 None,
                 inference.as_ref().ok(),
             );
@@ -2187,14 +2188,16 @@ fn process_claim(
         model,
         Some(&options),
         request.as_ref(),
-        Some(rss_before),
-        Some(rss_after),
+        rss_before,
+        rss_after,
         inference.as_ref().ok(),
     );
     if request
         .as_ref()
         .is_none_or(|request| request.decision != "rejected")
-        && enforce_worker_rss_budget(rss_after, options.max_worker_rss_bytes).is_err()
+        && rss_after.is_some_and(|rss| {
+            enforce_worker_rss_budget(rss, options.max_worker_rss_bytes).is_err()
+        })
     {
         let mut trace = trace;
         trace["stop_reason"] = Value::String("portable_worker_rss_budget_exceeded".to_owned());
@@ -2756,6 +2759,17 @@ fn process_rss_bytes_from(status: &str) -> Option<u64> {
         .split_ascii_whitespace();
     let kib = fields.next()?.parse::<u64>().ok()?;
     (fields.next() == Some("kB") && fields.next().is_none()).then(|| kib.checked_mul(1024))?
+}
+
+fn rss_sample_for_budget(
+    sample: Result<u64, String>,
+    max_worker_rss_bytes: u64,
+) -> Result<Option<u64>, String> {
+    match sample {
+        Ok(rss) => Ok(Some(rss)),
+        Err(_) if max_worker_rss_bytes == 0 => Ok(None),
+        Err(error) => Err(error),
+    }
 }
 
 fn enforce_worker_rss_budget(rss_bytes: u64, max_worker_rss_bytes: u64) -> Result<(), String> {
@@ -3689,6 +3703,11 @@ esac
         );
         options.max_worker_rss_bytes = 1;
         assert_eq!(worker_memory_budget_trace(Some(&options)).0, Some(1));
+        assert_eq!(
+            rss_sample_for_budget(Err("unavailable".to_owned()), 0).unwrap(),
+            None
+        );
+        assert!(rss_sample_for_budget(Err("unavailable".to_owned()), 1).is_err());
     }
 
     #[test]

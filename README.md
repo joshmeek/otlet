@@ -49,17 +49,13 @@ BEGIN;
 SELECT name
 FROM otlet.register_model(
   'qwen3_1_7b',
-  '/var/lib/postgresql/otlet-models/Qwen3-1.7B-Q8_0.gguf',
-  '061b54daade076b5d3362dac252678d17da8c68f07560be70818cace6590cb1a',
-  '{"sha256":"061b54daade076b5d3362dac252678d17da8c68f07560be70818cace6590cb1a","bytes":1834426016,"source":"https://huggingface.co/Qwen/Qwen3-1.7B-GGUF/resolve/main/Qwen3-1.7B-Q8_0.gguf","revision":"main","quantization":"Q8_0","license":"unknown"}'::jsonb
+  '/var/lib/postgresql/otlet-models/Qwen3-1.7B-Q8_0.gguf'
 )
 UNION ALL
 SELECT name
 FROM otlet.register_model(
   'qwen35_4b',
-  '/var/lib/postgresql/otlet-models/Qwen3.5-4B-Q4_K_M.gguf',
-  '00fe7986ff5f6b463e62455821146049db6f9313603938a70800d1fb69ef11a4',
-  '{"sha256":"00fe7986ff5f6b463e62455821146049db6f9313603938a70800d1fb69ef11a4","bytes":2740937888,"source":"https://huggingface.co/unsloth/Qwen3.5-4B-GGUF/resolve/main/Qwen3.5-4B-Q4_K_M.gguf","revision":"main","quantization":"Q4_K_M","license":"unknown"}'::jsonb
+  '/var/lib/postgresql/otlet-models/Qwen3.5-4B-Q4_K_M.gguf'
 );
 COMMIT;
 ```
