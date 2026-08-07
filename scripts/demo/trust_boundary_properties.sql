@@ -206,6 +206,7 @@ DO $body$
 DECLARE
   test_case record;
   rejected_cases integer := 0;
+  violated_constraint text;
 BEGIN
   FOR test_case IN SELECT * FROM trust_property_identifiers ORDER BY case_id LOOP
     BEGIN
@@ -218,8 +219,13 @@ BEGIN
       );
       RAISE EXCEPTION 'trust property identifier case % was accepted', test_case.case_id;
     EXCEPTION WHEN OTHERS THEN
+      GET STACKED DIAGNOSTICS violated_constraint = CONSTRAINT_NAME;
       IF SQLERRM LIKE 'trust property identifier case % was accepted' THEN
         RAISE;
+      END IF;
+      IF SQLSTATE <> '23514' OR violated_constraint <> 'tasks_name_check' THEN
+        RAISE EXCEPTION 'trust property identifier case % failed unexpectedly [%] %',
+          test_case.case_id, SQLSTATE, SQLERRM;
       END IF;
       INSERT INTO trust_property_errors VALUES (SQLERRM);
       rejected_cases := rejected_cases + 1;
@@ -601,34 +607,43 @@ INSERT INTO trust_property_temp_source VALUES ('temp');
 CREATE TEMP TABLE trust_property_sql_dependencies (
   case_id integer PRIMARY KEY,
   query text NOT NULL,
-  declared_sources jsonb
+  declared_sources jsonb,
+  expected_message text NOT NULL
 );
 
 INSERT INTO trust_property_sql_dependencies VALUES
   (1,
    'SELECT current_setting(''search_path'') AS subject_id, ''{}''::jsonb AS input',
-   '[]'::jsonb),
+   '[]'::jsonb,
+   'otlet source query cannot observe or change session name resolution'),
   (2,
    'SELECT set_config(''application_name'', ''safe'', true) AS subject_id, ''{}''::jsonb AS input',
-   '[]'::jsonb),
+   '[]'::jsonb,
+   'otlet source query cannot observe or change session name resolution'),
   (3,
    'SELECT CURRENT_SCHEMA::text AS subject_id, ''{}''::jsonb AS input',
-   '[]'::jsonb),
+   '[]'::jsonb,
+   'otlet source query cannot observe or change session name resolution'),
   (4,
    'SELECT ''pg_database''::regclass::text AS subject_id, ''{}''::jsonb AS input',
-   '[]'::jsonb),
+   '[]'::jsonb,
+   'otlet source query cannot observe or change session name resolution'),
   (5,
    'SELECT id AS subject_id, ''{}''::jsonb AS input FROM pg_temp.trust_property_temp_source',
-   '[{"table":"pg_temp.trust_property_temp_source"}]'::jsonb),
+   '[{"table":"pg_temp.trust_property_temp_source"}]'::jsonb,
+   'otlet source query cannot depend on temporary relation '),
   (6,
    'SELECT ''one''::text AS subject_id, ''{}''::jsonb AS input; SELECT 2',
-   '[]'::jsonb),
+   '[]'::jsonb,
+   'otlet source query binding failed: syntax error at or near ";"'),
   (7,
    'SELECT id AS subject_id, jsonb_build_object(''value'', value) AS input FROM trust_property_sql.source',
-   '[]'::jsonb),
+   '[]'::jsonb,
+   'otlet declared source relations do not cover actual query reads'),
   (8,
    'SELECT id AS subject_id, jsonb_build_object(''value'', trust_property_sql.write_probe(value)) AS input FROM trust_property_sql.source',
-   '[{"table":"trust_property_sql.source"}]'::jsonb);
+   '[{"table":"trust_property_sql.source"}]'::jsonb,
+   'otlet source query function trust_property_sql.write_probe(value text) is not read-only parsed SQL');
 
 DO $body$
 DECLARE
@@ -645,6 +660,10 @@ BEGIN
     EXCEPTION WHEN OTHERS THEN
       IF SQLERRM LIKE 'trust property SQL dependency case % was accepted' THEN
         RAISE;
+      END IF;
+      IF SQLSTATE <> 'P0001' OR strpos(SQLERRM, test_case.expected_message) = 0 THEN
+        RAISE EXCEPTION 'trust property SQL dependency case % failed unexpectedly [%] %',
+          test_case.case_id, SQLSTATE, SQLERRM;
       END IF;
       INSERT INTO trust_property_errors VALUES (SQLERRM);
       rejected_cases := rejected_cases + 1;
@@ -843,7 +862,8 @@ SELECT
   (SELECT count(*) FROM trust_property_fault_results WHERE NOT passed)
     AS partial_trusted_writes,
   pg_backend_pid() = (SELECT backend_pid FROM trust_property_params)
-    AS backend_pid_preserved;
+    AS backend_pid_preserved,
+  0::bigint AS invariants;
 
 DELETE FROM otlet.worker_events event
 USING otlet.jobs job
@@ -887,6 +907,9 @@ WHERE receipt.job_id = job.id
 DELETE FROM otlet.jobs
 WHERE task_name = 'trust_boundary_property_task';
 
+UPDATE trust_property_summary
+SET invariants = (SELECT count(*) FROM otlet.verify_invariants());
+
 DO $body$
 BEGIN
   IF EXISTS (SELECT 1 FROM trust_property_results WHERE NOT passed) THEN
@@ -903,6 +926,7 @@ BEGIN
        OR raw_secret_leaks <> 0
        OR partial_trusted_writes <> 0
        OR NOT backend_pid_preserved
+       OR invariants <> 0
   ) THEN
     RAISE EXCEPTION 'trust property safety summary failed';
   END IF;
@@ -925,7 +949,7 @@ SELECT concat_ws('|',
   'raw_secret_leaks=' || summary.raw_secret_leaks,
   'partial_trusted_writes=' || summary.partial_trusted_writes,
   'backend_pid_preserved=' || summary.backend_pid_preserved,
-  'invariants=0'
+  'invariants=' || summary.invariants
 )
 FROM trust_property_summary summary;
 

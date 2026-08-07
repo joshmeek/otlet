@@ -28,6 +28,24 @@ END;
 $$;
 \endif
 
+\if :portable_apply_migration_0001
+\else
+DO $migration$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1
+    FROM otlet.portable_schema_migrations
+    WHERE version = 44
+  ) THEN
+    RAISE EXCEPTION USING
+      ERRCODE = 'feature_not_supported',
+      MESSAGE = 'otlet cannot upgrade this unsupported pre-beta portable schema',
+      HINT = 'Create a fresh database and run the current portable install';
+  END IF;
+END;
+$migration$;
+\endif
+
 \set portable_migration_file ../../../otlet_pg/sql/migrations/0002_identity_contract.sql
 \ir migrations/apply.sql
 
@@ -284,4 +302,7 @@ $$;
 \ir migrations/apply.sql
 
 \set portable_migration_file ../../../otlet_pg/sql/migrations/0087_complete_evidence_lifecycle.sql
+\ir migrations/apply.sql
+
+\set portable_migration_file ../../../otlet_pg/sql/migrations/0088_branch_review_corrections.sql
 \ir migrations/apply.sql

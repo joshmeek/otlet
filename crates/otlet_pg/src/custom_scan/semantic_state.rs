@@ -13,8 +13,9 @@ fn load_semantic_states(
             policy,
         );
     }
+    let preload_timeout = PreloadStatementTimeout::start(policy.preload_max_ms);
     let preload_started = std::time::Instant::now();
-    pgrx::Spi::connect(|client| {
+    let result = pgrx::Spi::connect(|client| {
         let metadata_args = [index_name.into(), workload_revision_hash.into()];
         let metadata = client
             .select(
@@ -314,7 +315,9 @@ fn load_semantic_states(
             preload_bytes: actual_preload_bytes,
             preload_ms: actual_preload_ms,
         })
-    })
+    });
+    preload_timeout.finish();
+    result
 }
 
 fn load_semantic_join_states(
@@ -323,8 +326,9 @@ fn load_semantic_join_states(
     workload_revision_hash: &str,
     policy: &SemanticAutoPolicy,
 ) -> Result<LoadedSemanticState, String> {
+    let preload_timeout = PreloadStatementTimeout::start(policy.preload_max_ms);
     let preload_started = std::time::Instant::now();
-    pgrx::Spi::connect(|client| {
+    let result = pgrx::Spi::connect(|client| {
         let args = [
             index_name.into(),
             expected_json.into(),
@@ -569,7 +573,9 @@ fn load_semantic_join_states(
             preload_bytes: actual_preload_bytes,
             preload_ms: actual_preload_ms,
         })
-    })
+    });
+    preload_timeout.finish();
+    result
 }
 
 fn freshness_basis_counts_json(counts: &BTreeMap<String, u64>) -> String {
@@ -651,4 +657,68 @@ fn retain_runtime_semantic_state(
     runtime.semantic_states.insert(subject_id.to_owned(), state);
     runtime.retained_state_bytes = bytes;
     Ok(())
+}
+
+const STATEMENT_TIMEOUT_ID: std::ffi::c_int = 3;
+
+struct PreloadStatementTimeout {
+    original_finish: Option<pg_sys::TimestampTz>,
+}
+
+impl PreloadStatementTimeout {
+    fn start(max_ms: u64) -> Self {
+        unsafe {
+            pg_sys::ProcessInterrupts();
+            let original_finish = pg_timeout_active(STATEMENT_TIMEOUT_ID)
+                .then(|| pg_timeout_finish_time(STATEMENT_TIMEOUT_ID));
+            let original_remaining_ms = original_finish.map(|finish| {
+                pg_sys::TimestampDifferenceMilliseconds(pg_sys::GetCurrentTimestamp(), finish)
+            });
+            if original_finish.is_some() {
+                pg_disable_timeout(STATEMENT_TIMEOUT_ID, false);
+            }
+            pg_enable_timeout_after(
+                STATEMENT_TIMEOUT_ID,
+                effective_preload_timeout_ms(max_ms, original_remaining_ms),
+            );
+            Self { original_finish }
+        }
+    }
+
+    fn finish(self) {
+        unsafe { pg_sys::ProcessInterrupts() };
+    }
+}
+
+impl Drop for PreloadStatementTimeout {
+    fn drop(&mut self) {
+        unsafe {
+            pg_disable_timeout(STATEMENT_TIMEOUT_ID, false);
+            if let Some(finish) = self.original_finish
+                && finish > pg_sys::GetCurrentTimestamp()
+            {
+                pg_enable_timeout_at(STATEMENT_TIMEOUT_ID, finish);
+            }
+        }
+    }
+}
+
+fn effective_preload_timeout_ms(max_ms: u64, original_remaining_ms: Option<i64>) -> i32 {
+    let requested = i32::try_from(max_ms.max(1)).unwrap_or(i32::MAX);
+    original_remaining_ms.map_or(requested, |remaining| {
+        requested.min(i32::try_from(remaining.max(1)).unwrap_or(i32::MAX))
+    })
+}
+
+unsafe extern "C" {
+    #[link_name = "get_timeout_active"]
+    fn pg_timeout_active(id: std::ffi::c_int) -> bool;
+    #[link_name = "get_timeout_finish_time"]
+    fn pg_timeout_finish_time(id: std::ffi::c_int) -> pg_sys::TimestampTz;
+    #[link_name = "enable_timeout_after"]
+    fn pg_enable_timeout_after(id: std::ffi::c_int, delay_ms: std::ffi::c_int);
+    #[link_name = "enable_timeout_at"]
+    fn pg_enable_timeout_at(id: std::ffi::c_int, finish_time: pg_sys::TimestampTz);
+    #[link_name = "disable_timeout"]
+    fn pg_disable_timeout(id: std::ffi::c_int, keep_indicator: bool);
 }

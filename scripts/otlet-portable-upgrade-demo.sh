@@ -3,6 +3,7 @@ set -euo pipefail
 
 container="${OTLET_PG_CONTAINER:-otlet-postgres}"
 database="otlet_portable_upgrade_demo_$$"
+legacy_database="otlet_portable_legacy_upgrade_demo_$$"
 operator_role="otlet_portable_upgrade_operator_$$"
 reviewer_role="otlet_portable_upgrade_reviewer_$$"
 reviewer_login="otlet_portable_upgrade_reviewer_login_$$"
@@ -14,6 +15,7 @@ portable_worker_role="otlet_portable_upgrade_worker_$$"
 
 cleanup() {
   docker exec "$container" dropdb -U postgres --if-exists "$database" >/dev/null 2>&1 || true
+  docker exec "$container" dropdb -U postgres --if-exists "$legacy_database" >/dev/null 2>&1 || true
   docker exec "$container" psql -U postgres -d postgres -X -q \
     -c "DROP ROLE IF EXISTS $reviewer_login, $reviewer_role, $operator_role, $application_role, $partial_auditor_role, $preflight_role, $access_administrator_role, $portable_worker_role" >/dev/null 2>&1 || true
 }
@@ -64,7 +66,49 @@ WHERE status.model_name = 'model_concurrency_probe';
 SQL
 }
 
+prove_legacy_upgrade_rejection() {
+  docker exec "$container" createdb -U postgres "$legacy_database"
+  docker exec -i "$container" psql -U postgres -d "$legacy_database" \
+    -X -q -v ON_ERROR_STOP=1 <<'SQL' >/dev/null
+CREATE SCHEMA otlet;
+CREATE TABLE otlet.portable_schema_migrations (
+  version integer PRIMARY KEY,
+  file text NOT NULL UNIQUE,
+  applied_at timestamptz NOT NULL DEFAULT now()
+);
+INSERT INTO otlet.portable_schema_migrations (version, file)
+SELECT version, lpad(version::text, 4, '0') || '_legacy.sql'
+FROM generate_series(1, 43) version;
+CREATE TABLE public.portable_legacy_sentinel (value text NOT NULL);
+INSERT INTO public.portable_legacy_sentinel VALUES ('preserved');
+SQL
+
+  local output
+  if output="$(docker exec -w /work "$container" \
+    psql -U postgres -d "$legacy_database" -X -q -v ON_ERROR_STOP=1 \
+    -f crates/otlet_worker/sql/install.sql 2>&1)"; then
+    echo "Expected unsupported pre-beta portable upgrade rejection" >&2
+    exit 1
+  fi
+  [[ "$output" == *"otlet cannot upgrade this unsupported pre-beta portable schema"* ]] || {
+    echo "Unexpected pre-beta portable upgrade error: $output" >&2
+    exit 1
+  }
+
+  local contract
+  contract="$(docker exec "$container" psql -U postgres -d "$legacy_database" \
+    -X -qAt -v ON_ERROR_STOP=1 -c \
+    "SELECT count(*)::text || '|' || max(version)::text || '|' || (SELECT value FROM public.portable_legacy_sentinel) FROM otlet.portable_schema_migrations")"
+  [ "$contract" = "43|43|preserved" ] || {
+    echo "Pre-beta portable rejection changed legacy state: $contract" >&2
+    exit 1
+  }
+  echo "portable_legacy_upgrade_contract=$contract"
+  docker exec "$container" dropdb -U postgres "$legacy_database" >/dev/null
+}
+
 cleanup
+prove_legacy_upgrade_rejection
 docker exec "$container" createdb -U postgres "$database"
 docker exec -i "$container" psql -U postgres -d postgres \
   -X -q -v ON_ERROR_STOP=1 -v database="$database" <<'SQL' >/dev/null
@@ -517,6 +561,47 @@ SQL
 
 install_portable
 
+portable_access_policy_column_repair_contract="$(
+  docker exec -i "$container" psql -U postgres -d "$database" \
+    -X -qAt -v ON_ERROR_STOP=1 \
+    -v application_role="$application_role" \
+    -v access_administrator_role="$access_administrator_role" <<'SQL'
+GRANT SELECT(id) ON TABLE otlet.jobs TO :"application_role";
+SELECT (EXISTS (
+  SELECT 1
+  FROM pg_catalog.pg_attribute attribute
+  CROSS JOIN LATERAL pg_catalog.aclexplode(attribute.attacl) privilege
+  WHERE attribute.attrelid = 'otlet.jobs'::regclass
+    AND attribute.attname = 'id'
+    AND privilege.grantee = :'application_role'::regrole::oid
+))::text AS before_repair
+\gset column_
+BEGIN;
+SET LOCAL ROLE :"access_administrator_role";
+SELECT otlet.reconcile_access_policy_role(
+  :'application_role'::regrole,
+  'Repair upgraded column access drift'
+) \g /dev/null
+COMMIT;
+SELECT :'column_before_repair' || '|' ||
+       (NOT EXISTS (
+         SELECT 1
+         FROM pg_catalog.pg_attribute attribute
+         CROSS JOIN LATERAL pg_catalog.aclexplode(attribute.attacl) privilege
+         WHERE attribute.attrelid = 'otlet.jobs'::regclass
+           AND attribute.attname = 'id'
+           AND privilege.grantee = :'application_role'::regrole::oid
+       ))::text || '|' ||
+       (SELECT reconciled::text
+        FROM otlet.access_policy_role_status
+        WHERE role_oid = :'application_role'::regrole::oid);
+SQL
+)"
+[ "$portable_access_policy_column_repair_contract" = "true|true|true" ] || {
+  echo "Portable column access-policy repair mismatch: $portable_access_policy_column_repair_contract" >&2
+  exit 1
+}
+
 portable_evidence_lifecycle_default_contract="$(
   docker exec -i "$container" psql -U postgres -d "$database" \
     -X -qAt -v ON_ERROR_STOP=1 <<'SQL'
@@ -539,7 +624,7 @@ SELECT concat_ws('|',
   (SELECT successful_job_retention IS NULL
    FROM otlet.production_policy
    WHERE name = 'default'),
-  (SELECT max(version) = 87 AND count(*) = 87
+  (SELECT max(version) = 88 AND count(*) = 88
    FROM otlet.portable_schema_migrations),
   NOT EXISTS (SELECT 1 FROM otlet.verify_invariants()),
   'otlet.maintenance_cleanup_step()'::regprocedure::oid =
@@ -969,7 +1054,7 @@ SELECT concat_ws('|',
       AND trigger.tgname = 'evidence_mutation_barrier'
       AND NOT trigger.tgisinternal
   ),
-  (SELECT max(version) = 87 AND count(*) = 87
+  (SELECT max(version) = 88 AND count(*) = 88
    FROM otlet.portable_schema_migrations),
   NOT EXISTS (SELECT 1 FROM otlet.verify_invariants())
 )
@@ -1544,7 +1629,7 @@ RESET ROLE;
 SELECT concat_ws('|',
   max(version),
   count(*),
-  array_agg(version ORDER BY version) = ARRAY(SELECT generate_series(1, 87)),
+  array_agg(version ORDER BY version) = ARRAY(SELECT generate_series(1, 88)),
   bool_and(file ~ ('(^|/)' || lpad(version::text, 4, '0') || '_')),
   (SELECT value FROM public.portable_upgrade_sentinel),
   (
@@ -2052,6 +2137,95 @@ SELECT concat_ws('|',
     )
   ),
   (
+    EXISTS (
+      SELECT 1
+      FROM pg_catalog.pg_attribute attribute
+      JOIN pg_catalog.pg_attrdef default_value
+        ON default_value.adrelid = attribute.attrelid
+       AND default_value.adnum = attribute.attnum
+      WHERE attribute.attrelid = 'otlet.jobs'::regclass
+        AND attribute.attname = 'infer_now_request'
+        AND attribute.attnotnull
+        AND attribute.attnum = (
+          SELECT max(candidate.attnum)
+          FROM pg_catalog.pg_attribute candidate
+          WHERE candidate.attrelid = attribute.attrelid
+            AND candidate.attnum > 0
+            AND NOT candidate.attisdropped
+        )
+        AND pg_catalog.pg_get_expr(
+          default_value.adbin,
+          default_value.adrelid
+        ) = 'false'
+    )
+    AND EXISTS (
+      SELECT 1
+      FROM pg_catalog.pg_constraint constraint_row
+      WHERE constraint_row.conrelid = 'otlet.jobs'::regclass
+        AND constraint_row.conname = 'jobs_infer_now_request_origin_check'
+    )
+    AND NOT EXISTS (SELECT 1 FROM otlet.jobs WHERE infer_now_request)
+    AND pg_catalog.to_regprocedure(
+      'otlet.recover_orphaned_infer_now_jobs(boolean)'
+    ) IS NOT NULL
+    AND NOT pg_catalog.has_function_privilege(
+      'public',
+      'otlet.recover_orphaned_infer_now_jobs(boolean)',
+      'EXECUTE'
+    )
+    AND NOT pg_catalog.has_function_privilege(
+      'public',
+      'otlet.native_worker_ready_count()',
+      'EXECUTE'
+    )
+    AND pg_catalog.to_regprocedure(
+      'otlet.native_worker_startup_ready()'
+    ) IS NULL
+    AND position(
+      'WHERE NOT j.infer_now_request' IN pg_catalog.pg_get_functiondef(
+        'otlet.claim_jobs(text,integer,jsonb)'::regprocedure
+      )
+    ) > 0
+    AND position(
+      'infer_now_recovered := otlet.recover_orphaned_infer_now_jobs(false)' IN pg_catalog.pg_get_functiondef(
+        'otlet.sweep_expired_jobs()'::regprocedure
+      )
+    ) > 0
+    AND position(
+      'finished_at = clock_timestamp()' IN pg_catalog.pg_get_functiondef(
+        'otlet.finish_canceled_job(bigint,text,text,text,text,text,timestamptz,boolean,text,text,text,text,text)'::regprocedure
+      )
+    ) > 0
+    AND position(
+      'current_lifecycle.id = event.id' IN pg_catalog.pg_get_functiondef(
+        'otlet.maintenance_cleanup_step_before_evidence()'::regprocedure
+      )
+    ) > 0
+    AND position(
+      'current_lifecycle.id = event.id' IN pg_catalog.pg_get_functiondef(
+        'otlet.maintenance_cleanup_pending_before_evidence()'::regprocedure
+      )
+    ) > 0
+    AND position(
+      'claim.status' IN pg_catalog.pg_get_viewdef(
+        'otlet.native_cancellation_slo_status'::regclass,
+        true
+      )
+    ) = 0
+    AND position(
+      'native_worker_ready_count()' IN pg_catalog.pg_get_viewdef(
+        'otlet.route_readiness_status_internal'::regclass,
+        true
+      )
+    ) > 0
+    AND position(
+      'native_worker_ready_count()' IN pg_catalog.pg_get_viewdef(
+        'otlet.operational_observability_status_internal'::regclass,
+        true
+      )
+    ) > 0
+  ),
+  (
     pg_catalog.to_regclass('otlet.maintenance_runs') IS NOT NULL
     AND pg_catalog.to_regclass('otlet.maintenance_run_status') IS NOT NULL
     AND pg_catalog.to_regprocedure(
@@ -2221,7 +2395,7 @@ SELECT concat_ws('|',
 FROM otlet.portable_schema_migrations;
 SQL
 )"
-[ "$contract" = "87|87|t|t|preserved|t|4096|t|t|t|t|0|t|t|t|t|t|t|t|t|t|t|t|t|t|t|t|t|t" ] || {
+[ "$contract" = "88|88|t|t|preserved|t|4096|t|t|t|t|0|t|t|t|t|t|t|t|t|t|t|t|t|t|t|t|t|t|t" ] || {
   echo "Portable repeat-install contract mismatch: $contract" >&2
   exit 1
 }
@@ -6462,6 +6636,7 @@ renewal_race_contract="$renewal_race_claims|$(model_capacity_contract)"
 
 echo "portable_upgrade_contract=$contract"
 echo "portable_access_policy_migration_contract=$portable_access_policy_migration_contract"
+echo "portable_access_policy_column_repair_contract=$portable_access_policy_column_repair_contract"
 echo "portable_evidence_lifecycle_default_contract=$portable_evidence_lifecycle_default_contract"
 echo "portable_evidence_lifecycle_migration_contract=$portable_evidence_lifecycle_migration_contract"
 echo "portable_trust_boundary_property_contract=$portable_trust_boundary_property_contract"

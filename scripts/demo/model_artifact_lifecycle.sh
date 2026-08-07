@@ -627,6 +627,16 @@ SQL
     exit 1
   }
 
+  psql_exec -v model_name="$cheap_model_name" >/dev/null <<'SQL'
+SELECT count(*)
+FROM otlet.ask(
+  :'model_name',
+  'Return exactly one JSON object with ready set to true. No markdown.',
+  '{}'::jsonb,
+  '{"type":"object","required":["ready"],"additionalProperties":false,"properties":{"ready":{"const":true}}}'::jsonb,
+  '{"max_tokens":32,"reasoning":"off","inference_cache":false}'::jsonb
+);
+SQL
   resident_model="$(psql_value <<'SQL'
 SELECT model.name
 FROM otlet.models model

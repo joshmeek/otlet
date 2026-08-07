@@ -63,10 +63,10 @@ CROSS JOIN LATERAL otlet.renew_job_lease(claim.id, claim.claim_token) renewed;
 SELECT (SELECT count(*) FROM lease_claim)::text || '|' ||
        (SELECT count(*) FROM wrong_renew)::text || '|' ||
        COALESCE((SELECT status FROM current_renew), '') || '|' ||
-       COALESCE((SELECT (leased_until > now() + interval '30 seconds')::text FROM current_renew), 'false') || '|' ||
+       COALESCE((SELECT (leased_until > clock_timestamp() + interval '30 seconds')::text FROM current_renew), 'false') || '|' ||
        COALESCE((SELECT (
-         leased_until > now() + interval '31 seconds'
-         AND leased_until < now() + interval '33 seconds'
+         leased_until > clock_timestamp() + interval '31 seconds'
+         AND leased_until < clock_timestamp() + interval '33 seconds'
        )::text FROM current_renew), 'false');
 ROLLBACK;
 SQL

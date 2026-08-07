@@ -57,6 +57,7 @@ pub extern "C-unwind" fn otlet_worker_main(_arg: pgrx::pg_sys::Datum) {
         .unwrap_or_else(Instant::now);
     let mut preload_checked = false;
     let mut prefer_infer_now = true;
+    let mut infer_now_recovery_due = true;
 
     while BackgroundWorker::wait_latch(Some(recovery_interval)) {
         if schema_probe_due || last_schema_probe.elapsed() >= SCHEMA_READY_PROBE_INTERVAL {
@@ -84,6 +85,42 @@ pub extern "C-unwind" fn otlet_worker_main(_arg: pgrx::pg_sys::Datum) {
                     schema_probe_due = true;
                     continue;
                 }
+            }
+        }
+
+        if infer_now_recovery_due {
+            infer_now_recovery_due = false;
+            if let Err(error) = BackgroundWorker::transaction(recover_orphaned_infer_now_jobs) {
+                infer_now_recovery_due = true;
+                pgrx::warning!("otlet infer-now durable recovery failed: {error}");
+            }
+            if !infer_now_recovery_due {
+                for orphaned in crate::infer_now::recover_requests_after_worker_restart() {
+                    let recovered = if orphaned.job_id > 0 {
+                        crate::infer_now::resolve_orphaned_request(orphaned.job_id)
+                    } else {
+                        Ok(false)
+                    };
+                    match recovered {
+                        Ok(true) => crate::infer_now::finish_request(
+                            orphaned.request_id,
+                            orphaned.job_id,
+                            None,
+                        ),
+                        Ok(false) => crate::infer_now::finish_request(
+                            orphaned.request_id,
+                            orphaned.job_id,
+                            Some("infer-now worker restarted before requester delivery"),
+                        ),
+                        Err(error) => {
+                            infer_now_recovery_due = true;
+                            pgrx::warning!("{error}");
+                        }
+                    }
+                }
+            }
+            if infer_now_recovery_due {
+                continue;
             }
         }
 
@@ -266,6 +303,10 @@ fn startup_runtime_options() -> pgrx::spi::Result<Value> {
     .ok_or(pgrx::spi::SpiError::InvalidPosition)
 }
 
+fn recover_orphaned_infer_now_jobs() -> pgrx::spi::Result<()> {
+    pgrx::Spi::run("SELECT otlet.recover_orphaned_infer_now_jobs(true)")
+}
+
 fn configure_database_deadlines() -> pgrx::spi::Result<()> {
     let transaction_timeout = format!("{DATABASE_TRANSACTION_TIMEOUT_MS}ms");
     let lock_timeout = format!("{DATABASE_LOCK_TIMEOUT_MS}ms");
@@ -312,6 +353,7 @@ fn record_worker_started(max_worker_rss_bytes: u64) -> pgrx::spi::Result<()> {
                'worker_started', NULL, 'linked_inproc', 'otlet worker connected', \
                jsonb_build_object(\
                  'database', current_database(), \
+                 'backend_pid', pg_backend_pid(), \
                  'role', current_user, \
                  'default_max_worker_rss_bytes', $1, \
                  'database_transaction_timeout_ms', $2, \
@@ -417,7 +459,11 @@ fn record_worker_startup_failure(error: &str) {
             client.update(
                 "SELECT otlet.record_worker_event(\
                    'worker_startup_failed', NULL, 'linked_inproc', 'otlet worker startup preflight failed', \
-                   jsonb_build_object('database', current_database(), 'role', current_user, 'error', $1))",
+                   jsonb_build_object(\
+                     'database', current_database(), \
+                     'backend_pid', pg_backend_pid(), \
+                     'role', current_user, \
+                     'error', $1))",
                 Some(1),
                 &[error.into()],
             )?;
@@ -787,7 +833,7 @@ fn materialize_infer_now_subject(
 fn otlet_schema_ready() -> pgrx::spi::Result<bool> {
     pgrx::Spi::connect(|client| {
         let rows = client.select(
-            "SELECT to_regprocedure('otlet.claim_jobs(text,integer,jsonb)') IS NOT NULL AND to_regprocedure('otlet.replay_watch_reconciliation(boolean)') IS NOT NULL AND to_regprocedure('otlet.materialize_completed_semantic_job(bigint)') IS NOT NULL AND to_regprocedure('otlet.complete_and_materialize_job(bigint,jsonb,text,jsonb,text,text,text,text,jsonb,text,text,text,text)') IS NOT NULL AND to_regprocedure('otlet.model_artifact_release_requested(text)') IS NOT NULL",
+            "SELECT to_regprocedure('otlet.claim_jobs(text,integer,jsonb)') IS NOT NULL AND to_regprocedure('otlet.replay_watch_reconciliation(boolean)') IS NOT NULL AND to_regprocedure('otlet.materialize_completed_semantic_job(bigint)') IS NOT NULL AND to_regprocedure('otlet.complete_and_materialize_job(bigint,jsonb,text,jsonb,text,text,text,text,jsonb,text,text,text,text)') IS NOT NULL AND to_regprocedure('otlet.model_artifact_release_requested(text)') IS NOT NULL AND to_regprocedure('otlet.recover_orphaned_infer_now_jobs(boolean)') IS NOT NULL",
             Some(1),
             &[],
         )?;

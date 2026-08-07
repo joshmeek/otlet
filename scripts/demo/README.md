@@ -1,6 +1,6 @@
 # Demo proofs
 
-These scripts keep each proof simple and exhaustive. Each file checks one part of the Otlet contract close to its SQL, even when that repeats setup and assertions
+Each file checks one part of the Otlet contract close to its SQL, even when that repeats setup and assertions
 
 Run the full native suite from the repository root:
 

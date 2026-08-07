@@ -752,6 +752,70 @@ ROLLBACK;
 SQL
 )"
 
+live_worker_ready=false
+for _ in {1..100}; do
+  if [ "$(psql_value -c "SELECT otlet.native_worker_ready_count() = 1;")" = "t" ]; then
+    live_worker_ready=true
+    break
+  fi
+  sleep 0.05
+done
+[ "$live_worker_ready" = true ] || {
+  echo "Native worker did not recover before the maintenance lifecycle proof" >&2
+  exit 1
+}
+
+live_lifecycle_contract="$(psql_value <<'SQL'
+BEGIN;
+UPDATE otlet.worker_events
+SET created_at = clock_timestamp() + interval '1 day';
+UPDATE otlet.production_policy
+SET worker_event_retention = interval '0 seconds'
+WHERE name = 'default';
+INSERT INTO otlet.worker_events (
+  event_type,
+  runtime_name,
+  message,
+  detail,
+  created_at
+)
+SELECT
+  'worker_started',
+  'linked_inproc',
+  'bounded maintenance live lifecycle proof',
+  jsonb_build_object(
+    'database', current_database(),
+    'backend_pid', activity.pid
+  ),
+  clock_timestamp() - interval '1 second'
+FROM (
+  SELECT pid
+  FROM pg_catalog.pg_stat_activity
+  WHERE backend_type = 'otlet worker'
+    AND datname = current_database()
+  ORDER BY pid
+  LIMIT 1
+) activity
+RETURNING id AS live_lifecycle_event_id \gset
+SELECT concat_ws(
+  '|',
+  NOT otlet.maintenance_cleanup_pending_before_evidence(),
+  EXISTS (
+    SELECT 1
+    FROM otlet.worker_events
+    WHERE id = :'live_lifecycle_event_id'::bigint
+  )
+)
+FROM otlet.maintenance_cleanup_step_before_evidence() step;
+ROLLBACK;
+SQL
+)"
+[ "$live_lifecycle_contract" = "t|t" ] || {
+  echo "Current worker lifecycle cleanup fence mismatch: $live_lifecycle_contract" >&2
+  exit 1
+}
+bounded_maintenance_contract="$bounded_maintenance_contract|live_lifecycle_retained"
+
 skip_locked_contract="$({
   set -euo pipefail
   skip_locked_run_id=""
@@ -890,7 +954,7 @@ SQL
 bounded_maintenance_contract="$bounded_maintenance_contract|skip_locked"
 
 echo "bounded_maintenance_contract=$bounded_maintenance_contract"
-[ "$bounded_maintenance_contract" = "budgets|cleanup|progress|partial_retry|pause_resume_cancel|wal|time|archive_retry|reconciliation_due_backoff_exhausted_seeded|repair|vacuum|cascade_vacuum|public_closed|invariants_clean|skip_locked" ] || {
+[ "$bounded_maintenance_contract" = "budgets|cleanup|progress|partial_retry|pause_resume_cancel|wal|time|archive_retry|reconciliation_due_backoff_exhausted_seeded|repair|vacuum|cascade_vacuum|public_closed|invariants_clean|live_lifecycle_retained|skip_locked" ] || {
   echo "Bounded maintenance contract mismatch: $bounded_maintenance_contract" >&2
   exit 1
 }

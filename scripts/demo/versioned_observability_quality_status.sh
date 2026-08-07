@@ -9,6 +9,7 @@ SQL
 startup_event_floor="$(psql_value -c \
   "SELECT COALESCE(max(id), 0) FROM otlet.worker_events")"
 startup_failure_event_id=""
+startup_recovery_task="versioned_observability_restart_recovery"
 
 cleanup_observability_startup_probe() {
   psql_exec -q -v runtime_options="$original_native_runtime_options" <<'SQL' \
@@ -23,6 +24,7 @@ SQL
 DELETE FROM otlet.worker_events WHERE id = :'event_id';
 SQL
   fi
+  cleanup_task "$startup_recovery_task" >/dev/null 2>&1 || true
 }
 
 wait_observability_postgres() {
@@ -38,6 +40,62 @@ wait_observability_postgres() {
 }
 
 trap cleanup_observability_startup_probe EXIT
+cleanup_task "$startup_recovery_task"
+startup_recovery_ids="$(psql_exec -qAt \
+  -v task_name="$startup_recovery_task" \
+  -v model_name="$cheap_model_name" <<'SQL' | tail -n 1
+SELECT otlet.create_task(
+  :'task_name',
+  NULL,
+  'Return an empty object',
+  '{"type":"object"}'::jsonb,
+  :'model_name',
+  '{"max_tokens":1,"reasoning":"off","inference_cache":false}'::jsonb
+);
+SELECT otlet.promote_configured_workload_revision(:'task_name');
+WITH revision AS (
+  SELECT active_workload_revision_hash AS revision_hash
+  FROM otlet.workload_revision_heads
+  WHERE task_name = :'task_name'
+), inserted AS (
+  INSERT INTO otlet.jobs (
+    task_name,
+    workload_revision_hash,
+    subject_id,
+    input,
+    job_origin,
+    infer_now_request,
+    status,
+    attempts,
+    leased_until,
+    claim_token,
+    started_at
+  )
+  SELECT
+    :'task_name',
+    revision.revision_hash,
+    fixture.subject_id,
+    '{}'::jsonb,
+    fixture.job_origin,
+    fixture.infer_now_request,
+    'running',
+    1,
+    clock_timestamp() + interval '5 minutes',
+    fixture.claim_token,
+    clock_timestamp()
+  FROM revision
+  CROSS JOIN (VALUES
+    ('01-sync', 'direct_ask', true, 'observability-sync'),
+    ('02-async-direct', 'direct_ask', false, 'observability-async-direct'),
+    ('03-async-customscan', 'customscan', false, 'observability-async-customscan')
+  ) fixture(subject_id, job_origin, infer_now_request, claim_token)
+  RETURNING id, subject_id
+)
+SELECT string_agg(id::text, '|' ORDER BY subject_id) FROM inserted;
+SQL
+)"
+IFS='|' read -r startup_sync_job_id startup_async_direct_job_id \
+  startup_async_customscan_job_id <<<"$startup_recovery_ids"
 psql_exec -q <<'SQL' >/dev/null
 UPDATE otlet.production_policy
 SET default_runtime_options = jsonb_set(
@@ -64,6 +122,45 @@ done
   echo "Native worker did not record the controlled startup failure" >&2
   exit 1
 }
+startup_failure_runtime_contract="$(psql_value \
+  -v task_name="$startup_recovery_task" \
+  -v sync_job_id="$startup_sync_job_id" <<'SQL'
+SELECT concat_ws(
+  '|',
+  (SELECT status FROM otlet.jobs WHERE id = :'sync_job_id'::bigint),
+  (SELECT error = 'infer-now worker restarted before requester delivery'
+   FROM otlet.jobs WHERE id = :'sync_job_id'::bigint),
+  (SELECT count(*) FROM otlet.jobs
+   WHERE task_name = :'task_name' AND NOT infer_now_request AND status = 'running'),
+  (SELECT count(*) FROM otlet.outputs WHERE job_id = :'sync_job_id'::bigint),
+  (SELECT count(*) FROM otlet.actions WHERE job_id = :'sync_job_id'::bigint),
+  otlet.native_worker_ready_count() > 0,
+  (SELECT sample_count = 0 AND value_numeric = 0 AND status = 'absent'
+   FROM otlet.operational_observability_status
+   WHERE metric_name = 'native_worker_liveness'),
+  (SELECT bool_and(native_eligible_workers = 0)
+   FROM otlet.route_readiness_status WHERE task_name = :'task_name')
+);
+SQL
+)"
+[ "$startup_failure_runtime_contract" = "canceled|t|2|0|0|f|t|t" ] || {
+  echo "Startup failure did not close native readiness and orphaned infer-now work: $startup_failure_runtime_contract" >&2
+  exit 1
+}
+psql_exec -qAt \
+  -v direct_job_id="$startup_async_direct_job_id" \
+  -v customscan_job_id="$startup_async_customscan_job_id" >/dev/null <<'SQL'
+SELECT count(*) FROM otlet.cancel_job(
+  :'direct_job_id'::bigint,
+  'observability-async-direct',
+  'observability restart control cleanup'
+);
+SELECT count(*) FROM otlet.cancel_job(
+  :'customscan_job_id'::bigint,
+  'observability-async-customscan',
+  'observability restart control cleanup'
+);
+SQL
 psql_exec -q -v runtime_options="$original_native_runtime_options" <<'SQL' \
   >/dev/null
 UPDATE otlet.production_policy
@@ -87,6 +184,22 @@ SQL
 done
 [ "${native_restart_ready:-f}" = "t" ] || {
   echo "Native worker did not recover after the controlled startup failure" >&2
+  exit 1
+}
+startup_recovered_route="$(psql_value -v task_name="$startup_recovery_task" <<'SQL'
+SELECT otlet.native_worker_ready_count() > 0
+  AND bool_and(native_eligible_workers > 0)
+  AND (
+    SELECT sample_count > 0 AND value_numeric > 0 AND status = 'healthy'
+    FROM otlet.operational_observability_status
+    WHERE metric_name = 'native_worker_liveness'
+  )
+FROM otlet.route_readiness_status
+WHERE task_name = :'task_name';
+SQL
+)"
+[ "$startup_recovered_route" = "t" ] || {
+  echo "Native route did not recover after a successful worker restart" >&2
   exit 1
 }
 

@@ -558,6 +558,10 @@ BEGIN
       SELECT observed_observation_hash FROM quality_data_drift_proof
     );
   EXCEPTION WHEN OTHERS THEN
+    IF SQLSTATE <> 'P0001'
+       OR SQLERRM <> 'otlet quality and data drift evidence is append only' THEN
+      RAISE;
+    END IF;
     UPDATE quality_data_drift_proof SET observation_immutable = true;
   END;
 
@@ -565,6 +569,10 @@ BEGIN
     DELETE FROM otlet.quality_data_drift_reports
     WHERE report_hash = (SELECT drift_report_hash FROM quality_data_drift_proof);
   EXCEPTION WHEN OTHERS THEN
+    IF SQLSTATE <> 'P0001'
+       OR SQLERRM <> 'otlet quality and data drift evidence is append only' THEN
+      RAISE;
+    END IF;
     UPDATE quality_data_drift_proof SET report_immutable = true;
   END;
 END

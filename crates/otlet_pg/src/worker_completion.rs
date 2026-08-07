@@ -11,7 +11,18 @@ fn accept_attempt_with_model(
     if let Some(metrics) = metrics {
         record_metrics(job, model_name, metrics);
     }
-    match linked_cancel_requested(job, "output_acceptance") {
+    let mut cancellation = linked_cancel_requested(job, "output_acceptance");
+    if matches!(&cancellation, Ok(false))
+        && !crate::infer_now::try_begin_output_acceptance(job.id)
+    {
+        cancellation = linked_cancel_requested(job, "output_acceptance");
+        if matches!(&cancellation, Ok(false)) {
+            cancellation = Err(ModelError::new(
+                "infer-now cancellation fence was not persisted",
+            ));
+        }
+    }
+    match cancellation {
         Ok(true) => {
             let err = ModelError::new("canceled");
             let failure_message =
@@ -363,7 +374,7 @@ fn force_terminal_job_failure(
                          COALESCE(native_cancel_stopped_at, wall.stopped_at) \
                        ELSE native_cancel_stopped_at \
                      END, \
-                     finished_at = COALESCE(finished_at, now()) \
+                     finished_at = COALESCE(finished_at, wall.stopped_at) \
                  FROM (SELECT clock_timestamp() AS stopped_at) wall \
                  WHERE id = $1 \
                    AND status IN ('running', 'cancel_requested') \

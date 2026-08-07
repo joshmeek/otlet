@@ -232,14 +232,22 @@ SQL
 access_policy_drift_after="$(psql_value <<SQL
 SELECT missing_privilege_count::text || '|' ||
        unexpected_privilege_count::text || '|' ||
-       reconciliation_status
+       reconciliation_status || '|' ||
+       (NOT EXISTS (
+         SELECT 1
+         FROM pg_catalog.pg_attribute attribute
+         CROSS JOIN LATERAL pg_catalog.aclexplode(attribute.attacl) privilege
+         WHERE attribute.attrelid = 'otlet.jobs'::regclass
+           AND attribute.attname = 'id'
+           AND privilege.grantee = '$access_policy_application_role'::regrole::oid
+       ))::text
 FROM otlet.access_policy_role_status
 WHERE role_oid = '$access_policy_application_role'::regrole::oid;
 SQL
 )"
 echo "access_policy_drift_contract=$access_policy_drift_before|$access_policy_drift_after"
 [ "$access_policy_drift_before|$access_policy_drift_after" = \
-  "1|2|missing_privileges|0|0|reconciled" ] || {
+  "1|2|missing_privileges|0|0|reconciled|true" ] || {
   echo "Expected exact ACL drift detection and repair" >&2
   exit 1
 }

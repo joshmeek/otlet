@@ -29,7 +29,8 @@ unsafe fn postgres_child_scan_plan(
             pg_sys::add_path(rel, seq_path);
         }
         pg_sys::create_index_paths(root, rel);
-        let child_path = cheapest_postgres_child_scan_path(rel).unwrap_or(seq_path);
+        let child_path = cheapest_postgres_child_scan_path(rel)
+            .unwrap_or_else(|| pg_sys::create_seqscan_path(root, rel, ptr::null_mut(), 0));
         let child_plan = if child_path.is_null() {
             ptr::null_mut()
         } else {

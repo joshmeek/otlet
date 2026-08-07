@@ -376,6 +376,25 @@ SQL
   exit 1
 }
 
+application_concurrent_status=""
+for _ in $(seq 1 300); do
+  application_concurrent_status="$(psql_value -v job_id="$application_concurrent_one_id" <<'SQL'
+SELECT status FROM otlet.jobs WHERE id = :'job_id'::bigint;
+SQL
+)"
+  case "$application_concurrent_status" in
+    complete|failed|canceled) break ;;
+  esac
+  sleep 0.1
+done
+case "$application_concurrent_status" in
+  complete|canceled) ;;
+  *)
+    echo "Expected concurrent application job to become terminal before cleanup, got $application_concurrent_status" >&2
+    exit 1
+    ;;
+esac
+
 application_original_job_id="$(psql_value -v login_a="$application_login_a" <<'SQL'
 SELECT job.id
 FROM otlet.jobs job
@@ -600,7 +619,7 @@ SELECT status AS status,
 FROM otlet.application_job_status(:'application_job_id'::bigint)
 \gset final_
 RESET SESSION AUTHORIZATION;
-COMMIT;
+ROLLBACK;
 
 SELECT (:'application_job_id'::bigint > 0)::text || '|' ||
        :'cancel_status' || '|' ||

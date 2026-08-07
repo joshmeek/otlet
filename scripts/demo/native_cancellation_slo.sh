@@ -43,18 +43,31 @@ WITH inserted AS (
     claim_token,
     cancel_requested_at,
     error
-  ) VALUES (
-    'native_cancel_slo_sql',
-    'portable-gap',
-    '{}'::jsonb,
-    'cancel_requested',
-    1,
-    clock_timestamp(),
-    clock_timestamp() + interval '5 minutes',
-    'native-cancel-portable-gap-token',
-    clock_timestamp() - interval '2 seconds',
-    'canceled'
-  )
+  ) VALUES
+    (
+      'native_cancel_slo_sql',
+      'portable-gap',
+      '{}'::jsonb,
+      'cancel_requested',
+      1,
+      clock_timestamp(),
+      clock_timestamp() + interval '5 minutes',
+      'native-cancel-portable-gap-token',
+      clock_timestamp() - interval '2 seconds',
+      'canceled'
+    ),
+    (
+      'native_cancel_slo_sql',
+      'portable-replaced-gap',
+      '{}'::jsonb,
+      'cancel_requested',
+      1,
+      clock_timestamp(),
+      clock_timestamp() + interval '5 minutes',
+      'native-cancel-portable-replaced-token',
+      clock_timestamp() - interval '2 seconds',
+      'canceled'
+    )
   RETURNING *
 )
 INSERT INTO otlet.portable_claims (
@@ -78,11 +91,18 @@ SELECT
   otlet.portable_text_hash('native-cancel-portable-gap-incarnation'),
   job.attempts,
   'direct',
-  otlet.portable_text_hash('native-cancel-portable-gap-token'),
+  otlet.portable_text_hash(job.claim_token),
   '{"compatible":true}'::jsonb
 FROM inserted job
 JOIN otlet.portable_workers worker
   ON worker.worker_id = 'native-cancel-portable-gap';
+UPDATE otlet.portable_claims claim
+SET status = 'replaced',
+    finished_at = clock_timestamp()
+FROM otlet.jobs job
+WHERE job.id = claim.job_id
+  AND job.task_name = 'native_cancel_slo_sql'
+  AND job.subject_id = 'portable-replaced-gap';
 CREATE TEMP TABLE native_cancel_claims AS
 WITH inserted AS (
   INSERT INTO otlet.jobs (
@@ -215,6 +235,10 @@ BEGIN
       helper_id, helper_token, 'invalid'
     );
   EXCEPTION WHEN OTHERS THEN
+    IF SQLSTATE <> 'P0001'
+       OR SQLERRM <> 'otlet native cancellation observation phase is invalid' THEN
+      RAISE;
+    END IF;
     invalid_phase := true;
   END;
   BEGIN
@@ -222,6 +246,10 @@ BEGIN
       helper_id, helper_token, NULL
     );
   EXCEPTION WHEN OTHERS THEN
+    IF SQLSTATE <> 'P0001'
+       OR SQLERRM <> 'otlet native cancellation observation phase is invalid' THEN
+      RAISE;
+    END IF;
     null_phase := true;
   END;
   BEGIN
@@ -229,6 +257,10 @@ BEGIN
       helper_id, 'stale', 'prompt_decode'
     );
   EXCEPTION WHEN OTHERS THEN
+    IF SQLSTATE <> 'P0001'
+       OR SQLERRM <> 'otlet native cancellation job claim is stale' THEN
+      RAISE;
+    END IF;
     stale_claim := true;
   END;
   BEGIN
@@ -236,6 +268,10 @@ BEGIN
       terminal_id, terminal_token, 'output_acceptance'
     );
   EXCEPTION WHEN OTHERS THEN
+    IF SQLSTATE <> 'P0001'
+       OR SQLERRM <> 'otlet native cancellation job claim is stale' THEN
+      RAISE;
+    END IF;
     terminal_claim := true;
   END;
   RETURN invalid_phase AND null_phase AND stale_claim AND terminal_claim;
@@ -301,6 +337,16 @@ SELECT concat_ws(
     SELECT status.active_unobserved_cancellations = 0
       AND status.overdue_unobserved_cancellations = 0
       AND job.native_cancel_observed_at IS NULL
+      AND EXISTS (
+        SELECT 1
+        FROM otlet.jobs replaced_job
+        JOIN otlet.portable_claims replaced_claim
+          ON replaced_claim.job_id = replaced_job.id
+        WHERE replaced_job.task_name = 'native_cancel_slo_sql'
+          AND replaced_job.subject_id = 'portable-replaced-gap'
+          AND replaced_claim.attempt_index = replaced_job.attempts
+          AND replaced_claim.status = 'replaced'
+      )
     FROM otlet.native_cancellation_slo_status status
     CROSS JOIN otlet.jobs job
     WHERE status.phase = 'all'

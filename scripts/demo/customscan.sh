@@ -498,6 +498,59 @@ require_contains "$customscan_preload_hard_cap_contract" \
   "preload hard cap exceeded: dimension=rows actual=2 limit=1" \
   "Expected a cached CustomScan plan to enforce the current executor row cap"
 
+psql_exec -qAt >/dev/null <<'SQL' &
+SET application_name = 'otlet-customscan-preload-lock';
+BEGIN;
+LOCK TABLE otlet.semantic_materializations IN ACCESS EXCLUSIVE MODE;
+SELECT pg_sleep(1);
+COMMIT;
+SQL
+customscan_preload_lock_pid="$!"
+customscan_preload_lock_ready=false
+for _ in {1..100}; do
+  if [ "$(psql_value <<'SQL'
+SELECT EXISTS (
+  SELECT 1
+  FROM pg_catalog.pg_locks lock
+  JOIN pg_catalog.pg_stat_activity activity ON activity.pid = lock.pid
+  WHERE activity.application_name = 'otlet-customscan-preload-lock'
+    AND lock.relation = 'otlet.semantic_materializations'::regclass
+    AND lock.mode = 'AccessExclusiveLock'
+    AND lock.granted
+);
+SQL
+)" = "t" ]; then
+    customscan_preload_lock_ready=true
+    break
+  fi
+  sleep 0.02
+done
+if [ "$customscan_preload_lock_ready" != true ]; then
+  wait "$customscan_preload_lock_pid" || true
+  echo "CustomScan preload lock fixture did not acquire its table lock" >&2
+  exit 1
+fi
+customscan_preload_timeout_contract="$(psql_exec -qAt -v ON_ERROR_STOP=0 \
+  -v watch_name="$row_customscan_watch" 2>&1 <<'SQL'
+BEGIN;
+SET LOCAL statement_timeout = '5s';
+UPDATE otlet.production_policy
+SET customscan_preload_max_ms = 100
+WHERE name = 'default';
+SELECT id
+FROM public.otlet_demo_customscan_signal
+WHERE otlet.semantic_matches(:'watch_name', id, '{}'::jsonb);
+ROLLBACK;
+SQL
+)"
+if ! wait "$customscan_preload_lock_pid"; then
+  echo "CustomScan preload lock fixture failed" >&2
+  exit 1
+fi
+require_contains "$customscan_preload_timeout_contract" \
+  "canceling statement due to statement timeout" \
+  "Expected blocked CustomScan preload to enforce its own elapsed deadline"
+
 correlated_customscan_plan="$(psql_exec -P border=2 -P null='' -v watch_name="$row_customscan_watch" <<'SQL'
 EXPLAIN (ANALYZE, VERBOSE, COSTS, SUMMARY OFF, TIMING OFF)
 SELECT repeated.pass, refreshed.id
@@ -692,6 +745,107 @@ echo "row_customscan_infer_origin_contract=$row_customscan_infer_origin_contract
   echo "Expected CustomScan infer-now receipt origin, got $row_customscan_infer_origin_contract" >&2
   exit 1
 }
+
+customscan_index_only_decline_plan="$(
+  psql_exec -P border=2 -P null='' -v watch_name="$row_customscan_watch" <<'SQL'
+BEGIN READ ONLY;
+SET LOCAL enable_seqscan = off;
+SET LOCAL enable_bitmapscan = off;
+EXPLAIN (ANALYZE, VERBOSE, COSTS OFF, SUMMARY OFF, TIMING OFF)
+SELECT id
+FROM public.otlet_demo_customscan_signal
+WHERE otlet.semantic_matches_auto(:'watch_name', id, '{}'::jsonb);
+ROLLBACK;
+SQL
+)"
+require_contains "$customscan_index_only_decline_plan" \
+  "Otlet Node: Semantic Source CustomScan" \
+  "Expected CustomScan after declining an index-only source path"
+require_contains "$customscan_index_only_decline_plan" \
+  "Seq Scan on public.otlet_demo_customscan_signal" \
+  "Expected a heap-backed fallback after declining an index-only source path"
+
+customscan_failed_batch_job_floor="$(psql_value -v task_name="$row_customscan_task" <<'SQL'
+SELECT COALESCE(max(id), 0)
+FROM otlet.jobs
+WHERE task_name = :'task_name';
+SQL
+)"
+psql_exec >/dev/null <<'SQL'
+UPDATE public.otlet_demo_customscan_signal
+SET signal = CASE id
+  WHEN 'customscan-1' THEN 'bounded failed batch'
+  ELSE repeat('x', 9000)
+END;
+UPDATE otlet.production_policy
+SET stale_policy = 'lookup_only_fail_closed',
+    semantic_auto_wait_ms = 0,
+    semantic_auto_infer_ms = 1,
+    semantic_auto_max_rows = 2
+WHERE name = 'default';
+SQL
+customscan_failed_batch_plan="$(
+  psql_exec -P border=2 -P null='' -v watch_name="$row_customscan_watch" <<'SQL'
+BEGIN;
+SET LOCAL enable_seqscan = off;
+SET LOCAL enable_bitmapscan = off;
+EXPLAIN (ANALYZE, VERBOSE, COSTS, SUMMARY OFF, TIMING OFF)
+SELECT id, signal
+FROM public.otlet_demo_customscan_signal
+WHERE otlet.semantic_matches_auto(:'watch_name', id, '{}'::jsonb)
+ORDER BY id;
+COMMIT;
+SQL
+)"
+printf '%s\n' "$customscan_failed_batch_plan"
+require_contains "$customscan_failed_batch_plan" \
+  "Infer Now Batches: 1" \
+  "Expected one accepted request to consume the failed-batch row budget"
+require_contains "$customscan_failed_batch_plan" \
+  "Actual Fail Closed Rows: 2" \
+  "Expected both failed-batch rows to fail closed"
+require_contains "$customscan_failed_batch_plan" \
+  "Infer Now Last Error: infer-now input exceeds 8192 byte cap" \
+  "Expected the oversized later row to report its bounded input rejection"
+require_contains "$customscan_failed_batch_plan" \
+  "Index Scan using otlet_demo_customscan_signal_pkey" \
+  "Expected ordered heap-backed input for the mixed failed batch"
+customscan_failed_batch_drained=false
+for _ in {1..200}; do
+  if [ "$(psql_value -c \
+    "SELECT otlet.worker_infer_now_state() ->> 'queue_depth';")" = "0" ]; then
+    customscan_failed_batch_drained=true
+    break
+  fi
+  sleep 0.05
+done
+[ "$customscan_failed_batch_drained" = true ] || {
+  echo "CustomScan failed batch left an infer-now slot occupied" >&2
+  exit 1
+}
+customscan_failed_batch_contract="$(psql_value \
+  -v task_name="$row_customscan_task" \
+  -v job_floor="$customscan_failed_batch_job_floor" <<'SQL'
+SELECT count(*) = 1
+   AND COALESCE(bool_and(subject_id = 'customscan-1' AND job_origin = 'customscan'), false)
+FROM otlet.jobs
+WHERE task_name = :'task_name'
+  AND id > :'job_floor'::bigint;
+SQL
+)"
+echo "customscan_failed_batch_contract=$customscan_failed_batch_contract"
+[ "$customscan_failed_batch_contract" = "t" ] || {
+  echo "CustomScan failed batch did not submit only the ordered small subject" >&2
+  exit 1
+}
+psql_exec >/dev/null <<'SQL'
+UPDATE otlet.production_policy
+SET stale_policy = 'refresh_then_fail_closed',
+    semantic_auto_wait_ms = 10000,
+    semantic_auto_infer_ms = 15000,
+    semantic_auto_max_rows = 1
+WHERE name = 'default';
+SQL
 
 queue_suppression_output="$(psql_exec -qAt -v model_name="$strong_model_name" <<'SQL'
 BEGIN;

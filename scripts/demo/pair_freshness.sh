@@ -76,7 +76,7 @@ join_stale_contract="$(psql_exec -qAt \
   -v index_name="$join_index_name" \
   -v task_name="$join_task" <<'SQL'
 SELECT stale_subjects::text || '|' || fresh_subjects::text
-FROM otlet.semantic_join_index_plan(:'index_name');
+FROM otlet.semantic_join_index_plan(:'index_name', true);
 SELECT count(*)::text
 FROM otlet.semantic_join_index_current_rows(:'index_name', true);
 SELECT count(*)::text

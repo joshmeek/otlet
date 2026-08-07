@@ -259,6 +259,7 @@ inserted AS (
     subject_id,
     input,
     job_origin,
+    infer_now_request,
     status,
     attempts,
     leased_until,
@@ -272,6 +273,7 @@ inserted AS (
     $2,
     $3::jsonb,
     $5,
+    true,
     'running',
     1,
     now() + make_interval(

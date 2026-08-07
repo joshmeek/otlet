@@ -47,7 +47,7 @@ FROM otlet.route_readiness_status
 ORDER BY task_name, selection_role;
 ```
 
-The view keeps direct and cheap as separate routes even when both use the same model. A native route needs a live worker in the current database, supported runtime options, a claim-ready exact artifact, and no errored model slot. A portable route also needs an active protocol, the complete eight-RPC worker grant, current incarnation, matching artifact, claim-reported RSS compatible with the workload, ready model, and heartbeat no older than two minutes. Busy workers remain ready
+The view keeps direct and cheap as separate routes even when both use the same model. A native route needs a live worker in the current database whose latest startup event belongs to that backend and records success, supported runtime options, a claim-ready exact artifact, and no errored model slot. A startup failure closes readiness while the worker process remains alive. A portable route also needs an active protocol, the complete eight-RPC worker grant, current incarnation, matching artifact, claim-reported RSS compatible with the workload, ready model, and heartbeat no older than two minutes. Busy workers remain ready
 
 Portable cheap-to-strong handoffs stay on the same job. When their strong route is not ready, `otlet.stranded_escalation_status` reports the job immediately without a minimum retry age:
 
@@ -68,7 +68,7 @@ ORDER BY escalated_at, job_id;
 
 ## Inspect Versioned Operational Status
 
-`otlet.operational_observability_status` gives auditors and operators one tall status surface. Durable queue, run, failure, and schema evidence uses closed 15-minute, 1-hour, and 24-hour windows. Mutable backlog, route, heartbeat, liveness, cleanup, and pressure rows use `window_name = 'current'`
+`otlet.operational_observability_status` gives auditors and operators one tall status surface. Durable queue, run, failure, and schema evidence uses closed 15-minute, 1-hour, and 24-hour windows. Mutable backlog, route, heartbeat, liveness, cleanup, and pressure rows use `window_name = 'current'`. Native liveness counts current backend processes whose latest lifecycle event records startup success
 
 ```sql
 SELECT window_name,
@@ -597,7 +597,7 @@ Representative output:
 
 Otlet records a receipt for canceled work and preserves model-run evidence
 
-A synchronous infer-now caller can time out while the worker decodes. The requester records a shared abort marker and calls `otlet.request_job_cancellation`; the worker then closes the job with its live claim token before it can accept output. The caller's failed transaction cannot roll back that worker-owned cancellation
+A synchronous infer-now caller can time out while the worker decodes. The requester and worker arbitrate the cancel marker against output acceptance under one shared lock. A marker that wins makes the worker close the job with its live claim token. Output acceptance that wins may commit after the caller detaches. Worker startup cancels marked synchronous jobs left by a prior worker or postmaster, and lease recovery never reclaims them as asynchronous work. Jobs created through asynchronous ask or queued/asynchronous CustomScan paths keep their retry behavior
 
 The demo requires the canceled job and receipt, zero outputs and actions, a recorded timeout and abort, the canceled job ID, and one healthy worker:
 

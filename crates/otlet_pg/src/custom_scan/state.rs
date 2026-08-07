@@ -271,7 +271,6 @@ struct PendingInferNowRow {
     slot: *mut pg_sys::TupleTableSlot,
     submitted: crate::infer_now::SubmittedInferNow,
     submitted_at: pg_sys::TimestampTz,
-    snapshot_before: crate::infer_now::InferNowSnapshot,
 }
 
 enum PrefetchedRow {

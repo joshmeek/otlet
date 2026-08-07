@@ -885,8 +885,20 @@ ROLLBACK;
 SQL
 
 revision_claim_lock_task="revision_claim_lock_probe"
+revision_claim_gate_pid=""
+revision_claim_lock_pid=""
 
 cleanup_revision_claim_lock() {
+  if [ -n "$revision_claim_gate_pid" ]; then
+    kill "$revision_claim_gate_pid" >/dev/null 2>&1 || true
+    wait "$revision_claim_gate_pid" >/dev/null 2>&1 || true
+    revision_claim_gate_pid=""
+  fi
+  if [ -n "$revision_claim_lock_pid" ]; then
+    kill "$revision_claim_lock_pid" >/dev/null 2>&1 || true
+    wait "$revision_claim_lock_pid" >/dev/null 2>&1 || true
+    revision_claim_lock_pid=""
+  fi
   cleanup_task "$revision_claim_lock_task"
   psql_exec -qAt >/dev/null <<'SQL'
 DROP TRIGGER IF EXISTS revision_claim_lock_delay ON otlet.jobs;
@@ -931,8 +943,6 @@ FROM public.revision_claim_lock_proof proof
 JOIN otlet.workload_revision_heads head
   ON head.task_name = 'revision_claim_lock_probe'
 WHERE head.active_workload_revision_hash IS DISTINCT FROM proof.revision_a;
-INSERT INTO otlet.jobs (task_name, subject_id, input)
-VALUES ('revision_claim_lock_probe', 'subject', '{}'::jsonb);
 UPDATE otlet.tasks
 SET instruction = 'revision B'
 WHERE name = 'revision_claim_lock_probe';
@@ -955,12 +965,83 @@ BEFORE UPDATE ON otlet.jobs
 FOR EACH ROW EXECUTE FUNCTION public.revision_claim_lock_delay();
 SQL
 
+psql_exec -qAt >/dev/null 2>&1 <<'SQL' &
+SET application_name = 'otlet_revision_claim_gate';
+SELECT pg_advisory_lock(hashtext('otlet_queue_admission'));
+INSERT INTO otlet.jobs (
+  task_name,
+  workload_revision_hash,
+  subject_id,
+  input
+)
+SELECT
+  'revision_claim_lock_probe',
+  revision_a,
+  'subject',
+  '{}'::jsonb
+FROM public.revision_claim_lock_proof;
+SELECT pg_sleep(60);
+SQL
+revision_claim_gate_pid="$!"
+revision_claim_gate_ready=false
+for _ in {1..40}; do
+  if [ "$(psql_value <<'SQL'
+SELECT EXISTS (
+  SELECT 1
+  FROM pg_stat_activity
+  WHERE application_name = 'otlet_revision_claim_gate'
+    AND wait_event = 'PgSleep'
+);
+SQL
+)" = "t" ]; then
+    revision_claim_gate_ready=true
+    break
+  fi
+  sleep 0.05
+done
+[ "$revision_claim_gate_ready" = true ] || {
+  cleanup_revision_claim_lock
+  echo "Claim serialization gate did not acquire queue admission" >&2
+  exit 1
+}
+
 psql_exec -qAt >/dev/null <<'SQL' &
+SET application_name = 'otlet_revision_claim_lock_starting';
+BEGIN;
+SELECT id
+FROM otlet.jobs
+WHERE task_name = 'revision_claim_lock_probe'
+FOR UPDATE;
 SET application_name = 'otlet_revision_claim_lock';
 SELECT count(*)
 FROM otlet.claim_jobs('revision_claim_lock_model', 1);
+COMMIT;
 SQL
 revision_claim_lock_pid="$!"
+revision_claim_owned=false
+for _ in {1..40}; do
+  if [ "$(psql_value <<'SQL'
+SELECT EXISTS (
+  SELECT 1
+  FROM pg_stat_activity
+  WHERE application_name = 'otlet_revision_claim_lock'
+    AND wait_event_type = 'Lock'
+);
+SQL
+)" = "t" ]; then
+    revision_claim_owned=true
+    break
+  fi
+  sleep 0.05
+done
+[ "$revision_claim_owned" = true ] || {
+  cleanup_revision_claim_lock
+  echo "Controlled claimant did not lock its fixture" >&2
+  exit 1
+}
+psql_value -c "SELECT pg_cancel_backend(pid) FROM pg_stat_activity WHERE application_name = 'otlet_revision_claim_gate';" >/dev/null
+wait "$revision_claim_gate_pid" >/dev/null 2>&1 || true
+revision_claim_gate_pid=""
 revision_claim_waiting=false
 for _ in {1..40}; do
   if [ "$(psql_value <<'SQL'
@@ -980,6 +1061,7 @@ done
 
 if [ "$revision_claim_waiting" != true ]; then
   wait "$revision_claim_lock_pid" || true
+  revision_claim_lock_pid=""
   cleanup_revision_claim_lock
   echo "Claim serialization proof did not reach its controlled delay" >&2
   exit 1
@@ -998,21 +1080,25 @@ SELECT otlet.promote_workload_revision(
 SQL
 )"; then
   wait "$revision_claim_lock_pid" || true
+  revision_claim_lock_pid=""
   cleanup_revision_claim_lock
   echo "Promotion crossed an in-flight claim" >&2
   exit 1
 fi
 if [[ "$revision_claim_promotion_output" != *"lock timeout"* ]]; then
   wait "$revision_claim_lock_pid" || true
+  revision_claim_lock_pid=""
   cleanup_revision_claim_lock
   echo "Claim serialization proof failed unexpectedly: $revision_claim_promotion_output" >&2
   exit 1
 fi
 if ! wait "$revision_claim_lock_pid"; then
+  revision_claim_lock_pid=""
   cleanup_revision_claim_lock
   echo "Controlled claim failed" >&2
   exit 1
 fi
+revision_claim_lock_pid=""
 
 revision_claim_lock_contract="$(psql_value <<'SQL'
 SELECT (

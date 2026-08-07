@@ -445,6 +445,11 @@ pgrx::extension_sql_file!(
     name = "complete_evidence_lifecycle",
     requires = ["access_policy_lifecycle"]
 );
+pgrx::extension_sql_file!(
+    "../sql/migrations/0088_branch_review_corrections.sql",
+    name = "branch_review_corrections",
+    requires = ["complete_evidence_lifecycle"]
+);
 
 #[allow(non_snake_case)]
 #[pgrx::pg_guard]

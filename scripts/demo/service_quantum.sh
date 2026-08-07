@@ -103,7 +103,7 @@ FROM otlet.production_policy
 WHERE name = 'default'
 FOR UPDATE;
 SELECT otlet.run_task(:'task_name');
-SELECT pg_sleep(5);
+SELECT pg_sleep(0.5);
 COMMIT;
 SQL
 service_quantum_lock_pid="$!"

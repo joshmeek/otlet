@@ -1,5 +1,5 @@
 [ "$requester_timeout_contract" = "canceled|true|canceled|canceled|0|0|true|true|true|1|ready|ready" ] || {
-  echo "Expected requester timeout to leave no late output and one healthy worker, got $requester_timeout_contract" >&2
+  echo "Expected marker-first requester timeout to cancel without output and keep one healthy worker, got $requester_timeout_contract" >&2
   exit 1
 }
 
@@ -87,7 +87,7 @@ receipt_row AS (
   LIMIT 1
 )
 SELECT j.status || '|' ||
-       (j.error LIKE 'linked worker RSS budget%')::text || '|' ||
+       (j.error LIKE 'linked request memory admission rejected:%')::text || '|' ||
        r.status || '|' ||
        r.selection_status || '|' ||
        r.selection_reason || '|' ||
@@ -117,7 +117,7 @@ JOIN otlet.runtime_status rs
 SQL
 )"
 echo "rss_budget_worker_contract=$rss_budget_contract"
-[ "$rss_budget_contract" = "failed|true|failed|failed|direct_attempt_failed|failed|worker_rss_budget_exceeded|otlet.failure.v1.resource_admission_rejected|otlet.failure.v1.resource_admission_rejected|admission|after_owner_action|repair_runtime_capacity|database_owner_only|true|true|0|ready|ready" ] || {
+[ "$rss_budget_contract" = "failed|true|failed|failed|direct_attempt_failed|failed|request_memory_admission_rejected|otlet.failure.v1.resource_admission_rejected|otlet.failure.v1.resource_admission_rejected|admission|after_owner_action|repair_runtime_capacity|database_owner_only|true|true|0|ready|ready" ] || {
   echo "Expected RSS budget hit to produce a clean failed receipt and healthy worker, got $rss_budget_contract" >&2
   exit 1
 }

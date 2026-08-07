@@ -1,5 +1,6 @@
 use pgrx::{IntoDatum, JsonB, PgLwLock, pg_guard, pg_sys};
 use serde_json::{Value, json};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 const STATE_IDLE: u32 = 0;
 const STATE_REQUESTED: u32 = 1;
@@ -16,6 +17,8 @@ const ERROR_CAP: usize = 512;
 const MAX_WAIT_MS: u32 = 30_000;
 const INFER_NOW_SLOTS: usize = 4;
 const TIMEOUT_CANCEL_REASON: &str = "infer-now timeout requested job cancellation";
+const ABORT_CANCEL_REASON: &str = "infer-now requester statement aborted";
+const REQUESTER_GONE_CANCEL_REASON: &str = "infer-now requester backend exited";
 pub(crate) const INFER_NOW_ADMISSION_POLICY: &str = "bounded_shared_memory_infer_queue_4_slots";
 
 #[repr(C)]
@@ -23,9 +26,10 @@ pub(crate) const INFER_NOW_ADMISSION_POLICY: &str = "bounded_shared_memory_infer
 struct InferNowSlot {
     state: u32,
     timeout_cancel_pending: bool,
+    completion_started: bool,
     customscan_origin: bool,
     request_id: u64,
-    requester_latch: usize,
+    requester_pid: i32,
     last_job_id: i64,
     last_elapsed_ms: u64,
     requested_at: pg_sys::TimestampTz,
@@ -52,9 +56,10 @@ impl Default for InferNowSlot {
         Self {
             state: STATE_IDLE,
             timeout_cancel_pending: false,
+            completion_started: false,
             customscan_origin: false,
             request_id: 0,
-            requester_latch: 0,
+            requester_pid: 0,
             last_job_id: 0,
             last_elapsed_ms: 0,
             requested_at: 0,
@@ -122,6 +127,8 @@ unsafe impl pgrx::PGRXSharedMemory for InferNowState {}
 pub(crate) static INFER_NOW_STATE: PgLwLock<InferNowState> =
     unsafe { PgLwLock::new(c"otlet infer now state") };
 
+static REQUEST_CALLBACKS_REGISTERED: AtomicBool = AtomicBool::new(false);
+
 static OTLET_WORKER_INFER_NOW_FINFO: pg_sys::Pg_finfo_record =
     pg_sys::Pg_finfo_record { api_version: 1 };
 static OTLET_WORKER_INFER_NOW_STATE_FINFO: pg_sys::Pg_finfo_record =
@@ -137,12 +144,6 @@ pub(crate) struct InferNowRequest {
     pub(crate) inline_task_json: Option<String>,
     /// Canonical JSON text from the shared-memory slot (no parse/re-serialize).
     pub(crate) input_json: String,
-}
-
-#[derive(Clone, Copy)]
-pub(crate) struct InferNowSnapshot {
-    pub(crate) timeouts: u64,
-    pub(crate) last_job_id: i64,
 }
 
 pub(crate) struct InferNowQueueSnapshot {
@@ -161,11 +162,198 @@ pub(crate) struct CompletedInferNow {
     pub(crate) job_id: i64,
 }
 
+pub(crate) struct FailedInferNow {
+    pub(crate) job_id: i64,
+    pub(crate) error: String,
+}
+
+fn failed_infer_now(slot: &InferNowSlot) -> FailedInferNow {
+    FailedInferNow {
+        job_id: slot.last_job_id,
+        error: read_buf(&slot.error, slot.error_len as usize),
+    }
+}
+
+struct DetachedInferNow {
+    job_id: i64,
+    newly_canceled: bool,
+}
+
+fn detach_running_requester(slot: &mut InferNowSlot, reason: &str) -> Option<DetachedInferNow> {
+    slot.requester_pid = 0;
+    if slot.state != STATE_RUNNING || slot.completion_started {
+        return None;
+    }
+    let detached = DetachedInferNow {
+        job_id: slot.last_job_id,
+        newly_canceled: !slot.timeout_cancel_pending,
+    };
+    slot.timeout_cancel_pending = true;
+    write_error(slot, reason);
+    Some(detached)
+}
+
+pub(crate) struct OrphanedInferNow {
+    pub(crate) request_id: u64,
+    pub(crate) job_id: i64,
+}
+
 pub(crate) fn init_shared_memory() {
     pgrx::pg_shmem_init!(INFER_NOW_STATE);
 }
 
+pub(crate) fn recover_requests_after_worker_restart() -> Vec<OrphanedInferNow> {
+    let mut state = INFER_NOW_STATE.exclusive();
+    let mut orphaned = Vec::new();
+    for slot in &mut state.slots {
+        let requester_alive = requester_alive(slot.requester_pid);
+        if slot.state == STATE_RUNNING {
+            orphaned.push(OrphanedInferNow {
+                request_id: slot.request_id,
+                job_id: slot.last_job_id,
+            });
+        }
+        let recovered_state = restart_recovery_state(slot.state, requester_alive);
+        slot.state = recovered_state;
+        slot.completion_started = false;
+        if recovered_state == STATE_IDLE {
+            slot.requester_pid = 0;
+        }
+    }
+    orphaned
+}
+
+const fn restart_recovery_state(state: u32, requester_alive: bool) -> u32 {
+    match state {
+        STATE_REQUESTED if !requester_alive => STATE_IDLE,
+        STATE_RUNNING => STATE_RUNNING,
+        STATE_DONE | STATE_FAILED if !requester_alive => STATE_IDLE,
+        _ => state,
+    }
+}
+
+fn reap_dead_requester_slots() {
+    let should_wake = {
+        let mut state = INFER_NOW_STATE.exclusive();
+        let mut abort_requests = 0_u64;
+        let mut last_cancel_job_id = 0_i64;
+        let mut should_wake = false;
+        for slot in &mut state.slots {
+            if slot.requester_pid <= 0 || requester_alive(slot.requester_pid) {
+                continue;
+            }
+            match slot.state {
+                STATE_REQUESTED | STATE_DONE | STATE_FAILED => {
+                    slot.requester_pid = 0;
+                    slot.state = STATE_IDLE;
+                }
+                STATE_RUNNING => {
+                    if let Some(detached) =
+                        detach_running_requester(slot, REQUESTER_GONE_CANCEL_REASON)
+                    {
+                        if detached.newly_canceled {
+                            abort_requests = abort_requests.saturating_add(1);
+                        }
+                        last_cancel_job_id = last_cancel_job_id.max(detached.job_id);
+                        should_wake = true;
+                    }
+                }
+                _ => slot.requester_pid = 0,
+            }
+        }
+        state.abort_requests = state.abort_requests.saturating_add(abort_requests);
+        if last_cancel_job_id > 0 {
+            state.last_cancel_job_id = last_cancel_job_id;
+        }
+        should_wake
+    };
+    if should_wake {
+        crate::wake::signal_worker_latch_immediate();
+    }
+}
+
+fn ensure_request_callbacks() {
+    if !REQUEST_CALLBACKS_REGISTERED.swap(true, Ordering::SeqCst) {
+        unsafe {
+            pg_sys::RegisterXactCallback(Some(infer_now_xact_callback), std::ptr::null_mut());
+            pg_sys::RegisterSubXactCallback(Some(infer_now_subxact_callback), std::ptr::null_mut());
+        }
+    }
+}
+
+#[pg_guard]
+unsafe extern "C-unwind" fn infer_now_xact_callback(
+    event: pg_sys::XactEvent::Type,
+    _arg: *mut std::ffi::c_void,
+) {
+    if matches!(
+        event,
+        pg_sys::XactEvent::XACT_EVENT_ABORT | pg_sys::XactEvent::XACT_EVENT_PARALLEL_ABORT
+    ) {
+        abandon_current_backend_requests(ABORT_CANCEL_REASON);
+    }
+}
+
+#[pg_guard]
+unsafe extern "C-unwind" fn infer_now_subxact_callback(
+    event: pg_sys::SubXactEvent::Type,
+    _my_subid: pg_sys::SubTransactionId,
+    _parent_subid: pg_sys::SubTransactionId,
+    _arg: *mut std::ffi::c_void,
+) {
+    if event == pg_sys::SubXactEvent::SUBXACT_EVENT_ABORT_SUB {
+        abandon_current_backend_requests(ABORT_CANCEL_REASON);
+    }
+}
+
+fn abandon_current_backend_requests(reason: &str) {
+    if abandon_requester_requests(unsafe { pg_sys::MyProcPid }, reason) {
+        crate::wake::signal_worker_latch_immediate();
+    }
+}
+
+fn abandon_requester_requests(requester_pid: i32, reason: &str) -> bool {
+    if requester_pid <= 0 {
+        return false;
+    }
+    let mut state = INFER_NOW_STATE.exclusive();
+    let mut abort_requests = 0_u64;
+    let mut last_cancel_job_id = 0_i64;
+    let mut should_wake = false;
+    for slot in &mut state.slots {
+        if slot.requester_pid != requester_pid {
+            continue;
+        }
+        match slot.state {
+            STATE_REQUESTED => {
+                slot.requester_pid = 0;
+                slot.state = STATE_IDLE;
+            }
+            STATE_RUNNING => {
+                if let Some(detached) = detach_running_requester(slot, reason) {
+                    if detached.newly_canceled {
+                        abort_requests = abort_requests.saturating_add(1);
+                    }
+                    last_cancel_job_id = last_cancel_job_id.max(detached.job_id);
+                    should_wake = true;
+                }
+            }
+            STATE_DONE | STATE_FAILED => {
+                slot.requester_pid = 0;
+                slot.state = STATE_IDLE;
+            }
+            _ => slot.requester_pid = 0,
+        }
+    }
+    state.abort_requests = state.abort_requests.saturating_add(abort_requests);
+    if last_cancel_job_id > 0 {
+        state.last_cancel_job_id = last_cancel_job_id;
+    }
+    should_wake
+}
+
 pub(crate) fn take_request() -> Option<InferNowRequest> {
+    reap_dead_requester_slots();
     let mut state = INFER_NOW_STATE.exclusive();
     let slot_index = state
         .slots
@@ -242,29 +430,77 @@ pub(crate) fn mark_request_job_started(request_id: u64, job_id: i64) {
     }
 }
 
-pub(crate) fn snapshot() -> InferNowSnapshot {
-    let state = INFER_NOW_STATE.share();
-    InferNowSnapshot {
-        timeouts: state.timeouts,
-        last_job_id: state.last_job_id,
+pub(crate) fn try_begin_output_acceptance(job_id: i64) -> bool {
+    let mut state = INFER_NOW_STATE.exclusive();
+    let Some(slot_index) = state
+        .slots
+        .iter()
+        .position(|slot| slot.state == STATE_RUNNING && slot.last_job_id == job_id && job_id > 0)
+    else {
+        return true;
+    };
+    if state.slots[slot_index].timeout_cancel_pending {
+        return false;
     }
+    if !requester_alive(state.slots[slot_index].requester_pid) {
+        if let Some(detached) =
+            detach_running_requester(&mut state.slots[slot_index], REQUESTER_GONE_CANCEL_REASON)
+        {
+            if detached.newly_canceled {
+                state.abort_requests = state.abort_requests.saturating_add(1);
+            }
+            state.last_cancel_job_id = detached.job_id;
+        }
+        return false;
+    }
+    state.slots[slot_index].completion_started = true;
+    true
 }
 
 pub(crate) fn persist_timeout_cancel(job_id: i64) -> Result<bool, String> {
-    let requested = {
-        let state = INFER_NOW_STATE.share();
-        state.slots.iter().any(|slot| {
-            timeout_cancel_matches(slot.timeout_cancel_pending, slot.last_job_id, job_id)
+    let reason = {
+        let mut state = INFER_NOW_STATE.exclusive();
+        let Some(slot_index) = state.slots.iter().position(|slot| {
+            slot.state == STATE_RUNNING && slot.last_job_id == job_id && job_id > 0
+        }) else {
+            return Ok(false);
+        };
+        if !state.slots[slot_index].timeout_cancel_pending
+            && !state.slots[slot_index].completion_started
+            && !requester_alive(state.slots[slot_index].requester_pid)
+        {
+            if let Some(detached) =
+                detach_running_requester(&mut state.slots[slot_index], REQUESTER_GONE_CANCEL_REASON)
+            {
+                if detached.newly_canceled {
+                    state.abort_requests = state.abort_requests.saturating_add(1);
+                }
+                state.last_cancel_job_id = detached.job_id;
+            }
+        }
+        timeout_cancel_matches(
+            state.slots[slot_index].timeout_cancel_pending,
+            state.slots[slot_index].last_job_id,
+            job_id,
+        )
+        .then(|| {
+            let slot = &state.slots[slot_index];
+            let reason = read_buf(&slot.error, slot.error_len as usize);
+            if reason.is_empty() {
+                TIMEOUT_CANCEL_REASON.to_owned()
+            } else {
+                reason
+            }
         })
     };
-    if !requested {
+    let Some(reason) = reason else {
         return Ok(false);
-    }
+    };
 
     let result: pgrx::spi::Result<Option<String>> =
         pgrx::bgworkers::BackgroundWorker::transaction(|| {
             pgrx::Spi::connect_mut(|client| {
-                let args = [job_id.into(), TIMEOUT_CANCEL_REASON.into()];
+                let args = [job_id.into(), reason.as_str().into()];
                 let rows = client.select(
                     "SELECT status FROM otlet.request_job_cancellation($1, $2) LIMIT 1",
                     Some(1),
@@ -283,6 +519,37 @@ pub(crate) fn persist_timeout_cancel(job_id: i64) -> Result<bool, String> {
             "infer-now timeout cancel affected no rows for job_id={job_id}"
         )),
         Err(err) => Err(format!("infer-now timeout cancel failed: {err}")),
+    }
+}
+
+pub(crate) fn resolve_orphaned_request(job_id: i64) -> Result<bool, String> {
+    let result: pgrx::spi::Result<Option<String>> =
+        pgrx::bgworkers::BackgroundWorker::transaction(|| {
+            pgrx::Spi::connect(|client| {
+                client
+                    .select(
+                        "SELECT status FROM otlet.jobs WHERE id = $1",
+                        Some(1),
+                        &[job_id.into()],
+                    )?
+                    .first()
+                    .get::<String>(1)
+            })
+        });
+
+    match result {
+        Ok(status) => classify_orphaned_request_status(job_id, status.as_deref()),
+        Err(err) => Err(format!("infer-now restart recovery failed: {err}")),
+    }
+}
+
+fn classify_orphaned_request_status(job_id: i64, status: Option<&str>) -> Result<bool, String> {
+    match status {
+        Some("complete") => Ok(true),
+        Some("failed" | "canceled") | None => Ok(false),
+        Some(status) => Err(format!(
+            "infer-now restart recovery reached status {status} for job_id={job_id}"
+        )),
     }
 }
 
@@ -336,8 +603,9 @@ pub(crate) fn finish_request(request_id: u64, job_id: i64, error: Option<&str>) 
             slot.state = STATE_DONE;
             slot.error_len = 0;
         }
-        if slot.requester_latch == 0 {
+        if slot.requester_pid == 0 || !requester_alive(slot.requester_pid) {
             slot.state = STATE_IDLE;
+            slot.requester_pid = 0;
         } else {
             should_signal = true;
         }

@@ -108,6 +108,8 @@ fn submit_infer_now_text(
     input_text: &str,
     customscan_origin: bool,
 ) -> Result<Option<SubmittedInferNow>, String> {
+    ensure_request_callbacks();
+    reap_dead_requester_slots();
     check_len("task_name", task_name.len(), TASK_CAP)?;
     check_len("subject_id", subject_id.len(), SUBJECT_CAP)?;
     if let Some(hash) = expected_workload_revision_hash {
@@ -135,8 +137,9 @@ fn submit_infer_now_text(
         slot.request_id = request_id;
         slot.state = STATE_REQUESTED;
         slot.timeout_cancel_pending = false;
+        slot.completion_started = false;
         slot.customscan_origin = customscan_origin;
-        slot.requester_latch = unsafe { pg_sys::MyLatch as usize };
+        slot.requester_pid = unsafe { pg_sys::MyProcPid };
         slot.last_job_id = 0;
         slot.last_elapsed_ms = 0;
         slot.requested_at = unsafe { pg_sys::GetCurrentTimestamp() };
@@ -170,6 +173,14 @@ pub(crate) fn wait_for_submitted_infer_now(
     submitted: &SubmittedInferNow,
     timeout_ms: u32,
 ) -> Result<Option<CompletedInferNow>, String> {
+    wait_for_submitted_infer_now_detailed(submitted, timeout_ms)
+        .map_err(|failure| failure.error)
+}
+
+pub(crate) fn wait_for_submitted_infer_now_detailed(
+    submitted: &SubmittedInferNow,
+    timeout_ms: u32,
+) -> Result<Option<CompletedInferNow>, FailedInferNow> {
     wait_for_request(submitted.request_id, timeout_ms.min(MAX_WAIT_MS))
 }
 
@@ -177,7 +188,28 @@ pub(crate) fn signal_infer_now_worker() {
     crate::wake::signal_worker_latch_immediate();
 }
 
-fn wait_for_request(request_id: u64, timeout_ms: u32) -> Result<Option<CompletedInferNow>, String> {
+fn wait_for_request(
+    request_id: u64,
+    timeout_ms: u32,
+) -> Result<Option<CompletedInferNow>, FailedInferNow> {
+    let completed_normally = std::cell::Cell::new(false);
+    pgrx::PgTryBuilder::new(std::panic::AssertUnwindSafe(|| {
+        let result = wait_for_request_inner(request_id, timeout_ms);
+        completed_normally.set(true);
+        result
+    }))
+    .finally(|| {
+        if !completed_normally.get() {
+            abandon_current_backend_requests(ABORT_CANCEL_REASON);
+        }
+    })
+    .execute()
+}
+
+fn wait_for_request_inner(
+    request_id: u64,
+    timeout_ms: u32,
+) -> Result<Option<CompletedInferNow>, FailedInferNow> {
     let start = unsafe { pg_sys::GetCurrentTimestamp() };
     loop {
         unsafe {
@@ -200,25 +232,22 @@ fn wait_for_request(request_id: u64, timeout_ms: u32) -> Result<Option<Completed
                             let slot = &mut state.slots[slot_index];
                             slot.last_elapsed_ms = elapsed;
                             slot.state = STATE_IDLE;
-                            slot.requester_latch = 0;
+                            slot.requester_pid = 0;
                         }
                         state.last_elapsed_ms = elapsed;
                         return Ok(Some(completed));
                     }
                     STATE_FAILED => {
-                        let error = read_buf(
-                            &state.slots[slot_index].error,
-                            state.slots[slot_index].error_len as usize,
-                        );
+                        let failed = failed_infer_now(&state.slots[slot_index]);
                         let elapsed = elapsed_ms(start);
                         {
                             let slot = &mut state.slots[slot_index];
                             slot.last_elapsed_ms = elapsed;
                             slot.state = STATE_IDLE;
-                            slot.requester_latch = 0;
+                            slot.requester_pid = 0;
                         }
                         state.last_elapsed_ms = elapsed;
-                        return Err(error);
+                        return Err(failed);
                     }
                     _ => {}
                 }
@@ -232,7 +261,7 @@ fn wait_for_request(request_id: u64, timeout_ms: u32) -> Result<Option<Completed
                 std::ffi::c_int::try_from(timeout_ms).unwrap_or(std::ffi::c_int::MAX),
             )
         } {
-            let mut cancel_job_id = 0;
+            let mut terminal_result = None;
             {
                 let mut state = INFER_NOW_STATE.exclusive();
                 if let Some(slot_index) = state
@@ -240,33 +269,52 @@ fn wait_for_request(request_id: u64, timeout_ms: u32) -> Result<Option<Completed
                     .iter()
                     .position(|slot| slot.request_id == request_id)
                 {
-                    state.timeouts = state.timeouts.saturating_add(1);
-                    let elapsed = elapsed_ms(start);
-                    state.last_elapsed_ms = elapsed;
-                    {
-                        let slot = &mut state.slots[slot_index];
-                        slot.last_elapsed_ms = elapsed;
-                        slot.requester_latch = 0;
+                    match state.slots[slot_index].state {
+                        STATE_DONE => {
+                            terminal_result = Some(Ok(Some(CompletedInferNow {
+                                job_id: state.slots[slot_index].last_job_id,
+                            })));
+                            state.slots[slot_index].state = STATE_IDLE;
+                            state.slots[slot_index].requester_pid = 0;
+                        }
+                        STATE_FAILED => {
+                            terminal_result =
+                                Some(Err(failed_infer_now(&state.slots[slot_index])));
+                            state.slots[slot_index].state = STATE_IDLE;
+                            state.slots[slot_index].requester_pid = 0;
+                        }
+                        STATE_REQUESTED => {
+                            state.slots[slot_index].state = STATE_IDLE;
+                            state.slots[slot_index].requester_pid = 0;
+                        }
+                        STATE_RUNNING => {
+                            if let Some(detached) = detach_running_requester(
+                                &mut state.slots[slot_index],
+                                TIMEOUT_CANCEL_REASON,
+                            ) {
+                                if detached.newly_canceled {
+                                    state.abort_requests =
+                                        state.abort_requests.saturating_add(1);
+                                }
+                                if detached.job_id > 0 {
+                                    state.last_cancel_job_id = detached.job_id;
+                                }
+                            }
+                        }
+                        _ => {}
                     }
-                    if state.slots[slot_index].state == STATE_REQUESTED {
-                        state.slots[slot_index].state = STATE_IDLE;
-                    } else if state.slots[slot_index].state == STATE_RUNNING
-                        && state.slots[slot_index].last_job_id > 0
-                    {
-                        cancel_job_id = state.slots[slot_index].last_job_id;
-                        state.abort_requests = state.abort_requests.saturating_add(1);
-                        state.last_cancel_job_id = cancel_job_id;
-                        state.slots[slot_index].timeout_cancel_pending = true;
-                        write_error(&mut state.slots[slot_index], TIMEOUT_CANCEL_REASON);
+                    if terminal_result.is_none() {
+                        state.timeouts = state.timeouts.saturating_add(1);
+                        let elapsed = elapsed_ms(start);
+                        state.last_elapsed_ms = elapsed;
+                        state.slots[slot_index].last_elapsed_ms = elapsed;
                     }
                 }
             }
-            if cancel_job_id > 0
-                && let Err(err) = request_job_cancellation(cancel_job_id)
-            {
-                pgrx::warning!("otlet infer-now timeout cancel failed: {err}");
-                force_cancel_requested(cancel_job_id, TIMEOUT_CANCEL_REASON);
+            if let Some(result) = terminal_result {
+                return result;
             }
+            crate::wake::signal_worker_latch_immediate();
             return Ok(None);
         }
 
@@ -285,57 +333,15 @@ fn wait_for_request(request_id: u64, timeout_ms: u32) -> Result<Option<Completed
     }
 }
 
-fn request_job_cancellation(job_id: i64) -> Result<(), String> {
-    pgrx::Spi::connect_mut(|client| {
-        let args = [job_id.into(), TIMEOUT_CANCEL_REASON.into()];
-        let table = client
-            .select(
-                "SELECT id FROM otlet.request_job_cancellation($1, $2) LIMIT 1",
-                Some(1),
-                &args,
-            )
-            .map_err(|err| err.to_string())?;
-        let canceled = table
-            .first()
-            .get::<i64>(1)
-            .map_err(|err| err.to_string())?
-            .is_some();
-        if !canceled {
-            return Err(format!(
-                "request_job_cancellation affected no rows for job_id={job_id}"
-            ));
-        }
-        Ok(())
-    })
-}
-
-fn force_cancel_requested(job_id: i64, reason: &str) {
-    // Emergency fallback marks the cancellation when the requester call fails
-    // The linked worker observes cancel_requested and stops decoding
-    let recovery: pgrx::spi::Result<()> = pgrx::Spi::connect_mut(|client| {
-        let args = [job_id.into(), reason.into()];
-        client.update(
-            "UPDATE otlet.jobs \
-             SET status = 'cancel_requested', \
-                 error = $2, \
-                 cancel_requested_at = COALESCE(cancel_requested_at, now()) \
-             WHERE id = $1 AND status = 'running'",
-            Some(1),
-            &args,
-        )?;
-        Ok(())
-    });
-    if let Err(err) = recovery {
-        pgrx::warning!("otlet infer-now force cancel_requested failed: {err}");
-    }
-}
-
 fn signal_requester_latch(slot: &InferNowSlot) {
-    if slot.requester_latch != 0 {
-        unsafe {
-            pg_sys::SetLatch(slot.requester_latch as *mut pg_sys::Latch);
-        }
+    let requester = unsafe { pg_sys::BackendPidGetProc(slot.requester_pid) };
+    if !requester.is_null() {
+        unsafe { pg_sys::SetLatch(&raw mut (*requester).procLatch) };
     }
+}
+
+fn requester_alive(requester_pid: i32) -> bool {
+    requester_pid > 0 && !unsafe { pg_sys::BackendPidGetProc(requester_pid) }.is_null()
 }
 
 fn write_buf(target: &mut [u8], value: &[u8]) -> u32 {
@@ -403,7 +409,11 @@ const fn infer_queue_state_label(
 
 #[cfg(test)]
 mod tests {
-    use super::timeout_cancel_matches;
+    use super::{
+        InferNowSlot, STATE_DONE, STATE_FAILED, STATE_IDLE, STATE_REQUESTED, STATE_RUNNING,
+        classify_orphaned_request_status, failed_infer_now, restart_recovery_state,
+        timeout_cancel_matches, write_error,
+    };
 
     #[test]
     fn timeout_cancel_matches_only_the_recorded_job() {
@@ -411,5 +421,48 @@ mod tests {
         assert!(!timeout_cancel_matches(true, 42, 41));
         assert!(!timeout_cancel_matches(false, 42, 42));
         assert!(!timeout_cancel_matches(true, 0, 0));
+    }
+
+    #[test]
+    fn restart_keeps_started_requests_for_fail_closed_recovery() {
+        assert_eq!(restart_recovery_state(STATE_RUNNING, true), STATE_RUNNING);
+        assert_eq!(restart_recovery_state(STATE_RUNNING, false), STATE_RUNNING);
+        assert_eq!(restart_recovery_state(STATE_REQUESTED, false), STATE_IDLE);
+        assert_eq!(restart_recovery_state(STATE_REQUESTED, true), STATE_REQUESTED);
+        assert_eq!(restart_recovery_state(STATE_DONE, false), STATE_IDLE);
+        assert_eq!(restart_recovery_state(STATE_FAILED, false), STATE_IDLE);
+        assert_eq!(restart_recovery_state(STATE_DONE, true), STATE_DONE);
+    }
+
+    #[test]
+    fn missing_orphaned_jobs_fail_delivery_without_retrying_recovery() {
+        assert!(!classify_orphaned_request_status(41, None).unwrap());
+        assert!(!classify_orphaned_request_status(41, Some("canceled")).unwrap());
+        assert!(classify_orphaned_request_status(41, Some("complete")).unwrap());
+        assert!(classify_orphaned_request_status(41, Some("running")).is_err());
+    }
+
+    #[test]
+    fn failures_keep_their_slot_job_identity() {
+        let mut first = InferNowSlot {
+            state: STATE_FAILED,
+            last_job_id: 41,
+            ..InferNowSlot::default()
+        };
+        let mut second = InferNowSlot {
+            state: STATE_FAILED,
+            last_job_id: 42,
+            ..InferNowSlot::default()
+        };
+        write_error(&mut first, "first failure");
+        write_error(&mut second, "second failure");
+
+        let first_failure = failed_infer_now(&first);
+        let second_failure = failed_infer_now(&second);
+        assert_eq!((first_failure.job_id, first_failure.error.as_str()), (41, "first failure"));
+        assert_eq!(
+            (second_failure.job_id, second_failure.error.as_str()),
+            (42, "second failure")
+        );
     }
 }

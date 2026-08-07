@@ -71,8 +71,8 @@ pub(crate) fn status_json() -> JsonB {
         "priority_classes": false,
         "service_measurement_status": "native_cancellation_measured_queue_targets_declared",
         "cap_policy": "task_subject_inline_task_input_byte_caps_reject_before_queue_insert",
-        "timeout_policy": "requester_fail_closed_job_cancel_requested_no_late_materialization",
-        "cancellation_policy": "timeout_requests_cancellation_then_linked_runtime_checks_cancel_requested",
+        "timeout_policy": "timeout_marker_and_output_acceptance_use_atomic_first_winner",
+        "cancellation_policy": "marker_winner_is_worker_terminalized_completion_winner_may_commit",
         "mutation_policy": "otlet_tables_only_no_user_table_mutation",
         "error": read_buf(&last_slot.error, last_slot.error_len as usize),
     }))

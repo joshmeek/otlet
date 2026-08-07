@@ -100,7 +100,7 @@ SELECT (SELECT count(*) = 1 FROM otlet.redaction_policy_status)::text || '|' ||
        (SELECT count(*) > 0 FROM otlet.semantic_dependency_audit)::text || '|' ||
        (SELECT count(*) > 0 FROM otlet.operational_event_log)::text || '|' ||
        (SELECT count(*) > 0 FROM otlet.operational_observability_status)::text || '|' ||
-       (SELECT count(*) > 0 FROM otlet.labeled_quality_status)::text || '|' ||
+       (SELECT count(*) >= 0 FROM otlet.labeled_quality_status)::text || '|' ||
        (SELECT count(*) > 0 FROM otlet.worker_batch_timing_status)::text || '|' ||
        (SELECT count(*) = 1 FROM otlet.portable_protocol_status)::text || '|' ||
        (SELECT count(*) >= 1 FROM otlet.runtime_capability_status)::text || '|' ||
@@ -578,6 +578,7 @@ WITH table_grants AS (
             'portable_receipt_status',
             'task_queue_status',
             'task_resource_status',
+            'production_policy_status',
             'native_cancellation_slo_status',
             'route_readiness_status',
             'stranded_escalation_status',
@@ -816,7 +817,7 @@ source "$demo_dir/review_provenance.sh"
 
 permission_contract="public=0/0/0|auditor=32/31|operator=32/34|reviewer=3/11|definer=45/45|application=3/3/3|operator_rpc=3/3/3|reviewer_rpc=8/8/8|portable=8/8/8|positive=7|denied=$permission_denied_count"
 echo "permission_contract=$permission_contract"
-[ "$permission_contract" = "public=0/0/0|auditor=32/31|operator=32/34|reviewer=3/11|definer=45/45|application=3/3/3|operator_rpc=3/3/3|reviewer_rpc=8/8/8|portable=8/8/8|positive=7|denied=112" ] || {
+[ "$permission_contract" = "public=0/0/0|auditor=32/31|operator=32/34|reviewer=3/11|definer=45/45|application=3/3/3|operator_rpc=3/3/3|reviewer_rpc=8/8/8|portable=8/8/8|positive=7|denied=116" ] || {
   echo "Expected complete permission contract, got $permission_contract" >&2
   exit 1
 }

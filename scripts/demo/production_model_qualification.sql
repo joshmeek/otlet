@@ -358,6 +358,10 @@ BEGIN
       SELECT sample_hash FROM production_model_qualification_runs LIMIT 1
     );
   EXCEPTION WHEN OTHERS THEN
+    IF SQLSTATE <> 'P0001'
+       OR SQLERRM <> 'otlet evaluation evidence is append only' THEN
+      RAISE;
+    END IF;
     UPDATE production_model_qualification_proof SET sample_immutable = true;
   END;
   BEGIN
@@ -366,6 +370,10 @@ BEGIN
       SELECT probe_hash FROM production_model_qualification_probes LIMIT 1
     );
   EXCEPTION WHEN OTHERS THEN
+    IF SQLSTATE <> 'P0001'
+       OR SQLERRM <> 'otlet evaluation evidence is append only' THEN
+      RAISE;
+    END IF;
     UPDATE production_model_qualification_proof SET probe_immutable = true;
   END;
   BEGIN
@@ -375,6 +383,10 @@ BEGIN
       SELECT qualification_hash FROM production_model_qualification_proof
     );
   EXCEPTION WHEN OTHERS THEN
+    IF SQLSTATE <> 'P0001'
+       OR SQLERRM <> 'otlet workload acceptance evidence is append only' THEN
+      RAISE;
+    END IF;
     UPDATE production_model_qualification_proof SET event_immutable = true;
   END;
 END

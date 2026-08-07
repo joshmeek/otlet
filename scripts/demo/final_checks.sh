@@ -1,3 +1,14 @@
+psql_exec -v model_name="$cheap_model_name" >/dev/null <<'SQL'
+SELECT count(*)
+FROM otlet.ask(
+  :'model_name',
+  'Return exactly one JSON object with ready set to true. No markdown.',
+  '{}'::jsonb,
+  '{"type":"object","required":["ready"],"additionalProperties":false,"properties":{"ready":{"const":true}}}'::jsonb,
+  '{"max_tokens":32,"reasoning":"off","inference_cache":false}'::jsonb
+);
+SQL
+
 runtime_contract="$(psql_exec -qAt <<'SQL'
 SELECT runtime_status || '|' ||
        slot_state || '|' ||
@@ -1189,11 +1200,11 @@ echo "audit_export_contract=$audit_export_contract"
   exit 1
 }
 
-prepared_metadata_output="$(psql_value -v watch_name="$row_customscan_watch" <<'SQL'
+prepared_metadata_output="$(psql_value -v watch_name="$row_scoped_watch" <<'SQL'
 BEGIN;
 PREPARE otlet_prepared_metadata_probe AS
 SELECT count(*)
-FROM public.otlet_demo_customscan_signal
+FROM public.otlet_demo_scoped_signal
 WHERE otlet.semantic_matches(:'watch_name', id, '{}'::jsonb);
 EXECUTE otlet_prepared_metadata_probe;
 UPDATE otlet.semantic_indexes

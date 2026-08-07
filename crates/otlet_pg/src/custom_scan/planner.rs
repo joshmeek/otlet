@@ -291,6 +291,14 @@ mod preload_tests {
         assert_eq!(stats.preload_estimated_bytes, u64::MAX);
         assert!(stats.preload_estimated_ms > 0);
     }
+
+    #[test]
+    fn preload_timeout_preserves_a_stricter_statement_deadline() {
+        assert_eq!(effective_preload_timeout_ms(500, None), 500);
+        assert_eq!(effective_preload_timeout_ms(500, Some(200)), 200);
+        assert_eq!(effective_preload_timeout_ms(100, Some(200)), 100);
+        assert_eq!(effective_preload_timeout_ms(0, Some(0)), 1);
+    }
 }
 
 fn finish_planner_stats(
