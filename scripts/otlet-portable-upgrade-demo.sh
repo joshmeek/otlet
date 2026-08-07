@@ -1387,6 +1387,19 @@ SQL
 
 install_portable
 
+portable_trust_boundary_property_contract="$(
+  docker exec -i "$container" psql -U postgres -d "$database" \
+    -X -qAt -v ON_ERROR_STOP=1 \
+    -v model_name=model_concurrency_probe \
+    < scripts/demo/trust_boundary_properties.sql
+)"
+expected_trust_boundary_property_contract='malformed_json=8|schema_depth=4|identifiers=8|unicode=8|claim_sequences=8|sql_dependencies=8|action_payloads=8|crash_points=4|unauthorized_state=0|raw_secret_leaks=0|partial_trusted_writes=0|backend_pid_preserved=true|invariants=0'
+[ "$portable_trust_boundary_property_contract" = \
+  "$expected_trust_boundary_property_contract" ] || {
+  echo "Portable trust-boundary property contract mismatch: $portable_trust_boundary_property_contract" >&2
+  exit 1
+}
+
 docker exec -i "$container" psql -U postgres -d "$database" \
   -X -q -v ON_ERROR_STOP=1 <<'SQL' >/dev/null
 SELECT otlet.register_model(
@@ -6451,6 +6464,7 @@ echo "portable_upgrade_contract=$contract"
 echo "portable_access_policy_migration_contract=$portable_access_policy_migration_contract"
 echo "portable_evidence_lifecycle_default_contract=$portable_evidence_lifecycle_default_contract"
 echo "portable_evidence_lifecycle_migration_contract=$portable_evidence_lifecycle_migration_contract"
+echo "portable_trust_boundary_property_contract=$portable_trust_boundary_property_contract"
 echo "portable_identity_vector_contract=$identity_vector_contract"
 echo "portable_application_migration_contract=$application_migration_contract"
 echo "portable_lifecycle_migration_contract=$lifecycle_migration_contract"

@@ -210,7 +210,16 @@ The trust proof prints one stable line:
 adversarial_trust_contract=prompt_injection=rejected|secret_canary=redacted|unicode_identity=preserved|malicious_identifier=rejected|oversized_field=rejected|malformed_configuration=rejected|forged_identity=rejected|stale_claim=rejected|worker_health=preserved|malformed_artifact=rejected|oversized_prompt=rejected
 ```
 
-The same run must finish with `invariant_contract=0` and `docker_crash_log_scan=ok`
+The bounded property proof exhausts every byte split across a fixed native and portable JSON corpus and every four-step portable claim-signal sequence. One shared SQL corpus then generates 52 malformed JSON, schema-depth, identifier, Unicode, claim, SQL-dependency, and action-payload cases. Four transaction-local triggers fail receipt, output, action, and record insertion without killing a backend. The outer transaction rolls back every fixture and requires no unauthorized state, raw-secret leak, partial trusted write, backend replacement, or invariant violation
+
+The native and SQL-only runs print the same contract:
+
+```text
+trust_boundary_property_contract=malformed_json=8|schema_depth=4|identifiers=8|unicode=8|claim_sequences=8|sql_dependencies=8|action_payloads=8|crash_points=4|unauthorized_state=0|raw_secret_leaks=0|partial_trusted_writes=0|backend_pid_preserved=true|invariants=0
+portable_trust_boundary_property_contract=malformed_json=8|schema_depth=4|identifiers=8|unicode=8|claim_sequences=8|sql_dependencies=8|action_payloads=8|crash_points=4|unauthorized_state=0|raw_secret_leaks=0|partial_trusted_writes=0|backend_pid_preserved=true|invariants=0
+```
+
+The native run must also finish with `invariant_contract=0` and `docker_crash_log_scan=ok`
 
 ## Limits
 

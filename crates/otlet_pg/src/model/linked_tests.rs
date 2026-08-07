@@ -75,31 +75,38 @@ mod tests {
     }
 
     #[test]
-    fn json_completion_accepts_utf8_split_across_pieces() {
-        let mut completion = JsonCompletion::new();
-        let prefix = b"{\"text\":\"";
-        let split_utf8 = [0xe2, 0x82, 0xac];
-        let suffix = b"\"} trailing";
+    fn json_completion_is_invariant_across_bounded_splits() {
+        let escaped = br#"{"text":"quoted\" brace }","nested":{"ok":true}}"#;
+        let unicode = r#"{"unicode":"é🙂","combining":"é"}"#.as_bytes();
+        let invalid_utf8 = &[b'{', b'"', 0xf0, 0x28, 0x8c, 0x28, b'"', b'}'];
+        let cases = [
+            (b"".as_slice(), None),
+            (b"{".as_slice(), None),
+            (b"}".as_slice(), Some(0)),
+            (b"{} trailing".as_slice(), Some(2)),
+            (b"{}{}".as_slice(), Some(2)),
+            (br#"{"unterminated":"canary"#.as_slice(), None),
+            (escaped.as_slice(), Some(escaped.len())),
+            (unicode, Some(unicode.len())),
+            (invalid_utf8.as_slice(), Some(invalid_utf8.len())),
+        ];
 
-        assert_eq!(completion.observe(prefix), None);
-        assert_eq!(completion.observe(&split_utf8), None);
-        assert_eq!(
-            completion.observe(suffix),
-            Some(prefix.len() + split_utf8.len() + 2)
-        );
-    }
+        for (input, expected) in cases {
+            for split in 0..=input.len() {
+                let mut completion = JsonCompletion::new();
+                let actual = completion
+                    .observe(&input[..split])
+                    .or_else(|| completion.observe(&input[split..]));
+                assert_eq!(actual, expected, "split {split} for {input:?}");
+                assert!(actual.is_none_or(|end| end <= input.len()));
+            }
 
-    #[test]
-    fn json_completion_keeps_escape_state_across_pieces() {
-        let mut completion = JsonCompletion::new();
-        let prefix = b"{\"text\":\"quoted\\";
-        let suffix = b"\"\"}";
-
-        assert_eq!(completion.observe(prefix), None);
-        assert_eq!(
-            completion.observe(suffix),
-            Some(prefix.len() + suffix.len())
-        );
+            let mut completion = JsonCompletion::new();
+            let actual = input
+                .iter()
+                .find_map(|byte| completion.observe(std::slice::from_ref(byte)));
+            assert_eq!(actual, expected, "byte splits for {input:?}");
+        }
     }
 
     #[test]

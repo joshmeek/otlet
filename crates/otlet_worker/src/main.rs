@@ -3056,10 +3056,38 @@ mod tests {
     }
 
     #[test]
-    fn json_completion_handles_split_escapes() {
-        let mut completion = JsonCompletion::new();
-        assert_eq!(completion.observe(br#" {"value":"a\"#), None);
-        assert_eq!(completion.observe(br#""b"}"#), Some(17));
+    fn json_completion_is_invariant_across_bounded_splits() {
+        let escaped = br#"{"text":"quoted\" brace }","nested":{"ok":true}}"#;
+        let unicode = r#"{"unicode":"é🙂","combining":"é"}"#.as_bytes();
+        let invalid_utf8 = &[b'{', b'"', 0xf0, 0x28, 0x8c, 0x28, b'"', b'}'];
+        let cases = [
+            (b"".as_slice(), None),
+            (b"{".as_slice(), None),
+            (b"}".as_slice(), Some(0)),
+            (b"{} trailing".as_slice(), Some(2)),
+            (b"{}{}".as_slice(), Some(2)),
+            (br#"{"unterminated":"canary"#.as_slice(), None),
+            (escaped.as_slice(), Some(escaped.len())),
+            (unicode, Some(unicode.len())),
+            (invalid_utf8.as_slice(), Some(invalid_utf8.len())),
+        ];
+
+        for (input, expected) in cases {
+            for split in 0..=input.len() {
+                let mut completion = JsonCompletion::new();
+                let actual = completion
+                    .observe(&input[..split])
+                    .or_else(|| completion.observe(&input[split..]));
+                assert_eq!(actual, expected, "split {split} for {input:?}");
+                assert!(actual.is_none_or(|end| end <= input.len()));
+            }
+
+            let mut completion = JsonCompletion::new();
+            let actual = input
+                .iter()
+                .find_map(|byte| completion.observe(std::slice::from_ref(byte)));
+            assert_eq!(actual, expected, "byte splits for {input:?}");
+        }
     }
 
     #[test]
@@ -3377,10 +3405,22 @@ esac
 
     #[test]
     fn claim_signal_keeps_the_first_terminal_change() {
-        let signal = ClaimSignal::new(Instant::now() + Duration::from_secs(1));
-        signal.set(CLAIM_CANCELED);
-        signal.set(CLAIM_LOST);
-        assert_eq!(signal.state(), CLAIM_CANCELED);
+        let states = [CLAIM_ACTIVE, CLAIM_CANCELED, CLAIM_LOST, CLAIM_TIMED_OUT];
+        for encoded in 0..states.len().pow(4) {
+            let signal = ClaimSignal::new(Instant::now() + Duration::from_secs(60));
+            let mut sequence = encoded;
+            let mut expected = CLAIM_ACTIVE;
+            for _ in 0..4 {
+                let state = states[sequence % states.len()];
+                signal.set(state);
+                if expected == CLAIM_ACTIVE && state != CLAIM_ACTIVE {
+                    expected = state;
+                }
+                sequence /= states.len();
+            }
+            assert_eq!(signal.state(), expected, "sequence {encoded}");
+            assert_eq!(signal.ensure_active().is_ok(), expected == CLAIM_ACTIVE);
+        }
     }
 
     #[test]
