@@ -9,6 +9,4 @@ Run the full native suite from the repository root:
 ./scripts/otlet-demo.sh
 ```
 
-`otlet-demo.sh` sources these files in order. Most files share setup and database state, so do not run them as standalone scripts
-
-The suite can split into smaller groups and shared setup after the contracts settle or the full run becomes hard to maintain
+`otlet-demo.sh` sources these files in order. Most files share setup and database state, so do not run them as standalone scripts. These files can also be used as docs and/or tests at some point
